@@ -196,3 +196,23 @@ __kernel void exl3_rotate_out(__global uchar *base, __global const exl3_desc *de
         else AT(ushort, d.out)[at] = to_bf(y);
     }
 }
+
+// P3.2 routed experts. One descriptor a (token, pick) slot, built on the device from the router's picks, so the
+// three kernels above run with no host round trip. experts holds the layer's per-expert descriptors (trellis,
+// suh, svh, k, n, halves; the rest ignored). Slot s = token * topk + j reads x row token (x_per_slot = 0, gate and up)
+// or row s (x_per_slot = 1, down), and writes out row s.
+// x, rot, sums, out are base offsets; rot, sums and out give each slot its own row. Grid (tokens * topk).
+__kernel void exl3_route(__global const exl3_desc *experts, __global const uint *ids, __global exl3_desc *desc,
+                         uint topk, ulong x, uint x_stride, uint x_per_slot, ulong rot, ulong sums, ulong out, uint out_stride, uint out_f32) {
+    const uint s = get_global_id(0), token = s / topk;
+    exl3_desc d = experts[ids[s]];
+    d.rows = 1;
+    d.x = x + (ulong)(x_per_slot ? s : token) * x_stride * 2;
+    d.x_stride = x_stride;
+    d.rot = rot + (ulong)s * d.k * 4;
+    d.sums = sums + (ulong)s * d.n * 4;
+    d.out_stride = out_stride;
+    d.out_f32 = out_f32;
+    d.out = out + (ulong)s * out_stride * (out_f32 ? 4 : 2);
+    desc[s] = d;
+}
