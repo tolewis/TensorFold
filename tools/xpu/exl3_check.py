@@ -41,7 +41,7 @@ class Exl3:
     def matvec(self, bits, rows, ns=1):
         key = (bits, rows, ns)
         if key not in self.kern:
-            p = cl.Program(self.ctx, self.src).build(f"-cl-std=CL3.0 -DBITS={bits} -DROWS={rows} -DNS={ns}")
+            p = cl.Program(self.ctx, self.src).build(f"-cl-std=CL3.0 -DBITS={bits} -DROWS={rows} -DNS={ns} " + getattr(self, "extra_opts", ""))
             self.progs[key] = p
             self.kern[key] = cl.Kernel(p, "exl3_matvec")
         return self.kern[key]

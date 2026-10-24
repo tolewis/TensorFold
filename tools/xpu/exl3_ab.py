@@ -10,8 +10,8 @@ ROWS = tuple(int(r) for r in os.environ.get("AB_ROWS", "1,8").split(","))
 variants = []
 for spec in sys.argv[3:]:
     name, rest = spec.split("=")
-    repo, ns = rest.split(":")
-    e = ck.Exl3(repo); e.ns_fixed = int(ns)
+    repo, ns, *opt = rest.split(":")
+    e = ck.Exl3(repo); e.ns_fixed = int(ns); e.extra_opts = " ".join(opt)
     variants.append((name, e))
 st = ref.SafeTensors(sage)
 rng = np.random.default_rng(6)
