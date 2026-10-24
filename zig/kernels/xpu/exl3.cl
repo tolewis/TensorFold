@@ -72,15 +72,14 @@ inline uint mapped_state(__global const ushort *tile, uint map) {
     return ((lo << off) | carry) >> 16;
 }
 
-// mul1: x = s * 0x83DCD12D; fp16((1024 + the bytes of x) * fp16(0x1EEE) + fp16(0xC931)). The FP32 fma is exact;
-// the one rounding is to fp16. IGC (driver 26.05) folds (float)convert_half_rte(f) to f, so the rounding is done
-// on the bits: round to nearest even at 11 significant bits. This is the fp16 rounding because every mul1 value
-// is a normal fp16 (0.0018 <= |v| <= 3.5). exl3_mul1_check proves all 65536 states.
+// mul1: x = s * 0x83DCD12D; fp16((1024 + the bytes of x) * fp16(0x1EEE) + fp16(0xC931)), one rounding.
+// The byte sum is one dp4a; 1024 + sum <= 2044 is exact in fp16, so one fp16 fma gives the format's rounding
+// (method from exl3xpu, MIT, 0xSero). The fp16 type matters: IGC on driver 26.05 folds
+// (float)convert_half_rte(f) to f, so an FP32 fma followed by a conversion loses the rounding.
+// exl3_mul1_check proves all 65536 states.
 inline float mul1_value(uint s) {
-    const uint x = s * 0x83DCD12Du;
-    const uint h = 1024u + (x & 255u) + ((x >> 8) & 255u) + ((x >> 16) & 255u) + (x >> 24);
-    const uint u = as_uint(fma((float)h, as_float(0x3BDDC000u), as_float(0xC1262000u)));
-    return as_float((u + 0xFFFu + ((u >> 13) & 1u)) & 0xFFFFE000u);
+    const uint h = dot_acc_sat_4x8packed_uu_uint(s * 0x83DCD12Du, 0x01010101u, 1024u);
+    return (float)fma((half)h, as_half((ushort)0x1EEE), as_half((ushort)0xC931));
 }
 
 // Lane c owns tile column c. Its 16 stream values are p = 32 (c % 8) + 8 m + 4 (c / 8) + i (m, i < 4),
