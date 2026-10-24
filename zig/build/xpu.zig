@@ -25,6 +25,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         // Sage-A1.5 (qwen3_5_moe): the same sources at its shape (shape.h); the GEMM and GDN chunk images are shared
         .{ "sage_glue", "zig/kernels/xpu/qwen27/glue.cl", " " ++ sage_config.sage_defines },
         .{ "sage_decode", "zig/kernels/xpu/qwen27/decode.cl", " " ++ sage_config.sage_defines },
+        .{ "sage_moe", "zig/kernels/xpu/sage_moe.cl", "" },
     }) |k| {
         const c = b.addSystemCommand(&.{ ocloc, "compile", "-q", "-file" });
         c.addFileArg(b.path(k[1]));
@@ -75,6 +76,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         \\pub const ngen_a4 align(8) = @embedFile("ngen_a4.zebin").*;
         \\pub const sage_glue align(8) = @embedFile("sage_glue.bin").*;
         \\pub const sage_decode align(8) = @embedFile("sage_decode.bin").*;
+        \\pub const sage_moe align(8) = @embedFile("sage_moe.bin").*;
         \\
     ) });
     const ze_mod = zeModule(b, target, optimize);
@@ -154,7 +156,6 @@ const kernels = [_]Kernel{
     .{ .name = "nem_rows_r8", .src = "nem_rows", .options = cl3 ++ " -DMAXR=8" },
     .{ .name = "nem_prow", .options = cl3 },
     .{ .name = "nem_attn_dec", .options = cl3 },
-    .{ .name = "sage_moe", .options = cl3 },
     .{ .name = "sage_exl3", .options = cl3 },
 };
 

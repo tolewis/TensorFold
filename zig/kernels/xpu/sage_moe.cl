@@ -1,5 +1,7 @@
 // Sage-A1.5 (qwen3_5_moe) MoE decode ops: fp16 router, softmax top-k with renormalised weights, the shared expert's
 // sigmoid gate, 4-bit affine (MLX, groups of 64) SwiGLU experts on stacked tables, and the gated combine.
+// x: the post-attention norm's fp16 rows [rows, dim] (forward.zig's h); out: fp16 [rows, dim], the residual's r.
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
 inline float bf(ushort v) { return as_float((uint)v << 16); }
 inline ushort to_bf(float f) {
     uint u = as_uint(f);
@@ -14,13 +16,13 @@ inline ushort to_bf(float f) {
 // logits[row][e] = x[row] . gate[e] in fp32 (gate fp16 [n_experts, dim]); slot n_experts is the shared expert's gate.
 // Grid (n_experts + 1, rows), one sub-group a work-group.
 __attribute__((intel_reqd_sub_group_size(SG)))
-__kernel void sage_router(__global const ushort *x, __global const half *gate, __global const half *shared_gate,
+__kernel void sage_router(__global const half *x, __global const half *gate, __global const half *shared_gate,
                           __global float *logits, uint dim) {
     const uint e = get_group_id(0), row = get_group_id(1), n = get_num_groups(0);
     const uint lane = get_sub_group_local_id();
     __global const half *w = e + 1 == n ? shared_gate : gate + (ulong)e * dim;
     float acc = 0.0f;
-    for (uint i = lane; i < dim; i += SG) acc = fma(bf(x[row * dim + i]), vload_half(i, w), acc);
+    for (uint i = lane; i < dim; i += SG) acc = fma((float)x[row * dim + i], vload_half(i, w), acc);
     acc = sub_group_reduce_add(acc);
     if (lane == 0) logits[row * n + e] = acc;
 }
@@ -62,8 +64,8 @@ __kernel void sage_route(__global const float *logits, __global uint *ids, __glo
     }
 }
 
-// 4-bit affine dot of row `row` of a stacked table with bf16 x; the sum is valid on every lane of the sub-group.
-inline float qdot(__global const uint *w, __global const ushort *scales, __global const ushort *biases, __global const ushort *x,
+// 4-bit affine dot of row `row` of a stacked table with fp16 x; the sum is valid on every lane of the sub-group.
+inline float qdot(__global const uint *w, __global const ushort *scales, __global const ushort *biases, __global const half *x,
                   ulong row, uint in_dim) {
     const uint lane = get_sub_group_local_id();
     const uint words = in_dim / 8, groups = in_dim / 64;
@@ -75,7 +77,7 @@ inline float qdot(__global const uint *w, __global const ushort *scales, __globa
         const uint pk = w[row * words + wi];
         float dot = 0.0f, sx = 0.0f;
         for (uint j = 0; j < 8; j++) {
-            const float xv = bf(x[wi * 8 + j]);
+            const float xv = (float)x[wi * 8 + j];
             dot += xv * (float)((pk >> (4 * j)) & 15u);
             sx += xv;
         }
@@ -84,41 +86,41 @@ inline float qdot(__global const uint *w, __global const ushort *scales, __globa
     return sub_group_reduce_add(acc);
 }
 
-// gate and up of one expert pair and SwiGLU: act[p][r] = bf16(silu(gate) * up). Grid (ff, pairs).
+// gate and up of one expert pair and SwiGLU: act[p][r] = fp16(bf16(silu(bf16(gate)) * bf16(up))). Grid (ff, pairs).
 // Pair p is (row p / top_k, expert ids[p]); pairs at or past n_pairs are the shared expert of row p - n_pairs, whose
 // tables are the `sh_` ones. gate_up holds 2 * ff rows an expert: gate rows 0..ff, then up rows.
 __attribute__((intel_reqd_sub_group_size(SG)))
 __kernel void sage_expert_swiglu(__global const uint *w, __global const ushort *scales, __global const ushort *biases,
                                  __global const uint *sh_w, __global const ushort *sh_scales, __global const ushort *sh_biases,
-                                 __global const ushort *x, __global const uint *ids, __global ushort *act,
+                                 __global const half *x, __global const uint *ids, __global half *act,
                                  uint dim, uint ff, uint top_k, uint n_pairs) {
     const uint r = get_group_id(0), p = get_group_id(1);
     const bool shared = p >= n_pairs;
     const uint row = shared ? p - n_pairs : p / top_k;
     const ulong base = shared ? 0 : (ulong)ids[p] * 2 * ff;
-    __global const ushort *xr = x + (ulong)row * dim;
+    __global const half *xr = x + (ulong)row * dim;
     const float g = shared ? qdot(sh_w, sh_scales, sh_biases, xr, r, dim) : qdot(w, scales, biases, xr, base + r, dim);
     const float u = shared ? qdot(sh_w, sh_scales, sh_biases, xr, ff + r, dim) : qdot(w, scales, biases, xr, base + ff + r, dim);
     const float gb = bf(to_bf(g)), ub = bf(to_bf(u));
-    if (get_sub_group_local_id() == 0) act[(ulong)p * ff + r] = to_bf(gb / (1.0f + exp(-gb)) * ub);
+    if (get_sub_group_local_id() == 0) act[(ulong)p * ff + r] = convert_half_rte(bf(to_bf(gb / (1.0f + exp(-gb)) * ub)));
 }
 
 // down of one expert pair to fp32: y[p][r]. Grid (dim, pairs); pairs as in sage_expert_swiglu.
 __attribute__((intel_reqd_sub_group_size(SG)))
 __kernel void sage_expert_down(__global const uint *w, __global const ushort *scales, __global const ushort *biases,
                                __global const uint *sh_w, __global const ushort *sh_scales, __global const ushort *sh_biases,
-                               __global const ushort *act, __global const uint *ids, __global float *y,
+                               __global const half *act, __global const uint *ids, __global float *y,
                                uint dim, uint ff, uint n_pairs) {
     const uint r = get_group_id(0), p = get_group_id(1);
     const bool shared = p >= n_pairs;
-    __global const ushort *a = act + (ulong)p * ff;
+    __global const half *a = act + (ulong)p * ff;
     const float acc = shared ? qdot(sh_w, sh_scales, sh_biases, a, r, ff) : qdot(w, scales, biases, a, (ulong)ids[p] * dim + r, ff);
     if (get_sub_group_local_id() == 0) y[(ulong)p * dim + r] = acc;
 }
 
-// out[row][i] = bf16(sum_k wts[k] * y[k][i] + shared_w * y_shared[i]), the sum in pick order. Grid (dim, rows).
+// out[row][i] = fp16(bf16(sum_k wts[k] * y[k][i] + shared_w * y_shared[i])), the sum in pick order. Grid (dim, rows).
 __kernel void sage_moe_combine(__global const float *y, __global const float *wts, __global const float *shared_w,
-                               __global ushort *out, uint dim, uint top_k, uint n_pairs) {
+                               __global half *out, uint dim, uint top_k, uint n_pairs) {
     const uint i = get_global_id(0), row = get_global_id(1);
     if (i >= dim) return;
     float acc = 0.0f;
@@ -127,5 +129,5 @@ __kernel void sage_moe_combine(__global const float *y, __global const float *wt
         acc = fma(y[(ulong)p * dim + i], wts[p], acc);
     }
     acc = fma(y[(ulong)(n_pairs + row) * dim + i], shared_w[row], acc);
-    out[(ulong)row * dim + i] = to_bf(acc);
+    out[(ulong)row * dim + i] = convert_half_rte(bf(to_bf(acc)));
 }
