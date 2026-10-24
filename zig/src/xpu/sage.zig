@@ -157,15 +157,49 @@ fn name(comptime f: []const u8, args: anytype) []const u8 {
     return std.fmt.allocPrint(alloc, f, args) catch @panic("out of memory");
 }
 
-/// fp16 [n] of a BF16 or F16 tensor, uploaded.
-fn halfTensor(d: *Dev, c: *const Checkpoint, n: []const u8) !*anyopaque {
-    const t = try c.get(n);
-    if (std.mem.eql(u8, t.dtype, "F16")) return d.upload(t.bytes);
-    if (!std.mem.eql(u8, t.dtype, "BF16")) return error.UnexpectedDtype;
-    const out = try alloc.alloc(f16, t.bytes.len / 2);
-    defer alloc.free(out);
-    for (out, 0..) |*o, i| o.* = @floatCast(@as(f32, @bitCast(@as(u32, std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little)) << 16)));
-    return d.upload(std.mem.sliceAsBytes(out));
+fn bf16At(b: []const u8, i: usize) f32 {
+    return @bitCast(@as(u32, std.mem.readInt(u16, b[2 * i ..][0..2], .little)) << 16);
+}
+
+/// fp16 [rows, k] of `p`.weight: BF16, F16, or MLX affine (bits from the shapes: the Sage MLX router and shared
+/// expert gate are 8 bit). Host work, no device code, so a CUDA runner can take it as is.
+pub fn halfRows(c: *const Checkpoint, p: []const u8) ![]f16 {
+    const t = try c.get(name("{s}.weight", .{p}));
+    if (std.mem.eql(u8, t.dtype, "F16")) {
+        const out = try alloc.alloc(f16, t.bytes.len / 2);
+        @memcpy(std.mem.sliceAsBytes(out), t.bytes);
+        return out;
+    }
+    if (std.mem.eql(u8, t.dtype, "BF16")) {
+        const out = try alloc.alloc(f16, t.bytes.len / 2);
+        for (out, 0..) |*o, i| o.* = @floatCast(bf16At(t.bytes, i));
+        return out;
+    }
+    if (!std.mem.eql(u8, t.dtype, "U32")) return error.UnexpectedDtype;
+    const sc = try c.get(name("{s}.scales", .{p}));
+    const bi = try c.get(name("{s}.biases", .{p}));
+    const rows: usize = @intCast(t.shape[0]);
+    const words: usize = @intCast(t.shape[1]);
+    const groups = sc.bytes.len / 2 / rows;
+    const bits = words * 32 / (groups * 64);
+    if (bits != 4 and bits != 8) return error.UnexpectedShape;
+    const k = groups * 64;
+    const out = try alloc.alloc(f16, rows * k);
+    const mask: u32 = (@as(u32, 1) << @intCast(bits)) - 1;
+    for (0..rows) |r| for (0..k) |j| {
+        const bit = j * bits;
+        const w = std.mem.readInt(u32, t.bytes[4 * (r * words + bit / 32) ..][0..4], .little);
+        const q: f32 = @floatFromInt((w >> @intCast(bit % 32)) & mask); // low bits first
+        const g = r * groups + j / 64;
+        out[r * k + j] = @floatCast(q * bf16At(sc.bytes, g) + bf16At(bi.bytes, g));
+    };
+    return out;
+}
+
+fn halfTensor(d: *Dev, c: *const Checkpoint, p: []const u8) !*anyopaque {
+    const h = try halfRows(c, p);
+    defer alloc.free(h);
+    return d.upload(std.mem.sliceAsBytes(h));
 }
 
 /// Expert `e`'s bytes of one MLX tensor (`which`: weight, scales, biases): stacked switch_mlp, else one a tensor.
@@ -219,7 +253,8 @@ fn experts(d: *Dev, c: *const Checkpoint, p: []const u8, count: u32, shared: boo
     return x;
 }
 
-/// MLX affine 4/64 only in this form; the scales of the experts must be BF16 (sage_moe.cl reads bf16).
+/// MLX affine 4/64 only in this form; the scales of the experts must be BF16 (sage_moe.cl reads bf16). Checked on the
+/// real Sage MLX-4bit by tools/xpu/sage_mlx_check.py: stacked switch_mlp experts, 8 bit router, conv1d [NCONV, 4, 1].
 pub fn load(d: *Dev, c: *const Checkpoint, z: Sizes, ctx: u32) !Model {
     const s = z.s;
     if (c.has("in_proj_qkv.qweight") or c.has("in_proj_qkv.trellis")) return error.OnlyMlxInThisForm;
@@ -239,15 +274,14 @@ pub fn load(d: *Dev, c: *const Checkpoint, z: Sizes, ctx: u32) !Model {
     for (m.layers, 0..) |*l, i| {
         const p = name("model.layers.{d}.", .{i});
         const attn = (i + 1) % 4 == 0;
-        if (c.has(name("{s}mlp.gate.scales", .{p}))) return error.QuantizedRouterNotWired;
         l.* = .{
             .in_norm = try loader.bf16Tensor(d, c, name("{s}input_layernorm.weight", .{p})),
             .post_norm = try loader.bf16Tensor(d, c, name("{s}post_attention_layernorm.weight", .{p})),
             .attn = attn,
             .mixer_in = undefined,
             .mixer_out = undefined,
-            .router = try halfTensor(d, c, name("{s}mlp.gate.weight", .{p})),
-            .shared_gate = try halfTensor(d, c, name("{s}mlp.shared_expert_gate.weight", .{p})),
+            .router = try halfTensor(d, c, name("{s}mlp.gate", .{p})),
+            .shared_gate = try halfTensor(d, c, name("{s}mlp.shared_expert_gate", .{p})),
             .experts = try experts(d, c, p, s.experts, false, s.expert_ff, s.hidden),
             .shared = try experts(d, c, p, 1, true, s.shared_ff, s.hidden),
         };
