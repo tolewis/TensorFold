@@ -141,38 +141,47 @@ __kernel void exl3_rotate_in(__global const uchar *base, __global const exl3_des
 #define SHB ((4 * BITS) % 32)                         //                 and bits
 #define USEW ((OFF0 + 27 * BITS + 16 + 31) / 32 + 1)  // aligned words the windows touch
 #define LOADW (USEW + SHW + 1)
+#ifndef NS
+#define NS 1                                  // column strips a sub-group (N / 16 must divide by NS)
+#endif
 __attribute__((intel_reqd_sub_group_size(SG)))
 __kernel void exl3_matvec(__global const uchar *base, __global const exl3_desc *desc) {
     const exl3_desc d = desc[get_group_id(1)];
-    const uint tn = get_global_id(0) / SG, c = get_sub_group_local_id();
-    if (tn * 16 >= d.n || d.halves != 2 * BITS) return;
+    const uint tn0 = get_global_id(0) / SG * NS, c = get_sub_group_local_id();
+    if (tn0 * 16 >= d.n || d.halves != 2 * BITS) return;
     const uint g = c % 8, h = c / 8;
     const uint wbase = ((32 * g * BITS + BITS + 32 * RINGW - 16) / 32) % RINGW;
-    __global const uint *tile = (__global const uint *)(AT(const ushort, d.trellis) + (ulong)tn * 16 * BITS);
+    __global const uint *tile = (__global const uint *)(AT(const ushort, d.trellis) + (ulong)tn0 * 16 * BITS);
     __global const float *rot = AT(const float, d.rot);
     const ulong tile_k = (ulong)(d.n / 16) * RINGW;  // uint32 words between k tiles
-    float acc[ROWS];
-    for (uint r = 0; r < ROWS; r++) acc[r] = 0.0f;
+    float acc[NS][ROWS];
+    for (uint s = 0; s < NS; s++)
+        for (uint r = 0; r < ROWS; r++) acc[s][r] = 0.0f;
     for (uint kb = 0; kb < d.k; kb += 16, tile += tile_k) {
-        uint raw[LOADW], w[USEW];
-        for (uint j = 0; j < LOADW; j++) {
-            raw[j] = tile[(wbase + j) % RINGW];  // = stream_word: a little-endian uint32 load
-        }
-        for (uint j = 0; j < USEW; j++)
-            w[j] = h ? (SHB ? (raw[j + SHW] << SHB) | (raw[j + SHW + 1] >> (32 - SHB)) : raw[j + SHW]) : raw[j];
+        uint raw[NS][LOADW], w[NS][USEW];
+        for (uint s = 0; s < NS; s++)
+            for (uint j = 0; j < LOADW; j++) raw[s][j] = tile[s * RINGW + (wbase + j) % RINGW];  // = stream_word
+        for (uint s = 0; s < NS; s++)
+            for (uint j = 0; j < USEW; j++)
+                w[s][j] = h ? (SHB ? (raw[s][j + SHW] << SHB) | (raw[s][j + SHW + 1] >> (32 - SHB)) : raw[s][j + SHW]) : raw[s][j];
         float xr[ROWS];
         for (uint r = 0; r < ROWS; r++) xr[r] = r < d.rows ? rot[(ulong)r * d.k + kb + c] : 0.0f;
         for (uint v = 0; v < 16; v++) {
             const uint bit = OFF0 + (8 * (v / 4) + (v % 4)) * BITS, wi = bit / 32, off = bit % 32;
-            const uint st = off ? ((w[wi] << off) | (w[wi + 1] >> (32 - off))) >> 16 : w[wi] >> 16;
-            const float wv = mul1_value(st);
             const uint kr = lane_row(v);
-            for (uint r = 0; r < ROWS; r++) acc[r] = fma(sub_group_broadcast(xr[r], kr), wv, acc[r]);
+            float wv[NS];
+            for (uint s = 0; s < NS; s++)
+                wv[s] = mul1_value(off ? ((w[s][wi] << off) | (w[s][wi + 1] >> (32 - off))) >> 16 : w[s][wi] >> 16);
+            for (uint r = 0; r < ROWS; r++) {
+                const float xv = sub_group_broadcast(xr[r], kr);  // shared by the NS strips
+                for (uint s = 0; s < NS; s++) acc[s][r] = fma(xv, wv[s], acc[s][r]);
+            }
         }
     }
     __global float *sums = AT(float, d.sums);
-    for (uint r = 0; r < ROWS; r++)
-        if (r < d.rows) sums[(ulong)r * d.n + tn * 16 + c] = acc[r];
+    for (uint s = 0; s < NS; s++)
+        for (uint r = 0; r < ROWS; r++)
+            if (r < d.rows) sums[(ulong)r * d.n + (tn0 + s) * 16 + c] = acc[s][r];
 }
 #endif
 

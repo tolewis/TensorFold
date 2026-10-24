@@ -25,10 +25,23 @@ class Exl3:
         self.src, self.progs, self.kern = src, {}, {}
         self.p = cl.Program(self.ctx, src).build("-cl-std=CL3.0")
 
-    def matvec(self, bits, rows):
-        key = (bits, rows)
+    def ns(self, bits, rows, strips=1 << 30):
+        """Column strips a sub-group (measured on the B70 by exl3_ab.py, 2026-10-24). 8 spills."""
+        fixed = getattr(self, "ns_fixed", None) or int(os.environ.get("EXL3_NS", "0"))
+        if fixed:
+            return fixed
+        if strips < 128:  # few strips a group (expert gate/up, N 512): keep the sub-group count up
+            ns = 2 if rows == 1 else 1
+        else:
+            ns = 4 if rows <= 4 else (2 if rows <= 8 else 1)
+        while strips % ns:
+            ns //= 2
+        return ns
+
+    def matvec(self, bits, rows, ns=1):
+        key = (bits, rows, ns)
         if key not in self.kern:
-            p = cl.Program(self.ctx, self.src).build(f"-cl-std=CL3.0 -DBITS={bits} -DROWS={rows}")
+            p = cl.Program(self.ctx, self.src).build(f"-cl-std=CL3.0 -DBITS={bits} -DROWS={rows} -DNS={ns}")
             self.progs[key] = p
             self.kern[key] = cl.Kernel(p, "exl3_matvec")
         return self.kern[key]
@@ -97,9 +110,11 @@ def project(e, groups, xs, rows, out_f32=True, reps=0):
     rb = next(r for r in (1, 2, 4, 8, 16) if r >= rows)
     bits = {int(h) // 2 for h in d["halves"]}
     assert len(bits) == 1, "one width a launch"
-    mv = e.matvec(bits.pop(), rb)
+    bits = bits.pop()
+    ns = e.ns(bits, rb, min(int(n) // 16 for n in d["n"]))
+    mv = e.matvec(bits, rb, ns)
     WG = 128
-    gx = (nmax // 16 * 16 + WG - 1) // WG * WG
+    gx = (nmax // 16 // ns * 16 + WG - 1) // WG * WG
     def launch():
         ev = [e.p.exl3_rotate_in(e.q, (kmax // 128 * 16, rows, len(groups)), (16, 1, 1), base, db),
               mv(e.q, (gx, len(groups)), (WG, 1), base, db),

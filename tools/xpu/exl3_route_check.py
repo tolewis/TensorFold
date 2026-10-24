@@ -39,9 +39,10 @@ def main():
             db = cl.Buffer(e.ctx, cl.mem_flags.READ_WRITE, slots * ck.DESC.itemsize)
             e.p.exl3_route(e.q, (slots,), None, tb, ib, db, np.uint32(TOPK), np.uint64(xo), np.uint32(k), np.uint32(per),
                            np.uint64(ro), np.uint64(so), np.uint64(oo), np.uint32(n), np.uint32(1))
-            mv = e.matvec(w // 16, 1)
+            ns = e.ns(w // 16, 1, n // 16)
+            mv = e.matvec(w // 16, 1, ns)
             e.p.exl3_rotate_in(e.q, (k // 128 * 16, 1, slots), (16, 1, 1), base, db)
-            mv(e.q, ((n // 16 * 16 + 127) // 128 * 128, slots), (128, 1), base, db)
+            mv(e.q, ((n // 16 // ns * 16 + 127) // 128 * 128, slots), (128, 1), base, db)
             e.p.exl3_rotate_out(e.q, (n // 128 * 16, 1, slots), (16, 1, 1), base, db)
             e.q.finish()
             y = ar.read(e.q, oo, (tokens, TOPK, n), np.float32)
