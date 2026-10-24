@@ -127,35 +127,55 @@ __kernel void exl3_rotate_in(__global const uchar *base, __global const exl3_des
     for (uint j = 0; j < 8; j++) rot[blk * 128 + lane + SG * j] = v[j] * INV_SQRT128;
 }
 
-// sums[row][n] = rot[row] @ W_q[:, n] for one 16-column strip and up to ROWS rows (built per ROWS).
-// Grid (N_max / 16 * SG, groups); one sub-group a strip. FP32 fma accumulation.
+// sums[row][n] = rot[row] @ W_q[:, n] for one 16-column strip and up to ROWS rows. Built per (BITS, ROWS);
+// a launch holds groups of one width only (the host sorts them). Grid (strips_max * SG rounded to the
+// work-group, groups), work-group 8 sub-groups, one sub-group a strip.
+//
+// Lane c (column c) reads only the stream words its 16 values use. With g = c % 8 and h = c / 8, its values are
+// p = 32 g + q, q = 8 m + i + 4 h, and value p's window starts at bit S(p) = p * BITS + BITS - 16 (mod the ring).
+// The lane loads LOADW words from word floor(S(32 g) / 32); lanes with h = 1 shift them left by 4 * BITS bits.
+// After that every window's word and bit offset is a compile-time constant.
+#ifdef BITS
+#define RINGW (8 * BITS)                              // uint32 stream words a tile
+#define OFF0 (BITS + 16)                              // S(32 g) mod 32, for whole bits below 16
+#define SHW ((4 * BITS) / 32)                         // the h = 1 shift: whole words
+#define SHB ((4 * BITS) % 32)                         //                 and bits
+#define USEW ((OFF0 + 27 * BITS + 16 + 31) / 32 + 1)  // aligned words the windows touch
+#define LOADW (USEW + SHW + 1)
 __attribute__((intel_reqd_sub_group_size(SG)))
 __kernel void exl3_matvec(__global const uchar *base, __global const exl3_desc *desc) {
     const exl3_desc d = desc[get_group_id(1)];
-    const uint tn = get_group_id(0), c = get_sub_group_local_id();
-    if (tn * 16 >= d.n) return;
-    if (d.halves < 4 || d.halves > 16) return;  // the host refuses these; never decode garbage
-    const uint tiles_n = d.n / 16, words = 8 * d.halves;
-    uint maps[16];
-    for (uint v = 0; v < 16; v++) maps[v] = state_map(d.halves, lane_value(c, v));
-    __global const ushort *tile = AT(const ushort, d.trellis) + (ulong)tn * words;
+    const uint tn = get_global_id(0) / SG, c = get_sub_group_local_id();
+    if (tn * 16 >= d.n || d.halves != 2 * BITS) return;
+    const uint g = c % 8, h = c / 8;
+    const uint wbase = ((32 * g * BITS + BITS + 32 * RINGW - 16) / 32) % RINGW;
+    __global const uint *tile = (__global const uint *)(AT(const ushort, d.trellis) + (ulong)tn * 16 * BITS);
     __global const float *rot = AT(const float, d.rot);
-    const ulong tile_k = (ulong)tiles_n * words;
+    const ulong tile_k = (ulong)(d.n / 16) * RINGW;  // uint32 words between k tiles
     float acc[ROWS];
     for (uint r = 0; r < ROWS; r++) acc[r] = 0.0f;
     for (uint kb = 0; kb < d.k; kb += 16, tile += tile_k) {
+        uint raw[LOADW], w[USEW];
+        for (uint j = 0; j < LOADW; j++) {
+            raw[j] = tile[(wbase + j) % RINGW];  // = stream_word: a little-endian uint32 load
+        }
+        for (uint j = 0; j < USEW; j++)
+            w[j] = h ? (SHB ? (raw[j + SHW] << SHB) | (raw[j + SHW + 1] >> (32 - SHB)) : raw[j + SHW]) : raw[j];
         float xr[ROWS];
         for (uint r = 0; r < ROWS; r++) xr[r] = r < d.rows ? rot[(ulong)r * d.k + kb + c] : 0.0f;
         for (uint v = 0; v < 16; v++) {
-            const float w = mul1_value(mapped_state(tile, maps[v]));
+            const uint bit = OFF0 + (8 * (v / 4) + (v % 4)) * BITS, wi = bit / 32, off = bit % 32;
+            const uint st = off ? ((w[wi] << off) | (w[wi + 1] >> (32 - off))) >> 16 : w[wi] >> 16;
+            const float wv = mul1_value(st);
             const uint kr = lane_row(v);
-            for (uint r = 0; r < ROWS; r++) acc[r] = fma(sub_group_broadcast(xr[r], kr), w, acc[r]);
+            for (uint r = 0; r < ROWS; r++) acc[r] = fma(sub_group_broadcast(xr[r], kr), wv, acc[r]);
         }
     }
     __global float *sums = AT(float, d.sums);
     for (uint r = 0; r < ROWS; r++)
         if (r < d.rows) sums[(ulong)r * d.n + tn * 16 + c] = acc[r];
 }
+#endif
 
 // out[row][n] = (H_N sums) * svh, fp32 or bf16, for one 128 block. Grid (N_max / 128, ROWS_max, groups).
 __attribute__((intel_reqd_sub_group_size(SG)))
