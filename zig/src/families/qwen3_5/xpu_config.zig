@@ -87,6 +87,35 @@ pub const Shape = struct {
     }
 };
 
+/// The -D values zig/kernels/xpu/qwen27/shape.h takes, for a qwen27 kernel image built at shape `s`.
+/// `qpg`: query heads one attn_decode subgroup holds (4 keeps a lane's q and o at 128 floats).
+pub fn kernelDefines(buf: []u8, s: Shape, qpg: u32) ![]const u8 {
+    const nqk = s.gdn_k_heads * 128;
+    const vd = s.gdn_v_heads * 128;
+    const nconv = 2 * nqk + vd;
+    const gqa = s.q_heads / s.kv_heads;
+    const att_k = s.q_heads * 512;
+    if (s.hidden % 512 != 0 or s.gdn_v_heads % s.gdn_k_heads != 0 or gqa % qpg != 0) return error.UnsupportedConfig;
+    return std.fmt.bufPrint(buf, "-DQ27_D={d} -DQ27_D512={d} -DQ27_GK={d} -DQ27_GV={d} -DQ27_GVK={d} -DQ27_NQK={d} " ++
+        "-DQ27_NCONV={d} -DQ27_VD={d} -DQ27_GDN_IN={d} -DQ27_GA={d} -DQ27_GB={d} -DQ27_AQ={d} -DQ27_AKV={d} -DQ27_AH={d} " ++
+        "-DQ27_AV0={d} -DQ27_GQA={d} -DQ27_QPG={d} -DQ27_QPARTS={d} -DQ27_ATT_IN={d} -DQ27_AK0={d} -DQ27_AV0C={d} " ++
+        "-DQ27_OD={d} -DQ27_OB={d} -DQ27_KVROW={d}", .{
+        s.hidden,                          s.hidden / 512,      s.gdn_k_heads,              s.gdn_v_heads,
+        s.gdn_v_heads / s.gdn_k_heads,     nqk,                 nconv,                      vd,
+        (nconv + vd + 2 * s.gdn_v_heads + 255) / 256 * 256,     nconv + vd,                 nconv + vd + s.gdn_v_heads,
+        s.q_heads,                         s.kv_heads,          s.q_heads + 2 * s.kv_heads, s.q_heads + s.kv_heads,
+        gqa,                               qpg,                 gqa / qpg,                  s.attIn(),
+        att_k,                             att_k + s.kv_heads * 256,                        s.q_heads * 256,
+        s.q_heads * 2,                     s.kv_heads * 256,
+    });
+}
+
+/// What zig/build/xpu.zig compiles the Sage images with: kernelDefines of Sage-A1.5's config, qpg 4 (tested below).
+pub const sage_defines = "-DQ27_D=2048 -DQ27_D512=4 -DQ27_GK=16 -DQ27_GV=32 -DQ27_GVK=2 -DQ27_NQK=2048 -DQ27_NCONV=8192 " ++
+    "-DQ27_VD=4096 -DQ27_GDN_IN=12544 -DQ27_GA=12288 -DQ27_GB=12320 -DQ27_AQ=16 -DQ27_AKV=2 -DQ27_AH=20 -DQ27_AV0=18 " ++
+    "-DQ27_GQA=8 -DQ27_QPG=4 -DQ27_QPARTS=2 -DQ27_ATT_IN=9216 -DQ27_AK0=8192 -DQ27_AV0C=8704 -DQ27_OD=4096 -DQ27_OB=32 " ++
+    "-DQ27_KVROW=512";
+
 pub fn kind(c: Text, layer: usize) Kind {
     return if (std.mem.eql(u8, c.layer_types[layer], "full_attention")) .attention else .gdn;
 }
@@ -145,4 +174,15 @@ test "Sage-A1.5 EXL3 config gives the shape the XPU kernels take" {
     try std.testing.expectEqual(@as(u32, 4096 + 8192 + 64), s.gdnIn());
     try std.testing.expectEqual(Kind.attention, kind(p.value.text_config, 3));
     try std.testing.expectEqual(Kind.gdn, kind(p.value.text_config, 4));
+    var buf: [1024]u8 = undefined;
+    try std.testing.expectEqualStrings(sage_defines, try kernelDefines(&buf, s, 4));
+}
+
+test "the 27B's shape gives shape.h's defaults" {
+    const s: Shape = .{ .hidden = 5120, .layers = 64, .vocab = 248320, .q_heads = 24, .kv_heads = 4, .head_dim = 256, .rope_dims = 64, .gdn_k_heads = 16, .gdn_v_heads = 48, .gdn_head_dim = 128, .experts = 0, .top_k = 0, .expert_ff = 0, .shared_ff = 0, .mtp = false };
+    var buf: [1024]u8 = undefined;
+    try std.testing.expectEqualStrings("-DQ27_D=5120 -DQ27_D512=10 -DQ27_GK=16 -DQ27_GV=48 -DQ27_GVK=3 -DQ27_NQK=2048 " ++
+        "-DQ27_NCONV=10240 -DQ27_VD=6144 -DQ27_GDN_IN=16640 -DQ27_GA=16384 -DQ27_GB=16432 -DQ27_AQ=24 -DQ27_AKV=4 -DQ27_AH=32 " ++
+        "-DQ27_AV0=28 -DQ27_GQA=6 -DQ27_QPG=6 -DQ27_QPARTS=1 -DQ27_ATT_IN=14336 -DQ27_AK0=12288 -DQ27_AV0C=13312 " ++
+        "-DQ27_OD=6144 -DQ27_OB=48 -DQ27_KVROW=1024", try kernelDefines(&buf, s, 6));
 }
