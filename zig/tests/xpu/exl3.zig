@@ -1,6 +1,8 @@
 //! EXL3 through the Level Zero host (xpu/exl3.zig): runs one case file from tools/xpu/exl3_zig_check.py and
 //! writes the fp32 outputs. The Python side checks them against the numpy reference (gate 3, route check).
-//! Usage: tf-xpu-exl3-test <case.bin> <out.bin>
+//! Usage: tf-xpu-exl3-test <case.bin> <out.bin> [reps]
+//! With reps: the same call queued reps times back to back, then the wall time a call and the weight GB/s
+//! (launch gaps included). Routed: every slot counts its expert's weight once.
 //! Case: u32 magic "EXL3", mode (0 project, 1 routed), count (groups or experts), k, n, halves, rows (or tokens),
 //! topk, x_per_slot, out_f32; then per group or expert trellis, suh, svh; then u32 ids [tokens][topk] (routed);
 //! then bf16 x. Project groups each read their own x [rows][k].
@@ -85,10 +87,20 @@ pub fn main(init: std.process.Init) !u8 {
     defer gpa.free(ms);
     for (ms, weights) |*m, w| m.* = .{ .trellis = base + w[0], .suh = base + w[1], .svh = base + w[2], .k = h.k, .n = h.n, .halves = h.halves };
 
+    const reps: usize = if (args.len > 3) try std.fmt.parseInt(usize, args[3], 10) else 0;
+    const weight_bytes: f64 = @floatFromInt((tr_bytes + h.k * 2 + h.n * 2) * (if (routed) slots else h.count));
     if (routed) {
         var experts = try exl3.Plan.experts(&ctx, s, gpa, ms);
         defer experts.deinit();
-        try exl3.encodeRouted(&p, s, &experts, .{ .ids = base + ids_off, .tokens = h.rows, .topk = h.topk, .x = base + x_off, .x_stride = h.k, .x_per_slot = h.x_per_slot != 0, .y = base + y_off, .y_stride = h.n, .output = output, .scratch = base + scratch_off, .slots = base + slots_off });
+        const r: exl3.Route = .{ .ids = base + ids_off, .tokens = h.rows, .topk = h.topk, .x = base + x_off, .x_stride = h.k, .x_per_slot = h.x_per_slot != 0, .y = base + y_off, .y_stride = h.n, .output = output, .scratch = base + scratch_off, .slots = base + slots_off };
+        try exl3.encodeRouted(&p, s, &experts, r);
+        if (reps > 0) {
+            try s.synchronize();
+            const t0 = std.Io.Clock.awake.now(io);
+            for (0..reps) |_| try exl3.encodeRouted(&p, s, &experts, r);
+            try s.synchronize();
+            report(io, t0, reps, weight_bytes);
+        }
     } else {
         const groups = try gpa.alloc(exl3.Group, h.count);
         defer gpa.free(groups);
@@ -97,10 +109,22 @@ pub fn main(init: std.process.Init) !u8 {
         var plan = try exl3.Plan.init(&ctx, s, gpa, groups);
         defer plan.deinit();
         try exl3.encode(&p, s, &plan);
+        if (reps > 0) {
+            try s.synchronize();
+            const t0 = std.Io.Clock.awake.now(io);
+            for (0..reps) |_| try exl3.encode(&p, s, &plan);
+            try s.synchronize();
+            report(io, t0, reps, weight_bytes);
+        }
     }
     const y = try gpa.alloc(u8, y_rows * h.n * y_elem);
     defer gpa.free(y);
     try buf.download(s, y_off, y);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = args[2], .data = y });
     return 0;
+}
+
+fn report(io: std.Io, t0: std.Io.Timestamp, reps: usize, weight_bytes: f64) void {
+    const dt = @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0.toNanoseconds())) / 1e9 / @as(f64, @floatFromInt(reps));
+    std.debug.print("call {d:.1} us, weights {d:.2} MB, {d:.1} GB/s\n", .{ dt * 1e6, weight_bytes / 1e6, weight_bytes / dt / 1e9 });
 }
