@@ -22,10 +22,19 @@ extern "c" fn read(fd: c_int, buf: [*]u8, n: usize) isize;
 
 pub const EPS: f32 = 1e-6;
 pub const SPLIT = 32; // keys per attention split (decode.cl)
+/// Decode attention slices at most (attn_decode_span): a slice holds a multiple of SPLIT keys.
+const SLICES = 256;
+
+/// Keys a slice of attn_decode_span holds for `keys` keys.
+fn span(keys: u32) u32 {
+    return @max(1, (keys + SLICES * SPLIT - 1) / (SLICES * SPLIT)) * SPLIT;
+}
 /// Rows of one forward: the decode kernels' limit (the chain table and the serial GDN).
 pub const WINDOW = 16;
 /// Rows of one prompt chunk: norms, GEMMs and MoE take the whole chunk, the mixers WINDOW rows at a time.
 pub const CHUNK = 512;
+/// Streams one runner holds (a stepMulti row each): K/V caches, GDN and convolution states of their own.
+pub const MAX_SLOTS = 8;
 /// Query heads an attn_decode subgroup holds at Sage's shape (sage_config.sage_defines: Q27_QPG).
 const QPG = 4;
 
@@ -55,7 +64,12 @@ pub const Layer = struct {
     kn: ?*anyopaque = null,
     kc: ?*anyopaque = null, // bf16 [ctx, AKV, 256]
     vc: ?*anyopaque = null,
+    // every slot's: the fields above are the current slot's (Runner.use)
+    st: [MAX_SLOTS]SlotState = undefined,
 };
+
+/// One slot's state in one layer.
+pub const SlotState = struct { kc: ?*anyopaque = null, vc: ?*anyopaque = null, rec: ?*anyopaque = null, conv: [2]?*anyopaque = .{ null, null }, conv_cur: u1 = 0 };
 
 /// EXL3 checkpoints: embed_w is an fp16 table (embed_dense); the layers' mixer projections, experts and the head
 /// are in x3, and those fields of Layer and Model are not set.
@@ -110,6 +124,8 @@ pub const Acts = struct {
     ids: *anyopaque,
     chain: *anyopaque,
     // MoE
+    mt: *anyopaque, // u64 [layers, WINDOW, 8]: stepMulti's per-row state table (the 27B's acts.mt)
+    mpos: *anyopaque, // i32 [WINDOW]: stepMulti's row positions
     mlog: *anyopaque, // fp32 [CHUNK, experts + 1]
     mids: *anyopaque, // u32 [CHUNK, top_k]
     mwts: *anyopaque, // fp32 [CHUNK, top_k]
@@ -120,6 +136,7 @@ pub const Acts = struct {
     morder: *anyopaque, // u32 [CHUNK (top_k + 1)]: pair indices by expert
     mtiles: *anyopaque, // u32x4 [tileBound(CHUNK)]
     mnt: *anyopaque, // u32: the tile count
+    mplan: *anyopaque, // u32: sage_group_plan's groups of a decode step of up to WINDOW rows
     mxs: *anyopaque, // fp32 [CHUNK, D / 64]: group sums of h
     mas: *anyopaque, // fp32 [CHUNK (top_k + 1), ff / 64]: group sums of act
 
@@ -153,6 +170,8 @@ pub const Acts = struct {
             .pi = try d.alloc_(w * 1024),
             .ids = try d.alloc_(w * 4),
             .chain = try d.upload(std.mem.sliceAsBytes(&fwd.chainTable())),
+            .mt = try d.alloc_(@as(usize, s.layers) * w * 8 * 8),
+            .mpos = try d.alloc_(w * 4),
             .mlog = try d.alloc_(c * (s.experts + 1) * 4),
             .mids = try d.alloc_(c * s.top_k * 4),
             .mwts = try d.alloc_(c * s.top_k * 4),
@@ -162,14 +181,16 @@ pub const Acts = struct {
             .morder = try d.alloc_(pairs * 4),
             .mtiles = try d.alloc_(tileBound(s, CHUNK) * 16),
             .mnt = try d.alloc_(4),
+            .mplan = try d.alloc_((1 + (w * s.top_k + 1) * (2 + 16)) * 4),
             .mxs = try d.alloc_(c * (s.hidden / 64) * 4),
             .mas = try d.alloc_(pairs * (@max(s.expert_ff, s.shared_ff) / 64) * 4),
         };
     }
 };
 
-/// sage_moe.cl's kernels (the Dev's table is the 27B runner's, filled from the Sage images).
-pub const MoeKernels = struct { router: ze.H, route: ze.H, swiglu: ze.H, down: ze.H, combine: ze.H, router_tile: ze.H, sums: ze.H, sort: ze.H, tile_swiglu: ze.H, tile_down: ze.H };
+/// sage_moe.cl's kernels and the long-cache attention pair of decode.cl (the Dev's table is the 27B runner's, filled from
+/// the Sage images).
+pub const MoeKernels = struct { attn_span: ze.H, merge_span: ze.H, router: ze.H, route: ze.H, swiglu: ze.H, down: ze.H, combine: ze.H, group_plan: ze.H, group_swiglu: ze.H, group_down: ze.H, router_tile: ze.H, sums: ze.H, sort: ze.H, tile_swiglu: ze.H, tile_down: ze.H };
 
 /// Sub-groups a work-group of the decode expert kernels (one sub-group a row).
 const MOE_SG = 4;
@@ -245,7 +266,8 @@ fn experts(d: *Dev, c: *const Checkpoint, p: []const u8, count: u32, shared: boo
 
 /// MLX affine 4/64 only in this form; the scales of the experts must be BF16 (sage_moe.cl reads bf16). Checked on the
 /// Sage MLX-4bit checkpoint by tools/xpu/sage_mlx_check.py: stacked switch_mlp experts, 8 bit router, conv1d [NCONV, 4, 1].
-pub fn load(d: *Dev, c: *const Checkpoint, z: Sizes, ctx: u32) !Model {
+/// kv8: an int8 K/V cache (256 int8 a position and head, then the fp32 scales after `ctx` positions), else bf16.
+pub fn load(d: *Dev, c: *const Checkpoint, z: Sizes, ctx: u32, slots: u32, kv8: bool) !Model {
     const s = z.s;
     if (c.has("in_proj_qkv.qweight")) return error.OnlyMlxInThisForm;
     const x3 = c.has("in_proj_qkv.trellis");
@@ -270,7 +292,7 @@ pub fn load(d: *Dev, c: *const Checkpoint, z: Sizes, ctx: u32) !Model {
     for (&invf, 0..) |*f, i| f.* = @floatCast(std.math.pow(f64, 1e7, -@as(f64, @floatFromInt(i)) / half_dims));
     m.invf = try d.upload(std.mem.sliceAsBytes(invf[0 .. s.rope_dims / 2]));
     m.layers = try alloc.alloc(Layer, s.layers);
-    const kv_bytes = @as(usize, ctx) * s.kv_heads * 256 * 2;
+    const kv_bytes = @as(usize, ctx) * s.kv_heads * @as(usize, if (kv8) 256 + 4 else 256 * 2);
     for (m.layers, 0..) |*l, i| {
         const p = name("model.layers.{d}.", .{i});
         const attn = (i + 1) % 4 == 0;
@@ -293,8 +315,9 @@ pub fn load(d: *Dev, c: *const Checkpoint, z: Sizes, ctx: u32) !Model {
             }
             l.qn = try normTensor(d, c, name("{s}self_attn.q_norm.weight", .{p}), x3);
             l.kn = try normTensor(d, c, name("{s}self_attn.k_norm.weight", .{p}), x3);
-            l.kc = try d.alloc_(kv_bytes);
-            l.vc = try d.alloc_(kv_bytes);
+            for (l.st[0..slots]) |*st| st.* = .{ .kc = try d.alloc_(kv_bytes), .vc = try d.alloc_(kv_bytes) };
+            l.kc = l.st[0].kc;
+            l.vc = l.st[0].vc;
         } else {
             if (!x3) {
                 l.mixer_in = try loader.projection(d, c, name("{s}linear_attn.", .{p}), &.{ "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b" }, true, false, stage);
@@ -305,8 +328,12 @@ pub fn load(d: *Dev, c: *const Checkpoint, z: Sizes, ctx: u32) !Model {
             l.alog = try loader.bf16Tensor(d, c, name("{s}linear_attn.A_log", .{p}));
             l.dt = try loader.bf16Tensor(d, c, name("{s}linear_attn.dt_bias", .{p}));
             l.gnorm = try loader.bf16Tensor(d, c, name("{s}linear_attn.norm.weight", .{p}));
-            l.rec = try d.alloc_(@as(usize, s.gdn_v_heads) * 128 * 128 * 4);
-            for (&l.conv) |*cv| cv.* = try d.alloc_(3 * @as(usize, z.nconv) * 2);
+            for (l.st[0..slots]) |*st| {
+                st.* = .{ .rec = try d.alloc_(@as(usize, s.gdn_v_heads) * 128 * 128 * 4) };
+                for (&st.conv) |*cv| cv.* = try d.alloc_(3 * @as(usize, z.nconv) * 2);
+            }
+            l.rec = l.st[0].rec;
+            l.conv = l.st[0].conv;
         }
         if (i % 8 == 7) std.debug.print("  layers loaded: {d}/{d}\n", .{ i + 1, s.layers });
     }
@@ -326,17 +353,25 @@ pub const Runner = struct {
     acts: Acts,
     ckpt: Checkpoint,
     ctx: u32,
+    cap: i32 = 0, // > 0: the int8 K/V cache (XPU_KV_INT8), its positions
     pos: u32 = 0,
     last: i32 = -1, // the greedy token after the last fed row
+    slots: u32 = 1,
+    cur: u32 = 0, // the slot pos, last and the layers' current fields are
+    spos: [MAX_SLOTS]u32 = @splat(0),
+    slast: [MAX_SLOTS]i32 = @splat(-1),
+    mt_host: []u64 = &.{},
 
-    pub fn init(dir: []const u8, ctx: u32) !*Runner {
+    /// `slots` streams (1 to MAX_SLOTS) of `ctx` positions each.
+    pub fn init(dir: []const u8, ctx: u32, slots: u32) !*Runner {
+        if (slots == 0 or slots > MAX_SLOTS) return error.BadSlots;
         const z = Sizes.of(try readShape(dir));
         var ckpt: Checkpoint = .{};
         errdefer ckpt.deinit();
         try addShards(&ckpt, dir);
         const r = try alloc.create(Runner);
         errdefer alloc.destroy(r);
-        r.* = .{ .d = .{ .g = try ze.Gpu.open(0xe223), .list = undefined, .k = undefined }, .mk = undefined, .z = z, .model = undefined, .acts = undefined, .ckpt = ckpt, .ctx = ctx };
+        r.* = .{ .d = .{ .g = try ze.Gpu.open(0xe223), .list = undefined, .k = undefined }, .mk = undefined, .z = z, .model = undefined, .acts = undefined, .ckpt = ckpt, .ctx = ctx, .slots = slots };
         const d = &r.d;
         errdefer d.g.close();
         d.list = try d.g.immediate(0, 0);
@@ -347,11 +382,17 @@ pub const Runner = struct {
             const base = @typeInfo(@TypeOf(d.k)).@"struct".field_names.len;
             inline for (@typeInfo(MoeKernels).@"struct".field_names, 0..) |n, i| q.prof.names[base + i] = .{ .k = @field(r.mk, n), .name = "moe_" ++ n };
         }
-        r.model = try load(d, &r.ckpt, z, ctx);
+        if (std.c.getenv("XPU_KV_INT8") != null) r.cap = @intCast(ctx);
+        r.model = try load(d, &r.ckpt, z, ctx, slots, r.cap > 0);
+        r.mt_host = try alloc.alloc(u64, z.s.layers * WINDOW * 8);
         q.prof.on = std.c.getenv("XPU_PROFILE") != null; // not during the load
         r.acts = try Acts.init(d, z, ctx);
         if (r.model.x3) |w| try w.bind(d, .{ .h = r.acts.h, .p = r.acts.p, .r = r.acts.r, .logits = r.acts.logits, .mids = r.acts.mids, .my = r.acts.my, .morder = r.acts.morder, .mtiles = r.acts.mtiles, .mnt = r.acts.mnt, .hidden = z.s.hidden, .vocab = z.s.vocab, .gdn_in = z.gdn_in, .att_in = z.att_in, .top_k = z.s.top_k, .experts = z.s.experts, .ab_col = z.nconv + z.vd, .ab_rows = 2 * z.s.gdn_v_heads });
-        try r.reset();
+        for (0..slots) |i| {
+            try r.use(@intCast(i));
+            try r.reset();
+        }
+        try r.use(0);
         return r;
     }
 
@@ -359,7 +400,125 @@ pub const Runner = struct {
         r.d.deinit();
         r.ckpt.deinit();
         alloc.free(r.model.layers);
+        alloc.free(r.mt_host);
         alloc.destroy(r);
+    }
+
+    /// Makes `slot` current: prompt, step, reset and logits act on it.
+    pub fn use(r: *Runner, slot: u32) !void {
+        if (slot >= r.slots) return error.BadSlot;
+        r.spos[r.cur] = r.pos;
+        r.slast[r.cur] = r.last;
+        for (r.model.layers) |*l| {
+            l.st[r.cur].conv_cur = l.conv_cur;
+            const st = l.st[slot];
+            if (l.attn) {
+                l.kc = st.kc;
+                l.vc = st.vc;
+            } else {
+                l.rec = st.rec;
+                l.conv = st.conv;
+                l.conv_cur = st.conv_cur;
+            }
+        }
+        r.cur = slot;
+        r.pos = r.spos[slot];
+        r.last = r.slast[slot];
+    }
+
+    /// One decode token for each slot in `slots` (distinct, at most WINDOW), fed `toks`: one forward of a row a slot.
+    /// Each slot's greedy next token goes to `out`; logits row i (rowLogits) is slot i's.
+    pub fn stepMulti(r: *Runner, slots: []const u32, toks: []const i32, out: []i32) !void {
+        const T: u32 = @intCast(slots.len);
+        if (T == 0 or T > WINDOW or toks.len != T or out.len != T) return error.BadWindow;
+        try r.use(r.cur); // store the current slot's fields
+        const d = &r.d;
+        const a = &r.acts;
+        const m = &r.model;
+        const z = r.z;
+        const s = z.s;
+        var pos: [WINDOW]i32 = undefined;
+        var max_pos: u32 = 0;
+        for (slots, 0..) |slot, t| {
+            if (slot >= r.slots) return error.BadSlot;
+            for (slots[0..t]) |o| if (o == slot) return error.SlotTwice;
+            if (r.spos[slot] + 1 > r.ctx) return error.ContextFull;
+            pos[t] = @intCast(r.spos[slot]);
+            max_pos = @max(max_pos, r.spos[slot]);
+        }
+        for (m.layers, 0..) |*l, i| for (slots, 0..) |slot, t| {
+            const e = r.mt_host[(i * WINDOW + t) * 8 ..][0..8];
+            e.* = @splat(0);
+            e[6] = t;
+            e[7] = 1;
+            const st = l.st[slot];
+            if (l.attn) {
+                e[0] = @intFromPtr(st.kc.?);
+                e[1] = @intFromPtr(st.vc.?);
+            } else {
+                e[2] = @intFromPtr(st.conv[st.conv_cur].?);
+                e[3] = @intFromPtr(st.conv[1 - st.conv_cur].?);
+                e[4] = @intFromPtr(st.rec.?);
+                e[5] = @intFromPtr(st.rec.?);
+            }
+        };
+        const D: i32 = @intCast(s.hidden);
+        const gs: i32 = 64;
+        const t32: i32 = @intCast(T);
+        const nul: ?*anyopaque = null;
+        const zero: i32 = 0;
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.mt, r.mt_host.ptr, r.mt_host.len * 8, null, 0, null));
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.mpos, &pos, T * 4, null, 0, null));
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.ids, toks.ptr, T * 4, null, 0, null));
+        errdefer d.settle();
+        try d.launch(d.k.embed, .{ .x = T }, .{ a.ids, m.embed_w, m.embed_s, m.embed_b, a.x, D });
+        const sp: i32 = @intCast(span(max_pos + 1));
+        const ns: u32 = (max_pos + 1 + @as(u32, @intCast(sp)) - 1) / @as(u32, @intCast(sp));
+        for (m.layers, 0..) |*l, i| {
+            const mt = off(a.mt, i * WINDOW * 8 * 8);
+            try d.launch(d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.in_norm, a.h, a.ahi, a.alo, D, EPS, @as(i32, if (i == 0) 0 else 1), gs, nul, nul, zero, zero });
+            try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_in, a.p, T);
+            if (l.attn) {
+                try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, zero, EPS, nul, mt, a.mpos, zero, r.cap });
+                try d.launch(r.mk.attn_span, .{ .x = ns, .y = s.kv_heads * (s.q_heads / s.kv_heads / QPG), .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, zero, @as(i32, @intCast(ns)), sp, @as(f32, 1.0 / 16.0), mt, a.mpos, r.cap });
+                try d.launch(r.mk.merge_span, .{ .x = s.q_heads, .y = T }, .{ a.pm, a.pl, a.po, a.y, zero, @as(i32, @intCast(ns)), sp, a.mpos });
+                try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo, gs, zero, nul, nul, zero });
+            } else {
+                try d.launch(d.k.gdn_pre, .{ .x = T, .y = z.nconv / 256 }, .{ a.p, l.conv[0].?, l.conv[1].?, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32, nul, mt });
+                try d.launch(d.k.gdn_step, .{ .x = 16, .y = s.gdn_v_heads, .z = T }, .{ a.q, a.k, a.v, a.g, a.beta, l.rec.?, l.rec.?, a.y, t32, nul, nul, nul, mt });
+                try d.launch(d.k.gated_norm, .{ .x = T }, .{ a.y, a.p, l.gnorm.?, a.h, a.ahi, a.alo, EPS, gs, zero, nul, nul, zero });
+            }
+            try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_out, a.r, T);
+            try d.launch(d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, D, EPS, @as(i32, 1), gs, nul, nul, zero, zero });
+            try r.moe(l, T);
+        }
+        const hgs: i32 = @intCast(m.head.gs);
+        try d.launch(d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, m.norm, a.h, a.ahi, a.alo, D, EPS, @as(i32, 1), hgs, nul, nul, zero, zero });
+        try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, m.head, a.logits, T);
+        try d.launch(d.k.argmax_part, .{ .x = 256, .y = T }, .{ a.logits, @as(i32, @intCast(s.vocab)), a.pv, a.pi });
+        try d.launch(d.k.argmax, .{ .x = T }, .{ a.pv, a.pi, a.tok });
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, out.ptr, a.tok, T * 4, null, 0, null));
+        try d.sync();
+        for (m.layers) |*l| if (!l.attn) for (slots) |slot| {
+            l.st[slot].conv_cur = 1 - l.st[slot].conv_cur;
+        };
+        for (slots, out) |slot, o| {
+            r.spos[slot] += 1;
+            r.slast[slot] = o;
+        }
+        // the current slot's fields again (its conv_cur and position may have moved)
+        for (m.layers) |*l| if (!l.attn) {
+            l.conv_cur = l.st[r.cur].conv_cur;
+        };
+        r.pos = r.spos[r.cur];
+        r.last = r.slast[r.cur];
+    }
+
+    /// The fp16 logits of row `row` of the last stepMulti.
+    pub fn rowLogits(r: *Runner, row: u32, out: []f16) !void {
+        if (out.len != r.z.s.vocab) return error.BadLength;
+        try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, out.ptr, off(r.acts.logits, @as(usize, row) * out.len * 2), out.len * 2, null, 0, null));
+        try r.d.sync();
     }
 
     /// A fresh sequence: zero GDN and convolution states, position 0 (the K/V rows are overwritten as they are fed).
@@ -424,10 +583,11 @@ pub const Runner = struct {
             try d.launch(d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.in_norm, a.h, a.ahi, a.alo, D, EPS, @as(i32, if (i == 0) 0 else 1), gs, nul, nul, zero, zero });
             if (m.x3) |w| try w.mixerIn(d, i, T) else try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_in, a.p, T);
             if (l.attn) {
-                const ns: u32 = (r.pos + T + SPLIT - 1) / SPLIT;
-                try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, p0, EPS, nul, nul, nul, zero, zero });
-                try d.launch(d.k.attn_decode, .{ .x = ns, .y = s.kv_heads * (s.q_heads / s.kv_heads / QPG), .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, p0, @as(i32, @intCast(ns)), @as(f32, 1.0 / 16.0), a.chain, nul, nul, zero });
-                try d.launch(d.k.attn_merge, .{ .x = s.q_heads, .y = T }, .{ a.pm, a.pl, a.po, a.y, p0, @as(i32, @intCast(ns)), a.chain, nul });
+                const sp = span(r.pos + T);
+                const ns: u32 = (r.pos + T + sp - 1) / sp;
+                try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, p0, EPS, nul, nul, nul, zero, r.cap });
+                try d.launch(r.mk.attn_span, .{ .x = ns, .y = s.kv_heads * (s.q_heads / s.kv_heads / QPG), .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, p0, @as(i32, @intCast(ns)), @as(i32, @intCast(sp)), @as(f32, 1.0 / 16.0), nul, nul, r.cap });
+                try d.launch(r.mk.merge_span, .{ .x = s.q_heads, .y = T }, .{ a.pm, a.pl, a.po, a.y, p0, @as(i32, @intCast(ns)), @as(i32, @intCast(sp)), nul });
                 try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo, gs, zero, nul, nul, zero });
             } else {
                 const cin = l.conv[l.conv_cur].?;
@@ -471,8 +631,11 @@ pub const Runner = struct {
             if (m.x3) |w| try w.mixerIn(d, i, T) else try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_in, a.p, T);
             if (l.attn) {
                 const p0: i32 = @intCast(r.pos);
-                try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, p0, EPS, nul, nul, nul, zero, zero });
-                try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p0, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0) });
+                try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, p0, EPS, nul, nul, nul, zero, r.cap });
+                if (r.cap > 0)
+                    try d.launch(d.k.attn_prompt8, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p0, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0), r.cap })
+                else
+                    try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p0, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0) });
                 try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo, gs, zero, nul, nul, zero });
             }
             const pin = if (m.x3 != null) z.gdn_in else l.mixer_in.n;
@@ -560,14 +723,19 @@ pub const Runner = struct {
         }
         if (s.expert_ff != s.shared_ff) return error.SharedWidthNotWired; // one act stride for both (Sage: 512, 512)
         if (T > WINDOW) return r.moeTiles(l, T);
+        if (T > 1) { // several rows: each expert's weights once for all its pairs
+            try d.launch(r.mk.group_plan, .{ .x = 1 }, .{ a.mids, a.mplan, s.experts, pairs, T });
+            try d.launch(r.mk.group_swiglu, .{ .x = s.expert_ff, .y = pairs + 1 }, .{ l.experts.gu_w, l.experts.gu_s, l.experts.gu_b, l.shared.gu_w, l.shared.gu_s, l.shared.gu_b, a.h, a.mplan, a.mact, s.hidden, s.expert_ff, s.top_k, pairs, s.experts });
+            try d.launch(r.mk.group_down, .{ .x = s.hidden / 16, .y = pairs + 1 }, .{ l.experts.dn_w, l.experts.dn_s, l.experts.dn_b, l.shared.dn_w, l.shared.dn_s, l.shared.dn_b, a.mact, a.mplan, a.my, s.hidden, s.expert_ff, s.experts });
+            return d.launch(r.mk.combine, .{ .x = s.hidden / 64, .y = T }, .{ a.my, a.mwts, a.msw, a.r, s.hidden, s.top_k, pairs });
+        }
         try d.launch(r.mk.swiglu, .{ .x = s.expert_ff, .y = pairs + T }, .{ l.experts.gu_w, l.experts.gu_s, l.experts.gu_b, l.shared.gu_w, l.shared.gu_s, l.shared.gu_b, a.h, a.mids, a.mact, s.hidden, s.expert_ff, s.top_k, pairs });
         try d.launch(r.mk.down, .{ .x = s.hidden / MOE_SG, .y = pairs + T }, .{ l.experts.dn_w, l.experts.dn_s, l.experts.dn_b, l.shared.dn_w, l.shared.dn_s, l.shared.dn_b, a.mact, a.mids, a.my, s.hidden, s.expert_ff, pairs });
         try d.launch(r.mk.combine, .{ .x = s.hidden / 64, .y = T }, .{ a.my, a.mwts, a.msw, a.r, s.hidden, s.top_k, pairs });
     }
 };
 
-/// The Dev's kernel table from the Sage images; attn_prompt8 (int8 cache, 6 query heads a K/V head) has no Sage build,
-/// so its slot holds attn_decode and this runner never launches it.
+/// The Dev's kernel table from the Sage images.
 fn kernels(d: *Dev, mk: *MoeKernels) !void {
     const mg = try d.g.module(&kb.sage_glue);
     const md = try d.g.module(&kb.sage_decode);
@@ -603,7 +771,7 @@ fn kernels(d: *Dev, mk: *MoeKernels) !void {
         .exl3_gemv = try d.kernel(md, "exl3_gemv", 16),
         .rot_heads = try d.kernel(mg, "rot_heads", 16),
         .attn_prompt = try d.kernel(md, "attn_prompt", 128),
-        .attn_prompt8 = attn_decode, // the int8 cache: not built at Sage's shape, never launched here
+        .attn_prompt8 = try d.kernel(md, "attn_prompt8", 128),
         .embed_dense = try d.kernel(mg, "embed_dense", 256),
         .dense_rows = try d.kernel(mg, "dense_rows", 256),
         .repack_gptq = try d.kernel(mg, "repack_gptq", 16),
@@ -637,6 +805,11 @@ fn kernels(d: *Dev, mk: *MoeKernels) !void {
         .swiglu = try d.kernel(mo, "sage_expert_swiglu", SWIGLU_WG),
         .down = try d.kernel(mo, "sage_expert_down", 16 * MOE_SG),
         .combine = try d.kernel(mo, "sage_moe_combine", 64),
+        .attn_span = try d.kernel(md, "attn_decode_span", 16),
+        .merge_span = try d.kernel(md, "attn_merge_span", 256),
+        .group_plan = try d.kernel(mo, "sage_group_plan", 256),
+        .group_swiglu = try d.kernel(mo, "sage_group_swiglu", 16),
+        .group_down = try d.kernel(mo, "sage_group_down", 16),
         .router_tile = try d.kernel(mo, "sage_router_tile", 16),
         .sums = try d.kernel(mo, "sage_group_sums", 16),
         .sort = try d.kernel(mo, "sage_moe_sort", 256),
