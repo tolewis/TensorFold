@@ -54,6 +54,16 @@ pub const moe = struct {
     /// Largest K of gate|up (hidden) and of down (intermediate): local memory a work-group.
     pub const k_max = 4096;
 
+    /// Prompt rows (P3.4, the same image): exl3.cl GEMM_M rows a sub-group and GEMM_S strips a work-group of
+    /// exl3_gemm, GEMM_KC k tiles a local-memory step, TILE_NS strips a sub-group of exl3_moe_tile, and the most rows
+    /// of a prompt launch. The kernel defaults are these values.
+    pub const gemm_m = 16;
+    pub const gemm_s = 4;
+    pub const gemm_kc = 8;
+    pub const tile_ns = 2;
+    pub const tile_rows = 16;
+    pub const prompt_rows_max = 1024;
+
     pub fn name(comptime b: u32) []const u8 {
         return std.fmt.comptimePrint("exl3_moe_b{d}", .{b});
     }
