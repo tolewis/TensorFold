@@ -92,8 +92,9 @@ inline uint mapped_state(__global const ushort *tile, uint map) {
 // (float)convert_half_rte(f) to f, so an FP32 fma followed by a conversion loses the rounding.
 // exl3_mul1_check proves all 65536 states.
 inline half mul1_half(uint s) {
-    const uint h = dot_acc_sat_4x8packed_uu_uint(s * 0x83DCD12Du, 0x01010101u, 1024u);
-    return fma((half)h, as_half((ushort)0x1EEE), as_half((ushort)0xC931));
+    // 0x6400 is fp16 1024 and the sum is below 1024, so the dp4a result is already the fp16 bits of 1024 + sum.
+    const uint h = dot_acc_sat_4x8packed_uu_uint(s * 0x83DCD12Du, 0x01010101u, 0x6400u);
+    return fma(as_half((ushort)h), as_half((ushort)0x1EEE), as_half((ushort)0xC931));
 }
 inline float mul1_value(uint s) { return (float)mul1_half(s); }
 
@@ -166,6 +167,45 @@ __kernel void exl3_rotate_in(__global const uchar *base, __global const exl3_des
 #endif
 // Fused rotate_in (ROWS <= 4): the sub-group rotates the 128 block of x that holds kb in registers, as
 // exl3_rotate_in does. After hadamard128 lane c holds k = blk + c + 16 j in v[j]: the xr of k tile j.
+#define DPH(a, b, c) intel_sub_group_f16_f16_matrix_mad_k16(as_short8(a), as_int8(b), c)
+
+inline int8 tile_b(__global const uint *t, uint c) {
+    const uint g = c % 8, h = c / 8;
+    const uint wbase = ((32 * g * BITS + BITS + 32 * RINGW - 16) / 32) % RINGW;
+    uint raw[LOADW], w[USEW];
+#if TB_BLK && (RINGW % 16 == 0)
+    // one block read of the tile (lane l: words l + 16 i), then each lane gathers its words by shuffles
+    uint ch[RINGW / 16];
+    for (uint i = 0; i < RINGW / 16; i++) ch[i] = intel_sub_group_block_read(t + 16 * i);
+    for (uint j = 0; j < LOADW; j++) {
+        const uint idx = (wbase + j) % RINGW;
+        uint v = 0;
+        for (uint i = 0; i < RINGW / 16; i++) {
+            const uint sv = sub_group_shuffle(ch[i], idx % 16);
+            v = idx / 16 == i ? sv : v;
+        }
+        raw[j] = v;
+    }
+#else
+    for (uint j = 0; j < LOADW; j++) raw[j] = t[(wbase + j) % RINGW];
+#endif
+    for (uint j = 0; j < USEW; j++) w[j] = h ? (SHB ? (raw[j + SHW] << SHB) | (raw[j + SHW + 1] >> (32 - SHB)) : raw[j + SHW]) : raw[j];
+    half kv[16];
+    for (uint v = 0; v < 16; v++) {
+        const uint bit = OFF0 + (8 * (v / 4) + (v % 4)) * BITS, wi = bit / 32, off = bit % 32;
+        kv[lane_row(v)] = mul1_half(off ? ((w[wi] << off) | (w[wi + 1] >> (32 - off))) >> 16 : w[wi] >> 16);
+    }
+    int8 b;
+    for (uint j = 0; j < 8; j++) ((int *)&b)[j] = as_int((half2)(kv[2 * j], kv[2 * j + 1]));
+    return b;
+}
+
+#ifndef TB_BLK
+#define TB_BLK 1
+#endif
+#ifndef DP
+#define DP (ROWS <= 8)                                // decode on XMX: tiles decoded in registers as DPAS B operands, rows padded to 8
+#endif
 #define RI (ROWS <= 4)
 #if RI
 inline void rotate_block(float vr[ROWS][8], __global const uchar *base, exl3_desc d, uint blk, uint lane) {
@@ -203,7 +243,30 @@ __kernel void exl3_matvec(__global const uchar *base, __global const exl3_desc *
 #if RI
     float vr[ROWS][8];  // fuse: the rotated block, K span a multiple of 128 (the host checks)
 #endif
-#if HS && NS >= 2
+#if DP
+    float8 acc[NS];
+    for (uint s = 0; s < NS; s++) acc[s] = 0.0f;
+    for (uint kb = k0; kb < k0 + kspan; kb += 16, tile += tile_k) {
+        float xr[ROWS];
+        LOAD_XR(xr, kb, c)
+        short8 ah, al;
+        for (uint r = 0; r < 8; r++) {
+            const float f = r < ROWS ? xr[r] : 0.0f;
+            const half hv = convert_half_rte(f);
+            ah[r] = as_short(hv);
+            al[r] = as_short(convert_half_rte(f - (float)hv));
+        }
+        for (uint s = 0; s < NS; s++) {
+            const int8 b = tile_b(tile + s * RINGW, c);
+            acc[s] = DPH(ah, b, acc[s]);
+            acc[s] = DPH(al, b, acc[s]);
+        }
+    }
+    __global float *sums = AT(float, d.sums) + (ulong)split * d.rows * d.n;
+    for (uint s = 0; s < NS; s++)
+        for (uint r = 0; r < ROWS; r++)
+            if (r < d.rows) sums[(ulong)r * d.n + (tn0 + s) * 16 + c] = acc[s][r];
+#elif HS && NS >= 2
     // HS: the half h = c / 8 takes strips h * NS / 2 and up, and each lane decodes both column halves of its
     // strips from the same words (g + 0 and g + 8). The h offset is then a compile-time constant: no shift.
     const uint sl = h * (NS / 2);
@@ -496,7 +559,6 @@ __kernel void exl3_moe_down(__global const uchar *base, __global const exl3_desc
 // its 16 weights in k order, k pairs 2j and 2j + 1 a dword. A is 8 rows of the rotated input, k = lane, in fp16 (the
 // mul1 weights are fp16 values, so only the input rounds). The tiling is that of the W4A16 grouped GEMM for Xe2 in
 // vllm-xpu-kernels: weights decoded in registers straight into the B operand, fp32 accumulators.
-#define DPH(a, b, c) intel_sub_group_f16_f16_matrix_mad_k16(as_short8(a), as_int8(b), c)
 #ifndef GEMM_M
 #define GEMM_M 16                         // rows a sub-group: GEMM_M / 8 DPAS a k tile
 #endif
@@ -504,21 +566,6 @@ __kernel void exl3_moe_down(__global const uchar *base, __global const exl3_desc
 #define GEMM_LO 1                         // 1: x = hi + lo in two fp16 DPAS (fp16 x alone gave 1.35e-3 on down_proj)
 #endif
 
-inline int8 tile_b(__global const uint *t, uint c) {
-    const uint g = c % 8, h = c / 8;
-    const uint wbase = ((32 * g * BITS + BITS + 32 * RINGW - 16) / 32) % RINGW;
-    uint raw[LOADW], w[USEW];
-    for (uint j = 0; j < LOADW; j++) raw[j] = t[(wbase + j) % RINGW];
-    for (uint j = 0; j < USEW; j++) w[j] = h ? (SHB ? (raw[j + SHW] << SHB) | (raw[j + SHW + 1] >> (32 - SHB)) : raw[j + SHW]) : raw[j];
-    half kv[16];
-    for (uint v = 0; v < 16; v++) {
-        const uint bit = OFF0 + (8 * (v / 4) + (v % 4)) * BITS, wi = bit / 32, off = bit % 32;
-        kv[lane_row(v)] = mul1_half(off ? ((w[wi] << off) | (w[wi + 1] >> (32 - off))) >> 16 : w[wi] >> 16);
-    }
-    int8 b;
-    for (uint j = 0; j < 8; j++) ((int *)&b)[j] = as_int((half2)(kv[2 * j], kv[2 * j + 1]));
-    return b;
-}
 
 // The rotated input of prompt rows as two fp16 planes, x = hi + lo: rot holds hi [rows][k], then lo. Grid (K_max / 128,
 // rows_max, groups) of one sub-group, as exl3_rotate_in.

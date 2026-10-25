@@ -74,7 +74,7 @@ pub const moe = struct {
 };
 
 /// Sub-groups a launch needs to fill the GPU; fewer strips a sub-group and K splits get it there.
-pub const sub_group_target = 2048;
+pub const sub_group_target = 4096;
 /// Most K splits (the sums scratch holds this many) and fewest 16-row K tiles a split.
 pub const ks_max = 16;
 const ks_min_tiles = 8;
@@ -114,8 +114,8 @@ test "picks follow the measured rule" {
     try std.testing.expectEqual(@as(?usize, null), pick(4, 17, .{ .min = 128, .gcd = 128, .total = 1024 }));
     // one layer's top-8: NS 1, then K splits up to the target
     try std.testing.expectEqual(@as(u32, 1), all[pick(4, 1, .{ .min = 32, .gcd = 32, .total = 256 }).?].ns);
-    try std.testing.expectEqual(@as(u32, 8), split(256, 128));
-    try std.testing.expectEqual(@as(u32, 2), split(1024, 32));
-    try std.testing.expectEqual(@as(u32, 1), split(3880, 128));
+    try std.testing.expectEqual(@as(u32, 16), split(256, 128));
+    try std.testing.expectEqual(@as(u32, 4), split(1024, 32));
+    try std.testing.expectEqual(@as(u32, 2), split(3880, 128));
     try std.testing.expectEqualStrings("exl3_b6_r4_n4_hs", name(all[all.len - 7]));
 }

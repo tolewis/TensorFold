@@ -42,7 +42,7 @@ class Exl3:
         """(NS, KS) for a launch: strips are the groups' N / 16, ks_ their K / 16. The per-group rule above, then
         fewer strips a sub-group and K splits until the launch has SG_TARGET sub-groups (one layer's experts
         is far below it; measured by exl3_ab.py with AB_LAYERS=1, 2026-10-25)."""
-        target = int(os.environ.get("EXL3_SG", "2048"))
+        target = int(os.environ.get("EXL3_SG", "4096"))
         ns = self.ns(bits, rows, min(strips))
         fixed_ns = getattr(self, "ns_fixed", None) or int(os.environ.get("EXL3_NS", "0"))
         if not fixed_ns:
