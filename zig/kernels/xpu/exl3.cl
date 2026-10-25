@@ -91,10 +91,11 @@ inline uint mapped_state(__global const ushort *tile, uint map) {
 // (method from exl3xpu, MIT, 0xSero). The fp16 type matters: IGC on driver 26.05 folds
 // (float)convert_half_rte(f) to f, so an FP32 fma followed by a conversion loses the rounding.
 // exl3_mul1_check proves all 65536 states.
-inline float mul1_value(uint s) {
+inline half mul1_half(uint s) {
     const uint h = dot_acc_sat_4x8packed_uu_uint(s * 0x83DCD12Du, 0x01010101u, 1024u);
-    return (float)fma((half)h, as_half((ushort)0x1EEE), as_half((ushort)0xC931));
+    return fma((half)h, as_half((ushort)0x1EEE), as_half((ushort)0xC931));
 }
+inline float mul1_value(uint s) { return (float)mul1_half(s); }
 
 // Lane c owns tile column c. Its 16 stream values are p = 32 (c % 8) + 8 m + 4 (c / 8) + i (m, i < 4),
 // at tile row 2 m + (i & 1) + 8 (i >> 1). This is the inverse of exl3_format.tilePlacement.
@@ -512,7 +513,7 @@ inline int8 tile_b(__global const uint *t, uint c) {
     half kv[16];
     for (uint v = 0; v < 16; v++) {
         const uint bit = OFF0 + (8 * (v / 4) + (v % 4)) * BITS, wi = bit / 32, off = bit % 32;
-        kv[lane_row(v)] = (half)mul1_value(off ? ((w[wi] << off) | (w[wi + 1] >> (32 - off))) >> 16 : w[wi] >> 16);
+        kv[lane_row(v)] = mul1_half(off ? ((w[wi] << off) | (w[wi + 1] >> (32 - off))) >> 16 : w[wi] >> 16);
     }
     int8 b;
     for (uint j = 0; j < 8; j++) ((int *)&b)[j] = as_int((half2)(kv[2 * j], kv[2 * j + 1]));
