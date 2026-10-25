@@ -140,7 +140,7 @@ __kernel void exl3_rotate_in(__global const uchar *base, __global const exl3_des
     for (uint j = 0; j < 8; j++) rot[blk * 128 + lane + SG * j] = v[j] * INV_SQRT128;
 }
 
-// sums[row][n] = rot[row] @ W_q[:, n] for one 16-column strip and up to ROWS rows. Built per (BITS, ROWS);
+// sums[row][n] = rot[row] @ W_q[:, n] for one 16-column strip and up to ROWS rows (fuse: rot from x, see RI). Built per (BITS, ROWS);
 // a launch holds groups of one width only (the host sorts them). Grid (strips_max * SG / NS rounded to the
 // work-group, groups, ks), work-group 8 sub-groups, one sub-group NS strips.
 // K split: split z of ks (K / 16 divides by ks) sums its K / ks rows of W into sums + z * rows * n. A small
@@ -163,8 +163,32 @@ __kernel void exl3_rotate_in(__global const uchar *base, __global const exl3_des
 #ifndef NS
 #define NS 1                                  // column strips a sub-group (N / 16 must divide by NS)
 #endif
+// Fused rotate_in (ROWS <= 4): the sub-group rotates the 128 block of x that holds kb in registers, as
+// exl3_rotate_in does. After hadamard128 lane c holds k = blk + c + 16 j in v[j]: the xr of k tile j.
+#define RI (ROWS <= 4)
+#if RI
+inline void rotate_block(float vr[ROWS][8], __global const uchar *base, exl3_desc d, uint blk, uint lane) {
+    __global const half *suh = AT(const half, d.suh);
+    for (uint r = 0; r < ROWS; r++) {
+        __global const ushort *x = AT(const ushort, d.x) + (ulong)r * d.x_stride;
+        for (uint j = 0; j < 8; j++) {
+            const uint i = blk + lane + SG * j;
+            vr[r][j] = r < d.rows ? load_x(x, i, d.x_f16) * vload_half(i, suh) : 0.0f;
+        }
+        hadamard128(vr[r], lane);
+        for (uint j = 0; j < 8; j++) vr[r][j] *= INV_SQRT128;
+    }
+}
+#define LOAD_XR(xr, kb, c)                                                                    \
+    if (RI && fuse && ((kb) & 127) == 0) rotate_block(vr, base, d, (kb), (c));                   \
+    for (uint r = 0; r < ROWS; r++)                                                           \
+        xr[r] = r < d.rows ? (RI && fuse ? vr[r][((kb) / 16) & 7] : rot[(ulong)r * d.k + (kb) + (c)]) : 0.0f;
+#else
+#define LOAD_XR(xr, kb, c) \
+    for (uint r = 0; r < ROWS; r++) xr[r] = r < d.rows ? rot[(ulong)r * d.k + (kb) + (c)] : 0.0f;
+#endif
 __attribute__((intel_reqd_sub_group_size(SG)))
-__kernel void exl3_matvec(__global const uchar *base, __global const exl3_desc *desc, uint ks) {
+__kernel void exl3_matvec(__global const uchar *base, __global const exl3_desc *desc, uint ks, uint fuse) {
     const exl3_desc d = desc[get_group_id(1)];
     const uint tn0 = get_global_id(0) / SG * NS, c = get_sub_group_local_id();
     if (tn0 * 16 >= d.n || d.halves != 2 * BITS) return;
@@ -175,6 +199,9 @@ __kernel void exl3_matvec(__global const uchar *base, __global const exl3_desc *
     const ulong tile_k = (ulong)(d.n / 16) * RINGW;  // uint32 words between k tiles
     const uint split = get_group_id(2), kspan = d.k / ks, k0 = split * kspan;
     tile += (ulong)(k0 / 16) * tile_k;
+#if RI
+    float vr[ROWS][8];  // fuse: the rotated block, K span a multiple of 128 (the host checks)
+#endif
 #if HS && NS >= 2
     // HS: the half h = c / 8 takes strips h * NS / 2 and up, and each lane decodes both column halves of its
     // strips from the same words (g + 0 and g + 8). The h offset is then a compile-time constant: no shift.
@@ -188,7 +215,7 @@ __kernel void exl3_matvec(__global const uchar *base, __global const exl3_desc *
         for (uint s = 0; s < NS / 2; s++)
             for (uint j = 0; j < LOADW; j++) raw[s][j] = tile[(sl + s) * RINGW + (wbase + j) % RINGW];
         float xr[ROWS];
-        for (uint r = 0; r < ROWS; r++) xr[r] = r < d.rows ? rot[(ulong)r * d.k + kb + c] : 0.0f;
+        LOAD_XR(xr, kb, c)
         for (uint v = 0; v < 16; v++) {
             const uint kr = lane_row(v);
             float wv[NS / 2][2];
@@ -221,7 +248,7 @@ __kernel void exl3_matvec(__global const uchar *base, __global const exl3_desc *
             for (uint j = 0; j < USEW; j++)
                 w[s][j] = h ? (SHB ? (raw[s][j + SHW] << SHB) | (raw[s][j + SHW + 1] >> (32 - SHB)) : raw[s][j + SHW]) : raw[s][j];
         float xr[ROWS];
-        for (uint r = 0; r < ROWS; r++) xr[r] = r < d.rows ? rot[(ulong)r * d.k + kb + c] : 0.0f;
+        LOAD_XR(xr, kb, c)
         for (uint v = 0; v < 16; v++) {
             const uint bit = OFF0 + (8 * (v / 4) + (v % 4)) * BITS, wi = bit / 32, off = bit % 32;
             const uint kr = lane_row(v);
