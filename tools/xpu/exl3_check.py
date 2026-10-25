@@ -31,17 +31,26 @@ class Exl3:
         if fixed:
             return fixed
         if strips < 128:  # few strips a group (expert gate/up, N 512): keep the sub-group count up
-            ns = 2 if rows == 1 else 1
+            ns = 2 if rows <= 4 else 1
         else:
             ns = 4 if rows <= 4 else (2 if rows <= 8 else 1)
         while strips % ns:
             ns //= 2
         return ns
 
+    def hs(self, rows, ns):
+        """Split-half matvec (HS) at 2 to 4 rows: +3 to +14% there, a loss at 1, 8 and 16 rows (exl3_ab.py, 2026-10-24)."""
+        env = getattr(self, "hs_fixed", None)
+        env = os.environ.get("EXL3_HS") if env is None else env
+        if env is not None:
+            return int(env) and ns >= 2
+        return 2 <= rows <= 4 and ns >= 2
+
     def matvec(self, bits, rows, ns=1):
-        key = (bits, rows, ns)
+        hs = int(self.hs(rows, ns))
+        key = (bits, rows, ns, hs)
         if key not in self.kern:
-            p = cl.Program(self.ctx, self.src).build(f"-cl-std=CL3.0 -DBITS={bits} -DROWS={rows} -DNS={ns} " + getattr(self, "extra_opts", ""))
+            p = cl.Program(self.ctx, self.src).build(f"-cl-std=CL3.0 -DBITS={bits} -DROWS={rows} -DNS={ns} -DHS={hs} " + getattr(self, "extra_opts", os.environ.get("EXL3_OPTS", "")))
             self.progs[key] = p
             self.kern[key] = cl.Kernel(p, "exl3_matvec")
         return self.kern[key]

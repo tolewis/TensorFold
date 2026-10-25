@@ -141,6 +141,9 @@ __kernel void exl3_rotate_in(__global const uchar *base, __global const exl3_des
 #define SHB ((4 * BITS) % 32)                         //                 and bits
 #define USEW ((OFF0 + 27 * BITS + 16 + 31) / 32 + 1)  // aligned words the windows touch
 #define LOADW (USEW + SHW + 1)
+#ifndef HS
+#define HS 0                                  // see exl3_matvec (needs NS >= 2)
+#endif
 #ifndef NS
 #define NS 1                                  // column strips a sub-group (N / 16 must divide by NS)
 #endif
@@ -154,6 +157,41 @@ __kernel void exl3_matvec(__global const uchar *base, __global const exl3_desc *
     __global const uint *tile = (__global const uint *)(AT(const ushort, d.trellis) + (ulong)tn0 * 16 * BITS);
     __global const float *rot = AT(const float, d.rot);
     const ulong tile_k = (ulong)(d.n / 16) * RINGW;  // uint32 words between k tiles
+#if HS && NS >= 2
+    // HS: the half h = c / 8 takes strips h * NS / 2 and up, and each lane decodes both column halves of its
+    // strips from the same words (g + 0 and g + 8). The h offset is then a compile-time constant: no shift.
+    const uint sl = h * (NS / 2);
+    float acc[NS / 2][2][ROWS];
+    for (uint s = 0; s < NS / 2; s++)
+        for (uint e = 0; e < 2; e++)
+            for (uint r = 0; r < ROWS; r++) acc[s][e][r] = 0.0f;
+    for (uint kb = 0; kb < d.k; kb += 16, tile += tile_k) {
+        uint raw[NS / 2][LOADW];
+        for (uint s = 0; s < NS / 2; s++)
+            for (uint j = 0; j < LOADW; j++) raw[s][j] = tile[(sl + s) * RINGW + (wbase + j) % RINGW];
+        float xr[ROWS];
+        for (uint r = 0; r < ROWS; r++) xr[r] = r < d.rows ? rot[(ulong)r * d.k + kb + c] : 0.0f;
+        for (uint v = 0; v < 16; v++) {
+            const uint kr = lane_row(v);
+            float wv[NS / 2][2];
+            for (uint e = 0; e < 2; e++) {
+                const uint bit = OFF0 + e * 4 * BITS + (8 * (v / 4) + (v % 4)) * BITS, wi = bit / 32, off = bit % 32;
+                for (uint s = 0; s < NS / 2; s++)
+                    wv[s][e] = mul1_value(off ? ((raw[s][wi] << off) | (raw[s][wi + 1] >> (32 - off))) >> 16 : raw[s][wi] >> 16);
+            }
+            for (uint r = 0; r < ROWS; r++) {
+                const float xv = sub_group_broadcast(xr[r], kr);
+                for (uint s = 0; s < NS / 2; s++)
+                    for (uint e = 0; e < 2; e++) acc[s][e][r] = fma(xv, wv[s][e], acc[s][e][r]);
+            }
+        }
+    }
+    __global float *sums = AT(float, d.sums);
+    for (uint s = 0; s < NS / 2; s++)
+        for (uint e = 0; e < 2; e++)
+            for (uint r = 0; r < ROWS; r++)
+                if (r < d.rows) sums[(ulong)r * d.n + (tn0 + sl + s) * 16 + g + 8 * e] = acc[s][e][r];
+#else
     float acc[NS][ROWS];
     for (uint s = 0; s < NS; s++)
         for (uint r = 0; r < ROWS; r++) acc[s][r] = 0.0f;
@@ -182,6 +220,7 @@ __kernel void exl3_matvec(__global const uchar *base, __global const exl3_desc *
     for (uint s = 0; s < NS; s++)
         for (uint r = 0; r < ROWS; r++)
             if (r < d.rows) sums[(ulong)r * d.n + (tn0 + s) * 16 + c] = acc[s][r];
+#endif
 }
 #endif
 
