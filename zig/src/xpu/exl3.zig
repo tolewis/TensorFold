@@ -278,24 +278,35 @@ fn shapeOf(plan: *const Plan, rows: u32, strips_total: u32) Error!Shape {
     return .{ .variant = vi, .ks = variants.split(strips.total / variants.all[vi].ns, plan.k_tiles_gcd) };
 }
 
-/// Queues the three stages over a table of `count` groups (no host wait).
-fn stages(p: *const Pipelines, s: Stream, table: ?*anyopaque, count: u32, rows: u32, k_max: u32, n_max: u32, sh: Shape) Error!void {
+/// The matvec rotates x itself (exl3.cl RI) at 1 to 4 rows when every K split is whole 128 blocks, on launches
+/// below fuse_n_max columns. Each sub-group repeats the rotation: on lm_head (N 248320, 3880 sub-groups) that took
+/// 797 to 815 us at 1 row and 1339 to 1477 us at 4 rows. On one layer's experts it saves a launch (B70, 2026-10-25).
+const fuse_n_max = 65536;
+
+fn fused(rows: u32, n_max: u32, k_tiles_gcd: u32, ks: u32) bool {
+    return rows <= 4 and n_max < fuse_n_max and (k_tiles_gcd / ks) % 8 == 0;
+}
+
+/// Queues the stages over a table of `count` groups (no host wait): rotate_in (unless fused), matvec, rotate_out.
+fn stages(p: *const Pipelines, s: Stream, table: ?*anyopaque, count: u32, rows: u32, k_max: u32, n_max: u32, k_tiles_gcd: u32, sh: Shape) Error!void {
     const mv = p.matvec[sh.variant];
     const ns = variants.all[sh.variant].ns;
+    const fuse = fused(rows, n_max, k_tiles_gcd, sh.ks);
     for ([_]mod.Kernel{ p.rotate_in, mv, p.rotate_out }) |k| {
         try k.setPtr(0, null); // base: unused with -DEXL3_ABS
         try k.setPtr(1, table);
     }
     try mv.setU32(2, sh.ks);
+    try mv.setU32(3, @intFromBool(fuse));
     try p.rotate_out.setU32(2, sh.ks);
-    try launch(p.rotate_in, s, .{ k_max / 128, rows, count });
+    if (!fuse) try launch(p.rotate_in, s, .{ k_max / 128, rows, count });
     try launch(mv, s, .{ std.math.divCeil(u32, n_max / 16 / ns, local_matvec[0] / 16) catch unreachable, count, sh.ks });
     try launch(p.rotate_out, s, .{ n_max / 128, rows, count });
 }
 
 /// y = x @ W for every group of the plan.
 pub fn encode(p: *const Pipelines, s: Stream, plan: *const Plan) Error!void {
-    try stages(p, s, plan.table.ptr, plan.count, plan.rows, plan.k_max, plan.n_max, try shapeOf(plan, plan.rows, plan.strips.total));
+    try stages(p, s, plan.table.ptr, plan.count, plan.rows, plan.k_max, plan.n_max, plan.k_tiles_gcd, try shapeOf(plan, plan.rows, plan.strips.total));
 }
 
 /// Routed experts, one row a (token, pick) slot. ids are u32 [tokens][topk] on the device. Slot t * topk + j reads
@@ -341,7 +352,7 @@ pub fn encodeRouted(p: *const Pipelines, s: Stream, experts: *const Plan, r: Rou
     try k.setU32(12, sh.ks);
     try k.setU32(13, @intFromEnum(r.input));
     try launch(k, s, .{ slots, 1, 1 });
-    try stages(p, s, @ptrFromInt(r.slots), slots, 1, experts.k_max, experts.n_max, sh);
+    try stages(p, s, @ptrFromInt(r.slots), slots, 1, experts.k_max, experts.n_max, experts.k_tiles_gcd, sh);
 }
 
 /// A fused routed MLP: for each (token, pick) slot y = down(silu(gate x) * up x), and with `shared` one more slot a

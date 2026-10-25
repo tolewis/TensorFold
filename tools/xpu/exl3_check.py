@@ -145,12 +145,13 @@ def project(e, groups, xs, rows, out_f32=True, reps=0):
     ns, ks = e.shape(bits, rb, [int(n) // 16 for n in d["n"]], [int(k) // 16 for k in d["k"]])
     assert ks <= KS_MAX
     mv = e.matvec(bits, rb, ns)
+    fuse = fused(rb, nmax, [int(k) // 16 for k in d["k"]], ks)
     WG = 128
     gx = (nmax // 16 // ns * 16 + WG - 1) // WG * WG
     def launch():
-        ev = [e.p.exl3_rotate_in(e.q, (kmax // 128 * 16, rows, len(groups)), (16, 1, 1), base, db),
-              mv(e.q, (gx, len(groups), ks), (WG, 1, 1), base, db, np.uint32(ks)),
-              e.p.exl3_rotate_out(e.q, (nmax // 128 * 16, rows * 8, len(groups)), (16, 8, 1), base, db, np.uint32(ks))]
+        ev = [] if fuse else [e.p.exl3_rotate_in(e.q, (kmax // 128 * 16, rows, len(groups)), (16, 1, 1), base, db)]
+        ev += [mv(e.q, (gx, len(groups), ks), (WG, 1, 1), base, db, np.uint32(ks), np.uint32(fuse)),
+               e.p.exl3_rotate_out(e.q, (nmax // 128 * 16, rows * 8, len(groups)), (16, 8, 1), base, db, np.uint32(ks))]
         return ev
     ev = launch()
     e.q.finish()
@@ -163,6 +164,12 @@ def project(e, groups, xs, rows, out_f32=True, reps=0):
             t.append([(v.profile.end - v.profile.start) * 1e-9 for v in ev])
         times = np.median(np.array(t), axis=0)
     return outs, times
+
+
+def fused(rows, n_max, k_tiles, ks):
+    """exl3.zig fused: the matvec rotates x itself at 1 to 4 rows when every K split is whole 128 blocks
+    below 65536 columns (EXL3_FUSE=0 keeps exl3_rotate_in, to compare)."""
+    return os.environ.get("EXL3_FUSE", "1") != "0" and rows <= 4 and n_max < 65536 and all(t // ks % 8 == 0 for t in k_tiles)
 
 
 def to_bf16(a):

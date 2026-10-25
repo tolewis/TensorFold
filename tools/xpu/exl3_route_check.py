@@ -41,8 +41,10 @@ def main():
             e.p.exl3_route(e.q, (slots,), None, tb, ib, db, np.uint32(TOPK), np.uint64(xo), np.uint32(k), np.uint32(per),
                            np.uint64(ro), np.uint64(so), np.uint64(oo), np.uint32(n), np.uint32(1), np.uint32(ks), np.uint32(0))
             mv = e.matvec(w // 16, 1, ns)
-            e.p.exl3_rotate_in(e.q, (k // 128 * 16, 1, slots), (16, 1, 1), base, db)
-            mv(e.q, ((n // 16 // ns * 16 + 127) // 128 * 128, slots, ks), (128, 1, 1), base, db, np.uint32(ks))
+            fuse = ck.fused(1, n, [k // 16], ks)
+            if not fuse:
+                e.p.exl3_rotate_in(e.q, (k // 128 * 16, 1, slots), (16, 1, 1), base, db)
+            mv(e.q, ((n // 16 // ns * 16 + 127) // 128 * 128, slots, ks), (128, 1, 1), base, db, np.uint32(ks), np.uint32(fuse))
             e.p.exl3_rotate_out(e.q, (n // 128 * 16, 8, slots), (16, 8, 1), base, db, np.uint32(ks))
             e.q.finish()
             y = ar.read(e.q, oo, (tokens, TOPK, n), np.float32)
