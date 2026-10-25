@@ -1,11 +1,11 @@
-"""Gate 3 and the route check through the Level Zero host (zig/src/xpu/exl3.zig, program tf-xpu-exl3-test).
+"""Gate 3, the route check and the fused MLP check through the Level Zero host (zig/src/xpu/exl3.zig, program tf-xpu-exl3-test).
 Each case runs in the zig program; its outputs must equal the PyOpenCL host's bit for bit (same kernels, same
 picks) and meet the numpy reference within 1e-3.
 Usage: exl3_zig_check.py <repo> <sage EXL3 dir> <tf-xpu-exl3-test> <work dir>   (one GPU job at a time)"""
 import os, struct, subprocess, sys
 import numpy as np
 sys.path.insert(0, os.path.dirname(__file__))
-import exl3_ref as ref, exl3_check as ck
+import exl3_ref as ref, exl3_check as ck, exl3_moe_check as mc
 
 MAGIC = 0x334C5845
 
@@ -25,6 +25,25 @@ def run(prog, work, mode, mats, rows, x, topk=0, per=0, ids=None, out_f32=1):
     subprocess.run([prog, case, out], check=True, stdout=subprocess.DEVNULL)
     y = np.fromfile(out, np.float32 if out_f32 else np.uint16)
     return y if out_f32 else ck.from_bf16(y)
+
+
+def run_moe(prog, work, experts, shared, x, ids, topk, out_f32=1):
+    """Mode 2: experts and shared are (gate, up, down) groups; y [slots, hidden]."""
+    tr = experts[0][0][0]
+    k, n, halves = tr.shape[0] * 16, tr.shape[1] * 16, tr.shape[2] // 8
+    table = experts + [shared]
+    parts = [struct.pack("<10I", MAGIC, 2, len(table), k, n, halves, x.shape[0], topk, 1, out_f32)]
+    for ex in table:
+        for tr_, suh, svh, mul1 in ex:
+            ck.refuse(halves, mul1)
+            parts += [np.ascontiguousarray(a).tobytes() for a in (tr_, suh, svh)]
+    parts.append(np.ascontiguousarray(ids, np.uint32).tobytes())
+    parts.append(np.ascontiguousarray(x).tobytes())
+    case, out = os.path.join(work, "case.bin"), os.path.join(work, "y.bin")
+    open(case, "wb").write(b"".join(parts))
+    subprocess.run([prog, case, out], check=True, stdout=subprocess.DEVNULL)
+    y = np.fromfile(out, np.float32 if out_f32 else np.uint16)
+    return (y if out_f32 else ck.from_bf16(y)).reshape(-1, k)
 
 
 def main():
@@ -82,6 +101,33 @@ def main():
             worst = max(worst, err)
             print(f"zig route {proj} tokens={tokens} slots={tokens * TOPK}: worst max|y-ref|/max|ref| = {err:.2e}")
             assert err <= 1e-3
+    # fused MLP: 8 picks of 24 experts and the shared expert, against the PyOpenCL host and the float64 reference
+    L = mc.LAYER.format(0)
+    grp = lambda p: tuple(st.group(f"{p}.{j}_proj") for j in ("gate", "up", "down"))
+    sub = [grp(f"{L}.experts.{i}") for i in range(24)]
+    shared = grp(f"{L}.shared_expert")
+    moe = mc.Moe(e, 4, 2, 2)  # exl3_variants.moe: p, pd, ds
+    dq = {}
+    for tokens in (1, 4):
+        x = ck.to_bf16(rng.standard_normal((tokens, 2048)).astype(np.float32))
+        ids = np.stack([rng.permutation(24)[:TOPK] for _ in range(tokens)]).astype(np.uint32)
+        y = run_moe(prog, work, sub, shared, x, ids, TOPK)
+        moe.setup(sub, shared, x, [ids], TOPK)
+        moe.launch()
+        same = (y.view(np.uint32) == moe.y_out().view(np.uint32)).all()
+        xf = ck.from_bf16(x).astype(np.float64)
+        err = 0.0
+        for s_ in range(y.shape[0]):
+            i = int(ids.flat[s_]) if s_ < tokens * TOPK else 24
+            t = s_ // TOPK if s_ < tokens * TOPK else s_ - tokens * TOPK
+            if i not in dq:
+                dq[i] = [mc.dq(m) for m in (sub[i] if i < 24 else shared)]
+            g, u = xf[t] @ dq[i][0], xf[t] @ dq[i][1]
+            yr = (g / (1 + np.exp(-g)) * u) @ dq[i][2]
+            err = max(err, np.abs(y[s_] - yr).max() / np.abs(yr).max())
+        worst = max(worst, err)
+        print(f"zig fused MLP tokens={tokens} slots={y.shape[0]}: worst max|y-ref|/max|ref| = {err:.2e}, bit-exact vs PyOpenCL host: {same}")
+        assert same and err <= 1e-3
     print(f"zig host: all cases pass, worst fp32 {worst:.2e}")
 
 

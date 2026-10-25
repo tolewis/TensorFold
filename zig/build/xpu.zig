@@ -150,7 +150,14 @@ const kernels = [_]Kernel{
     .{ .name = "nem_prow", .options = cl3 },
     .{ .name = "nem_attn_dec", .options = cl3 },
     .{ .name = "exl3", .options = cl3 ++ " -DEXL3_ABS" },
-} ++ exl3Matvec();
+} ++ exl3Matvec() ++ exl3Moe();
+
+/// Fused routed MLP images: one a width of exl3_variants.moe.
+fn exl3Moe() [exl3_variants.moe.bits.len]Kernel {
+    var out: [exl3_variants.moe.bits.len]Kernel = undefined;
+    inline for (exl3_variants.moe.bits, &out) |b, *k| k.* = .{ .name = exl3_variants.moe.name(b), .src = "exl3", .options = exl3_variants.moe.options(b) };
+    return out;
+}
 
 /// EXL3 matvec images: one a (bits, rows, NS, HS) of src/xpu/exl3_variants.zig.
 fn exl3Matvec() [exl3_variants.all.len]Kernel {

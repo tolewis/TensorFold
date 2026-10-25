@@ -3,6 +3,7 @@
 //! Model code gives device addresses and shapes only; it never sees a Level Zero type.
 //! A launch covers many groups (projections) of one width through a descriptor table on the device, built once
 //! at load time and run every step. Routed experts build their slot table on the device (exl3_route).
+//! A whole routed MLP (gate, up, SiLU, down for every pick, plus the shared expert) runs fused: encodeMoe.
 
 const std = @import("std");
 const Context = @import("context.zig").Context;
@@ -108,6 +109,32 @@ pub fn descriptor(g: Group) !Desc {
 const local_rotate = [3]u32{ 16, 1, 1 };
 const local_matvec = [3]u32{ 128, 1, 1 };
 
+/// The four kernels of a fused routed MLP image (exl3_variants.moe).
+const MoeKernels = struct {
+    gate_up: mod.Kernel,
+    act: mod.Kernel,
+    down: mod.Kernel,
+    out: mod.Kernel,
+
+    const names = [_][:0]const u8{ "exl3_moe_gate_up", "exl3_moe_act", "exl3_moe_down", "exl3_moe_out" };
+    const locals = [_][3]u32{ .{ 128, 1, 1 }, .{ 32, 1, 1 }, .{ 128 / variants.moe.ds, 1, 1 }, .{ 16, 1, 1 } };
+
+    fn load(m: mod.Module) Error!MoeKernels {
+        var ks: [4]mod.Kernel = undefined;
+        var done: usize = 0;
+        errdefer for (ks[0..done]) |*k| k.deinit();
+        for (&ks, names, locals) |*k, n, l| {
+            k.* = try m.kernel(n, l);
+            done += 1;
+        }
+        return .{ .gate_up = ks[0], .act = ks[1], .down = ks[2], .out = ks[3] };
+    }
+
+    fn deinit(mk: *MoeKernels) void {
+        inline for (.{ &mk.gate_up, &mk.act, &mk.down, &mk.out }) |k| k.deinit();
+    }
+};
+
 pub const Pipelines = struct {
     base: mod.Module,
     rotate_in: mod.Kernel,
@@ -115,6 +142,8 @@ pub const Pipelines = struct {
     route: mod.Kernel,
     matvec_modules: [variants.all.len]mod.Module,
     matvec: [variants.all.len]mod.Kernel,
+    moe_modules: [variants.moe.bits.len]mod.Module,
+    moe: [variants.moe.bits.len]MoeKernels,
 
     pub fn load(ctx: *const Context) Error!Pipelines {
         var p: Pipelines = undefined;
@@ -139,10 +168,27 @@ pub const Pipelines = struct {
             };
             done += 1;
         }
+        var moe_done: usize = 0;
+        errdefer for (0..moe_done) |i| {
+            p.moe[i].deinit();
+            p.moe_modules[i].unload();
+        };
+        for (kernels.exl3_moe, 0..) |image, i| {
+            p.moe_modules[i] = try mod.Module.load(ctx, image);
+            p.moe[i] = MoeKernels.load(p.moe_modules[i]) catch |e| {
+                p.moe_modules[i].unload();
+                return e;
+            };
+            moe_done += 1;
+        }
         return p;
     }
 
     pub fn deinit(p: *Pipelines) void {
+        for (&p.moe, &p.moe_modules) |*k, *m| {
+            k.deinit();
+            m.unload();
+        }
         for (&p.matvec, &p.matvec_modules) |*k, *m| {
             k.deinit();
             m.unload();
@@ -285,6 +331,105 @@ pub fn encodeRouted(p: *const Pipelines, s: Stream, experts: *const Plan, r: Rou
     try stages(p, s, @ptrFromInt(r.slots), slots, 1, experts.k_max, experts.n_max, sh);
 }
 
+/// A fused routed MLP: for each (token, pick) slot y = down(silu(gate x) * up x), and with `shared` one more slot a
+/// token on the shared expert. gate, up and down are Plan.experts tables in the same expert order (gate and up
+/// W[hidden, ff], down W[ff, hidden]); the shared expert is an entry of them. ids are u32 [tokens][topk] on the device.
+/// y row t * topk + j is token t's pick j; rows from tokens * topk on are the shared expert's, one a token.
+pub const MoeRoute = struct {
+    ids: u64,
+    tokens: u32,
+    topk: u32,
+    /// Table index of the shared expert, or null for none.
+    shared: ?u32 = null,
+    x: u64,
+    x_stride: u32,
+    y: u64,
+    y_stride: u32,
+    output: Output = .bf16,
+    /// moeScratchBytes(hidden, ff, slots()) bytes.
+    scratch: u64,
+
+    pub fn slots(r: MoeRoute) u32 {
+        return r.tokens * r.topk + if (r.shared != null) r.tokens else 0;
+    }
+};
+
+/// Scratch of a fused MLP: gate|up split sums, the down input, down split sums (fp32), each 256-byte aligned.
+const MoeScratch = struct { gu: usize, act: usize, dn: usize, size: usize };
+
+fn moeScratch(hidden: usize, ff: usize, slots: usize) MoeScratch {
+    const gu = std.mem.alignForward(usize, slots * variants.moe.p * 2 * ff * 4, 256);
+    const act = std.mem.alignForward(usize, slots * ff * 4, 256);
+    return .{ .gu = 0, .act = gu, .dn = gu + act, .size = gu + act + slots * variants.moe.pd * hidden * 4 };
+}
+
+pub fn moeScratchBytes(hidden: usize, ff: usize, slots: usize) usize {
+    return moeScratch(hidden, ff, slots).size;
+}
+
+/// Four launches, no host wait. The splits are added in a fixed order: the result does not depend on the schedule.
+pub fn encodeMoe(p: *const Pipelines, s: Stream, gate: *const Plan, up: *const Plan, down: *const Plan, r: MoeRoute) Error!void {
+    const hidden = gate.k_max;
+    const ff = gate.n_max;
+    const m = variants.moe;
+    if (up.k_max != hidden or up.n_max != ff or down.k_max != ff or down.n_max != hidden) return error.Invalid;
+    if (gate.count != up.count or gate.count != down.count or gate.bits != up.bits or gate.bits != down.bits) return error.Invalid;
+    if (hidden % (128 * m.p) != 0 or ff % (128 * m.pd) != 0 or hidden > m.k_max or ff > m.k_max) return error.Invalid;
+    if (r.shared) |e| if (e >= gate.count) return error.Invalid;
+    if (r.x_stride < hidden or r.y_stride < hidden) return error.Invalid;
+    const mi = std.mem.indexOfScalar(u32, &m.bits, gate.bits) orelse return error.Invalid;
+    const k = p.moe[mi];
+    const slots = r.slots();
+    if (slots == 0) return error.Invalid;
+    const pairs = r.tokens * r.topk;
+    const shared = r.shared orelse 0;
+    const sc = moeScratch(hidden, ff, slots);
+    const ids: ?*anyopaque = @ptrFromInt(r.ids);
+
+    try k.gate_up.setPtr(0, null); // base: unused with -DEXL3_ABS
+    try k.gate_up.setPtr(1, gate.table.ptr);
+    try k.gate_up.setPtr(2, up.table.ptr);
+    try k.gate_up.setPtr(3, ids);
+    try k.gate_up.setU32(4, r.topk);
+    try k.gate_up.setU32(5, pairs);
+    try k.gate_up.setU32(6, shared);
+    try setU64(k.gate_up, 7, r.x);
+    try k.gate_up.setU32(8, r.x_stride);
+    try setU64(k.gate_up, 9, r.scratch + sc.gu);
+    try launch(k.gate_up, s, .{ ff / 128 * m.p, slots, 1 });
+
+    try k.act.setPtr(0, null);
+    try k.act.setPtr(1, gate.table.ptr);
+    try k.act.setPtr(2, up.table.ptr);
+    try k.act.setPtr(3, down.table.ptr);
+    try k.act.setPtr(4, ids);
+    try k.act.setU32(5, pairs);
+    try k.act.setU32(6, shared);
+    try setU64(k.act, 7, r.scratch + sc.gu);
+    try setU64(k.act, 8, r.scratch + sc.act);
+    try launch(k.act, s, .{ ff / 128, slots, 1 });
+
+    try k.down.setPtr(0, null);
+    try k.down.setPtr(1, down.table.ptr);
+    try k.down.setPtr(2, ids);
+    try k.down.setU32(3, pairs);
+    try k.down.setU32(4, shared);
+    try setU64(k.down, 5, r.scratch + sc.act);
+    try setU64(k.down, 6, r.scratch + sc.dn);
+    try launch(k.down, s, .{ hidden / 128 * m.pd, slots, 1 });
+
+    try k.out.setPtr(0, null);
+    try k.out.setPtr(1, down.table.ptr);
+    try k.out.setPtr(2, ids);
+    try k.out.setU32(3, pairs);
+    try k.out.setU32(4, shared);
+    try setU64(k.out, 5, r.scratch + sc.dn);
+    try setU64(k.out, 6, r.y);
+    try k.out.setU32(7, r.y_stride);
+    try k.out.setU32(8, @intFromEnum(r.output));
+    try launch(k.out, s, .{ hidden / 128, slots, 1 });
+}
+
 test "descriptor layout and scratch" {
     const m = Matrix{ .trellis = 0x1000, .suh = 0x2000, .svh = 0x3000, .k = 2048, .n = 512, .halves = 8 };
     const d = try descriptor(.{ .m = m, .rows = 3, .x = 0x4000, .x_stride = 2048, .y = 0x5000, .y_stride = 512, .output = .f32, .scratch = 0x10000 });
@@ -294,6 +439,8 @@ test "descriptor layout and scratch" {
     try std.testing.expectEqual(@as(usize, 1), splitBound(248320));
     try std.testing.expectError(error.InvalidExl3Rows, descriptor(.{ .m = m, .rows = 17, .x = 0, .x_stride = 2048, .y = 0, .y_stride = 512, .scratch = 0 }));
     try std.testing.expectError(error.UnsupportedExl3Shape, (Matrix{ .trellis = 0, .suh = 0, .svh = 0, .k = 100, .n = 512, .halves = 8 }).validate());
+    // Sage: hidden 2048, ff 512, 8 picks and the shared expert
+    try std.testing.expectEqual(@as(usize, 9 * 4 * 2 * 512 * 4 + 9 * 512 * 4 + 9 * 2 * 2048 * 4), moeScratchBytes(2048, 512, 9));
 }
 
 test {

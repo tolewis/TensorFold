@@ -31,3 +31,9 @@ pub const exl3_matvec: [exl3_variants.all.len][]const u8 = blk: {
     for (exl3_variants.all, &out) |v, *image| image.* = if (available) &Blob("spv_" ++ exl3_variants.name(v)).bytes else &.{};
     break :blk out;
 };
+/// The fused routed MLP, one image a width of exl3_variants.moe.bits (same order).
+pub const exl3_moe: [exl3_variants.moe.bits.len][]const u8 = blk: {
+    var out: [exl3_variants.moe.bits.len][]const u8 = undefined;
+    for (exl3_variants.moe.bits, &out) |b, *image| image.* = if (available) &Blob("spv_" ++ exl3_variants.moe.name(b)).bytes else &.{};
+    break :blk out;
+};

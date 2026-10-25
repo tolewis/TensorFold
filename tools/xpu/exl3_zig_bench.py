@@ -1,5 +1,7 @@
 """Wall-time speed through the Level Zero host (tf-xpu-exl3-test with reps): launch gaps included.
-Cases: one layer's routed experts (top-8 of 256, one token), the same 8 experts as plain groups, and lm_head.
+Cases: one layer's routed experts (top-8 of 256, one token), the same 8 experts as plain groups, the fused MLP
+(top-8 of 256 and the shared expert: gate, up, SiLU, down) and lm_head. Each call reads the same experts, so some
+of a layer's 14 MB can stay in L2 between calls (about 6% on the fused MLP, by exl3_moe_check.py with fresh picks).
 Inputs are real checkpoint weights (constant fills read faster than DRAM on Xe2: memory compression).
 Usage: exl3_zig_bench.py <EXL3 checkpoint> <tf-xpu-exl3-test> <work dir> [reps]   (one GPU job at a time)"""
 import os, struct, subprocess, sys
@@ -7,6 +9,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(__file__))
 import exl3_ref as ref, exl3_check as ck
 from exl3_zig_check import MAGIC
+import exl3_moe_check as mc
 
 
 def bench(prog, work, mode, mats, rows, x, reps, topk=0, per=0, ids=None):
@@ -39,6 +42,18 @@ def main():
         picked = [experts[int(i)] for i in ids[0]]
         xg = ck.to_bf16(rng.standard_normal((8, 1, k)).astype(np.float32))
         print(f"groups {proj} same 8 experts, 1 row: {bench(prog, work, 0, picked, 1, xg, reps)}", flush=True)
+    grp = lambda p: tuple(st.group(f"{p}.{j}_proj") for j in ("gate", "up", "down"))
+    table = [grp(f"{L}.{i}") for i in range(256)] + [grp(L.replace("experts", "shared_expert"))]
+    parts = [struct.pack("<10I", MAGIC, 2, len(table), 2048, 512, 8, 1, 8, 1, 1)]
+    for ex in table:
+        for m in ex:
+            parts += [np.ascontiguousarray(a).tobytes() for a in m[:3]]
+    parts.append(np.ascontiguousarray(ids, np.uint32).tobytes())
+    parts.append(np.ascontiguousarray(ck.to_bf16(rng.standard_normal((1, 2048)).astype(np.float32))).tobytes())
+    case = os.path.join(work, "case.bin")
+    open(case, "wb").write(b"".join(parts))
+    r = subprocess.run([prog, case, os.path.join(work, "y.bin"), str(reps)], check=True, capture_output=True, text=True)
+    print(f"fused MLP top-8 of 256 + shared, 1 token: {r.stderr.strip().splitlines()[-1]}", flush=True)
     head = st.group("lm_head")
     for rows in (1, 4):
         x = ck.to_bf16(rng.standard_normal((rows, 2048)).astype(np.float32))

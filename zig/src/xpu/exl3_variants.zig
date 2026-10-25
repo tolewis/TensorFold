@@ -43,6 +43,26 @@ pub fn options(comptime v: Variant) []const u8 {
     return std.fmt.comptimePrint("-cl-std=CL3.0 -DEXL3_ABS -DBITS={d} -DROWS={d} -DNS={d} -DHS={d}", .{ v.bits, v.rows, v.ns, @intFromBool(v.hs) });
 }
 
+/// The fused routed MLP (exl3_moe_*): one image a width. K splits and strips measured on the B70 with one Sage
+/// layer (8 picks and the shared expert, 1 token) by tools/xpu/exl3_moe_check.py (2026-10-25).
+pub const moe = struct {
+    pub const bits = [_]u32{ 4, 6 };
+    /// gate|up K splits (a work-group each), down K splits and down strips a sub-group.
+    pub const p = 4;
+    pub const pd = 2;
+    pub const ds = 2;
+    /// Largest K of gate|up (hidden) and of down (intermediate): local memory a work-group.
+    pub const k_max = 4096;
+
+    pub fn name(comptime b: u32) []const u8 {
+        return std.fmt.comptimePrint("exl3_moe_b{d}", .{b});
+    }
+
+    pub fn options(comptime b: u32) []const u8 {
+        return std.fmt.comptimePrint("-cl-std=CL3.0 -DEXL3_ABS -DBITS={d} -DMOE_P={d} -DMOE_PD={d} -DMOE_DS={d} -DMOE_KMAX={d}", .{ b, p, pd, ds, k_max });
+    }
+};
+
 /// Sub-groups a launch needs to fill the GPU; fewer strips a sub-group and K splits get it there.
 pub const sub_group_target = 2048;
 /// Most K splits (the sums scratch holds this many) and fewest 16-row K tiles a split.
