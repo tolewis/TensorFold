@@ -471,13 +471,16 @@ pub const Runner = struct {
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.mpos, &pos, T * 4, null, 0, null));
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.ids, toks.ptr, T * 4, null, 0, null));
         errdefer d.settle();
-        try d.launch(d.k.embed, .{ .x = T }, .{ a.ids, m.embed_w, m.embed_s, m.embed_b, a.x, D });
+        if (m.x3 != null)
+            try d.launch(d.k.embed_dense, .{ .x = T }, .{ a.ids, m.embed_w, a.x, D })
+        else
+            try d.launch(d.k.embed, .{ .x = T }, .{ a.ids, m.embed_w, m.embed_s, m.embed_b, a.x, D });
         const sp: i32 = @intCast(span(max_pos + 1));
         const ns: u32 = (max_pos + 1 + @as(u32, @intCast(sp)) - 1) / @as(u32, @intCast(sp));
         for (m.layers, 0..) |*l, i| {
             const mt = off(a.mt, i * WINDOW * 8 * 8);
             try d.launch(d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.in_norm, a.h, a.ahi, a.alo, D, EPS, @as(i32, if (i == 0) 0 else 1), gs, nul, nul, zero, zero });
-            try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_in, a.p, T);
+            if (m.x3) |w| try w.mixerIn(d, i, T) else try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_in, a.p, T);
             if (l.attn) {
                 try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, zero, EPS, nul, mt, a.mpos, zero, r.cap });
                 try d.launch(r.mk.attn_span, .{ .x = ns, .y = s.kv_heads * (s.q_heads / s.kv_heads / QPG), .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, zero, @as(i32, @intCast(ns)), sp, @as(f32, 1.0 / 16.0), mt, a.mpos, r.cap });
@@ -488,13 +491,13 @@ pub const Runner = struct {
                 try d.launch(d.k.gdn_step, .{ .x = 16, .y = s.gdn_v_heads, .z = T }, .{ a.q, a.k, a.v, a.g, a.beta, l.rec.?, l.rec.?, a.y, t32, nul, nul, nul, mt });
                 try d.launch(d.k.gated_norm, .{ .x = T }, .{ a.y, a.p, l.gnorm.?, a.h, a.ahi, a.alo, EPS, gs, zero, nul, nul, zero });
             }
-            try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_out, a.r, T);
+            if (m.x3) |w| try w.mixerOut(i, T) else try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_out, a.r, T);
             try d.launch(d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, D, EPS, @as(i32, 1), gs, nul, nul, zero, zero });
-            try r.moe(l, T);
+            try r.moe(l, i, T);
         }
-        const hgs: i32 = @intCast(m.head.gs);
+        const hgs: i32 = if (m.x3 != null) 64 else @intCast(m.head.gs);
         try d.launch(d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, m.norm, a.h, a.ahi, a.alo, D, EPS, @as(i32, 1), hgs, nul, nul, zero, zero });
-        try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, m.head, a.logits, T);
+        if (m.x3) |w| try w.headRows(T) else try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, m.head, a.logits, T);
         try d.launch(d.k.argmax_part, .{ .x = 256, .y = T }, .{ a.logits, @as(i32, @intCast(s.vocab)), a.pv, a.pi });
         try d.launch(d.k.argmax, .{ .x = T }, .{ a.pv, a.pi, a.tok });
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, out.ptr, a.tok, T * 4, null, 0, null));

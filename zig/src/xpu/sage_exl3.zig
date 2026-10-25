@@ -139,6 +139,8 @@ pub const Weights = struct {
     /// A chunk's last row of h, for lm_head.
     head_row: u64 = 0,
     head_chunk: exl3.Plan = undefined,
+    /// lm_head over rows 0 to t of h into logits rows 0 to t (stepMulti: a row a slot).
+    head_multi: [WINDOW]exl3.Plan = undefined,
     scratch: [3]u64 = .{ 0, 0, 0 },
     moe_scratch: u64 = 0,
     b: Bind = undefined,
@@ -263,6 +265,7 @@ pub const Weights = struct {
         }
         // lm_head reads the window's last row only
         w.head_chunk = try exl3.Plan.init(&w.ctx, s, alloc, &.{.{ .m = w.lm_head.on(w.head_base), .rows = 1, .x = w.head_row, .x_stride = b.hidden, .y = @intFromPtr(b.logits), .y_stride = b.vocab, .output = .f16, .input = .f16, .scratch = w.scratch[0] }});
+        for (&w.head_multi, 0..) |*hp, t| hp.* = try exl3.Plan.init(&w.ctx, s, alloc, &.{.{ .m = w.lm_head.on(w.head_base), .rows = @intCast(t + 1), .x = h, .x_stride = b.hidden, .y = @intFromPtr(b.logits), .y_stride = b.vocab, .output = .f16, .input = .f16, .scratch = w.scratch[0] }});
         for (&w.head_plans, 0..) |*hp, t| hp.* = try exl3.Plan.init(&w.ctx, s, alloc, &.{.{ .m = w.lm_head.on(w.head_base), .rows = 1, .x = h + t * b.hidden * 2, .x_stride = b.hidden, .y = @intFromPtr(b.logits), .y_stride = b.vocab, .output = .f16, .input = .f16, .scratch = w.scratch[0] }});
     }
 
@@ -308,6 +311,11 @@ pub const Weights = struct {
     }
 
     /// The final norm's last row (of T) to fp16 logits.
+    /// The logits of every row of h (T at most WINDOW): row t to logits row t.
+    pub fn headRows(w: *const Weights, T: u32) !void {
+        return exl3.encode(&w.p, w.stream(), &w.head_multi[T - 1]);
+    }
+
     pub fn head(w: *const Weights, d: *Dev, T: u32) !void {
         if (T <= WINDOW) return exl3.encode(&w.p, w.stream(), &w.head_plans[T - 1]);
         const h: [*]u8 = @ptrCast(w.b.h);
