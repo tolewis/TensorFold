@@ -14,6 +14,8 @@ import exl3_ref as ref
 from exl3_check import Exl3, Arena, DESC, to_bf16, from_bf16
 
 LAYER = "model.language_model.layers.{}.mlp"
+TILE_M = int(os.environ.get("TILE_M", "16"))    # exl3.cl TILE_M and TILE_NS (pass the same in EXL3_OPTS)
+TILE_NS = int(os.environ.get("TILE_NS", "2"))
 
 
 def table(ar, mats):
@@ -69,25 +71,21 @@ class Moe:
         (gate|up), exl3_moe_act (one split), exl3_moe_tile (down), exl3_moe_out_rows."""
         e, u32, u64 = self.e, np.uint32, np.uint64
         ne = self.shared_id
-        expert = np.concatenate([ids.ravel(), np.full(self.T, ne)]).astype(np.int64)
-        order = np.argsort(expert, kind="stable").astype(np.uint32)
-        tiles = []
-        for x in range(ne + 1):
-            at = np.flatnonzero(expert[order] == x)
-            for i in range(0, len(at), 16):
-                tiles.append((x, at[0] + i, min(16, len(at) - i), 0))
-        tl = np.array(tiles, np.uint32)
-        ob, tb, nb, ib = e.buf(order), e.buf(tl), e.buf(np.array([len(tl)], np.uint32)), e.buf(np.ascontiguousarray(ids, np.uint32))
-        g, u, d = self.tabs
         H, I, S = self.H, self.I, self.slots
-        nt = len(tl)
-        ev = [self.p.exl3_moe_rot(e.q, (H // 128 * 16, S, 2), (16, 1, 1), self.base, g, u, ib, u32(self.topk), u32(self.pairs),
+        nt = S // TILE_M + ne + 1  # tile bound
+        ob = cl.Buffer(e.ctx, cl.mem_flags.READ_WRITE, S * 4)
+        tb = cl.Buffer(e.ctx, cl.mem_flags.READ_WRITE, nt * 16)
+        nb = cl.Buffer(e.ctx, cl.mem_flags.READ_WRITE, 4)
+        ib = e.buf(np.ascontiguousarray(ids, np.uint32))
+        g, u, d = self.tabs
+        ev = [self.p.exl3_moe_sort(e.q, (256,), (256,), ib, ob, tb, nb, u32(ne), u32(self.pairs), u32(self.T)),
+              self.p.exl3_moe_rot(e.q, (H // 128 * 16, S, 2), (16, 1, 1), self.base, g, u, ib, u32(self.topk), u32(self.pairs),
                                   u32(self.shared_id), u64(self.x), u32(H), u32(0), u64(self.rot), u32(S)),
-              self.p.exl3_moe_tile(e.q, ((I // 16 // 2 * 16 + 127) // 128 * 128, nt, 2), (128, 1, 1), self.base, g, u, ob, tb, nb,
+              self.p.exl3_moe_tile(e.q, ((I // 16 // TILE_NS * 16 + 127) // 128 * 128, nt, 2), (128, 1, 1), self.base, g, u, ob, tb, nb,
                                    u64(self.rot), u64(S * H), u64(self.gu), u32(2 * I), u32(I)),
               self.p.exl3_moe_act(e.q, (I // 128 * 32, S), (32, 1), self.base, g, u, d, ib, u32(self.pairs), u32(self.shared_id),
                                   u64(self.gu), u64(self.act), u32(1)),
-              self.p.exl3_moe_tile(e.q, ((H // 16 // 2 * 16 + 127) // 128 * 128, nt, 1), (128, 1, 1), self.base, d, d, ob, tb, nb,
+              self.p.exl3_moe_tile(e.q, ((H // 16 // TILE_NS * 16 + 127) // 128 * 128, nt, 1), (128, 1, 1), self.base, d, d, ob, tb, nb,
                                    u64(self.act), u64(0), u64(self.dns), u32(H), u32(0)),
               self.p.exl3_moe_out_rows(e.q, (H // 128 * 16, S), (16, 1), self.base, d, ib, u32(self.pairs), u32(self.shared_id),
                                        u64(self.dns), u64(self.y), u32(H), u32(1))]
@@ -151,11 +149,22 @@ def main():
             gg, uu = xf[t] @ G, xf[t] @ U
             yr = (gg / (1 + np.exp(-gg)) * uu) @ D
             pw = max(pw, np.abs(y[s] - yr).max() / np.abs(yr).max())
-        tt = [(v.profile.end - v.profile.start) * 1e6 for v in ev]
-        print(f"moe prompt tiles tokens={T} slots={m.slots}: worst max|y-ref|/max|ref| = {pw:.2e}; us rot/gu/act/down/out " + " ".join(f"{v:.0f}" for v in tt), flush=True)
+        tt = [(v.profile.end - v.profile.start) * 1e-3 for v in ev]
+        print(f"moe prompt tiles tokens={T} slots={m.slots}: worst max|y-ref|/max|ref| = {pw:.2e}; us sort/rot/gu/act/down/out " + " ".join(f"{v:.0f}" for v in tt), flush=True)
         assert pw <= 1e-4, pw
     # time: all 256 experts resident, fresh picks each call (see MOE_IDSETS)
     full = [grp(f"{L}.experts.{i}") for i in range(256)]
+    for T in [int(t) for t in os.environ.get("MOE_PROMPT_TIME", "512").split(",") if t]:  # a prompt chunk, timing only
+        x = to_bf16(rng.standard_normal((T, 2048)).astype(np.float32))
+        ids = np.stack([rng.permutation(256)[:8] for _ in range(T)]).astype(np.uint32)
+        m.setup(full, shared, x, [ids], 8)
+        tt = []
+        for _ in range(max(3, reps // 10)):
+            ev = m.prompt(ids)
+            e.q.finish()
+            tt.append([(v.profile.end - v.profile.start) * 1e-3 for v in ev])
+        tt = np.median(np.array(tt), axis=0)
+        print(f"moe prompt tiles tokens={T} slots={m.slots}, 256 experts: us sort/rot/gu/act/down/out " + " ".join(f"{v:.0f}" for v in tt) + f", sum {tt.sum():.0f} us", flush=True)
     x = to_bf16(rng.standard_normal((1, 2048)).astype(np.float32))
     m.setup(full, shared, x, [rng.permutation(256)[:8].reshape(1, 8) for _ in range(int(os.environ.get("MOE_IDSETS", "32")))], 8)
     t = []

@@ -654,9 +654,42 @@ __kernel void exl3_moe_rot(__global const uchar *base, __global const exl3_desc 
 #ifndef TILE_NS
 #define TILE_NS 2                         // strips a sub-group in exl3_moe_tile
 #endif
+#ifndef TILE_M
+#define TILE_M 16                         // slots a tile (exl3_moe_sort)
+#endif
+#define SORT_MAX 1024                     // most experts (with the shared one) exl3_moe_sort takes
+
+// The slots of a chunk grouped by expert (shared expert last, index n_experts): order holds slot numbers; tiles are
+// (expert, first entry of order, count, 0) of at most TILE_M slots; ntiles[0] is their count. One work-group of 256.
+__kernel __attribute__((reqd_work_group_size(256, 1, 1)))
+void exl3_moe_sort(__global const uint *ids, __global uint *order, __global uint4 *tiles, __global uint *ntiles,
+                   uint n_experts, uint pairs, uint tokens) {
+    __local uint cnt[SORT_MAX], start[SORT_MAX], tbase[SORT_MAX], fill[SORT_MAX];
+    const uint lid = get_local_id(0);
+    for (uint e = lid; e <= n_experts; e += 256) cnt[e] = e == n_experts ? tokens : 0;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint p = lid; p < pairs; p += 256) atomic_inc(&cnt[ids[p]]);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lid == 0) {
+        uint s = 0, t = 0;
+        for (uint e = 0; e <= n_experts; e++) {
+            start[e] = s;
+            tbase[e] = t;
+            fill[e] = s;
+            s += cnt[e];
+            t += (cnt[e] + TILE_M - 1) / TILE_M;
+        }
+        ntiles[0] = t;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint e = lid; e <= n_experts; e += 256)
+        for (uint i = 0; i * TILE_M < cnt[e]; i++) tiles[tbase[e] + i] = (uint4)(e, start[e] + i * TILE_M, min((uint)TILE_M, cnt[e] - i * TILE_M), 0);
+    for (uint p = lid; p < pairs; p += 256) order[atomic_inc(&fill[ids[p]])] = p;
+    for (uint t = lid; t < tokens; t += 256) order[start[n_experts] + t] = pairs + t;
+}
 
 // sums[slot][proj][n] = a[proj][slot] @ W_q (expert of the tile, table proj: 0 gate or down, 1 up) for TILE_NS strips
-// and one tile of at most 16 slots: x = hi + lo in two fp16 DPAS, as exl3_gemm. a is fp32 [proj][slots][K] (a_proj
+// and one tile of at most TILE_M slots: x = hi + lo in two fp16 DPAS, as exl3_gemm. a is fp32 [proj][slots][K] (a_proj
 // floats between the projections); sums rows are s_stride floats, s_proj floats between the projections.
 // Grid (N / 16 / TILE_NS * SG rounded to 128, tile bound, projections), work-group 128.
 __attribute__((intel_reqd_sub_group_size(SG)))
@@ -672,25 +705,29 @@ __kernel void exl3_moe_tile(__global const uchar *base, __global const exl3_desc
     __global const uint *tile = (__global const uint *)(AT(const ushort, d.trellis) + (ulong)tn0 * 16 * BITS);
     const ulong tile_k = (ulong)(d.n / 16) * RINGW;
     __global const float *ap = AT(const float, a) + proj * a_proj + c;
-    uint slot[16];
-    for (uint i = 0; i < 16; i++) slot[i] = order[tl.y + min(i, tl.z - 1)];  // rows past the tile repeat its last slot
-    float8 acc[TILE_NS][2];
-    for (uint s = 0; s < TILE_NS; s++) acc[s][0] = acc[s][1] = 0.0f;
+    const uint rbs = (tl.z + 7) / 8;  // 8-row blocks that hold slots
+    uint slot[TILE_M];
+    for (uint i = 0; i < TILE_M; i++) slot[i] = order[tl.y + min(i, tl.z - 1)];  // rows past the tile repeat its last slot
+    float8 acc[TILE_NS][TILE_M / 8];
+    for (uint s = 0; s < TILE_NS; s++)
+        for (uint rb = 0; rb < TILE_M / 8; rb++) acc[s][rb] = 0.0f;
     for (uint kb = 0; kb < d.k; kb += 16, tile += tile_k) {
-        short8 ah[2], al[2];
-        for (uint rb = 0; rb < 2; rb++)
-            for (uint r = 0; r < 8; r++) {
-                const float f = ap[(ulong)slot[rb * 8 + r] * d.k + kb];
-                const half h = convert_half_rte(f);
-                ah[rb][r] = as_short(h);
-                al[rb][r] = as_short(convert_half_rte(f - (float)h));
-            }
+        short8 ah[TILE_M / 8], al[TILE_M / 8];
+        for (uint rb = 0; rb < TILE_M / 8; rb++)
+            if (rb < rbs)
+                for (uint r = 0; r < 8; r++) {
+                    const float f = ap[(ulong)slot[rb * 8 + r] * d.k + kb];
+                    const half h = convert_half_rte(f);
+                    ah[rb][r] = as_short(h);
+                    al[rb][r] = as_short(convert_half_rte(f - (float)h));
+                }
         for (uint s = 0; s < TILE_NS; s++) {
             const int8 b = tile_b(tile + s * RINGW, c);
-            for (uint rb = 0; rb < 2; rb++) {
-                acc[s][rb] = DPH(ah[rb], b, acc[s][rb]);
-                acc[s][rb] = DPH(al[rb], b, acc[s][rb]);
-            }
+            for (uint rb = 0; rb < TILE_M / 8; rb++)
+                if (rb < rbs) {
+                    acc[s][rb] = DPH(ah[rb], b, acc[s][rb]);
+                    acc[s][rb] = DPH(al[rb], b, acc[s][rb]);
+                }
         }
     }
     __global float *o = AT(float, sums) + proj * s_proj + (tn0 * 16 + c);
