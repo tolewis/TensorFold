@@ -15,7 +15,8 @@ const launch = @import("launch.zig").launch;
 const kernels = @import("kernels.zig");
 pub const variants = @import("exl3_variants.zig");
 
-pub const Output = enum(u32) { bf16 = 0, f32 = 1 };
+pub const Output = enum(u32) { bf16 = 0, f32 = 1, f16 = 2 };
+pub const Input = enum(u32) { bf16 = 0, f16 = 1 };
 
 /// One stored EXL3 weight W[K,N] (codebook mul1, fp16 suh and svh): device addresses of the checkpoint tensors.
 pub const Matrix = struct {
@@ -33,7 +34,7 @@ pub const Matrix = struct {
     }
 };
 
-/// One projection of a launch. x is bf16 [rows][x_stride], y is [rows][y_stride] in `output`, and scratch holds
+/// One projection of a launch. x is [rows][x_stride] in `input`, y is [rows][y_stride] in `output`, and scratch holds
 /// scratchBytes(k, n, rows) bytes that no other group of the launch uses.
 pub const Group = struct {
     m: Matrix,
@@ -43,6 +44,7 @@ pub const Group = struct {
     y: u64,
     y_stride: u32,
     output: Output = .bf16,
+    input: Input = .bf16,
     scratch: u64,
 };
 
@@ -61,8 +63,8 @@ pub const Desc = extern struct {
     rows: u32,
     x_stride: u32,
     out_stride: u32,
-    out_f32: u32,
-    pad: u32 = 0,
+    out_type: u32,
+    x_f16: u32 = 0,
 };
 
 comptime {
@@ -102,7 +104,8 @@ pub fn descriptor(g: Group) !Desc {
         .rows = g.rows,
         .x_stride = g.x_stride,
         .out_stride = g.y_stride,
-        .out_f32 = @intFromEnum(g.output),
+        .out_type = @intFromEnum(g.output),
+        .x_f16 = @intFromEnum(g.input),
     };
 }
 
@@ -242,7 +245,7 @@ pub const Plan = struct {
         for (ms, descs) |m, *d| {
             try m.validate();
             if (m.k != ms[0].k or m.n != ms[0].n or m.halves != ms[0].halves) return error.MixedExl3Experts;
-            d.* = .{ .trellis = m.trellis, .suh = m.suh, .svh = m.svh, .x = 0, .rot = 0, .sums = 0, .out = 0, .k = m.k, .n = m.n, .halves = m.halves, .rows = 1, .x_stride = m.k, .out_stride = m.n, .out_f32 = 0 };
+            d.* = .{ .trellis = m.trellis, .suh = m.suh, .svh = m.svh, .x = 0, .rot = 0, .sums = 0, .out = 0, .k = m.k, .n = m.n, .halves = m.halves, .rows = 1, .x_stride = m.k, .out_stride = m.n, .out_type = 0 };
         }
         const strips = ms[0].n / 16;
         return .{ .table = try DeviceBuffer.fromHost(ctx, s, std.mem.sliceAsBytes(descs)), .count = @intCast(ms.len), .bits = ms[0].halves / 2, .rows = 1, .k_max = ms[0].k, .n_max = ms[0].n, .strips = .{ .min = strips, .gcd = strips, .total = strips }, .k_tiles_gcd = ms[0].k / 16 };
@@ -299,6 +302,7 @@ pub const Route = struct {
     y: u64,
     y_stride: u32,
     output: Output = .bf16,
+    input: Input = .bf16,
     /// scratchBytes(k, n, tokens * topk) bytes.
     scratch: u64,
     /// slotTableBytes(tokens * topk) bytes for the descriptors exl3_route writes.
@@ -327,6 +331,7 @@ pub fn encodeRouted(p: *const Pipelines, s: Stream, experts: *const Plan, r: Rou
     try k.setU32(10, r.y_stride);
     try k.setU32(11, @intFromEnum(r.output));
     try k.setU32(12, sh.ks);
+    try k.setU32(13, @intFromEnum(r.input));
     try launch(k, s, .{ slots, 1, 1 });
     try stages(p, s, @ptrFromInt(r.slots), slots, 1, experts.k_max, experts.n_max, sh);
 }
@@ -346,6 +351,7 @@ pub const MoeRoute = struct {
     y: u64,
     y_stride: u32,
     output: Output = .bf16,
+    input: Input = .bf16,
     /// moeScratchBytes(hidden, ff, slots()) bytes.
     scratch: u64,
 
@@ -396,6 +402,7 @@ pub fn encodeMoe(p: *const Pipelines, s: Stream, gate: *const Plan, up: *const P
     try setU64(k.gate_up, 7, r.x);
     try k.gate_up.setU32(8, r.x_stride);
     try setU64(k.gate_up, 9, r.scratch + sc.gu);
+    try k.gate_up.setU32(10, @intFromEnum(r.input));
     try launch(k.gate_up, s, .{ ff / 128 * m.p, slots, 1 });
 
     try k.act.setPtr(0, null);
@@ -434,7 +441,7 @@ test "descriptor layout and scratch" {
     const m = Matrix{ .trellis = 0x1000, .suh = 0x2000, .svh = 0x3000, .k = 2048, .n = 512, .halves = 8 };
     const d = try descriptor(.{ .m = m, .rows = 3, .x = 0x4000, .x_stride = 2048, .y = 0x5000, .y_stride = 512, .output = .f32, .scratch = 0x10000 });
     try std.testing.expectEqual(@as(u64, 0x10000 + 2048 * 3 * 4), d.sums);
-    try std.testing.expectEqual(@as(u32, 1), d.out_f32);
+    try std.testing.expectEqual(@as(u32, 1), d.out_type);
     try std.testing.expectEqual(@as(usize, 2048 * 3 * 4 + 16 * 512 * 3 * 4), scratchBytes(2048, 512, 3));
     try std.testing.expectEqual(@as(usize, 1), splitBound(248320));
     try std.testing.expectError(error.InvalidExl3Rows, descriptor(.{ .m = m, .rows = 17, .x = 0, .x_stride = 2048, .y = 0, .y_stride = 512, .scratch = 0 }));

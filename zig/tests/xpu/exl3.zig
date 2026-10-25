@@ -4,7 +4,8 @@
 //! With reps: the same call queued reps times back to back, then the wall time a call and the weight GB/s
 //! (launch gaps included). Routed: every slot counts its expert's weight once.
 //! Case: u32 magic "EXL3", mode (0 project, 1 routed, 2 fused MLP), count (groups or experts), k, n, halves, rows
-//! (or tokens), topk, x_per_slot (fused MLP: 1 if the last expert is the shared expert), out_f32; then per group or
+//! (or tokens), topk, x_per_slot (fused MLP: 1 if the last expert is the shared expert), formats (output in the low
+//! byte: 0 bf16, 1 fp32, 2 fp16; input in the next: 0 bf16, 1 fp16); then per group or
 //! expert trellis, suh, svh (fused MLP: gate and up [k, n], then down [n, k]); then u32 ids [tokens][topk] (routed,
 //! fused MLP); then bf16 x. Project groups each read their own x [rows][k]. Fused MLP: y [slots][k].
 
@@ -12,7 +13,7 @@ const std = @import("std");
 const xpu = @import("xpu");
 const exl3 = xpu.exl3;
 
-const Header = extern struct { magic: u32, mode: u32, count: u32, k: u32, n: u32, halves: u32, rows: u32, topk: u32, x_per_slot: u32, out_f32: u32 };
+const Header = extern struct { magic: u32, mode: u32, count: u32, k: u32, n: u32, halves: u32, rows: u32, topk: u32, x_per_slot: u32, formats: u32 };
 
 const Arena = struct {
     size: usize = 0,
@@ -41,7 +42,9 @@ pub fn main(init: std.process.Init) !u8 {
     const x_rows: usize = if (routed) (if (h.x_per_slot != 0) slots else h.rows) else if (fused) h.rows else h.count * h.rows;
     const y_rows: usize = if (routed or fused) slots else h.count * h.rows;
     const y_n: usize = if (fused) h.k else h.n;
-    const y_elem: usize = if (h.out_f32 != 0) 4 else 2;
+    const output: exl3.Output = std.enums.fromInt(exl3.Output, h.formats & 0xff) orelse return error.BadCase;
+    const input: exl3.Input = std.enums.fromInt(exl3.Input, h.formats >> 8) orelse return error.BadCase;
+    const y_elem: usize = if (output == .f32) 4 else 2;
     // per group or expert: one matrix [k, n], or (fused) gate and up [k, n] and down [n, k]
     const mats: usize = if (fused) 3 else 1;
     const shapes = [3][2]u32{ .{ h.k, h.n }, .{ h.k, h.n }, .{ h.n, h.k } };
@@ -89,7 +92,6 @@ pub fn main(init: std.process.Init) !u8 {
     try buf.uploadAsync(s, x_off, case[x_src..][0 .. x_rows * h.k * 2]);
     try s.synchronize();
     const base: u64 = @intFromPtr(buf.ptr.?);
-    const output: exl3.Output = if (h.out_f32 != 0) .f32 else .bf16;
 
     const ms = try gpa.alloc(exl3.Matrix, h.count * mats);
     defer gpa.free(ms);
@@ -112,7 +114,7 @@ pub fn main(init: std.process.Init) !u8 {
             pl.* = try exl3.Plan.experts(&ctx, s, gpa, one);
             made += 1;
         }
-        const r: exl3.MoeRoute = .{ .ids = base + ids_off, .tokens = h.rows, .topk = h.topk, .shared = if (shared) h.count - 1 else null, .x = base + x_off, .x_stride = h.k, .y = base + y_off, .y_stride = h.k, .output = output, .scratch = base + scratch_off };
+        const r: exl3.MoeRoute = .{ .ids = base + ids_off, .tokens = h.rows, .topk = h.topk, .shared = if (shared) h.count - 1 else null, .x = base + x_off, .x_stride = h.k, .y = base + y_off, .y_stride = h.k, .output = output, .input = input, .scratch = base + scratch_off };
         try exl3.encodeMoe(&p, s, &plans[0], &plans[1], &plans[2], r);
         if (reps > 0) {
             try s.synchronize();
@@ -124,7 +126,7 @@ pub fn main(init: std.process.Init) !u8 {
     } else if (routed) {
         var experts = try exl3.Plan.experts(&ctx, s, gpa, ms);
         defer experts.deinit();
-        const r: exl3.Route = .{ .ids = base + ids_off, .tokens = h.rows, .topk = h.topk, .x = base + x_off, .x_stride = h.k, .x_per_slot = h.x_per_slot != 0, .y = base + y_off, .y_stride = h.n, .output = output, .scratch = base + scratch_off, .slots = base + slots_off };
+        const r: exl3.Route = .{ .ids = base + ids_off, .tokens = h.rows, .topk = h.topk, .x = base + x_off, .x_stride = h.k, .x_per_slot = h.x_per_slot != 0, .y = base + y_off, .y_stride = h.n, .output = output, .input = input, .scratch = base + scratch_off, .slots = base + slots_off };
         try exl3.encodeRouted(&p, s, &experts, r);
         if (reps > 0) {
             try s.synchronize();
@@ -137,7 +139,7 @@ pub fn main(init: std.process.Init) !u8 {
         const groups = try gpa.alloc(exl3.Group, h.count);
         defer gpa.free(groups);
         const per = std.mem.alignForward(usize, exl3.scratchBytes(h.k, h.n, h.rows), 256);
-        for (groups, ms, 0..) |*g, m, i| g.* = .{ .m = m, .rows = h.rows, .x = base + x_off + i * h.rows * h.k * 2, .x_stride = h.k, .y = base + y_off + i * h.rows * h.n * y_elem, .y_stride = h.n, .output = output, .scratch = base + scratch_off + i * per };
+        for (groups, ms, 0..) |*g, m, i| g.* = .{ .m = m, .rows = h.rows, .x = base + x_off + i * h.rows * h.k * 2, .x_stride = h.k, .y = base + y_off + i * h.rows * h.n * y_elem, .y_stride = h.n, .output = output, .input = input, .scratch = base + scratch_off + i * per };
         var plan = try exl3.Plan.init(&ctx, s, gpa, groups);
         defer plan.deinit();
         try exl3.encode(&p, s, &plan);

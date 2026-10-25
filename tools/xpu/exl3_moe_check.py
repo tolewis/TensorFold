@@ -56,7 +56,7 @@ class Moe:
         ids = self.ids[i % len(self.ids)]
         g, u, d = self.tabs
         ev = [self.p.exl3_moe_gate_up(self.e.q, (self.I // 128 * self.P * 128, self.slots), (128, 1), self.base, g, u, ids,
-                                      u32(self.topk), u32(self.pairs), u32(self.shared_id), u64(self.x), u32(self.H), u64(self.gu)),
+                                      u32(self.topk), u32(self.pairs), u32(self.shared_id), u64(self.x), u32(self.H), u64(self.gu), u32(0)),
               self.p.exl3_moe_act(self.e.q, (self.I // 128 * 32, self.slots), (32, 1), self.base, g, u, d, ids, u32(self.pairs),
                                   u32(self.shared_id), u64(self.gu), u64(self.act)),
               self.p.exl3_moe_down(self.e.q, (self.H // 128 * self.PD * 128 // self.DS, self.slots), (128 // self.DS, 1), self.base,

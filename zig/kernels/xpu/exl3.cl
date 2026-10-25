@@ -18,12 +18,12 @@
 
 // One group: offsets in bytes from the base pointer of the launch. Built with -DEXL3_ABS (the Level Zero host,
 // zig/src/xpu/exl3.zig) they are device addresses and base is not read.
-// x is bf16 [rows][x_stride]; rot fp32 [rows][k] (fp16 lost 1e-3 on Sage down_proj);
-// sums fp32 [rows][n]; out fp32 or bf16 [rows][out_stride].
+// x is bf16 or (x_f16) fp16 [rows][x_stride]; rot fp32 [rows][k] (fp16 lost 1e-3 on Sage down_proj);
+// sums fp32 [rows][n]; out [rows][out_stride] in bf16 (out_type 0), fp32 (1) or fp16 (2).
 typedef struct {
     ulong trellis, suh, svh, x, rot, sums, out;
     uint k, n, halves, rows;
-    uint x_stride, out_stride, out_f32, pad;
+    uint x_stride, out_stride, out_type, x_f16;
 } exl3_desc;
 
 #ifdef EXL3_ABS
@@ -37,6 +37,15 @@ inline ushort to_bf(float f) {
     uint u = as_uint(f);
     u += 0x7fffu + ((u >> 16) & 1u);
     return (ushort)(u >> 16);
+}
+
+inline float load_x(__global const ushort *x, ulong i, uint f16) { return f16 ? vload_half(i, (__global const half *)x) : bf(x[i]); }
+
+// out[at] = y as out_type (0 bf16, 1 fp32, 2 fp16, rounded to nearest even).
+inline void store_y(__global uchar *out, ulong at, uint type, float y) {
+    if (type == 1) ((__global float *)out)[at] = y;
+    else if (type == 2) vstore_half_rte(y, at, (__global half *)out);
+    else ((__global ushort *)out)[at] = to_bf(y);
 }
 
 // Lane l holds indices l + 16 j. Four cross-lane stages, then three in the lane; fixed FP32 order.
@@ -124,7 +133,7 @@ __kernel void exl3_rotate_in(__global const uchar *base, __global const exl3_des
     float v[8];
     for (uint j = 0; j < 8; j++) {
         const uint i = blk * 128 + lane + SG * j;
-        v[j] = bf(x[i]) * vload_half(i, suh);
+        v[j] = load_x(x, i, d.x_f16) * vload_half(i, suh);
     }
     hadamard128(v, lane);
     __global float *rot = AT(float, d.rot) + (ulong)row * d.k;
@@ -233,7 +242,7 @@ __kernel void exl3_matvec(__global const uchar *base, __global const exl3_desc *
 }
 #endif
 
-// out[row][n] = (H_N sums) * svh, fp32 or bf16, for one 128 block; sums adds the ks splits in order (deterministic).
+// out[row][n] = (H_N sums) * svh in out_type, for one 128 block; sums adds the ks splits in order (deterministic).
 // Grid (N_max / 128, ROWS_max, groups).
 __attribute__((intel_reqd_sub_group_size(SG)))
 __kernel void exl3_rotate_out(__global uchar *base, __global const exl3_desc *desc, uint ks) {
@@ -251,9 +260,7 @@ __kernel void exl3_rotate_out(__global uchar *base, __global const exl3_desc *de
     for (uint j = 0; j < 8; j++) {
         const uint i = blk * 128 + lane + SG * j;
         const float y = v[j] * INV_SQRT128 * vload_half(i, svh);
-        const ulong at = (ulong)row * d.out_stride + i;
-        if (d.out_f32) AT(float, d.out)[at] = y;
-        else AT(ushort, d.out)[at] = to_bf(y);
+        store_y(AT(uchar, d.out), (ulong)row * d.out_stride + i, d.out_type, y);
     }
 }
 
@@ -263,17 +270,19 @@ __kernel void exl3_rotate_out(__global uchar *base, __global const exl3_desc *de
 // or row s (x_per_slot = 1, down), and writes out row s.
 // x, rot, sums, out are base offsets; rot, sums and out give each slot its own row. Grid (tokens * topk).
 __kernel void exl3_route(__global const exl3_desc *experts, __global const uint *ids, __global exl3_desc *desc,
-                         uint topk, ulong x, uint x_stride, uint x_per_slot, ulong rot, ulong sums, ulong out, uint out_stride, uint out_f32, uint ks) {
+                         uint topk, ulong x, uint x_stride, uint x_per_slot, ulong rot, ulong sums, ulong out, uint out_stride, uint out_type, uint ks,
+                         uint x_f16) {
     const uint s = get_global_id(0), token = s / topk;
     exl3_desc d = experts[ids[s]];
     d.rows = 1;
     d.x = x + (ulong)(x_per_slot ? s : token) * x_stride * 2;
     d.x_stride = x_stride;
+    d.x_f16 = x_f16;
     d.rot = rot + (ulong)s * d.k * 4;
     d.sums = sums + (ulong)s * d.n * 4 * ks;  // the slot's ks partial rows
     d.out_stride = out_stride;
-    d.out_f32 = out_f32;
-    d.out = out + (ulong)s * out_stride * (out_f32 ? 4 : 2);
+    d.out_type = out_type;
+    d.out = out + (ulong)s * out_stride * (out_type == 1 ? 4 : 2);
     desc[s] = d;
 }
 
@@ -352,7 +361,7 @@ inline void sums_out(float v[8], __global const float *sums, uint splits, ulong 
 __attribute__((intel_reqd_sub_group_size(SG)))
 __kernel void exl3_moe_gate_up(__global const uchar *base, __global const exl3_desc *gate, __global const exl3_desc *up,
                                __global const uint *ids, uint topk, uint pairs, uint shared_id, ulong x, uint x_stride,
-                               ulong gu) {
+                               ulong gu, uint x_f16) {
     __local float xr[2][MOE_KMAX / MOE_P];
     const uint nb = get_group_id(0) / MOE_P, p = get_group_id(0) % MOE_P, s = get_group_id(1);
     const uint q = get_sub_group_id(), c = get_sub_group_local_id();
@@ -366,7 +375,7 @@ __kernel void exl3_moe_gate_up(__global const uchar *base, __global const exl3_d
         float v[8];
         for (uint j = 0; j < 8; j++) {
             const uint at = blk * 128 + c + SG * j;
-            v[j] = bf(xs[at]) * vload_half(at, suh);
+            v[j] = load_x(xs, at, x_f16) * vload_half(at, suh);
         }
         hadamard128(v, c);
         for (uint j = 0; j < 8; j++) xr[proj][blk * 128 + c + SG * j] = v[j] * INV_SQRT128;
@@ -433,18 +442,14 @@ __kernel void exl3_moe_down(__global const uchar *base, __global const exl3_desc
     for (uint i = 0; i < MOE_DS; i++) out[(q * MOE_DS + i) * 16] = acc[i];
 }
 
-// y[s] = rotate_out of dn[s] (MOE_PD splits in order), fp32 or bf16. Grid (N / 128 * 16, slots).
+// y[s] = rotate_out of dn[s] (MOE_PD splits in order) in out_type. Grid (N / 128 * 16, slots).
 __attribute__((intel_reqd_sub_group_size(SG)))
 __kernel void exl3_moe_out(__global uchar *base, __global const exl3_desc *down, __global const uint *ids, uint pairs,
-                           uint shared_id, ulong dn, ulong y, uint y_stride, uint out_f32) {
+                           uint shared_id, ulong dn, ulong y, uint y_stride, uint out_type) {
     const uint nb = get_group_id(0), s = get_group_id(1), c = get_sub_group_local_id();
     const exl3_desc d = down[moe_expert(ids, s, pairs, shared_id)];
     float v[8];
     sums_out(v, AT(const float, dn) + (ulong)s * MOE_PD * d.n + nb * 128, MOE_PD, d.n, AT(const half, d.svh) + nb * 128, c);
-    for (uint j = 0; j < 8; j++) {
-        const ulong at = (ulong)s * y_stride + nb * 128 + c + SG * j;
-        if (out_f32) AT(float, y)[at] = v[j];
-        else AT(ushort, y)[at] = to_bf(v[j]);
-    }
+    for (uint j = 0; j < 8; j++) store_y(AT(uchar, y), (ulong)s * y_stride + nb * 128 + c + SG * j, out_type, v[j]);
 }
 #endif

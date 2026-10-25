@@ -27,12 +27,13 @@ def run(prog, work, mode, mats, rows, x, topk=0, per=0, ids=None, out_f32=1):
     return y if out_f32 else ck.from_bf16(y)
 
 
-def run_moe(prog, work, experts, shared, x, ids, topk, out_f32=1):
-    """Mode 2: experts and shared are (gate, up, down) groups; y [slots, hidden]."""
+def run_moe(prog, work, experts, shared, x, ids, topk, formats=1):
+    """Mode 2: experts and shared are (gate, up, down) groups; y [slots, hidden]. formats: output in the low byte
+    (0 bf16, 1 fp32, 2 fp16), input in the next (0 bf16 x, 1 fp16 x)."""
     tr = experts[0][0][0]
     k, n, halves = tr.shape[0] * 16, tr.shape[1] * 16, tr.shape[2] // 8
     table = experts + [shared]
-    parts = [struct.pack("<10I", MAGIC, 2, len(table), k, n, halves, x.shape[0], topk, 1, out_f32)]
+    parts = [struct.pack("<10I", MAGIC, 2, len(table), k, n, halves, x.shape[0], topk, 1, formats)]
     for ex in table:
         for tr_, suh, svh, mul1 in ex:
             ck.refuse(halves, mul1)
@@ -42,8 +43,8 @@ def run_moe(prog, work, experts, shared, x, ids, topk, out_f32=1):
     case, out = os.path.join(work, "case.bin"), os.path.join(work, "y.bin")
     open(case, "wb").write(b"".join(parts))
     subprocess.run([prog, case, out], check=True, stdout=subprocess.DEVNULL)
-    y = np.fromfile(out, np.float32 if out_f32 else np.uint16)
-    return (y if out_f32 else ck.from_bf16(y)).reshape(-1, k)
+    y = np.fromfile(out, (np.uint16, np.float32, np.float16)[formats & 0xff])
+    return (ck.from_bf16(y) if formats & 0xff == 0 else y.astype(np.float32)).reshape(-1, k)
 
 
 def main():
@@ -108,14 +109,20 @@ def main():
     shared = grp(f"{L}.shared_expert")
     moe = mc.Moe(e, 4, 2, 2)  # exl3_variants.moe: p, pd, ds
     dq = {}
-    for tokens in (1, 4):
-        x = ck.to_bf16(rng.standard_normal((tokens, 2048)).astype(np.float32))
+    for tokens, f16 in ((1, False), (4, False), (4, True)):
+        xr = rng.standard_normal((tokens, 2048)).astype(np.float32)
         ids = np.stack([rng.permutation(24)[:TOPK] for _ in range(tokens)]).astype(np.uint32)
-        y = run_moe(prog, work, sub, shared, x, ids, TOPK)
-        moe.setup(sub, shared, x, [ids], TOPK)
-        moe.launch()
-        same = (y.view(np.uint32) == moe.y_out().view(np.uint32)).all()
-        xf = ck.from_bf16(x).astype(np.float64)
+        if f16:  # the Sage loop's activations: fp16 x in, fp16 y out
+            x = xr.astype(np.float16)
+            y = run_moe(prog, work, sub, shared, x, ids, TOPK, formats=2 | 1 << 8)
+            same, xf = True, x.astype(np.float64)
+        else:
+            x = ck.to_bf16(xr)
+            y = run_moe(prog, work, sub, shared, x, ids, TOPK)
+            moe.setup(sub, shared, x, [ids], TOPK)
+            moe.launch()
+            same = (y.view(np.uint32) == moe.y_out().view(np.uint32)).all()
+            xf = ck.from_bf16(x).astype(np.float64)
         err = 0.0
         for s_ in range(y.shape[0]):
             i = int(ids.flat[s_]) if s_ < tokens * TOPK else 24
@@ -125,8 +132,11 @@ def main():
             g, u = xf[t] @ dq[i][0], xf[t] @ dq[i][1]
             yr = (g / (1 + np.exp(-g)) * u) @ dq[i][2]
             err = max(err, np.abs(y[s_] - yr).max() / np.abs(yr).max())
-        worst = max(worst, err)
-        print(f"zig fused MLP tokens={tokens} slots={y.shape[0]}: worst max|y-ref|/max|ref| = {err:.2e}, bit-exact vs PyOpenCL host: {same}")
+        if f16:
+            print(f"zig fused MLP fp16 in and out tokens={tokens}: worst max|y-ref|/max|ref| = {err:.2e} (fp16 rounding, limit 1e-3)")
+        else:
+            worst = max(worst, err)
+            print(f"zig fused MLP tokens={tokens} slots={y.shape[0]}: worst max|y-ref|/max|ref| = {err:.2e}, bit-exact vs PyOpenCL host: {same}")
         assert same and err <= 1e-3
     print(f"zig host: all cases pass, worst fp32 {worst:.2e}")
 

@@ -13,7 +13,7 @@ import exl3_ref as ref
 
 DESC = np.dtype([("trellis", "<u8"), ("suh", "<u8"), ("svh", "<u8"), ("x", "<u8"), ("rot", "<u8"), ("sums", "<u8"), ("out", "<u8"),
                  ("k", "<u4"), ("n", "<u4"), ("halves", "<u4"), ("rows", "<u4"),
-                 ("x_stride", "<u4"), ("out_stride", "<u4"), ("out_f32", "<u4"), ("pad", "<u4")])
+                 ("x_stride", "<u4"), ("out_stride", "<u4"), ("out_type", "<u4"), ("x_f16", "<u4")])
 assert DESC.itemsize == 88
 
 
