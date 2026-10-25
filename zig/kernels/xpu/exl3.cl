@@ -16,8 +16,9 @@
 #endif
 #define INV_SQRT128 0.08838834764831845f
 
-// One group: offsets in bytes from the base pointer of the launch (Level Zero passes any device address
-// as base and stores ptr - base, modulo 2^64). x is bf16 [rows][x_stride]; rot fp32 [rows][k] (fp16 lost 1e-3 on Sage down_proj);
+// One group: offsets in bytes from the base pointer of the launch. Built with -DEXL3_ABS (the Level Zero host,
+// zig/src/xpu/exl3.zig) they are device addresses and base is not read.
+// x is bf16 [rows][x_stride]; rot fp32 [rows][k] (fp16 lost 1e-3 on Sage down_proj);
 // sums fp32 [rows][n]; out fp32 or bf16 [rows][out_stride].
 typedef struct {
     ulong trellis, suh, svh, x, rot, sums, out;
@@ -25,7 +26,11 @@ typedef struct {
     uint x_stride, out_stride, out_f32, pad;
 } exl3_desc;
 
+#ifdef EXL3_ABS
+#define AT(T, off) ((__global T *)(off))
+#else
 #define AT(T, off) ((__global T *)(base + (off)))
+#endif
 
 inline float bf(ushort v) { return as_float((uint)v << 16); }
 inline ushort to_bf(float f) {
