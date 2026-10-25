@@ -12,6 +12,8 @@ const alloc = std.heap.c_allocator;
 
 /// Rows of one forward (sage.WINDOW): a plan a row count, built once.
 pub const WINDOW = 16;
+/// Rows of one prompt chunk (sage.CHUNK): one plan of this size serves every chunk length (exl3.encodeRows).
+pub const CHUNK = 512;
 /// The shared expert's index in the expert tables: after the routed experts.
 fn sharedIndex(experts: u32) u32 {
     return experts;
@@ -99,6 +101,8 @@ const Layer = struct {
     down: exl3.Plan,
     in_plans: [WINDOW]exl3.Plan = undefined,
     out_plans: [WINDOW]exl3.Plan = undefined,
+    in_chunk: exl3.Plan = undefined,
+    out_chunk: exl3.Plan = undefined,
 };
 
 /// The runner's buffers the plans read and write (sage.Acts), and the sizes their strides need.
@@ -109,6 +113,10 @@ pub const Bind = struct {
     logits: *anyopaque,
     mids: *anyopaque,
     my: *anyopaque,
+    /// The runner's expert sort of a prompt chunk: slots by expert, uint4 tiles, the tile count.
+    morder: *anyopaque,
+    mtiles: *anyopaque,
+    mnt: *anyopaque,
     hidden: u32,
     vocab: u32,
     gdn_in: u32,
@@ -128,6 +136,9 @@ pub const Weights = struct {
     head_base: u64,
     lm_head: Mat,
     head_plans: [WINDOW]exl3.Plan = undefined,
+    /// A chunk's last row of h, for lm_head.
+    head_row: u64 = 0,
+    head_chunk: exl3.Plan = undefined,
     scratch: [3]u64 = .{ 0, 0, 0 },
     moe_scratch: u64 = 0,
     b: Bind = undefined,
@@ -213,13 +224,15 @@ pub const Weights = struct {
         var need: [3]usize = .{ 0, 0, 0 };
         for (w.layers) |l| {
             for (l.mixer_in, 0..) |m, j| if (l.attn or j < 2) {
-                need[j] = @max(need[j], exl3.scratchBytes(m.k, m.n, WINDOW));
+                need[j] = @max(need[j], exl3.scratchBytes(m.k, m.n, WINDOW), exl3.promptScratchBytes(m.k, m.n, CHUNK));
             };
-            need[0] = @max(need[0], exl3.scratchBytes(l.mixer_out.k, l.mixer_out.n, WINDOW));
+            need[0] = @max(need[0], exl3.scratchBytes(l.mixer_out.k, l.mixer_out.n, WINDOW), exl3.promptScratchBytes(l.mixer_out.k, l.mixer_out.n, CHUNK));
         }
         need[0] = @max(need[0], exl3.scratchBytes(w.lm_head.k, w.lm_head.n, 1));
         for (&w.scratch, need) |*sc, n| sc.* = @intFromPtr(try d.alloc_(n));
-        w.moe_scratch = @intFromPtr(try d.alloc_(exl3.moeScratchBytes(b.hidden, w.layers[0].gate.n_max, WINDOW * (b.top_k + 1))));
+        const ff = w.layers[0].gate.n_max;
+        w.moe_scratch = @intFromPtr(try d.alloc_(@max(exl3.moeScratchBytes(b.hidden, ff, WINDOW * (b.top_k + 1)), exl3.moeTileScratchBytes(b.hidden, ff, CHUNK * (b.top_k + 1)))));
+        w.head_row = @intFromPtr(try d.alloc_(b.hidden * 2));
         const h: u64 = @intFromPtr(b.h);
         const p: u64 = @intFromPtr(b.p);
         for (w.layers) |*l| {
@@ -237,15 +250,26 @@ pub const Weights = struct {
                 const mo = l.mixer_out;
                 l.out_plans[t] = try exl3.Plan.init(&w.ctx, s, alloc, &.{.{ .m = mo.on(l.base), .rows = rows, .x = h, .x_stride = mo.k, .y = @intFromPtr(b.r), .y_stride = b.hidden, .output = .f16, .input = .f16, .scratch = w.scratch[0] }});
             }
+            var gs: [3]exl3.Group = undefined;
+            var y = p;
+            const count: usize = if (l.attn) 3 else 2;
+            for (l.mixer_in[0..count], gs[0..count], 0..) |m, *g, j| {
+                g.* = .{ .m = m.on(l.base), .rows = CHUNK, .x = h, .x_stride = b.hidden, .y = y, .y_stride = stride, .output = .f16, .input = .f16, .scratch = w.scratch[j] };
+                y += @as(u64, m.n) * 2;
+            }
+            l.in_chunk = try exl3.Plan.init(&w.ctx, s, alloc, gs[0..count]);
+            const mo = l.mixer_out;
+            l.out_chunk = try exl3.Plan.init(&w.ctx, s, alloc, &.{.{ .m = mo.on(l.base), .rows = CHUNK, .x = h, .x_stride = mo.k, .y = @intFromPtr(b.r), .y_stride = b.hidden, .output = .f16, .input = .f16, .scratch = w.scratch[0] }});
         }
         // lm_head reads the window's last row only
+        w.head_chunk = try exl3.Plan.init(&w.ctx, s, alloc, &.{.{ .m = w.lm_head.on(w.head_base), .rows = 1, .x = w.head_row, .x_stride = b.hidden, .y = @intFromPtr(b.logits), .y_stride = b.vocab, .output = .f16, .input = .f16, .scratch = w.scratch[0] }});
         for (&w.head_plans, 0..) |*hp, t| hp.* = try exl3.Plan.init(&w.ctx, s, alloc, &.{.{ .m = w.lm_head.on(w.head_base), .rows = 1, .x = h + t * b.hidden * 2, .x_stride = b.hidden, .y = @intFromPtr(b.logits), .y_stride = b.vocab, .output = .f16, .input = .f16, .scratch = w.scratch[0] }});
     }
 
     /// h (the input norm) to the mixer's input projections in p: the EXL3 groups, then GDN's dense a and b gates.
     pub fn mixerIn(w: *const Weights, d: *Dev, i: usize, T: u32) !void {
         const l = &w.layers[i];
-        try exl3.encode(&w.p, w.stream(), &l.in_plans[T - 1]);
+        if (T > WINDOW) try exl3.encodeRows(&w.p, w.stream(), &l.in_chunk, T) else try exl3.encode(&w.p, w.stream(), &l.in_plans[T - 1]);
         if (!l.attn) {
             const ab: *anyopaque = @ptrFromInt(l.ab);
             try d.launch(d.k.dense_rows, .{ .x = (T + 15) / 16, .y = w.b.ab_rows / 16 }, .{ w.b.h, ab, w.b.p, @as(i32, @intCast(T)), @as(i32, @intCast(w.b.gdn_in)), @as(i32, @intCast(w.b.ab_col)) });
@@ -254,13 +278,21 @@ pub const Weights = struct {
 
     /// h (the mixer's gated output) to r.
     pub fn mixerOut(w: *const Weights, i: usize, T: u32) !void {
-        try exl3.encode(&w.p, w.stream(), &w.layers[i].out_plans[T - 1]);
+        const l = &w.layers[i];
+        if (T > WINDOW) try exl3.encodeRows(&w.p, w.stream(), &l.out_chunk, T) else try exl3.encode(&w.p, w.stream(), &l.out_plans[T - 1]);
     }
 
-    /// Every pick and the shared expert of T rows: h to my (fp32, the runner's combine order).
-    pub fn moe(w: *const Weights, i: usize, T: u32) !void {
+    /// Every pick and the shared expert of T rows: h to my (fp32, the runner's combine order). Prompt chunks (more than
+    /// WINDOW rows) run as expert tiles over the runner's sort (at most tile_bound tiles).
+    pub fn moe(w: *const Weights, i: usize, T: u32, tile_bound: u32) !void {
         const l = &w.layers[i];
-        try exl3.encodeMoe(&w.p, w.stream(), &l.gate, &l.up, &l.down, .{
+        const r = w.route(T);
+        if (T > WINDOW) return exl3.encodeMoeTiles(&w.p, w.stream(), &l.gate, &l.up, &l.down, .{ .route = r, .order = @intFromPtr(w.b.morder), .tiles = @intFromPtr(w.b.mtiles), .ntiles = @intFromPtr(w.b.mnt), .tile_bound = tile_bound });
+        try exl3.encodeMoe(&w.p, w.stream(), &l.gate, &l.up, &l.down, r);
+    }
+
+    fn route(w: *const Weights, T: u32) exl3.MoeRoute {
+        return .{
             .ids = @intFromPtr(w.b.mids),
             .tokens = T,
             .topk = w.b.top_k,
@@ -272,11 +304,14 @@ pub const Weights = struct {
             .output = .f32,
             .input = .f16,
             .scratch = w.moe_scratch,
-        });
+        };
     }
 
     /// The final norm's last row (of T) to fp16 logits.
-    pub fn head(w: *const Weights, T: u32) !void {
-        try exl3.encode(&w.p, w.stream(), &w.head_plans[T - 1]);
+    pub fn head(w: *const Weights, d: *Dev, T: u32) !void {
+        if (T <= WINDOW) return exl3.encode(&w.p, w.stream(), &w.head_plans[T - 1]);
+        const h: [*]u8 = @ptrCast(w.b.h);
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, @ptrFromInt(w.head_row), h + (T - 1) * w.b.hidden * 2, w.b.hidden * 2, null, 0, null));
+        try exl3.encode(&w.p, w.stream(), &w.head_chunk);
     }
 };

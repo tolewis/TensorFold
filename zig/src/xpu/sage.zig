@@ -350,7 +350,7 @@ pub const Runner = struct {
         r.model = try load(d, &r.ckpt, z, ctx);
         q.prof.on = std.c.getenv("XPU_PROFILE") != null; // not during the load
         r.acts = try Acts.init(d, z, ctx);
-        if (r.model.x3) |w| try w.bind(d, .{ .h = r.acts.h, .p = r.acts.p, .r = r.acts.r, .logits = r.acts.logits, .mids = r.acts.mids, .my = r.acts.my, .hidden = z.s.hidden, .vocab = z.s.vocab, .gdn_in = z.gdn_in, .att_in = z.att_in, .top_k = z.s.top_k, .experts = z.s.experts, .ab_col = z.nconv + z.vd, .ab_rows = 2 * z.s.gdn_v_heads });
+        if (r.model.x3) |w| try w.bind(d, .{ .h = r.acts.h, .p = r.acts.p, .r = r.acts.r, .logits = r.acts.logits, .mids = r.acts.mids, .my = r.acts.my, .morder = r.acts.morder, .mtiles = r.acts.mtiles, .mnt = r.acts.mnt, .hidden = z.s.hidden, .vocab = z.s.vocab, .gdn_in = z.gdn_in, .att_in = z.att_in, .top_k = z.s.top_k, .experts = z.s.experts, .ab_col = z.nconv + z.vd, .ab_rows = 2 * z.s.gdn_v_heads });
         try r.reset();
         return r;
     }
@@ -379,7 +379,7 @@ pub const Runner = struct {
     pub fn prompt(r: *Runner, ids: []const i32) !void {
         var at: usize = 0;
         while (at < ids.len) {
-            const n = @min(@as(usize, if (r.model.x3 != null) WINDOW else CHUNK), ids.len - at); // EXL3: decode windows until P3.4
+            const n = @min(CHUNK, ids.len - at);
             const tail = at + n == ids.len;
             r.last = if (n > WINDOW) try r.chunk(ids[at..][0..n], tail) else try r.forward(ids[at..][0..n], tail);
             at += n;
@@ -462,18 +462,21 @@ pub const Runner = struct {
         const zero: i32 = 0;
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.ids, ids.ptr, ids.len * 4, null, 0, null));
         errdefer d.settle();
-        try d.launch(d.k.embed, .{ .x = T }, .{ a.ids, m.embed_w, m.embed_s, m.embed_b, a.x, D });
+        if (m.x3 != null)
+            try d.launch(d.k.embed_dense, .{ .x = T }, .{ a.ids, m.embed_w, a.x, D })
+        else
+            try d.launch(d.k.embed, .{ .x = T }, .{ a.ids, m.embed_w, m.embed_s, m.embed_b, a.x, D });
         for (m.layers, 0..) |*l, i| {
             try d.launch(d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.in_norm, a.h, a.ahi, a.alo, D, EPS, @as(i32, if (i == 0) 0 else 1), gs, nul, nul, zero, zero });
-            try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_in, a.p, T);
+            if (m.x3) |w| try w.mixerIn(d, i, T) else try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_in, a.p, T);
             if (l.attn) {
                 const p0: i32 = @intCast(r.pos);
                 try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, p0, EPS, nul, nul, nul, zero, zero });
                 try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p0, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0) });
                 try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo, gs, zero, nul, nul, zero });
             }
-            const pin = l.mixer_in.n;
-            const hk = l.mixer_out.k;
+            const pin = if (m.x3 != null) z.gdn_in else l.mixer_in.n;
+            const hk = if (m.x3 != null) z.vd else l.mixer_out.k;
             var j: u32 = 0;
             while (!l.attn and j < T) : (j += WINDOW) {
                 const w = @min(WINDOW, T - j);
@@ -489,7 +492,7 @@ pub const Runner = struct {
                 try d.launch(d.k.gdn_step, .{ .x = 16, .y = s.gdn_v_heads, .z = 1 }, .{ a.q, a.k, a.v, a.g, a.beta, l.rec.?, l.rec.?, a.y, w32, nul, nul, nul, nul });
                 try d.launch(d.k.gated_norm, .{ .x = w }, .{ a.y, pj, l.gnorm.?, hj, hij, loj, EPS, gs, zero, nul, nul, zero });
             }
-            try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_out, a.r, T);
+            if (m.x3) |w| try w.mixerOut(i, T) else try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_out, a.r, T);
             try d.launch(d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, D, EPS, @as(i32, 1), gs, nul, nul, zero, zero });
             try r.moe(l, i, T);
         }
@@ -530,7 +533,7 @@ pub const Runner = struct {
         try d.launch(d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, m.norm, a.h, a.ahi, a.alo, D, EPS, @as(i32, 1), hgs, nul, nul, zero, zero });
         const first = T - 1;
         const kg = s.hidden / @as(u32, @intCast(hgs));
-        if (m.x3) |w| try w.head(T) else try fwd.gemm(d, a.pscr, off(a.h, first * s.hidden * 2), off(a.ahi, first * kg * 2), off(a.alo, first * kg * 2), m.head, a.logits, 1);
+        if (m.x3) |w| try w.head(d, T) else try fwd.gemm(d, a.pscr, off(a.h, first * s.hidden * 2), off(a.ahi, first * kg * 2), off(a.alo, first * kg * 2), m.head, a.logits, 1);
         try d.launch(d.k.argmax_part, .{ .x = 256, .y = 1 }, .{ a.logits, @as(i32, @intCast(s.vocab)), a.pv, a.pi });
         try d.launch(d.k.argmax, .{ .x = 1 }, .{ a.pv, a.pi, a.tok });
         var tok: [1]i32 = undefined;
@@ -551,7 +554,8 @@ pub const Runner = struct {
             try d.launch(r.mk.router, .{ .x = s.experts + 1, .y = T }, .{ a.h, l.router, l.shared_gate, a.mlog, s.hidden });
         try d.launch(r.mk.route, .{ .x = T }, .{ a.mlog, a.mids, a.mwts, a.msw, s.experts, s.top_k });
         if (r.model.x3) |w| {
-            try w.moe(i, T);
+            if (T > WINDOW) try d.launch(r.mk.sort, .{ .x = 1 }, .{ a.mids, a.morder, a.mtiles, a.mnt, s.experts, pairs, T });
+            try w.moe(i, T, tileBound(s, T));
             try d.launch(r.mk.combine, .{ .x = s.hidden / 64, .y = T }, .{ a.my, a.mwts, a.msw, a.r, s.hidden, s.top_k, pairs });
             return;
         }
