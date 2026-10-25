@@ -554,8 +554,7 @@ pub const Runner = struct {
             try d.launch(r.mk.router, .{ .x = s.experts + 1, .y = T }, .{ a.h, l.router, l.shared_gate, a.mlog, s.hidden });
         try d.launch(r.mk.route, .{ .x = T }, .{ a.mlog, a.mids, a.mwts, a.msw, s.experts, s.top_k });
         if (r.model.x3) |w| {
-            if (T > WINDOW) try d.launch(r.mk.sort, .{ .x = 1 }, .{ a.mids, a.morder, a.mtiles, a.mnt, s.experts, pairs, T });
-            try w.moe(i, T, tileBound(s, T));
+            try w.moe(i, T);
             try d.launch(r.mk.combine, .{ .x = s.hidden / 64, .y = T }, .{ a.my, a.mwts, a.msw, a.r, s.hidden, s.top_k, pairs });
             return;
         }

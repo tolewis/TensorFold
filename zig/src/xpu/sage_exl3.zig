@@ -113,7 +113,7 @@ pub const Bind = struct {
     logits: *anyopaque,
     mids: *anyopaque,
     my: *anyopaque,
-    /// The runner's expert sort of a prompt chunk: slots by expert, uint4 tiles, the tile count.
+    /// Sort buffers of a prompt chunk: slots by expert, uint4 tiles (exl3.tileBound of CHUNK), the tile count.
     morder: *anyopaque,
     mtiles: *anyopaque,
     mnt: *anyopaque,
@@ -283,11 +283,11 @@ pub const Weights = struct {
     }
 
     /// Every pick and the shared expert of T rows: h to my (fp32, the runner's combine order). Prompt chunks (more than
-    /// WINDOW rows) run as expert tiles over the runner's sort (at most tile_bound tiles).
-    pub fn moe(w: *const Weights, i: usize, T: u32, tile_bound: u32) !void {
+    /// WINDOW rows) run as expert tiles, sorted into the runner's sort buffers.
+    pub fn moe(w: *const Weights, i: usize, T: u32) !void {
         const l = &w.layers[i];
         const r = w.route(T);
-        if (T > WINDOW) return exl3.encodeMoeTiles(&w.p, w.stream(), &l.gate, &l.up, &l.down, .{ .route = r, .order = @intFromPtr(w.b.morder), .tiles = @intFromPtr(w.b.mtiles), .ntiles = @intFromPtr(w.b.mnt), .tile_bound = tile_bound });
+        if (T > WINDOW) return exl3.encodeMoeTiles(&w.p, w.stream(), &l.gate, &l.up, &l.down, .{ .route = r, .order = @intFromPtr(w.b.morder), .tiles = @intFromPtr(w.b.mtiles), .ntiles = @intFromPtr(w.b.mnt) });
         try exl3.encodeMoe(&w.p, w.stream(), &l.gate, &l.up, &l.down, r);
     }
 
