@@ -1,5 +1,5 @@
-//! Sage-A1.5 (qwen3_5_moe, 35B-A3B) on Intel Xe2 over Level Zero, first form: MLX affine 4/64 weights, decode kernels
-//! only (prompts go through in windows of at most 16 rows), one sequence. It reuses the 27B's device layer, loaders and
+//! Sage-A1.5 (qwen3_5_moe, 35B-A3B) on Intel Xe2 over Level Zero, first form: MLX affine 4/64 or EXL3 weights
+//! (sage_exl3.zig), decode kernels only (prompts go through in windows of at most 16 rows), one sequence. It reuses the 27B's device layer, loaders and
 //! kernels, built at Sage's shape (shape.h, sage_glue and sage_decode), plus the MoE ops of sage_moe.cl.
 const std = @import("std");
 const ze = @import("ze");
@@ -10,6 +10,7 @@ const dev = @import("dev.zig");
 const loader = @import("load.zig");
 const fwd = @import("forward.zig");
 const q = @import("qwen27.zig"); // the profiler state (XPU_PROFILE) the Dev records into
+const sx = @import("sage_exl3.zig");
 const Dev = dev.Dev;
 const Checkpoint = dev.Checkpoint;
 const Proj = loader.Proj;
@@ -54,10 +55,13 @@ pub const Layer = struct {
     vc: ?*anyopaque = null,
 };
 
+/// EXL3 checkpoints: embed_w is an fp16 table (embed_dense); the layers' mixer projections, experts and the head
+/// are in x3, and those fields of Layer and Model are not set.
 pub const Model = struct {
     embed_w: *anyopaque,
     embed_s: *anyopaque,
     embed_b: *anyopaque,
+    x3: ?*sx.Weights = null,
     layers: []Layer,
     norm: *anyopaque,
     head: Proj,
@@ -159,6 +163,23 @@ fn name(comptime f: []const u8, args: anytype) []const u8 {
     return std.fmt.allocPrint(alloc, f, args) catch @panic("out of memory");
 }
 
+/// An RMSNorm weight as the kernels apply it (x * w). The MLX export stores 1 + w; a checkpoint in the Hugging Face
+/// form (EXL3) stores w, and the model applies 1 + w: add the 1 here, in fp32, rounded to bf16.
+fn normTensor(d: *Dev, c: *const Checkpoint, p: []const u8, hf: bool) !*anyopaque {
+    if (!hf) return loader.bf16Tensor(d, c, p);
+    const t = try c.get(p);
+    if (!std.mem.eql(u8, t.dtype, "BF16")) return error.UnexpectedDtype;
+    const w = try alloc.alloc(u16, t.bytes.len / 2);
+    defer alloc.free(w);
+    for (w, 0..) |*o, i| {
+        const f: f32 = @bitCast(@as(u32, std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little)) << 16);
+        var u: u32 = @bitCast(f + 1.0);
+        u += 0x7fff + ((u >> 16) & 1);
+        o.* = @intCast(u >> 16);
+    }
+    return d.upload(std.mem.sliceAsBytes(w));
+}
+
 fn halfTensor(d: *Dev, c: *const Checkpoint, p: []const u8) !*anyopaque {
     const h = try sl.halfRows(alloc, c, p);
     defer alloc.free(h);
@@ -201,14 +222,24 @@ fn experts(d: *Dev, c: *const Checkpoint, p: []const u8, count: u32, shared: boo
 /// Sage MLX-4bit checkpoint by tools/xpu/sage_mlx_check.py: stacked switch_mlp experts, 8 bit router, conv1d [NCONV, 4, 1].
 pub fn load(d: *Dev, c: *const Checkpoint, z: Sizes, ctx: u32) !Model {
     const s = z.s;
-    if (c.has("in_proj_qkv.qweight") or c.has("in_proj_qkv.trellis")) return error.OnlyMlxInThisForm;
-    const stage = try d.alloc_(800 << 20);
+    if (c.has("in_proj_qkv.qweight")) return error.OnlyMlxInThisForm;
+    const x3 = c.has("in_proj_qkv.trellis");
+    const stage = try d.alloc_(if (x3) 64 else 800 << 20);
     var m: Model = undefined;
-    m.embed_w = try d.upload((try c.get("embed_tokens.weight")).bytes);
-    m.embed_s = try loader.bf16Tensor(d, c, "embed_tokens.scales");
-    m.embed_b = try loader.bf16Tensor(d, c, "embed_tokens.biases");
-    m.norm = try loader.bf16Tensor(d, c, "model.norm.weight");
-    m.head = try loader.projection(d, c, "lm_head", &.{""}, true, false, stage);
+    m.x3 = null;
+    if (x3) {
+        m.x3 = try sx.Weights.load(d, c, s.layers, s.experts);
+        m.embed_w = try halfTensor(d, c, "embed_tokens");
+        m.embed_s = m.embed_w;
+        m.embed_b = m.embed_w;
+        m.head = undefined;
+    } else {
+        m.embed_w = try d.upload((try c.get("embed_tokens.weight")).bytes);
+        m.embed_s = try loader.bf16Tensor(d, c, "embed_tokens.scales");
+        m.embed_b = try loader.bf16Tensor(d, c, "embed_tokens.biases");
+        m.head = try loader.projection(d, c, "lm_head", &.{""}, true, false, stage);
+    }
+    m.norm = try normTensor(d, c, "model.norm.weight", x3);
     var invf: [32]f32 = undefined;
     const half_dims: f64 = @floatFromInt(s.rope_dims / 2);
     for (&invf, 0..) |*f, i| f.* = @floatCast(std.math.pow(f64, 1e7, -@as(f64, @floatFromInt(i)) / half_dims));
@@ -219,28 +250,32 @@ pub fn load(d: *Dev, c: *const Checkpoint, z: Sizes, ctx: u32) !Model {
         const p = name("model.layers.{d}.", .{i});
         const attn = (i + 1) % 4 == 0;
         l.* = .{
-            .in_norm = try loader.bf16Tensor(d, c, name("{s}input_layernorm.weight", .{p})),
-            .post_norm = try loader.bf16Tensor(d, c, name("{s}post_attention_layernorm.weight", .{p})),
+            .in_norm = try normTensor(d, c, name("{s}input_layernorm.weight", .{p}), x3),
+            .post_norm = try normTensor(d, c, name("{s}post_attention_layernorm.weight", .{p}), x3),
             .attn = attn,
             .mixer_in = undefined,
             .mixer_out = undefined,
             .router = try halfTensor(d, c, name("{s}mlp.gate", .{p})),
             .shared_gate = try halfTensor(d, c, name("{s}mlp.shared_expert_gate", .{p})),
-            .experts = try experts(d, c, p, s.experts, false, s.expert_ff, s.hidden),
-            .shared = try experts(d, c, p, 1, true, s.shared_ff, s.hidden),
+            .experts = if (x3) undefined else try experts(d, c, p, s.experts, false, s.expert_ff, s.hidden),
+            .shared = if (x3) undefined else try experts(d, c, p, 1, true, s.shared_ff, s.hidden),
         };
         if (attn) {
-            l.mixer_in = try loader.projection(d, c, name("{s}self_attn.", .{p}), &.{ "q_proj", "k_proj", "v_proj" }, true, false, stage);
-            l.mixer_out = try loader.projection(d, c, name("{s}self_attn.", .{p}), &.{"o_proj"}, false, false, stage);
-            if (l.mixer_in.n != z.att_in) return error.UnexpectedShape;
-            l.qn = try loader.bf16Tensor(d, c, name("{s}self_attn.q_norm.weight", .{p}));
-            l.kn = try loader.bf16Tensor(d, c, name("{s}self_attn.k_norm.weight", .{p}));
+            if (!x3) {
+                l.mixer_in = try loader.projection(d, c, name("{s}self_attn.", .{p}), &.{ "q_proj", "k_proj", "v_proj" }, true, false, stage);
+                l.mixer_out = try loader.projection(d, c, name("{s}self_attn.", .{p}), &.{"o_proj"}, false, false, stage);
+                if (l.mixer_in.n != z.att_in) return error.UnexpectedShape;
+            }
+            l.qn = try normTensor(d, c, name("{s}self_attn.q_norm.weight", .{p}), x3);
+            l.kn = try normTensor(d, c, name("{s}self_attn.k_norm.weight", .{p}), x3);
             l.kc = try d.alloc_(kv_bytes);
             l.vc = try d.alloc_(kv_bytes);
         } else {
-            l.mixer_in = try loader.projection(d, c, name("{s}linear_attn.", .{p}), &.{ "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b" }, true, false, stage);
-            l.mixer_out = try loader.projection(d, c, name("{s}linear_attn.", .{p}), &.{"out_proj"}, false, false, stage);
-            if (l.mixer_in.n != z.gdn_in) return error.UnexpectedShape;
+            if (!x3) {
+                l.mixer_in = try loader.projection(d, c, name("{s}linear_attn.", .{p}), &.{ "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b" }, true, false, stage);
+                l.mixer_out = try loader.projection(d, c, name("{s}linear_attn.", .{p}), &.{"out_proj"}, false, false, stage);
+                if (l.mixer_in.n != z.gdn_in) return error.UnexpectedShape;
+            }
             l.conv_w = try loader.bf16Tensor(d, c, name("{s}linear_attn.conv1d.weight", .{p}));
             l.alog = try loader.bf16Tensor(d, c, name("{s}linear_attn.A_log", .{p}));
             l.dt = try loader.bf16Tensor(d, c, name("{s}linear_attn.dt_bias", .{p}));
@@ -252,7 +287,7 @@ pub fn load(d: *Dev, c: *const Checkpoint, z: Sizes, ctx: u32) !Model {
     }
     try d.sync();
     d.g.free(stage);
-    d.allocated -= 800 << 20;
+    d.allocated -= if (x3) 64 else 800 << 20;
     return m;
 }
 
@@ -290,6 +325,7 @@ pub const Runner = struct {
         r.model = try load(d, &r.ckpt, z, ctx);
         q.prof.on = std.c.getenv("XPU_PROFILE") != null; // not during the load
         r.acts = try Acts.init(d, z, ctx);
+        if (r.model.x3) |w| try w.bind(d, .{ .h = r.acts.h, .p = r.acts.p, .r = r.acts.r, .logits = r.acts.logits, .mids = r.acts.mids, .my = r.acts.my, .hidden = z.s.hidden, .vocab = z.s.vocab, .gdn_in = z.gdn_in, .att_in = z.att_in, .top_k = z.s.top_k, .experts = z.s.experts, .ab_col = z.nconv + z.vd, .ab_rows = 2 * z.s.gdn_v_heads });
         try r.reset();
         return r;
     }
@@ -353,10 +389,13 @@ pub const Runner = struct {
         const zero: i32 = 0;
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.ids, ids.ptr, ids.len * 4, null, 0, null));
         errdefer d.settle();
-        try d.launch(d.k.embed, .{ .x = T }, .{ a.ids, m.embed_w, m.embed_s, m.embed_b, a.x, D });
+        if (m.x3 != null)
+            try d.launch(d.k.embed_dense, .{ .x = T }, .{ a.ids, m.embed_w, a.x, D })
+        else
+            try d.launch(d.k.embed, .{ .x = T }, .{ a.ids, m.embed_w, m.embed_s, m.embed_b, a.x, D });
         for (m.layers, 0..) |*l, i| {
             try d.launch(d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.in_norm, a.h, a.ahi, a.alo, D, EPS, @as(i32, if (i == 0) 0 else 1), gs, nul, nul, zero, zero });
-            try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_in, a.p, T);
+            if (m.x3) |w| try w.mixerIn(d, i, T) else try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_in, a.p, T);
             if (l.attn) {
                 const ns: u32 = (r.pos + T + SPLIT - 1) / SPLIT;
                 try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, p0, EPS, nul, nul, nul, zero, zero });
@@ -371,20 +410,20 @@ pub const Runner = struct {
                 try d.launch(d.k.gdn_step, .{ .x = 16, .y = s.gdn_v_heads, .z = 1 }, .{ a.q, a.k, a.v, a.g, a.beta, l.rec.?, l.rec.?, a.y, t32, nul, nul, nul, nul });
                 try d.launch(d.k.gated_norm, .{ .x = T }, .{ a.y, a.p, l.gnorm.?, a.h, a.ahi, a.alo, EPS, gs, zero, nul, nul, zero });
             }
-            try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_out, a.r, T);
+            if (m.x3) |w| try w.mixerOut(i, T) else try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_out, a.r, T);
             try d.launch(d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, D, EPS, @as(i32, 1), gs, nul, nul, zero, zero });
-            try r.moe(l, T);
+            try r.moe(l, i, T);
         }
         r.pos += T;
         if (!want) {
             try d.sync();
             return -1;
         }
-        const hgs: i32 = @intCast(m.head.gs);
+        const hgs: i32 = if (m.x3 != null) 64 else @intCast(m.head.gs);
         try d.launch(d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, m.norm, a.h, a.ahi, a.alo, D, EPS, @as(i32, 1), hgs, nul, nul, zero, zero });
         const first = T - 1;
-        const kg = s.hidden / m.head.gs;
-        try fwd.gemm(d, a.pscr, off(a.h, first * s.hidden * 2), off(a.ahi, first * kg * 2), off(a.alo, first * kg * 2), m.head, a.logits, 1);
+        const kg = s.hidden / @as(u32, @intCast(hgs));
+        if (m.x3) |w| try w.head(T) else try fwd.gemm(d, a.pscr, off(a.h, first * s.hidden * 2), off(a.ahi, first * kg * 2), off(a.alo, first * kg * 2), m.head, a.logits, 1);
         try d.launch(d.k.argmax_part, .{ .x = 256, .y = 1 }, .{ a.logits, @as(i32, @intCast(s.vocab)), a.pv, a.pi });
         try d.launch(d.k.argmax, .{ .x = 1 }, .{ a.pv, a.pi, a.tok });
         var tok: [1]i32 = undefined;
@@ -394,13 +433,18 @@ pub const Runner = struct {
     }
 
     /// The MoE block of `T` rows: h (the post-attention norm) to r (its output, the residual's next addend).
-    fn moe(r: *Runner, l: *const Layer, T: u32) !void {
+    fn moe(r: *Runner, l: *const Layer, i: usize, T: u32) !void {
         const d = &r.d;
         const a = &r.acts;
         const s = r.z.s;
         const pairs = T * s.top_k;
         try d.launch(r.mk.router, .{ .x = s.experts + 1, .y = T }, .{ a.h, l.router, l.shared_gate, a.mlog, s.hidden });
         try d.launch(r.mk.route, .{ .x = T }, .{ a.mlog, a.mids, a.mwts, a.msw, s.experts, s.top_k });
+        if (r.model.x3) |w| {
+            try w.moe(i, T);
+            try d.launch(r.mk.combine, .{ .x = s.hidden / 64, .y = T }, .{ a.my, a.mwts, a.msw, a.r, s.hidden, s.top_k, pairs });
+            return;
+        }
         if (s.expert_ff != s.shared_ff) return error.SharedWidthNotWired; // one act stride for both (Sage: 512, 512)
         try d.launch(r.mk.swiglu, .{ .x = s.expert_ff, .y = pairs + T }, .{ l.experts.gu_w, l.experts.gu_s, l.experts.gu_b, l.shared.gu_w, l.shared.gu_s, l.shared.gu_b, a.h, a.mids, a.mact, s.hidden, s.expert_ff, s.top_k, pairs });
         try d.launch(r.mk.down, .{ .x = s.hidden, .y = pairs + T }, .{ l.experts.dn_w, l.experts.dn_s, l.experts.dn_b, l.shared.dn_w, l.shared.dn_s, l.shared.dn_b, a.mact, a.mids, a.my, s.hidden, s.expert_ff, pairs });
