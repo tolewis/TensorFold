@@ -110,6 +110,7 @@ pub fn descriptor(g: Group) !Desc {
 }
 
 const local_rotate = [3]u32{ 16, 1, 1 };
+const local_rotate_out = [3]u32{ 16, 8, 1 }; // exl3.cl RO_PARTS sub-groups a block
 const local_matvec = [3]u32{ 128, 1, 1 };
 
 /// The four kernels of a fused routed MLP image (exl3_variants.moe).
@@ -155,7 +156,7 @@ pub const Pipelines = struct {
         errdefer p.base.unload();
         p.rotate_in = try p.base.kernel("exl3_rotate_in", local_rotate);
         errdefer p.rotate_in.deinit();
-        p.rotate_out = try p.base.kernel("exl3_rotate_out", local_rotate);
+        p.rotate_out = try p.base.kernel("exl3_rotate_out", local_rotate_out);
         errdefer p.rotate_out.deinit();
         p.route = try p.base.kernel("exl3_route", .{ 1, 1, 1 }); // one work-item a slot, no bound check in the kernel
         errdefer p.route.deinit();

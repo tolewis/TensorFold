@@ -242,20 +242,28 @@ __kernel void exl3_matvec(__global const uchar *base, __global const exl3_desc *
 }
 #endif
 
-// out[row][n] = (H_N sums) * svh in out_type, for one 128 block; sums adds the ks splits in order (deterministic).
-// Grid (N_max / 128, ROWS_max, groups).
-__attribute__((intel_reqd_sub_group_size(SG)))
+// out[row][n] = (H_N sums) * svh in out_type, for one 128 block. Sub-group p of RO_PARTS adds splits p, p + RO_PARTS,
+// ... in order; sub-group 0 then adds the parts in order (deterministic). One sub-group for all 16 splits of a narrow
+// launch (N 2048) took longer than its matvec. Work-groups (N_max / 128, ROWS_max, groups) of SG x RO_PARTS.
+#define RO_PARTS 8
+__attribute__((intel_reqd_sub_group_size(SG))) __attribute__((reqd_work_group_size(SG, RO_PARTS, 1)))
 __kernel void exl3_rotate_out(__global uchar *base, __global const exl3_desc *desc, uint ks) {
+    __local float part[RO_PARTS - 1][128];
     const exl3_desc d = desc[get_group_id(2)];
-    const uint blk = get_group_id(0), row = get_group_id(1), lane = get_sub_group_local_id();
-    if (blk * 128 >= d.n || row >= d.rows) return;
-    __global const float *sums = AT(const float, d.sums) + (ulong)row * d.n;
+    const uint blk = get_group_id(0), row = get_group_id(1), lane = get_sub_group_local_id(), p = get_local_id(1);
+    if (blk * 128 >= d.n || row >= d.rows) return;  // the whole work-group
+    __global const float *sums = AT(const float, d.sums) + (ulong)row * d.n + blk * 128 + lane;
     __global const half *svh = AT(const half, d.svh);
     float v[8];
     for (uint j = 0; j < 8; j++) {
-        v[j] = sums[blk * 128 + lane + SG * j];
-        for (uint z = 1; z < ks; z++) v[j] += sums[(ulong)z * d.rows * d.n + blk * 128 + lane + SG * j];
+        v[j] = 0.0f;
+        for (uint z = p; z < ks; z += RO_PARTS) v[j] += sums[(ulong)z * d.rows * d.n + SG * j];
     }
+    if (p) for (uint j = 0; j < 8; j++) part[p - 1][lane + SG * j] = v[j];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (p) return;
+    for (uint q = 0; q < RO_PARTS - 1; q++)
+        for (uint j = 0; j < 8; j++) v[j] += part[q][lane + SG * j];
     hadamard128(v, lane);
     for (uint j = 0; j < 8; j++) {
         const uint i = blk * 128 + lane + SG * j;

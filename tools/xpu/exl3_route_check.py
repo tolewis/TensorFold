@@ -43,7 +43,7 @@ def main():
             mv = e.matvec(w // 16, 1, ns)
             e.p.exl3_rotate_in(e.q, (k // 128 * 16, 1, slots), (16, 1, 1), base, db)
             mv(e.q, ((n // 16 // ns * 16 + 127) // 128 * 128, slots, ks), (128, 1, 1), base, db, np.uint32(ks))
-            e.p.exl3_rotate_out(e.q, (n // 128 * 16, 1, slots), (16, 1, 1), base, db, np.uint32(ks))
+            e.p.exl3_rotate_out(e.q, (n // 128 * 16, 8, slots), (16, 8, 1), base, db, np.uint32(ks))
             e.q.finish()
             y = ar.read(e.q, oo, (tokens, TOPK, n), np.float32)
             worst, cache = 0.0, {}
