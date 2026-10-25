@@ -92,8 +92,9 @@ inline uint mapped_state(__global const ushort *tile, uint map) {
 // (float)convert_half_rte(f) to f, so an FP32 fma followed by a conversion loses the rounding.
 // exl3_mul1_check proves all 65536 states.
 inline half mul1_half(uint s) {
-    const uint h = dot_acc_sat_4x8packed_uu_uint(s * 0x83DCD12Du, 0x01010101u, 1024u);
-    return fma((half)h, as_half((ushort)0x1EEE), as_half((ushort)0xC931));
+    // 0x6400 is fp16 1024 and the sum is below 1024, so the dp4a result is already the fp16 bits of 1024 + sum.
+    const uint h = dot_acc_sat_4x8packed_uu_uint(s * 0x83DCD12Du, 0x01010101u, 0x6400u);
+    return fma(as_half((ushort)h), as_half((ushort)0x1EEE), as_half((ushort)0xC931));
 }
 inline float mul1_value(uint s) { return (float)mul1_half(s); }
 
