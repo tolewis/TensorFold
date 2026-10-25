@@ -132,9 +132,10 @@ const MoeKernels = struct {
     rot: mod.Kernel,
     tile: mod.Kernel,
     out_rows: mod.Kernel,
+    sort: mod.Kernel,
 
-    const names = [_][:0]const u8{ "exl3_moe_gate_up", "exl3_moe_act", "exl3_moe_down", "exl3_rotate_in_h", "exl3_gemm", "exl3_rotate_out_rows", "exl3_moe_rot", "exl3_moe_tile", "exl3_moe_out_rows" };
-    const locals = [_][3]u32{ .{ 128, 1, 1 }, .{ 32, 1, 1 }, .{ 128 / variants.moe.ds * variants.moe.pd, 1, 1 }, local_rotate, .{ 128, 1, 1 }, local_rotate, local_rotate, .{ 128, 1, 1 }, local_rotate };
+    const names = [_][:0]const u8{ "exl3_moe_gate_up", "exl3_moe_act", "exl3_moe_down", "exl3_rotate_in_h", "exl3_gemm", "exl3_rotate_out_rows", "exl3_moe_rot", "exl3_moe_tile", "exl3_moe_out_rows", "exl3_moe_sort" };
+    const locals = [_][3]u32{ .{ 128, 1, 1 }, .{ 32, 1, 1 }, .{ 128 / variants.moe.ds * variants.moe.pd, 1, 1 }, local_rotate, .{ 128, 1, 1 }, local_rotate, local_rotate, .{ 128, 1, 1 }, local_rotate, .{ 256, 1, 1 } };
 
     fn load(m: mod.Module) Error!MoeKernels {
         var ks: [names.len]mod.Kernel = undefined;
@@ -145,11 +146,11 @@ const MoeKernels = struct {
             done += 1;
             try k.indirect();
         }
-        return .{ .gate_up = ks[0], .act = ks[1], .down = ks[2], .rotate_in_h = ks[3], .gemm = ks[4], .rotate_out_rows = ks[5], .rot = ks[6], .tile = ks[7], .out_rows = ks[8] };
+        return .{ .gate_up = ks[0], .act = ks[1], .down = ks[2], .rotate_in_h = ks[3], .gemm = ks[4], .rotate_out_rows = ks[5], .rot = ks[6], .tile = ks[7], .out_rows = ks[8], .sort = ks[9] };
     }
 
     fn deinit(mk: *MoeKernels) void {
-        inline for (.{ &mk.gate_up, &mk.act, &mk.down, &mk.rotate_in_h, &mk.gemm, &mk.rotate_out_rows, &mk.rot, &mk.tile, &mk.out_rows }) |k| k.deinit();
+        inline for (.{ &mk.gate_up, &mk.act, &mk.down, &mk.rotate_in_h, &mk.gemm, &mk.rotate_out_rows, &mk.rot, &mk.tile, &mk.out_rows, &mk.sort }) |k| k.deinit();
     }
 };
 
@@ -484,17 +485,21 @@ pub fn encodeRows(p: *const Pipelines, s: Stream, plan: *const Plan, rows: u32) 
     try launch(k.rotate_out_rows, s, .{ plan.n_max / 128, rows, plan.count });
 }
 
-/// A routed MLP over prompt rows on XMX, as encodeMoe: slots sorted by expert into tiles of at most
-/// variants.moe.tile_rows slots by the caller. order holds the slots (pair p, or pairs + t for the shared expert of
-/// token t) grouped by expert; tiles are uint4 (table index, first entry of order, count, 0); ntiles[0] is their count,
-/// at most tile_bound. y and the slot numbering are those of encodeMoe.
+/// A routed MLP over prompt rows on XMX, as encodeMoe (the same y and slot numbering). exl3_moe_sort groups the slots
+/// by expert into tiles of at most variants.moe.tile_rows slots, in buffers of the caller: order u32 [slots], tiles
+/// uint4 [tileBound], ntiles u32.
 pub const MoeTiles = struct {
     route: MoeRoute,
     order: u64,
     tiles: u64,
     ntiles: u64,
-    tile_bound: u32,
 };
+
+/// The most tiles of a prompt MLP over `tables` expert table entries (the shared expert included): one partial tile an
+/// entry over the full ones.
+pub fn tileBound(slots: u32, tables: u32) u32 {
+    return slots / variants.moe.tile_rows + tables;
+}
 
 /// Scratch of the prompt MLP: gate|up rotated input [2][slots][hidden] fp32 (then the down sums [slots][hidden]),
 /// gate|up sums [slots][2][ff], the down input [slots][ff].
@@ -510,7 +515,7 @@ pub fn moeTileScratchBytes(hidden: usize, ff: usize, slots: usize) usize {
     return tileScratch(hidden, ff, slots).size;
 }
 
-/// Five launches, no host wait: rotate gate|up input a slot, gate|up tiles, act (one split), down tiles, rotate out.
+/// Six launches, no host wait: sort, rotate gate|up input a slot, gate|up tiles, act (one split), down tiles, rotate out.
 pub fn encodeMoeTiles(p: *const Pipelines, s: Stream, gate: *const Plan, up: *const Plan, down: *const Plan, t: MoeTiles) Error!void {
     const r = t.route;
     const hidden = gate.k_max;
@@ -524,7 +529,7 @@ pub fn encodeMoeTiles(p: *const Pipelines, s: Stream, gate: *const Plan, up: *co
     const mi = std.mem.indexOfScalar(u32, &m.bits, gate.bits) orelse return error.Invalid;
     const k = p.moe[mi];
     const slots = r.slots();
-    if (slots == 0 or t.tile_bound == 0) return error.Invalid;
+    if (slots == 0) return error.Invalid;
     const pairs = r.tokens * r.topk;
     const shared = r.shared orelse 0;
     const sc = tileScratch(hidden, ff, slots);
@@ -532,6 +537,17 @@ pub fn encodeMoeTiles(p: *const Pipelines, s: Stream, gate: *const Plan, up: *co
     const order: ?*anyopaque = @ptrFromInt(t.order);
     const tiles: ?*anyopaque = @ptrFromInt(t.tiles);
     const ntiles: ?*anyopaque = @ptrFromInt(t.ntiles);
+    const tile_bound = tileBound(slots, gate.count);
+
+    try k.sort.setPtr(0, ids);
+    try k.sort.setPtr(1, order);
+    try k.sort.setPtr(2, tiles);
+    try k.sort.setPtr(3, ntiles);
+    try k.sort.setU32(4, if (r.shared) |e| e else gate.count); // no shared expert: an empty bucket past the table
+    try k.sort.setU32(5, pairs);
+    try k.sort.setU32(6, if (r.shared != null) r.tokens else 0);
+    try launch(k.sort, s, .{ 1, 1, 1 });
+
     const tile_x = struct {
         fn f(n: u32) u32 {
             return std.math.divCeil(u32, n / 16 / m.tile_ns, 8) catch unreachable; // work-groups of 8 sub-groups
@@ -563,7 +579,7 @@ pub fn encodeMoeTiles(p: *const Pipelines, s: Stream, gate: *const Plan, up: *co
     try setU64(k.tile, 8, r.scratch + sc.gu);
     try k.tile.setU32(9, 2 * ff);
     try k.tile.setU32(10, ff);
-    try launch(k.tile, s, .{ tile_x(ff), t.tile_bound, 2 });
+    try launch(k.tile, s, .{ tile_x(ff), tile_bound, 2 });
 
     try k.act.setPtr(0, null);
     try k.act.setPtr(1, gate.table.ptr);
@@ -585,7 +601,7 @@ pub fn encodeMoeTiles(p: *const Pipelines, s: Stream, gate: *const Plan, up: *co
     try setU64(k.tile, 8, r.scratch + sc.rot);
     try k.tile.setU32(9, hidden);
     try k.tile.setU32(10, 0);
-    try launch(k.tile, s, .{ tile_x(hidden), t.tile_bound, 1 });
+    try launch(k.tile, s, .{ tile_x(hidden), tile_bound, 1 });
 
     try k.out_rows.setPtr(0, null);
     try k.out_rows.setPtr(1, down.table.ptr);
