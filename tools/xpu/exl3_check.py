@@ -38,6 +38,25 @@ class Exl3:
             ns //= 2
         return ns
 
+    def shape(self, bits, rows, strips, ks_):
+        """(NS, KS) for a launch: strips are the groups' N / 16, ks_ their K / 16. The per-group rule above, then
+        fewer strips a sub-group and K splits until the launch has SG_TARGET sub-groups (one layer's experts
+        is far below it; measured by exl3_ab.py with AB_LAYERS=1, 2026-10-25)."""
+        target = int(os.environ.get("EXL3_SG", "2048"))
+        ns = self.ns(bits, rows, min(strips))
+        fixed_ns = getattr(self, "ns_fixed", None) or int(os.environ.get("EXL3_NS", "0"))
+        if not fixed_ns:
+            while ns > 1 and sum(s // ns for s in strips) < target:
+                ns //= 2
+        while any(s % ns for s in strips):
+            ns //= 2
+        ks = getattr(self, "ks_fixed", None) or int(os.environ.get("EXL3_KS", "0"))
+        if not ks:
+            ks, sg = 1, sum(s // ns for s in strips)
+            while sg * ks < target and all(k % (2 * ks) == 0 and k // (2 * ks) >= 8 for k in ks_):
+                ks *= 2
+        return ns, ks
+
     def hs(self, rows, ns):
         """Split-half matvec (HS) at 2 to 4 rows: +3 to +14% there, a loss at 1, 8 and 16 rows (exl3_ab.py, 2026-10-24)."""
         env = getattr(self, "hs_fixed", None)
@@ -102,6 +121,9 @@ def refuse(halves, mul1):
         raise ValueError(f"exl3: {halves / 2} bits not supported (2 to 8 whole bits)")
 
 
+KS_MAX = 16  # sums scratch holds this many K splits
+
+
 def project(e, groups, xs, rows, out_f32=True, reps=0):
     """groups: list of (trellis, suh, svh, mul1). xs: bf16 inputs [rows, K] per group. Returns fp32 outputs."""
     ar = Arena(e.ctx)
@@ -111,7 +133,7 @@ def project(e, groups, xs, rows, out_f32=True, reps=0):
         halves = w // 8
         refuse(halves, mul1)
         k, n = kt * 16, nt * 16
-        d[g] = (ar.add(tr), ar.add(suh), ar.add(svh), ar.add(x), ar.add(nbytes=rows * k * 4), ar.add(nbytes=rows * n * 4),
+        d[g] = (ar.add(tr), ar.add(suh), ar.add(svh), ar.add(x), ar.add(nbytes=rows * k * 4), ar.add(nbytes=rows * n * 4 * KS_MAX),
                 ar.add(nbytes=rows * n * 4), k, n, halves, rows, k, n, int(out_f32), 0)
     base = ar.build(e.q)
     db = e.buf(d)
@@ -120,14 +142,15 @@ def project(e, groups, xs, rows, out_f32=True, reps=0):
     bits = {int(h) // 2 for h in d["halves"]}
     assert len(bits) == 1, "one width a launch"
     bits = bits.pop()
-    ns = e.ns(bits, rb, min(int(n) // 16 for n in d["n"]))
+    ns, ks = e.shape(bits, rb, [int(n) // 16 for n in d["n"]], [int(k) // 16 for k in d["k"]])
+    assert ks <= KS_MAX
     mv = e.matvec(bits, rb, ns)
     WG = 128
     gx = (nmax // 16 // ns * 16 + WG - 1) // WG * WG
     def launch():
         ev = [e.p.exl3_rotate_in(e.q, (kmax // 128 * 16, rows, len(groups)), (16, 1, 1), base, db),
-              mv(e.q, (gx, len(groups)), (WG, 1), base, db),
-              e.p.exl3_rotate_out(e.q, (nmax // 128 * 16, rows, len(groups)), (16, 1, 1), base, db)]
+              mv(e.q, (gx, len(groups), ks), (WG, 1, 1), base, db, np.uint32(ks)),
+              e.p.exl3_rotate_out(e.q, (nmax // 128 * 16, rows, len(groups)), (16, 1, 1), base, db, np.uint32(ks))]
         return ev
     ev = launch()
     e.q.finish()

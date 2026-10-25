@@ -72,9 +72,15 @@ fn rotBytes(k: usize, rows: usize) usize {
     return std.mem.alignForward(usize, k * rows * 4, 256);
 }
 
-/// fp32 rotated input [rows][k], then fp32 sums [rows][n].
+/// The most K splits a launch holding a group of width n can pick: a launch has at least that group's strips.
+fn splitBound(n: usize) usize {
+    const strips = n / 16;
+    return @min(variants.ks_max, std.math.ceilPowerOfTwoAssert(usize, std.math.divCeil(usize, variants.sub_group_target, strips) catch unreachable));
+}
+
+/// fp32 rotated input [rows][k], then fp32 sums [splits][rows][n] (see splitBound).
 pub fn scratchBytes(k: usize, n: usize, rows: usize) usize {
-    return rotBytes(k, rows) + n * rows * 4;
+    return rotBytes(k, rows) + splitBound(n) * n * rows * 4;
 }
 
 pub fn descriptor(g: Group) !Desc {
@@ -157,25 +163,27 @@ pub const Plan = struct {
     rows: u32,
     k_max: u32,
     n_max: u32,
-    strips_min: u32,
-    strips_gcd: u32,
+    strips: variants.Strips,
+    k_tiles_gcd: u32,
 
     /// Checks every group and uploads the table (waits for the copy).
     pub fn init(ctx: *const Context, s: Stream, gpa: std.mem.Allocator, groups: []const Group) !Plan {
         if (groups.len == 0 or groups.len > std.math.maxInt(u16)) return error.InvalidExl3Groups;
         const descs = try gpa.alloc(Desc, groups.len);
         defer gpa.free(descs);
-        var p: Plan = .{ .table = undefined, .count = @intCast(groups.len), .bits = groups[0].m.halves / 2, .rows = 0, .k_max = 0, .n_max = 0, .strips_min = std.math.maxInt(u32), .strips_gcd = 0 };
+        var p: Plan = .{ .table = undefined, .count = @intCast(groups.len), .bits = groups[0].m.halves / 2, .rows = 0, .k_max = 0, .n_max = 0, .strips = .{ .min = std.math.maxInt(u32), .gcd = 0, .total = 0 }, .k_tiles_gcd = 0 };
         for (groups, descs) |g, *d| {
             d.* = try descriptor(g);
             if (g.m.halves / 2 != p.bits) return error.MixedExl3Widths; // the host sorts groups by width
             p.rows = @max(p.rows, g.rows);
             p.k_max = @max(p.k_max, g.m.k);
             p.n_max = @max(p.n_max, g.m.n);
-            p.strips_min = @min(p.strips_min, g.m.n / 16);
-            p.strips_gcd = std.math.gcd(p.strips_gcd, g.m.n / 16);
+            p.strips.min = @min(p.strips.min, g.m.n / 16);
+            p.strips.gcd = std.math.gcd(p.strips.gcd, g.m.n / 16);
+            p.strips.total += g.m.n / 16;
+            p.k_tiles_gcd = std.math.gcd(p.k_tiles_gcd, g.m.k / 16);
         }
-        if (variants.pick(p.bits, p.rows, p.strips_min, p.strips_gcd) == null) return error.UnsupportedExl3Width;
+        if (variants.pick(p.bits, p.rows, p.strips) == null) return error.UnsupportedExl3Width;
         p.table = try DeviceBuffer.fromHost(ctx, s, std.mem.sliceAsBytes(descs));
         return p;
     }
@@ -191,7 +199,7 @@ pub const Plan = struct {
             d.* = .{ .trellis = m.trellis, .suh = m.suh, .svh = m.svh, .x = 0, .rot = 0, .sums = 0, .out = 0, .k = m.k, .n = m.n, .halves = m.halves, .rows = 1, .x_stride = m.k, .out_stride = m.n, .out_f32 = 0 };
         }
         const strips = ms[0].n / 16;
-        return .{ .table = try DeviceBuffer.fromHost(ctx, s, std.mem.sliceAsBytes(descs)), .count = @intCast(ms.len), .bits = ms[0].halves / 2, .rows = 1, .k_max = ms[0].k, .n_max = ms[0].n, .strips_min = strips, .strips_gcd = strips };
+        return .{ .table = try DeviceBuffer.fromHost(ctx, s, std.mem.sliceAsBytes(descs)), .count = @intCast(ms.len), .bits = ms[0].halves / 2, .rows = 1, .k_max = ms[0].k, .n_max = ms[0].n, .strips = .{ .min = strips, .gcd = strips, .total = strips }, .k_tiles_gcd = ms[0].k / 16 };
     }
 
     pub fn deinit(p: *Plan) void {
@@ -204,23 +212,33 @@ fn setU64(k: mod.Kernel, i: u32, v: u64) Error!void {
     try k.setBytes(i, std.mem.asBytes(&v));
 }
 
+/// NS image and K splits for a launch over `plan`'s widths with `strips_total` strips in all.
+const Shape = struct { variant: usize, ks: u32 };
+
+fn shapeOf(plan: *const Plan, rows: u32, strips_total: u32) Error!Shape {
+    const strips: variants.Strips = .{ .min = plan.strips.min, .gcd = plan.strips.gcd, .total = strips_total };
+    const vi = variants.pick(plan.bits, rows, strips) orelse return error.Invalid;
+    return .{ .variant = vi, .ks = variants.split(strips.total / variants.all[vi].ns, plan.k_tiles_gcd) };
+}
+
 /// Queues the three stages over a table of `count` groups (no host wait).
-fn stages(p: *const Pipelines, s: Stream, table: ?*anyopaque, count: u32, bits: u32, rows: u32, k_max: u32, n_max: u32, strips_min: u32, strips_gcd: u32) Error!void {
-    const vi = variants.pick(bits, rows, strips_min, strips_gcd) orelse return error.Invalid;
-    const mv = p.matvec[vi];
-    const ns = variants.all[vi].ns;
+fn stages(p: *const Pipelines, s: Stream, table: ?*anyopaque, count: u32, rows: u32, k_max: u32, n_max: u32, sh: Shape) Error!void {
+    const mv = p.matvec[sh.variant];
+    const ns = variants.all[sh.variant].ns;
     for ([_]mod.Kernel{ p.rotate_in, mv, p.rotate_out }) |k| {
         try k.setPtr(0, null); // base: unused with -DEXL3_ABS
         try k.setPtr(1, table);
     }
+    try mv.setU32(2, sh.ks);
+    try p.rotate_out.setU32(2, sh.ks);
     try launch(p.rotate_in, s, .{ k_max / 128, rows, count });
-    try launch(mv, s, .{ std.math.divCeil(u32, n_max / 16 / ns, local_matvec[0] / 16) catch unreachable, count, 1 });
+    try launch(mv, s, .{ std.math.divCeil(u32, n_max / 16 / ns, local_matvec[0] / 16) catch unreachable, count, sh.ks });
     try launch(p.rotate_out, s, .{ n_max / 128, rows, count });
 }
 
 /// y = x @ W for every group of the plan.
 pub fn encode(p: *const Pipelines, s: Stream, plan: *const Plan) Error!void {
-    try stages(p, s, plan.table.ptr, plan.count, plan.bits, plan.rows, plan.k_max, plan.n_max, plan.strips_min, plan.strips_gcd);
+    try stages(p, s, plan.table.ptr, plan.count, plan.rows, plan.k_max, plan.n_max, try shapeOf(plan, plan.rows, plan.strips.total));
 }
 
 /// Routed experts, one row a (token, pick) slot. ids are u32 [tokens][topk] on the device. Slot t * topk + j reads
@@ -249,6 +267,7 @@ pub fn encodeRouted(p: *const Pipelines, s: Stream, experts: *const Plan, r: Rou
     const slots = r.tokens * r.topk;
     if (slots == 0) return error.Invalid;
     const k = p.route;
+    const sh = try shapeOf(experts, 1, experts.strips.min * slots); // one expert's strips a slot
     try k.setPtr(0, experts.table.ptr);
     try k.setPtr(1, @ptrFromInt(r.ids));
     try k.setPtr(2, @ptrFromInt(r.slots));
@@ -261,8 +280,9 @@ pub fn encodeRouted(p: *const Pipelines, s: Stream, experts: *const Plan, r: Rou
     try setU64(k, 9, r.y);
     try k.setU32(10, r.y_stride);
     try k.setU32(11, @intFromEnum(r.output));
+    try k.setU32(12, sh.ks);
     try launch(k, s, .{ slots, 1, 1 });
-    try stages(p, s, @ptrFromInt(r.slots), slots, experts.bits, 1, experts.k_max, experts.n_max, experts.strips_min, experts.strips_gcd);
+    try stages(p, s, @ptrFromInt(r.slots), slots, 1, experts.k_max, experts.n_max, sh);
 }
 
 test "descriptor layout and scratch" {
@@ -270,7 +290,8 @@ test "descriptor layout and scratch" {
     const d = try descriptor(.{ .m = m, .rows = 3, .x = 0x4000, .x_stride = 2048, .y = 0x5000, .y_stride = 512, .output = .f32, .scratch = 0x10000 });
     try std.testing.expectEqual(@as(u64, 0x10000 + 2048 * 3 * 4), d.sums);
     try std.testing.expectEqual(@as(u32, 1), d.out_f32);
-    try std.testing.expectEqual(@as(usize, 2048 * 3 * 4 + 512 * 3 * 4), scratchBytes(2048, 512, 3));
+    try std.testing.expectEqual(@as(usize, 2048 * 3 * 4 + 16 * 512 * 3 * 4), scratchBytes(2048, 512, 3));
+    try std.testing.expectEqual(@as(usize, 1), splitBound(248320));
     try std.testing.expectError(error.InvalidExl3Rows, descriptor(.{ .m = m, .rows = 17, .x = 0, .x_stride = 2048, .y = 0, .y_stride = 512, .scratch = 0 }));
     try std.testing.expectError(error.UnsupportedExl3Shape, (Matrix{ .trellis = 0, .suh = 0, .svh = 0, .k = 100, .n = 512, .halves = 8 }).validate());
 }

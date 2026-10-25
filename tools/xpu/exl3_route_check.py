@@ -33,17 +33,17 @@ def main():
                 table[i]["trellis"], table[i]["suh"], table[i]["svh"] = ar.add(tr), ar.add(suh), ar.add(svh)
                 table[i]["k"], table[i]["n"], table[i]["halves"] = k, n, w // 8
             slots = tokens * TOPK
-            xo, ro, so, oo = ar.add(x), ar.add(nbytes=slots * k * 4), ar.add(nbytes=slots * n * 4), ar.add(nbytes=slots * n * 4)
+            xo, ro, so, oo = ar.add(x), ar.add(nbytes=slots * k * 4), ar.add(nbytes=slots * n * 4 * ck.KS_MAX), ar.add(nbytes=slots * n * 4)
             base = ar.build(e.q)
             tb, ib = e.buf(table), e.buf(ids.ravel())
+            ns, ks = e.shape(w // 16, 1, [n // 16] * slots, [k // 16] * slots)
             db = cl.Buffer(e.ctx, cl.mem_flags.READ_WRITE, slots * ck.DESC.itemsize)
             e.p.exl3_route(e.q, (slots,), None, tb, ib, db, np.uint32(TOPK), np.uint64(xo), np.uint32(k), np.uint32(per),
-                           np.uint64(ro), np.uint64(so), np.uint64(oo), np.uint32(n), np.uint32(1))
-            ns = e.ns(w // 16, 1, n // 16)
+                           np.uint64(ro), np.uint64(so), np.uint64(oo), np.uint32(n), np.uint32(1), np.uint32(ks))
             mv = e.matvec(w // 16, 1, ns)
             e.p.exl3_rotate_in(e.q, (k // 128 * 16, 1, slots), (16, 1, 1), base, db)
-            mv(e.q, ((n // 16 // ns * 16 + 127) // 128 * 128, slots), (128, 1), base, db)
-            e.p.exl3_rotate_out(e.q, (n // 128 * 16, 1, slots), (16, 1, 1), base, db)
+            mv(e.q, ((n // 16 // ns * 16 + 127) // 128 * 128, slots, ks), (128, 1, 1), base, db, np.uint32(ks))
+            e.p.exl3_rotate_out(e.q, (n // 128 * 16, 1, slots), (16, 1, 1), base, db, np.uint32(ks))
             e.q.finish()
             y = ar.read(e.q, oo, (tokens, TOPK, n), np.float32)
             worst, cache = 0.0, {}

@@ -132,8 +132,10 @@ __kernel void exl3_rotate_in(__global const uchar *base, __global const exl3_des
 }
 
 // sums[row][n] = rot[row] @ W_q[:, n] for one 16-column strip and up to ROWS rows. Built per (BITS, ROWS);
-// a launch holds groups of one width only (the host sorts them). Grid (strips_max * SG rounded to the
-// work-group, groups), work-group 8 sub-groups, one sub-group a strip.
+// a launch holds groups of one width only (the host sorts them). Grid (strips_max * SG / NS rounded to the
+// work-group, groups, ks), work-group 8 sub-groups, one sub-group NS strips.
+// K split: split z of ks (K / 16 divides by ks) sums its K / ks rows of W into sums + z * rows * n. A small
+// launch (one layer's experts) has too few strips to fill the GPU; the splits multiply the sub-groups.
 //
 // Lane c (column c) reads only the stream words its 16 values use. With g = c % 8 and h = c / 8, its values are
 // p = 32 g + q, q = 8 m + i + 4 h, and value p's window starts at bit S(p) = p * BITS + BITS - 16 (mod the ring).
@@ -153,7 +155,7 @@ __kernel void exl3_rotate_in(__global const uchar *base, __global const exl3_des
 #define NS 1                                  // column strips a sub-group (N / 16 must divide by NS)
 #endif
 __attribute__((intel_reqd_sub_group_size(SG)))
-__kernel void exl3_matvec(__global const uchar *base, __global const exl3_desc *desc) {
+__kernel void exl3_matvec(__global const uchar *base, __global const exl3_desc *desc, uint ks) {
     const exl3_desc d = desc[get_group_id(1)];
     const uint tn0 = get_global_id(0) / SG * NS, c = get_sub_group_local_id();
     if (tn0 * 16 >= d.n || d.halves != 2 * BITS) return;
@@ -162,6 +164,8 @@ __kernel void exl3_matvec(__global const uchar *base, __global const exl3_desc *
     __global const uint *tile = (__global const uint *)(AT(const ushort, d.trellis) + (ulong)tn0 * 16 * BITS);
     __global const float *rot = AT(const float, d.rot);
     const ulong tile_k = (ulong)(d.n / 16) * RINGW;  // uint32 words between k tiles
+    const uint split = get_group_id(2), kspan = d.k / ks, k0 = split * kspan;
+    tile += (ulong)(k0 / 16) * tile_k;
 #if HS && NS >= 2
     // HS: the half h = c / 8 takes strips h * NS / 2 and up, and each lane decodes both column halves of its
     // strips from the same words (g + 0 and g + 8). The h offset is then a compile-time constant: no shift.
@@ -170,7 +174,7 @@ __kernel void exl3_matvec(__global const uchar *base, __global const exl3_desc *
     for (uint s = 0; s < NS / 2; s++)
         for (uint e = 0; e < 2; e++)
             for (uint r = 0; r < ROWS; r++) acc[s][e][r] = 0.0f;
-    for (uint kb = 0; kb < d.k; kb += 16, tile += tile_k) {
+    for (uint kb = k0; kb < k0 + kspan; kb += 16, tile += tile_k) {
         uint raw[NS / 2][LOADW];
         for (uint s = 0; s < NS / 2; s++)
             for (uint j = 0; j < LOADW; j++) raw[s][j] = tile[(sl + s) * RINGW + (wbase + j) % RINGW];
@@ -191,7 +195,7 @@ __kernel void exl3_matvec(__global const uchar *base, __global const exl3_desc *
             }
         }
     }
-    __global float *sums = AT(float, d.sums);
+    __global float *sums = AT(float, d.sums) + (ulong)split * d.rows * d.n;
     for (uint s = 0; s < NS / 2; s++)
         for (uint e = 0; e < 2; e++)
             for (uint r = 0; r < ROWS; r++)
@@ -200,7 +204,7 @@ __kernel void exl3_matvec(__global const uchar *base, __global const exl3_desc *
     float acc[NS][ROWS];
     for (uint s = 0; s < NS; s++)
         for (uint r = 0; r < ROWS; r++) acc[s][r] = 0.0f;
-    for (uint kb = 0; kb < d.k; kb += 16, tile += tile_k) {
+    for (uint kb = k0; kb < k0 + kspan; kb += 16, tile += tile_k) {
         uint raw[NS][LOADW], w[NS][USEW];
         for (uint s = 0; s < NS; s++)
             for (uint j = 0; j < LOADW; j++) raw[s][j] = tile[s * RINGW + (wbase + j) % RINGW];  // = stream_word
@@ -221,7 +225,7 @@ __kernel void exl3_matvec(__global const uchar *base, __global const exl3_desc *
             }
         }
     }
-    __global float *sums = AT(float, d.sums);
+    __global float *sums = AT(float, d.sums) + (ulong)split * d.rows * d.n;
     for (uint s = 0; s < NS; s++)
         for (uint r = 0; r < ROWS; r++)
             if (r < d.rows) sums[(ulong)r * d.n + (tn0 + s) * 16 + c] = acc[s][r];
@@ -229,16 +233,20 @@ __kernel void exl3_matvec(__global const uchar *base, __global const exl3_desc *
 }
 #endif
 
-// out[row][n] = (H_N sums) * svh, fp32 or bf16, for one 128 block. Grid (N_max / 128, ROWS_max, groups).
+// out[row][n] = (H_N sums) * svh, fp32 or bf16, for one 128 block; sums adds the ks splits in order (deterministic).
+// Grid (N_max / 128, ROWS_max, groups).
 __attribute__((intel_reqd_sub_group_size(SG)))
-__kernel void exl3_rotate_out(__global uchar *base, __global const exl3_desc *desc) {
+__kernel void exl3_rotate_out(__global uchar *base, __global const exl3_desc *desc, uint ks) {
     const exl3_desc d = desc[get_group_id(2)];
     const uint blk = get_group_id(0), row = get_group_id(1), lane = get_sub_group_local_id();
     if (blk * 128 >= d.n || row >= d.rows) return;
     __global const float *sums = AT(const float, d.sums) + (ulong)row * d.n;
     __global const half *svh = AT(const half, d.svh);
     float v[8];
-    for (uint j = 0; j < 8; j++) v[j] = sums[blk * 128 + lane + SG * j];
+    for (uint j = 0; j < 8; j++) {
+        v[j] = sums[blk * 128 + lane + SG * j];
+        for (uint z = 1; z < ks; z++) v[j] += sums[(ulong)z * d.rows * d.n + blk * 128 + lane + SG * j];
+    }
     hadamard128(v, lane);
     for (uint j = 0; j < 8; j++) {
         const uint i = blk * 128 + lane + SG * j;
@@ -255,14 +263,14 @@ __kernel void exl3_rotate_out(__global uchar *base, __global const exl3_desc *de
 // or row s (x_per_slot = 1, down), and writes out row s.
 // x, rot, sums, out are base offsets; rot, sums and out give each slot its own row. Grid (tokens * topk).
 __kernel void exl3_route(__global const exl3_desc *experts, __global const uint *ids, __global exl3_desc *desc,
-                         uint topk, ulong x, uint x_stride, uint x_per_slot, ulong rot, ulong sums, ulong out, uint out_stride, uint out_f32) {
+                         uint topk, ulong x, uint x_stride, uint x_per_slot, ulong rot, ulong sums, ulong out, uint out_stride, uint out_f32, uint ks) {
     const uint s = get_global_id(0), token = s / topk;
     exl3_desc d = experts[ids[s]];
     d.rows = 1;
     d.x = x + (ulong)(x_per_slot ? s : token) * x_stride * 2;
     d.x_stride = x_stride;
     d.rot = rot + (ulong)s * d.k * 4;
-    d.sums = sums + (ulong)s * d.n * 4;
+    d.sums = sums + (ulong)s * d.n * 4 * ks;  // the slot's ks partial rows
     d.out_stride = out_stride;
     d.out_f32 = out_f32;
     d.out = out + (ulong)s * out_stride * (out_f32 ? 4 : 2);
