@@ -173,22 +173,7 @@ inline int8 tile_b(__global const uint *t, uint c) {
     const uint g = c % 8, h = c / 8;
     const uint wbase = ((32 * g * BITS + BITS + 32 * RINGW - 16) / 32) % RINGW;
     uint raw[LOADW], w[USEW];
-#if TB_BLK && (RINGW % 16 == 0)
-    // one block read of the tile (lane l: words l + 16 i), then each lane gathers its words by shuffles
-    uint ch[RINGW / 16];
-    for (uint i = 0; i < RINGW / 16; i++) ch[i] = intel_sub_group_block_read(t + 16 * i);
-    for (uint j = 0; j < LOADW; j++) {
-        const uint idx = (wbase + j) % RINGW;
-        uint v = 0;
-        for (uint i = 0; i < RINGW / 16; i++) {
-            const uint sv = sub_group_shuffle(ch[i], idx % 16);
-            v = idx / 16 == i ? sv : v;
-        }
-        raw[j] = v;
-    }
-#else
     for (uint j = 0; j < LOADW; j++) raw[j] = t[(wbase + j) % RINGW];
-#endif
     for (uint j = 0; j < USEW; j++) w[j] = h ? (SHB ? (raw[j + SHW] << SHB) | (raw[j + SHW + 1] >> (32 - SHB)) : raw[j + SHW]) : raw[j];
     half kv[16];
     for (uint v = 0; v < 16; v++) {
@@ -200,9 +185,6 @@ inline int8 tile_b(__global const uint *t, uint c) {
     return b;
 }
 
-#ifndef TB_BLK
-#define TB_BLK 1
-#endif
 #ifndef DP
 #define DP (ROWS <= 8)                                // decode on XMX: tiles decoded in registers as DPAS B operands, rows padded to 8
 #endif
