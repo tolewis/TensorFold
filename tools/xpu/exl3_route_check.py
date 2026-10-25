@@ -1,6 +1,6 @@
 """P3.2 gate: routed experts by device-built descriptors against the fp64 host reference, per (token, pick).
 
-Usage: exl3_route_check.py <repo> <sage EXL3 dir>   (run under flock ~/b70/gpu.lock)
+Usage: exl3_route_check.py <repo> <sage EXL3 dir>   (one GPU job at a time)
 """
 import os, sys
 import numpy as np

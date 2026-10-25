@@ -1,6 +1,6 @@
 """Gates 1 to 3 for zig/kernels/xpu/exl3.cl, through pyopencl (run-time compile, no ocloc).
 
-Usage: exl3_check.py <repo> <sage EXL3 dir>   (run under flock ~/b70/gpu.lock)
+Usage: exl3_check.py <repo> <sage EXL3 dir>   (one GPU job at a time)
 """
 import os, sys
 import numpy as np

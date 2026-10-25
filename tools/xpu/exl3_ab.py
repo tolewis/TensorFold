@@ -1,5 +1,5 @@
 """Interleaved A/B of exl3.cl variants: each round runs every variant on every case in turn; median over rounds.
-Usage: exl3_ab.py <sage dir> <rounds> name=repo:NS[:hs][:opts] ...   (under flock ~/b70/gpu.lock)"""
+Usage: exl3_ab.py <sage dir> <rounds> name=repo:NS[:hs][:opts] ...   (one GPU job at a time)"""
 import os, sys
 import numpy as np
 sys.path.insert(0, os.path.dirname(__file__))

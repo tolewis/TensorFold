@@ -1,6 +1,6 @@
 """Gate 4: EXL3 kernel speed on the B70 against the measured copy bandwidth.
 
-Usage: exl3_bench.py <repo> <sage EXL3 dir>   (run under flock ~/b70/gpu.lock)
+Usage: exl3_bench.py <repo> <sage EXL3 dir>   (one GPU job at a time)
 Effective GB/s = trellis bytes / kernel time (OpenCL profiling events, median of reps).
 """
 import os, sys, time

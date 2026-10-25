@@ -1,5 +1,5 @@
 """Head-to-head: exl3xpu decode path (via exl3xpu_bench) vs exl3.cl on the same Sage groups, same B70.
-Usage: exl3xpu_vs.py <repo> <sage dir> <exl3xpu_bench binary> <work dir>   (under flock ~/b70/gpu.lock)"""
+Usage: exl3xpu_vs.py <repo> <sage dir> <exl3xpu_bench binary> <work dir>   (one GPU job at a time)"""
 import os, subprocess, sys
 import numpy as np
 sys.path.insert(0, os.path.join(sys.argv[1], "tools/xpu"))
