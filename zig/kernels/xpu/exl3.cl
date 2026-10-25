@@ -276,3 +276,175 @@ __kernel void exl3_route(__global const exl3_desc *experts, __global const uint 
     d.out = out + (ulong)s * out_stride * (out_f32 ? 4 : 2);
     desc[s] = d;
 }
+
+// Fused routed MLP for one MoE layer: y_s = down(silu(gate x) * up x) for every (token, pick) slot s in four
+// launches, with no slot table and no host round trip. Built per BITS with MOE_P, MOE_PD (K splits of gate|up and of
+// down) and MOE_DS (down strips a sub-group). Slot s < pairs is pick s % topk of token s / topk, expert ids[s]; slots
+// from pairs on are token s - pairs on the shared expert (shared_id). gate, up and down are expert tables as for
+// exl3_route (trellis, suh, svh, k, n). The steps and the fp32 order are those of rotate_in, matvec (ks = MOE_P or
+// MOE_PD) and rotate_out. Small work-groups (one K split of 8 strips each) spread one layer over all Xe-cores; the
+// split sums go through memory and are added in split order, so the result does not depend on the schedule.
+// The gate|up epilogue (SiLU and the down input Hadamard per 128 block) follows exl3_moe.a8.sycl (MIT, 0xSero).
+#if defined(MOE_P) && defined(BITS)
+#ifndef MOE_KMAX
+#define MOE_KMAX 2048                     // largest gate/up K (hidden) and down K (intermediate)
+#endif
+#ifndef MOE_PD
+#define MOE_PD MOE_P
+#endif
+#ifndef MOE_DS
+#define MOE_DS 1                          // down strips a sub-group: 1, 2 or 4
+#endif
+
+inline uint moe_expert(__global const uint *ids, uint s, uint pairs, uint shared_id) { return s < pairs ? ids[s] : shared_id; }
+inline uint moe_token(uint s, uint pairs, uint topk) { return s < pairs ? s / topk : s - pairs; }
+
+// MS 16-column strips over kt k tiles: the exl3_matvec loop at ROWS = 1, strip i reading its input from xr[i].
+// The strips' tile loads are independent, so a sub-group keeps MS loads in flight.
+#define STRIP_DOT(MS)                                                                                                  \
+    inline void strip_dot##MS(__global const uint *tile[MS], ulong tile_k, uint kt, __local const float *xr[MS],    \
+                              float acc[MS]) {                                                                     \
+        const uint c = get_sub_group_local_id(), g = c % 8, h = c / 8;                                             \
+        const uint wbase = ((32 * g * BITS + BITS + 32 * RINGW - 16) / 32) % RINGW;                                \
+        for (uint i = 0; i < MS; i++) acc[i] = 0.0f;                                                               \
+        for (uint t = 0; t < kt; t++) {                                                                            \
+            uint raw[MS][LOADW], w[MS][USEW];                                                                      \
+            for (uint i = 0; i < MS; i++)                                                                          \
+                for (uint j = 0; j < LOADW; j++) raw[i][j] = tile[i][(ulong)t * tile_k + (wbase + j) % RINGW];     \
+            for (uint i = 0; i < MS; i++)                                                                          \
+                for (uint j = 0; j < USEW; j++)                                                                    \
+                    w[i][j] = h ? (SHB ? (raw[i][j + SHW] << SHB) | (raw[i][j + SHW + 1] >> (32 - SHB)) : raw[i][j + SHW]) \
+                                : raw[i][j];                                                                       \
+            float x[MS];                                                                                           \
+            for (uint i = 0; i < MS; i++) x[i] = xr[i][t * 16 + c];                                                \
+            for (uint v = 0; v < 16; v++) {                                                                        \
+                const uint bit = OFF0 + (8 * (v / 4) + (v % 4)) * BITS, wi = bit / 32, off = bit % 32;             \
+                for (uint i = 0; i < MS; i++) {                                                                    \
+                    const float wv = mul1_value(off ? ((w[i][wi] << off) | (w[i][wi + 1] >> (32 - off))) >> 16 : w[i][wi] >> 16); \
+                    acc[i] = fma(sub_group_broadcast(x[i], lane_row(v)), wv, acc[i]);                              \
+                }                                                                                                  \
+            }                                                                                                      \
+        }                                                                                                          \
+    }
+STRIP_DOT(1)
+STRIP_DOT(2)
+STRIP_DOT(4)
+#define STRIP_DOT_N(MS) strip_dot##MS
+#define STRIP_DOT_X(MS) STRIP_DOT_N(MS)
+
+// The tile words of strip tn of d from k tile kt0 on.
+inline __global const uint *strip_tiles(__global const uchar *base, exl3_desc d, uint tn, uint kt0) {
+    return (__global const uint *)(AT(const ushort, d.trellis) + (ulong)tn * 16 * BITS) + (ulong)kt0 * (d.n / 16) * RINGW;
+}
+
+// v = (H_128 of the split sums) / sqrt(128) * svh for one 128 block; sums [splits][stride], added in split order.
+inline void sums_out(float v[8], __global const float *sums, uint splits, ulong stride, __global const half *svh, uint lane) {
+    for (uint j = 0; j < 8; j++) {
+        v[j] = sums[lane + SG * j];
+        for (uint z = 1; z < splits; z++) v[j] += sums[z * stride + lane + SG * j];
+    }
+    hadamard128(v, lane);
+    for (uint j = 0; j < 8; j++) v[j] = v[j] * INV_SQRT128 * vload_half(lane + SG * j, svh);
+}
+
+// gu[s][p][proj][I]: split p of gate (proj 0) and up (1) for the 8 strips of one 128 block nb of I.
+// Grid (I / 128 * MOE_P * 128, slots), work-group 8 sub-groups, each the gate and the up strip of one column.
+__attribute__((intel_reqd_sub_group_size(SG)))
+__kernel void exl3_moe_gate_up(__global const uchar *base, __global const exl3_desc *gate, __global const exl3_desc *up,
+                               __global const uint *ids, uint topk, uint pairs, uint shared_id, ulong x, uint x_stride,
+                               ulong gu) {
+    __local float xr[2][MOE_KMAX / MOE_P];
+    const uint nb = get_group_id(0) / MOE_P, p = get_group_id(0) % MOE_P, s = get_group_id(1);
+    const uint q = get_sub_group_id(), c = get_sub_group_local_id();
+    const uint e = moe_expert(ids, s, pairs, shared_id);
+    const exl3_desc dg = gate[e], du = up[e];
+    const uint kt = dg.k / 16 / MOE_P, k0 = p * kt * 16, ff = dg.n;
+    __global const ushort *xs = AT(const ushort, x) + (ulong)moe_token(s, pairs, topk) * x_stride + k0;
+    for (uint i = q; i < 2 * (kt / 8); i += 8) {  // rotate_in of this split's blocks, for gate and up (their suh differ)
+        const uint proj = i & 1, blk = i >> 1;
+        __global const half *suh = AT(const half, proj ? du.suh : dg.suh) + k0;
+        float v[8];
+        for (uint j = 0; j < 8; j++) {
+            const uint at = blk * 128 + c + SG * j;
+            v[j] = bf(xs[at]) * vload_half(at, suh);
+        }
+        hadamard128(v, c);
+        for (uint j = 0; j < 8; j++) xr[proj][blk * 128 + c + SG * j] = v[j] * INV_SQRT128;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    __global const uint *tile[2] = {strip_tiles(base, dg, nb * 8 + q, p * kt), strip_tiles(base, du, nb * 8 + q, p * kt)};
+    __local const float *xp[2] = {xr[0], xr[1]};
+    float acc[2];
+    strip_dot2(tile, (ulong)(ff / 16) * RINGW, kt, xp, acc);
+    __global float *sums = AT(float, gu) + ((ulong)s * MOE_P + p) * 2 * ff + (nb * 8 + q) * 16 + c;
+    sums[0] = acc[0];
+    sums[ff] = acc[1];
+}
+
+// act[s][I] = H_I((silu(gate x) * up x) * suh_down) / sqrt(128), the down projection's rotated input: rotate_out of
+// gate and up from gu (MOE_P splits in order), SiLU, then the down rotate_in, one 128 block a work-group.
+// Grid (I / 128 * 32, slots), work-group 2 sub-groups (gate, up).
+__attribute__((intel_reqd_sub_group_size(SG)))
+__kernel void exl3_moe_act(__global const uchar *base, __global const exl3_desc *gate, __global const exl3_desc *up,
+                           __global const exl3_desc *down, __global const uint *ids, uint pairs, uint shared_id, ulong gu,
+                           ulong act) {
+    __local float gv[2][128];
+    const uint nb = get_group_id(0), s = get_group_id(1), q = get_sub_group_id(), c = get_sub_group_local_id();
+    const uint e = moe_expert(ids, s, pairs, shared_id);
+    const exl3_desc g = q ? up[e] : gate[e];
+    const uint ff = g.n;
+    float v[8];
+    sums_out(v, AT(const float, gu) + (ulong)s * MOE_P * 2 * ff + q * ff + nb * 128, MOE_P, 2 * ff, AT(const half, g.svh) + nb * 128, c);
+    for (uint j = 0; j < 8; j++) gv[q][c + SG * j] = v[j];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (q) return;
+    __global const half *suh = AT(const half, down[e].suh) + nb * 128;
+    for (uint j = 0; j < 8; j++) {
+        const float a = gv[0][c + SG * j];
+        v[j] = a / (1.0f + exp(-a)) * gv[1][c + SG * j] * vload_half(c + SG * j, suh);
+    }
+    hadamard128(v, c);
+    __global float *o = AT(float, act) + (ulong)s * ff + nb * 128;
+    for (uint j = 0; j < 8; j++) o[c + SG * j] = v[j] * INV_SQRT128;
+}
+
+// dn[s][p][N]: split p of down over act[s] for the 8 strips of one 128 block nb of N, MOE_DS strips a sub-group.
+// Grid (N / 128 * MOE_PD * 128 / MOE_DS, slots), work-group 8 / MOE_DS sub-groups.
+__attribute__((intel_reqd_sub_group_size(SG)))
+__kernel void exl3_moe_down(__global const uchar *base, __global const exl3_desc *down, __global const uint *ids,
+                            uint pairs, uint shared_id, ulong act, ulong dn) {
+    __local float xr[MOE_KMAX / MOE_PD];
+    const uint nb = get_group_id(0) / MOE_PD, p = get_group_id(0) % MOE_PD, s = get_group_id(1);
+    const uint q = get_sub_group_id(), c = get_sub_group_local_id();
+    const exl3_desc d = down[moe_expert(ids, s, pairs, shared_id)];
+    const uint kt = d.k / 16 / MOE_PD, k0 = p * kt * 16;
+    __global const float *a = AT(const float, act) + (ulong)s * d.k + k0;
+    for (uint i = get_local_id(0); i < kt * 16; i += get_local_size(0)) xr[i] = a[i];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    __global const uint *tile[MOE_DS];
+    __local const float *xp[MOE_DS];
+    for (uint i = 0; i < MOE_DS; i++) {
+        tile[i] = strip_tiles(base, d, nb * 8 + q * MOE_DS + i, p * kt);
+        xp[i] = xr;
+    }
+    float acc[MOE_DS];
+    STRIP_DOT_X(MOE_DS)(tile, (ulong)(d.n / 16) * RINGW, kt, xp, acc);
+    __global float *out = AT(float, dn) + ((ulong)s * MOE_PD + p) * d.n + nb * 128 + c;
+    for (uint i = 0; i < MOE_DS; i++) out[(q * MOE_DS + i) * 16] = acc[i];
+}
+
+// y[s] = rotate_out of dn[s] (MOE_PD splits in order), fp32 or bf16. Grid (N / 128 * 16, slots).
+__attribute__((intel_reqd_sub_group_size(SG)))
+__kernel void exl3_moe_out(__global uchar *base, __global const exl3_desc *down, __global const uint *ids, uint pairs,
+                           uint shared_id, ulong dn, ulong y, uint y_stride, uint out_f32) {
+    const uint nb = get_group_id(0), s = get_group_id(1), c = get_sub_group_local_id();
+    const exl3_desc d = down[moe_expert(ids, s, pairs, shared_id)];
+    float v[8];
+    sums_out(v, AT(const float, dn) + (ulong)s * MOE_PD * d.n + nb * 128, MOE_PD, d.n, AT(const half, d.svh) + nb * 128, c);
+    for (uint j = 0; j < 8; j++) {
+        const ulong at = (ulong)s * y_stride + nb * 128 + c + SG * j;
+        if (out_f32) AT(float, y)[at] = v[j];
+        else AT(ushort, y)[at] = to_bf(v[j]);
+    }
+}
+#endif
