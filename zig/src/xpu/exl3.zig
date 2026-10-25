@@ -129,6 +129,7 @@ const MoeKernels = struct {
         for (&ks, names, locals) |*k, n, l| {
             k.* = try m.kernel(n, l);
             done += 1;
+            try k.indirect();
         }
         return .{ .gate_up = ks[0], .act = ks[1], .down = ks[2], .out = ks[3] };
     }
@@ -158,6 +159,8 @@ pub const Pipelines = struct {
         errdefer p.rotate_out.deinit();
         p.route = try p.base.kernel("exl3_route", .{ 1, 1, 1 }); // one work-item a slot, no bound check in the kernel
         errdefer p.route.deinit();
+        // every EXL3 kernel reads weights, activations and scratch through device addresses in a table
+        for ([_]mod.Kernel{ p.rotate_in, p.rotate_out, p.route }) |k| try k.indirect();
         var done: usize = 0;
         errdefer for (0..done) |i| {
             p.matvec[i].deinit();
@@ -166,6 +169,11 @@ pub const Pipelines = struct {
         for (kernels.exl3_matvec, 0..) |image, i| {
             p.matvec_modules[i] = try mod.Module.load(ctx, image);
             p.matvec[i] = p.matvec_modules[i].kernel("exl3_matvec", local_matvec) catch |e| {
+                p.matvec_modules[i].unload();
+                return e;
+            };
+            p.matvec[i].indirect() catch |e| {
+                p.matvec[i].deinit();
                 p.matvec_modules[i].unload();
                 return e;
             };
