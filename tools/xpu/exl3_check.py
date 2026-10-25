@@ -155,9 +155,9 @@ def project(e, groups, xs, rows, out_f32=True, reps=0):
         gp = e.progs[("gemm", bits)]  # the prompt kernels live in the fused MLP image
         gx = nmax // 16 // GEMM_S * 128
         def launch():
-            return [gp.exl3_rotate_in_h(e.q, (kmax // 128 * 16, rows, len(groups)), (16, 1, 1), base, db),
-                    gm(e.q, (gx, (rows + 8 * GEMM_M - 1) // (8 * GEMM_M), len(groups)), (128, 1, 1), base, db),
-                    gp.exl3_rotate_out_rows(e.q, (nmax // 128 * 16, rows, len(groups)), (16, 1, 1), base, db)]
+            return [gp.exl3_rotate_in_h(e.q, (kmax // 128 * 16, rows, len(groups)), (16, 1, 1), base, db, np.uint32(rows)),
+                    gm(e.q, (gx, (rows + 8 * GEMM_M - 1) // (8 * GEMM_M), len(groups)), (128, 1, 1), base, db, np.uint32(rows)),
+                    gp.exl3_rotate_out_rows(e.q, (nmax // 128 * 16, rows, len(groups)), (16, 1, 1), base, db, np.uint32(rows))]
         return finish(e, ar, d, groups, rows, launch, reps)
     rb = next(r for r in (1, 2, 4, 8, 16) if r >= rows)
     ns, ks = e.shape(bits, rb, [int(n) // 16 for n in d["n"]], [int(k) // 16 for k in d["k"]])
