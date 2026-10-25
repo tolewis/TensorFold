@@ -46,6 +46,8 @@ class Moe:
         self.gu = ar.add(nbytes=self.slots * self.P * 2 * self.I * 4)
         self.act = ar.add(nbytes=self.slots * self.I * 4)
         self.y = ar.add(nbytes=self.slots * self.H * 4)
+        self.rot = ar.add(nbytes=2 * self.slots * self.H * 4)  # prompt tiles: gate|up rotated input, then down sums
+        self.dns = ar.add(nbytes=self.slots * self.H * 4)
         self.ar, self.base = ar, ar.build(e.q)
         self.ids = [e.buf(np.ascontiguousarray(i, np.uint32)) for i in ids_sets]
         self.shared_id = len(experts)
@@ -57,9 +59,38 @@ class Moe:
         ev = [self.p.exl3_moe_gate_up(self.e.q, (self.I // 128 * self.P * 128, self.slots), (128, 1), self.base, g, u, ids,
                                       u32(self.topk), u32(self.pairs), u32(self.shared_id), u64(self.x), u32(self.H), u64(self.gu), u32(0)),
               self.p.exl3_moe_act(self.e.q, (self.I // 128 * 32, self.slots), (32, 1), self.base, g, u, d, ids, u32(self.pairs),
-                                  u32(self.shared_id), u64(self.gu), u64(self.act)),
+                                  u32(self.shared_id), u64(self.gu), u64(self.act), u32(self.P)),
               self.p.exl3_moe_down(self.e.q, (self.H // 128 * 128 // self.DS * self.PD, self.slots), (128 // self.DS * self.PD, 1),
                                    self.base, d, ids, u32(self.pairs), u32(self.shared_id), u64(self.act), u64(self.y), u32(self.H), u32(1))]
+        return ev
+
+    def prompt(self, ids):
+        """The prompt path (expert tiles on XMX): the runner's sort on the host, then exl3_moe_rot, exl3_moe_tile
+        (gate|up), exl3_moe_act (one split), exl3_moe_tile (down), exl3_moe_out_rows."""
+        e, u32, u64 = self.e, np.uint32, np.uint64
+        ne = self.shared_id
+        expert = np.concatenate([ids.ravel(), np.full(self.T, ne)]).astype(np.int64)
+        order = np.argsort(expert, kind="stable").astype(np.uint32)
+        tiles = []
+        for x in range(ne + 1):
+            at = np.flatnonzero(expert[order] == x)
+            for i in range(0, len(at), 16):
+                tiles.append((x, at[0] + i, min(16, len(at) - i), 0))
+        tl = np.array(tiles, np.uint32)
+        ob, tb, nb, ib = e.buf(order), e.buf(tl), e.buf(np.array([len(tl)], np.uint32)), e.buf(np.ascontiguousarray(ids, np.uint32))
+        g, u, d = self.tabs
+        H, I, S = self.H, self.I, self.slots
+        nt = len(tl)
+        ev = [self.p.exl3_moe_rot(e.q, (H // 128 * 16, S, 2), (16, 1, 1), self.base, g, u, ib, u32(self.topk), u32(self.pairs),
+                                  u32(self.shared_id), u64(self.x), u32(H), u32(0), u64(self.rot), u32(S)),
+              self.p.exl3_moe_tile(e.q, ((I // 16 // 2 * 16 + 127) // 128 * 128, nt, 2), (128, 1, 1), self.base, g, u, ob, tb, nb,
+                                   u64(self.rot), u64(S * H), u64(self.gu), u32(2 * I), u32(I)),
+              self.p.exl3_moe_act(e.q, (I // 128 * 32, S), (32, 1), self.base, g, u, d, ib, u32(self.pairs), u32(self.shared_id),
+                                  u64(self.gu), u64(self.act), u32(1)),
+              self.p.exl3_moe_tile(e.q, ((H // 16 // 2 * 16 + 127) // 128 * 128, nt, 1), (128, 1, 1), self.base, d, d, ob, tb, nb,
+                                   u64(self.act), u64(0), u64(self.dns), u32(H), u32(0)),
+              self.p.exl3_moe_out_rows(e.q, (H // 128 * 16, S), (16, 1), self.base, d, ib, u32(self.pairs), u32(self.shared_id),
+                                       u64(self.dns), u64(self.y), u32(H), u32(1))]
         return ev
 
     def y_out(self):
@@ -101,6 +132,28 @@ def main():
             worst = max(worst, np.abs(y[s] - yr).max() / np.abs(yr).max())
         print(f"moe tokens={T} slots={m.slots}: worst max|y-ref|/max|ref| = {worst:.2e}", flush=True)
     assert worst <= 1e-4, worst
+    # prompt tiles: MOE_PROMPT tokens (default 64), ids among the 24 experts
+    for T in [int(t) for t in os.environ.get("MOE_PROMPT", "64").split(",") if t]:
+        x = to_bf16(rng.standard_normal((T, 2048)).astype(np.float32))
+        ids = np.stack([rng.permutation(24)[:8] for _ in range(T)]).astype(np.uint32)
+        m.setup(sub, shared, x, [ids], 8)
+        ev = m.prompt(ids)
+        y = m.y_out()
+        xf = from_bf16(x).astype(np.float64)
+        cache, pw = {}, 0.0
+        for s in range(m.slots):
+            ei = int(ids.flat[s]) if s < m.pairs else -1
+            ex = sub[ei] if ei >= 0 else shared
+            if ei not in cache:
+                cache[ei] = tuple(dq(ex[j]) for j in range(3))
+            G, U, D = cache[ei]
+            t = s // 8 if s < m.pairs else s - m.pairs
+            gg, uu = xf[t] @ G, xf[t] @ U
+            yr = (gg / (1 + np.exp(-gg)) * uu) @ D
+            pw = max(pw, np.abs(y[s] - yr).max() / np.abs(yr).max())
+        tt = [(v.profile.end - v.profile.start) * 1e6 for v in ev]
+        print(f"moe prompt tiles tokens={T} slots={m.slots}: worst max|y-ref|/max|ref| = {pw:.2e}; us rot/gu/act/down/out " + " ".join(f"{v:.0f}" for v in tt), flush=True)
+        assert pw <= 1e-4, pw
     # time: all 256 experts resident, fresh picks each call (see MOE_IDSETS)
     full = [grp(f"{L}.experts.{i}") for i in range(256)]
     x = to_bf16(rng.standard_normal((1, 2048)).astype(np.float32))

@@ -74,6 +74,15 @@ class Exl3:
             self.kern[key] = cl.Kernel(p, "exl3_matvec")
         return self.kern[key]
 
+    def gemm(self, bits):
+        """exl3_gemm (prompt rows on XMX) from the fused MLP image of these bits (exl3_variants.moe)."""
+        key = ("gemm", bits)
+        if key not in self.kern:
+            p = cl.Program(self.ctx, self.src).build(f"-cl-std=CL3.0 -DBITS={bits} -DMOE_P=4 -DMOE_PD=2 -DMOE_DS=2 -DMOE_KMAX=4096 " + os.environ.get("EXL3_OPTS", ""))
+            self.progs[key] = p
+            self.kern[key] = cl.Kernel(p, "exl3_gemm")
+        return self.kern[key]
+
     def buf(self, a):
         return cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE | cl.mem_flags.COPY_HOST_PTR, hostbuf=np.ascontiguousarray(a))
 
@@ -138,10 +147,19 @@ def project(e, groups, xs, rows, out_f32=True, reps=0):
     base = ar.build(e.q)
     db = e.buf(d)
     kmax, nmax = int(d["k"].max()), int(d["n"].max())
-    rb = next(r for r in (1, 2, 4, 8, 16) if r >= rows)
     bits = {int(h) // 2 for h in d["halves"]}
     assert len(bits) == 1, "one width a launch"
     bits = bits.pop()
+    if rows > 16:  # prompt rows: rotate_in, exl3_gemm (XMX), rotate_out with one split
+        gm = e.gemm(bits)
+        gp = e.progs[("gemm", bits)]  # the prompt kernels live in the fused MLP image
+        gx = nmax // 16 // GEMM_S * 128
+        def launch():
+            return [gp.exl3_rotate_in_h(e.q, (kmax // 128 * 16, rows, len(groups)), (16, 1, 1), base, db),
+                    gm(e.q, (gx, (rows + 8 * GEMM_M - 1) // (8 * GEMM_M), len(groups)), (128, 1, 1), base, db),
+                    gp.exl3_rotate_out_rows(e.q, (nmax // 128 * 16, rows, len(groups)), (16, 1, 1), base, db)]
+        return finish(e, ar, d, groups, rows, launch, reps)
+    rb = next(r for r in (1, 2, 4, 8, 16) if r >= rows)
     ns, ks = e.shape(bits, rb, [int(n) // 16 for n in d["n"]], [int(k) // 16 for k in d["k"]])
     assert ks <= KS_MAX
     mv = e.matvec(bits, rb, ns)
@@ -153,6 +171,14 @@ def project(e, groups, xs, rows, out_f32=True, reps=0):
         ev += [mv(e.q, (gx, len(groups), ks), (WG, 1, 1), base, db, np.uint32(ks), np.uint32(fuse)),
                e.p.exl3_rotate_out(e.q, (nmax // 128 * 16, rows * 8, len(groups)), (16, 8, 1), base, db, np.uint32(ks))]
         return ev
+    return finish(e, ar, d, groups, rows, launch, reps)
+
+
+GEMM_M = int(os.environ.get("GEMM_M", "16"))    # exl3.cl GEMM_M and GEMM_S (pass the same in EXL3_OPTS)
+GEMM_S = int(os.environ.get("GEMM_S", "4"))
+
+
+def finish(e, ar, d, groups, rows, launch, reps):
     ev = launch()
     e.q.finish()
     outs = [ar.read(e.q, int(d[g]["out"]), (rows, int(d[g]["n"])), np.float32) for g in range(len(groups))]
@@ -234,7 +260,7 @@ def gate3(e, st):
         if label == "lm_head":
             tr = np.ascontiguousarray(tr[:, :1024]); svh = svh[: 1024 * 16]
         W = ref.dequantize(w // 8, 2, tr, suh, svh)
-        for rows in (1, 3, 16):
+        for rows in (1, 3, 16, 64, 333):
             x = to_bf16(rng.standard_normal((rows, kt * 16)).astype(np.float32))
             (y,), _ = project(e, [(tr, suh, svh, mul1)], [x], rows)
             yr = from_bf16(x).astype(np.float64) @ W
@@ -247,13 +273,13 @@ def gate3(e, st):
             tr = rng.integers(-32768, 32768, (kt, nt, 16 * bits)).astype(np.int16)
             suh = rng.uniform(0.5, 1.5, kt * 16).astype(np.float16); svh = rng.uniform(0.5, 1.5, nt * 16).astype(np.float16)
             groups.append((tr, suh, svh, True))
-        for rows in (1, 5):
+        for rows in (1, 5, 40):
             xs = [to_bf16(rng.standard_normal((rows, g[0].shape[0] * 16)).astype(np.float32)) for g in groups]
             ys, _ = project(e, groups, xs, rows)
             for g, x, y in zip(groups, xs, ys):
                 yr = from_bf16(x).astype(np.float64) @ ref.dequantize(2 * bits, 2, *g[:3])
                 worst = max(worst, np.abs(y - yr).max() / np.abs(yr).max())
-    print(f"gate3 synthetic: bits 2..8, two groups a launch, rows 1 and 5: worst so far {worst:.2e}")
+    print(f"gate3 synthetic: bits 2..8, two groups a launch, rows 1, 5 and 40: worst so far {worst:.2e}")
     assert worst <= 1e-3, worst
     print(f"gate3: worst {worst:.2e} <= 1e-3")
 

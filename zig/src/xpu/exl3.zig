@@ -4,6 +4,7 @@
 //! A launch covers many groups (projections) of one width through a descriptor table on the device, built once
 //! at load time and run every step. Routed experts build their slot table on the device (exl3_route).
 //! A whole routed MLP (gate, up, SiLU, down for every pick, plus the shared expert) runs fused: encodeMoe.
+//! Prompt rows (more than variants.rows_max) run on XMX: exl3_gemm for groups, expert tiles for the MLP (encodeMoeTiles).
 
 const std = @import("std");
 const Context = @import("context.zig").Context;
@@ -35,7 +36,7 @@ pub const Matrix = struct {
 };
 
 /// One projection of a launch. x is [rows][x_stride] in `input`, y is [rows][y_stride] in `output`, and scratch holds
-/// scratchBytes(k, n, rows) bytes that no other group of the launch uses.
+/// scratchBytes(k, n, rows) bytes (promptScratchBytes above variants.rows_max rows) that no other group of the launch uses.
 pub const Group = struct {
     m: Matrix,
     rows: u32,
@@ -86,9 +87,15 @@ pub fn scratchBytes(k: usize, n: usize, rows: usize) usize {
     return rotBytes(k, rows) + splitBound(n) * n * rows * 4;
 }
 
+/// A prompt group (more than variants.rows_max rows): fp16 hi and lo planes of the rotated input (the size of rotBytes),
+/// then fp32 sums [rows][n], one split.
+pub fn promptScratchBytes(k: usize, n: usize, rows: usize) usize {
+    return rotBytes(k, rows) + n * rows * 4;
+}
+
 pub fn descriptor(g: Group) !Desc {
     try g.m.validate();
-    if (g.rows == 0 or g.rows > variants.rows_max) return error.InvalidExl3Rows;
+    if (g.rows == 0 or g.rows > variants.moe.prompt_rows_max) return error.InvalidExl3Rows;
     if (g.x_stride < g.m.k or g.y_stride < g.m.n) return error.InvalidExl3Stride;
     return .{
         .trellis = g.m.trellis,
@@ -113,17 +120,24 @@ const local_rotate = [3]u32{ 16, 1, 1 };
 const local_rotate_out = [3]u32{ 16, 8, 1 }; // exl3.cl RO_PARTS sub-groups a block
 const local_matvec = [3]u32{ 128, 1, 1 };
 
-/// The three kernels of a fused routed MLP image (exl3_variants.moe).
+/// The kernels of a fused routed MLP image (exl3_variants.moe): the decode MLP, then the prompt kernels (groups and
+/// expert tiles on XMX).
 const MoeKernels = struct {
     gate_up: mod.Kernel,
     act: mod.Kernel,
     down: mod.Kernel,
+    rotate_in_h: mod.Kernel,
+    gemm: mod.Kernel,
+    rotate_out_rows: mod.Kernel,
+    rot: mod.Kernel,
+    tile: mod.Kernel,
+    out_rows: mod.Kernel,
 
-    const names = [_][:0]const u8{ "exl3_moe_gate_up", "exl3_moe_act", "exl3_moe_down" };
-    const locals = [_][3]u32{ .{ 128, 1, 1 }, .{ 32, 1, 1 }, .{ 128 / variants.moe.ds * variants.moe.pd, 1, 1 } };
+    const names = [_][:0]const u8{ "exl3_moe_gate_up", "exl3_moe_act", "exl3_moe_down", "exl3_rotate_in_h", "exl3_gemm", "exl3_rotate_out_rows", "exl3_moe_rot", "exl3_moe_tile", "exl3_moe_out_rows" };
+    const locals = [_][3]u32{ .{ 128, 1, 1 }, .{ 32, 1, 1 }, .{ 128 / variants.moe.ds * variants.moe.pd, 1, 1 }, local_rotate, .{ 128, 1, 1 }, local_rotate, local_rotate, .{ 128, 1, 1 }, local_rotate };
 
     fn load(m: mod.Module) Error!MoeKernels {
-        var ks: [3]mod.Kernel = undefined;
+        var ks: [names.len]mod.Kernel = undefined;
         var done: usize = 0;
         errdefer for (ks[0..done]) |*k| k.deinit();
         for (&ks, names, locals) |*k, n, l| {
@@ -131,11 +145,11 @@ const MoeKernels = struct {
             done += 1;
             try k.indirect();
         }
-        return .{ .gate_up = ks[0], .act = ks[1], .down = ks[2] };
+        return .{ .gate_up = ks[0], .act = ks[1], .down = ks[2], .rotate_in_h = ks[3], .gemm = ks[4], .rotate_out_rows = ks[5], .rot = ks[6], .tile = ks[7], .out_rows = ks[8] };
     }
 
     fn deinit(mk: *MoeKernels) void {
-        inline for (.{ &mk.gate_up, &mk.act, &mk.down }) |k| k.deinit();
+        inline for (.{ &mk.gate_up, &mk.act, &mk.down, &mk.rotate_in_h, &mk.gemm, &mk.rotate_out_rows, &mk.rot, &mk.tile, &mk.out_rows }) |k| k.deinit();
     }
 };
 
@@ -240,7 +254,11 @@ pub const Plan = struct {
             p.strips.total += g.m.n / 16;
             p.k_tiles_gcd = std.math.gcd(p.k_tiles_gcd, g.m.k / 16);
         }
-        if (variants.pick(p.bits, p.rows, p.strips) == null) return error.UnsupportedExl3Width;
+        if (p.rows > variants.rows_max) { // prompt rows: exl3_gemm of the fused MLP image
+            const m = variants.moe;
+            if (std.mem.indexOfScalar(u32, &m.bits, p.bits) == null) return error.UnsupportedExl3Width;
+            if (p.strips.gcd % m.gemm_s != 0 or p.k_tiles_gcd % m.gemm_kc != 0) return error.UnsupportedExl3Shape;
+        } else if (variants.pick(p.bits, p.rows, p.strips) == null) return error.UnsupportedExl3Width;
         p.table = try DeviceBuffer.fromHost(ctx, s, std.mem.sliceAsBytes(descs));
         return p;
     }
@@ -306,6 +324,7 @@ fn stages(p: *const Pipelines, s: Stream, table: ?*anyopaque, count: u32, rows: 
 
 /// y = x @ W for every group of the plan.
 pub fn encode(p: *const Pipelines, s: Stream, plan: *const Plan) Error!void {
+    if (plan.rows > variants.rows_max) return encodeRows(p, s, plan, plan.rows);
     try stages(p, s, plan.table.ptr, plan.count, plan.rows, plan.k_max, plan.n_max, plan.k_tiles_gcd, try shapeOf(plan, plan.rows, plan.strips.total));
 }
 
@@ -433,6 +452,7 @@ pub fn encodeMoe(p: *const Pipelines, s: Stream, gate: *const Plan, up: *const P
     try k.act.setU32(6, shared);
     try setU64(k.act, 7, r.scratch + sc.gu);
     try setU64(k.act, 8, r.scratch + sc.act);
+    try k.act.setU32(9, m.p);
     try launch(k.act, s, .{ ff / 128, slots, 1 });
 
     try k.down.setPtr(0, null);
@@ -447,6 +467,138 @@ pub fn encodeMoe(p: *const Pipelines, s: Stream, gate: *const Plan, up: *const P
     try launch(k.down, s, .{ hidden / 128, slots, 1 });
 }
 
+/// The first `rows` rows of a prompt plan (built with more than variants.rows_max rows): rotate_in to fp16 hi and lo
+/// planes, exl3_gemm on XMX, rotate_out. One plan of the chunk size serves every chunk length.
+pub fn encodeRows(p: *const Pipelines, s: Stream, plan: *const Plan, rows: u32) Error!void {
+    if (rows == 0 or rows > plan.rows or plan.rows <= variants.rows_max) return error.Invalid;
+    const m = variants.moe;
+    const mi = std.mem.indexOfScalar(u32, &m.bits, plan.bits) orelse return error.Invalid;
+    const k = p.moe[mi];
+    for ([_]mod.Kernel{ k.rotate_in_h, k.gemm, k.rotate_out_rows }) |kk| {
+        try kk.setPtr(0, null); // base: unused with -DEXL3_ABS
+        try kk.setPtr(1, plan.table.ptr);
+        try kk.setU32(2, rows);
+    }
+    try launch(k.rotate_in_h, s, .{ plan.k_max / 128, rows, plan.count });
+    try launch(k.gemm, s, .{ plan.n_max / 16 / m.gemm_s, std.math.divCeil(u32, rows, 8 * m.gemm_m) catch unreachable, plan.count });
+    try launch(k.rotate_out_rows, s, .{ plan.n_max / 128, rows, plan.count });
+}
+
+/// A routed MLP over prompt rows on XMX, as encodeMoe: slots sorted by expert into tiles of at most
+/// variants.moe.tile_rows slots by the caller. order holds the slots (pair p, or pairs + t for the shared expert of
+/// token t) grouped by expert; tiles are uint4 (table index, first entry of order, count, 0); ntiles[0] is their count,
+/// at most tile_bound. y and the slot numbering are those of encodeMoe.
+pub const MoeTiles = struct {
+    route: MoeRoute,
+    order: u64,
+    tiles: u64,
+    ntiles: u64,
+    tile_bound: u32,
+};
+
+/// Scratch of the prompt MLP: gate|up rotated input [2][slots][hidden] fp32 (then the down sums [slots][hidden]),
+/// gate|up sums [slots][2][ff], the down input [slots][ff].
+const TileScratch = struct { rot: usize, gu: usize, act: usize, size: usize };
+
+fn tileScratch(hidden: usize, ff: usize, slots: usize) TileScratch {
+    const rot = std.mem.alignForward(usize, 2 * slots * hidden * 4, 256);
+    const gu = std.mem.alignForward(usize, slots * 2 * ff * 4, 256);
+    return .{ .rot = 0, .gu = rot, .act = rot + gu, .size = rot + gu + slots * ff * 4 };
+}
+
+pub fn moeTileScratchBytes(hidden: usize, ff: usize, slots: usize) usize {
+    return tileScratch(hidden, ff, slots).size;
+}
+
+/// Five launches, no host wait: rotate gate|up input a slot, gate|up tiles, act (one split), down tiles, rotate out.
+pub fn encodeMoeTiles(p: *const Pipelines, s: Stream, gate: *const Plan, up: *const Plan, down: *const Plan, t: MoeTiles) Error!void {
+    const r = t.route;
+    const hidden = gate.k_max;
+    const ff = gate.n_max;
+    const m = variants.moe;
+    if (up.k_max != hidden or up.n_max != ff or down.k_max != ff or down.n_max != hidden) return error.Invalid;
+    if (gate.count != up.count or gate.count != down.count or gate.bits != up.bits or gate.bits != down.bits) return error.Invalid;
+    if (hidden % 128 != 0 or ff % 128 != 0 or ff % (16 * m.tile_ns) != 0 or hidden % (16 * m.tile_ns) != 0) return error.Invalid;
+    if (r.shared) |e| if (e >= gate.count) return error.Invalid;
+    if (r.x_stride < hidden or r.y_stride < hidden) return error.Invalid;
+    const mi = std.mem.indexOfScalar(u32, &m.bits, gate.bits) orelse return error.Invalid;
+    const k = p.moe[mi];
+    const slots = r.slots();
+    if (slots == 0 or t.tile_bound == 0) return error.Invalid;
+    const pairs = r.tokens * r.topk;
+    const shared = r.shared orelse 0;
+    const sc = tileScratch(hidden, ff, slots);
+    const ids: ?*anyopaque = @ptrFromInt(r.ids);
+    const order: ?*anyopaque = @ptrFromInt(t.order);
+    const tiles: ?*anyopaque = @ptrFromInt(t.tiles);
+    const ntiles: ?*anyopaque = @ptrFromInt(t.ntiles);
+    const tile_x = struct {
+        fn f(n: u32) u32 {
+            return std.math.divCeil(u32, n / 16 / m.tile_ns, 8) catch unreachable; // work-groups of 8 sub-groups
+        }
+    }.f;
+
+    try k.rot.setPtr(0, null);
+    try k.rot.setPtr(1, gate.table.ptr);
+    try k.rot.setPtr(2, up.table.ptr);
+    try k.rot.setPtr(3, ids);
+    try k.rot.setU32(4, r.topk);
+    try k.rot.setU32(5, pairs);
+    try k.rot.setU32(6, shared);
+    try setU64(k.rot, 7, r.x);
+    try k.rot.setU32(8, r.x_stride);
+    try k.rot.setU32(9, @intFromEnum(r.input));
+    try setU64(k.rot, 10, r.scratch + sc.rot);
+    try k.rot.setU32(11, slots);
+    try launch(k.rot, s, .{ hidden / 128, slots, 2 });
+
+    try k.tile.setPtr(0, null);
+    try k.tile.setPtr(1, gate.table.ptr);
+    try k.tile.setPtr(2, up.table.ptr);
+    try k.tile.setPtr(3, order);
+    try k.tile.setPtr(4, tiles);
+    try k.tile.setPtr(5, ntiles);
+    try setU64(k.tile, 6, r.scratch + sc.rot);
+    try setU64(k.tile, 7, @as(u64, slots) * hidden);
+    try setU64(k.tile, 8, r.scratch + sc.gu);
+    try k.tile.setU32(9, 2 * ff);
+    try k.tile.setU32(10, ff);
+    try launch(k.tile, s, .{ tile_x(ff), t.tile_bound, 2 });
+
+    try k.act.setPtr(0, null);
+    try k.act.setPtr(1, gate.table.ptr);
+    try k.act.setPtr(2, up.table.ptr);
+    try k.act.setPtr(3, down.table.ptr);
+    try k.act.setPtr(4, ids);
+    try k.act.setU32(5, pairs);
+    try k.act.setU32(6, shared);
+    try setU64(k.act, 7, r.scratch + sc.gu);
+    try setU64(k.act, 8, r.scratch + sc.act);
+    try k.act.setU32(9, 1);
+    try launch(k.act, s, .{ ff / 128, slots, 1 });
+
+    // down sums reuse the rotated input's space (its gate|up use is done)
+    try k.tile.setPtr(1, down.table.ptr);
+    try k.tile.setPtr(2, down.table.ptr);
+    try setU64(k.tile, 6, r.scratch + sc.act);
+    try setU64(k.tile, 7, 0);
+    try setU64(k.tile, 8, r.scratch + sc.rot);
+    try k.tile.setU32(9, hidden);
+    try k.tile.setU32(10, 0);
+    try launch(k.tile, s, .{ tile_x(hidden), t.tile_bound, 1 });
+
+    try k.out_rows.setPtr(0, null);
+    try k.out_rows.setPtr(1, down.table.ptr);
+    try k.out_rows.setPtr(2, ids);
+    try k.out_rows.setU32(3, pairs);
+    try k.out_rows.setU32(4, shared);
+    try setU64(k.out_rows, 5, r.scratch + sc.rot);
+    try setU64(k.out_rows, 6, r.y);
+    try k.out_rows.setU32(7, r.y_stride);
+    try k.out_rows.setU32(8, @intFromEnum(r.output));
+    try launch(k.out_rows, s, .{ hidden / 128, slots, 1 });
+}
+
 test "descriptor layout and scratch" {
     const m = Matrix{ .trellis = 0x1000, .suh = 0x2000, .svh = 0x3000, .k = 2048, .n = 512, .halves = 8 };
     const d = try descriptor(.{ .m = m, .rows = 3, .x = 0x4000, .x_stride = 2048, .y = 0x5000, .y_stride = 512, .output = .f32, .scratch = 0x10000 });
@@ -454,7 +606,9 @@ test "descriptor layout and scratch" {
     try std.testing.expectEqual(@as(u32, 1), d.out_type);
     try std.testing.expectEqual(@as(usize, 2048 * 3 * 4 + 16 * 512 * 3 * 4), scratchBytes(2048, 512, 3));
     try std.testing.expectEqual(@as(usize, 1), splitBound(248320));
-    try std.testing.expectError(error.InvalidExl3Rows, descriptor(.{ .m = m, .rows = 17, .x = 0, .x_stride = 2048, .y = 0, .y_stride = 512, .scratch = 0 }));
+    try std.testing.expectError(error.InvalidExl3Rows, descriptor(.{ .m = m, .rows = 1025, .x = 0, .x_stride = 2048, .y = 0, .y_stride = 512, .scratch = 0 }));
+    // prompt rows: one split
+    try std.testing.expectEqual(@as(usize, 2048 * 512 * 4 + 512 * 512 * 4), promptScratchBytes(2048, 512, 512));
     try std.testing.expectError(error.UnsupportedExl3Shape, (Matrix{ .trellis = 0, .suh = 0, .svh = 0, .k = 100, .n = 512, .halves = 8 }).validate());
     // Sage: hidden 2048, ff 512, 8 picks and the shared expert
     try std.testing.expectEqual(@as(usize, 9 * 4 * 2 * 512 * 4 + 9 * 512 * 4), moeScratchBytes(2048, 512, 9));

@@ -426,19 +426,19 @@ __kernel void exl3_moe_gate_up(__global const uchar *base, __global const exl3_d
 }
 
 // act[s][I] = H_I((silu(gate x) * up x) * suh_down) / sqrt(128), the down projection's rotated input: rotate_out of
-// gate and up from gu (MOE_P splits in order), SiLU, then the down rotate_in, one 128 block a work-group.
+// gate and up from gu (`splits` splits in order: MOE_P in decode, 1 for prompt tiles), SiLU, then the down rotate_in, one 128 block a work-group.
 // Grid (I / 128 * 32, slots), work-group 2 sub-groups (gate, up).
 __attribute__((intel_reqd_sub_group_size(SG)))
 __kernel void exl3_moe_act(__global const uchar *base, __global const exl3_desc *gate, __global const exl3_desc *up,
                            __global const exl3_desc *down, __global const uint *ids, uint pairs, uint shared_id, ulong gu,
-                           ulong act) {
+                           ulong act, uint splits) {
     __local float gv[2][128];
     const uint nb = get_group_id(0), s = get_group_id(1), q = get_sub_group_id(), c = get_sub_group_local_id();
     const uint e = moe_expert(ids, s, pairs, shared_id);
     const exl3_desc g = q ? up[e] : gate[e];
     const uint ff = g.n;
     float v[8];
-    sums_out(v, AT(const float, gu) + (ulong)s * MOE_P * 2 * ff + q * ff + nb * 128, MOE_P, 2 * ff, AT(const half, g.svh) + nb * 128, c);
+    sums_out(v, AT(const float, gu) + (ulong)s * splits * 2 * ff + q * ff + nb * 128, splits, 2 * ff, AT(const half, g.svh) + nb * 128, c);
     for (uint j = 0; j < 8; j++) gv[q][c + SG * j] = v[j];
     barrier(CLK_LOCAL_MEM_FENCE);
     if (q) return;
@@ -489,4 +489,228 @@ __kernel void exl3_moe_down(__global const uchar *base, __global const exl3_desc
     for (uint j = 0; j < 8; j++)
         store_y(AT(uchar, y), (ulong)s * y_stride + nb * 128 + c + SG * j, out_type, v[j] * INV_SQRT128 * vload_half(c + SG * j, svh));
 }
+
+// ---------------------------------------------------------------- prompt rows (P3.4): trellis tiles on XMX
+// A k tile of 16 rows and a 16-column strip is one DPAS B operand: lane c decodes column c (as exl3_matvec) and puts
+// its 16 weights in k order, k pairs 2j and 2j + 1 a dword. A is 8 rows of the rotated input, k = lane, in fp16 (the
+// mul1 weights are fp16 values, so only the input rounds). The tiling is that of the W4A16 grouped GEMM for Xe2 in
+// vllm-xpu-kernels: weights decoded in registers straight into the B operand, fp32 accumulators.
+#define DPH(a, b, c) intel_sub_group_f16_f16_matrix_mad_k16(as_short8(a), as_int8(b), c)
+#ifndef GEMM_M
+#define GEMM_M 16                         // rows a sub-group: GEMM_M / 8 DPAS a k tile
+#endif
+#ifndef GEMM_LO
+#define GEMM_LO 1                         // 1: x = hi + lo in two fp16 DPAS (fp16 x alone gave 1.35e-3 on down_proj)
+#endif
+
+inline int8 tile_b(__global const uint *t, uint c) {
+    const uint g = c % 8, h = c / 8;
+    const uint wbase = ((32 * g * BITS + BITS + 32 * RINGW - 16) / 32) % RINGW;
+    uint raw[LOADW], w[USEW];
+    for (uint j = 0; j < LOADW; j++) raw[j] = t[(wbase + j) % RINGW];
+    for (uint j = 0; j < USEW; j++) w[j] = h ? (SHB ? (raw[j + SHW] << SHB) | (raw[j + SHW + 1] >> (32 - SHB)) : raw[j + SHW]) : raw[j];
+    half kv[16];
+    for (uint v = 0; v < 16; v++) {
+        const uint bit = OFF0 + (8 * (v / 4) + (v % 4)) * BITS, wi = bit / 32, off = bit % 32;
+        kv[lane_row(v)] = (half)mul1_value(off ? ((w[wi] << off) | (w[wi + 1] >> (32 - off))) >> 16 : w[wi] >> 16);
+    }
+    int8 b;
+    for (uint j = 0; j < 8; j++) ((int *)&b)[j] = as_int((half2)(kv[2 * j], kv[2 * j + 1]));
+    return b;
+}
+
+// The rotated input of prompt rows as two fp16 planes, x = hi + lo: rot holds hi [rows][k], then lo. Grid (K_max / 128,
+// rows_max, groups) of one sub-group, as exl3_rotate_in.
+__attribute__((intel_reqd_sub_group_size(SG)))
+__kernel void exl3_rotate_in_h(__global const uchar *base, __global const exl3_desc *desc, uint rows) {
+    exl3_desc d = desc[get_group_id(2)];
+    d.rows = min(d.rows, rows);
+    const uint blk = get_group_id(0), row = get_group_id(1), lane = get_sub_group_local_id();
+    if (blk * 128 >= d.k || row >= d.rows) return;
+    __global const ushort *x = AT(const ushort, d.x) + (ulong)row * d.x_stride;
+    __global const half *suh = AT(const half, d.suh);
+    float v[8];
+    for (uint j = 0; j < 8; j++) {
+        const uint i = blk * 128 + lane + SG * j;
+        v[j] = load_x(x, i, d.x_f16) * vload_half(i, suh);
+    }
+    hadamard128(v, lane);
+    __global half *hi = AT(half, d.rot) + (ulong)row * d.k;
+    __global half *lo = AT(half, d.rot) + (ulong)desc[get_group_id(2)].rows * d.k + (ulong)row * d.k;
+    for (uint j = 0; j < 8; j++) {
+        const float f = v[j] * INV_SQRT128;
+        const half h = convert_half_rte(f);
+        hi[blk * 128 + lane + SG * j] = h;
+        lo[blk * 128 + lane + SG * j] = convert_half_rte(f - (float)h);
+    }
+}
+
+#ifndef GEMM_S
+#define GEMM_S 4                          // 16-column strips a work-group (N divides by 16 * GEMM_S)
+#endif
+#ifndef GEMM_KC
+#define GEMM_KC 8                         // k tiles decoded into local memory between two barriers (K divides by 16 * KC)
+#endif
+#define GEMM_WM (8 * GEMM_M)              // rows a work-group: 8 sub-groups of GEMM_M rows
+
+// sums[row][n] = rot[row] @ W_q for GEMM_S strips and GEMM_WM rows of a group (any row count; exl3_rotate_in_h before,
+// exl3_rotate_out_rows after). The work-group decodes each weight tile once into local memory as DPAS B operands, and
+// its 8 sub-groups (GEMM_M rows each) all use it: the decode is shared by GEMM_WM rows. Grid (N_max / 16 / GEMM_S * 128,
+// rows_max / GEMM_WM, groups), work-group 128.
+__attribute__((intel_reqd_sub_group_size(SG))) __attribute__((reqd_work_group_size(128, 1, 1)))
+__kernel void exl3_gemm(__global const uchar *base, __global const exl3_desc *desc, uint rows) {
+    __local int8 bs[GEMM_KC][GEMM_S][SG];
+    exl3_desc d = desc[get_group_id(2)];
+    d.rows = min(d.rows, rows);
+    const uint q = get_sub_group_id(), c = get_sub_group_local_id();
+    const uint tn0 = get_group_id(0) * GEMM_S, w0 = get_group_id(1) * GEMM_WM, m0 = w0 + q * GEMM_M;
+    if (tn0 * 16 >= d.n || w0 >= d.rows || d.halves != 2 * BITS) return;  // the whole work-group
+    __global const uint *tiles = (__global const uint *)(AT(const ushort, d.trellis) + (ulong)tn0 * 16 * BITS);
+    const ulong tile_k = (ulong)(d.n / 16) * RINGW;
+    const uint last = d.rows - 1;
+    __global const ushort *hi = AT(const ushort, d.rot);
+    __global const ushort *lo = hi + (ulong)desc[get_group_id(2)].rows * d.k;
+    float8 acc[GEMM_S][GEMM_M / 8];
+    for (uint s = 0; s < GEMM_S; s++)
+        for (uint rb = 0; rb < GEMM_M / 8; rb++) acc[s][rb] = 0.0f;
+    for (uint kc = 0; kc < d.k; kc += 16 * GEMM_KC) {
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (uint job = q; job < GEMM_KC * GEMM_S; job += 8) {
+            const uint t = job / GEMM_S, s = job % GEMM_S;
+            bs[t][s][c] = tile_b(tiles + (ulong)(kc / 16 + t) * tile_k + s * RINGW, c);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (uint t = 0; t < GEMM_KC; t++) {
+            const uint kb = kc + 16 * t;
+            short8 ah[GEMM_M / 8], al[GEMM_M / 8];
+            for (uint rb = 0; rb < GEMM_M / 8; rb++)
+                for (uint r = 0; r < 8; r++) {
+                    const ulong at = (ulong)min(m0 + rb * 8 + r, last) * d.k + kb;  // rows past the end are not stored
+                    ah[rb][r] = as_short(intel_sub_group_block_read_us(hi + at));
+                    if (GEMM_LO) al[rb][r] = as_short(intel_sub_group_block_read_us(lo + at));
+                }
+            for (uint s = 0; s < GEMM_S; s++) {
+                const int8 b = bs[t][s][c];
+                for (uint rb = 0; rb < GEMM_M / 8; rb++) {
+                    acc[s][rb] = DPH(ah[rb], b, acc[s][rb]);
+                    if (GEMM_LO) acc[s][rb] = DPH(al[rb], b, acc[s][rb]);
+                }
+            }
+        }
+    }
+    __global float *sums = AT(float, d.sums) + tn0 * 16 + c;
+    for (uint s = 0; s < GEMM_S; s++)
+        for (uint rb = 0; rb < GEMM_M / 8; rb++)
+            for (uint r = 0; r < 8; r++) {
+                const uint row = m0 + rb * 8 + r;
+                if (row < d.rows) sums[(ulong)row * d.n + s * 16] = acc[s][rb][r];
+            }
+}
+
+// out[row][n] = (H_N sums[row]) * svh in out_type for one 128 block, one split. Grid (N_max / 128, rows_max, groups) of
+// one sub-group.
+__attribute__((intel_reqd_sub_group_size(SG)))
+__kernel void exl3_rotate_out_rows(__global uchar *base, __global const exl3_desc *desc, uint rows) {
+    exl3_desc d = desc[get_group_id(2)];
+    d.rows = min(d.rows, rows);
+    const uint blk = get_group_id(0), row = get_group_id(1), lane = get_sub_group_local_id();
+    if (blk * 128 >= d.n || row >= d.rows) return;
+    __global const float *sums = AT(const float, d.sums) + (ulong)row * d.n + blk * 128;
+    __global const half *svh = AT(const half, d.svh) + blk * 128;
+    float v[8];
+    for (uint j = 0; j < 8; j++) v[j] = sums[lane + SG * j];
+    hadamard128(v, lane);
+    for (uint j = 0; j < 8; j++)
+        store_y(AT(uchar, d.out), (ulong)row * d.out_stride + blk * 128 + lane + SG * j, d.out_type, v[j] * INV_SQRT128 * vload_half(lane + SG * j, svh));
+}
+
+
+// ---------------------------------------------------------------- prompt MoE: expert tiles on XMX
+// A chunk's slots (pair p < pairs: token p / topk on expert ids[p]; slot pairs + t: token t on the shared expert) are
+// sorted by expert into tiles of at most 16 slots (the runner's sort: uint4 expert, first, count; order holds slots).
+// A tile reads its expert's weights once for all its slots.
+
+// rot[proj][slot][K] = H_K (x[token] * suh) / sqrt(128) for gate (proj 0) and up (1): their suh differ. Grid
+// (K / 128, slots, 2) of one sub-group.
+__attribute__((intel_reqd_sub_group_size(SG)))
+__kernel void exl3_moe_rot(__global const uchar *base, __global const exl3_desc *gate, __global const exl3_desc *up,
+                           __global const uint *ids, uint topk, uint pairs, uint shared_id, ulong x, uint x_stride,
+                           uint x_f16, ulong rot, uint slots) {
+    const uint blk = get_group_id(0), s = get_group_id(1), proj = get_group_id(2), lane = get_sub_group_local_id();
+    const exl3_desc d = (proj ? up : gate)[moe_expert(ids, s, pairs, shared_id)];
+    __global const ushort *xs = AT(const ushort, x) + (ulong)moe_token(s, pairs, topk) * x_stride;
+    __global const half *suh = AT(const half, d.suh);
+    float v[8];
+    for (uint j = 0; j < 8; j++) {
+        const uint i = blk * 128 + lane + SG * j;
+        v[j] = load_x(xs, i, x_f16) * vload_half(i, suh);
+    }
+    hadamard128(v, lane);
+    __global float *o = AT(float, rot) + ((ulong)proj * slots + s) * d.k + blk * 128;
+    for (uint j = 0; j < 8; j++) o[lane + SG * j] = v[j] * INV_SQRT128;
+}
+
+#ifndef TILE_NS
+#define TILE_NS 2                         // strips a sub-group in exl3_moe_tile
+#endif
+
+// sums[slot][proj][n] = a[proj][slot] @ W_q (expert of the tile, table proj: 0 gate or down, 1 up) for TILE_NS strips
+// and one tile of at most 16 slots: x = hi + lo in two fp16 DPAS, as exl3_gemm. a is fp32 [proj][slots][K] (a_proj
+// floats between the projections); sums rows are s_stride floats, s_proj floats between the projections.
+// Grid (N / 16 / TILE_NS * SG rounded to 128, tile bound, projections), work-group 128.
+__attribute__((intel_reqd_sub_group_size(SG)))
+__kernel void exl3_moe_tile(__global const uchar *base, __global const exl3_desc *t0, __global const exl3_desc *t1,
+                            __global const uint *order, __global const uint4 *tiles, __global const uint *ntiles,
+                            ulong a, ulong a_proj, ulong sums, uint s_stride, uint s_proj) {
+    if (get_group_id(1) >= ntiles[0]) return;
+    const uint4 tl = tiles[get_group_id(1)];
+    const uint proj = get_group_id(2), c = get_sub_group_local_id();
+    const exl3_desc d = (proj ? t1 : t0)[tl.x];
+    const uint tn0 = get_global_id(0) / SG * TILE_NS;
+    if (tn0 * 16 >= d.n || d.halves != 2 * BITS) return;
+    __global const uint *tile = (__global const uint *)(AT(const ushort, d.trellis) + (ulong)tn0 * 16 * BITS);
+    const ulong tile_k = (ulong)(d.n / 16) * RINGW;
+    __global const float *ap = AT(const float, a) + proj * a_proj + c;
+    uint slot[16];
+    for (uint i = 0; i < 16; i++) slot[i] = order[tl.y + min(i, tl.z - 1)];  // rows past the tile repeat its last slot
+    float8 acc[TILE_NS][2];
+    for (uint s = 0; s < TILE_NS; s++) acc[s][0] = acc[s][1] = 0.0f;
+    for (uint kb = 0; kb < d.k; kb += 16, tile += tile_k) {
+        short8 ah[2], al[2];
+        for (uint rb = 0; rb < 2; rb++)
+            for (uint r = 0; r < 8; r++) {
+                const float f = ap[(ulong)slot[rb * 8 + r] * d.k + kb];
+                const half h = convert_half_rte(f);
+                ah[rb][r] = as_short(h);
+                al[rb][r] = as_short(convert_half_rte(f - (float)h));
+            }
+        for (uint s = 0; s < TILE_NS; s++) {
+            const int8 b = tile_b(tile + s * RINGW, c);
+            for (uint rb = 0; rb < 2; rb++) {
+                acc[s][rb] = DPH(ah[rb], b, acc[s][rb]);
+                acc[s][rb] = DPH(al[rb], b, acc[s][rb]);
+            }
+        }
+    }
+    __global float *o = AT(float, sums) + proj * s_proj + (tn0 * 16 + c);
+    for (uint i = 0; i < tl.z; i++)
+        for (uint s = 0; s < TILE_NS; s++) o[(ulong)slot[i] * s_stride + s * 16] = acc[s][i / 8][i % 8];
+}
+
+// y[slot] for one 128 block of N in out_type: (H_N sums[slot]) * svh of the slot's down. Grid (N / 128, slots) of one
+// sub-group.
+__attribute__((intel_reqd_sub_group_size(SG)))
+__kernel void exl3_moe_out_rows(__global const uchar *base, __global const exl3_desc *down, __global const uint *ids,
+                                uint pairs, uint shared_id, ulong sums, ulong y, uint y_stride, uint out_type) {
+    const uint blk = get_group_id(0), s = get_group_id(1), lane = get_sub_group_local_id();
+    const exl3_desc d = down[moe_expert(ids, s, pairs, shared_id)];
+    __global const float *v0 = AT(const float, sums) + (ulong)s * d.n + blk * 128;
+    __global const half *svh = AT(const half, d.svh) + blk * 128;
+    float v[8];
+    for (uint j = 0; j < 8; j++) v[j] = v0[lane + SG * j];
+    hadamard128(v, lane);
+    for (uint j = 0; j < 8; j++)
+        store_y(AT(uchar, y), (ulong)s * y_stride + blk * 128 + lane + SG * j, out_type, v[j] * INV_SQRT128 * vload_half(lane + SG * j, svh));
+}
+
 #endif
