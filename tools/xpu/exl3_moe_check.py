@@ -1,4 +1,4 @@
-"""Fused routed MLP (exl3_moe_gate_up, _act, _down, _out) through pyopencl: check against the float64 reference,
+"""Fused routed MLP (exl3_moe_gate_up, _act, _down) through pyopencl: check against the float64 reference,
 then time it (device time a kernel, median). One Sage layer: top-k of the routed experts plus the shared expert,
 every slot y = down(silu(gate x) * up x).
 
@@ -44,7 +44,6 @@ class Moe:
         self.slots = self.pairs + self.T
         self.x = ar.add(x)
         self.gu = ar.add(nbytes=self.slots * self.P * 2 * self.I * 4)
-        self.dn = ar.add(nbytes=self.slots * self.PD * self.H * 4)
         self.act = ar.add(nbytes=self.slots * self.I * 4)
         self.y = ar.add(nbytes=self.slots * self.H * 4)
         self.ar, self.base = ar, ar.build(e.q)
@@ -59,10 +58,8 @@ class Moe:
                                       u32(self.topk), u32(self.pairs), u32(self.shared_id), u64(self.x), u32(self.H), u64(self.gu), u32(0)),
               self.p.exl3_moe_act(self.e.q, (self.I // 128 * 32, self.slots), (32, 1), self.base, g, u, d, ids, u32(self.pairs),
                                   u32(self.shared_id), u64(self.gu), u64(self.act)),
-              self.p.exl3_moe_down(self.e.q, (self.H // 128 * self.PD * 128 // self.DS, self.slots), (128 // self.DS, 1), self.base,
-                                   d, ids, u32(self.pairs), u32(self.shared_id), u64(self.act), u64(self.dn)),
-              self.p.exl3_moe_out(self.e.q, (self.H // 128 * 16, self.slots), (16, 1), self.base, d, ids, u32(self.pairs),
-                                  u32(self.shared_id), u64(self.dn), u64(self.y), u32(self.H), u32(1))]
+              self.p.exl3_moe_down(self.e.q, (self.H // 128 * 128 // self.DS * self.PD, self.slots), (128 // self.DS * self.PD, 1),
+                                   self.base, d, ids, u32(self.pairs), u32(self.shared_id), u64(self.act), u64(self.y), u32(self.H), u32(1))]
         return ev
 
     def y_out(self):
@@ -117,7 +114,7 @@ def main():
     gu_bytes = sum(a.nbytes for j in (0, 1) for a in full[0][j][:3]) * 9
     dn_bytes = sum(a.nbytes for a in full[0][2][:3]) * 9
     print(f"P={P} PD={PD} DS={DS} 1 token, 8 picks + shared: gate_up {t[0]*1e6:.1f} us {gu_bytes/t[0]/1e9:.0f} GB/s, act {t[1]*1e6:.1f} us, "
-          f"down {t[2]*1e6:.1f} us {dn_bytes/t[2]/1e9:.0f} GB/s, out {t[3]*1e6:.1f} us, sum {sum(t)*1e6:.1f} us {(gu_bytes+dn_bytes)/sum(t)/1e9:.0f} GB/s")
+          f"down {t[2]*1e6:.1f} us {dn_bytes/t[2]/1e9:.0f} GB/s, sum {sum(t)*1e6:.1f} us {(gu_bytes+dn_bytes)/sum(t)/1e9:.0f} GB/s")
 
 
 if __name__ == "__main__":

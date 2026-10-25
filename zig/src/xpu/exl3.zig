@@ -110,20 +110,20 @@ pub fn descriptor(g: Group) !Desc {
 }
 
 const local_rotate = [3]u32{ 16, 1, 1 };
+const local_rotate_out = [3]u32{ 16, 8, 1 }; // exl3.cl RO_PARTS sub-groups a block
 const local_matvec = [3]u32{ 128, 1, 1 };
 
-/// The four kernels of a fused routed MLP image (exl3_variants.moe).
+/// The three kernels of a fused routed MLP image (exl3_variants.moe).
 const MoeKernels = struct {
     gate_up: mod.Kernel,
     act: mod.Kernel,
     down: mod.Kernel,
-    out: mod.Kernel,
 
-    const names = [_][:0]const u8{ "exl3_moe_gate_up", "exl3_moe_act", "exl3_moe_down", "exl3_moe_out" };
-    const locals = [_][3]u32{ .{ 128, 1, 1 }, .{ 32, 1, 1 }, .{ 128 / variants.moe.ds, 1, 1 }, .{ 16, 1, 1 } };
+    const names = [_][:0]const u8{ "exl3_moe_gate_up", "exl3_moe_act", "exl3_moe_down" };
+    const locals = [_][3]u32{ .{ 128, 1, 1 }, .{ 32, 1, 1 }, .{ 128 / variants.moe.ds * variants.moe.pd, 1, 1 } };
 
     fn load(m: mod.Module) Error!MoeKernels {
-        var ks: [4]mod.Kernel = undefined;
+        var ks: [3]mod.Kernel = undefined;
         var done: usize = 0;
         errdefer for (ks[0..done]) |*k| k.deinit();
         for (&ks, names, locals) |*k, n, l| {
@@ -131,11 +131,11 @@ const MoeKernels = struct {
             done += 1;
             try k.indirect();
         }
-        return .{ .gate_up = ks[0], .act = ks[1], .down = ks[2], .out = ks[3] };
+        return .{ .gate_up = ks[0], .act = ks[1], .down = ks[2] };
     }
 
     fn deinit(mk: *MoeKernels) void {
-        inline for (.{ &mk.gate_up, &mk.act, &mk.down, &mk.out }) |k| k.deinit();
+        inline for (.{ &mk.gate_up, &mk.act, &mk.down }) |k| k.deinit();
     }
 };
 
@@ -155,7 +155,7 @@ pub const Pipelines = struct {
         errdefer p.base.unload();
         p.rotate_in = try p.base.kernel("exl3_rotate_in", local_rotate);
         errdefer p.rotate_in.deinit();
-        p.rotate_out = try p.base.kernel("exl3_rotate_out", local_rotate);
+        p.rotate_out = try p.base.kernel("exl3_rotate_out", local_rotate_out);
         errdefer p.rotate_out.deinit();
         p.route = try p.base.kernel("exl3_route", .{ 1, 1, 1 }); // one work-item a slot, no bound check in the kernel
         errdefer p.route.deinit();
@@ -368,20 +368,20 @@ pub const MoeRoute = struct {
     }
 };
 
-/// Scratch of a fused MLP: gate|up split sums, the down input, down split sums (fp32), each 256-byte aligned.
-const MoeScratch = struct { gu: usize, act: usize, dn: usize, size: usize };
+/// Scratch of a fused MLP: gate|up split sums, then the down input (fp32), 256-byte aligned.
+const MoeScratch = struct { gu: usize, act: usize, size: usize };
 
 fn moeScratch(hidden: usize, ff: usize, slots: usize) MoeScratch {
+    _ = hidden;
     const gu = std.mem.alignForward(usize, slots * variants.moe.p * 2 * ff * 4, 256);
-    const act = std.mem.alignForward(usize, slots * ff * 4, 256);
-    return .{ .gu = 0, .act = gu, .dn = gu + act, .size = gu + act + slots * variants.moe.pd * hidden * 4 };
+    return .{ .gu = 0, .act = gu, .size = gu + slots * ff * 4 };
 }
 
 pub fn moeScratchBytes(hidden: usize, ff: usize, slots: usize) usize {
     return moeScratch(hidden, ff, slots).size;
 }
 
-/// Four launches, no host wait. The splits are added in a fixed order: the result does not depend on the schedule.
+/// Three launches, no host wait. The splits are added in a fixed order: the result does not depend on the schedule.
 pub fn encodeMoe(p: *const Pipelines, s: Stream, gate: *const Plan, up: *const Plan, down: *const Plan, r: MoeRoute) Error!void {
     const hidden = gate.k_max;
     const ff = gate.n_max;
@@ -430,19 +430,10 @@ pub fn encodeMoe(p: *const Pipelines, s: Stream, gate: *const Plan, up: *const P
     try k.down.setU32(3, pairs);
     try k.down.setU32(4, shared);
     try setU64(k.down, 5, r.scratch + sc.act);
-    try setU64(k.down, 6, r.scratch + sc.dn);
-    try launch(k.down, s, .{ hidden / 128 * m.pd, slots, 1 });
-
-    try k.out.setPtr(0, null);
-    try k.out.setPtr(1, down.table.ptr);
-    try k.out.setPtr(2, ids);
-    try k.out.setU32(3, pairs);
-    try k.out.setU32(4, shared);
-    try setU64(k.out, 5, r.scratch + sc.dn);
-    try setU64(k.out, 6, r.y);
-    try k.out.setU32(7, r.y_stride);
-    try k.out.setU32(8, @intFromEnum(r.output));
-    try launch(k.out, s, .{ hidden / 128, slots, 1 });
+    try setU64(k.down, 6, r.y);
+    try k.down.setU32(7, r.y_stride);
+    try k.down.setU32(8, @intFromEnum(r.output));
+    try launch(k.down, s, .{ hidden / 128, slots, 1 });
 }
 
 test "descriptor layout and scratch" {
@@ -455,7 +446,7 @@ test "descriptor layout and scratch" {
     try std.testing.expectError(error.InvalidExl3Rows, descriptor(.{ .m = m, .rows = 17, .x = 0, .x_stride = 2048, .y = 0, .y_stride = 512, .scratch = 0 }));
     try std.testing.expectError(error.UnsupportedExl3Shape, (Matrix{ .trellis = 0, .suh = 0, .svh = 0, .k = 100, .n = 512, .halves = 8 }).validate());
     // Sage: hidden 2048, ff 512, 8 picks and the shared expert
-    try std.testing.expectEqual(@as(usize, 9 * 4 * 2 * 512 * 4 + 9 * 512 * 4 + 9 * 2 * 2048 * 4), moeScratchBytes(2048, 512, 9));
+    try std.testing.expectEqual(@as(usize, 9 * 4 * 2 * 512 * 4 + 9 * 512 * 4), moeScratchBytes(2048, 512, 9));
 }
 
 test {

@@ -150,7 +150,7 @@ def project(e, groups, xs, rows, out_f32=True, reps=0):
     def launch():
         ev = [e.p.exl3_rotate_in(e.q, (kmax // 128 * 16, rows, len(groups)), (16, 1, 1), base, db),
               mv(e.q, (gx, len(groups), ks), (WG, 1, 1), base, db, np.uint32(ks)),
-              e.p.exl3_rotate_out(e.q, (nmax // 128 * 16, rows, len(groups)), (16, 1, 1), base, db, np.uint32(ks))]
+              e.p.exl3_rotate_out(e.q, (nmax // 128 * 16, rows * 8, len(groups)), (16, 8, 1), base, db, np.uint32(ks))]
         return ev
     ev = launch()
     e.q.finish()
