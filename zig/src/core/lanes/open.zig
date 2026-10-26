@@ -20,12 +20,19 @@ pub fn add(e: *Engine, s: *Stream) !void {
 
 pub fn addCommitted(e: *Engine, s: *Stream, hook: ?be.Committed) !void {
     _ = e.arena.reset(.retain_capacity);
+    greedyDrafts(e, s);
     try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
     e.backend.prefill(s) catch |err| {
         if (err == error.Cancelled) e.backend.release(s); // the host finishes a cancelled stream without the core
         return err;
     };
     try openedCommitted(e, s, .rule, hook);
+}
+
+/// A sampled stream on a head that drafts greedily only takes no drafts: it decodes one row a round, alone or beside
+/// drafted greedy streams. The head's drafts and its verify keep argmax tokens, which a sampled draw does not match.
+pub fn greedyDrafts(e: *const Engine, s: *Stream) void {
+    if (!e.cfg.sampled_drafts and s.sampling != null) s.drafts = false;
 }
 
 /// How a stream's first drafts are sized: the depth rule, or the head's whole reach under node probabilities.
@@ -39,6 +46,7 @@ pub fn addStreams(e: *Engine, ss: []const *Stream, errs: []?anyerror) void {
     for (errs) |*x| x.* = null;
     const many = e.backend.vtable.prefill_many orelse return addEach(e, ss, errs);
     if (ss.len < 2 or ss.len > max_together) return addEach(e, ss, errs);
+    for (ss) |s| greedyDrafts(e, s);
     _ = e.arena.reset(.retain_capacity);
     for (ss) |s| trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) }) catch {};
     const together = many(e.backend.ptr, ss) catch |err| blk: { // one stream's refusal is its own: each goes alone
@@ -74,6 +82,7 @@ pub fn openedWith(e: *Engine, s: *Stream, reach: Reach) !void {
 }
 
 fn openedCommitted(e: *Engine, s: *Stream, reach: Reach, hook: ?be.Committed) !void {
+    greedyDrafts(e, s);
     if (s.embedding != null) {
         if (s.isCancelled()) {
             e.backend.release(s);
@@ -152,6 +161,7 @@ pub fn fillStream(e: *Engine, s: *Stream, first: bool) !bool {
 pub fn fillStreamCommitted(e: *Engine, s: *Stream, first: bool, hook: ?be.Committed) !bool {
     _ = e.arena.reset(.retain_capacity);
     if (first) try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
+    if (first) greedyDrafts(e, s);
     const chunk = e.backend.vtable.prefill_step orelse return error.NoPrefillSteps;
     const done = chunk(e.backend.ptr, s) catch |err| {
         if (err == error.Cancelled) e.backend.release(s); // the host finishes a cancelled stream without the core
