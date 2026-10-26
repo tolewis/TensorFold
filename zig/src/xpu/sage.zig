@@ -35,6 +35,8 @@ fn span(keys: u32) u32 {
 pub const WINDOW = 16;
 /// Rows of one prompt chunk: norms, GEMMs and MoE take the whole chunk, the mixers WINDOW rows at a time.
 pub const CHUNK = 512;
+/// K/V positions a page holds (shape.h Q27_PAGE): a stream's positions reach its pages through its page table.
+pub const PAGE = 64;
 /// Streams one runner holds (a stepMulti row each): K/V caches, GDN and convolution states of their own.
 pub const MAX_SLOTS = 8;
 
@@ -445,6 +447,19 @@ pub fn loadMtp(d: *Dev, dir: []const u8, z: Sizes, ctx: u32, slots: u32, kv8: bo
     return mt;
 }
 
+/// `bytes` of zeros at `p` on the device: the first 64 MiB from the host, the rest copied from them on the card.
+fn zeroed(d: *Dev, p: *anyopaque, bytes: usize) !void {
+    const first = @min(bytes, 64 << 20);
+    try d.fill(p, @as(u32, 0), first);
+    var at: usize = first;
+    while (at < bytes) {
+        const n = @min(first, bytes - at);
+        try dev.copy(d, off(p, at), p, n);
+        at += n;
+    }
+    try d.sync();
+}
+
 /// The AutoRound shard that holds mtp.fc.weight, from the checkpoint's index.
 fn mtpShard(dir: []const u8) ![:0]const u8 {
     const bytes = try readFile(name("{s}/model.safetensors.index.json", .{dir}));
@@ -469,6 +484,10 @@ pub const Runner = struct {
     ckpt: Checkpoint,
     ctx: u32,
     cap: i32 = 0, // > 0: the int8 K/V cache (XPU_KV_INT8), its positions
+    pool: u32 = 0, // K/V pages each attention layer holds (allocPool; 0: none yet)
+    page_bytes: usize = 0, // one K (or V) page of one layer
+    pt: [MAX_SLOTS]?*anyopaque = @splat(null), // each slot's page table: u32 [ceil(ctx / PAGE)] on the device
+    held: [MAX_SLOTS]u32 = @splat(0), // pages each slot's table maps, from its position 0
     pos: u32 = 0,
     last: i32 = -1, // the greedy token after the last fed row
     slots: u32 = 1,
@@ -532,6 +551,40 @@ pub const Runner = struct {
         return r;
     }
 
+    /// Bytes of one K (or V) page of one layer: `PAGE` positions times the heads' rows and their scales.
+    pub fn pageBytes(r: *const Runner) usize {
+        if (r.cap > 0) return PAGE * r.z.s.kv_heads * (256 + 4);
+        return PAGE * r.z.s.kv_heads * 256 * 2;
+    }
+
+    /// The K/V pool: `pages` pages in each attention layer and the MTP layer (K pages, then V pages, one allocation
+    /// a layer, zeroed so the card holds them now), and each slot's page table, mapping nothing.
+    pub fn allocPool(r: *Runner, pages: u32) !void {
+        r.pool = pages;
+        r.page_bytes = r.pageBytes();
+        const half = @as(usize, pages) * r.page_bytes;
+        for (r.model.layers) |*l| {
+            if (!l.attn) continue;
+            const base = try r.d.alloc_(2 * half);
+            try zeroed(&r.d, base, 2 * half);
+            l.kc = base;
+            l.vc = off(base, half);
+        }
+        if (r.mtp != null) {
+            const l = &r.mtp.?.layer;
+            const base = try r.d.alloc_(2 * half);
+            try zeroed(&r.d, base, 2 * half);
+            l.kc = base;
+            l.vc = off(base, half);
+        }
+        const entries = (r.ctx + PAGE - 1) / PAGE;
+        for (0..r.slots) |i| {
+            r.pt[i] = try r.d.alloc_(@as(usize, entries) * 4);
+            r.held[i] = 0;
+        }
+        try r.d.sync();
+    }
+
     /// Device bytes one position of one slot takes in K/V: every attention layer, and the MTP layer when loaded.
     pub fn kvBytesPerToken(r: *const Runner) usize {
         const s = r.z.s;
@@ -567,6 +620,20 @@ pub const Runner = struct {
         r.slast[r.cur] = r.last;
         for (r.model.layers) |*l| l.st[r.cur].conv_cur = l.conv_cur;
         r.enter(slot);
+    }
+
+    /// Page ids `ids` into `slot`'s table from entry `from` (its positions from * PAGE on); it then maps from + ids.len.
+    pub fn mapPages(r: *Runner, slot: u32, from: u32, ids: []const u32) !void {
+        if (slot >= r.slots or r.pt[slot] == null or from > r.held[slot]) return error.BadSlot;
+        if (from + @as(u32, @intCast(ids.len)) > (r.ctx + PAGE - 1) / PAGE) return error.ContextFull;
+        try r.d.copyIn(off(r.pt[slot].?, @as(usize, from) * 4), std.mem.sliceAsBytes(ids));
+        r.held[slot] = from + @as(u32, @intCast(ids.len));
+    }
+
+    /// Positions `slot` may hold: what its pages cover, at most ctx (ctx when it has no page table).
+    pub fn room(r: *const Runner, slot: u32) u32 {
+        if (r.pt[slot] == null) return r.ctx;
+        return @min(r.ctx, r.held[slot] * PAGE);
     }
 
     /// The layers' current fields, pos and last from `slot`'s state, with nothing stored first.
