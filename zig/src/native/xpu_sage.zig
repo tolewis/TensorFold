@@ -506,7 +506,8 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         problem.* = try std.fmt.allocPrint(a, "XPU_SPEC: 1 to {d} MTP drafts a round, not {d}", .{ sage.WINDOW - 1, h.back.depth });
         return null;
     }
-    if (!try fitsCard(a, r, slots, context, problem)) {
+    const budget = cacheBudget(r, o);
+    if (!try fitsCard(a, r, slots, context, budget, problem)) {
         if (h.back.vision) |v| v.deinit(gpa);
         h.back.deinit();
         gpa.destroy(h);
@@ -533,25 +534,36 @@ const card_reserve: u64 = 64 << 20;
 /// (the same with the MTP head at --context 100000). Taken a little under the 0.49 GB seen.
 const counted_not_held: u64 = 450_000_000;
 
-/// Whether the card holds what the load allocated. A K/V page is written only when its slot first reaches it, so
-/// an overcommit loses the device then, not at load. Else `problem` names the largest context for these slots and
-/// the most slots for this context.
-fn fitsCard(a: Allocator, r: *sage.Runner, slots: u32, context: u32, problem: *[]const u8) !bool {
+/// The prompt cache's budget: --prompt-cache-gib (0: no cache), else 2 GiB, or less when the card has less left past
+/// the load (a server started without the option keeps its slots).
+fn cacheBudget(r: *sage.Runner, o: api.Open) u64 {
+    if (o.prompt_cache_gib) |gib| return if (gib > 0) std.math.lossyCast(u64, gib * (1 << 30)) else 0;
+    const want: u64 = 2 << 30;
+    const mem = r.d.g.memory() catch return want;
+    const left = (mem.size -| card_reserve) -| (r.d.allocated -| counted_not_held);
+    if (left < want) std.log.warn("XPU: the card has {d:.2} GB left past the load, so the prompt cache takes that, not 2 GiB (--prompt-cache-gib)", .{gb(left)});
+    return @min(want, left);
+}
+
+/// Whether the card holds what the load allocated and `cache` bytes of kept prompt states. A K/V page is written only
+/// when its slot first reaches it, so an overcommit loses the device then, not at load. Else `problem` names the
+/// largest context for these slots and the most slots for this context, beside the prompt cache.
+fn fitsCard(a: Allocator, r: *sage.Runner, slots: u32, context: u32, cache: u64, problem: *[]const u8) !bool {
     const mem = r.d.g.memory() catch |err| {
         std.log.warn("XPU: no Sysman memory size ({s}), so the load does not check that the card holds every slot's K/V", .{@errorName(err)});
         return true;
     };
     const room = mem.size -| card_reserve;
     const need: u64 = r.d.allocated -| counted_not_held;
-    std.log.info("XPU: the load holds {d:.2} GB of the card's {d:.2} GB ({d:.2} GB kept free)", .{ gb(need), gb(mem.size), gb(card_reserve) });
-    if (need <= room) return true;
+    std.log.info("XPU: the load holds {d:.2} GB of the card's {d:.2} GB ({d:.2} GB kept free), and the prompt cache takes up to {d:.2} GB", .{ gb(need), gb(mem.size), gb(card_reserve), gb(cache) });
+    if (need + cache <= room) return true;
     const per: u64 = r.kvBytesPerToken();
     const state: u64 = r.slotStateBytes();
     const fixed = need -| slots * (state + per * context); // weights, activations, the tower: what fewer slots leave
-    const left = room -| fixed;
+    const left = room -| fixed -| cache;
     const max_context = (left / slots -| state) / per;
     const max_slots = left / (state + per * context);
-    problem.* = try std.fmt.allocPrint(a, "the XPU Sage engine needs {d:.2} GB for {d} stream(s) of {d} tokens{s}, and the card has {d:.2} GB with {d:.2} GB kept free. It fits {d} stream(s) of at most {d} tokens, or at most {d} stream(s) of {d} tokens (--parallel, --context)", .{ gb(need), slots, context, if (r.mtp != null) " with the MTP head" else "", gb(mem.size), gb(card_reserve), slots, max_context, max_slots, context });
+    problem.* = try std.fmt.allocPrint(a, "the XPU Sage engine needs {d:.2} GB for {d} stream(s) of {d} tokens{s} and {d:.2} GB for the prompt cache (--prompt-cache-gib {d:.2}), and the card has {d:.2} GB with {d:.2} GB kept free. Beside that cache it fits {d} stream(s) of at most {d} tokens, or at most {d} stream(s) of {d} tokens (--parallel, --context, --prompt-cache-gib)", .{ gb(need), slots, context, if (r.mtp != null) " with the MTP head" else "", gb(cache), @as(f64, @floatFromInt(cache)) / (1 << 30), gb(mem.size), gb(card_reserve), slots, max_context, max_slots, context });
     return false;
 }
 
