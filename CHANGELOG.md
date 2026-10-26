@@ -2,6 +2,10 @@
 
 Each release's page on GitHub has its notes and measurements. See [the 1.0.0 release notes](RELEASE-NOTES-1.0.0.md) for the native binary's supported models and migration details.
 
+## Unreleased
+
+- Sage-A1.5 on the XPU backend keeps the K/V of all streams in one pool of 64-token pages. `--context` is now the most one stream holds (262,144 by default), `--kv-pool-tokens` sets the pool, and a request waits in the queue until the pool can promise its pages. On one Arc Pro B70 at 200 W with the MTP head, `--parallel 4 --context 262144` loads with a pool of 994,176 tokens and a 240k prompt answers. Decode with a 1k prompt is 241.0 tokens/s on one stream and 250.7 aggregate at four, against 242.0 and 252.6 with a fixed cache of 4 x 220,000. Greedy replies are the same text.
+
 ## 1.1.5
 
 - Flash Next on Macs without tensor units decodes faster with the same tokens: the hyper-connection act pair runs for windows of two rows and more, the HC down projection runs without staging or barriers at four outputs a threadgroup, rounds are gated on the GPU with a GPU-only event between them, drafts are gated at tau 0.4, the decode and draft argmaxes take two launches, and wide windows use grouped experts and exact tree windows. On an M3 Ultra with Qwen3.8 Flash Next MLX 4-bit MTP, the served sweep goes from 120.2 to 147.6 tokens/s on one stream (+22.7%), 129.7 to 155.3 at two (+19.8%), 143.8 to 167.0 at four (+16.2%) and 154.4 to 176.1 at eight (+14.1%); prefill is unchanged and every token is identical.

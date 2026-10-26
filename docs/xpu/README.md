@@ -80,6 +80,60 @@ Options through environment variables:
 | `XPU_FP64_REF=1` | `xpu-qwen27` runner only: on the prompt's real activations, each int4 GEMM of layers 0, 1, 31, 63 and the head (decode on 1 and 8 rows, prompt) against FP64 references of the same int4 weights (`core/quant` MLX affine; GPTQ as affine with bias −8·scale), worst column and error over the outputs' rms (`zig/src/xpu/fp64_ref.zig`) |
 | `XPU_FIDELITY=1` | `xpu-qwen27` runner only: teacher-forced top tokens of the prompt and decode paths at every position of the IDS file against the same forward with every GEMM in FP64, all differences and margins (`XPU_FIDELITY_CACHE=FILE` keeps the FP64 forward's tokens) |
 
+## K/V pool (Sage-A1.5, `qwen3_5_moe`)
+
+The XPU Sage engine keeps the K/V of all its streams in one pool of pages. A page holds 64 positions. There is one
+allocation for each of the 10 attention layers and one for the MTP head. A page id means the same 64 positions in
+all 11 allocations, so one page table for each stream serves every layer. The GDN and convolution states stay one
+fixed state for each slot.
+
+```sh
+tensorfold-native serve SAGE_MLX --vision --drafter SAGE_AUTOROUND --parallel 4 --context 262144 --kv-pool-tokens 700000
+```
+
+| Flag | Effect |
+|---|---|
+| `--context N` | The most positions one stream holds: its prompt and its reply. 262,144 by default. |
+| `--kv-pool-tokens N` | The pool's size in tokens, rounded up to whole pages. Without it, the pool takes what the card leaves after the weights, the vision tower, the activations and the GDN state of every slot. It is never larger than every slot's whole context. |
+
+A token takes 11,440 bytes of the pool with `XPU_KV_INT8=1` (11 allocations, K and V, 520 bytes each), and 22,528
+bytes in bf16.
+
+How a request gets its pages:
+
+1. A request waits in the queue until the pool can promise pages for its prompt, its `max_tokens` and one verify
+   window of 16 rows, at most `--context`. Requests behind it that fit can go first.
+2. The prompt pass maps every page that the stream can need into its page table. A running stream takes no new page,
+   so it never waits on the pool.
+3. When the stream ends, its pages go back to the pool.
+
+A request without `max_tokens` promises the server's `--max-tokens` (4,096 by default). A request that needs more
+pages than the whole pool holds fails at once, and the message names `--kv-pool-tokens`. If a stream ever holds
+fewer pages than its request asks for, its reply stops where the pages end, with `finish_reason: length` and a log
+line. The kernels never write past the pages that a stream holds.
+
+The load counts the pool beside the weights. The pool is zeroed at load, so a pool that the card cannot hold fails at
+startup and not under a request. A refusal gives the most tokens the pool can hold. The startup line names the pool's
+pages, tokens and GB. `/metrics` shows `tensorfold:kv_pool_pages`, `kv_pool_page_tokens`, `kv_pool_pages_used`,
+`kv_pool_pages_promised` and `kv_pool_pages_free`.
+
+Measured on one Arc Pro B70 (power cap 200 W), `XPU_KV_INT8=1`, MTP head, `--vision`, `--parallel 4`, greedy,
+median of 3 (`benchmark_openai_chat.py`) unless the row says otherwise:
+
+| | A fixed cache for each slot (4 x 220,000, the most that fits) | One pool (4 x 262,144, default pool) |
+|---|---|---|
+| K/V | 880,000 tokens, 10.07 GB | 994,176 tokens, 11.37 GB |
+| 1k prompt, 1 stream, decode | 242.0 tok/s | 241.0 tok/s |
+| 1k prompt, 4 streams, aggregate | 252.6 tok/s | 250.7 tok/s |
+| 20k prompt, 1 stream, first token | 5.87 s | 5.90 s |
+| 240k prompt alone (1 run) | refused (more than 220,000) | first token 181.9 s, 40.9 tok/s |
+| 4 x 200k prompts at once | not run | 4 of 4 answer, the four hold 801,024 tokens of pages at once |
+| 4 x 200k, `--kv-pool-tokens 700000` | not run | 3 run, the fourth waits until one ends, 4 of 4 answer |
+
+Greedy replies over 256 tokens (4 prompts of 1k, 4 of 20k, each alone) are the same text with the pool as with the
+fixed cache, and the greedy eval set scores the same (39/41). At 240k, one stream alone decodes 4.6 % slower than
+with a fixed cache at `--parallel 1` (40.9 against 42.9 tok/s): the decode reads its K/V through the page table.
+
 ## Numbers (B70 at 230 W, server `--parallel 8 --context 16384`, validation of 2026-10-13)
 
 | | MLX g64 | GPTQ g128 | GPTQ g128 + W4A8 | Rotated RTN + W4A4 |
