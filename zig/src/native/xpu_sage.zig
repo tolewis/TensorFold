@@ -130,7 +130,8 @@ pub const Slots = struct {
         return @intCast(best orelse return error.NoAllowedToken);
     }
 
-    /// The prompt into a free slot in chunks (a cancel lands between them); its first token drawn at once.
+    /// The prompt into a free slot in chunks (a cancel lands between them); its first token drawn at once. A kept
+    /// state of the prompt's prefix (s.reuse) is restored first, and the pass goes on from its end.
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
         const b = of(ptr);
         const r = b.r;
@@ -144,13 +145,38 @@ pub const Slots = struct {
         const v: ?*Vision = if (s.images.len == 0) null else b.vision orelse return error.NoVision;
         const layout = if (v) |x| try x.encode(r, s) else vl.rope.Layout{};
         var at: usize = 0;
+        s.cached = 0;
+        if (s.reuse.saved) |saved| {
+            const k: *const sage.snapshot.Snap = @ptrCast(@alignCast(saved));
+            if (k.at < ids.len) {
+                if (r.restoreSlot(slot, k.*)) {
+                    at = k.at;
+                    s.cached = k.at;
+                } else |err| {
+                    s.reuse_failed = true;
+                    s.reuse_error = err;
+                    try r.use(slot);
+                    try r.reset();
+                }
+            } else s.reuse_failed = true;
+        }
         while (at < ids.len) {
             if (s.isCancelled()) return error.Cancelled;
-            const n = @min(sage.CHUNK, ids.len - at);
+            // chunks end at multiples of CHUNK from position 0, at the request's chunks and at the cache's marks: a
+            // pass resumed at a mark cuts its chunks where a pass from 0 does
+            var end = @min(ids.len, (at / sage.CHUNK + 1) * sage.CHUNK);
+            for (s.chunks) |cut| if (cut > at and cut < end) {
+                end = cut;
+            };
+            for (s.reuse.marks) |mark| if (mark > at and mark < end) {
+                end = mark;
+            };
+            const n = end - at;
             for (b.ids[0..n], ids[at..][0..n]) |*d, t| d.* = @intCast(t);
             const next: ?i32 = if (at + n < ids.len) @intCast(ids[at + n]) else null;
             try r.promptPiece(b.ids[0..n], if (v) |x| x.feed(r, &layout, @intCast(at), @intCast(n)) else .{}, next);
             at += n;
+            if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) if (s.reuse.hook) |hk| hk.at(hk.ptr, s, @intCast(at));
         }
         r.shift[slot] = layout.shift;
         if (s.grammar != null) {
@@ -342,6 +368,36 @@ pub const Slots = struct {
         b.held[slot] = 0;
     }
 
+    /// The prompt cache's states: a slot's copy at a mark of its prompt pass, restored by the pass itself (prefillFn).
+    pub fn snapshots(b: *Slots) api.prompt_cache.Snapshots {
+        return .{ .ptr = b, .vtable = &.{ .bytes = snapBytes, .save = snapSave, .restore = snapRestore, .drop = snapDrop } };
+    }
+
+    fn snapBytes(ptr: *anyopaque, at: u32) u64 {
+        return of(ptr).r.snapBytes(at);
+    }
+
+    fn snapSave(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!api.prompt_cache.Saved {
+        const b = of(ptr);
+        const s: *lanes.Stream = @ptrCast(@alignCast(owner orelse return error.NoStream));
+        const slot = b.slotOf(s) orelse return error.UnknownStream;
+        const k = try b.gpa.create(sage.snapshot.Snap);
+        errdefer b.gpa.destroy(k);
+        k.* = try b.r.saveSlot(slot, at);
+        return k;
+    }
+
+    fn snapRestore(_: *anyopaque, _: ?*anyopaque, _: api.prompt_cache.Saved) anyerror!void {
+        return error.RestoredInPrefill;
+    }
+
+    fn snapDrop(ptr: *anyopaque, saved: api.prompt_cache.Saved) void {
+        const b = of(ptr);
+        const k: *sage.snapshot.Snap = @ptrCast(@alignCast(saved));
+        b.r.dropSnap(k.*);
+        b.gpa.destroy(k);
+    }
+
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const b = of(ptr);
         const slot = b.slotOf(s) orelse return;
@@ -465,10 +521,12 @@ const Served = struct {
     core: lanes.Engine,
     host: api.LaneHost,
     startup: []u8 = &.{},
+    cache: ?api.prompt_cache.Store = null, // kept prompt states (engine thread only); null: no budget
 
     fn close(ptr: *anyopaque) void {
         const h: *Served = @ptrCast(@alignCast(ptr));
         h.host.stop();
+        if (h.cache) |*store| store.deinit(); // the states' device memory, before the runner's
         h.core.deinit();
         h.cfg.deinit(h.gpa);
         const r = h.back.r;
@@ -523,6 +581,16 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     h.host.explain = .{ .text = lane.explain };
     if (h.back.vision) |v| h.host.info_.vision = v.offer(o.vision.?);
     if (r.mtp != null) h.host.lone = .{ .ctx = &h.back, .run = Slots.loneFn };
+    if (budget > 0) {
+        // kept and resumed only at multiples of 64 tokens (planned, grid): every cut a resumed pass adds splits a CHUNK
+        // into pieces of more than WINDOW rows, which the chunk kernels compute as the whole chunk does. The MTP's
+        // last row reads the token after a state (lookahead).
+        h.cache = api.prompt_cache.Store.init(gpa, h.back.snapshots(), .{ .lookahead = if (r.mtp != null) 1 else 0, .planned = true, .grid = 64 }, budget);
+        h.host.cache = &h.cache.?;
+        h.host.info_.prompt_cache = true;
+        std.log.info("sage-xpu: prompt cache of {d:.2} GiB", .{@as(f64, @floatFromInt(budget)) / (1 << 30)});
+    }
+    errdefer if (h.cache) |*store| store.deinit();
     try h.host.start();
     return .{ .engine = h.host.engine(), .close = Served.close, .ctx = h };
 }
