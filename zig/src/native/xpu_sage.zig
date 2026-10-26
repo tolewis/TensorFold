@@ -13,6 +13,8 @@ pub const model_type = "qwen3_5_moe";
 
 /// Drawn tokens a handle can still name (a prompt's first draw, then one a stream a round).
 const ring = 64;
+/// The prompt cache keeps no state under this many tokens: a cut there splits a chunk, and the state saves little.
+const min_kept = 4096;
 
 pub const Slots = struct {
     gpa: Allocator,
@@ -181,7 +183,7 @@ pub const Slots = struct {
             for (s.chunks) |cut| if (cut > at and cut < end) {
                 end = cut;
             };
-            for (s.reuse.marks) |mark| if (mark > at and mark < end) {
+            for (s.reuse.marks) |mark| if (mark >= min_kept and mark > at and mark < end) {
                 end = mark;
             };
             const n = end - at;
@@ -189,7 +191,7 @@ pub const Slots = struct {
             const next: ?i32 = if (at + n < ids.len) @intCast(ids[at + n]) else null;
             try r.promptPiece(b.ids[0..n], if (v) |x| x.feed(r, &layout, @intCast(at), @intCast(n)) else .{}, next);
             at += n;
-            if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) if (s.reuse.hook) |hk| hk.at(hk.ptr, s, @intCast(at));
+            if (at >= min_kept and std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) if (s.reuse.hook) |hk| hk.at(hk.ptr, s, @intCast(at));
         }
         r.shift[slot] = layout.shift;
         if (s.grammar != null) {
