@@ -503,15 +503,17 @@ kernel void attn_prompt8(global const ushort *Q, global const char *KC, global c
 
 // Decode attention for long caches: as attn_decode, but a slice holds `span` keys (a launch argument), so the partials
 // stay few at any context. Rows: one stream each (MT, POS), or a window at p0 (row t at position p0 + t). Grid (NS,
-// Q27_AKV * Q27_QPARTS, rows). cap > 0: int8 cache.
+// Q27_AKV * Q27_QPARTS, rows). cap > 0: int8 cache. PT (if non-null): the stream's page table (with MT, MT[8t + 2]).
 KERNEL(16) void attn_decode_span(global const ushort *Q, global const ushort *KC, global const ushort *VC,
                                  global float *PM, global float *PL, global float *PO, int p0, int NS, int span,
-                                 float scale, global const ulong *MT, global const int *POS, int cap) {
+                                 float scale, global const ulong *MT, global const int *POS, int cap,
+                                 global const uint *PT) {
   const int sp = get_group_id(0), hk = get_group_id(1) / Q27_QPARTS, t = get_group_id(2), lane = get_sub_group_local_id();
   const int qh0 = hk * Q27_GQA + (get_group_id(1) % Q27_QPARTS) * Q27_QPG;
   if (MT) {
     KC = (global const ushort *)MT[t * 8];
     VC = (global const ushort *)MT[t * 8 + 1];
+    PT = (global const uint *)MT[t * 8 + 2];
   }
   const int last = MT ? POS[t] : p0 + t, j0 = sp * span, j1 = min(j0 + span, last + 1);
   float q[Q27_QPG][16], o[Q27_QPG][16], m[Q27_QPG], l[Q27_QPG];
@@ -523,17 +525,25 @@ KERNEL(16) void attn_decode_span(global const ushort *Q, global const ushort *KC
     m[a] = -INFINITY;
     l[a] = 0.0f;
   }
+  const global ushort *kp = KC, *vp = VC;
   const global float *ks = (const global float *)((const global char *)KC + (long)cap * Q27_KVROW);
   const global float *vs = (const global float *)((const global char *)VC + (long)cap * Q27_KVROW);
   for (int j = j0; j < j1; j++) {
-    const long kr = (long)j * Q27_AKV + hk; // the cache row of key j
+    if (PT && (j == j0 || j % Q27_PAGE == 0)) { // move to the page holding key j
+      const long pb = (long)PT[j / Q27_PAGE] * (cap ? Q27_PAGE8 : Q27_PAGE16);
+      kp = (const global ushort *)((const global char *)KC + pb);
+      vp = (const global ushort *)((const global char *)VC + pb);
+      ks = (const global float *)((const global char *)kp + (long)Q27_PAGE * Q27_KVROW);
+      vs = (const global float *)((const global char *)vp + (long)Q27_PAGE * Q27_KVROW);
+    }
+    const long kr = (long)(PT ? j % Q27_PAGE : j) * Q27_AKV + hk; // the cache row of key j
     float kv[16];
     if (cap) {
-      const char16 k8 = vload16(lane, (const global char *)KC + kr * 256);
+      const char16 k8 = vload16(lane, (const global char *)kp + kr * 256);
       const float s = ks[kr];
       for (int i = 0; i < 16; i++) kv[i] = (float)k8[i] * s;
     } else {
-      const ushort16 kb = vload16(lane, KC + kr * 256);
+      const ushort16 kb = vload16(lane, kp + kr * 256);
       for (int i = 0; i < 16; i++) kv[i] = bf2f(kb[i]);
     }
     float sc[Q27_QPG];
@@ -543,11 +553,11 @@ KERNEL(16) void attn_decode_span(global const ushort *Q, global const ushort *KC
       sc[a] = sub_group_reduce_add(d);
     }
     if (cap) {
-      const char16 v8 = vload16(lane, (const global char *)VC + kr * 256);
+      const char16 v8 = vload16(lane, (const global char *)vp + kr * 256);
       const float s = vs[kr];
       for (int i = 0; i < 16; i++) kv[i] = (float)v8[i] * s;
     } else {
-      const ushort16 vb = vload16(lane, VC + kr * 256);
+      const ushort16 vb = vload16(lane, vp + kr * 256);
       for (int i = 0; i < 16; i++) kv[i] = bf2f(vb[i]);
     }
     for (int a = 0; a < Q27_QPG; a++) {
