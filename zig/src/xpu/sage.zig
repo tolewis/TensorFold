@@ -166,12 +166,12 @@ pub const Acts = struct {
     mxs: *anyopaque, // fp32 [CHUNK, D / 64]: group sums of h
     mas: *anyopaque, // fp32 [CHUNK (top_k + 1), ff / 64]: group sums of act
 
-    pub fn init(d: *Dev, z: Sizes, ctx: u32) !Acts {
+    pub fn init(d: *Dev, z: Sizes) !Acts {
         const s = z.s;
         const w: usize = WINDOW;
         const c: usize = CHUNK;
         const widest_in: usize = @max(s.hidden, @max(z.vd, z.od));
-        const ns: usize = @max((ctx + SPLIT - 1) / SPLIT, SLICES);
+        const ns: usize = SLICES;
         const pairs: usize = c * (s.top_k + 1);
         return .{
             .x = try d.alloc_(c * s.hidden * 4),
@@ -523,7 +523,7 @@ pub const Runner = struct {
         r.mt_host = try alloc.alloc(u64, z.s.layers * WINDOW * 8);
         r.rope_host = try alloc.alloc([3]i32, CHUNK);
         q.prof.on = std.c.getenv("XPU_PROFILE") != null; // not during the load
-        r.acts = try Acts.init(d, z, ctx);
+        r.acts = try Acts.init(d, z);
         for (0..slots) |i| {
             try r.use(@intCast(i));
             try r.reset();
