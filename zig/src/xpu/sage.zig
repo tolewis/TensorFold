@@ -734,6 +734,7 @@ pub const Runner = struct {
             if (l.attn) {
                 e[0] = @intFromPtr(st.kc.?);
                 e[1] = @intFromPtr(st.vc.?);
+                e[2] = if (r.pt[slot]) |p| @intFromPtr(p) else 0; // the slot's page table
             } else {
                 e[2] = @intFromPtr(st.conv[st.conv_cur].?);
                 e[3] = @intFromPtr(st.conv[1 - st.conv_cur].?);
@@ -868,20 +869,21 @@ pub const Runner = struct {
         if (T == 0 or T > CHUNK) return error.BadWindow;
         if (p0 + T > r.ctx) return error.ContextFull;
         const nul: ?*anyopaque = null;
+        const pt = r.pt[r.cur]; // the slot's page table (null: the contiguous cache)
         const zero: i32 = 0;
         const p32: i32 = @intCast(p0);
         errdefer d.settle();
         try r.mtpFront(ids);
-        try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, p32, EPS, nul, nul, nul, zero, r.cap, nul, nul });
+        try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, p32, EPS, nul, nul, nul, zero, r.cap, nul, pt });
         if (T <= WINDOW) {
             const sp = span(p0 + T);
             const ns: u32 = (p0 + T + sp - 1) / sp;
-            try d.launch(r.mk.attn_span, .{ .x = ns, .y = s.kv_heads * (s.q_heads / s.kv_heads / QPG), .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, p32, @as(i32, @intCast(ns)), @as(i32, @intCast(sp)), @as(f32, 1.0 / 16.0), nul, nul, r.cap, nul });
+            try d.launch(r.mk.attn_span, .{ .x = ns, .y = s.kv_heads * (s.q_heads / s.kv_heads / QPG), .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, p32, @as(i32, @intCast(ns)), @as(i32, @intCast(sp)), @as(f32, 1.0 / 16.0), nul, nul, r.cap, pt });
             try d.launch(r.mk.merge_span, .{ .x = s.q_heads, .y = T }, .{ a.pm, a.pl, a.po, a.y, p32, @as(i32, @intCast(ns)), @as(i32, @intCast(sp)), nul });
         } else if (r.cap > 0)
-            try d.launch(d.k.attn_prompt8, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p32, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0), r.cap, nul })
+            try d.launch(d.k.attn_prompt8, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p32, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0), r.cap, pt })
         else
-            try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p32, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0), nul });
+            try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p32, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0), pt });
         try r.mtpBack(T);
         const last = T - 1;
         const kg = s.hidden / m.head.gs;
@@ -1087,6 +1089,7 @@ pub const Runner = struct {
             e.* = @splat(0);
             e[0] = @intFromPtr(l.st[slot].kc.?);
             e[1] = @intFromPtr(l.st[slot].vc.?);
+            e[2] = if (r.pt[slot]) |p| @intFromPtr(p) else 0;
             e[6] = t;
             e[7] = 1;
             max_pos = @max(max_pos, @as(u32, @intCast(pos[t])));
@@ -1180,6 +1183,7 @@ pub const Runner = struct {
         const D: i32 = @intCast(s.hidden);
         const gs: i32 = 64;
         const nul: ?*anyopaque = null;
+        const pt = r.pt[r.cur]; // the slot's page table (null: the contiguous cache)
         const zero: i32 = 0;
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.ids, ids.ptr, ids.len * 4, null, 0, null));
         errdefer d.settle();
@@ -1192,8 +1196,8 @@ pub const Runner = struct {
             if (l.attn) {
                 const sp = span(r.pos + T);
                 const ns: u32 = (r.pos + T + sp - 1) / sp;
-                try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, p0, EPS, nul, nul, nul, zero, r.cap, rope, nul });
-                try d.launch(r.mk.attn_span, .{ .x = ns, .y = s.kv_heads * (s.q_heads / s.kv_heads / QPG), .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, p0, @as(i32, @intCast(ns)), @as(i32, @intCast(sp)), @as(f32, 1.0 / 16.0), nul, nul, r.cap, nul });
+                try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, p0, EPS, nul, nul, nul, zero, r.cap, rope, pt });
+                try d.launch(r.mk.attn_span, .{ .x = ns, .y = s.kv_heads * (s.q_heads / s.kv_heads / QPG), .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, p0, @as(i32, @intCast(ns)), @as(i32, @intCast(sp)), @as(f32, 1.0 / 16.0), nul, nul, r.cap, pt });
                 try d.launch(r.mk.merge_span, .{ .x = s.q_heads, .y = T }, .{ a.pm, a.pl, a.po, a.y, p0, @as(i32, @intCast(ns)), @as(i32, @intCast(sp)), nul });
                 try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo, gs, zero, nul, nul, zero });
             } else {
@@ -1241,6 +1245,7 @@ pub const Runner = struct {
         const D: i32 = @intCast(s.hidden);
         const gs: i32 = 64;
         const nul: ?*anyopaque = null;
+        const pt = r.pt[r.cur]; // the slot's page table (null: the contiguous cache)
         const zero: i32 = 0;
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.ids, ids.ptr, ids.len * 4, null, 0, null));
         errdefer d.settle();
@@ -1252,11 +1257,11 @@ pub const Runner = struct {
             try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_in, a.p, T);
             if (l.attn) {
                 const p0: i32 = @intCast(r.pos);
-                try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, p0, EPS, nul, nul, nul, zero, r.cap, rope, nul });
+                try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, p0, EPS, nul, nul, nul, zero, r.cap, rope, pt });
                 if (r.cap > 0)
-                    try d.launch(d.k.attn_prompt8, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p0, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0), r.cap, nul })
+                    try d.launch(d.k.attn_prompt8, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p0, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0), r.cap, pt })
                 else
-                    try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p0, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0), nul });
+                    try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p0, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0), pt });
                 try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo, gs, zero, nul, nul, zero });
             }
             const pin = l.mixer_in.n;
