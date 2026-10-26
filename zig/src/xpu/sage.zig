@@ -480,10 +480,22 @@ pub const Runner = struct {
     rope_host: [][3]i32 = &.{}, // a forward's rows' positions on their way to acts.rope
     mtp: ?*Mtp = null, // XPU_MTP: the drafter (an AutoRound checkpoint directory)
     sdraft: [MAX_SLOTS]i32 = @splat(-1), // each slot's first draft, from its newest absorbed row
+    hin_last: u32 = 0, // the row of mtp.hin that absorb's last row read
+    sdrawn: [MAX_SLOTS]bool = @splat(false), // the slot's first draft is a Judge.draft draw (else the MTP's argmax)
     mpos: [MAX_SLOTS]u32 = @splat(0), // each slot's next MTP slot to absorb
     verifying: bool = false, // forward runs a block for verify: every row's token, states kept for commit
     block: [WINDOW]i32 = undefined, // the last verified block's greedy tokens, a row each
     block_rows: u32 = 0,
+
+    /// specMulti's host side for sampled slots (Leviathan and Chen speculative sampling). `keep` gets slot i's block
+    /// (its rows from `row` of the logits, `ids` the pending token then the drafts) and returns null for a greedy
+    /// slot, else the rows to keep with their tokens in `out`. `draft` gets the slot's row of the MTP logits and
+    /// returns null for a greedy slot, else the slot's next first draft.
+    pub const Judge = struct {
+        ctx: *anyopaque,
+        keep: *const fn (ctx: *anyopaque, i: usize, row: u32, ids: []const i32, out: *[WINDOW]i32) anyerror!?u32,
+        draft: *const fn (ctx: *anyopaque, i: usize, row: u32) anyerror!?i32,
+    };
 
     /// `slots` streams (1 to MAX_SLOTS) of `ctx` positions each.
     pub fn init(dir: []const u8, ctx: u32, slots: u32) !*Runner {
@@ -744,6 +756,7 @@ pub const Runner = struct {
         r.shift[r.cur] = 0;
         r.mpos[r.cur] = 0;
         r.sdraft[r.cur] = -1;
+        r.sdrawn[r.cur] = false;
     }
 
     /// Feeds tokens in chunks of CHUNK rows (a tail of WINDOW rows or less as one decode forward); `last` afterwards
@@ -785,7 +798,21 @@ pub const Runner = struct {
         const mt = r.mtp.?;
         try dev.copy(&r.d, mt.hin, r.acts.h, follow.len * r.z.s.hidden * 2);
         r.sdraft[r.cur] = try r.mtpForward(follow, p0);
+        r.sdrawn[r.cur] = false;
+        r.hin_last = @intCast(follow.len - 1);
         r.mpos[r.cur] = p0 + @as(u32, @intCast(follow.len));
+    }
+
+    /// The MTP reads the last absorbed row of the current slot again, with `token` after it in place of the greedy
+    /// one: a sampled first token. The slot's first draft becomes this row's. Only right after prompt or promptFeed.
+    pub fn refollow(r: *Runner, token: i32) !void {
+        const mt = r.mtp orelse return;
+        if (r.mpos[r.cur] == 0) return;
+        const row = r.z.s.hidden * 2;
+        if (r.hin_last > 0) try dev.copy(&r.d, mt.hin, off(mt.hin, r.hin_last * row), row);
+        r.hin_last = 0;
+        r.sdraft[r.cur] = try r.mtpForward(&.{token}, r.mpos[r.cur] - 1);
+        r.sdrawn[r.cur] = false;
     }
 
     /// The MTP layer over rows `ids` (with mtp.hin their hidden) at slots p0..; the last row's normed output goes to
@@ -911,8 +938,9 @@ pub const Runner = struct {
     /// One speculative step of several greedy slots (MTP on, `slots` distinct): each slot's drafts (up to `k`, fewer
     /// when all the blocks would pass WINDOW rows), one forward of every slot's block as a window, each slot's kept
     /// rows committed, and all kept rows absorbed in one MTP forward. Slot i's tokens go to out[i][0..n[i]]; the
-    /// newest of them is its last, not yet fed.
-    pub fn specMulti(r: *Runner, slots: []const u32, k: u32, out: [][WINDOW]i32, n: []usize) !void {
+    /// newest of them is its last, not yet fed. With `judge`, a slot it samples keeps the rows judge.keep picks, and
+    /// its next first draft is judge.draft's draw.
+    pub fn specMulti(r: *Runner, slots: []const u32, k: u32, out: [][WINDOW]i32, n: []usize, judge: ?Judge) !void {
         const mt = r.mtp orelse return error.NoMtpHead;
         const S: u32 = @intCast(slots.len);
         if (S == 0 or S > MAX_SLOTS or out.len < S or n.len < S) return error.BadWindow;
@@ -959,6 +987,11 @@ pub const Runner = struct {
         for (m.layers) |*l| if (!l.attn) for (slots) |slot| {
             l.st[slot].conv_cur = 1 - l.st[slot].conv_cur;
         };
+        // a sampled slot's kept rows, from the block's logits before anything writes them again
+        var judged: [MAX_SLOTS]?u32 = @splat(null);
+        if (judge) |j| for (0..S) |i| {
+            judged[i] = try j.keep(j.ctx, i, wf[i], ids[wf[i]..][0..wn[i]], &out[i]);
+        };
         // each slot's kept rows: its drafts while they match, then the token after them
         const at = StashAt.of(z);
         const nul: ?*anyopaque = null;
@@ -967,11 +1000,14 @@ pub const Runner = struct {
         var mlast: [MAX_SLOTS]u32 = undefined;
         var Tm: u32 = 0;
         for (slots, 0..) |slot, i| {
-            const blk = r.block[wf[i]..][0..wn[i]];
-            var kept: u32 = 0;
-            while (kept + 1 < wn[i] and ids[wf[i] + kept + 1] == blk[kept]) kept += 1;
-            const keep = kept + 1;
-            @memcpy(out[i][0..keep], blk[0..keep]);
+            const keep = judged[i] orelse greedy: {
+                const blk = r.block[wf[i]..][0..wn[i]];
+                var kept: u32 = 0;
+                while (kept + 1 < wn[i] and ids[wf[i] + kept + 1] == blk[kept]) kept += 1;
+                @memcpy(out[i][0 .. kept + 1], blk[0 .. kept + 1]);
+                break :greedy kept + 1;
+            };
+            const blk = out[i][0..keep];
             n[i] = keep;
             const k32: i32 = @intCast(keep);
             for (m.layers) |*l| if (!l.attn) {
@@ -996,14 +1032,14 @@ pub const Runner = struct {
             mlast[i] = Tm - 1;
         }
         r.enter(home);
-        try r.mtpMulti(slots, mids[0..Tm], mpos[0..Tm], n[0..S], mlast[0..S]);
+        try r.mtpMulti(slots, mids[0..Tm], mpos[0..Tm], n[0..S], mlast[0..S], judge);
         for (slots, 0..) |slot, i| r.mpos[slot] = p0[i] + @as(u32, @intCast(n[i]));
     }
 
     /// The MTP layer over the kept rows of several slots (mtp.hin their hidden), row t at position pos[t] of its
     /// slot's MTP cache: slot i has n[i] rows, its last at row mlast[i]. Each slot's state and first draft become its
     /// last row's.
-    fn mtpMulti(r: *Runner, slots: []const u32, ids: []const i32, pos: []const i32, n: []const usize, mlast: []const u32) !void {
+    fn mtpMulti(r: *Runner, slots: []const u32, ids: []const i32, pos: []const i32, n: []const usize, mlast: []const u32, judge: ?Judge) !void {
         const mt = r.mtp.?;
         const l = &mt.layer;
         const d = &r.d;
@@ -1042,7 +1078,19 @@ pub const Runner = struct {
         var tok: [WINDOW]i32 = undefined;
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &tok, a.tok, T * 4, null, 0, null));
         try d.sync();
-        for (slots, mlast) |slot, ml| r.sdraft[slot] = tok[ml];
+        for (slots, mlast, 0..) |slot, ml, i| {
+            const drawn = if (judge) |j| try j.draft(j.ctx, i, ml) else null;
+            r.sdraft[slot] = drawn orelse tok[ml];
+            r.sdrawn[slot] = drawn != null;
+        }
+    }
+
+    /// The host rows `rows` of the last forward's logits (fp16, a vocabulary a row) into `out`.
+    pub fn logitRows(r: *Runner, row: u32, rows: u32, out: []f16) !void {
+        const v = r.z.s.vocab;
+        if (out.len < @as(usize, rows) * v) return error.BadLength;
+        try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, out.ptr, off(r.acts.logits, @as(usize, row) * v * 2), @as(usize, rows) * v * 2, null, 0, null));
+        try r.d.sync();
     }
 
     /// The fp16 logits of the last forward's final row (`out.len` is the vocabulary size).

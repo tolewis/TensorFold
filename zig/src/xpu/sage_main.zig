@@ -224,7 +224,7 @@ fn loop(r: *sage.Runner) !void {
         if (greedy) { // greedy streams: MTP drafts, one block a stream
             var got: [sage.MAX_SLOTS][sage.WINDOW]i32 = undefined;
             var n: [sage.MAX_SLOTS]usize = undefined;
-            try r.specMulti(feed[0..nf], spec, got[0..nf], n[0..nf]);
+            try r.specMulti(feed[0..nf], spec, got[0..nf], n[0..nf], null);
             for (feed[0..nf], 0..) |si, j| {
                 const sl = &slots[si];
                 var ended = false;
@@ -429,7 +429,7 @@ fn specMultiCheck(r: *sage.Runner, ids: []const i32, steps: usize, k: u32) !void
     var short = true;
     const t0 = now();
     while (short) : (rounds += 1) {
-        try r.specMulti(slots[0..n], k, buf[0..n], cnt[0..n]);
+        try r.specMulti(slots[0..n], k, buf[0..n], cnt[0..n], null);
         short = false;
         for (0..n) |i| {
             try got[i].appendSlice(alloc, buf[i][0..cnt[i]]);
