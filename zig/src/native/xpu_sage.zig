@@ -148,7 +148,8 @@ pub const Slots = struct {
             if (s.isCancelled()) return error.Cancelled;
             const n = @min(sage.CHUNK, ids.len - at);
             for (b.ids[0..n], ids[at..][0..n]) |*d, t| d.* = @intCast(t);
-            if (v) |x| try r.promptFeed(b.ids[0..n], x.feed(r, &layout, @intCast(at), @intCast(n))) else try r.prompt(b.ids[0..n]);
+            const next: ?i32 = if (at + n < ids.len) @intCast(ids[at + n]) else null;
+            try r.promptPiece(b.ids[0..n], if (v) |x| x.feed(r, &layout, @intCast(at), @intCast(n)) else .{}, next);
             at += n;
         }
         r.shift[slot] = layout.shift;
