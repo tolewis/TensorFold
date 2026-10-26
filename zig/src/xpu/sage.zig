@@ -10,6 +10,8 @@ const dev = @import("dev.zig");
 const loader = @import("load.zig");
 const fwd = @import("forward.zig");
 const q = @import("qwen27.zig"); // the profiler state (XPU_PROFILE) the Dev records into
+/// A slot's prompt state for the prompt cache (Runner.saveSlot, restoreSlot).
+pub const snapshot = @import("sage_snapshot.zig");
 const Dev = dev.Dev;
 const Checkpoint = dev.Checkpoint;
 const Proj = loader.Proj;
@@ -550,6 +552,11 @@ pub const Runner = struct {
         }
         return n;
     }
+
+    pub const snapBytes = snapshot.bytes;
+    pub const saveSlot = snapshot.save;
+    pub const restoreSlot = snapshot.restore;
+    pub const dropSnap = snapshot.drop;
 
     pub fn deinit(r: *Runner) void {
         r.d.deinit();
