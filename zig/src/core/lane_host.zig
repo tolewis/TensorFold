@@ -63,6 +63,7 @@ pub const LaneHost = struct {
     health: ?api.HealthSource = null,
     frame_key: ?*const fn (images: []const api.Image) u32 = null, // a family's image frame (0: text's), in the cache key
     memory: ?api.MemorySource = null, // the backend's memory counts; null: Engine.memory reports none
+    kv_pool: ?api.KvPoolSource = null, // the backend's shared K/V pool counts (Status.kv_pool); null: none
     explain: ?api.Explain = null, // the backend's words for a request it refuses; null: the error's name
     learner: ?api.Learner = null, // the family's Sliding Weights learner; null: learn requests are refused
     lessons: std.ArrayList(Lesson) = .empty, // learn requests waiting for an idle engine

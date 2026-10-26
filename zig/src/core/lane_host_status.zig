@@ -29,6 +29,7 @@ pub fn read(ctx: *anyopaque, out: *api.Status, stream_tokens: []u32) void {
         .streams = n,
         .generation_tokens = h.live_generated,
         .prompt_cache = h.cache_status,
+        .kv_pool = if (h.kv_pool) |src| src.read(src.ctx) else null,
     };
     fillTotals(h, out);
 }
