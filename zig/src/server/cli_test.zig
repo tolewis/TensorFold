@@ -174,6 +174,9 @@ test "parse and capabilities share the table" {
     try std.testing.expectEqual(@as(?f64, 0), (try parse(a, &.{ "m", "--prompt-cache-gib", "0" }, &u)).prompt_cache_gib);
     try std.testing.expect(!(try parse(a, &.{ "m", "--prompt-cache-gib", "16" }, &u)).prompt_cache_over_cap);
     try std.testing.expect((try parse(a, &.{ "m", "--prompt-cache-gib", "16", "--prompt-cache-over-cap" }, &u)).prompt_cache_over_cap);
+    try std.testing.expectEqual(@as(?u32, 700000), (try parse(a, &.{ "m", "--kv-pool-tokens", "700000" }, &u)).kv_pool_tokens);
+    try std.testing.expectEqual(@as(?u32, null), (try parse(a, &.{"m"}, &u)).kv_pool_tokens);
+    for ([_][]const u8{ "0", "-1", "4294967296", "x" }) |bad| try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--kv-pool-tokens", bad }, &u));
     try std.testing.expect((try parse(a, &.{ "m", "--learn" }, &u)).learn);
     const dir = try parse(a, &.{ "m", "--learn-dir", "/x/y" }, &u);
     try std.testing.expect(dir.learn and std.mem.eql(u8, "/x/y", dir.learn_dir.?));

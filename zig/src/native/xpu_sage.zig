@@ -6,6 +6,7 @@ const xq = @import("xpu_qwen27");
 const lane = @import("xpu_lane.zig");
 const sage = xq.sage;
 const vl = @import("core").qwen_vl;
+const kv = @import("core").kv_pool;
 const be = lanes.backend;
 const Allocator = std.mem.Allocator;
 
@@ -33,6 +34,12 @@ pub const Slots = struct {
     sampled_drafts: bool = true, // sampled streams take MTP drafts too (XPU_SAMPLED_DRAFTS=0: one row a round)
     draft_q: bool = true, // a sampled stream's first draft is drawn from the MTP's filtered row (XPU_SAMPLED_Q=0: its argmax)
     spec: ?*Spec = null, // speculative sampling's host buffers, made at the first sampled window
+    pool: ?kv.Pool = null, // the K/V pages all slots share (null: no shared pool)
+    leases: [sage.MAX_SLOTS]kv.Lease = @splat(.{}), // each slot's pages from the pool
+    pages_total: std.atomic.Value(u64) = .init(0), // the pool's counts, for admission and /metrics (other threads)
+    pages_free: std.atomic.Value(u64) = .init(0),
+    pages_used: std.atomic.Value(u64) = .init(0),
+    pages_promised: std.atomic.Value(u64) = .init(0),
 
     fn of(ptr: *anyopaque) *Slots {
         return @ptrCast(@alignCast(ptr));
@@ -55,6 +62,10 @@ pub const Slots = struct {
         for (b.first_rows) |x| if (x) |row| b.gpa.free(row);
         if (b.masked_vals) |x| b.gpa.free(x);
         if (b.masked_ids) |x| b.gpa.free(x);
+        if (b.pool) |*p| {
+            for (&b.leases) |*l| p.finish(l);
+            p.deinit();
+        }
     }
 
     pub fn backend(b: *Slots) be.Backend {
@@ -84,6 +95,69 @@ pub const Slots = struct {
     fn freeSlot(b: *const Slots) ?u32 {
         for (b.owners[0..b.r.slots], 0..) |o, i| if (o == null) return @intCast(i);
         return null;
+    }
+
+    /// Pages a stream of `prompt` tokens and `max_new` more takes: its rows and one more verify window, at most ctx.
+    fn need(b: *const Slots, prompt: u64, max_new: u64) u64 {
+        return (@min(prompt + max_new + sage.WINDOW, b.r.ctx) + sage.PAGE - 1) / sage.PAGE;
+    }
+
+    /// The pool's counts where admission and /metrics read them.
+    fn publish(b: *Slots) void {
+        if (b.pool) |*p| {
+            b.pages_total.store(p.total(), .release);
+            b.pages_free.store(p.available(), .release);
+            b.pages_used.store(p.total() - p.nfree, .release);
+            b.pages_promised.store(p.promised, .release);
+        }
+    }
+
+    /// `slot`'s pages for a stream of `prompt` and `max_new` tokens: promised and mapped now, so the stream takes no
+    /// page while it runs. LaneMemory: they do not fit beside the running streams now (the request waits).
+    fn lease(b: *Slots, slot: u32, prompt: u64, max_new: u64) !void {
+        const p = if (b.pool) |*x| x else return;
+        b.unlease(slot);
+        const n = b.need(prompt, max_new);
+        if (n > p.total()) return error.KvPoolTooSmall;
+        try p.promise(&b.leases[slot], @intCast(n));
+        errdefer b.unlease(slot);
+        var map: Map = .{ .r = b.r, .slot = slot };
+        try p.cover(&b.leases[slot], @intCast(n), .{ .ctx = &map, .write = Map.write });
+        b.publish();
+    }
+
+    /// `slot`'s pages back to the pool; its table then maps none.
+    fn unlease(b: *Slots, slot: u32) void {
+        const p = if (b.pool) |*x| x else return;
+        p.finish(&b.leases[slot]);
+        b.r.mapPages(slot, 0, &.{}) catch {};
+        b.publish();
+    }
+
+    /// A lease's new page ids into its slot's table on the device (kv.Table).
+    const Map = struct {
+        r: *sage.Runner,
+        slot: u32,
+
+        fn write(ctx: *anyopaque, ids: []const u32, from: usize) anyerror!void {
+            const m: *Map = @ptrCast(@alignCast(ctx));
+            try m.r.mapPages(m.slot, @intCast(from), ids[from..]);
+        }
+    };
+
+    /// api.Admit: whether the pool can promise a request's pages now. A request no pool could hold goes through, so
+    /// its prompt pass refuses it at once (PromptTooLong, KvPoolTooSmall) instead of holding the queue.
+    fn fitsFn(ptr: *anyopaque, prompt: u32, max_tokens: u32) bool {
+        const b = of(ptr);
+        const n = b.need(prompt, max_tokens);
+        if (@as(u64, prompt) + max_tokens + 1 > b.r.ctx or n > b.pages_total.load(.acquire)) return true;
+        return n <= b.pages_free.load(.acquire);
+    }
+
+    /// api.KvPoolSource: the pool's counts for /metrics, from the atomics alone.
+    fn poolRead(ptr: *anyopaque) api.Status.KvPool {
+        const b = of(ptr);
+        return .{ .pages = b.pages_total.load(.acquire), .page_tokens = sage.PAGE, .used = b.pages_used.load(.acquire), .promised = b.pages_promised.load(.acquire), .free = b.pages_free.load(.acquire) };
     }
 
     /// The stream's next token: the runner's greedy one, else drawn on the host from logits row `row` (null: the
@@ -143,6 +217,13 @@ pub const Slots = struct {
         const slot = b.slotOf(s) orelse (b.freeSlot() orelse return error.NoFreeSlot);
         b.owners[slot] = s;
         errdefer b.owners[slot] = null;
+        try b.lease(slot, ids.len, s.max_new);
+        errdefer b.unlease(slot);
+        const room = r.room(slot);
+        if (ids.len + s.max_new + 1 > room) { // pages short of the request: the reply ends where they end
+            std.log.warn("XPU Sage: slot {d} holds {d} positions, short of a {d}-token prompt and {d} new tokens; the reply stops at {d} tokens", .{ slot, room, ids.len, s.max_new, room -| ids.len -| 1 });
+            s.max_new = @intCast(room -| ids.len -| 1);
+        }
         try r.use(slot);
         try r.reset();
         const v: ?*Vision = if (s.images.len == 0) null else b.vision orelse return error.NoVision;
@@ -366,6 +447,7 @@ pub const Slots = struct {
         var handed = false;
         defer if (!handed) {
             b.owners[slot] = null;
+            b.unlease(slot);
         };
         var pending = b.drawn[(b.next - 1) % ring];
         _ = try s.commit(b.gpa, &.{pending}, &.{});
@@ -407,6 +489,7 @@ pub const Slots = struct {
         const slot = b.slotOf(s) orelse return;
         b.owners[slot] = null;
         b.held[slot] = 0;
+        b.unlease(slot);
     }
 };
 
@@ -697,9 +780,11 @@ const Served = struct {
     }
 };
 
-/// Sage from `o.dir` (MLX affine 4/64, or AutoRound GPTQ 4/128 shown as MLX at load): --parallel slots (1 to 8) of --context tokens each, int8 K/V with XPU_KV_INT8.
+/// Sage from `o.dir` (MLX affine 4/64, or AutoRound GPTQ 4/128 shown as MLX at load): --parallel slots (1 to 8), a
+/// stream of at most --context tokens (262144 by default), their K/V in one pool of pages (--kv-pool-tokens, else
+/// what the card leaves), int8 K/V with XPU_KV_INT8.
 pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
-    const context: u32 = std.math.cast(u32, o.context orelse 32768) orelse 0;
+    const context: u32 = std.math.cast(u32, o.context orelse 262144) orelse 0;
     if (context == 0) {
         problem.* = try std.fmt.allocPrint(a, "the XPU Sage engine needs a context of 1 to 2^32-1 tokens, not {d}", .{o.context.?});
         return null;
@@ -725,20 +810,27 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         problem.* = try std.fmt.allocPrint(a, "XPU_SPEC: 1 to {d} MTP drafts a round, not {d}", .{ sage.WINDOW - 1, h.back.depth });
         return null;
     }
-    if (!try fitsCard(a, r, slots, context, problem)) {
+    const pages = poolPages(r, slots, context, o.kv_pool_tokens);
+    if (!(try fitsCard(a, r, slots, pages, problem) and try poolMade(a, r, pages, problem))) {
         if (h.back.vision) |v| v.deinit(gpa);
         h.back.deinit();
         gpa.destroy(h);
         r.deinit();
         return null;
     }
+    h.back.pool = try kv.Pool.init(gpa, pages, r.kvBytesPerToken() * sage.PAGE);
+    h.back.publish();
+    const pool_tokens = @as(u64, pages) * sage.PAGE;
+    if (pool_tokens < context) std.log.warn("XPU Sage: the K/V pool holds {d} tokens, less than one stream's --context of {d}: a longer request is refused", .{ pool_tokens, context });
     h.cfg = try lanes.Config.init(gpa, h.back.facts(), if (r.mtp != null) h.back.depth + 1 else 2, if (r.mtp != null) h.back.depth else 0);
     errdefer h.cfg.deinit(gpa);
     h.core = lanes.Engine.init(gpa, &h.cfg, h.back.backend(), h.wall.clock());
     errdefer h.core.deinit();
-    h.startup = try std.fmt.allocPrint(gpa, "Intel GPU engine: Sage (qwen3_5_moe), {d} stream(s) of {d} tokens, {s} K/V, sampling on the host{s}", .{ slots, context, if (r.cap > 0) "int8" else "bf16", if (r.mtp == null) "" else if (h.back.sampled_drafts) ", MTP drafts for greedy and sampled streams" else ", MTP drafts for greedy streams" });
+    h.startup = try std.fmt.allocPrint(gpa, "Intel GPU engine: Sage (qwen3_5_moe), {d} stream(s) of at most {d} tokens, a K/V pool of {d} pages ({d} tokens, {d:.2} GB, {s}), sampling on the host{s}", .{ slots, context, pages, pool_tokens, gb(pool_tokens * r.kvBytesPerToken()), if (r.cap > 0) "int8" else "bf16", if (r.mtp == null) "" else if (h.back.sampled_drafts) ", MTP drafts for greedy and sampled streams" else ", MTP drafts for greedy streams" });
     h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "sage-xpu", .lanes = slots, .context_window = context, .context_fitted = true, .startup = h.startup, .prefill_step = 0, .structures = true });
     h.host.explain = .{ .text = lane.explain };
+    h.host.info_.admit = .{ .ctx = &h.back, .fits = Slots.fitsFn }; // a request waits until the pool can promise its pages
+    h.host.kv_pool = .{ .ctx = &h.back, .read = Slots.poolRead };
     if (h.back.vision) |v| h.host.info_.vision = v.offer(o.vision.?);
     if (r.mtp != null) h.host.lone = .{ .ctx = &h.back, .run = Slots.loneFn };
     try h.host.start();
@@ -747,31 +839,46 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
 
 /// Card bytes kept free of the engine's buffers.
 const card_reserve: u64 = 64 << 20;
-/// Bytes Dev.allocated counts that the card does not hold once every slot is in use. Measured with drm-total-vram0
-/// after 8 streams at once: 34.60 GB counted and 34.12 GB held (--parallel 8 --context 133000), 32.91 and 32.42 GB
-/// (the same with the MTP head at --context 100000). Taken a little under the 0.49 GB seen.
-const counted_not_held: u64 = 450_000_000;
+/// Bytes the card holds beyond what Dev.allocated counts (the runtime's own buffers). Measured with drm-total-vram0
+/// after 4 streams at once, the pool zeroed at load: 32.47 GB counted and 32.71 GB held (--parallel 4 --context
+/// 220000, the MTP head, --vision, int8 K/V). Taken above the 0.24 GB seen.
+const held_not_counted: u64 = 400_000_000;
 
-/// Whether the card holds what the load allocated. A K/V page is written only when its slot first reaches it, so
-/// an overcommit loses the device then, not at load. Else `problem` names the largest context for these slots and
-/// the most slots for this context.
-fn fitsCard(a: Allocator, r: *sage.Runner, slots: u32, context: u32, problem: *[]const u8) !bool {
+/// Whether the card holds the load and a K/V pool of `pages` pages. The pool is zeroed at load, so a pool the card
+/// cannot hold fails then, not under a request. Else `problem` names the pool, the most it holds, and the flag.
+fn fitsCard(a: Allocator, r: *sage.Runner, slots: u32, pages: u32, problem: *[]const u8) !bool {
     const mem = r.d.g.memory() catch |err| {
-        std.log.warn("XPU: no Sysman memory size ({s}), so the load does not check that the card holds every slot's K/V", .{@errorName(err)});
+        std.log.warn("XPU: no Sysman memory size ({s}), so the load does not check that the card holds the K/V pool", .{@errorName(err)});
         return true;
     };
     const room = mem.size -| card_reserve;
-    const need: u64 = r.d.allocated -| counted_not_held;
-    std.log.info("XPU: the load holds {d:.2} GB of the card's {d:.2} GB ({d:.2} GB kept free)", .{ gb(need), gb(mem.size), gb(card_reserve) });
+    const page: u64 = r.kvBytesPerToken() * sage.PAGE;
+    const pool: u64 = @as(u64, pages) * page;
+    const need: u64 = r.d.allocated + pool + held_not_counted;
+    std.log.info("XPU: the load holds {d:.2} GB of the card's {d:.2} GB ({d:.2} GB kept free), {d:.2} GB of it the K/V pool", .{ gb(need), gb(mem.size), gb(card_reserve), gb(pool) });
     if (need <= room) return true;
-    const per: u64 = r.kvBytesPerToken();
-    const state: u64 = r.slotStateBytes();
-    const fixed = need -| slots * (state + per * context); // weights, activations, the tower: what fewer slots leave
-    const left = room -| fixed;
-    const max_context = (left / slots -| state) / per;
-    const max_slots = left / (state + per * context);
-    problem.* = try std.fmt.allocPrint(a, "the XPU Sage engine needs {d:.2} GB for {d} stream(s) of {d} tokens{s}, and the card has {d:.2} GB with {d:.2} GB kept free. It fits {d} stream(s) of at most {d} tokens, or at most {d} stream(s) of {d} tokens (--parallel, --context)", .{ gb(need), slots, context, if (r.mtp != null) " with the MTP head" else "", gb(mem.size), gb(card_reserve), slots, max_context, max_slots, context });
+    const most = (room -| (r.d.allocated + held_not_counted)) / page * sage.PAGE;
+    problem.* = try std.fmt.allocPrint(a, "the XPU Sage engine needs {d:.2} GB for {d} stream(s){s} and a K/V pool of {d} tokens ({d:.2} GB), and the card has {d:.2} GB with {d:.2} GB kept free. The pool fits at most {d} tokens (--kv-pool-tokens); fewer --parallel slots leave more", .{ gb(need), slots, if (r.mtp != null) " with the MTP head" else "", @as(u64, pages) * sage.PAGE, gb(pool), gb(mem.size), gb(card_reserve), most });
     return false;
+}
+
+/// The pool's pages: --kv-pool-tokens rounded up to whole pages, else what the card leaves after the load (the
+/// weights, the tower, the activations, every slot's GDN state), at most every slot's whole context.
+fn poolPages(r: *sage.Runner, slots: u32, context: u32, tokens: ?u32) u32 {
+    if (tokens) |t| return @intCast((@as(u64, t) + sage.PAGE - 1) / sage.PAGE);
+    const most: u64 = @as(u64, slots) * ((@as(u64, context) + sage.PAGE - 1) / sage.PAGE);
+    const mem = r.d.g.memory() catch return @intCast(most);
+    const left = (mem.size -| card_reserve) -| (r.d.allocated + held_not_counted);
+    return @intCast(@min(most, left / (r.kvBytesPerToken() * sage.PAGE)));
+}
+
+/// The runner's pool of `pages` pages; false with `problem` set when the card does not give it.
+fn poolMade(a: Allocator, r: *sage.Runner, pages: u32, problem: *[]const u8) !bool {
+    r.allocPool(pages) catch |err| {
+        problem.* = try std.fmt.allocPrint(a, "the XPU Sage engine could not make a K/V pool of {d} pages ({d} tokens): {s}", .{ pages, @as(u64, pages) * sage.PAGE, @errorName(err) });
+        return false;
+    };
+    return true;
 }
 
 fn gb(b: u64) f64 {

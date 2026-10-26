@@ -169,6 +169,13 @@ pub const Metrics = struct {
         const live = streams[0..@min(status.streams, streams.len)];
         try family(w, "kv_cache_usage_ratio", "gauge", "Tokens in a stream cache divided by that stream's context window.");
         try pools(w, "kv_cache_usage_ratio", "pool", live, window);
+        if (status.kv_pool) |p| {
+            try gauge(w, "kv_pool_pages", "gauge", "Pages in the K/V pool that all streams share.", p.pages);
+            try gauge(w, "kv_pool_page_tokens", "gauge", "Tokens one K/V pool page holds.", p.page_tokens);
+            try gauge(w, "kv_pool_pages_used", "gauge", "K/V pool pages the running streams hold.", p.used);
+            try gauge(w, "kv_pool_pages_promised", "gauge", "K/V pool pages admitted requests reserved and do not hold yet.", p.promised);
+            try gauge(w, "kv_pool_pages_free", "gauge", "K/V pool pages neither held nor reserved: what a new request can get.", p.free);
+        }
         try gauge(w, "mtp_drafted_total", "counter", "Draft tokens verified on finished requests.", snap.drafted);
         try gauge(w, "mtp_accepted_total", "counter", "Draft tokens kept on finished requests.", snap.accepted);
         try histogram(w, "request_latency_seconds", "Seconds from arrival to the reply leaving.", snap.latency);
@@ -288,6 +295,26 @@ const RenderStub = struct {
     status_value: api.Status = .{ .running = 1, .waiting = 2, .generation_tokens = 3 },
     memory_value: ?api.Memory = null,
 };
+
+test "render shows the K/V pool's pages where the engine has a pool" {
+    const gpa = std.testing.allocator;
+    var m: Metrics = .{ .gpa = gpa };
+    var stub: RenderStub = .{};
+    var none: std.Io.Writer.Allocating = .init(gpa);
+    defer none.deinit();
+    try m.render(std.testing.io, &none.writer, stub.status_value, &.{}, stub.info_value, stub.memory_value, 4096);
+    try std.testing.expect(std.mem.indexOf(u8, none.written(), "kv_pool_pages") == null); // no pool: no gauge
+    stub.status_value.kv_pool = .{ .pages = 16384, .page_tokens = 64, .used = 3000, .promised = 10, .free = 13374 };
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try m.render(std.testing.io, &out.writer, stub.status_value, &.{}, stub.info_value, stub.memory_value, 4096);
+    const body = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:kv_pool_pages 16384\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:kv_pool_page_tokens 64\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:kv_pool_pages_used 3000\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:kv_pool_pages_promised 10\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:kv_pool_pages_free 13374\n") != null);
+}
 
 test "render exposes live counters, rounds, prefill and TPOT without cache family" {
     const gpa = std.testing.allocator;

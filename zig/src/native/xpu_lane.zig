@@ -414,6 +414,7 @@ pub fn Xpu(comptime S: type) type {
 pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     return switch (err) {
         error.PromptTooLong => "the prompt and its reply exceed this server's context window: shorten it or lower max_tokens",
+        error.KvPoolTooSmall => "the prompt and its reply need more K/V pages than this server's whole pool holds: shorten it, lower max_tokens, or start the server with a larger --kv-pool-tokens",
         error.ShuttingDown => "the server is shutting down",
         else => null,
     };

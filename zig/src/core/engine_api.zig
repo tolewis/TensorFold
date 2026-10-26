@@ -282,6 +282,8 @@ pub const Open = struct {
     speed_up: ?[]const u8 = null,
     prompt_cache_gib: ?f64 = null,
     prompt_cache_over_cap: bool = false,
+    /// --kv-pool-tokens: the shared K/V pool's size in tokens (the XPU Sage engine; null: what the card leaves).
+    kv_pool_tokens: ?u32 = null,
     /// --learn: where shared prompt states are kept on disk for later sessions and servers (null: off).
     learn: ?[]const u8 = null,
     /// --learn-min-free-gib: filesystem space kept free before any learned-state write.
@@ -360,6 +362,7 @@ pub const MemorySource = struct {
 };
 
 pub const HealthSource = @import("engine_status.zig").HealthSource;
+pub const KvPoolSource = @import("engine_status.zig").KvPoolSource;
 pub const Status = @import("engine_status.zig").Status;
 
 pub const SubmitError = error{ Closed, Busy, InvalidSpans, Stale, InvalidRequest }; // Stale: put-back has not reached the device

@@ -35,6 +35,8 @@ fn span(keys: u32) u32 {
 pub const WINDOW = 16;
 /// Rows of one prompt chunk: norms, GEMMs and MoE take the whole chunk, the mixers WINDOW rows at a time.
 pub const CHUNK = 512;
+/// K/V positions a page holds (shape.h Q27_PAGE): a stream's positions reach its pages through its page table.
+pub const PAGE = 64;
 /// Streams one runner holds (a stepMulti row each): K/V caches, GDN and convolution states of their own.
 pub const MAX_SLOTS = 8;
 
@@ -71,14 +73,14 @@ pub const Layer = struct {
     // attention
     qn: ?*anyopaque = null,
     kn: ?*anyopaque = null,
-    kc: ?*anyopaque = null, // bf16 [ctx, AKV, 256]
-    vc: ?*anyopaque = null,
+    kc: ?*anyopaque = null, // the pool: K pages then V pages, [pool, PAGE, AKV, 256] (Runner.allocPool)
+    vc: ?*anyopaque = null, // the V pages of the same allocation
     // every slot's: the fields above are the current slot's (Runner.use)
     st: [MAX_SLOTS]SlotState = undefined,
 };
 
 /// One slot's state in one layer.
-pub const SlotState = struct { kc: ?*anyopaque = null, vc: ?*anyopaque = null, rec: ?*anyopaque = null, rec_save: ?*anyopaque = null, stash: ?*anyopaque = null, conv: [2]?*anyopaque = .{ null, null }, conv_cur: u1 = 0 };
+pub const SlotState = struct { rec: ?*anyopaque = null, rec_save: ?*anyopaque = null, stash: ?*anyopaque = null, conv: [2]?*anyopaque = .{ null, null }, conv_cur: u1 = 0 };
 
 /// Byte offsets in a GDN layer's stash of WINDOW rows: q at 0, then k, v, g, beta and the mixer input rows p.
 pub const StashAt = struct {
@@ -166,12 +168,12 @@ pub const Acts = struct {
     mxs: *anyopaque, // fp32 [CHUNK, D / 64]: group sums of h
     mas: *anyopaque, // fp32 [CHUNK (top_k + 1), ff / 64]: group sums of act
 
-    pub fn init(d: *Dev, z: Sizes, ctx: u32) !Acts {
+    pub fn init(d: *Dev, z: Sizes) !Acts {
         const s = z.s;
         const w: usize = WINDOW;
         const c: usize = CHUNK;
         const widest_in: usize = @max(s.hidden, @max(z.vd, z.od));
-        const ns: usize = @max((ctx + SPLIT - 1) / SPLIT, SLICES);
+        const ns: usize = SLICES;
         const pairs: usize = c * (s.top_k + 1);
         return .{
             .x = try d.alloc_(c * s.hidden * 4),
@@ -278,8 +280,7 @@ fn experts(d: *Dev, c: *const Checkpoint, p: []const u8, count: u32, shared: boo
 
 /// MLX affine 4/64 only in this form; the scales of the experts must be BF16 (sage_moe.cl reads bf16). Checked on the
 /// Sage MLX-4bit checkpoint by tools/xpu/sage_mlx_check.py: stacked switch_mlp experts, 8 bit router, conv1d [NCONV, 4, 1].
-/// kv8: an int8 K/V cache (256 int8 a position and head, then the fp32 scales after `ctx` positions), else bf16.
-pub fn load(d: *Dev, c: *const Checkpoint, z: Sizes, ctx: u32, slots: u32, kv8: bool) !Model {
+pub fn load(d: *Dev, c: *const Checkpoint, z: Sizes, slots: u32) !Model {
     const s = z.s;
     if (c.has("in_proj_qkv.qweight") or c.has("in_proj_qkv.trellis")) return error.OnlyMlxInThisForm;
     const stage = try d.alloc_(800 << 20);
@@ -307,7 +308,6 @@ pub fn load(d: *Dev, c: *const Checkpoint, z: Sizes, ctx: u32, slots: u32, kv8: 
     for (&invf, 0..) |*f, i| f.* = @floatCast(std.math.pow(f64, 1e7, -@as(f64, @floatFromInt(i)) / half_dims));
     m.invf = try d.upload(std.mem.sliceAsBytes(invf[0 .. s.rope_dims / 2]));
     m.layers = try alloc.alloc(Layer, s.layers);
-    const kv_bytes = @as(usize, ctx) * s.kv_heads * @as(usize, if (kv8) 256 + 4 else 256 * 2);
     for (m.layers, 0..) |*l, i| {
         const p = name("model.layers.{d}.", .{i});
         const attn = (i + 1) % 4 == 0;
@@ -328,9 +328,7 @@ pub fn load(d: *Dev, c: *const Checkpoint, z: Sizes, ctx: u32, slots: u32, kv8: 
             if (l.mixer_in.n != z.att_in) return error.UnexpectedShape;
             l.qn = try loader.bf16Tensor(d, c, name("{s}self_attn.q_norm.weight", .{p}));
             l.kn = try loader.bf16Tensor(d, c, name("{s}self_attn.k_norm.weight", .{p}));
-            for (l.st[0..slots]) |*st| st.* = .{ .kc = try d.alloc_(kv_bytes), .vc = try d.alloc_(kv_bytes) };
-            l.kc = l.st[0].kc;
-            l.vc = l.st[0].vc;
+            l.st = @splat(.{}); // K/V: the pool (Runner.allocPool)
         } else {
             l.mixer_in = try loader.projection(d, c, name("{s}linear_attn.", .{p}), &.{ "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b" }, true, false, stage);
             l.mixer_out = try loader.projection(d, c, name("{s}linear_attn.", .{p}), &.{"out_proj"}, false, false, stage);
@@ -379,7 +377,7 @@ pub const Mtp = struct {
 
 /// The MTP head from the W4A16 AutoRound checkpoint in `dir` (the MLX export drops it): its projections and experts
 /// shown as MLX affine 4/64 with no requantization, fc quantized to 4/64 from bf16.
-pub fn loadMtp(d: *Dev, dir: []const u8, z: Sizes, ctx: u32, slots: u32, kv8: bool) !*Mtp {
+pub fn loadMtp(d: *Dev, dir: []const u8, z: Sizes) !*Mtp {
     const s = z.s;
     const shard = try mtpShard(dir);
     var c: Checkpoint = .{};
@@ -424,10 +422,7 @@ pub fn loadMtp(d: *Dev, dir: []const u8, z: Sizes, ctx: u32, slots: u32, kv8: bo
         .kn = try loader.bf16Tensor(d, &c, p ++ "self_attn.k_norm.weight"),
     };
     if (mt.layer.mixer_in.n != z.att_in) return error.UnexpectedShape;
-    const kv_bytes = @as(usize, ctx) * s.kv_heads * @as(usize, if (kv8) 256 + 4 else 256 * 2);
-    for (mt.layer.st[0..slots]) |*st| st.* = .{ .kc = try d.alloc_(kv_bytes), .vc = try d.alloc_(kv_bytes) };
-    mt.layer.kc = mt.layer.st[0].kc;
-    mt.layer.vc = mt.layer.st[0].vc;
+    mt.layer.st = @splat(.{}); // K/V: the pool (Runner.allocPool)
     mt.fc_e = try loader.projection(d, &c, "mtp.", &.{"fc_e"}, false, false, stage);
     mt.fc_h = try loader.projection(d, &c, "mtp.", &.{"fc_h"}, false, false, stage);
     mt.norm_e = try loader.bf16Tensor(d, &c, "mtp.pre_fc_norm_embedding.weight");
@@ -443,6 +438,19 @@ pub fn loadMtp(d: *Dev, dir: []const u8, z: Sizes, ctx: u32, slots: u32, kv8: bo
     try d.sync();
     std.debug.print("  MTP head loaded from {s}\n", .{shard});
     return mt;
+}
+
+/// `bytes` of zeros at `p` on the device: the first 64 MiB from the host, the rest copied from them on the card.
+fn zeroed(d: *Dev, p: *anyopaque, bytes: usize) !void {
+    const first = @min(bytes, 64 << 20);
+    try d.fill(p, @as(u32, 0), first);
+    var at: usize = first;
+    while (at < bytes) {
+        const n = @min(first, bytes - at);
+        try dev.copy(d, off(p, at), p, n);
+        at += n;
+    }
+    try d.sync();
 }
 
 /// The AutoRound shard that holds mtp.fc.weight, from the checkpoint's index.
@@ -469,6 +477,10 @@ pub const Runner = struct {
     ckpt: Checkpoint,
     ctx: u32,
     cap: i32 = 0, // > 0: the int8 K/V cache (XPU_KV_INT8), its positions
+    pool: u32 = 0, // K/V pages each attention layer holds (allocPool; 0: none yet)
+    page_bytes: usize = 0, // one K (or V) page of one layer
+    pt: [MAX_SLOTS]?*anyopaque = @splat(null), // each slot's page table: u32 [ceil(ctx / PAGE)] on the device
+    held: [MAX_SLOTS]u32 = @splat(0), // pages each slot's table maps, from its position 0
     pos: u32 = 0,
     last: i32 = -1, // the greedy token after the last fed row
     slots: u32 = 1,
@@ -499,10 +511,14 @@ pub const Runner = struct {
 
     /// `slots` streams (1 to MAX_SLOTS) of `ctx` positions each.
     pub fn init(dir: []const u8, ctx: u32, slots: u32) !*Runner {
-        return initMtp(dir, ctx, slots, if (std.c.getenv("XPU_MTP")) |md| std.mem.span(md) else null);
+        const r = try initMtp(dir, ctx, slots, if (std.c.getenv("XPU_MTP")) |md| std.mem.span(md) else null);
+        errdefer r.deinit();
+        try r.poolFixed();
+        return r;
     }
 
-    /// As init, with the MTP drafter from `mtp` (an AutoRound checkpoint directory; null: none).
+    /// As init, with the MTP drafter from `mtp` (an AutoRound checkpoint directory; null: none). Each slot has its
+    /// own pages (poolFixed).
     pub fn initMtp(dir: []const u8, ctx: u32, slots: u32, mtp: ?[]const u8) !*Runner {
         if (slots == 0 or slots > MAX_SLOTS) return error.BadSlots;
         const z = Sizes.of(try readShape(dir));
@@ -524,8 +540,8 @@ pub const Runner = struct {
             inline for (@typeInfo(MoeKernels).@"struct".field_names, 0..) |n, i| q.prof.names[base + i] = .{ .k = @field(r.mk, n), .name = "moe_" ++ n };
         }
         if (std.c.getenv("XPU_KV_INT8") != null) r.cap = @intCast(ctx);
-        r.model = try load(d, &r.ckpt, z, ctx, slots, r.cap > 0);
-        if (mtp) |md| r.mtp = try loadMtp(d, md, z, ctx, slots, r.cap > 0);
+        r.model = try load(d, &r.ckpt, z, slots);
+        if (mtp) |md| r.mtp = try loadMtp(d, md, z);
         if (gptq) {
             // the converted host copies are on the device now; the conversion threads freed them into their own malloc
             // arenas, which keep the pages until a trim gives them back
@@ -535,13 +551,47 @@ pub const Runner = struct {
         r.mt_host = try alloc.alloc(u64, z.s.layers * WINDOW * 8);
         r.rope_host = try alloc.alloc([3]i32, CHUNK);
         q.prof.on = std.c.getenv("XPU_PROFILE") != null; // not during the load
-        r.acts = try Acts.init(d, z, ctx);
+        r.acts = try Acts.init(d, z);
         for (0..slots) |i| {
             try r.use(@intCast(i));
             try r.reset();
         }
         try r.use(0);
         return r;
+    }
+
+    /// Bytes of one K (or V) page of one layer: `PAGE` positions times the heads' rows and their scales.
+    pub fn pageBytes(r: *const Runner) usize {
+        if (r.cap > 0) return PAGE * r.z.s.kv_heads * (256 + 4);
+        return PAGE * r.z.s.kv_heads * 256 * 2;
+    }
+
+    /// The K/V pool: `pages` pages in each attention layer and the MTP layer (K pages, then V pages, one allocation
+    /// a layer, zeroed so the card holds them now), and each slot's page table, mapping nothing.
+    pub fn allocPool(r: *Runner, pages: u32) !void {
+        r.pool = pages;
+        r.page_bytes = r.pageBytes();
+        const half = @as(usize, pages) * r.page_bytes;
+        for (r.model.layers) |*l| {
+            if (!l.attn) continue;
+            const base = try r.d.alloc_(2 * half);
+            try zeroed(&r.d, base, 2 * half);
+            l.kc = base;
+            l.vc = off(base, half);
+        }
+        if (r.mtp != null) {
+            const l = &r.mtp.?.layer;
+            const base = try r.d.alloc_(2 * half);
+            try zeroed(&r.d, base, 2 * half);
+            l.kc = base;
+            l.vc = off(base, half);
+        }
+        const entries = (r.ctx + PAGE - 1) / PAGE;
+        for (0..r.slots) |i| {
+            r.pt[i] = try r.d.alloc_(@as(usize, entries) * 4);
+            r.held[i] = 0;
+        }
+        try r.d.sync();
     }
 
     /// Device bytes one position of one slot takes in K/V: every attention layer, and the MTP layer when loaded.
@@ -581,24 +631,44 @@ pub const Runner = struct {
         r.enter(slot);
     }
 
+    /// Page ids `ids` into `slot`'s table from entry `from` (its positions from * PAGE on); it then maps from + ids.len.
+    pub fn mapPages(r: *Runner, slot: u32, from: u32, ids: []const u32) !void {
+        if (slot >= r.slots or r.pt[slot] == null or from > r.held[slot]) return error.BadSlot;
+        if (from + @as(u32, @intCast(ids.len)) > (r.ctx + PAGE - 1) / PAGE) return error.ContextFull;
+        try r.d.copyIn(off(r.pt[slot].?, @as(usize, from) * 4), std.mem.sliceAsBytes(ids));
+        r.held[slot] = from + @as(u32, @intCast(ids.len));
+    }
+
+    /// Positions `slot` may hold: what its pages cover, at most ctx (ctx when it has no page table).
+    pub fn room(r: *const Runner, slot: u32) u32 {
+        if (r.pt[slot] == null) return r.ctx;
+        return @min(r.ctx, r.held[slot] * PAGE);
+    }
+
+    /// A pool that gives each slot its own run of ceil(ctx / PAGE) pages: a slot holds ctx positions, as before the
+    /// pool.
+    pub fn poolFixed(r: *Runner) !void {
+        const e = (r.ctx + PAGE - 1) / PAGE;
+        try r.allocPool(r.slots * e);
+        const ids = try alloc.alloc(u32, e);
+        defer alloc.free(ids);
+        for (0..r.slots) |i| {
+            for (ids, 0..) |*p, j| p.* = @intCast(i * e + j);
+            try r.mapPages(@intCast(i), 0, ids);
+        }
+    }
+
     /// The layers' current fields, pos and last from `slot`'s state, with nothing stored first.
     fn enter(r: *Runner, slot: u32) void {
         for (r.model.layers) |*l| {
             const st = l.st[slot];
-            if (l.attn) {
-                l.kc = st.kc;
-                l.vc = st.vc;
-            } else {
+            if (!l.attn) {
                 l.rec = st.rec;
                 l.rec_save = st.rec_save;
                 l.stash = st.stash;
                 l.conv = st.conv;
                 l.conv_cur = st.conv_cur;
             }
-        }
-        if (r.mtp) |mt| {
-            mt.layer.kc = mt.layer.st[slot].kc;
-            mt.layer.vc = mt.layer.st[slot].vc;
         }
         r.cur = slot;
         r.pos = r.spos[slot];
@@ -663,7 +733,7 @@ pub const Runner = struct {
         var max_pos: u32 = 0;
         for (slots, wn, 0..) |slot, w, i| {
             if (w == 0 or T + w > WINDOW) return error.BadWindow;
-            if (r.spos[slot] + w > r.ctx) return error.ContextFull;
+            if (r.spos[slot] + w > r.room(slot)) return error.ContextFull;
             wf[i] = T;
             for (0..w) |j| pos[T + j] = @intCast(r.spos[slot] + j);
             max_pos = @max(max_pos, r.spos[slot] + w - 1);
@@ -677,8 +747,9 @@ pub const Runner = struct {
             e[7] = w;
             const st = l.st[slot];
             if (l.attn) {
-                e[0] = @intFromPtr(st.kc.?);
-                e[1] = @intFromPtr(st.vc.?);
+                e[0] = @intFromPtr(l.kc.?);
+                e[1] = @intFromPtr(l.vc.?);
+                e[2] = if (r.pt[slot]) |p| @intFromPtr(p) else 0; // the slot's page table
             } else {
                 e[2] = @intFromPtr(st.conv[st.conv_cur].?);
                 e[3] = @intFromPtr(st.conv[1 - st.conv_cur].?);
@@ -710,8 +781,8 @@ pub const Runner = struct {
             try d.launch(d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.in_norm, a.h, a.ahi, a.alo, D, EPS, @as(i32, if (i == 0) 0 else 1), gs, nul, nul, zero, zero });
             try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_in, a.p, T);
             if (l.attn) {
-                try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, zero, EPS, nul, mt, a.mpos, zero, r.cap, rope });
-                try d.launch(r.mk.attn_span, .{ .x = ns, .y = s.kv_heads * (s.q_heads / s.kv_heads / QPG), .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, zero, @as(i32, @intCast(ns)), sp, @as(f32, 1.0 / 16.0), mt, a.mpos, r.cap });
+                try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, zero, EPS, nul, mt, a.mpos, zero, r.cap, rope, nul });
+                try d.launch(r.mk.attn_span, .{ .x = ns, .y = s.kv_heads * (s.q_heads / s.kv_heads / QPG), .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, zero, @as(i32, @intCast(ns)), sp, @as(f32, 1.0 / 16.0), mt, a.mpos, r.cap, nul });
                 try d.launch(r.mk.merge_span, .{ .x = s.q_heads, .y = T }, .{ a.pm, a.pl, a.po, a.y, zero, @as(i32, @intCast(ns)), sp, a.mpos });
                 try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo, gs, zero, nul, nul, zero });
             } else {
@@ -826,22 +897,23 @@ pub const Runner = struct {
         const s = r.z.s;
         const T: u32 = @intCast(ids.len);
         if (T == 0 or T > CHUNK) return error.BadWindow;
-        if (p0 + T > r.ctx) return error.ContextFull;
+        if (p0 + T > r.room(r.cur)) return error.ContextFull;
         const nul: ?*anyopaque = null;
+        const pt = r.pt[r.cur]; // the slot's page table (null: the contiguous cache)
         const zero: i32 = 0;
         const p32: i32 = @intCast(p0);
         errdefer d.settle();
         try r.mtpFront(ids);
-        try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, p32, EPS, nul, nul, nul, zero, r.cap, nul });
+        try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, p32, EPS, nul, nul, nul, zero, r.cap, nul, pt });
         if (T <= WINDOW) {
             const sp = span(p0 + T);
             const ns: u32 = (p0 + T + sp - 1) / sp;
-            try d.launch(r.mk.attn_span, .{ .x = ns, .y = s.kv_heads * (s.q_heads / s.kv_heads / QPG), .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, p32, @as(i32, @intCast(ns)), @as(i32, @intCast(sp)), @as(f32, 1.0 / 16.0), nul, nul, r.cap });
+            try d.launch(r.mk.attn_span, .{ .x = ns, .y = s.kv_heads * (s.q_heads / s.kv_heads / QPG), .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, p32, @as(i32, @intCast(ns)), @as(i32, @intCast(sp)), @as(f32, 1.0 / 16.0), nul, nul, r.cap, pt });
             try d.launch(r.mk.merge_span, .{ .x = s.q_heads, .y = T }, .{ a.pm, a.pl, a.po, a.y, p32, @as(i32, @intCast(ns)), @as(i32, @intCast(sp)), nul });
         } else if (r.cap > 0)
-            try d.launch(d.k.attn_prompt8, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p32, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0), r.cap })
+            try d.launch(d.k.attn_prompt8, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p32, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0), r.cap, pt })
         else
-            try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p32, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0) });
+            try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p32, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0), pt });
         try r.mtpBack(T);
         const last = T - 1;
         const kg = s.hidden / m.head.gs;
@@ -911,7 +983,7 @@ pub const Runner = struct {
         const mt = r.mtp orelse return error.NoMtpHead;
         const s = r.z.s;
         if (k == 0 or k + 1 > WINDOW or out.len < k + 1) return error.BadDrafts;
-        const n: u32 = @min(k, r.ctx - r.pos - 1);
+        const n: u32 = @min(k, r.room(r.cur) -| r.pos -| 1);
         if (n == 0) {
             try r.step(r.last);
             out[0] = r.last;
@@ -961,8 +1033,8 @@ pub const Runner = struct {
         for (slots, 0..) |slot, i| {
             if (slot >= r.slots) return error.BadSlot;
             for (slots[0..i]) |o| if (o == slot) return error.SlotTwice;
-            if (r.spos[slot] + 1 > r.ctx) return error.ContextFull;
-            const nd = @min(kk, r.ctx - r.spos[slot] - 1);
+            if (r.spos[slot] + 1 > r.room(slot)) return error.ContextFull;
+            const nd = @min(kk, r.room(slot) - r.spos[slot] - 1);
             wf[i] = T;
             wn[i] = nd + 1;
             p0[i] = r.spos[slot];
@@ -1054,8 +1126,9 @@ pub const Runner = struct {
         for (slots, n) |slot, c| for (0..c) |_| { // the rows' MTP caches, in the first layer's part of the table
             const e = r.mt_host[t * 8 ..][0..8];
             e.* = @splat(0);
-            e[0] = @intFromPtr(l.st[slot].kc.?);
-            e[1] = @intFromPtr(l.st[slot].vc.?);
+            e[0] = @intFromPtr(l.kc.?);
+            e[1] = @intFromPtr(l.vc.?);
+            e[2] = if (r.pt[slot]) |p| @intFromPtr(p) else 0;
             e[6] = t;
             e[7] = 1;
             max_pos = @max(max_pos, @as(u32, @intCast(pos[t])));
@@ -1067,8 +1140,8 @@ pub const Runner = struct {
         try r.mtpFront(ids);
         const sp: i32 = @intCast(span(max_pos + 1));
         const ns: u32 = (max_pos + 1 + @as(u32, @intCast(sp)) - 1) / @as(u32, @intCast(sp));
-        try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, zero, EPS, nul, a.mt, a.mpos, zero, r.cap });
-        try d.launch(r.mk.attn_span, .{ .x = ns, .y = s.kv_heads * (s.q_heads / s.kv_heads / QPG), .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, zero, @as(i32, @intCast(ns)), sp, @as(f32, 1.0 / 16.0), a.mt, a.mpos, r.cap });
+        try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, zero, EPS, nul, a.mt, a.mpos, zero, r.cap, nul, nul });
+        try d.launch(r.mk.attn_span, .{ .x = ns, .y = s.kv_heads * (s.q_heads / s.kv_heads / QPG), .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, zero, @as(i32, @intCast(ns)), sp, @as(f32, 1.0 / 16.0), a.mt, a.mpos, r.cap, nul });
         try d.launch(r.mk.merge_span, .{ .x = s.q_heads, .y = T }, .{ a.pm, a.pl, a.po, a.y, zero, @as(i32, @intCast(ns)), sp, a.mpos });
         try r.mtpBack(T);
         for (slots, mlast) |slot, ml| try dev.copy(d, off(mt.state, slot * s.hidden * 2), off(a.h, ml * s.hidden * 2), s.hidden * 2);
@@ -1149,7 +1222,7 @@ pub const Runner = struct {
     /// One forward over at most WINDOW rows at r.pos; the last row's greedy token when `want`, else -1.
     fn forward(r: *Runner, ids: []const i32, want: bool, f: Feed) !i32 {
         if (ids.len == 0 or ids.len > WINDOW) return error.BadWindow;
-        if (r.pos + ids.len > r.ctx) return error.ContextFull;
+        if (r.pos + ids.len > r.room(r.cur)) return error.ContextFull;
         const d = &r.d;
         const a = &r.acts;
         const m = &r.model;
@@ -1161,6 +1234,7 @@ pub const Runner = struct {
         const D: i32 = @intCast(s.hidden);
         const gs: i32 = 64;
         const nul: ?*anyopaque = null;
+        const pt = r.pt[r.cur]; // the slot's page table (null: the contiguous cache)
         const zero: i32 = 0;
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.ids, ids.ptr, ids.len * 4, null, 0, null));
         errdefer d.settle();
@@ -1173,8 +1247,8 @@ pub const Runner = struct {
             if (l.attn) {
                 const sp = span(r.pos + T);
                 const ns: u32 = (r.pos + T + sp - 1) / sp;
-                try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, p0, EPS, nul, nul, nul, zero, r.cap, rope });
-                try d.launch(r.mk.attn_span, .{ .x = ns, .y = s.kv_heads * (s.q_heads / s.kv_heads / QPG), .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, p0, @as(i32, @intCast(ns)), @as(i32, @intCast(sp)), @as(f32, 1.0 / 16.0), nul, nul, r.cap });
+                try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, p0, EPS, nul, nul, nul, zero, r.cap, rope, pt });
+                try d.launch(r.mk.attn_span, .{ .x = ns, .y = s.kv_heads * (s.q_heads / s.kv_heads / QPG), .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, p0, @as(i32, @intCast(ns)), @as(i32, @intCast(sp)), @as(f32, 1.0 / 16.0), nul, nul, r.cap, pt });
                 try d.launch(r.mk.merge_span, .{ .x = s.q_heads, .y = T }, .{ a.pm, a.pl, a.po, a.y, p0, @as(i32, @intCast(ns)), @as(i32, @intCast(sp)), nul });
                 try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo, gs, zero, nul, nul, zero });
             } else {
@@ -1212,7 +1286,7 @@ pub const Runner = struct {
     /// rows, the GDN in windows of WINDOW rows.
     fn chunk(r: *Runner, ids: []const i32, want: bool, f: Feed) !i32 {
         if (ids.len <= WINDOW or ids.len > CHUNK) return error.BadWindow;
-        if (r.pos + ids.len > r.ctx) return error.ContextFull;
+        if (r.pos + ids.len > r.room(r.cur)) return error.ContextFull;
         const d = &r.d;
         const a = &r.acts;
         const m = &r.model;
@@ -1222,6 +1296,7 @@ pub const Runner = struct {
         const D: i32 = @intCast(s.hidden);
         const gs: i32 = 64;
         const nul: ?*anyopaque = null;
+        const pt = r.pt[r.cur]; // the slot's page table (null: the contiguous cache)
         const zero: i32 = 0;
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.ids, ids.ptr, ids.len * 4, null, 0, null));
         errdefer d.settle();
@@ -1233,11 +1308,11 @@ pub const Runner = struct {
             try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_in, a.p, T);
             if (l.attn) {
                 const p0: i32 = @intCast(r.pos);
-                try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, p0, EPS, nul, nul, nul, zero, r.cap, rope });
+                try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, p0, EPS, nul, nul, nul, zero, r.cap, rope, pt });
                 if (r.cap > 0)
-                    try d.launch(d.k.attn_prompt8, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p0, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0), r.cap })
+                    try d.launch(d.k.attn_prompt8, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p0, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0), r.cap, pt })
                 else
-                    try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p0, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0) });
+                    try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p0, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0), pt });
                 try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo, gs, zero, nul, nul, zero });
             }
             const pin = l.mixer_in.n;

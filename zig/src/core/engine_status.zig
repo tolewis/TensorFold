@@ -29,6 +29,16 @@ pub const Status = struct {
     fill_unknown: bool = false,
     /// Changes whenever the filling set does: a reader pairs its drain samples with one fill.
     fill_run: u64 = 0,
+    /// A shared K/V pool's pages (null: the engine has none), read from the backend's atomic counts.
+    kv_pool: ?KvPool = null,
 
     pub const PromptCache = struct { states: u64 = 0, bytes: u64 = 0 };
+    /// Pages in the pool, tokens a page holds, pages streams hold, pages promised and not yet held, and the rest.
+    pub const KvPool = struct { pages: u64 = 0, page_tokens: u32 = 0, used: u64 = 0, promised: u64 = 0, free: u64 = 0 };
+};
+
+/// A backend's K/V pool counts; read from HTTP threads, so it must not touch the GPU or take the engine's locks.
+pub const KvPoolSource = struct {
+    ctx: *anyopaque,
+    read: *const fn (*anyopaque) Status.KvPool,
 };
