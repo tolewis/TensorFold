@@ -14,6 +14,8 @@ pub const model_type = "qwen3_5_moe";
 
 /// Drawn tokens a handle can still name (a prompt's first draw, then one a stream a round).
 const ring = 64;
+/// The prompt cache keeps no state under this many tokens: a cut there splits a chunk, and the state saves little.
+const min_kept = 4096;
 
 pub const Slots = struct {
     gpa: Allocator,
@@ -40,6 +42,7 @@ pub const Slots = struct {
     pages_free: std.atomic.Value(u64) = .init(0),
     pages_used: std.atomic.Value(u64) = .init(0),
     pages_promised: std.atomic.Value(u64) = .init(0),
+    dropped: std.ArrayList(sage.snapshot.Snap) = .empty, // dropped prompt states, freed once the queue is idle
 
     fn of(ptr: *anyopaque) *Slots {
         return @ptrCast(@alignCast(ptr));
@@ -66,6 +69,17 @@ pub const Slots = struct {
             for (&b.leases) |*l| p.finish(l);
             p.deinit();
         }
+        b.freeDropped();
+        b.dropped.deinit(b.gpa);
+    }
+
+    /// Frees the dropped states: a copy queued into one may still run, so this waits for the queue (idle at a prefill's
+    /// start, after the last round read its tokens back).
+    fn freeDropped(b: *Slots) void {
+        if (b.dropped.items.len == 0) return;
+        b.r.d.settle();
+        for (b.dropped.items) |k| b.r.dropSnap(k);
+        b.dropped.clearRetainingCapacity();
     }
 
     pub fn backend(b: *Slots) be.Backend {
@@ -208,12 +222,14 @@ pub const Slots = struct {
         return @intCast(best orelse return error.NoAllowedToken);
     }
 
-    /// The prompt into a free slot in chunks (a cancel lands between them); its first token drawn at once.
+    /// The prompt into a free slot in chunks (a cancel lands between them); its first token drawn at once. A kept
+    /// state of the prompt's prefix (s.reuse) is restored first, and the pass goes on from its end.
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
         const b = of(ptr);
         const r = b.r;
         const ids = s.prompt();
         if (ids.len == 0 or ids.len + s.max_new + 1 > r.ctx) return error.PromptTooLong;
+        b.freeDropped();
         const slot = b.slotOf(s) orelse (b.freeSlot() orelse return error.NoFreeSlot);
         b.owners[slot] = s;
         errdefer b.owners[slot] = null;
@@ -229,12 +245,38 @@ pub const Slots = struct {
         const v: ?*Vision = if (s.images.len == 0) null else b.vision orelse return error.NoVision;
         const layout = if (v) |x| try x.encode(r, s) else vl.rope.Layout{};
         var at: usize = 0;
+        s.cached = 0;
+        if (ids.len < min_kept) {} else if (s.reuse.saved) |saved| { // a short prompt does no cache work
+            const k: *const sage.snapshot.Snap = @ptrCast(@alignCast(saved));
+            if (k.at < ids.len) {
+                if (r.restoreSlot(slot, k.*)) {
+                    at = k.at;
+                    s.cached = k.at;
+                } else |err| {
+                    s.reuse_failed = true;
+                    s.reuse_error = err;
+                    try r.use(slot);
+                    try r.reset();
+                }
+            } else s.reuse_failed = true;
+        }
         while (at < ids.len) {
             if (s.isCancelled()) return error.Cancelled;
-            const n = @min(sage.CHUNK, ids.len - at);
+            // chunks end at multiples of CHUNK from position 0, at the request's chunks and at the cache's marks: a
+            // pass resumed at a mark cuts its chunks where a pass from 0 does
+            var end = @min(ids.len, (at / sage.CHUNK + 1) * sage.CHUNK);
+            for (s.chunks) |cut| if (cut > at and cut < end) {
+                end = cut;
+            };
+            for (s.reuse.marks) |mark| if (mark >= min_kept and mark > at and mark < end) {
+                end = mark;
+            };
+            const n = end - at;
             for (b.ids[0..n], ids[at..][0..n]) |*d, t| d.* = @intCast(t);
-            if (v) |x| try r.promptFeed(b.ids[0..n], x.feed(r, &layout, @intCast(at), @intCast(n))) else try r.prompt(b.ids[0..n]);
+            const next: ?i32 = if (at + n < ids.len) @intCast(ids[at + n]) else null;
+            try r.promptPiece(b.ids[0..n], if (v) |x| x.feed(r, &layout, @intCast(at), @intCast(n)) else .{}, next);
             at += n;
+            if (at >= min_kept and std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) if (s.reuse.hook) |hk| hk.at(hk.ptr, s, @intCast(at));
         }
         r.shift[slot] = layout.shift;
         if (s.grammar != null) {
@@ -482,6 +524,39 @@ pub const Slots = struct {
         if (out.len != 1) return error.GrammarDraftsDeep; // the two-row path takes one draft
         out[0] = @intCast(@max(b.r.sdraft[slot], 0)); // none yet: any token, the draw decides
         b.held[slot] = 0;
+    }
+
+    /// The prompt cache's states: a slot's copy at a mark of its prompt pass, restored by the pass itself (prefillFn).
+    pub fn snapshots(b: *Slots) api.prompt_cache.Snapshots {
+        return .{ .ptr = b, .vtable = &.{ .bytes = snapBytes, .save = snapSave, .restore = snapRestore, .drop = snapDrop } };
+    }
+
+    fn snapBytes(ptr: *anyopaque, at: u32) u64 {
+        return of(ptr).r.snapBytes(at);
+    }
+
+    fn snapSave(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!api.prompt_cache.Saved {
+        const b = of(ptr);
+        const s: *lanes.Stream = @ptrCast(@alignCast(owner orelse return error.NoStream));
+        const slot = b.slotOf(s) orelse return error.UnknownStream;
+        const k = try b.gpa.create(sage.snapshot.Snap);
+        errdefer b.gpa.destroy(k);
+        k.* = try b.r.saveSlot(slot, at);
+        return k;
+    }
+
+    fn snapRestore(_: *anyopaque, _: ?*anyopaque, _: api.prompt_cache.Saved) anyerror!void {
+        return error.RestoredInPrefill;
+    }
+
+    fn snapDrop(ptr: *anyopaque, saved: api.prompt_cache.Saved) void {
+        const b = of(ptr);
+        const k: *sage.snapshot.Snap = @ptrCast(@alignCast(saved));
+        b.dropped.append(b.gpa, k.*) catch {
+            b.r.d.settle();
+            b.r.dropSnap(k.*);
+        };
+        b.gpa.destroy(k);
     }
 
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
@@ -765,10 +840,12 @@ const Served = struct {
     core: lanes.Engine,
     host: api.LaneHost,
     startup: []u8 = &.{},
+    cache: ?api.prompt_cache.Store = null, // kept prompt states (engine thread only); null: no budget
 
     fn close(ptr: *anyopaque) void {
         const h: *Served = @ptrCast(@alignCast(ptr));
         h.host.stop();
+        if (h.cache) |*store| store.deinit(); // the states' device memory, before the runner's
         h.core.deinit();
         h.cfg.deinit(h.gpa);
         const r = h.back.r;
@@ -810,8 +887,9 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         problem.* = try std.fmt.allocPrint(a, "XPU_SPEC: 1 to {d} MTP drafts a round, not {d}", .{ sage.WINDOW - 1, h.back.depth });
         return null;
     }
+    const budget = cacheBudget(r, o);
     const pages = poolPages(r, slots, context, o.kv_pool_tokens);
-    if (!(try fitsCard(a, r, slots, pages, problem) and try poolMade(a, r, pages, problem))) {
+    if (!(try fitsCard(a, r, slots, pages, budget, problem) and try poolMade(a, r, pages, problem))) {
         if (h.back.vision) |v| v.deinit(gpa);
         h.back.deinit();
         gpa.destroy(h);
@@ -833,6 +911,16 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     h.host.kv_pool = .{ .ctx = &h.back, .read = Slots.poolRead };
     if (h.back.vision) |v| h.host.info_.vision = v.offer(o.vision.?);
     if (r.mtp != null) h.host.lone = .{ .ctx = &h.back, .run = Slots.loneFn };
+    if (budget > 0) {
+        // kept and resumed only at multiples of 64 tokens (planned, grid): every cut a resumed pass adds splits a CHUNK
+        // into pieces of more than WINDOW rows, which the chunk kernels compute as the whole chunk does. The MTP's
+        // last row reads the token after a state (lookahead).
+        h.cache = api.prompt_cache.Store.init(gpa, h.back.snapshots(), .{ .lookahead = if (r.mtp != null) 1 else 0, .planned = true, .grid = 64 }, budget);
+        h.host.cache = &h.cache.?;
+        h.host.info_.prompt_cache = true;
+        std.log.info("sage-xpu: prompt cache of {d:.2} GiB", .{@as(f64, @floatFromInt(budget)) / (1 << 30)});
+    }
+    errdefer if (h.cache) |*store| store.deinit();
     try h.host.start();
     return .{ .engine = h.host.engine(), .close = Served.close, .ctx = h };
 }
@@ -844,9 +932,21 @@ const card_reserve: u64 = 64 << 20;
 /// 220000, the MTP head, --vision, int8 K/V). Taken above the 0.24 GB seen.
 const held_not_counted: u64 = 400_000_000;
 
-/// Whether the card holds the load and a K/V pool of `pages` pages. The pool is zeroed at load, so a pool the card
-/// cannot hold fails then, not under a request. Else `problem` names the pool, the most it holds, and the flag.
-fn fitsCard(a: Allocator, r: *sage.Runner, slots: u32, pages: u32, problem: *[]const u8) !bool {
+/// The prompt cache's budget: --prompt-cache-gib (0: no cache), else 2 GiB, or less when the card has less left past
+/// the load (a server started without the option keeps its slots).
+fn cacheBudget(r: *sage.Runner, o: api.Open) u64 {
+    if (o.prompt_cache_gib) |gib| return if (gib > 0) std.math.lossyCast(u64, gib * (1 << 30)) else 0;
+    const want: u64 = 2 << 30;
+    const mem = r.d.g.memory() catch return want;
+    const left = (mem.size -| card_reserve) -| (r.d.allocated + held_not_counted);
+    if (left < want) std.log.warn("XPU: the card has {d:.2} GB left past the load, so the prompt cache takes that, not 2 GiB (--prompt-cache-gib)", .{gb(left)});
+    return @min(want, left);
+}
+
+/// Whether the card holds the load, a K/V pool of `pages` pages and `cache` bytes of kept prompt states. The pool is
+/// zeroed at load, so a pool the card cannot hold fails then, not under a request. Else `problem` names the pool, the
+/// most it holds beside the cache, and the flags.
+fn fitsCard(a: Allocator, r: *sage.Runner, slots: u32, pages: u32, cache: u64, problem: *[]const u8) !bool {
     const mem = r.d.g.memory() catch |err| {
         std.log.warn("XPU: no Sysman memory size ({s}), so the load does not check that the card holds the K/V pool", .{@errorName(err)});
         return true;
@@ -855,10 +955,10 @@ fn fitsCard(a: Allocator, r: *sage.Runner, slots: u32, pages: u32, problem: *[]c
     const page: u64 = r.kvBytesPerToken() * sage.PAGE;
     const pool: u64 = @as(u64, pages) * page;
     const need: u64 = r.d.allocated + pool + held_not_counted;
-    std.log.info("XPU: the load holds {d:.2} GB of the card's {d:.2} GB ({d:.2} GB kept free), {d:.2} GB of it the K/V pool", .{ gb(need), gb(mem.size), gb(card_reserve), gb(pool) });
-    if (need <= room) return true;
-    const most = (room -| (r.d.allocated + held_not_counted)) / page * sage.PAGE;
-    problem.* = try std.fmt.allocPrint(a, "the XPU Sage engine needs {d:.2} GB for {d} stream(s){s} and a K/V pool of {d} tokens ({d:.2} GB), and the card has {d:.2} GB with {d:.2} GB kept free. The pool fits at most {d} tokens (--kv-pool-tokens); fewer --parallel slots leave more", .{ gb(need), slots, if (r.mtp != null) " with the MTP head" else "", @as(u64, pages) * sage.PAGE, gb(pool), gb(mem.size), gb(card_reserve), most });
+    std.log.info("XPU: the load holds {d:.2} GB of the card's {d:.2} GB ({d:.2} GB kept free), {d:.2} GB of it the K/V pool, and the prompt cache takes up to {d:.2} GB", .{ gb(need), gb(mem.size), gb(card_reserve), gb(pool), gb(cache) });
+    if (need + cache <= room) return true;
+    const most = (room -| (r.d.allocated + held_not_counted + cache)) / page * sage.PAGE;
+    problem.* = try std.fmt.allocPrint(a, "the XPU Sage engine needs {d:.2} GB for {d} stream(s){s} and a K/V pool of {d} tokens ({d:.2} GB), and {d:.2} GB for the prompt cache (--prompt-cache-gib {d:.2}), and the card has {d:.2} GB with {d:.2} GB kept free. Beside that cache the pool fits at most {d} tokens (--kv-pool-tokens); fewer --parallel slots leave more", .{ gb(need), slots, if (r.mtp != null) " with the MTP head" else "", @as(u64, pages) * sage.PAGE, gb(pool), gb(cache), @as(f64, @floatFromInt(cache)) / (1 << 30), gb(mem.size), gb(card_reserve), most });
     return false;
 }
 

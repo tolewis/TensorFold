@@ -10,6 +10,8 @@ const dev = @import("dev.zig");
 const loader = @import("load.zig");
 const fwd = @import("forward.zig");
 const q = @import("qwen27.zig"); // the profiler state (XPU_PROFILE) the Dev records into
+/// A slot's prompt state for the prompt cache (Runner.saveSlot, restoreSlot).
+pub const snapshot = @import("sage_snapshot.zig");
 const Dev = dev.Dev;
 const Checkpoint = dev.Checkpoint;
 const Proj = loader.Proj;
@@ -481,6 +483,7 @@ pub const Runner = struct {
     page_bytes: usize = 0, // one K (or V) page of one layer
     pt: [MAX_SLOTS]?*anyopaque = @splat(null), // each slot's page table: u32 [ceil(ctx / PAGE)] on the device
     held: [MAX_SLOTS]u32 = @splat(0), // pages each slot's table maps, from its position 0
+    pt_host: [MAX_SLOTS][]u32 = @splat(&.{}), // each slot's page table on the host: the prompt cache copies its pages
     pos: u32 = 0,
     last: i32 = -1, // the greedy token after the last fed row
     slots: u32 = 1,
@@ -589,6 +592,7 @@ pub const Runner = struct {
         const entries = (r.ctx + PAGE - 1) / PAGE;
         for (0..r.slots) |i| {
             r.pt[i] = try r.d.alloc_(@as(usize, entries) * 4);
+            r.pt_host[i] = try alloc.alloc(u32, entries);
             r.held[i] = 0;
         }
         try r.d.sync();
@@ -613,12 +617,18 @@ pub const Runner = struct {
         return n;
     }
 
+    pub const snapBytes = snapshot.bytes;
+    pub const saveSlot = snapshot.save;
+    pub const restoreSlot = snapshot.restore;
+    pub const dropSnap = snapshot.drop;
+
     pub fn deinit(r: *Runner) void {
         r.d.deinit();
         r.ckpt.deinit();
         alloc.free(r.model.layers);
         alloc.free(r.mt_host);
         alloc.free(r.rope_host);
+        for (r.pt_host) |t| alloc.free(t);
         alloc.destroy(r);
     }
 
@@ -636,6 +646,7 @@ pub const Runner = struct {
         if (slot >= r.slots or r.pt[slot] == null or from > r.held[slot]) return error.BadSlot;
         if (from + @as(u32, @intCast(ids.len)) > (r.ctx + PAGE - 1) / PAGE) return error.ContextFull;
         try r.d.copyIn(off(r.pt[slot].?, @as(usize, from) * 4), std.mem.sliceAsBytes(ids));
+        @memcpy(r.pt_host[slot][from..][0..ids.len], ids);
         r.held[slot] = from + @as(u32, @intCast(ids.len));
     }
 
@@ -852,13 +863,20 @@ pub const Runner = struct {
     /// One prompt piece of at most CHUNK rows with images: `f.rope` holds every row's M-RoPE positions and `f.rows`
     /// the tower rows that replace placeholder embeddings. `last` afterwards is the greedy token after the piece.
     pub fn promptFeed(r: *Runner, ids: []const i32, f: Feed) !void {
-        if (ids.len > CHUNK or (f.rope != null and f.rope.?.len != ids.len)) return error.BadWindow;
+        return r.promptPiece(ids, f, null);
+    }
+
+    /// promptFeed with `next`, the prompt token after the piece (null: the piece ends the prompt). The MTP reads each
+    /// row with the token after it, so the piece's last row reads `next`, not the greedy token: the MTP row before a
+    /// cut is the one a pass without the cut makes, and a kept state's last MTP row reads the token at its end.
+    pub fn promptPiece(r: *Runner, ids: []const i32, f: Feed, next: ?i32) !void {
+        if (ids.len == 0 or ids.len > CHUNK or (f.rope != null and f.rope.?.len != ids.len)) return error.BadWindow;
         const p0 = r.pos;
         r.last = if (ids.len > WINDOW) try r.chunk(ids, true, f) else try r.forward(ids, true, f);
-        if (r.mtp != null) { // as in prompt; a piece's last row reads the greedy token, the next piece's first id is not known here
+        if (r.mtp != null) {
             var follow: [CHUNK]i32 = undefined;
             @memcpy(follow[0 .. ids.len - 1], ids[1..]);
-            follow[ids.len - 1] = r.last;
+            follow[ids.len - 1] = next orelse r.last;
             try r.absorb(follow[0..ids.len], p0);
         }
     }
