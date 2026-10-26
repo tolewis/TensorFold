@@ -75,13 +75,17 @@ pub fn save(r: *Runner, slot: u32, at: u32) !Snap {
     if (at == 0 or r.pos != at or r.block_rows != 0 or (r.mtp != null and r.mpos[slot] != at)) return error.SlotNotThere;
     const n = bytes(r, at);
     const buf = try r.d.alloc_(n);
-    errdefer free(r, buf, n);
+    errdefer {
+        r.d.settle(); // copies may be queued into it
+        free(r, buf, n);
+    }
     var w: Walk = .{ .r = r, .buf = buf, .to_snap = true };
     try w.all(at);
     return .{ .at = at, .buf = buf, .bytes = n };
 }
 
-/// Makes `slot` stand where `snap` was taken: its prompt pass goes on from snap.at.
+/// Makes `slot` stand where `snap` was taken: its prompt pass goes on from snap.at. The copies are queued before the
+/// pass's kernels on the same in-order list, so no sync waits for them.
 pub fn restore(r: *Runner, slot: u32, snap: Snap) !void {
     if (snap.at == 0 or snap.at >= r.ctx or snap.bytes != bytes(r, snap.at)) return error.SnapshotLayout;
     try r.use(slot);
@@ -93,16 +97,14 @@ pub fn restore(r: *Runner, slot: u32, snap: Snap) !void {
     r.mpos[slot] = snap.at;
     r.sdraft[slot] = -1;
     r.block_rows = 0;
-    try r.d.sync();
 }
 
+/// Frees the snapshot's memory at once: the caller makes sure no queued copy still reads or writes it.
 pub fn drop(r: *Runner, snap: Snap) void {
     free(r, snap.buf, snap.bytes);
 }
 
-/// Frees `p` once the queue has drained (copies into or out of it may be queued); kept when it cannot be waited for.
 fn free(r: *Runner, p: *anyopaque, n: usize) void {
-    r.d.sync() catch return;
     r.d.g.free(p);
     r.d.allocated -|= @max(n, 64);
 }

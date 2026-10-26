@@ -30,6 +30,7 @@ pub const Slots = struct {
     vision: ?*Vision = null, // --vision
     depth: u32 = 1, // MTP drafts a lone round (XPU_SPEC; 1 keeps 80 % of drafts on chat text)
     held: [sage.MAX_SLOTS]u32 = @splat(0), // drafts a slot holds for its next window (specMulti makes them then)
+    dropped: std.ArrayList(sage.snapshot.Snap) = .empty, // dropped prompt states, freed once the queue is idle
 
     fn of(ptr: *anyopaque) *Slots {
         return @ptrCast(@alignCast(ptr));
@@ -51,6 +52,17 @@ pub const Slots = struct {
         for (b.first_rows) |x| if (x) |row| b.gpa.free(row);
         if (b.masked_vals) |x| b.gpa.free(x);
         if (b.masked_ids) |x| b.gpa.free(x);
+        b.freeDropped();
+        b.dropped.deinit(b.gpa);
+    }
+
+    /// Frees the dropped states: a copy queued into one may still run, so this waits for the queue (idle at a prefill's
+    /// start, after the last round read its tokens back).
+    fn freeDropped(b: *Slots) void {
+        if (b.dropped.items.len == 0) return;
+        b.r.d.settle();
+        for (b.dropped.items) |k| b.r.dropSnap(k);
+        b.dropped.clearRetainingCapacity();
     }
 
     pub fn backend(b: *Slots) be.Backend {
@@ -137,6 +149,7 @@ pub const Slots = struct {
         const r = b.r;
         const ids = s.prompt();
         if (ids.len == 0 or ids.len + s.max_new + 1 > r.ctx) return error.PromptTooLong;
+        b.freeDropped();
         const slot = b.slotOf(s) orelse (b.freeSlot() orelse return error.NoFreeSlot);
         b.owners[slot] = s;
         errdefer b.owners[slot] = null;
@@ -394,7 +407,10 @@ pub const Slots = struct {
     fn snapDrop(ptr: *anyopaque, saved: api.prompt_cache.Saved) void {
         const b = of(ptr);
         const k: *sage.snapshot.Snap = @ptrCast(@alignCast(saved));
-        b.r.dropSnap(k.*);
+        b.dropped.append(b.gpa, k.*) catch {
+            b.r.d.settle();
+            b.r.dropSnap(k.*);
+        };
         b.gpa.destroy(k);
     }
 
