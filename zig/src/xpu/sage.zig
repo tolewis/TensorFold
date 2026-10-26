@@ -718,7 +718,7 @@ pub const Runner = struct {
         var max_pos: u32 = 0;
         for (slots, wn, 0..) |slot, w, i| {
             if (w == 0 or T + w > WINDOW) return error.BadWindow;
-            if (r.spos[slot] + w > r.ctx) return error.ContextFull;
+            if (r.spos[slot] + w > r.room(slot)) return error.ContextFull;
             wf[i] = T;
             for (0..w) |j| pos[T + j] = @intCast(r.spos[slot] + j);
             max_pos = @max(max_pos, r.spos[slot] + w - 1);
@@ -867,7 +867,7 @@ pub const Runner = struct {
         const s = r.z.s;
         const T: u32 = @intCast(ids.len);
         if (T == 0 or T > CHUNK) return error.BadWindow;
-        if (p0 + T > r.ctx) return error.ContextFull;
+        if (p0 + T > r.room(r.cur)) return error.ContextFull;
         const nul: ?*anyopaque = null;
         const pt = r.pt[r.cur]; // the slot's page table (null: the contiguous cache)
         const zero: i32 = 0;
@@ -953,7 +953,7 @@ pub const Runner = struct {
         const mt = r.mtp orelse return error.NoMtpHead;
         const s = r.z.s;
         if (k == 0 or k + 1 > WINDOW or out.len < k + 1) return error.BadDrafts;
-        const n: u32 = @min(k, r.ctx - r.pos - 1);
+        const n: u32 = @min(k, r.room(r.cur) -| r.pos -| 1);
         if (n == 0) {
             try r.step(r.last);
             out[0] = r.last;
@@ -1002,8 +1002,8 @@ pub const Runner = struct {
         for (slots, 0..) |slot, i| {
             if (slot >= r.slots) return error.BadSlot;
             for (slots[0..i]) |o| if (o == slot) return error.SlotTwice;
-            if (r.spos[slot] + 1 > r.ctx) return error.ContextFull;
-            const nd = @min(kk, r.ctx - r.spos[slot] - 1);
+            if (r.spos[slot] + 1 > r.room(slot)) return error.ContextFull;
+            const nd = @min(kk, r.room(slot) - r.spos[slot] - 1);
             wf[i] = T;
             wn[i] = nd + 1;
             p0[i] = r.spos[slot];
@@ -1171,7 +1171,7 @@ pub const Runner = struct {
     /// One forward over at most WINDOW rows at r.pos; the last row's greedy token when `want`, else -1.
     fn forward(r: *Runner, ids: []const i32, want: bool, f: Feed) !i32 {
         if (ids.len == 0 or ids.len > WINDOW) return error.BadWindow;
-        if (r.pos + ids.len > r.ctx) return error.ContextFull;
+        if (r.pos + ids.len > r.room(r.cur)) return error.ContextFull;
         const d = &r.d;
         const a = &r.acts;
         const m = &r.model;
@@ -1235,7 +1235,7 @@ pub const Runner = struct {
     /// rows, the GDN in windows of WINDOW rows.
     fn chunk(r: *Runner, ids: []const i32, want: bool, f: Feed) !i32 {
         if (ids.len <= WINDOW or ids.len > CHUNK) return error.BadWindow;
-        if (r.pos + ids.len > r.ctx) return error.ContextFull;
+        if (r.pos + ids.len > r.room(r.cur)) return error.ContextFull;
         const d = &r.d;
         const a = &r.acts;
         const m = &r.model;
