@@ -54,7 +54,7 @@ static void store_kv8(global ushort *C, long row, int h, const float v[16], int 
 KERNEL(256) void attn_prep(global const half *P, global const ushort *QN, global const ushort *KN,
                            global const float *INVF, global ushort *Q, global ushort *KC, global ushort *VC, int p0,
                            float eps, global const int *TREE, global const ulong *MT, global const int *POS, int kv8,
-                           int cap, global const int *ROPE) {
+                           int cap, global const int *ROPE, global const uint *PT) {
   // cap > 0: int8 K/V cache (store_kv8)
 
   // ROPE (if non-null): row t's M-RoPE positions (t, h, w) at ROPE[3t] turn q and k; K and V go to the rows above.
@@ -66,6 +66,7 @@ KERNEL(256) void attn_prep(global const half *P, global const ushort *QN, global
   // TREE (if non-null): row t's position is p0 + its depth, K, V stay at p0 + t; with MT, POS[t] is its position
 
   // MT (if non-null): several streams, one row each: caches MT[8t], MT[8t + 1], position POS[t], where K, V go.
+  // PT (if non-null): the stream's page table, K and V go to row krow % Q27_PAGE of page PT[krow / Q27_PAGE]; with MT, MT[8t + 2] is the row's table.
   const int t = get_group_id(0), sg = get_sub_group_id(), lane = get_sub_group_local_id();
   const float pos = (float)(MT ? POS[t] : p0 + (TREE ? TREE[t * 17] & 255 : t));
   const int wf = MT ? (int)MT[t * 8 + 6] : 0;
@@ -74,6 +75,14 @@ KERNEL(256) void attn_prep(global const half *P, global const ushort *QN, global
     KC = (global ushort *)MT[t * 8];
     VC = (global ushort *)MT[t * 8 + 1];
   }
+  if (MT) PT = (global const uint *)MT[t * 8 + 2];
+  if (PT) {
+    const long o = (long)PT[krow / Q27_PAGE] * (cap ? Q27_PAGE8 : Q27_PAGE16);
+    KC = (global ushort *)((global char *)KC + o);
+    VC = (global ushort *)((global char *)VC + o);
+  }
+  const long row = PT ? krow % Q27_PAGE : krow;
+  const int rcap = PT && cap ? Q27_PAGE : cap;
   for (int hh = sg; hh < Q27_AH; hh += 16) {           // 27B: 0-23 : q, 24-27 : k, 28-31 : v
     if (hh >= Q27_AV0) {
       float vv[16];
@@ -81,9 +90,9 @@ KERNEL(256) void attn_prep(global const half *P, global const ushort *QN, global
       if (kv8 & 1) fwht256(vv);
       if (kv8 & 2) quant8_head(vv, (kv8 & 4) ? 7.0f : 127.0f);
       if (cap)
-        store_kv8(VC, krow, hh - Q27_AV0, vv, cap);
+        store_kv8(VC, row, hh - Q27_AV0, vv, rcap);
       else
-        for (int i = 0; i < 16; i++) VC[(krow * Q27_AKV + hh - Q27_AV0) * 256 + i * 16 + lane] = f2bf(vv[i]);
+        for (int i = 0; i < 16; i++) VC[(row * Q27_AKV + hh - Q27_AV0) * 256 + i * 16 + lane] = f2bf(vv[i]);
       continue;
     }
     const bool isq = hh < Q27_AQ;
@@ -107,10 +116,10 @@ KERNEL(256) void attn_prep(global const half *P, global const ushort *QN, global
     if (kv8 & 1) fwht256(v);
     if ((kv8 & 2) && !isq) quant8_head(v, (kv8 & 4) ? 7.0f : 127.0f);
     if (!isq && cap) {
-      store_kv8(KC, krow, hh - Q27_AQ, v, cap);
+      store_kv8(KC, row, hh - Q27_AQ, v, rcap);
       continue;
     }
-    global ushort *dst = isq ? Q + ((long)t * Q27_AQ + hh) * 256 : KC + (krow * Q27_AKV + hh - Q27_AQ) * 256;
+    global ushort *dst = isq ? Q + ((long)t * Q27_AQ + hh) * 256 : KC + (row * Q27_AKV + hh - Q27_AQ) * 256;
     for (int i = 0; i < 16; i++) dst[i * 16 + lane] = f2bf(v[i]);
   }
 }

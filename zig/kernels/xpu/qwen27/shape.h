@@ -76,3 +76,8 @@
 #ifndef Q27_KVROW
 #define Q27_KVROW 1024     // int8 cache bytes a position: Q27_AKV * 256
 #endif
+// K/V pages: a stream's positions through its page table, Q27_PAGE positions a page. A page is a cache of
+// Q27_PAGE positions: int8, the rows then their fp32 scales (Q27_PAGE8 bytes); bf16, the rows (Q27_PAGE16 bytes).
+#define Q27_PAGE 64
+#define Q27_PAGE8 (Q27_PAGE * (Q27_KVROW + Q27_AKV * 4))
+#define Q27_PAGE16 (Q27_PAGE * Q27_KVROW * 2)
