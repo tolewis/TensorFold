@@ -161,7 +161,7 @@ pub const Slots = struct {
         const layout = if (v) |x| try x.encode(r, s) else vl.rope.Layout{};
         var at: usize = 0;
         s.cached = 0;
-        if (s.reuse.saved) |saved| {
+        if (ids.len < min_kept) {} else if (s.reuse.saved) |saved| { // a short prompt does no cache work
             const k: *const sage.snapshot.Snap = @ptrCast(@alignCast(saved));
             if (k.at < ids.len) {
                 if (r.restoreSlot(slot, k.*)) {
