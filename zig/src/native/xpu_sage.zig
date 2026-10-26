@@ -6,6 +6,7 @@ const xq = @import("xpu_qwen27");
 const lane = @import("xpu_lane.zig");
 const sage = xq.sage;
 const vl = @import("core").qwen_vl;
+const kv = @import("core").kv_pool;
 const be = lanes.backend;
 const Allocator = std.mem.Allocator;
 
@@ -30,6 +31,12 @@ pub const Slots = struct {
     vision: ?*Vision = null, // --vision
     depth: u32 = 1, // MTP drafts a lone round (XPU_SPEC; 1 keeps 80 % of drafts on chat text)
     held: [sage.MAX_SLOTS]u32 = @splat(0), // drafts a slot holds for its next window (specMulti makes them then)
+    pool: ?kv.Pool = null, // the K/V pages all slots share (null: each slot keeps its own pages, Runner.poolFixed)
+    leases: [sage.MAX_SLOTS]kv.Lease = @splat(.{}), // each slot's pages from the pool
+    pages_total: std.atomic.Value(u64) = .init(0), // the pool's counts, for admission and /metrics (other threads)
+    pages_free: std.atomic.Value(u64) = .init(0),
+    pages_used: std.atomic.Value(u64) = .init(0),
+    pages_promised: std.atomic.Value(u64) = .init(0),
 
     fn of(ptr: *anyopaque) *Slots {
         return @ptrCast(@alignCast(ptr));
@@ -51,6 +58,10 @@ pub const Slots = struct {
         for (b.first_rows) |x| if (x) |row| b.gpa.free(row);
         if (b.masked_vals) |x| b.gpa.free(x);
         if (b.masked_ids) |x| b.gpa.free(x);
+        if (b.pool) |*p| {
+            for (&b.leases) |*l| p.finish(l);
+            p.deinit();
+        }
     }
 
     pub fn backend(b: *Slots) be.Backend {
@@ -80,6 +91,63 @@ pub const Slots = struct {
     fn freeSlot(b: *const Slots) ?u32 {
         for (b.owners[0..b.r.slots], 0..) |o, i| if (o == null) return @intCast(i);
         return null;
+    }
+
+    /// Pages a stream of `prompt` tokens and `max_new` more takes: its rows and one more verify window, at most ctx.
+    fn need(b: *const Slots, prompt: u64, max_new: u64) u64 {
+        return (@min(prompt + max_new + sage.WINDOW, b.r.ctx) + sage.PAGE - 1) / sage.PAGE;
+    }
+
+    /// The pool's counts where admission and /metrics read them.
+    fn publish(b: *Slots) void {
+        if (b.pool) |*p| {
+            b.pages_total.store(p.total(), .release);
+            b.pages_free.store(p.available(), .release);
+            b.pages_used.store(p.total() - p.nfree, .release);
+            b.pages_promised.store(p.promised, .release);
+        }
+    }
+
+    /// `slot`'s pages for a stream of `prompt` and `max_new` tokens: promised and mapped now, so the stream takes no
+    /// page while it runs. LaneMemory: they do not fit beside the running streams now (the request waits).
+    fn lease(b: *Slots, slot: u32, prompt: u64, max_new: u64) !void {
+        const p = if (b.pool) |*x| x else return;
+        b.unlease(slot);
+        const n = b.need(prompt, max_new);
+        if (n > p.total()) return error.KvPoolTooSmall;
+        try p.promise(&b.leases[slot], @intCast(n));
+        errdefer b.unlease(slot);
+        var map: Map = .{ .r = b.r, .slot = slot };
+        try p.cover(&b.leases[slot], @intCast(n), .{ .ctx = &map, .write = Map.write });
+        b.publish();
+    }
+
+    /// `slot`'s pages back to the pool; its table then maps none.
+    fn unlease(b: *Slots, slot: u32) void {
+        const p = if (b.pool) |*x| x else return;
+        p.finish(&b.leases[slot]);
+        b.r.mapPages(slot, 0, &.{}) catch {};
+        b.publish();
+    }
+
+    /// A lease's new page ids into its slot's table on the device (kv.Table).
+    const Map = struct {
+        r: *sage.Runner,
+        slot: u32,
+
+        fn write(ctx: *anyopaque, ids: []const u32, from: usize) anyerror!void {
+            const m: *Map = @ptrCast(@alignCast(ctx));
+            try m.r.mapPages(m.slot, @intCast(from), ids[from..]);
+        }
+    };
+
+    /// api.Admit: whether the pool can promise a request's pages now. A request no pool could hold goes through, so
+    /// its prompt pass refuses it at once (PromptTooLong, KvPoolTooSmall) instead of holding the queue.
+    fn fitsFn(ptr: *anyopaque, prompt: u32, max_tokens: u32) bool {
+        const b = of(ptr);
+        const n = b.need(prompt, max_tokens);
+        if (@as(u64, prompt) + max_tokens + 1 > b.r.ctx or n > b.pages_total.load(.acquire)) return true;
+        return n <= b.pages_free.load(.acquire);
     }
 
     /// The stream's next token: the runner's greedy one, else drawn on the host from logits row `row` (null: the
@@ -139,6 +207,13 @@ pub const Slots = struct {
         const slot = b.slotOf(s) orelse (b.freeSlot() orelse return error.NoFreeSlot);
         b.owners[slot] = s;
         errdefer b.owners[slot] = null;
+        try b.lease(slot, ids.len, s.max_new);
+        errdefer b.unlease(slot);
+        const room = r.room(slot);
+        if (ids.len + s.max_new + 1 > room) { // pages short of the request: the reply ends where they end
+            std.log.warn("XPU Sage: slot {d} holds {d} positions, short of a {d}-token prompt and {d} new tokens; the reply stops at {d} tokens", .{ slot, room, ids.len, s.max_new, room -| ids.len -| 1 });
+            s.max_new = @intCast(room -| ids.len -| 1);
+        }
         try r.use(slot);
         try r.reset();
         const v: ?*Vision = if (s.images.len == 0) null else b.vision orelse return error.NoVision;
@@ -305,6 +380,7 @@ pub const Slots = struct {
         var handed = false;
         defer if (!handed) {
             b.owners[slot] = null;
+            b.unlease(slot);
         };
         var pending = b.drawn[(b.next - 1) % ring];
         _ = try s.commit(b.gpa, &.{pending}, &.{});
@@ -346,6 +422,7 @@ pub const Slots = struct {
         const slot = b.slotOf(s) orelse return;
         b.owners[slot] = null;
         b.held[slot] = 0;
+        b.unlease(slot);
     }
 };
 
