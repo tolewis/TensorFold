@@ -73,14 +73,14 @@ pub const Layer = struct {
     // attention
     qn: ?*anyopaque = null,
     kn: ?*anyopaque = null,
-    kc: ?*anyopaque = null, // bf16 [ctx, AKV, 256]
-    vc: ?*anyopaque = null,
+    kc: ?*anyopaque = null, // the pool: K pages then V pages, [pool, PAGE, AKV, 256] (Runner.allocPool)
+    vc: ?*anyopaque = null, // the V pages of the same allocation
     // every slot's: the fields above are the current slot's (Runner.use)
     st: [MAX_SLOTS]SlotState = undefined,
 };
 
 /// One slot's state in one layer.
-pub const SlotState = struct { kc: ?*anyopaque = null, vc: ?*anyopaque = null, rec: ?*anyopaque = null, rec_save: ?*anyopaque = null, stash: ?*anyopaque = null, conv: [2]?*anyopaque = .{ null, null }, conv_cur: u1 = 0 };
+pub const SlotState = struct { rec: ?*anyopaque = null, rec_save: ?*anyopaque = null, stash: ?*anyopaque = null, conv: [2]?*anyopaque = .{ null, null }, conv_cur: u1 = 0 };
 
 /// Byte offsets in a GDN layer's stash of WINDOW rows: q at 0, then k, v, g, beta and the mixer input rows p.
 pub const StashAt = struct {
@@ -280,8 +280,7 @@ fn experts(d: *Dev, c: *const Checkpoint, p: []const u8, count: u32, shared: boo
 
 /// MLX affine 4/64 only in this form; the scales of the experts must be BF16 (sage_moe.cl reads bf16). Checked on the
 /// Sage MLX-4bit checkpoint by tools/xpu/sage_mlx_check.py: stacked switch_mlp experts, 8 bit router, conv1d [NCONV, 4, 1].
-/// kv8: an int8 K/V cache (256 int8 a position and head, then the fp32 scales after `ctx` positions), else bf16.
-pub fn load(d: *Dev, c: *const Checkpoint, z: Sizes, ctx: u32, slots: u32, kv8: bool) !Model {
+pub fn load(d: *Dev, c: *const Checkpoint, z: Sizes, slots: u32) !Model {
     const s = z.s;
     if (c.has("in_proj_qkv.qweight") or c.has("in_proj_qkv.trellis")) return error.OnlyMlxInThisForm;
     const stage = try d.alloc_(800 << 20);
@@ -309,7 +308,6 @@ pub fn load(d: *Dev, c: *const Checkpoint, z: Sizes, ctx: u32, slots: u32, kv8: 
     for (&invf, 0..) |*f, i| f.* = @floatCast(std.math.pow(f64, 1e7, -@as(f64, @floatFromInt(i)) / half_dims));
     m.invf = try d.upload(std.mem.sliceAsBytes(invf[0 .. s.rope_dims / 2]));
     m.layers = try alloc.alloc(Layer, s.layers);
-    const kv_bytes = @as(usize, ctx) * s.kv_heads * @as(usize, if (kv8) 256 + 4 else 256 * 2);
     for (m.layers, 0..) |*l, i| {
         const p = name("model.layers.{d}.", .{i});
         const attn = (i + 1) % 4 == 0;
@@ -330,9 +328,7 @@ pub fn load(d: *Dev, c: *const Checkpoint, z: Sizes, ctx: u32, slots: u32, kv8: 
             if (l.mixer_in.n != z.att_in) return error.UnexpectedShape;
             l.qn = try loader.bf16Tensor(d, c, name("{s}self_attn.q_norm.weight", .{p}));
             l.kn = try loader.bf16Tensor(d, c, name("{s}self_attn.k_norm.weight", .{p}));
-            for (l.st[0..slots]) |*st| st.* = .{ .kc = try d.alloc_(kv_bytes), .vc = try d.alloc_(kv_bytes) };
-            l.kc = l.st[0].kc;
-            l.vc = l.st[0].vc;
+            l.st = @splat(.{}); // K/V: the pool (Runner.allocPool)
         } else {
             l.mixer_in = try loader.projection(d, c, name("{s}linear_attn.", .{p}), &.{ "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b" }, true, false, stage);
             l.mixer_out = try loader.projection(d, c, name("{s}linear_attn.", .{p}), &.{"out_proj"}, false, false, stage);
@@ -381,7 +377,7 @@ pub const Mtp = struct {
 
 /// The MTP head from the W4A16 AutoRound checkpoint in `dir` (the MLX export drops it): its projections and experts
 /// shown as MLX affine 4/64 with no requantization, fc quantized to 4/64 from bf16.
-pub fn loadMtp(d: *Dev, dir: []const u8, z: Sizes, ctx: u32, slots: u32, kv8: bool) !*Mtp {
+pub fn loadMtp(d: *Dev, dir: []const u8, z: Sizes) !*Mtp {
     const s = z.s;
     const shard = try mtpShard(dir);
     var c: Checkpoint = .{};
@@ -426,10 +422,7 @@ pub fn loadMtp(d: *Dev, dir: []const u8, z: Sizes, ctx: u32, slots: u32, kv8: bo
         .kn = try loader.bf16Tensor(d, &c, p ++ "self_attn.k_norm.weight"),
     };
     if (mt.layer.mixer_in.n != z.att_in) return error.UnexpectedShape;
-    const kv_bytes = @as(usize, ctx) * s.kv_heads * @as(usize, if (kv8) 256 + 4 else 256 * 2);
-    for (mt.layer.st[0..slots]) |*st| st.* = .{ .kc = try d.alloc_(kv_bytes), .vc = try d.alloc_(kv_bytes) };
-    mt.layer.kc = mt.layer.st[0].kc;
-    mt.layer.vc = mt.layer.st[0].vc;
+    mt.layer.st = @splat(.{}); // K/V: the pool (Runner.allocPool)
     mt.fc_e = try loader.projection(d, &c, "mtp.", &.{"fc_e"}, false, false, stage);
     mt.fc_h = try loader.projection(d, &c, "mtp.", &.{"fc_h"}, false, false, stage);
     mt.norm_e = try loader.bf16Tensor(d, &c, "mtp.pre_fc_norm_embedding.weight");
@@ -506,10 +499,14 @@ pub const Runner = struct {
 
     /// `slots` streams (1 to MAX_SLOTS) of `ctx` positions each.
     pub fn init(dir: []const u8, ctx: u32, slots: u32) !*Runner {
-        return initMtp(dir, ctx, slots, if (std.c.getenv("XPU_MTP")) |md| std.mem.span(md) else null);
+        const r = try initMtp(dir, ctx, slots, if (std.c.getenv("XPU_MTP")) |md| std.mem.span(md) else null);
+        errdefer r.deinit();
+        try r.poolFixed();
+        return r;
     }
 
-    /// As init, with the MTP drafter from `mtp` (an AutoRound checkpoint directory; null: none).
+    /// As init, with the MTP drafter from `mtp` (an AutoRound checkpoint directory; null: none). Each slot has its
+    /// own pages (poolFixed).
     pub fn initMtp(dir: []const u8, ctx: u32, slots: u32, mtp: ?[]const u8) !*Runner {
         if (slots == 0 or slots > MAX_SLOTS) return error.BadSlots;
         const z = Sizes.of(try readShape(dir));
@@ -531,8 +528,8 @@ pub const Runner = struct {
             inline for (@typeInfo(MoeKernels).@"struct".field_names, 0..) |n, i| q.prof.names[base + i] = .{ .k = @field(r.mk, n), .name = "moe_" ++ n };
         }
         if (std.c.getenv("XPU_KV_INT8") != null) r.cap = @intCast(ctx);
-        r.model = try load(d, &r.ckpt, z, ctx, slots, r.cap > 0);
-        if (mtp) |md| r.mtp = try loadMtp(d, md, z, ctx, slots, r.cap > 0);
+        r.model = try load(d, &r.ckpt, z, slots);
+        if (mtp) |md| r.mtp = try loadMtp(d, md, z);
         if (gptq) {
             // the converted host copies are on the device now; the conversion threads freed them into their own malloc
             // arenas, which keep the pages until a trim gives them back
@@ -636,24 +633,30 @@ pub const Runner = struct {
         return @min(r.ctx, r.held[slot] * PAGE);
     }
 
+    /// A pool that gives each slot its own run of ceil(ctx / PAGE) pages: a slot holds ctx positions, as before the
+    /// pool.
+    pub fn poolFixed(r: *Runner) !void {
+        const e = (r.ctx + PAGE - 1) / PAGE;
+        try r.allocPool(r.slots * e);
+        const ids = try alloc.alloc(u32, e);
+        defer alloc.free(ids);
+        for (0..r.slots) |i| {
+            for (ids, 0..) |*p, j| p.* = @intCast(i * e + j);
+            try r.mapPages(@intCast(i), 0, ids);
+        }
+    }
+
     /// The layers' current fields, pos and last from `slot`'s state, with nothing stored first.
     fn enter(r: *Runner, slot: u32) void {
         for (r.model.layers) |*l| {
             const st = l.st[slot];
-            if (l.attn) {
-                l.kc = st.kc;
-                l.vc = st.vc;
-            } else {
+            if (!l.attn) {
                 l.rec = st.rec;
                 l.rec_save = st.rec_save;
                 l.stash = st.stash;
                 l.conv = st.conv;
                 l.conv_cur = st.conv_cur;
             }
-        }
-        if (r.mtp) |mt| {
-            mt.layer.kc = mt.layer.st[slot].kc;
-            mt.layer.vc = mt.layer.st[slot].vc;
         }
         r.cur = slot;
         r.pos = r.spos[slot];
@@ -732,8 +735,8 @@ pub const Runner = struct {
             e[7] = w;
             const st = l.st[slot];
             if (l.attn) {
-                e[0] = @intFromPtr(st.kc.?);
-                e[1] = @intFromPtr(st.vc.?);
+                e[0] = @intFromPtr(l.kc.?);
+                e[1] = @intFromPtr(l.vc.?);
                 e[2] = if (r.pt[slot]) |p| @intFromPtr(p) else 0; // the slot's page table
             } else {
                 e[2] = @intFromPtr(st.conv[st.conv_cur].?);
@@ -1087,8 +1090,8 @@ pub const Runner = struct {
         for (slots, n) |slot, c| for (0..c) |_| { // the rows' MTP caches, in the first layer's part of the table
             const e = r.mt_host[t * 8 ..][0..8];
             e.* = @splat(0);
-            e[0] = @intFromPtr(l.st[slot].kc.?);
-            e[1] = @intFromPtr(l.st[slot].vc.?);
+            e[0] = @intFromPtr(l.kc.?);
+            e[1] = @intFromPtr(l.vc.?);
             e[2] = if (r.pt[slot]) |p| @intFromPtr(p) else 0;
             e[6] = t;
             e[7] = 1;

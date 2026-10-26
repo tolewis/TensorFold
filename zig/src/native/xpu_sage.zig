@@ -570,6 +570,11 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         problem.* = try std.fmt.allocPrint(a, "the XPU Sage engine could not load {s} with {d} streams of {d} tokens: {s}", .{ o.dir, slots, context, @errorName(err) });
         return null;
     };
+    r.poolFixed() catch |err| {
+        problem.* = try std.fmt.allocPrint(a, "the XPU Sage engine could not hold the K/V of {d} streams of {d} tokens: {s}", .{ slots, context, @errorName(err) });
+        r.deinit();
+        return null;
+    };
     errdefer r.deinit();
     const h = try gpa.create(Served);
     errdefer gpa.destroy(h);
