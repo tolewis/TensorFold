@@ -232,10 +232,11 @@ KERNEL(16) void exl3_gemv(global const ushort *TR, global const half *X, global 
 // half of a group's 128-key block: GQA 6 (the 27B) or 8 (Sage-A1.5) for attn_prompt and attn_prompt8.
 #if Q27_GQA == 6 || Q27_GQA == 8
 // Prompt attention (FlashAttention-2 on bf16 DPAS), causal, 256-wide heads; fixed key order, so a row's bits ignore T.
+// PT (if non-null): the stream's page table; a page is a bf16 cache of Q27_PAGE positions (Q27_PAGE16 bytes).
 #pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable
 __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(128, 1, 1)))
 kernel void attn_prompt(global const ushort *Q, global const ushort *KC, global const ushort *VC, global ushort *O,
-                        int p0, int T, float scale) {
+                        int p0, int T, float scale, global const uint *PT) {
   local ushort P[Q27_GQA * 8 * 128];                         // A tiles: (tile of 8 queries, 16 keys), r × 16 + lane
   local float MX[Q27_GQA / 2][2][16], SM[Q27_GQA / 2][2][16], A[Q27_GQA * 8];
   const int t0 = get_group_id(0) * 8, hk = get_group_id(1), sg = get_sub_group_id(), lane = get_sub_group_local_id();
@@ -253,15 +254,23 @@ kernel void attn_prompt(global const ushort *Q, global const ushort *KC, global 
   for (int k0 = 0; k0 < nkeys; k0 += 128) {
     if (qk) {
       const int kb = k0 + kh * 64;                   // the 64 keys of this subgroup
+      const bool kin = !PT || kb < nkeys;            // a page past the keys: its keys are all masked
+      global const ushort *kpage = KC;               // the K reads' surface: the cache, or the page of keys kb..
+      int krows = nkeys, ky = kb;
+      if (PT && kin) {
+        kpage = (global const ushort *)((global const char *)KC + (long)PT[kb / Q27_PAGE] * Q27_PAGE16);
+        krows = min(Q27_PAGE, nkeys - kb);
+        ky = 0;
+      }
       float8 s[8];
       for (int b = 0; b < 8; b++) s[b] = 0.0f;
-      for (int ds = 0; ds < 16; ds++) {
+      for (int ds = 0; kin && ds < 16; ds++) {
         const int8 qb = qok ? as_int8(vload8(0, qrow + ds * 8)) : (int8)(0);
         __attribute__((opencl_unroll_hint))
         for (int h2 = 0; h2 < 2; h2++) {
           ushort ka[32];                               // 32 keys × 16 dimensions: 4 A tiles of 8 keys
-          intel_sub_group_2d_block_read_16b_32r16x1c((global void *)(KC + hk * 256), 256 * 2, nkeys, Q27_AKV * 256 * 2,
-                                                     (int2)(ds * 16, kb + h2 * 32), ka);
+          intel_sub_group_2d_block_read_16b_32r16x1c((global void *)(kpage + hk * 256), 256 * 2, krows, Q27_AKV * 256 * 2,
+                                                     (int2)(ds * 16, ky + h2 * 32), ka);
           __attribute__((opencl_unroll_hint))
           for (int b = 0; b < 4; b++) {
             short8 a;
@@ -313,14 +322,23 @@ kernel void attn_prompt(global const ushort *Q, global const ushort *KC, global 
       }
     for (int c = 0; c < 8; c++) {
       if (k0 + c * 16 >= nkeys) break;
+      const int y0 = k0 + c * 16;
+      global const ushort *vpage = VC;               // the V reads' surface: the cache, or the page of keys y0..
+      int vrows = nkeys, vy = y0;
+      if (PT) {
+        const int pg = y0 / Q27_PAGE;
+        vpage = (global const ushort *)((global const char *)VC + (long)PT[pg] * Q27_PAGE16);
+        vrows = min(Q27_PAGE, nkeys - pg * Q27_PAGE);
+        vy = y0 % Q27_PAGE;
+      }
       short8 pa[Q27_GQA];
       __attribute__((opencl_unroll_hint))
       for (int i = 0; i < Q27_GQA; i++) pa[i] = as_short8(intel_sub_group_block_read_us8(P + (i * 8 + c) * 128));
       __attribute__((opencl_unroll_hint))
       for (int dt = 0; dt < 2; dt++) {
         uint8 vw;
-        intel_sub_group_2d_block_read_transform_16b_16r16x1c((global void *)(VC + hk * 256), 256 * 2, nkeys,
-                                                             Q27_AKV * 256 * 2, (int2)((sg * 2 + dt) * 16, k0 + c * 16),
+        intel_sub_group_2d_block_read_transform_16b_16r16x1c((global void *)(vpage + hk * 256), 256 * 2, vrows,
+                                                             Q27_AKV * 256 * 2, (int2)((sg * 2 + dt) * 16, vy),
                                                              (private uint *)&vw);
         __attribute__((opencl_unroll_hint))
         for (int i = 0; i < Q27_GQA; i++) o[i][dt] = intel_sub_group_bf16_bf16_matrix_mad_k16(pa[i], as_int8(vw), o[i][dt]);

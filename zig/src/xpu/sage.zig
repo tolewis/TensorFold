@@ -814,7 +814,7 @@ pub const Runner = struct {
         } else if (r.cap > 0)
             try d.launch(d.k.attn_prompt8, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p32, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0), r.cap, nul })
         else
-            try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p32, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0) });
+            try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p32, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0), nul });
         try r.mtpBack(T);
         const last = T - 1;
         const kg = s.hidden / m.head.gs;
@@ -1189,7 +1189,7 @@ pub const Runner = struct {
                 if (r.cap > 0)
                     try d.launch(d.k.attn_prompt8, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p0, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0), r.cap, nul })
                 else
-                    try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p0, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0) });
+                    try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p0, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0), nul });
                 try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo, gs, zero, nul, nul, zero });
             }
             const pin = l.mixer_in.n;
