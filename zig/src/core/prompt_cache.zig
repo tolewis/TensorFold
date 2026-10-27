@@ -37,6 +37,11 @@ pub const Snapshots = struct {
         trim: ?*const fn (ptr: *anyopaque, room: u64) void = null,
         /// Whether a save at `at` would take spare storage (no new storage).
         reuses: ?*const fn (ptr: *anyopaque, at: u32) bool = null,
+        /// Bytes the kept states hold together, for a family whose states share storage (one page under several
+        /// states, or under a state and a running stream, counts once). Null: the sum of their charges.
+        held: ?*const fn (ptr: *anyopaque) u64 = null,
+        /// The storage a save at `at` for `owner` adds to what the kept states hold now (with `held`; null: `bytes`).
+        adds: ?*const fn (ptr: *anyopaque, owner: ?*anyopaque, at: u32) u64 = null,
         /// Write `saved` as learned state `key`, in files of the family's own under `dir` (null: nothing kept on disk).
         write: ?*const fn (ptr: *anyopaque, saved: Saved, dir: [:0]const u8, key: u64) anyerror!void = null,
         /// Learned state `key` of `at` tokens, read back from its files under `dir` into new storage.
@@ -199,9 +204,14 @@ pub const Store = struct {
     pub const collectExpired = lifetime.collect;
     pub const release = lifetime.release;
 
+    /// Bytes the kept states hold: the family's count when they share storage, else the sum of their charges.
+    pub fn holding(s: *const Store) u64 {
+        return if (s.family.vtable.held) |f| f(s.family.ptr) else s.held;
+    }
+
     /// What the budget leaves past the kept states and the spare storage: a family readies storage only inside it.
     pub fn room(s: *const Store) u64 {
-        return s.budget -| s.held -| s.spare();
+        return s.budget -| s.holding() -| s.spare();
     }
 
     /// Kept states free their storage, least valuable first and never `restoring`, until `left.fits()` (false: never).
@@ -321,15 +331,18 @@ pub const Store = struct {
     fn reserve(s: *Store, prompt: []const u32, born: u32, from: ?*Entry, marks_: []const u32, spans: []const modes.Span) void {
         var need: u64 = 0;
         var new: usize = 0; // states it keeps that the store lacks: a slot each
+        var prev: u32 = if (from) |e| e.at else 0; // a sharing family's new state holds the storage before it already
         for (marks_) |at| {
             const n = @as(usize, at) + s.rules.lookahead;
             const exists = for (s.entries.items) |e| {
                 if (!e.expired and e.at == at and e.tokens.len == n and n <= prompt.len and std.mem.eql(u32, e.tokens, prompt[0..n]) and modes.equal(e.decode_spans, spans, at)) break true;
             } else false;
-            if (!exists) need += s.family.vtable.bytes(s.family.ptr, at);
+            const bytes = s.family.vtable.bytes(s.family.ptr, at);
+            if (!exists) need += if (s.family.vtable.held == null) bytes else bytes -| s.family.vtable.bytes(s.family.ptr, prev) + s.family.vtable.bytes(s.family.ptr, 0);
             new += @intFromBool(!exists);
+            prev = @max(prev, at);
         }
-        while (s.held + need > s.budget or s.entries.items.len + @min(new, s.most) > s.most) {
+        while (s.holding() + need > s.budget or s.entries.items.len + @min(new, s.most) > s.most) {
             const i = s.victimBut(from, prompt, born) orelse return;
             s.remove(i);
             s.counts.evicted += 1;
@@ -461,7 +474,8 @@ pub const Store = struct {
         while (s.entries.items.len > 0) { // room: spare storage this save can take, else new storage inside the budget
             if (s.family.vtable.reuses) |f| if (s.entries.items.len < s.most and f(s.family.ptr, at)) break;
             const free_ = s.spare();
-            if (s.held + free_ + bytes <= s.budget and s.entries.items.len < s.most) break;
+            const adds = if (s.family.vtable.adds) |f| f(s.family.ptr, owner, at) else bytes;
+            if (s.holding() + free_ + adds <= s.budget and s.entries.items.len < s.most) break;
             if (free_ > 0) {
                 if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held -| bytes); // spare that cannot take this state goes before any state
                 if (s.spare() < free_) continue;
@@ -508,7 +522,7 @@ pub const Store = struct {
         const m = im.best(prompt, starts, s.rules.planned, if (have) |x| x.at else 0) orelse return have;
         if (!modes.equal(&.{}, spans, m.at)) return have; // the request decodes rows the learned prompt pass prefilled
         const bytes = s.family.vtable.bytes(s.family.ptr, m.at);
-        while (bytes <= s.budget and (s.held + s.spare() + bytes > s.budget or s.entries.items.len >= s.most)) {
+        while (bytes <= s.budget and (s.holding() + s.spare() + bytes > s.budget or s.entries.items.len >= s.most)) {
             s.remove(s.victimBut(have, prompt, born) orelse return have);
             s.counts.evicted += 1;
         }
@@ -542,7 +556,7 @@ pub const Store = struct {
     /// One log line after a prompt pass: where it resumed, how many states it kept, and what the store holds.
     pub fn report(s: *const Store, prompt: usize, from: u32, kept: u64) void {
         if (@import("builtin").is_test) return;
-        std.log.info("prompt cache: {d} tokens, resumed at {d}, kept {d}; {d} states, {d} MiB and {d} MiB spare of {d} MiB (hits {d}, misses {d}, evicted {d}, refused {d}, failed {d})", .{ prompt, from, kept, s.entries.items.len, s.held >> 20, s.spare() >> 20, s.budget >> 20, s.counts.hits, s.counts.misses, s.counts.evicted, s.counts.refused, s.counts.failed });
+        std.log.info("prompt cache: {d} tokens, resumed at {d}, kept {d}; {d} states, {d} MiB and {d} MiB spare of {d} MiB (hits {d}, misses {d}, evicted {d}, refused {d}, failed {d})", .{ prompt, from, kept, s.entries.items.len, s.holding() >> 20, s.spare() >> 20, s.budget >> 20, s.counts.hits, s.counts.misses, s.counts.evicted, s.counts.refused, s.counts.failed });
     }
 
     fn fail(s: *Store, at: u32, err: anyerror) bool {
@@ -569,6 +583,7 @@ test {
     _ = @import("prompt_cache_interior_test.zig");
     _ = @import("prompt_cache_branch_test.zig");
     _ = @import("prompt_cache_give_test.zig");
+    _ = @import("prompt_cache_shared_test.zig");
     _ = @import("prompt_cache_lifetime_test.zig");
     _ = @import("learned_fault_test.zig");
     _ = modes;
