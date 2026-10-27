@@ -116,7 +116,7 @@ pub const flags = [_]Flag{
     .{ .name = "--snapshot-dir", .native = true, .native_values = &.{"none"} },
     .{ .name = "--max-snapshots", .native = true, .native_values = &.{"0"} },
     .{ .name = "--parallel", .native = true },
-    .{ .name = "--decode-share" },
+    .{ .name = "--decode-share", .native = true },
     .{ .name = "--prefill-pass" },
     .{ .name = "--pass-cache-gib" },
     .{ .name = "--mlx-cache-gib" },
@@ -185,6 +185,7 @@ pub const Args = struct {
     kv_pool_tokens: ?u32 = null, // the shared K/V pool's size in tokens (the XPU Sage engine; null: what the card leaves)
     prefill_chunk: ?u32 = null, // a prompt step's tokens, a decode round of the other streams after each (the XPU Sage engine)
     decode_priority: bool = true, // off: a prompt pass runs whole before the other streams decode again (the XPU Sage engine)
+    decode_share: ?f64 = null, // decode rounds after a prompt step, as a share of the step's time (the XPU Sage engine)
     learn: bool = false, // keep shared prompt states on disk (--learn-dir: where; it implies --learn)
     learn_dir: ?[]const u8 = null,
     learn_min_free_gib: f64 = 4,
@@ -328,6 +329,13 @@ fn gib(u: *Usage, a: Allocator, name: []const u8, v: []const u8) error{ Usage, O
     return g;
 }
 
+/// A share of a prompt step's time from 0 (one decode round a step) to 99 (the prompt takes 1 % of the card).
+fn decodeShare(u: *Usage, a: Allocator, name: []const u8, v: []const u8) error{ Usage, OutOfMemory }!f64 {
+    const x = try float(u, a, name, v);
+    if (!std.math.isFinite(x) or x < 0 or x > 99) return fail(u, a, "argument {s}: expected a share of the prompt step's time from 0 to 99: '{s}'", .{ name, v });
+    return x;
+}
+
 const Repeated = struct { alias: std.ArrayList([]const u8) = .empty, keys: std.ArrayList([]const u8) = .empty, hosts: std.ArrayList([]const u8) = .empty, origins: std.ArrayList([]const u8) = .empty };
 
 fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usage, repeated: *Repeated) error{ Usage, OutOfMemory }!void {
@@ -390,7 +398,7 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
         const p = try int(u, a, name, v);
         if (p < 0 or p > 65535) return fail(u, a, "argument --port: invalid port: '{s}'", .{v});
         out.port = @intCast(p);
-    } else if (is(name, "--name")) out.name = v else if (is(name, "--alias")) try repeated.alias.append(a, v) else if (is(name, "--api-key")) try repeated.keys.append(a, v) else if (is(name, "--api-key-file")) out.api_key_file = v else if (is(name, "--metrics-open")) out.metrics_open = true else if (is(name, "--dashboard")) out.dashboard = true else if (is(name, "--context")) out.context = try int(u, a, name, v) else if (is(name, "--speed-up")) out.speed_up = v else if (is(name, "--prompt-cache-gib")) out.prompt_cache_gib = try gib(u, a, name, v) else if (is(name, "--prompt-cache-over-cap")) out.prompt_cache_over_cap = true else if (is(name, "--kv-pool-tokens")) out.kv_pool_tokens = try tokens(u, a, name, v) else if (is(name, "--prefill-chunk")) out.prefill_chunk = try tokens(u, a, name, v) else if (is(name, "--decode-priority")) out.decode_priority = std.mem.eql(u8, v, "on") else if (is(name, "--learn")) out.learn = true else if (is(name, "--learn-dir")) {
+    } else if (is(name, "--name")) out.name = v else if (is(name, "--alias")) try repeated.alias.append(a, v) else if (is(name, "--api-key")) try repeated.keys.append(a, v) else if (is(name, "--api-key-file")) out.api_key_file = v else if (is(name, "--metrics-open")) out.metrics_open = true else if (is(name, "--dashboard")) out.dashboard = true else if (is(name, "--context")) out.context = try int(u, a, name, v) else if (is(name, "--speed-up")) out.speed_up = v else if (is(name, "--prompt-cache-gib")) out.prompt_cache_gib = try gib(u, a, name, v) else if (is(name, "--prompt-cache-over-cap")) out.prompt_cache_over_cap = true else if (is(name, "--kv-pool-tokens")) out.kv_pool_tokens = try tokens(u, a, name, v) else if (is(name, "--prefill-chunk")) out.prefill_chunk = try tokens(u, a, name, v) else if (is(name, "--decode-priority")) out.decode_priority = std.mem.eql(u8, v, "on") else if (is(name, "--decode-share")) out.decode_share = try decodeShare(u, a, name, v) else if (is(name, "--learn")) out.learn = true else if (is(name, "--learn-dir")) {
         out.learn = true;
         out.learn_dir = v;
     } else if (is(name, "--learn-min-free-gib")) {
@@ -541,6 +549,7 @@ pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args
         .kv_pool_tokens = args.kv_pool_tokens,
         .prefill_chunk = args.prefill_chunk,
         .decode_priority = args.decode_priority,
+        .decode_share = args.decode_share,
         .learn = if (args.learn) args.learn_dir orelse try api.prompt_imprint.defaultRoot(a) else null,
         .learn_gib = args.learn_gib,
         .learn_min_free_gib = args.learn_min_free_gib,

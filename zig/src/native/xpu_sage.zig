@@ -1064,11 +1064,16 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     h.core = lanes.Engine.init(gpa, &h.cfg, h.back.backend(), h.wall.clock());
     errdefer h.core.deinit();
     const pool_bytes = pool_tokens * r.kvBytesPerToken();
-    const step_text = if (h.back.step > 0) try std.fmt.allocPrint(a, "prompt steps of {d} tokens with a decode round between", .{h.back.step}) else "prompt passes whole";
+    // --decode-share: after a prompt step of t, the decoding streams take rounds for share x t (the host's Share)
+    const Share = @FieldType(api.LaneHost, "share");
+    const share: Share = if (o.decode_share) |x| .{ .p = 1 / (1 + x) } else .fromEnv();
+    const rounds_text = if (share.p >= 1) "a decode round" else try std.fmt.allocPrint(a, "decode rounds for {d:.2} of the step's time", .{(1 - share.p) / share.p});
+    const step_text = if (h.back.step > 0) try std.fmt.allocPrint(a, "prompt steps of {d} tokens, each followed by {s}", .{ h.back.step, rounds_text }) else "prompt passes whole";
     const cache_text = if (budget > 0) try std.fmt.allocPrint(a, "kept prompt states in up to {d:.2} GB of it ({d:.0} %)", .{ gb(budget), 100 * @as(f64, @floatFromInt(budget)) / @as(f64, @floatFromInt(pool_bytes)) }) else "no prompt cache";
     h.startup = try std.fmt.allocPrint(gpa, "Intel GPU engine: Sage (qwen3_5_moe), {d} stream(s) of at most {d} tokens, a K/V pool of {d} pages ({d} tokens, {d:.2} GB, {s}), {s}, {d:.2} GB of the card kept free, {s}, sampling on the host{s}", .{ slots, context, pages, pool_tokens, gb(pool_bytes), if (r.cap > 0) "int8" else "bf16", cache_text, gb(cardReserve()), step_text, if (r.mtp == null) "" else if (h.back.sampled_drafts) ", MTP drafts for greedy and sampled streams" else ", MTP drafts for greedy streams" });
     h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "sage-xpu", .lanes = slots, .context_window = context, .context_fitted = true, .startup = h.startup, .prefill_step = 0, .structures = true });
     h.host.explain = .{ .text = lane.explain };
+    h.host.share = share;
     h.host.info_.admit = .{ .ctx = &h.back, .fits = Slots.fitsFn }; // a request waits until the pool can promise its pages
     h.host.kv_pool = .{ .ctx = &h.back, .read = Slots.poolRead };
     if (h.back.vision) |v| h.host.info_.vision = v.offer(o.vision.?);

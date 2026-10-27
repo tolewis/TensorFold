@@ -184,6 +184,10 @@ test "parse and capabilities share the table" {
     try std.testing.expect(!(try parse(a, &.{ "m", "--decode-priority", "off" }, &u)).decode_priority);
     try std.testing.expect((try parse(a, &.{ "m", "--decode-priority", "on" }, &u)).decode_priority);
     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--decode-priority", "high" }, &u));
+    try std.testing.expectEqual(@as(?f64, 1), (try parse(a, &.{ "m", "--decode-share", "1" }, &u)).decode_share);
+    try std.testing.expectEqual(@as(?f64, 0), (try parse(a, &.{ "m", "--decode-share", "0" }, &u)).decode_share);
+    try std.testing.expectEqual(@as(?f64, null), (try parse(a, &.{"m"}, &u)).decode_share);
+    for ([_][]const u8{ "-0.5", "100", "nan", "inf", "x" }) |bad| try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--decode-share", bad }, &u));
     try std.testing.expect((try parse(a, &.{ "m", "--learn" }, &u)).learn);
     const dir = try parse(a, &.{ "m", "--learn-dir", "/x/y" }, &u);
     try std.testing.expect(dir.learn and std.mem.eql(u8, "/x/y", dir.learn_dir.?));
