@@ -16,6 +16,8 @@ pub const model_type = "qwen3_5_moe";
 const ring = 64;
 /// The prompt cache keeps no state under this many tokens: a cut there splits a chunk, and the state saves little.
 const min_kept = 4096;
+/// A prompt step's tokens without --prefill-chunk: a decode round of the other streams runs after each.
+const default_step: usize = sage.CHUNK;
 
 pub const Slots = struct {
     gpa: Allocator,
@@ -46,6 +48,11 @@ pub const Slots = struct {
     store: ?*api.prompt_cache.Store = null, // the prompt cache, whose kept states the pool evicts for a lease (reclaimFn)
     kept: u64 = 0, // pages one kept state or more holds
     gdn_pages: u32 = 0, // pool pages a kept state's GDN states take
+    step: usize = default_step, // a prompt step's tokens (--prefill-chunk); 0: the pass runs whole (--decode-priority off)
+    filled: [sage.MAX_SLOTS]Fill = @splat(.{}), // each slot's prompt pass between steps
+
+    /// A slot's prompt pass between steps: the tokens in, the images' layout, whether a pass is under way.
+    const Fill = struct { at: usize = 0, layout: vl.rope.Layout = .{}, on: bool = false };
 
     fn of(ptr: *anyopaque) *Slots {
         return @ptrCast(@alignCast(ptr));
@@ -75,8 +82,17 @@ pub const Slots = struct {
     }
 
     pub fn backend(b: *Slots) be.Backend {
-        return .{ .ptr = b, .vtable = &.{ .prefill = prefillFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .held = heldFn, .release = releaseFn } };
+        return .{ .ptr = b, .vtable = if (b.step > 0) &stepped else &whole };
     }
+
+    const whole: be.Backend.VTable = .{ .prefill = prefillFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .held = heldFn, .release = releaseFn };
+    /// The prompt pass a step at a time: the lane host gives the decoding streams a round between steps.
+    const stepped: be.Backend.VTable = blk: {
+        var v = whole;
+        v.prefill_step = prefillStepFn;
+        v.reports_fill = true;
+        break :blk v;
+    };
 
     /// With an MTP head: greedy windows of the pending row and `depth` held drafts, all in one specMulti forward.
     /// Without: one-row rounds, no drafts; the running streams' rows share one forward (stepMulti). The lane core shares a
@@ -264,6 +280,31 @@ pub const Slots = struct {
     /// from its end in fresh pages.
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
         const b = of(ptr);
+        const slot = try b.begin(s);
+        errdefer releaseFn(ptr, s);
+        _ = try b.pieces(s, slot, std.math.maxInt(usize));
+        try b.finishPass(s, slot);
+    }
+
+    /// One step of the prompt pass (--prefill-chunk tokens, to the next multiple of it from position 0), false while
+    /// steps remain; the lane host runs a decode round of the other streams between steps. The step ends where the
+    /// whole pass cuts a chunk, so the chunks are the whole pass's. A prompt with images runs whole in its first step:
+    /// the tower's rows wait in buffers the next image prompt overwrites.
+    fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
+        const b = of(ptr);
+        const held = b.slotOf(s);
+        const slot = if (held != null and b.filled[held.?].on) held.? else try b.begin(s);
+        errdefer releaseFn(ptr, s);
+        try b.r.use(slot); // a decode round between steps made another slot current
+        const at = b.filled[slot].at;
+        const limit = if (s.images.len > 0) std.math.maxInt(usize) else (at / b.step + 1) * b.step;
+        if (!try b.pieces(s, slot, limit)) return false;
+        try b.finishPass(s, slot);
+        return true;
+    }
+
+    /// A prompt pass's start: the slot taken, its pages leased, a kept prefix restored (Fill.at past it).
+    fn begin(b: *Slots, s: *lanes.Stream) !u32 {
         const r = b.r;
         const ids = s.prompt();
         if (ids.len == 0 or ids.len + s.max_new + 1 > r.ctx) return error.PromptTooLong;
@@ -303,11 +344,25 @@ pub const Slots = struct {
                 try r.reset();
             }
         }
-        while (at < ids.len) {
+        b.filled[slot] = .{ .at = at, .layout = layout, .on = true };
+        return slot;
+    }
+
+    /// The pass's chunks from Fill.at up to `limit` (or the prompt's end); true once the whole prompt is in.
+    fn pieces(b: *Slots, s: *lanes.Stream, slot: u32, limit: usize) !bool {
+        const r = b.r;
+        const ids = s.prompt();
+        const v: ?*Vision = if (s.images.len == 0) null else b.vision orelse return error.NoVision;
+        const fl = &b.filled[slot];
+        const layout = &fl.layout;
+        var at = fl.at;
+        defer fl.at = at;
+        const grid: usize = if (b.step > 0 and b.step < sage.CHUNK) b.step else sage.CHUNK;
+        while (at < ids.len and at < limit) {
             if (s.isCancelled()) return error.Cancelled;
-            // chunks end at multiples of CHUNK from position 0, at the request's chunks and at the cache's marks: a
-            // pass resumed at a mark cuts its chunks where a pass from 0 does
-            var end = @min(ids.len, (at / sage.CHUNK + 1) * sage.CHUNK);
+            // chunks end at multiples of CHUNK from position 0 (of a step under CHUNK), at the request's chunks and at
+            // the cache's marks: a pass resumed at a mark cuts its chunks where a pass from 0 does
+            var end = @min(ids.len, (at / grid + 1) * grid);
             for (s.chunks) |cut| if (cut > at and cut < end) {
                 end = cut;
             };
@@ -317,11 +372,20 @@ pub const Slots = struct {
             const n = end - at;
             for (b.ids[0..n], ids[at..][0..n]) |*d, t| d.* = @intCast(t);
             const next: ?i32 = if (at + n < ids.len) @intCast(ids[at + n]) else null;
-            try r.promptPiece(b.ids[0..n], if (v) |x| x.feed(r, &layout, @intCast(at), @intCast(n)) else .{}, next);
+            try r.promptPiece(b.ids[0..n], if (v) |x| x.feed(r, layout, @intCast(at), @intCast(n)) else .{}, next);
             at += n;
+            s.fill_at.store(@intCast(at), .monotonic);
             if (at >= min_kept and std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) if (s.reuse.hook) |hk| hk.at(hk.ptr, s, @intCast(at));
         }
-        r.shift[slot] = layout.shift;
+        return at >= ids.len;
+    }
+
+    /// After the pass: the first token drawn from the prompt's last row.
+    fn finishPass(b: *Slots, s: *lanes.Stream, slot: u32) !void {
+        const r = b.r;
+        const ids = s.prompt();
+        b.filled[slot].on = false;
+        r.shift[slot] = b.filled[slot].layout.shift;
         if (s.grammar != null) {
             const keep = b.first_rows[slot] orelse try b.gpa.alloc(f32, b.row.len);
             b.first_rows[slot] = keep;
@@ -648,6 +712,7 @@ pub const Slots = struct {
         const slot = b.slotOf(s) orelse return;
         b.owners[slot] = null;
         b.held[slot] = 0;
+        b.filled[slot].on = false;
         b.unlease(slot);
     }
 };
@@ -971,6 +1036,12 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         problem.* = try std.fmt.allocPrint(a, "XPU_SPEC: 1 to {d} MTP drafts a round, not {d}", .{ sage.WINDOW - 1, h.back.depth });
         return null;
     }
+    // --decode-priority off: each prompt pass runs whole, and the decoding streams wait for it
+    if (o.prefill_chunk) |n| if (n % sage.PAGE != 0) {
+        problem.* = try std.fmt.allocPrint(a, "--prefill-chunk: a multiple of {d} tokens (the prompt cache's grid), not {d}", .{ sage.PAGE, n });
+        return null;
+    };
+    h.back.step = if (o.decode_priority) o.prefill_chunk orelse default_step else 0;
     // the pool takes what the card leaves; kept prompt states hold pages of it, at most the cache's budget
     const cache_on = if (o.prompt_cache_gib) |gib| gib > 0 else true;
     const pages = poolPages(r, slots, context, o.kv_pool_tokens, cache_on);
@@ -993,8 +1064,9 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     h.core = lanes.Engine.init(gpa, &h.cfg, h.back.backend(), h.wall.clock());
     errdefer h.core.deinit();
     const pool_bytes = pool_tokens * r.kvBytesPerToken();
+    const step_text = if (h.back.step > 0) try std.fmt.allocPrint(a, "prompt steps of {d} tokens with a decode round between", .{h.back.step}) else "prompt passes whole";
     const cache_text = if (budget > 0) try std.fmt.allocPrint(a, "kept prompt states in up to {d:.2} GB of it ({d:.0} %)", .{ gb(budget), 100 * @as(f64, @floatFromInt(budget)) / @as(f64, @floatFromInt(pool_bytes)) }) else "no prompt cache";
-    h.startup = try std.fmt.allocPrint(gpa, "Intel GPU engine: Sage (qwen3_5_moe), {d} stream(s) of at most {d} tokens, a K/V pool of {d} pages ({d} tokens, {d:.2} GB, {s}), {s}, {d:.2} GB of the card kept free, sampling on the host{s}", .{ slots, context, pages, pool_tokens, gb(pool_bytes), if (r.cap > 0) "int8" else "bf16", cache_text, gb(cardReserve()), if (r.mtp == null) "" else if (h.back.sampled_drafts) ", MTP drafts for greedy and sampled streams" else ", MTP drafts for greedy streams" });
+    h.startup = try std.fmt.allocPrint(gpa, "Intel GPU engine: Sage (qwen3_5_moe), {d} stream(s) of at most {d} tokens, a K/V pool of {d} pages ({d} tokens, {d:.2} GB, {s}), {s}, {d:.2} GB of the card kept free, {s}, sampling on the host{s}", .{ slots, context, pages, pool_tokens, gb(pool_bytes), if (r.cap > 0) "int8" else "bf16", cache_text, gb(cardReserve()), step_text, if (r.mtp == null) "" else if (h.back.sampled_drafts) ", MTP drafts for greedy and sampled streams" else ", MTP drafts for greedy streams" });
     h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "sage-xpu", .lanes = slots, .context_window = context, .context_fitted = true, .startup = h.startup, .prefill_step = 0, .structures = true });
     h.host.explain = .{ .text = lane.explain };
     h.host.info_.admit = .{ .ctx = &h.back, .fits = Slots.fitsFn }; // a request waits until the pool can promise its pages

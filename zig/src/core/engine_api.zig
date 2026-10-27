@@ -284,6 +284,11 @@ pub const Open = struct {
     prompt_cache_over_cap: bool = false,
     /// --kv-pool-tokens: the shared K/V pool's size in tokens (the XPU Sage engine; null: what the card leaves).
     kv_pool_tokens: ?u32 = null,
+    /// --prefill-chunk: a prompt step's tokens; the lane host runs a decode round of the other streams after each step
+    /// (the XPU Sage engine; null: its default).
+    prefill_chunk: ?u32 = null,
+    /// --decode-priority off: a prompt pass runs whole, and the other streams decode again after it (the XPU Sage engine).
+    decode_priority: bool = true,
     /// --learn: where shared prompt states are kept on disk for later sessions and servers (null: off).
     learn: ?[]const u8 = null,
     /// --learn-min-free-gib: filesystem space kept free before any learned-state write.

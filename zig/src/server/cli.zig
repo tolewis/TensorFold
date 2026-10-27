@@ -109,6 +109,8 @@ pub const flags = [_]Flag{
     .{ .name = "--prompt-cache-gib", .native = true },
     .{ .name = "--prompt-cache-over-cap", .kind = .store_true, .native = true },
     .{ .name = "--kv-pool-tokens", .native = true },
+    .{ .name = "--prefill-chunk", .native = true },
+    .{ .name = "--decode-priority", .choices = &.{ "on", "off" }, .native = true },
     .{ .name = "--checkpoint-slots", .native = served("--checkpoint-slots") },
     .{ .name = "--spill-gib" },
     .{ .name = "--snapshot-dir", .native = true, .native_values = &.{"none"} },
@@ -181,6 +183,8 @@ pub const Args = struct {
     prompt_cache_gib: ?f64 = null, // kept prompt states' budget (0: none; null: what 70% of RAM leaves past the loaded server)
     prompt_cache_over_cap: bool = false, // a --prompt-cache-gib past that is kept, not refused
     kv_pool_tokens: ?u32 = null, // the shared K/V pool's size in tokens (the XPU Sage engine; null: what the card leaves)
+    prefill_chunk: ?u32 = null, // a prompt step's tokens, a decode round of the other streams after each (the XPU Sage engine)
+    decode_priority: bool = true, // off: a prompt pass runs whole before the other streams decode again (the XPU Sage engine)
     learn: bool = false, // keep shared prompt states on disk (--learn-dir: where; it implies --learn)
     learn_dir: ?[]const u8 = null,
     learn_min_free_gib: f64 = 4,
@@ -386,7 +390,7 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
         const p = try int(u, a, name, v);
         if (p < 0 or p > 65535) return fail(u, a, "argument --port: invalid port: '{s}'", .{v});
         out.port = @intCast(p);
-    } else if (is(name, "--name")) out.name = v else if (is(name, "--alias")) try repeated.alias.append(a, v) else if (is(name, "--api-key")) try repeated.keys.append(a, v) else if (is(name, "--api-key-file")) out.api_key_file = v else if (is(name, "--metrics-open")) out.metrics_open = true else if (is(name, "--dashboard")) out.dashboard = true else if (is(name, "--context")) out.context = try int(u, a, name, v) else if (is(name, "--speed-up")) out.speed_up = v else if (is(name, "--prompt-cache-gib")) out.prompt_cache_gib = try gib(u, a, name, v) else if (is(name, "--prompt-cache-over-cap")) out.prompt_cache_over_cap = true else if (is(name, "--kv-pool-tokens")) out.kv_pool_tokens = try tokens(u, a, name, v) else if (is(name, "--learn")) out.learn = true else if (is(name, "--learn-dir")) {
+    } else if (is(name, "--name")) out.name = v else if (is(name, "--alias")) try repeated.alias.append(a, v) else if (is(name, "--api-key")) try repeated.keys.append(a, v) else if (is(name, "--api-key-file")) out.api_key_file = v else if (is(name, "--metrics-open")) out.metrics_open = true else if (is(name, "--dashboard")) out.dashboard = true else if (is(name, "--context")) out.context = try int(u, a, name, v) else if (is(name, "--speed-up")) out.speed_up = v else if (is(name, "--prompt-cache-gib")) out.prompt_cache_gib = try gib(u, a, name, v) else if (is(name, "--prompt-cache-over-cap")) out.prompt_cache_over_cap = true else if (is(name, "--kv-pool-tokens")) out.kv_pool_tokens = try tokens(u, a, name, v) else if (is(name, "--prefill-chunk")) out.prefill_chunk = try tokens(u, a, name, v) else if (is(name, "--decode-priority")) out.decode_priority = std.mem.eql(u8, v, "on") else if (is(name, "--learn")) out.learn = true else if (is(name, "--learn-dir")) {
         out.learn = true;
         out.learn_dir = v;
     } else if (is(name, "--learn-min-free-gib")) {
@@ -535,6 +539,8 @@ pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args
         .prompt_cache_gib = args.prompt_cache_gib,
         .prompt_cache_over_cap = args.prompt_cache_over_cap,
         .kv_pool_tokens = args.kv_pool_tokens,
+        .prefill_chunk = args.prefill_chunk,
+        .decode_priority = args.decode_priority,
         .learn = if (args.learn) args.learn_dir orelse try api.prompt_imprint.defaultRoot(a) else null,
         .learn_gib = args.learn_gib,
         .learn_min_free_gib = args.learn_min_free_gib,
