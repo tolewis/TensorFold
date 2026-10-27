@@ -483,7 +483,7 @@ pub const Runner = struct {
     page_bytes: usize = 0, // one K (or V) page of one layer
     pt: [MAX_SLOTS]?*anyopaque = @splat(null), // each slot's page table: u32 [ceil(ctx / PAGE)] on the device
     held: [MAX_SLOTS]u32 = @splat(0), // pages each slot's table maps, from its position 0
-    pt_host: [MAX_SLOTS][]u32 = @splat(&.{}), // each slot's page table on the host: the prompt cache copies its pages
+    pt_host: [MAX_SLOTS][]u32 = @splat(&.{}), // each slot's page table on the host: the prompt cache keeps its pages
     pos: u32 = 0,
     last: i32 = -1, // the greedy token after the last fed row
     slots: u32 = 1,
@@ -620,7 +620,7 @@ pub const Runner = struct {
     pub const snapBytes = snapshot.bytes;
     pub const saveSlot = snapshot.save;
     pub const restoreSlot = snapshot.restore;
-    pub const dropSnap = snapshot.drop;
+    pub const snapFits = snapshot.fits;
 
     pub fn deinit(r: *Runner) void {
         r.d.deinit();

@@ -42,7 +42,10 @@ pub const Slots = struct {
     pages_free: std.atomic.Value(u64) = .init(0),
     pages_used: std.atomic.Value(u64) = .init(0),
     pages_promised: std.atomic.Value(u64) = .init(0),
-    dropped: std.ArrayList(sage.snapshot.Snap) = .empty, // dropped prompt states, freed once the queue is idle
+    pages_kept: std.atomic.Value(u64) = .init(0), // pages only kept states hold: evicting them frees these
+    store: ?*api.prompt_cache.Store = null, // the prompt cache, whose kept states the pool evicts for a lease (reclaimFn)
+    kept: u64 = 0, // pages one kept state or more holds
+    gdn_pages: u32 = 0, // pool pages a kept state's GDN states take
 
     fn of(ptr: *anyopaque) *Slots {
         return @ptrCast(@alignCast(ptr));
@@ -69,17 +72,6 @@ pub const Slots = struct {
             for (&b.leases) |*l| p.finish(l);
             p.deinit();
         }
-        b.freeDropped();
-        b.dropped.deinit(b.gpa);
-    }
-
-    /// Frees the dropped states: a copy queued into one may still run, so this waits for the queue (idle at a prefill's
-    /// start, after the last round read its tokens back).
-    fn freeDropped(b: *Slots) void {
-        if (b.dropped.items.len == 0) return;
-        b.r.d.settle();
-        for (b.dropped.items) |k| b.r.dropSnap(k);
-        b.dropped.clearRetainingCapacity();
     }
 
     pub fn backend(b: *Slots) be.Backend {
@@ -123,21 +115,64 @@ pub const Slots = struct {
             b.pages_free.store(p.available(), .release);
             b.pages_used.store(p.total() - p.nfree, .release);
             b.pages_promised.store(p.promised, .release);
+            var only_kept: u64 = 0;
+            for (p.refs, p.leased) |r, l| only_kept += @intFromBool(r > 0 and l == 0);
+            b.pages_kept.store(only_kept, .release);
         }
     }
 
-    /// `slot`'s pages for a stream of `prompt` and `max_new` tokens: promised and mapped now, so the stream takes no
-    /// page while it runs. LaneMemory: they do not fit beside the running streams now (the request waits).
-    fn lease(b: *Slots, slot: u32, prompt: u64, max_new: u64) !void {
+    /// `slot`'s pages for a stream of `prompt` and `max_new` tokens: a kept state's K/V pages `kept` first (the slot
+    /// holds them too and writes only past them), then fresh pages, promised and mapped now, so the stream takes no
+    /// page while it runs. The pool evicts kept states for the fresh ones if it must (reclaimFn). LaneMemory: they do
+    /// not fit beside the running streams now (the request waits).
+    fn lease(b: *Slots, slot: u32, prompt: u64, max_new: u64, kept: []const u32) !void {
         const p = if (b.pool) |*x| x else return;
         b.unlease(slot);
+        errdefer b.unlease(slot);
         const n = b.need(prompt, max_new);
         if (n > p.total()) return error.KvPoolTooSmall;
-        try p.promise(&b.leases[slot], @intCast(n));
-        errdefer b.unlease(slot);
+        if (kept.len >= n) return error.SnapshotLayout;
+        if (kept.len > 0) {
+            for (kept) |id| p.retain(id);
+            try p.adopt(&b.leases[slot], kept); // its failure releases them
+            try b.r.mapPages(slot, 0, kept);
+        }
+        try p.promise(&b.leases[slot], @intCast(n - kept.len));
         var map: Map = .{ .r = b.r, .slot = slot };
         try p.cover(&b.leases[slot], @intCast(n), .{ .ctx = &map, .write = Map.write });
         b.publish();
+    }
+
+    /// Pool.Reclaim: kept states go, least recently used first (a superseded one before them), until `want` pages are
+    /// free and not promised. A state a prompt pass is restoring is borrowed and stays. False: none is left to evict.
+    fn reclaimFn(ptr: *anyopaque, want: usize) bool {
+        const b = of(ptr);
+        const p = &b.pool.?;
+        const store = b.store orelse return false;
+        store.collectExpired();
+        while (p.available() < want) {
+            const i = store.victimBut(null, &.{}, 0) orelse {
+                std.log.warn("prompt cache: no kept state left to drop for pages: {d} free, {d} wanted", .{ p.available(), want });
+                return false;
+            };
+            const at = store.entries.items[i].at;
+            store.remove(i);
+            store.counts.evicted += 1;
+            std.log.info("prompt cache: dropped the kept state of {d} tokens for pages: {d} free, {d} wanted, {d} states left", .{ at, p.available(), want, store.entries.items.len });
+        }
+        return true;
+    }
+
+    /// One more kept state holds page `id`.
+    fn keepPage(b: *Slots, p: *kv.Pool, id: u32) void {
+        if (p.refs[id] == p.leased[id]) b.kept += 1;
+        p.retain(id);
+    }
+
+    /// One kept state fewer holds page `id`; the pool frees it with its last holder.
+    fn dropPage(b: *Slots, p: *kv.Pool, id: u32) void {
+        p.drop(id) catch std.debug.panic("XPU Sage: kept page {d} dropped with no kept holder", .{id});
+        if (p.refs[id] == p.leased[id]) b.kept -= 1;
     }
 
     /// `slot`'s pages back to the pool; its table then maps none.
@@ -159,13 +194,15 @@ pub const Slots = struct {
         }
     };
 
-    /// api.Admit: whether the pool can promise a request's pages now. A request no pool could hold goes through, so
-    /// its prompt pass refuses it at once (PromptTooLong, KvPoolTooSmall) instead of holding the queue.
+    /// api.Admit: whether the pool can promise a request's pages now, kept states evicted (the pages only they hold
+    /// count as free). It runs before the lookup, so a request that will resume a state counts all its pages: the count
+    /// may also hold a state a pass borrows, so a lease can still wait (LaneMemory requeues it). A request no pool could
+    /// hold goes through, so its prompt pass refuses it at once (PromptTooLong, KvPoolTooSmall).
     fn fitsFn(ptr: *anyopaque, prompt: u32, max_tokens: u32) bool {
         const b = of(ptr);
         const n = b.need(prompt, max_tokens);
         if (@as(u64, prompt) + max_tokens + 1 > b.r.ctx or n > b.pages_total.load(.acquire)) return true;
-        return n <= b.pages_free.load(.acquire);
+        return n <= b.pages_free.load(.acquire) + b.pages_kept.load(.acquire);
     }
 
     /// api.KvPoolSource: the pool's counts for /metrics, from the atomics alone.
@@ -223,17 +260,26 @@ pub const Slots = struct {
     }
 
     /// The prompt into a free slot in chunks (a cancel lands between them); its first token drawn at once. A kept
-    /// state of the prompt's prefix (s.reuse) is restored first, and the pass goes on from its end.
+    /// state of the prompt's prefix (s.reuse) is restored first: the slot's table maps its pages, and the pass goes on
+    /// from its end in fresh pages.
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
         const b = of(ptr);
         const r = b.r;
         const ids = s.prompt();
         if (ids.len == 0 or ids.len + s.max_new + 1 > r.ctx) return error.PromptTooLong;
-        b.freeDropped();
         const slot = b.slotOf(s) orelse (b.freeSlot() orelse return error.NoFreeSlot);
         b.owners[slot] = s;
         errdefer b.owners[slot] = null;
-        try b.lease(slot, ids.len, s.max_new);
+        s.cached = 0;
+        var kept: ?*const sage.snapshot.Snap = null;
+        if (ids.len < min_kept) {} else if (s.reuse.saved) |saved| { // a short prompt does no cache work
+            const k: *const sage.snapshot.Snap = @ptrCast(@alignCast(saved));
+            if (k.at < ids.len and r.snapFits(k.*)) kept = k else {
+                s.reuse_failed = true;
+                if (k.at < ids.len) s.reuse_error = error.SnapshotLayout;
+            }
+        }
+        try b.lease(slot, ids.len, s.max_new, if (kept) |k| k.ids[0 .. k.at / sage.PAGE] else &.{});
         errdefer b.unlease(slot);
         const room = r.room(slot);
         if (ids.len + s.max_new + 1 > room) { // pages short of the request: the reply ends where they end
@@ -245,20 +291,17 @@ pub const Slots = struct {
         const v: ?*Vision = if (s.images.len == 0) null else b.vision orelse return error.NoVision;
         const layout = if (v) |x| try x.encode(r, s) else vl.rope.Layout{};
         var at: usize = 0;
-        s.cached = 0;
-        if (ids.len < min_kept) {} else if (s.reuse.saved) |saved| { // a short prompt does no cache work
-            const k: *const sage.snapshot.Snap = @ptrCast(@alignCast(saved));
-            if (k.at < ids.len) {
-                if (r.restoreSlot(slot, k.*)) {
-                    at = k.at;
-                    s.cached = k.at;
-                } else |err| {
-                    s.reuse_failed = true;
-                    s.reuse_error = err;
-                    try r.use(slot);
-                    try r.reset();
-                }
-            } else s.reuse_failed = true;
+        if (kept) |k| {
+            if (r.restoreSlot(slot, k.*)) {
+                at = k.at;
+                s.cached = k.at;
+            } else |err| { // the pass from 0 writes from page 0: fresh pages, never the kept state's
+                s.reuse_failed = true;
+                s.reuse_error = err;
+                try b.lease(slot, ids.len, s.max_new, &.{});
+                try r.use(slot);
+                try r.reset();
+            }
         }
         while (at < ids.len) {
             if (s.isCancelled()) return error.Cancelled;
@@ -526,23 +569,62 @@ pub const Slots = struct {
         b.held[slot] = 0;
     }
 
-    /// The prompt cache's states: a slot's copy at a mark of its prompt pass, restored by the pass itself (prefillFn).
+    /// The prompt cache's states, in the pool: a slot's K/V pages through a mark of its prompt pass, held by reference,
+    /// and its GDN states copied into pool pages. The pass itself restores one (prefillFn). The budget counts the pages
+    /// the states hold together (snapHeld): a turn's state shares the pages of the turn before.
     pub fn snapshots(b: *Slots) api.prompt_cache.Snapshots {
-        return .{ .ptr = b, .vtable = &.{ .bytes = snapBytes, .save = snapSave, .restore = snapRestore, .drop = snapDrop } };
+        return .{ .ptr = b, .vtable = &.{ .bytes = snapBytes, .save = snapSave, .restore = snapRestore, .drop = snapDrop, .held = snapHeld, .adds = snapAdds } };
     }
 
     fn snapBytes(ptr: *anyopaque, at: u32) u64 {
         return of(ptr).r.snapBytes(at);
     }
 
+    fn snapHeld(ptr: *anyopaque) u64 {
+        const b = of(ptr);
+        return b.kept * sage.snapshot.poolPageBytes(b.r);
+    }
+
+    /// The pages a save at `at` would make kept: the slot's pages no state holds yet, and its GDN pages.
+    fn snapAdds(ptr: *anyopaque, owner: ?*anyopaque, at: u32) u64 {
+        const b = of(ptr);
+        const p = if (b.pool) |*x| x else return snapBytes(ptr, at);
+        const s: *lanes.Stream = @ptrCast(@alignCast(owner orelse return snapBytes(ptr, at)));
+        const slot = b.slotOf(s) orelse return snapBytes(ptr, at);
+        const ids = b.leases[slot].ids.items;
+        var n: u64 = b.gdn_pages;
+        for (ids[0..@min(ids.len, at / sage.PAGE)]) |id| n += @intFromBool(p.refs[id] == p.leased[id]);
+        return n * sage.snapshot.poolPageBytes(b.r);
+    }
+
+    /// Keeps the slot's state at `at`: its K/V pages gain the state as a holder, and its GDN states go into free pages.
+    /// Those come from free pages alone, without an eviction: the store is inside a keep, and its budget leaves them.
     fn snapSave(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!api.prompt_cache.Saved {
         const b = of(ptr);
+        const p = if (b.pool) |*x| x else return error.NoPool;
         const s: *lanes.Stream = @ptrCast(@alignCast(owner orelse return error.NoStream));
         const slot = b.slotOf(s) orelse return error.UnknownStream;
-        b.freeDropped(); // the states the store evicted for this one: their bytes go back before its copy takes any
+        const kv_n = at / sage.PAGE;
+        if (at % sage.PAGE != 0 or kv_n > b.leases[slot].ids.items.len) return error.SnapshotLayout;
         const k = try b.gpa.create(sage.snapshot.Snap);
         errdefer b.gpa.destroy(k);
-        k.* = try b.r.saveSlot(slot, at);
+        const ids = try b.gpa.alloc(u32, kv_n + b.gdn_pages);
+        errdefer b.gpa.free(ids);
+        var gdn: kv.Lease = .{};
+        errdefer p.finish(&gdn);
+        const reclaim = p.reclaim;
+        p.reclaim = null;
+        defer p.reclaim = reclaim;
+        try p.promise(&gdn, b.gdn_pages);
+        try p.cover(&gdn, b.gdn_pages, null);
+        @memcpy(ids[kv_n..], gdn.ids.items);
+        std.mem.sort(u32, ids[kv_n..], {}, std.sort.asc(u32)); // runs of ids: fewer copies
+        try b.r.saveSlot(slot, at, ids[kv_n..]);
+        @memcpy(ids[0..kv_n], b.leases[slot].ids.items[0..kv_n]);
+        for (ids) |id| b.keepPage(p, id);
+        p.finish(&gdn); // the GDN pages' holder is the state now, not the lease
+        k.* = .{ .at = at, .ids = ids };
+        b.publish();
         return k;
     }
 
@@ -550,14 +632,15 @@ pub const Slots = struct {
         return error.RestoredInPrefill;
     }
 
+    /// The state's pages lose it as a holder. A page no lease maps goes back to the pool at once: a copy still queued
+    /// from it runs before any later work that writes it (one in-order list).
     fn snapDrop(ptr: *anyopaque, saved: api.prompt_cache.Saved) void {
         const b = of(ptr);
         const k: *sage.snapshot.Snap = @ptrCast(@alignCast(saved));
-        b.dropped.append(b.gpa, k.*) catch {
-            b.r.d.settle();
-            b.r.dropSnap(k.*);
-        };
+        if (b.pool) |*p| for (k.ids) |id| b.dropPage(p, id);
+        b.gpa.free(k.ids);
         b.gpa.destroy(k);
+        b.publish();
     }
 
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
@@ -846,7 +929,7 @@ const Served = struct {
     fn close(ptr: *anyopaque) void {
         const h: *Served = @ptrCast(@alignCast(ptr));
         h.host.stop();
-        if (h.cache) |*store| store.deinit(); // the states' device memory, before the runner's
+        if (h.cache) |*store| store.deinit(); // the states' pages, before the pool's
         h.core.deinit();
         h.cfg.deinit(h.gpa);
         const r = h.back.r;
@@ -901,6 +984,8 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         return null;
     }
     h.back.pool = try kv.Pool.init(gpa, pages, r.kvBytesPerToken() * sage.PAGE);
+    h.back.pool.?.reclaim = .{ .ctx = &h.back, .call = Slots.reclaimFn }; // a lease evicts kept states it needs pages of
+    h.back.gdn_pages = sage.snapshot.gdnPages(r);
     h.back.publish();
     const pool_tokens = @as(u64, pages) * sage.PAGE;
     if (pool_tokens < context) std.log.warn("XPU Sage: the K/V pool holds {d} tokens, less than one stream's --context of {d}: a longer request is refused", .{ pool_tokens, context });
@@ -922,6 +1007,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         // last row reads the token after a state (lookahead).
         h.cache = api.prompt_cache.Store.init(gpa, h.back.snapshots(), .{ .lookahead = if (r.mtp != null) 1 else 0, .planned = true, .grid = 64 }, budget);
         h.host.cache = &h.cache.?;
+        h.back.store = &h.cache.?;
         h.host.info_.prompt_cache = true;
         std.log.info("sage-xpu: prompt cache of {d:.2} GiB", .{@as(f64, @floatFromInt(budget)) / (1 << 30)});
     }
