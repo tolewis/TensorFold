@@ -908,7 +908,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     h.core = lanes.Engine.init(gpa, &h.cfg, h.back.backend(), h.wall.clock());
     errdefer h.core.deinit();
     const cache_text = if (budget > 0) try std.fmt.allocPrint(a, "a prompt cache of up to {d:.2} GB", .{gb(budget)}) else "no prompt cache";
-    h.startup = try std.fmt.allocPrint(gpa, "Intel GPU engine: Sage (qwen3_5_moe), {d} stream(s) of at most {d} tokens, a K/V pool of {d} pages ({d} tokens, {d:.2} GB, {s}), {s}, sampling on the host{s}", .{ slots, context, pages, pool_tokens, gb(pool_tokens * r.kvBytesPerToken()), if (r.cap > 0) "int8" else "bf16", cache_text, if (r.mtp == null) "" else if (h.back.sampled_drafts) ", MTP drafts for greedy and sampled streams" else ", MTP drafts for greedy streams" });
+    h.startup = try std.fmt.allocPrint(gpa, "Intel GPU engine: Sage (qwen3_5_moe), {d} stream(s) of at most {d} tokens, a K/V pool of {d} pages ({d} tokens, {d:.2} GB, {s}), {s}, {d:.2} GB of the card kept free, sampling on the host{s}", .{ slots, context, pages, pool_tokens, gb(pool_tokens * r.kvBytesPerToken()), if (r.cap > 0) "int8" else "bf16", cache_text, gb(cardReserve(budget)), if (r.mtp == null) "" else if (h.back.sampled_drafts) ", MTP drafts for greedy and sampled streams" else ", MTP drafts for greedy streams" });
     h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "sage-xpu", .lanes = slots, .context_window = context, .context_fitted = true, .startup = h.startup, .prefill_step = 0, .structures = true });
     h.host.explain = .{ .text = lane.explain };
     h.host.info_.admit = .{ .ctx = &h.back, .fits = Slots.fitsFn }; // a request waits until the pool can promise its pages
@@ -929,22 +929,33 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     return .{ .engine = h.host.engine(), .close = Served.close, .ctx = h };
 }
 
-/// Card bytes kept free of the engine's buffers.
-const card_reserve: u64 = 64 << 20;
+/// Card bytes a prompt pass and the driver hold beyond the counted load: the pass's chunk buffers, the driver's page
+/// tables and rings, and a margin. Measured with the xe VRAM manager's usage (debugfs tile0/vram_mm) under 4 sessions of
+/// 126k to 177k tokens (--parallel 4 --context 262144, the MTP head, --vision, int8 K/V, 2 GiB cache): idle 31.90 GB
+/// of the 32.03 GB counted, a pass at most 0.44 GB above idle, so 0.31 GB past the count. Taken with 0.34 GB of margin.
+const pass_reserve: u64 = 650_000_000;
 /// Bytes the card holds beyond what Dev.allocated counts (the runtime's own buffers). Measured with drm-total-vram0
 /// after 4 streams at once, the pool zeroed at load: 32.47 GB counted and 32.71 GB held (--parallel 4 --context
 /// 220000, the MTP head, --vision, int8 K/V). Taken above the 0.24 GB seen.
 const held_not_counted: u64 = 400_000_000;
 
+/// Card bytes kept free of the load, the pool and the cache's budget: pass_reserve, and with a prompt cache one more
+/// budget. A state the store evicts stays on the card until the next prompt pass starts (Slots.snapDrop defers the
+/// free past queued copies), so the states a pass keeps sit beside the ones it evicted: on the 2 GiB budget the card
+/// held 2.03 GB more for that span, and a 171k-token keep took the card to 34.24 of 34.24 GB.
+fn cardReserve(cache: u64) u64 {
+    return pass_reserve + cache;
+}
+
 /// The prompt cache's budget: --prompt-cache-gib (0: no cache), else 2 GiB, or less when the card has less left past
 /// the load and `pool` bytes of a K/V pool --kv-pool-tokens asked for (a server started without the option keeps its
-/// pool).
+/// pool). The budget counts twice on the card (cardReserve), so it takes at most half of what is left.
 fn cacheBudget(r: *sage.Runner, o: api.Open, pool: u64) u64 {
     if (o.prompt_cache_gib) |gib| return if (gib > 0) std.math.lossyCast(u64, gib * (1 << 30)) else 0;
     const want: u64 = 2 << 30;
     const mem = r.d.g.memory() catch return want;
-    const left = (mem.size -| card_reserve) -| (r.d.allocated + held_not_counted + pool);
-    if (left < want) std.log.warn("XPU: the card has {d:.2} GB left past the load, so the prompt cache takes that, not 2 GiB (--prompt-cache-gib)", .{gb(left)});
+    const left = ((mem.size -| pass_reserve) -| (r.d.allocated + held_not_counted + pool)) / 2;
+    if (left < want) std.log.warn("XPU: the card has {d:.2} GB left past the load, so the prompt cache takes {d:.2} GB, not 2 GiB (--prompt-cache-gib)", .{ gb(2 * left), gb(left) });
     return @min(want, left);
 }
 
@@ -956,25 +967,26 @@ fn fitsCard(a: Allocator, r: *sage.Runner, slots: u32, pages: u32, cache: u64, p
         std.log.warn("XPU: no Sysman memory size ({s}), so the load does not check that the card holds the K/V pool", .{@errorName(err)});
         return true;
     };
-    const room = mem.size -| card_reserve;
+    const keep = cardReserve(cache);
+    const room = mem.size -| keep;
     const page: u64 = r.kvBytesPerToken() * sage.PAGE;
     const pool: u64 = @as(u64, pages) * page;
     const need: u64 = r.d.allocated + pool + held_not_counted;
-    std.log.info("XPU: the load holds {d:.2} GB of the card's {d:.2} GB ({d:.2} GB kept free), {d:.2} GB of it the K/V pool, and the prompt cache takes up to {d:.2} GB", .{ gb(need), gb(mem.size), gb(card_reserve), gb(pool), gb(cache) });
+    std.log.info("XPU: the load holds {d:.2} GB of the card's {d:.2} GB ({d:.2} GB kept free: {d:.2} GB for a prompt pass and the driver, {d:.2} GB for evicted prompt states), {d:.2} GB of it the K/V pool, and the prompt cache takes up to {d:.2} GB", .{ gb(need), gb(mem.size), gb(keep), gb(pass_reserve), gb(cache), gb(pool), gb(cache) });
     if (need + cache <= room and pages > 0) return true;
     const most = (room -| (r.d.allocated + held_not_counted + cache)) / page * sage.PAGE;
-    problem.* = try std.fmt.allocPrint(a, "the XPU Sage engine needs {d:.2} GB for {d} stream(s){s} with a K/V pool of {d} tokens ({d:.2} GB, --kv-pool-tokens), and {d:.2} GB for the prompt cache (--prompt-cache-gib {d:.2}), and the card has {d:.2} GB with {d:.2} GB kept free. Beside that cache the pool fits at most {d} tokens. Set a smaller --kv-pool-tokens or --prompt-cache-gib (0: no cache, its bytes go to the pool), or fewer --parallel slots", .{ gb(need), slots, if (r.mtp != null) " with the MTP head" else "", @as(u64, pages) * sage.PAGE, gb(pool), gb(cache), @as(f64, @floatFromInt(cache)) / (1 << 30), gb(mem.size), gb(card_reserve), most });
+    problem.* = try std.fmt.allocPrint(a, "the XPU Sage engine needs {d:.2} GB for {d} stream(s){s} with a K/V pool of {d} tokens ({d:.2} GB, --kv-pool-tokens), and {d:.2} GB for the prompt cache (--prompt-cache-gib {d:.2}), and the card has {d:.2} GB with {d:.2} GB kept free. Beside that cache the pool fits at most {d} tokens. Set a smaller --kv-pool-tokens or --prompt-cache-gib (0: no cache, its bytes go to the pool), or fewer --parallel slots", .{ gb(need), slots, if (r.mtp != null) " with the MTP head" else "", @as(u64, pages) * sage.PAGE, gb(pool), gb(cache), @as(f64, @floatFromInt(cache)) / (1 << 30), gb(mem.size), gb(keep), most });
     return false;
 }
 
 /// The pool's pages: --kv-pool-tokens rounded up to whole pages, else what the card leaves after the load (the
-/// weights, the tower, the activations, every slot's GDN state) and `cache` bytes of the prompt cache's budget, at
-/// most every slot's whole context.
+/// weights, the tower, the activations, every slot's GDN state), `cache` bytes of the prompt cache's budget and the
+/// reserve (cardReserve), at most every slot's whole context.
 fn poolPages(r: *sage.Runner, slots: u32, context: u32, tokens: ?u32, cache: u64) u32 {
     if (tokens) |t| return @intCast((@as(u64, t) + sage.PAGE - 1) / sage.PAGE);
     const most: u64 = @as(u64, slots) * ((@as(u64, context) + sage.PAGE - 1) / sage.PAGE);
     const mem = r.d.g.memory() catch return @intCast(most);
-    const left = (mem.size -| card_reserve) -| (r.d.allocated + held_not_counted + cache);
+    const left = (mem.size -| cardReserve(cache)) -| (r.d.allocated + held_not_counted + cache);
     return @intCast(@min(most, left / (r.kvBytesPerToken() * sage.PAGE)));
 }
 
