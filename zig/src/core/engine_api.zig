@@ -290,7 +290,7 @@ pub const Open = struct {
     /// --decode-priority off: a prompt pass runs whole, and the other streams decode again after it (the XPU Sage engine).
     decode_priority: bool = true,
     /// --decode-share: after a prompt step of t seconds, the decoding streams take rounds for this share of t (0: one
-    /// round; the XPU Sage engine; null: TENSORFOLD_PREFILL_SHARE, else one round).
+    /// round; the XPU Sage engine; null: TENSORFOLD_PREFILL_SHARE, else the engine's default).
     decode_share: ?f64 = null,
     /// --learn: where shared prompt states are kept on disk for later sessions and servers (null: off).
     learn: ?[]const u8 = null,

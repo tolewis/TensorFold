@@ -16,8 +16,14 @@ pub const model_type = "qwen3_5_moe";
 const ring = 64;
 /// The prompt cache keeps no state under this many tokens: a cut there splits a chunk, and the state saves little.
 const min_kept = 4096;
-/// A prompt step's tokens without --prefill-chunk: a decode round of the other streams runs after each.
+/// A prompt step's tokens without --prefill-chunk. Measured on one B70 (4 x 262144, MTP, int8 K/V), 3 streams decoding
+/// at 40k through a 140k pass with decode rounds for the step's time: 512 kept every second with tokens, 2048 left 12
+/// to 18 seconds with none.
 const default_step: usize = sage.CHUNK;
+/// Decode rounds after a prompt step, as a share of its time, without --decode-share or TENSORFOLD_PREFILL_SHARE.
+/// Measured as above: 1 kept the decoders at 0.51 of their 53 tok/s and took the pass from 78 to 162 s; one round a
+/// step kept 0.10 (87 s); 0.49 kept 0.36 (122 s).
+const default_share: f64 = 1;
 
 pub const Slots = struct {
     gpa: Allocator,
@@ -1064,9 +1070,10 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     h.core = lanes.Engine.init(gpa, &h.cfg, h.back.backend(), h.wall.clock());
     errdefer h.core.deinit();
     const pool_bytes = pool_tokens * r.kvBytesPerToken();
-    // --decode-share: after a prompt step of t, the decoding streams take rounds for share x t (the host's Share)
+    // --decode-share, else TENSORFOLD_PREFILL_SHARE, else default_share: after a prompt step of t, the decoding streams
+    // take rounds for share x t (the host's Share)
     const Share = @FieldType(api.LaneHost, "share");
-    const share: Share = if (o.decode_share) |x| .{ .p = 1 / (1 + x) } else .fromEnv();
+    const share: Share = if (o.decode_share) |x| .{ .p = 1 / (1 + x) } else if (std.c.getenv("TENSORFOLD_PREFILL_SHARE") != null) .fromEnv() else .{ .p = 1 / (1 + default_share) };
     const rounds_text = if (share.p >= 1) "a decode round" else try std.fmt.allocPrint(a, "decode rounds for {d:.2} of the step's time", .{(1 - share.p) / share.p});
     const step_text = if (h.back.step > 0) try std.fmt.allocPrint(a, "prompt steps of {d} tokens, each followed by {s}", .{ h.back.step, rounds_text }) else "prompt passes whole";
     const cache_text = if (budget > 0) try std.fmt.allocPrint(a, "kept prompt states in up to {d:.2} GB of it ({d:.0} %)", .{ gb(budget), 100 * @as(f64, @floatFromInt(budget)) / @as(f64, @floatFromInt(pool_bytes)) }) else "no prompt cache";

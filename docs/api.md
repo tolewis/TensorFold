@@ -200,7 +200,7 @@ before a background one, then to the prompt with the fewest tokens left, and a p
 the next one: a short request starts at the next chunk, and a long prompt still finishes. Running replies take rounds
 between chunks for `--decode-share` of each chunk's time (default 0.25). That flag is the Python 0.6.6 engine's. The
 native binary reads it for the XPU Sage engine only (with `--prefill-chunk` for the step, and `--decode-priority off`
-for whole passes). Other native engines ignore it. In the Python engine, `--decode-share 0` prefills each prompt whole
+for whole passes). There the default is 1, with steps of 512 tokens. Other native engines ignore it. In the Python engine, `--decode-share 0` prefills each prompt whole
 first, in arrival order, as 0.3.6.2 did. Background work waits behind foreground requests. An active background
 request yields when a foreground request needs its lane or memory, then restarts with already-delivered tokens
 suppressed.
