@@ -49,6 +49,7 @@ pub fn unfill(h: *LaneHost, job: anytype) void {
 pub const Share = struct {
     p: f64 = 1,
     debt_ns: i64 = 0, // decode time owed before the next step of a long prompt
+    short: usize = short_rows, // a prompt of at most this many rows to fill runs whole, back to back with the others
 
     pub const short_rows = 512;
     pub const min_share = 0.01; // below it a step's debt is minutes of decoding, and is no share
@@ -83,7 +84,7 @@ pub fn run(h: *LaneHost) void {
         return;
     }
     // short prompts back to back, as a whole pass at admission went: a burst of them waits on no decode round
-    while (h.filling.items.len > 0 and short(h.filling.items[pick(h)])) {
+    while (h.filling.items.len > 0 and short(h, h.filling.items[pick(h)])) {
         h.fillAt(next(h));
         @import("lane_host_end.zig").takeCancels(h);
         while (h.admitOne()) {}
@@ -96,9 +97,9 @@ pub fn run(h: *LaneHost) void {
     h.share.stepped(@intCast(t0.durationTo(std.Io.Clock.awake.now(h.io)).toNanoseconds()), decoding);
 }
 
-/// A prompt whose whole pass is at most `short_rows` rows (a long prompt's last rows are not).
-fn short(j: *const LaneHost.Job) bool {
-    return j.stream.prompt_len -| j.stream.cached <= Share.short_rows;
+/// A prompt whose whole pass is at most `h.share.short` rows (a long prompt's last rows are not).
+fn short(h: *const LaneHost, j: *const LaneHost.Job) bool {
+    return j.stream.prompt_len -| j.stream.cached <= h.share.short;
 }
 
 /// A long prompt's step runs now: none owed, or nothing decoding.

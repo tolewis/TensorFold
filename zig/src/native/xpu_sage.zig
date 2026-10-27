@@ -24,6 +24,10 @@ const default_step: usize = sage.CHUNK;
 /// Measured as above: 1 kept the decoders at 0.51 of their 53 tok/s and took the pass from 78 to 162 s; one round a
 /// step kept 0.10 (87 s); 0.49 kept 0.36 (122 s).
 const default_share: f64 = 1;
+/// A prompt of at most this many rows to fill runs whole, back to back with the other short ones, before a decode
+/// round (the host's Share.short). Four 1k prompts at once on one B70: with 512, the three after the first owed
+/// decode time to the first's reply, and the 1k c4 aggregate fell from 251 to 224 tok/s.
+const short_rows: usize = 4 * sage.CHUNK;
 
 pub const Slots = struct {
     gpa: Allocator,
@@ -1073,7 +1077,8 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     // --decode-share, else TENSORFOLD_PREFILL_SHARE, else default_share: after a prompt step of t, the decoding streams
     // take rounds for share x t (the host's Share)
     const Share = @FieldType(api.LaneHost, "share");
-    const share: Share = if (o.decode_share) |x| .{ .p = 1 / (1 + x) } else if (std.c.getenv("TENSORFOLD_PREFILL_SHARE") != null) .fromEnv() else .{ .p = 1 / (1 + default_share) };
+    var share: Share = if (o.decode_share) |x| .{ .p = 1 / (1 + x) } else if (std.c.getenv("TENSORFOLD_PREFILL_SHARE") != null) .fromEnv() else .{ .p = 1 / (1 + default_share) };
+    share.short = short_rows;
     const rounds_text = if (share.p >= 1) "a decode round" else try std.fmt.allocPrint(a, "decode rounds for {d:.2} of the step's time", .{(1 - share.p) / share.p});
     const step_text = if (h.back.step > 0) try std.fmt.allocPrint(a, "prompt steps of {d} tokens, each followed by {s}", .{ h.back.step, rounds_text }) else "prompt passes whole";
     const cache_text = if (budget > 0) try std.fmt.allocPrint(a, "kept prompt states in up to {d:.2} GB of it ({d:.0} %)", .{ gb(budget), 100 * @as(f64, @floatFromInt(budget)) / @as(f64, @floatFromInt(pool_bytes)) }) else "no prompt cache";
