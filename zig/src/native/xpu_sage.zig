@@ -1065,7 +1065,17 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     errdefer h.back.deinit();
     if (o.vision) |vo| h.back.vision = try Vision.open(gpa, io, a, r, o.dir, vo, problem) orelse return null;
     errdefer if (h.back.vision) |v| v.deinit(gpa);
-    if (block) |bl| h.back.depth = @min(bl, sage.WINDOW) - 1;
+    if (block) |bl| {
+        const rows = o.drafter_block orelse bl;
+        if (rows < 2 or rows > sage.WINDOW) {
+            problem.* = try std.fmt.allocPrint(a, "--drafter-block: 2 to {d} rows (the pending token and its drafts), not {d}", .{ sage.WINDOW, rows });
+            return null;
+        }
+        h.back.depth = rows - 1;
+    } else if (o.drafter_block != null) {
+        problem.* = try a.dupe(u8, "--drafter-block: only a DFlash drafter drafts in blocks");
+        return null;
+    }
     h.back.stats = std.c.getenv("XPU_SPEC_STATS") != null;
     if (std.c.getenv("XPU_SPEC")) |v| h.back.depth = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0;
     if (std.c.getenv("XPU_SAMPLED_DRAFTS")) |v| h.back.sampled_drafts = !std.mem.eql(u8, std.mem.span(v), "0");

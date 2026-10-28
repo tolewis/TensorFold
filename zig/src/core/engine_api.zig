@@ -277,6 +277,9 @@ pub const Open = struct {
     /// --drafter: a draft model's directory (Qwen3.8-27B's DFlash2; null: none), and --drafter-bits: 4, or 0 for bf16.
     drafter: ?[]const u8 = null,
     drafter_bits: u8 = 4,
+    /// --drafter-block: the rows a block drafter proposes and the target verifies, the pending one with them (Sage's
+    /// DFlash; null: the checkpoint's block).
+    drafter_block: ?u32 = null,
     /// --record: each stream's committed rows and tapped features written under this folder, for drafter training.
     record: ?[]const u8 = null,
     speed_up: ?[]const u8 = null,
