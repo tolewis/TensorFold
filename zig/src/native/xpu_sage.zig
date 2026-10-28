@@ -431,8 +431,9 @@ pub const Slots = struct {
     }
 
     /// Every stream's pending token in one forward: the single-row step for one stream, else stepMulti. A window of
-    /// two rows (a grammar's forced token after the pending one) runs alone, row by row: its second row is fed only
-    /// when the first row's draw equals it, so the slot holds exactly the rows a keep can take.
+    /// two rows (a grammar's draft or forced token after the pending one, or the budget close's forced token) runs
+    /// alone, row by row: its second row is fed when the round keeps it whatever the draws (w.forced), else only when
+    /// the first row's draw equals it, so the slot holds exactly the rows a keep can take.
     fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const b = of(ptr);
         const r = b.r;
@@ -471,8 +472,8 @@ pub const Slots = struct {
             try r.use(slot);
             try r.step(@intCast(w.pending));
             o.sampled[0] = try b.drawRow(w, 0, r.last, null);
-            o.sampled[1] = o.sampled[0]; // not read unless the forced token lands
-            if (o.sampled[0] == w.tokens[0]) {
+            o.sampled[1] = o.sampled[0]; // not read unless the second row is fed
+            if (w.forced or o.sampled[0] == w.tokens[0]) {
                 try r.step(@intCast(w.tokens[0]));
                 o.sampled[1] = try b.drawRow(w, 1, r.last, null);
                 b.fed[slot] = 2;

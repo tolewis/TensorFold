@@ -18,6 +18,7 @@ pub const Window = struct {
     positions: []const u64, // the absolute position each row's draw is keyed at
     early: bool = false, // also draft each row's first head draft behind the verify (speculate_early)
     masks: []const u32 = &.{}, // structured output: each row's allowed-token bits (rows x words, lanes/grammar.zig); empty: none
+    forced: bool = false, // `tokens` are forced (the thinking budget's close): the round keeps every row, whatever the draws
 
     pub fn rows(w: Window) usize {
         return 1 + @as(usize, w.held) + w.tokens.len;

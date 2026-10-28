@@ -10,6 +10,7 @@ const grammar = @import("grammar.zig");
 const win = @import("windows.zig");
 
 const gpa = std.testing.allocator;
+var forced_rows: usize = 0; // the last run's rows its windows marked forced
 
 pub const Case = struct {
     prompt: []const u32,
@@ -129,6 +130,7 @@ fn run(cases: []const Case) ![][]u32 {
     };
     for (streams) |*s| try engine.addStream(s);
     while (engine.activeCount() > 0) try engine.step();
+    forced_rows = target.forced_rows;
     for (cases, streams) |c, *s| if (c.logprobs) |k| try expectRows(c, s, k);
     const out = try gpa.alloc([]u32, cases.len);
     for (out, streams) |*o, *s| o.* = try gpa.dupe(u32, s.emitted());
@@ -242,12 +244,16 @@ test "shared rounds commit what each stream commits alone" {
 }
 
 test "the thinking budget's forced close is the same drafted, plain and shared" {
+    // the close's tokens after its first reach the backend in windows marked forced (the round keeps them whatever the
+    // draws); the plain lone stream's go through the fake's pipelined queue, not windows
     const drafted = try run(&.{.{ .prompt = &p2, .think_budget = 9 }});
     defer free(drafted);
+    try std.testing.expectEqual(@as(usize, 2), forced_rows);
     const plain = try run(&.{.{ .prompt = &p2, .think_budget = 9, .drafts = false }});
     defer free(plain);
     const shared = try run(&.{ .{ .prompt = &p2, .think_budget = 9 }, .{ .prompt = &p1, .drafts = false } });
     defer free(shared);
+    try std.testing.expectEqual(@as(usize, 2), forced_rows);
     try std.testing.expectEqualSlices(u32, plain[0], drafted[0]);
     try std.testing.expectEqualSlices(u32, plain[0], shared[0]);
     try std.testing.expectEqual(@as(u32, 90), drafted[0][8]);

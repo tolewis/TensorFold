@@ -81,6 +81,7 @@ pub const Fake = struct {
     ring_at: usize = 0, // the slot the next draw takes
     fail_read: ?u64 = null, // this handle's read fails with error.GpuFailed, as a failed buffer's does
     last_rows: usize = 0, // the last verify's rows, for test clocks
+    forced_rows: usize = 0, // rows the windows marked forced (Window.forced)
     last_sampled: bool = false, // and whether one of its streams drew keyed samples
     pieces_run: usize = 0, // prompt pieces run (`pieceBackend`)
     joins: usize = 0, // prompts whose last token joined a round (`joinBackend`)
@@ -422,6 +423,7 @@ pub const Fake = struct {
         x.last_sampled = false;
         for (windows, out) |w, o| {
             x.last_rows += w.rows();
+            if (w.forced) x.forced_rows += w.tokens.len;
             x.last_sampled = x.last_sampled or w.stream.sampling != null;
             const l = x.lane(w.stream);
             l.base = l.history.items.len;
