@@ -423,6 +423,7 @@ fn specMultiCheck(r: *sage.Runner, ids: []const i32, steps: usize, k: u32) !void
         try r.prompt(ids[0 .. ids.len - 7 * i]);
         try got[i].append(alloc, r.last);
     }
+    @import("dev.zig").profReport("prompts");
     var buf: [sage.MAX_SLOTS][sage.WINDOW]i32 = undefined;
     var cnt: [sage.MAX_SLOTS]usize = undefined;
     var rounds: usize = 0;
