@@ -1359,7 +1359,7 @@ pub const Runner = struct {
         const tp: usize = (T + 63) / 64 * 64;
         const yb = try alloc.alloc(u16, T * z.vd);
         defer alloc.free(yb);
-        const hb = try alloc.alloc(u16, T * s.hidden);
+        const hb = try alloc.alloc(u16, T * z.vd); // the gated norm writes rows of vd (mixer_out.k) halves
         defer alloc.free(hb);
         const sb = try alloc.alloc(f32, s.gdn_v_heads * 128 * 128);
         defer alloc.free(sb);
