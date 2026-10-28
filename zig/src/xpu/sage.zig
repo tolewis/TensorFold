@@ -37,6 +37,8 @@ fn span(keys: u32) u32 {
 /// K1: attn_decode_dpas takes tiles of DPAS_TILE keys (4 pages). The splits of a (row, K/V head) fill one wave of
 /// work-groups: nsplit = min(wave x cores / (kv_heads x rows), tiles), in chunks of whole tiles.
 const DPAS_TILE = 256;
+/// Rows of one stream a work-group of attn_decode_dpas holds (its DPAS columns: 8 heads x rows).
+const DPAS_ROWS = 4;
 /// Xe cores of the B70 (Arc Pro B70, BMG-G31). XPU_ATTN_WAVE sets the work-groups a core (4).
 const XE_CORES = 32;
 fn dpasSpan(keys: u32, rows: u32, kv_heads: u32, wave: u32) u32 {
@@ -166,6 +168,7 @@ pub const Acts = struct {
     // MoE
     mt: *anyopaque, // u64 [layers, WINDOW, 8]: stepMulti's per-row state table (the 27B's acts.mt)
     mpos: *anyopaque, // i32 [WINDOW]: stepMulti's row positions
+    grp: *anyopaque, // i32 [WINDOW, 2]: attn_decode_dpas row groups (first row, rows)
     rope: *anyopaque, // i32 [CHUNK, 3]: a forward's M-RoPE positions (t, h, w) when its slots hold images
     mlog: *anyopaque, // fp32 [CHUNK, experts + 1]
     mids: *anyopaque, // u32 [CHUNK, top_k]
@@ -213,6 +216,7 @@ pub const Acts = struct {
             .chain = try d.upload(std.mem.sliceAsBytes(&fwd.chainTable())),
             .mt = try d.alloc_(@as(usize, s.layers) * w * 8 * 8),
             .mpos = try d.alloc_(w * 4),
+            .grp = try d.alloc_(w * 2 * 4),
             .rope = try d.alloc_(c * 3 * 4),
             .mlog = try d.alloc_(c * (s.experts + 1) * 4),
             .mids = try d.alloc_(c * s.top_k * 4),
@@ -510,8 +514,9 @@ pub const Runner = struct {
     sdrawn: [MAX_SLOTS]bool = @splat(false), // the slot's first draft is a Judge.draft draw (else the MTP's argmax)
     mpos: [MAX_SLOTS]u32 = @splat(0), // each slot's next MTP slot to absorb
     verifying: bool = false, // forward runs a block for verify: every row's token, states kept for commit
-    attn_dpas: bool = true, // K1: attn_decode_dpas for rows of one position over int8 pages (XPU_ATTN_DPAS=0: never)
+    attn_dpas: bool = true, // K1: attn_decode_dpas for decode rows and windows over int8 pages (XPU_ATTN_DPAS=0: never)
     attn_wave: u32 = 4, // K1: work-groups a core the split rule fills (XPU_ATTN_WAVE)
+    grp_host: [WINDOW * 2]i32 = undefined, // the row groups of the forward's attn_decode_dpas launches
     dump_fd: c_int = -1, // XPU_DUMP=path: one-row decode attention outputs and logits, as (u32 bytes, bytes) records
     block: [WINDOW]i32 = undefined, // the last verified block's greedy tokens, a row each
     block_rows: u32 = 0,
@@ -658,12 +663,36 @@ pub const Runner = struct {
         return true;
     }
 
+    /// K1: every slot of a launch holds int8 pages: attn_decode_dpas can take its rows.
+    fn pagedRows(r: *Runner, slots: []const u32) bool {
+        if (r.cap == 0) return false;
+        for (slots) |slot| if (r.pt[slot] == null) return false;
+        return true;
+    }
+
+    /// K1: the row groups of attn_decode_dpas for windows at rows wf[i] of wn[i] rows: up to DPAS_ROWS rows of one
+    /// window each, into acts.grp. Returns the group count (the launch's z).
+    fn dpasGroups(r: *Runner, wf: []const u32, wn: []const u32) !u32 {
+        var n: u32 = 0;
+        for (wf, wn) |f, w| {
+            var j: u32 = 0;
+            while (j < w) : (j += DPAS_ROWS) {
+                r.grp_host[2 * n] = @intCast(f + j);
+                r.grp_host[2 * n + 1] = @intCast(@min(DPAS_ROWS, w - j));
+                n += 1;
+            }
+        }
+        try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, r.acts.grp, &r.grp_host, n * 8, null, 0, null));
+        return n;
+    }
+
     /// XPU_DUMP: `bytes` of device memory `p` to the dump file, after a u32 length (a check's record).
     fn dumpDev(r: *Runner, p: *anyopaque, bytes: usize) !void {
         if (r.dump_fd < 0) return;
         const d = &r.d;
         const buf = try alloc.alloc(u8, bytes);
         defer alloc.free(buf);
+        try d.sync(); // the kernels before this point are done before the copy reads
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, buf.ptr, p, bytes, null, 0, null));
         try d.sync();
         const n: u32 = @intCast(bytes);
@@ -823,8 +852,9 @@ pub const Runner = struct {
         const rope = if (shifted) try r.ropeRows(T) else null;
         try r.embed(T);
         const one = r.oneRows(slots, T);
-        const dpas = r.attn_dpas and one;
-        const sp: i32 = @intCast(if (dpas) dpasSpan(max_pos + 1, T, s.kv_heads, r.attn_wave) else span(max_pos + 1));
+        const dpas = r.attn_dpas and r.pagedRows(slots);
+        const ng: u32 = if (dpas) try r.dpasGroups(wf[0..slots.len], wn) else 0;
+        const sp: i32 = @intCast(if (dpas) dpasSpan(max_pos + 1, ng, s.kv_heads, r.attn_wave) else span(max_pos + 1));
         const ns: u32 = (max_pos + 1 + @as(u32, @intCast(sp)) - 1) / @as(u32, @intCast(sp));
         const at = StashAt.of(z);
         for (m.layers, 0..) |*l, i| {
@@ -834,7 +864,7 @@ pub const Runner = struct {
             if (l.attn) {
                 try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, zero, EPS, nul, mt, a.mpos, zero, r.cap, rope, nul });
                 if (dpas)
-                    try d.launch(r.mk.attn_dpas, .{ .x = ns, .y = s.kv_heads, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, zero, @as(i32, @intCast(ns)), sp, @as(f32, 1.0 / 16.0), mt, a.mpos, r.cap, nul })
+                    try d.launch(r.mk.attn_dpas, .{ .x = ns, .y = s.kv_heads, .z = ng }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, zero, @as(i32, @intCast(ns)), sp, @as(f32, 1.0 / 16.0), mt, a.mpos, r.cap, nul, a.grp })
                 else
                     try d.launch(r.mk.attn_span, .{ .x = ns, .y = s.kv_heads * (s.q_heads / s.kv_heads / QPG), .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, zero, @as(i32, @intCast(ns)), sp, @as(f32, 1.0 / 16.0), mt, a.mpos, r.cap, nul });
                 try d.launch(r.mk.merge_span, .{ .x = s.q_heads, .y = T }, .{ a.pm, a.pl, a.po, a.y, zero, @as(i32, @intCast(ns)), sp, a.mpos });
@@ -968,11 +998,12 @@ pub const Runner = struct {
         try r.mtpFront(ids);
         try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, p32, EPS, nul, nul, nul, zero, r.cap, nul, pt });
         if (T <= WINDOW) {
-            const dpas = r.attn_dpas and r.cap > 0 and pt != null and T == 1;
-            const sp = if (dpas) dpasSpan(p0 + T, 1, s.kv_heads, r.attn_wave) else span(p0 + T);
+            const dpas = r.attn_dpas and r.cap > 0 and pt != null;
+            const ng: u32 = if (dpas) try r.dpasGroups(&.{0}, &.{T}) else 0;
+            const sp = if (dpas) dpasSpan(p0 + T, ng, s.kv_heads, r.attn_wave) else span(p0 + T);
             const ns: u32 = (p0 + T + sp - 1) / sp;
             if (dpas)
-                try d.launch(r.mk.attn_dpas, .{ .x = ns, .y = s.kv_heads, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, p32, @as(i32, @intCast(ns)), @as(i32, @intCast(sp)), @as(f32, 1.0 / 16.0), nul, nul, r.cap, pt })
+                try d.launch(r.mk.attn_dpas, .{ .x = ns, .y = s.kv_heads, .z = ng }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, p32, @as(i32, @intCast(ns)), @as(i32, @intCast(sp)), @as(f32, 1.0 / 16.0), nul, nul, r.cap, pt, a.grp })
             else
                 try d.launch(r.mk.attn_span, .{ .x = ns, .y = s.kv_heads * (s.q_heads / s.kv_heads / QPG), .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, p32, @as(i32, @intCast(ns)), @as(i32, @intCast(sp)), @as(f32, 1.0 / 16.0), nul, nul, r.cap, pt });
             try d.launch(r.mk.merge_span, .{ .x = s.q_heads, .y = T }, .{ a.pm, a.pl, a.po, a.y, p32, @as(i32, @intCast(ns)), @as(i32, @intCast(sp)), nul });
@@ -1205,12 +1236,24 @@ pub const Runner = struct {
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.mpos, pos.ptr, T * 4, null, 0, null));
         errdefer d.settle();
         try r.mtpFront(ids);
-        const dpas = r.attn_dpas and r.oneRows(slots, T);
-        const sp: i32 = @intCast(if (dpas) dpasSpan(max_pos + 1, T, s.kv_heads, r.attn_wave) else span(max_pos + 1));
+        const dpas = r.attn_dpas and r.pagedRows(slots);
+        var ng: u32 = 0;
+        if (dpas) {
+            var mf: [MAX_SLOTS]u32 = undefined;
+            var mw: [MAX_SLOTS]u32 = undefined;
+            var at: u32 = 0;
+            for (n, 0..) |c, i| {
+                mf[i] = at;
+                mw[i] = @intCast(c);
+                at += @intCast(c);
+            }
+            ng = try r.dpasGroups(mf[0..n.len], mw[0..n.len]);
+        }
+        const sp: i32 = @intCast(if (dpas) dpasSpan(max_pos + 1, ng, s.kv_heads, r.attn_wave) else span(max_pos + 1));
         const ns: u32 = (max_pos + 1 + @as(u32, @intCast(sp)) - 1) / @as(u32, @intCast(sp));
         try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, zero, EPS, nul, a.mt, a.mpos, zero, r.cap, nul, nul });
         if (dpas)
-            try d.launch(r.mk.attn_dpas, .{ .x = ns, .y = s.kv_heads, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, zero, @as(i32, @intCast(ns)), sp, @as(f32, 1.0 / 16.0), a.mt, a.mpos, r.cap, nul })
+            try d.launch(r.mk.attn_dpas, .{ .x = ns, .y = s.kv_heads, .z = ng }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, zero, @as(i32, @intCast(ns)), sp, @as(f32, 1.0 / 16.0), a.mt, a.mpos, r.cap, nul, a.grp })
         else
             try d.launch(r.mk.attn_span, .{ .x = ns, .y = s.kv_heads * (s.q_heads / s.kv_heads / QPG), .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, zero, @as(i32, @intCast(ns)), sp, @as(f32, 1.0 / 16.0), a.mt, a.mpos, r.cap, nul });
         try d.launch(r.mk.merge_span, .{ .x = s.q_heads, .y = T }, .{ a.pm, a.pl, a.po, a.y, zero, @as(i32, @intCast(ns)), sp, a.mpos });
@@ -1343,12 +1386,13 @@ pub const Runner = struct {
             try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_in, a.p, T);
             if (l.attn) {
                 const one = r.cap > 0 and pt != null and T == 1;
-                const dpas = r.attn_dpas and one;
-                const sp = if (dpas) dpasSpan(r.pos + T, 1, s.kv_heads, r.attn_wave) else span(r.pos + T);
+                const dpas = r.attn_dpas and r.cap > 0 and pt != null;
+                const ng: u32 = if (dpas) try r.dpasGroups(&.{0}, &.{T}) else 0;
+                const sp = if (dpas) dpasSpan(r.pos + T, ng, s.kv_heads, r.attn_wave) else span(r.pos + T);
                 const ns: u32 = (r.pos + T + sp - 1) / sp;
                 try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, p0, EPS, nul, nul, nul, zero, r.cap, rope, pt });
                 if (dpas)
-                    try d.launch(r.mk.attn_dpas, .{ .x = ns, .y = s.kv_heads, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, p0, @as(i32, @intCast(ns)), @as(i32, @intCast(sp)), @as(f32, 1.0 / 16.0), nul, nul, r.cap, pt })
+                    try d.launch(r.mk.attn_dpas, .{ .x = ns, .y = s.kv_heads, .z = ng }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, p0, @as(i32, @intCast(ns)), @as(i32, @intCast(sp)), @as(f32, 1.0 / 16.0), nul, nul, r.cap, pt, a.grp })
                 else
                     try d.launch(r.mk.attn_span, .{ .x = ns, .y = s.kv_heads * (s.q_heads / s.kv_heads / QPG), .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, p0, @as(i32, @intCast(ns)), @as(i32, @intCast(sp)), @as(f32, 1.0 / 16.0), nul, nul, r.cap, pt });
                 try d.launch(r.mk.merge_span, .{ .x = s.q_heads, .y = T }, .{ a.pm, a.pl, a.po, a.y, p0, @as(i32, @intCast(ns)), @as(i32, @intCast(sp)), nul });

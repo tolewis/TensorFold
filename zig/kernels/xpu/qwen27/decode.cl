@@ -653,49 +653,72 @@ KERNEL(256) void attn_merge_span(global const float *PM, global const float *PL,
   O[((long)t * Q27_AQ + hh) * 256 + e] = f2bf(so / sl);
 }
 
-// Decode attention over int8 pool pages on the XMX (K1): one work-group of 16 sub-groups per (split, K/V head, row).
-// The Q27_GQA query heads of the K/V head are the DPAS columns, so each K and V row is read once. A tile is 256 keys
-// (4 pages): QK as 16 sub-groups x 16 keys through 2D block reads of the page and i8_i8_k32, the K scale on the
+// Decode attention over int8 pool pages on the XMX (K1): one work-group of 16 sub-groups per (split, K/V head, row
+// group). A row group is up to DPAS_ROWS rows of one stream (a verify window's rows, or one row): its (row, query
+// head) pairs are the DPAS columns, 16 a pass, so each K and V row is read once for the whole group. A tile is 256
+// keys (4 pages): QK as 16 sub-groups x 16 keys through 2D block reads of the page and i8_i8_k32, the K scale on the
 // int32 score; P in f16 in SLM with the V scale folded in; PV as 16 sub-groups x 16 dimensions through transform
 // reads and f16_f16_k16. The next tile's K rows are prefetched during PV and its V rows during QK. Rows, arguments
-// and partials as attn_decode_span (grid (NS, Q27_AKV, rows)); span is a multiple of 256, cap > 0, PT non-null.
+// and partials as attn_decode_span (grid (NS, Q27_AKV, groups)); GRP[2 g], GRP[2 g + 1]: the group's first row and
+// row count; span is a multiple of 256, cap > 0, PT non-null. Row t sees keys 0 .. POS[t] (or p0 + t).
 #if Q27_GQA == 8
 #define DPAS_TILE 256
+#define DPAS_ROWS 4
 KERNEL(256) void attn_decode_dpas(global const ushort *Q, global const char *KC, global const char *VC,
                                   global float *PM, global float *PL, global float *PO, int p0, int NS, int span,
                                   float scale, global const ulong *MT, global const int *POS, int cap,
-                                  global const uint *PT) {
-  local uint QI[8 * 8 * 16];                       // (32-dimension step, word, lane): Q in int8, column = query head
-  local ushort P[16 * 8 * 16];                     // (16-key group, head, key): P in f16 with the V scale folded in
-  local float QS[16], MX[16][16], SM[16][16], AL[8];
-  const int sp = get_group_id(0), hk = get_group_id(1), t = get_group_id(2);
+                                  global const uint *PT, global const int *GRP) {
+  local uint QI[2 * 8 * 8 * 16];                   // (pass, 32-dimension step, word, lane): Q in int8, column (row, head)
+  local ushort P[16 * 32 * 16];                    // (16-key group, column, key): P in f16 with the V scale folded in
+  local float QS[32], MX[2][16][16], SM[2][16][16], AL[32];
+  const int sp = get_group_id(0), hk = get_group_id(1), g = get_group_id(2);
   const int sg = get_sub_group_id(), lane = get_sub_group_local_id();
-  if (MT) {
-    KC = (global const char *)MT[t * 8];
-    VC = (global const char *)MT[t * 8 + 1];
-    PT = (global const uint *)MT[t * 8 + 2];
+  const int t0 = GRP[2 * g], nr = GRP[2 * g + 1], npass = (nr + 1) / 2;
+  if (MT) {                                        // the rows of a group share a stream
+    KC = (global const char *)MT[t0 * 8];
+    VC = (global const char *)MT[t0 * 8 + 1];
+    PT = (global const uint *)MT[t0 * 8 + 2];
   }
-  const int last = MT ? POS[t] : p0 + t, nkeys = last + 1, j0 = sp * span, j1 = min(j0 + span, nkeys);
+  int lastr[DPAS_ROWS], max_last = -1;
+  for (int r = 0; r < DPAS_ROWS; r++) {
+    lastr[r] = r < nr ? (MT ? POS[t0 + r] : p0 + t0 + r) : -1;
+    max_last = max(max_last, lastr[r]);
+  }
+  const int nkeys = max_last + 1, j0 = sp * span, j1 = min(j0 + span, nkeys);
   const int qh0 = hk * Q27_GQA;
-  if (sg < 8) {                                    // head sg in int8, one scale a head: the lane's 16 dimensions
-    const ushort16 x = vload16(0, Q + ((long)t * Q27_AQ + qh0 + sg) * 256 + lane * 16);
-    float mq = 0.0f;
-    for (int b = 0; b < 16; b++) mq = fmax(mq, fabs(bf2f(x[b])));
-    mq = sub_group_reduce_max(mq);
-    const float qs = mq > 0.0f ? mq / 127.0f : 1.0f, iq = 1.0f / qs;
-    for (int j = 0; j < 4; j++) {
-      uint u = 0;
-      for (int b = 0; b < 4; b++) u |= ((uint)(uchar)(char)rint(bf2f(x[j * 4 + b]) * iq)) << (8 * b);
-      QI[((lane / 2) * 8 + (lane % 2) * 4 + j) * 16 + sg] = u;
+  for (int c = sg; c < 32; c += 16) {              // column c: row c / 8, head c % 8; the lane's 16 dimensions
+    const int pass = c / 16, col = c % 16;
+    if (c < 8 * nr) {
+      const ushort16 x = vload16(0, Q + ((long)(t0 + c / 8) * Q27_AQ + qh0 + c % 8) * 256 + lane * 16);
+      float mq = 0.0f;
+      for (int b = 0; b < 16; b++) mq = fmax(mq, fabs(bf2f(x[b])));
+      mq = sub_group_reduce_max(mq);
+      const float qs = mq > 0.0f ? mq / 127.0f : 1.0f, iq = 1.0f / qs;
+      for (int j = 0; j < 4; j++) {
+        uint u = 0;
+        for (int b = 0; b < 4; b++) u |= ((uint)(uchar)(char)rint(bf2f(x[j * 4 + b]) * iq)) << (8 * b);
+        QI[(pass * 64 + (lane / 2) * 8 + (lane % 2) * 4 + j) * 16 + col] = u;
+      }
+      if (lane == 0) QS[c] = qs;
+    } else {
+      for (int j = 0; j < 4; j++) QI[(pass * 64 + (lane / 2) * 8 + (lane % 2) * 4 + j) * 16 + col] = 0;
+      if (lane == 0) QS[c] = 0.0f;
     }
-    if (lane == 0) QS[sg] = qs;
-  } else {
-    for (int j = 0; j < 4; j++) QI[((lane / 2) * 8 + (lane % 2) * 4 + j) * 16 + sg] = 0; // columns 8..15 idle
   }
   barrier(CLK_LOCAL_MEM_FENCE);
-  const float qsl = lane < 8 ? QS[lane] * scale * M_LOG2E_F : 0.0f;
-  float8 o = 0.0f;                                 // lane: dimension 16 sg + lane; element: head
-  float m = -INFINITY, l = 0.0f;                   // lane: head (lanes 8..15 idle)
+  float qsl[2];                                    // the lane's column of each pass: p * 16 + lane
+  int lastc[2];
+  for (int p = 0; p < 2; p++) {
+    qsl[p] = QS[p * 16 + lane] * scale * M_LOG2E_F;
+    lastc[p] = lastr[2 * p + lane / 8];
+  }
+  float8 o[DPAS_ROWS];                             // lane: dimension 16 sg + lane; o[q][r]: column 8 q + r
+  for (int q = 0; q < DPAS_ROWS; q++) o[q] = 0.0f;
+  float m[2], l[2];
+  for (int p = 0; p < 2; p++) {
+    m[p] = -INFINITY;
+    l[p] = 0.0f;
+  }
   if (j0 < j1) {                                   // the first tile's K rows
     const int kb = j0 + sg * 16;
     if (kb < j1) {
@@ -721,19 +744,20 @@ KERNEL(256) void attn_decode_dpas(global const ushort *Q, global const char *KC,
           intel_sub_group_2d_block_prefetch_16b_16r16x1c((global void *)vp, 256, rows, Q27_KVROW, (int2)(ds * 16, vb % Q27_PAGE));
       }
     }
-    int8 si[2];
-    si[0] = si[1] = 0;
+    int8 si[2][2];
+    si[0][0] = si[0][1] = si[1][0] = si[1][1] = 0;
     if (kin) {
       __attribute__((opencl_unroll_hint))
       for (int ds = 0; ds < 8; ds++) {             // steps of 32 dimensions: 16 keys x 32 bytes, 2 A tiles of 8 keys
-        const int8 qb = as_int8(intel_sub_group_block_read8(QI + ds * 128));
         ushort ka[16];
         intel_sub_group_2d_block_read_16b_16r16x1c((global void *)kpage, 256, krows, Q27_KVROW, (int2)(ds * 16, kb % Q27_PAGE), ka);
-        __attribute__((opencl_unroll_hint))
-        for (int b = 0; b < 2; b++) {
-          short8 a;
-          for (int r = 0; r < 8; r++) a[r] = (short)ka[b * 8 + r];
-          si[b] = intel_sub_group_i8_i8_matrix_mad_k32(a, qb, si[b]);
+        short8 a[2];
+        for (int b = 0; b < 2; b++)
+          for (int r = 0; r < 8; r++) a[b][r] = (short)ka[b * 8 + r];
+        for (int p = 0; p < npass; p++) {
+          const int8 qb = as_int8(intel_sub_group_block_read8(QI + (p * 64 + ds * 8) * 16));
+          si[p][0] = intel_sub_group_i8_i8_matrix_mad_k32(a[0], qb, si[p][0]);
+          si[p][1] = intel_sub_group_i8_i8_matrix_mad_k32(a[1], qb, si[p][1]);
         }
       }
     }
@@ -741,37 +765,48 @@ KERNEL(256) void attn_decode_dpas(global const ushort *Q, global const char *KC,
     const bool kok = kin && key < j1;
     const float ksc = kok ? ((global const float *)(KC + kpb + (long)Q27_PAGE * Q27_KVROW))[(key % Q27_PAGE) * Q27_AKV + hk] : 0.0f;
     const float vsc = kok ? ((global const float *)(VC + kpb + (long)Q27_PAGE * Q27_KVROW))[(key % Q27_PAGE) * Q27_AKV + hk] : 0.0f;
-    float s[16];
-    float mx = -INFINITY;
-    __attribute__((opencl_unroll_hint))
-    for (int kk = 0; kk < 16; kk++) {
-      const float ks = sub_group_broadcast(ksc, kk);
-      const float x = (kin && kb + kk < j1) ? (float)si[kk / 8][kk % 8] * ks * qsl : -INFINITY;
-      s[kk] = x;
-      mx = fmax(mx, x);
+    float s[2][16], mx[2], alpha[2], mn[2];
+    for (int p = 0; p < 2; p++) {
+      mx[p] = -INFINITY;
+      if (p < npass) {
+        __attribute__((opencl_unroll_hint))
+        for (int kk = 0; kk < 16; kk++) {
+          const float ks = sub_group_broadcast(ksc, kk);
+          const float x = (kin && kb + kk <= lastc[p]) ? (float)si[p][kk / 8][kk % 8] * ks * qsl[p] : -INFINITY;
+          s[p][kk] = x;
+          mx[p] = fmax(mx[p], x);
+        }
+      }
+      MX[p][sg][lane] = mx[p];
     }
-    MX[sg][lane] = mx;
     barrier(CLK_LOCAL_MEM_FENCE);
-    float tm = -INFINITY;
-    for (int i = 0; i < 16; i++) tm = fmax(tm, MX[i][lane]);
-    const float mn = fmax(m, tm);
-    const float alpha = mn == -INFINITY ? 1.0f : native_exp2(m - mn);
-    float sum = 0.0f;
-    __attribute__((opencl_unroll_hint))
-    for (int kk = 0; kk < 16; kk++) {
-      const float p = mn == -INFINITY ? 0.0f : native_exp2(s[kk] - mn);
-      sum += p;
-      if (lane < 8) P[(sg * 8 + lane) * 16 + kk] = as_ushort(convert_half(p * sub_group_broadcast(vsc, kk)));
+    for (int p = 0; p < 2; p++) {
+      float tm = -INFINITY;
+      for (int i = 0; i < 16; i++) tm = fmax(tm, MX[p][i][lane]);
+      mn[p] = fmax(m[p], tm);
+      alpha[p] = mn[p] == -INFINITY ? 1.0f : native_exp2(m[p] - mn[p]);
+      float sum = 0.0f;
+      if (p < npass) {
+        __attribute__((opencl_unroll_hint))
+        for (int kk = 0; kk < 16; kk++) {
+          const float pr = mn[p] == -INFINITY ? 0.0f : native_exp2(s[p][kk] - mn[p]);
+          sum += pr;
+          P[(sg * 32 + p * 16 + lane) * 16 + kk] = as_ushort(convert_half(pr * sub_group_broadcast(vsc, kk)));
+        }
+      }
+      SM[p][sg][lane] = sum;
+      if (sg == 0) AL[p * 16 + lane] = alpha[p];
+      m[p] = mn[p];
     }
-    SM[sg][lane] = sum;
-    if (sg == 0 && lane < 8) AL[lane] = alpha;
-    m = mn;
     barrier(CLK_LOCAL_MEM_FENCE);
-    float ls = 0.0f;
-    for (int i = 0; i < 16; i++) ls += SM[i][lane];
-    l = l * alpha + ls;
-    __attribute__((opencl_unroll_hint))
-    for (int r = 0; r < 8; r++) o[r] *= AL[r];
+    for (int p = 0; p < 2; p++) {
+      float ls = 0.0f;
+      for (int i = 0; i < 16; i++) ls += SM[p][i][lane];
+      l[p] = l[p] * alpha[p] + ls;
+    }
+    for (int q = 0; q < nr; q++)
+      __attribute__((opencl_unroll_hint))
+      for (int r = 0; r < 8; r++) o[q][r] *= AL[q * 8 + r];
     { // the next tile's K rows: this sub-group's 16 keys of it
       const int nb = k0 + DPAS_TILE + sg * 16;
       if (nb < j1) {
@@ -799,18 +834,26 @@ KERNEL(256) void attn_decode_dpas(global const ushort *Q, global const char *KC,
           vw[2 * j] = as_uint(h.s01);
           vw[2 * j + 1] = as_uint(h.s23);
         }
-        const short8 pa = as_short8(intel_sub_group_block_read_us8(P + (c2 * 2 + hc) * 128));
-        o = intel_sub_group_f16_f16_matrix_mad_k16(pa, as_int8(vw), o);
+        const int kg = c2 * 2 + hc;
+        for (int q = 0; q < nr; q++) {
+          const short8 pa = as_short8(intel_sub_group_block_read_us8(P + (kg * 32 + q * 8) * 16));
+          o[q] = intel_sub_group_f16_f16_matrix_mad_k16(pa, as_int8(vw), o[q]);
+        }
       }
     }
     barrier(CLK_LOCAL_MEM_FENCE);                  // P, MX, SM and AL are reused by the next tile
   }
-  if (sg == 0 && lane < 8) {
-    const long base = ((long)t * Q27_AQ + qh0 + lane) * NS + sp;
-    PM[base] = m;
-    PL[base] = l;
-  }
-  __attribute__((opencl_unroll_hint))
-  for (int r = 0; r < 8; r++) PO[(((long)t * Q27_AQ + qh0 + r) * NS + sp) * 256 + sg * 16 + lane] = o[r];
+  if (sg == 0)
+    for (int p = 0; p < npass; p++) {
+      const int c = p * 16 + lane;
+      if (c < 8 * nr) {
+        const long base = ((long)(t0 + c / 8) * Q27_AQ + qh0 + c % 8) * NS + sp;
+        PM[base] = m[p];
+        PL[base] = l[p];
+      }
+    }
+  for (int q = 0; q < nr; q++)
+    __attribute__((opencl_unroll_hint))
+    for (int r = 0; r < 8; r++) PO[(((long)(t0 + q) * Q27_AQ + qh0 + r) * NS + sp) * 256 + sg * 16 + lane] = o[q][r];
 }
 #endif // Q27_GQA == 8
