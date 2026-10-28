@@ -14,17 +14,27 @@ inline ushort to_bf(float f) {
 #define MAX_TOPK 8
 
 // logits[row][e] = x[row] . gate[e] in fp32 (gate fp16 [n_experts, dim]); slot n_experts is the shared expert's gate.
-// Grid (n_experts + 1, rows), one sub-group a work-group; dim: a multiple of 8.
+// A lane's weight words (ROUTER_IT loads of 8 halves) are issued before the first FMA, so the whole table is in flight;
+// the FMA order a lane is unchanged. Grid (n_experts + 1, rows), one sub-group a work-group; dim: a multiple of 8,
+// dim / 8 at most SG * ROUTER_IT (2048: 16 loads a lane).
+#define ROUTER_IT 16
 __attribute__((intel_reqd_sub_group_size(SG)))
 __kernel void sage_router(__global const half *x, __global const half *gate, __global const half *shared_gate,
                           __global float *logits, uint dim) {
     const uint e = get_group_id(0), row = get_group_id(1), n = get_num_groups(0);
     const uint lane = get_sub_group_local_id();
     __global const half *w = e + 1 == n ? shared_gate : gate + (ulong)e * dim;
+    const uint it = dim / 8 / SG;
+    half8 wv[ROUTER_IT];
+    __attribute__((opencl_unroll_hint))
+    for (uint t = 0; t < ROUTER_IT; t++)
+        if (t < it) wv[t] = vload8(lane + SG * t, w);
     float acc = 0.0f;
-    for (uint i = lane; i < dim / 8; i += SG) {
-        const float8 xv = convert_float8(vload8(i, x + (ulong)row * dim)), wv = convert_float8(vload8(i, w));
-        for (uint j = 0; j < 8; j++) acc = fma(xv[j], wv[j], acc);
+    __attribute__((opencl_unroll_hint))
+    for (uint t = 0; t < ROUTER_IT; t++) {
+        if (t >= it) break;
+        const float8 xv = convert_float8(vload8(lane + SG * t, x + (ulong)row * dim)), wf = convert_float8(wv[t]);
+        for (uint j = 0; j < 8; j++) acc = fma(xv[j], wf[j], acc);
     }
     acc = sub_group_reduce_add(acc);
     if (lane == 0) logits[row * n + e] = acc;
