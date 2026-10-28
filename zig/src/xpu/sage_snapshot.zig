@@ -142,5 +142,6 @@ pub fn restore(r: *Runner, slot: u32, snap: Snap) !void {
     r.shift[slot] = 0;
     r.mpos[slot] = snap.at;
     r.sdraft[slot] = -1;
+    if (r.df) |df| df.restart(slot, snap.at); // the drafter's context starts at the state: its rows before are not kept
     r.block_rows = 0;
 }

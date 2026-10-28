@@ -43,7 +43,8 @@ pub const Slots = struct {
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
     vision: ?*Vision = null, // --vision
-    depth: u32 = 1, // MTP drafts a lone round (XPU_SPEC; 1 keeps 80 % of drafts on chat text)
+    depth: u32 = 1, // drafts a round (XPU_SPEC; the MTP's 1 keeps 80 % of drafts on chat text, DFlash: its block less one)
+    stats: bool = false, // XPU_SPEC_STATS: a line of the drafts by position at each stream's end
     held: [sage.MAX_SLOTS]u32 = @splat(0), // drafts a slot holds for its next window (specMulti makes them then)
     sampled_drafts: bool = true, // sampled streams take MTP drafts too (XPU_SAMPLED_DRAFTS=0: one row a round)
     draft_q: bool = true, // a sampled stream's first draft is drawn from the MTP's filtered row (XPU_SAMPLED_Q=0: its argmax)
@@ -104,12 +105,13 @@ pub const Slots = struct {
         break :blk v;
     };
 
-    /// With an MTP head: greedy windows of the pending row and `depth` held drafts, all in one specMulti forward.
+    /// With a drafter (MTP head or DFlash): greedy windows of the pending row and `depth` held drafts, all in one
+    /// specMulti forward.
     /// Without: one-row rounds, no drafts; the running streams' rows share one forward (stepMulti). The lane core shares a
     /// forward only for a width of 2 or more, so the width is 2 with copy drafts off: every window is one row.
     /// stepMulti's grouped expert kernels add in another order than step, so a near-tie can pick another token.
     pub fn facts(b: *const Slots) lanes.Model {
-        if (b.r.mtp != null) return .{ .exact_width = b.depth + 1, .copy_drafts = false, .gpu_tokens = false, .mtp = true, .speculate = true, .speculate_early = false, .sampled_drafts = b.sampled_drafts, .drafts = b.depth, .draft_streams = true, .hidden_rows = true, .streams_exact = true, .batch_rows = sage.WINDOW, .max_streams = b.r.slots };
+        if (b.r.drafting()) return .{ .exact_width = b.depth + 1, .copy_drafts = false, .gpu_tokens = false, .mtp = true, .speculate = true, .speculate_early = false, .sampled_drafts = b.sampled_drafts, .drafts = b.depth, .draft_streams = true, .hidden_rows = true, .streams_exact = true, .batch_rows = sage.WINDOW, .max_streams = b.r.slots };
         return .{ .exact_width = 2, .copy_drafts = false, .gpu_tokens = false, .mtp = false, .speculate = false, .speculate_early = false, .hidden_rows = true, .streams_exact = true, .batch_rows = b.r.slots, .max_streams = b.r.slots };
     }
 
@@ -589,7 +591,7 @@ pub const Slots = struct {
     /// window holds. specMulti makes them with its forward.
     fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
         const b = of(ptr);
-        if (b.r.mtp == null) return error.NoDraftHead;
+        if (!b.r.drafting()) return error.NoDraftHead;
         for (requests) |q| {
             const slot = b.slotOf(q.stream) orelse return error.UnknownStream;
             b.held[slot] = @min(q.depth, b.depth);
@@ -607,6 +609,7 @@ pub const Slots = struct {
         defer if (!handed) {
             b.owners[slot] = null;
             b.unlease(slot);
+            b.logStats();
         };
         var pending = b.drawn[(b.next - 1) % ring];
         _ = try s.commit(b.gpa, &.{pending}, &.{});
@@ -724,6 +727,20 @@ pub const Slots = struct {
         b.held[slot] = 0;
         b.filled[slot].on = false;
         b.unlease(slot);
+        b.logStats();
+    }
+
+    /// XPU_SPEC_STATS: the runner's rounds and drafts by position since the load, at a stream's end.
+    fn logStats(b: *Slots) void {
+        if (!b.stats) return;
+        const st = &b.r.stats;
+        var line: [1024]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&line);
+        w.print("sage-xpu spec: rounds {d} drafted", .{st.rounds}) catch {};
+        for (st.drafted[0..b.depth]) |x| w.print(" {d}", .{x}) catch {};
+        w.writeAll(" kept") catch {};
+        for (st.kept[0..b.depth]) |x| w.print(" {d}", .{x}) catch {};
+        std.log.info("{s}", .{w.buffered()});
     }
 };
 
@@ -1026,24 +1043,35 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         return null;
     }
     const slots: u32 = @min(@max(o.lanes, 1), sage.MAX_SLOTS);
-    // --drafter: the AutoRound checkpoint whose MTP head drafts for a lone greedy stream
-    const mtp = if (o.drafts) o.drafter else null;
-    const r = sage.Runner.initMtp(o.dir, context, slots, mtp) catch |err| {
+    // --drafter: the AutoRound checkpoint whose MTP head drafts, or a DFlash drafter (its config has dflash_config)
+    const drafter = if (o.drafts) o.drafter else null;
+    const block = if (drafter) |dd| dflashBlock(a, dd) else null;
+    const r = sage.Runner.initMtp(o.dir, context, slots, if (block == null) drafter else null) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "the XPU Sage engine could not load {s} with {d} streams of {d} tokens: {s}", .{ o.dir, slots, context, @errorName(err) });
         return null;
     };
     errdefer r.deinit();
+    if (block != null) {
+        // XPU_DFLASH_FULL: the context rows the drafter's full-attention layer sees (its sliding layers see their window)
+        const full: u32 = if (std.c.getenv("XPU_DFLASH_FULL")) |v| std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0 else sage.dflash.default_full;
+        r.df = sage.dflash.Drafter.init(r, drafter.?, @max(full, 1)) catch |err| {
+            problem.* = try std.fmt.allocPrint(a, "the XPU Sage engine could not load the DFlash drafter {s}: {s}", .{ drafter.?, @errorName(err) });
+            return null;
+        };
+    }
     const h = try gpa.create(Served);
     errdefer gpa.destroy(h);
     h.* = .{ .gpa = gpa, .back = try Slots.init(gpa, r), .cfg = undefined, .wall = .{ .io = io }, .core = undefined, .host = undefined };
     errdefer h.back.deinit();
     if (o.vision) |vo| h.back.vision = try Vision.open(gpa, io, a, r, o.dir, vo, problem) orelse return null;
     errdefer if (h.back.vision) |v| v.deinit(gpa);
+    if (block) |bl| h.back.depth = @min(bl, sage.WINDOW) - 1;
+    h.back.stats = std.c.getenv("XPU_SPEC_STATS") != null;
     if (std.c.getenv("XPU_SPEC")) |v| h.back.depth = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0;
     if (std.c.getenv("XPU_SAMPLED_DRAFTS")) |v| h.back.sampled_drafts = !std.mem.eql(u8, std.mem.span(v), "0");
     if (std.c.getenv("XPU_SAMPLED_Q")) |v| h.back.draft_q = !std.mem.eql(u8, std.mem.span(v), "0");
     if (h.back.depth == 0 or h.back.depth + 1 > sage.WINDOW) {
-        problem.* = try std.fmt.allocPrint(a, "XPU_SPEC: 1 to {d} MTP drafts a round, not {d}", .{ sage.WINDOW - 1, h.back.depth });
+        problem.* = try std.fmt.allocPrint(a, "XPU_SPEC: 1 to {d} drafts a round, not {d}", .{ sage.WINDOW - 1, h.back.depth });
         return null;
     }
     // --decode-priority off: each prompt pass runs whole, and the decoding streams wait for it
@@ -1069,7 +1097,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     h.back.publish();
     const pool_tokens = @as(u64, pages) * sage.PAGE;
     if (pool_tokens < context) std.log.warn("XPU Sage: the K/V pool holds {d} tokens, less than one stream's --context of {d}: a longer request is refused", .{ pool_tokens, context });
-    h.cfg = try lanes.Config.init(gpa, h.back.facts(), if (r.mtp != null) h.back.depth + 1 else 2, if (r.mtp != null) h.back.depth else 0);
+    h.cfg = try lanes.Config.init(gpa, h.back.facts(), if (r.drafting()) h.back.depth + 1 else 2, if (r.drafting()) h.back.depth else 0);
     errdefer h.cfg.deinit(gpa);
     h.core = lanes.Engine.init(gpa, &h.cfg, h.back.backend(), h.wall.clock());
     errdefer h.core.deinit();
@@ -1082,18 +1110,18 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     const rounds_text = if (share.p >= 1) "a decode round" else try std.fmt.allocPrint(a, "decode rounds for {d:.2} of the step's time", .{(1 - share.p) / share.p});
     const step_text = if (h.back.step > 0) try std.fmt.allocPrint(a, "prompt steps of {d} tokens, each followed by {s}", .{ h.back.step, rounds_text }) else "prompt passes whole";
     const cache_text = if (budget > 0) try std.fmt.allocPrint(a, "kept prompt states in up to {d:.2} GB of it ({d:.0} %)", .{ gb(budget), 100 * @as(f64, @floatFromInt(budget)) / @as(f64, @floatFromInt(pool_bytes)) }) else "no prompt cache";
-    h.startup = try std.fmt.allocPrint(gpa, "Intel GPU engine: Sage (qwen3_5_moe), {d} stream(s) of at most {d} tokens, a K/V pool of {d} pages ({d} tokens, {d:.2} GB, {s}), {s}, {d:.2} GB of the card kept free, {s}, sampling on the host{s}", .{ slots, context, pages, pool_tokens, gb(pool_bytes), if (r.cap > 0) "int8" else "bf16", cache_text, gb(cardReserve()), step_text, if (r.mtp == null) "" else if (h.back.sampled_drafts) ", MTP drafts for greedy and sampled streams" else ", MTP drafts for greedy streams" });
+    h.startup = try std.fmt.allocPrint(gpa, "Intel GPU engine: Sage (qwen3_5_moe), {d} stream(s) of at most {d} tokens, a K/V pool of {d} pages ({d} tokens, {d:.2} GB, {s}), {s}, {d:.2} GB of the card kept free, {s}, sampling on the host{s}", .{ slots, context, pages, pool_tokens, gb(pool_bytes), if (r.cap > 0) "int8" else "bf16", cache_text, gb(cardReserve()), step_text, try draftText(a, r, h.back.depth, h.back.sampled_drafts) });
     h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "sage-xpu", .lanes = slots, .context_window = context, .context_fitted = true, .startup = h.startup, .prefill_step = 0, .structures = true });
     h.host.explain = .{ .text = lane.explain };
     h.host.share = share;
     h.host.info_.admit = .{ .ctx = &h.back, .fits = Slots.fitsFn }; // a request waits until the pool can promise its pages
     h.host.kv_pool = .{ .ctx = &h.back, .read = Slots.poolRead };
     if (h.back.vision) |v| h.host.info_.vision = v.offer(o.vision.?);
-    if (r.mtp != null) h.host.lone = .{ .ctx = &h.back, .run = Slots.loneFn };
+    if (r.drafting()) h.host.lone = .{ .ctx = &h.back, .run = Slots.loneFn };
     if (budget > 0) {
         // kept and resumed only at multiples of 64 tokens (planned, grid): every cut a resumed pass adds splits a CHUNK
         // into pieces of more than WINDOW rows, which the chunk kernels compute as the whole chunk does. The MTP's
-        // last row reads the token after a state (lookahead).
+        // last row reads the token after a state (lookahead). DFlash's context rows are the target's, read by none.
         h.cache = api.prompt_cache.Store.init(gpa, h.back.snapshots(), .{ .lookahead = if (r.mtp != null) 1 else 0, .planned = true, .grid = 64 }, budget);
         h.host.cache = &h.cache.?;
         h.back.store = &h.cache.?;
@@ -1153,7 +1181,7 @@ fn fitsCard(a: Allocator, r: *sage.Runner, slots: u32, pages: u32, problem: *[]c
     std.log.info("XPU: the load holds {d:.2} GB of the card's {d:.2} GB ({d:.2} GB kept free for a prompt pass and the driver), {d:.2} GB of it the K/V pool", .{ gb(need), gb(mem.size), gb(keep), gb(pool) });
     if (need <= room and pages > 0) return true;
     const most = (room -| (r.d.allocated + held_not_counted)) / page * sage.PAGE;
-    problem.* = try std.fmt.allocPrint(a, "the XPU Sage engine needs {d:.2} GB for {d} stream(s){s} with a K/V pool of {d} tokens ({d:.2} GB, --kv-pool-tokens), and the card has {d:.2} GB with {d:.2} GB kept free. The pool fits at most {d} tokens. Set a smaller --kv-pool-tokens, or fewer --parallel slots", .{ gb(need), slots, if (r.mtp != null) " with the MTP head" else "", @as(u64, pages) * sage.PAGE, gb(pool), gb(mem.size), gb(keep), most });
+    problem.* = try std.fmt.allocPrint(a, "the XPU Sage engine needs {d:.2} GB for {d} stream(s){s} with a K/V pool of {d} tokens ({d:.2} GB, --kv-pool-tokens), and the card has {d:.2} GB with {d:.2} GB kept free. The pool fits at most {d} tokens. Set a smaller --kv-pool-tokens, or fewer --parallel slots", .{ gb(need), slots, if (r.mtp != null) " with the MTP head" else if (r.df != null) " with the DFlash drafter" else "", @as(u64, pages) * sage.PAGE, gb(pool), gb(mem.size), gb(keep), most });
     return false;
 }
 
@@ -1176,6 +1204,25 @@ fn poolMade(a: Allocator, r: *sage.Runner, pages: u32, problem: *[]const u8) !bo
         return false;
     };
     return true;
+}
+
+/// The block size of the DFlash drafter in `dir` (its config.json has dflash_config), or null for another drafter.
+fn dflashBlock(a: Allocator, dir: []const u8) ?u32 {
+    const path = std.fmt.allocPrint(a, "{s}/config.json", .{dir}) catch return null;
+    const bytes = sage.readFile(path) catch return null;
+    defer std.heap.c_allocator.free(bytes);
+    const C = struct { dflash_config: ?struct { block_size: u32 = 16 } = null };
+    const parsed = std.json.parseFromSlice(C, a, bytes, .{ .ignore_unknown_fields = true }) catch return null;
+    const dc = parsed.value.dflash_config orelse return null;
+    return dc.block_size;
+}
+
+/// The startup line's drafter part: the MTP's, or DFlash's block, context rings and weights.
+fn draftText(a: Allocator, r: *const sage.Runner, depth: u32, sampled: bool) ![]const u8 {
+    const who = if (sampled) "greedy and sampled streams" else "greedy streams";
+    if (r.df) |df| return std.fmt.allocPrint(a, ", DFlash drafts for {s} (blocks of {d} rows, at most {d} a slot at {d} slots; context rings {d:.2} GB, the full layer's {d} rows; weights {d:.2} GB)", .{ who, depth + 1, sage.WINDOW / r.slots, r.slots, gb(df.ctx_bytes), df.fullWindow(), gb(df.weight_bytes) });
+    if (r.mtp == null) return "";
+    return std.fmt.allocPrint(a, ", MTP drafts for {s}", .{who});
 }
 
 fn gb(b: u64) f64 {

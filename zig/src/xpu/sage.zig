@@ -12,6 +12,8 @@ const fwd = @import("forward.zig");
 const q = @import("qwen27.zig"); // the profiler state (XPU_PROFILE) the Dev records into
 /// A slot's prompt state for the prompt cache (Runner.saveSlot, restoreSlot).
 pub const snapshot = @import("sage_snapshot.zig");
+/// The DFlash (v1) block drafter, in place of the MTP head (--drafter names its checkpoint).
+pub const dflash = @import("sage_dflash.zig");
 const Dev = dev.Dev;
 const Checkpoint = dev.Checkpoint;
 const Proj = loader.Proj;
@@ -494,6 +496,8 @@ pub const Runner = struct {
     shift: [MAX_SLOTS]i32 = @splat(0), // M-RoPE: a row past a slot's images turns at its index plus this
     rope_host: [][3]i32 = &.{}, // a forward's rows' positions on their way to acts.rope
     mtp: ?*Mtp = null, // XPU_MTP: the drafter (an AutoRound checkpoint directory)
+    df: ?*dflash.Drafter = null, // the DFlash drafter: drafts a block of a slot in one forward (no MTP then)
+    stats: SpecStats = .{}, // drafts and kept drafts by position in the block, all slots
     sdraft: [MAX_SLOTS]i32 = @splat(-1), // each slot's first draft, from its newest absorbed row
     hin_last: u32 = 0, // the row of mtp.hin that absorb's last row read
     sdrawn: [MAX_SLOTS]bool = @splat(false), // the slot's first draft is a Judge.draft draw (else the MTP's argmax)
@@ -501,6 +505,25 @@ pub const Runner = struct {
     verifying: bool = false, // forward runs a block for verify: every row's token, states kept for commit
     block: [WINDOW]i32 = undefined, // the last verified block's greedy tokens, a row each
     block_rows: u32 = 0,
+
+    /// Speculative rounds of all slots since the load: a round with n drafts counts drafted[0..n], and kept[j] when its
+    /// drafts 0..j all landed (XPU_SPEC_STATS prints them).
+    pub const SpecStats = struct {
+        rounds: u64 = 0,
+        drafted: [WINDOW]u64 = @splat(0),
+        kept: [WINDOW]u64 = @splat(0),
+
+        fn note(st: *SpecStats, drafts: usize, landed: usize) void {
+            st.rounds += 1;
+            for (st.drafted[0..drafts]) |*x| x.* += 1;
+            for (st.kept[0..landed]) |*x| x.* += 1;
+        }
+    };
+
+    /// Whether a drafter makes drafts: the MTP head or DFlash.
+    pub fn drafting(r: *const Runner) bool {
+        return r.mtp != null or r.df != null;
+    }
 
     /// specMulti's host side for sampled slots (Leviathan and Chen speculative sampling). `keep` gets slot i's block
     /// (its rows from `row` of the logits, `ids` the pending token then the drafts) and returns null for a greedy
@@ -623,6 +646,7 @@ pub const Runner = struct {
     pub const snapFits = snapshot.fits;
 
     pub fn deinit(r: *Runner) void {
+        if (r.df) |df| df.deinit(); // its host tables, while the queue can still settle
         r.d.deinit();
         r.ckpt.deinit();
         alloc.free(r.model.layers);
@@ -717,6 +741,11 @@ pub const Runner = struct {
         for (m.layers) |*l| if (!l.attn) for (slots) |slot| {
             l.st[slot].conv_cur = 1 - l.st[slot].conv_cur;
         };
+        if (r.df) |df| {
+            var rows: [WINDOW]dflash.Absorb = undefined;
+            for (slots, 0..) |slot, t| rows[t] = .{ .slot = slot, .taps = off(df.taps, t * dflash.TAPS * 2), .n = 1, .at = r.spos[slot] };
+            try df.absorbMulti(rows[0..T]);
+        }
         for (slots, out) |slot, o| {
             r.spos[slot] += 1;
             r.slast[slot] = o;
@@ -815,6 +844,7 @@ pub const Runner = struct {
             try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_out, a.r, T);
             try d.launch(d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, D, EPS, @as(i32, 1), gs, nul, nul, zero, zero });
             try r.moe(l, T);
+            if (r.df) |df| try df.tapLayer(i, a.x, a.r, T);
         }
     }
 
@@ -839,6 +869,7 @@ pub const Runner = struct {
         r.mpos[r.cur] = 0;
         r.sdraft[r.cur] = -1;
         r.sdrawn[r.cur] = false;
+        if (r.df) |df| df.reset(r.cur);
     }
 
     /// Feeds tokens in chunks of CHUNK rows (a tail of WINDOW rows or less as one decode forward); `last` afterwards
@@ -856,6 +887,7 @@ pub const Runner = struct {
                 follow[n - 1] = if (tail) r.last else ids[at + n];
                 try r.absorb(follow[0..n], p0);
             }
+            if (r.df) |df| try df.absorb(r.cur, df.taps, @intCast(n), p0);
             at += n;
         }
     }
@@ -879,6 +911,7 @@ pub const Runner = struct {
             follow[ids.len - 1] = next orelse r.last;
             try r.absorb(follow[0..ids.len], p0);
         }
+        if (r.df) |df| try df.absorb(r.cur, df.taps, @intCast(ids.len), p0);
     }
 
     /// The MTP over the last forward's rows (their normed final hidden in acts.h) at slots p0..: `follow` holds the
@@ -998,7 +1031,7 @@ pub const Runner = struct {
     /// the kept rows committed and absorbed. The tokens it yields go to `out` (1 to k + 1 of them); r.last is the
     /// newest, not yet fed.
     pub fn specStep(r: *Runner, k: u32, out: []i32) !usize {
-        const mt = r.mtp orelse return error.NoMtpHead;
+        if (!r.drafting()) return error.NoMtpHead;
         const s = r.z.s;
         if (k == 0 or k + 1 > WINDOW or out.len < k + 1) return error.BadDrafts;
         const n: u32 = @min(k, r.room(r.cur) -| r.pos -| 1);
@@ -1009,19 +1042,27 @@ pub const Runner = struct {
         }
         var blk: [WINDOW]i32 = undefined;
         blk[0] = r.last;
-        blk[1] = r.sdraft[r.cur];
-        var j: u32 = 1;
-        while (j < n) : (j += 1) { // chained drafts: the row before's output, at the next MTP slots
-            try dev.copy(&r.d, mt.hin, off(mt.state, r.cur * s.hidden * 2), s.hidden * 2);
-            blk[j + 1] = try r.mtpForward(blk[j .. j + 1], r.mpos[r.cur] + j - 1);
+        if (r.df) |df| { // the block's drafts in one drafter forward
+            var d1: [1][WINDOW]i32 = undefined;
+            try df.propose(&.{.{ .slot = r.cur, .pending = r.last, .rows = n + 1, .at = r.pos }}, &d1);
+            @memcpy(blk[1 .. n + 1], d1[0][0..n]);
+        } else {
+            const mt = r.mtp.?;
+            blk[1] = r.sdraft[r.cur];
+            var j: u32 = 1;
+            while (j < n) : (j += 1) { // chained drafts: the row before's output, at the next MTP slots
+                try dev.copy(&r.d, mt.hin, off(mt.state, r.cur * s.hidden * 2), s.hidden * 2);
+                blk[j + 1] = try r.mtpForward(blk[j .. j + 1], r.mpos[r.cur] + j - 1);
+            }
         }
         const p0 = r.pos;
         const g = try r.verify(blk[0 .. n + 1]);
         var a: usize = 0;
         while (a < n and blk[a + 1] == g[a]) a += 1;
         @memcpy(out[0 .. a + 1], g[0 .. a + 1]);
+        r.stats.note(n, a);
         try r.commit(@intCast(a + 1));
-        try r.absorb(out[0 .. a + 1], p0);
+        if (r.df) |df| try df.absorb(r.cur, df.taps, @intCast(a + 1), p0) else try r.absorb(out[0 .. a + 1], p0);
         return a + 1;
     }
 
@@ -1031,7 +1072,7 @@ pub const Runner = struct {
     /// newest of them is its last, not yet fed. With `judge`, a slot it samples keeps the rows judge.keep picks, and
     /// its next first draft is judge.draft's draw.
     pub fn specMulti(r: *Runner, slots: []const u32, k: u32, out: [][WINDOW]i32, n: []usize, judge: ?Judge) !void {
-        const mt = r.mtp orelse return error.NoMtpHead;
+        if (!r.drafting()) return error.NoMtpHead;
         const S: u32 = @intCast(slots.len);
         if (S == 0 or S > MAX_SLOTS or out.len < S or n.len < S) return error.BadWindow;
         if (k == 0 or k + 1 > WINDOW) return error.BadDrafts;
@@ -1048,6 +1089,8 @@ pub const Runner = struct {
         var wn: [MAX_SLOTS]u32 = undefined;
         var p0: [MAX_SLOTS]u32 = undefined;
         var T: u32 = 0;
+        var blocks: [MAX_SLOTS]dflash.Block = undefined;
+        var nb: usize = 0;
         for (slots, 0..) |slot, i| {
             if (slot >= r.slots) return error.BadSlot;
             for (slots[0..i]) |o| if (o == slot) return error.SlotTwice;
@@ -1057,6 +1100,15 @@ pub const Runner = struct {
             wn[i] = nd + 1;
             p0[i] = r.spos[slot];
             ids[T] = r.slast[slot];
+            if (r.df != null) {
+                if (nd > 0) {
+                    blocks[nb] = .{ .slot = slot, .pending = r.slast[slot], .rows = nd + 1, .at = r.spos[slot] };
+                    nb += 1;
+                }
+                T += nd + 1;
+                continue;
+            }
+            const mt = r.mtp.?;
             if (nd > 0) ids[T + 1] = r.sdraft[slot];
             if (nd > 1) { // chained drafts on the slot's own MTP cache, as specStep
                 try r.use(slot);
@@ -1068,6 +1120,15 @@ pub const Runner = struct {
             }
             T += nd + 1;
         }
+        if (r.df) |df| if (nb > 0) { // every slot's block in one drafter forward
+            var dr: [MAX_SLOTS][WINDOW]i32 = undefined;
+            try df.propose(blocks[0..nb], dr[0..nb]);
+            var b: usize = 0;
+            for (0..S) |i| if (wn[i] > 1) {
+                @memcpy(ids[wf[i] + 1 ..][0 .. wn[i] - 1], dr[b][0 .. wn[i] - 1]);
+                b += 1;
+            };
+        };
         try r.use(home);
         // the blocks: the per-row kernels of verify, every row's greedy token into block
         r.verifying = true;
@@ -1088,6 +1149,7 @@ pub const Runner = struct {
         var mids: [WINDOW]i32 = undefined;
         var mpos: [WINDOW]i32 = undefined;
         var mlast: [MAX_SLOTS]u32 = undefined;
+        var absorbs: [MAX_SLOTS]dflash.Absorb = undefined;
         var Tm: u32 = 0;
         for (slots, 0..) |slot, i| {
             const keep = judged[i] orelse greedy: {
@@ -1112,6 +1174,12 @@ pub const Runner = struct {
             };
             r.spos[slot] += keep;
             r.slast[slot] = blk[keep - 1];
+            r.stats.note(wn[i] - 1, keep - 1);
+            if (r.df) |df| { // the kept rows' taps, the slot's context from p0
+                absorbs[i] = .{ .slot = slot, .taps = off(df.taps, wf[i] * dflash.TAPS * 2), .n = @intCast(keep), .at = p0[i] };
+                continue;
+            }
+            const mt = r.mtp.?;
             // the MTP rows: the kept rows' hidden with the token after each
             try dev.copy(d, off(mt.hin, Tm * s.hidden * 2), off(a.h, wf[i] * s.hidden * 2), keep * s.hidden * 2);
             for (0..keep) |j| {
@@ -1122,7 +1190,10 @@ pub const Runner = struct {
             mlast[i] = Tm - 1;
         }
         r.enter(home);
-        try r.mtpMulti(slots, mids[0..Tm], mpos[0..Tm], n[0..S], mlast[0..S], judge);
+        if (r.df) |df| {
+            try df.absorbMulti(absorbs[0..S]);
+            for (slots) |slot| r.sdraft[slot] = -1;
+        } else try r.mtpMulti(slots, mids[0..Tm], mpos[0..Tm], n[0..S], mlast[0..S], judge);
         for (slots, 0..) |slot, i| r.mpos[slot] = p0[i] + @as(u32, @intCast(n[i]));
     }
 
@@ -1194,6 +1265,7 @@ pub const Runner = struct {
     /// One serial decode token.
     pub fn step(r: *Runner, token: i32) !void {
         r.last = try r.forward(&.{token}, true, .{});
+        if (r.df) |df| try df.absorb(r.cur, df.taps, 1, r.pos - 1);
     }
 
     /// Runs a block at r.pos (2 to WINDOW rows: the pending token, then drafts) and returns each row's greedy token,
@@ -1295,6 +1367,7 @@ pub const Runner = struct {
             try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_out, a.r, T);
             try d.launch(d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, D, EPS, @as(i32, 1), gs, nul, nul, zero, zero });
             try r.moe(l, T);
+            if (r.df) |df| try df.tapLayer(i, a.x, a.r, T);
         }
         r.pos += T;
         return r.head(T, want);
@@ -1353,6 +1426,7 @@ pub const Runner = struct {
             try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_out, a.r, T);
             try d.launch(d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, D, EPS, @as(i32, 1), gs, nul, nul, zero, zero });
             try r.moe(l, T);
+            if (r.df) |df| try df.tapLayer(i, a.x, a.r, T);
         }
         r.pos += T;
         return r.head(T, want);
@@ -1409,7 +1483,7 @@ pub const Runner = struct {
     }
 
     /// T rows of h (fp16 [T, D], with their group sums for the 4/64 head) to logits: the GEMM, or fp16 rows.
-    fn headRows(r: *Runner, h: *anyopaque, ahi: *anyopaque, alo: *anyopaque, T: u32) !void {
+    pub fn headRows(r: *Runner, h: *anyopaque, ahi: *anyopaque, alo: *anyopaque, T: u32) !void {
         const m = &r.model;
         const a = &r.acts;
         const v: i32 = @intCast(r.z.s.vocab);
@@ -1577,7 +1651,7 @@ fn kernels(d: *Dev, mk: *MoeKernels) !void {
     };
 }
 
-fn readFile(path: []const u8) ![]u8 {
+pub fn readFile(path: []const u8) ![]u8 {
     const z = try std.fmt.allocPrintSentinel(alloc, "{s}", .{path}, 0);
     defer alloc.free(z);
     const fd = open(z.ptr, 0);

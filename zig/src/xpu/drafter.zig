@@ -65,7 +65,7 @@ pub const Block = struct { slot: u32, pending: u32 };
 pub const Absorb = struct { slot: u32, taps: *anyopaque, n: u32, rows: ?[]const u32 = null };
 
 /// A device-side MLX affine part (words [n, k/8], scales and biases bf16 [n, k/64]) to repack at column n0.
-const Mlx = struct { w: *anyopaque, s: *anyopaque, b: *anyopaque, n: u32 };
+pub const Mlx = struct { w: *anyopaque, s: *anyopaque, b: *anyopaque, n: u32 };
 
 pub const Drafter = struct {
     r: *q.Runner,
@@ -113,7 +113,7 @@ pub const Drafter = struct {
     ids: *anyopaque,
     pscr: *anyopaque,
 
-    fn pack(d: *q.Dev, parts: []const Mlx, k: u32, wide: bool) !q.Proj {
+    pub fn pack(d: *q.Dev, parts: []const Mlx, k: u32, wide: bool) !q.Proj {
         var n_real: u32 = 0;
         for (parts) |p| n_real += p.n;
         const n = (n_real + 255) / 256 * 256;

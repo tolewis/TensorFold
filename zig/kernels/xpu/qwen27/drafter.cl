@@ -1,4 +1,6 @@
 // DFlash2 drafter for Qwen3.8-27B on Intel Xe2: 5 layers, a block of L rows attending its context window and itself.
+// Built again with -DD, -DTAPS and -DFF for the DFlash (v1) drafter of Sage-A1.5 (sage_dflash.zig): dattn_win,
+// dswiglu and tap_rows below are its own; the defaults are the 27B's.
 
 // group means stored × ASC (and B · group / ASC): the low half stays out of fp16 subnormals
 #ifndef ASC
@@ -7,7 +9,15 @@
 #pragma OPENCL FP_CONTRACT OFF
 
 #define GS 64
-#define D 5120
+#ifndef D
+#define D 5120             // the target's hidden size, the drafter's too
+#endif
+#ifndef TAPS
+#define TAPS 25600         // a row of target taps: the tapped layers times D
+#endif
+#ifndef FF
+#define FF 17408           // the drafter's MLP width
+#endif
 #define HD 128
 #define NH 32
 #define NKV 8
@@ -161,16 +171,16 @@ KERNEL(256) void rowsums_rows(global const half *H, int K, global half *AHI, glo
 }
 
 // Target taps bf16 [n, 25 600] to fp16 with row sums (fc's input). Grid n, groups of 256.
-KERNEL(256) void taps_in(global const ushort *TAPS, global half *H, global half *AHI, global half *ALO) {
-  local half hl[25600];
+KERNEL(256) void taps_in(global const ushort *T, global half *H, global half *AHI, global half *ALO) {
+  local half hl[TAPS];
   const int r = get_group_id(0);
-  for (int e = get_local_id(0); e < 25600; e += 256) {
-    const half v = convert_half_rte(bf2f(TAPS[(long)r * 25600 + e]));
-    H[(long)r * 25600 + e] = v;
+  for (int e = get_local_id(0); e < TAPS; e += 256) {
+    const half v = convert_half_rte(bf2f(T[(long)r * TAPS + e]));
+    H[(long)r * TAPS + e] = v;
     hl[e] = v;
   }
   barrier(CLK_LOCAL_MEM_FENCE);
-  rowsums(hl, 25600, AHI, ALO, r);
+  rowsums(hl, TAPS, AHI, ALO, r);
 }
 
 // fp16 [n, D] to the fp32 residual stream (rounded to bf16): the drafter's x after fc's norm or the embedding.
@@ -224,4 +234,84 @@ kernel void quantize4(global const ushort *W, int N, int K, global uint *MW, glo
     }
     MW[(long)n * (K / 8) + g * (GS / 8) + w] = word;
   }
+}
+
+// Block attention with a window a layer and a choice of mask in the block (DFlash v1): a row sees the context rows
+// within WIN before it, then every block row (CAUSAL 0) or the block rows up to its own (CAUSAL 1). K, V in a ring.
+KERNEL(16) void dattn_win(global const ushort *Q, global const ushort *KC, global const ushort *VC, int CAP, int c0,
+                          int pos0, int L, int WIN, int CAUSAL, float scale, global half *O, global const int4 *ROWS,
+                          global const ulong *PTRS) {
+  const int r = get_group_id(0), h = get_group_id(1), lane = get_sub_group_local_id();
+  int p = pos0 + r, bs = pos0;
+  if (ROWS) {                                         // several blocks: the row's position, context start, block start
+    const int4 ri = ROWS[r];
+    p = ri.x;
+    c0 = ri.y;
+    bs = ri.z;
+    KC = (global const ushort *)PTRS[ri.w * 2];
+    VC = (global const ushort *)PTRS[ri.w * 2 + 1];
+  }
+  float q[4][8], o[4][8], m[4], l[4];
+  for (int a = 0; a < 4; a++) {
+    for (int i = 0; i < 8; i++) {
+      q[a][i] = bf2f(Q[((long)r * NH + h * 4 + a) * HD + i * 16 + lane]);
+      o[a][i] = 0.0f;
+    }
+    m[a] = -INFINITY;
+    l[a] = 0.0f;
+  }
+  const int first = max(c0, min(bs, p - WIN)), last = CAUSAL ? p : bs + L - 1;
+  for (int j = first; j <= last; j++) {
+    float kv[8];
+    const long jr = (long)h * CAP + j % CAP;          // the cache is a ring of CAP positions
+    for (int i = 0; i < 8; i++) kv[i] = bf2f(KC[jr * HD + i * 16 + lane]);
+    float sc[4];
+    for (int a = 0; a < 4; a++) {
+      float d = 0.0f;
+      for (int i = 0; i < 8; i++) d += q[a][i] * kv[i];
+      sc[a] = sub_group_reduce_add(d) * scale;
+    }
+    for (int i = 0; i < 8; i++) kv[i] = bf2f(VC[jr * HD + i * 16 + lane]);
+    for (int a = 0; a < 4; a++) {
+      const float mn = fmax(m[a], sc[a]);
+      const float al = exp(m[a] - mn), p = exp(sc[a] - mn);
+      l[a] = l[a] * al + p;
+      for (int i = 0; i < 8; i++) o[a][i] = o[a][i] * al + p * kv[i];
+      m[a] = mn;
+    }
+  }
+  for (int a = 0; a < 4; a++)
+    for (int i = 0; i < 8; i++) O[(long)r * NH * HD + (h * 4 + a) * HD + i * 16 + lane] = convert_half_rte(rbf(o[a][i] / l[a]));
+}
+
+// SwiGLU of the drafter's gate|up rows (GU fp16 [n, NS], gate then up): act = fp16(bf16(SiLU(g)·u)) and its row
+// sums, a group of 256 per 1 024 columns.
+KERNEL(256) void dswiglu(global const half *GU, int NS, global half *H, global half *AHI, global half *ALO) {
+  local half hl[1024];
+  const int t = get_group_id(0), blk = get_group_id(1), lid = get_local_id(0);
+  const int e = lid * 4, c = blk * 1024 + e;
+  const half4 gv = vload4(0, GU + (long)t * NS + c), uv = vload4(0, GU + (long)t * NS + FF + c);
+  half4 y;
+  for (int i = 0; i < 4; i++) {
+    const float g = (float)gv[i];
+    y[i] = convert_half_rte(rbf(g / (1.0f + exp(-g)) * (float)uv[i]));
+  }
+  vstore4(y, 0, H + (long)t * FF + c);
+  vstore4(y, 0, hl + e);
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const int lane = get_sub_group_local_id(), sg = get_sub_group_id();
+  float s = 0.0f;
+  for (int k = 0; k < 4; k++) s += (float)hl[sg * GS + lane * 4 + k];
+  s = sub_group_reduce_add(s) * (1.0f / GS);
+  if (lane == 0) {
+    const half hi = convert_half_rte(s * ASC);
+    AHI[(long)t * (FF / GS) + blk * 16 + sg] = hi;
+    ALO[(long)t * (FF / GS) + blk * 16 + sg] = convert_half_rte(s * ASC - (float)hi);
+  }
+}
+
+// A target layer's tap: T[t][slot·D + e] = bf16(x + r), the residual stream after the layer, a row of TAPS.
+KERNEL(256) void tap_rows(global const float *X, global const half *R, global ushort *T, int slot) {
+  const int t = get_group_id(1), e = get_global_id(0);
+  if (e < D) T[(long)t * TAPS + slot * D + e] = f2bf(rbf(X[(long)t * D + e] + (float)R[(long)t * D + e]));
 }

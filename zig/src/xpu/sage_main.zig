@@ -278,6 +278,8 @@ pub fn main(init: std.process.Init) !void {
     const t_load = now();
     const r = try sage.Runner.init(argv[1], ctx, slots);
     defer r.deinit();
+    // XPU_DFLASH: a DFlash drafter's directory, in place of XPU_MTP (XPU_DFLASH_FULL: its full layer's context rows)
+    if (std.c.getenv("XPU_DFLASH")) |dd| r.df = try sage.dflash.Drafter.init(r, std.mem.span(dd), if (std.c.getenv("XPU_DFLASH_FULL")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else sage.dflash.default_full);
     std.debug.print("loaded in {d:.1} s\n", .{now() - t_load});
     if (argv.len > 3 and std.mem.eql(u8, argv[3], "--nll")) return nll(r, ids.items);
     if (slots > 1) if (std.c.getenv("XPU_SPEC")) |v| return specMultiCheck(r, ids.items, steps, try std.fmt.parseInt(u32, std.mem.span(v), 10));
@@ -521,6 +523,7 @@ fn mtpCheck(r: *sage.Runner, ids: []const i32, steps: usize, k: u32) !void {
     try got.append(alloc, r.last);
     var buf: [sage.WINDOW]i32 = undefined;
     var nsteps: usize = 0;
+    @import("dev.zig").profReport("load, prompts and plain decode");
     const t2 = now();
     while (got.items.len < steps) : (nsteps += 1) {
         const n = try r.specStep(k, &buf);

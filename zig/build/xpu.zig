@@ -26,6 +26,8 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .{ "sage_glue", "zig/kernels/xpu/qwen27/glue.cl", " " ++ sage_config.sage_defines },
         .{ "sage_decode", "zig/kernels/xpu/qwen27/decode.cl", " " ++ sage_config.sage_defines },
         .{ "sage_moe", "zig/kernels/xpu/sage_moe.cl", "" },
+        // its DFlash (v1) drafter (z-lab Qwen3.6-35B-A3B-DFlash: hidden 2048, 8 taps, MLP 6144)
+        .{ "sage_drafter", "zig/kernels/xpu/qwen27/drafter.cl", " -DD=2048 -DTAPS=16384 -DFF=6144" },
         .{ "qwen_vision", "zig/kernels/xpu/qwen_vision.cl", "" },
     }) |k| {
         const c = b.addSystemCommand(&.{ ocloc, "compile", "-q", "-file" });
@@ -66,6 +68,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         \\pub const gemm128 align(8) = @embedFile("gemm128.bin").*;
         \\pub const gdn align(8) = @embedFile("gdn.bin").*;
         \\pub const drafter align(8) = @embedFile("drafter.bin").*;
+        \\pub const sage_drafter align(8) = @embedFile("sage_drafter.bin").*;
         \\pub const ngen_wide align(8) = @embedFile("ngen_wide.zebin").*;
         \\pub const ngen_narrow align(8) = @embedFile("ngen_narrow.zebin").*;
         \\pub const ngen_wide128 align(8) = @embedFile("ngen_wide128.zebin").*;
