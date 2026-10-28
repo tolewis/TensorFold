@@ -328,8 +328,13 @@ pub const Gpu = struct {
     }
 
     pub fn module(g: *Gpu, bin: []const u8) Error!H {
+        return g.moduleWith(bin, null);
+    }
+
+    /// As  with driver build flags (e.g. "-ze-opt-large-register-file").
+    pub fn moduleWith(g: *Gpu, bin: []const u8, flags: ?[*:0]const u8) Error!H {
         var m: H = null;
-        try check(g.api.zeModuleCreate(g.context, g.device, &.{ .inputSize = bin.len, .pInputModule = bin.ptr }, &m, null));
+        try check(g.api.zeModuleCreate(g.context, g.device, &.{ .inputSize = bin.len, .pInputModule = bin.ptr, .pBuildFlags = flags }, &m, null));
         return keep(&g.owned.modules, m, g.api.zeModuleDestroy);
     }
 
