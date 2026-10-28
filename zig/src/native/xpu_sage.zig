@@ -58,6 +58,9 @@ pub const Slots = struct {
     pages_kept: std.atomic.Value(u64) = .init(0), // pages only kept states hold: evicting them frees these
     store: ?*api.prompt_cache.Store = null, // the prompt cache, whose kept states the pool evicts for a lease (reclaimFn)
     kept: u64 = 0, // pages one kept state or more holds
+    prof_rounds: u32 = 0, // XPU_PROFILE: verify rounds since the last round table
+    prof_wall: f64 = 0, // and their host wall time (s)
+    prof_rows: u64 = 0, // and the rows their windows fed
     gdn_pages: u32 = 0, // pool pages a kept state's GDN states take
     step: usize = default_step, // a prompt step's tokens (--prefill-chunk); 0: the pass runs whole (--decode-priority off)
     filled: [sage.MAX_SLOTS]Fill = @splat(.{}), // each slot's prompt pass between steps
@@ -437,6 +440,8 @@ pub const Slots = struct {
     fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const b = of(ptr);
         const r = b.r;
+        const t0 = xq.now();
+        defer if (xq.prof.on) b.profRound(windows, t0);
         if (windows.len == 0 or windows.len > r.slots or windows.len != out.len) return error.BadWindows;
         var slots: [sage.MAX_SLOTS]u32 = undefined;
         var toks: [sage.MAX_SLOTS]i32 = undefined;
@@ -480,6 +485,22 @@ pub const Slots = struct {
             }
             @memcpy(o.drafts, w.tokens);
         }
+    }
+
+    /// XPU_PROFILE: every 64 verify rounds, the host wall time a round, the GPU time a round and the kernel table.
+    fn profRound(b: *Slots, windows: []const be.Window, t0: f64) void {
+        b.prof_wall += xq.now() - t0;
+        b.prof_rounds += 1;
+        for (windows) |w| b.prof_rows += w.rows() + w.held;
+        if (b.prof_rounds < 32) return;
+        var gpu: f64 = 0;
+        for (xq.prof.total) |t| gpu += t;
+        const n: f64 = @floatFromInt(b.prof_rounds);
+        std.debug.print("round table: {d} rounds, {d} windows, {d:.2} rows a round, {d:.3} ms wall a round, {d:.3} ms GPU a round, {d:.3} ms host a round\n", .{ b.prof_rounds, windows.len, @as(f64, @floatFromInt(b.prof_rows)) / n, b.prof_wall / n * 1e3, gpu / n * 1e3, (b.prof_wall - gpu) / n * 1e3 });
+        xq.profReport("rounds");
+        b.prof_rounds = 0;
+        b.prof_wall = 0;
+        b.prof_rows = 0;
     }
 
     /// The windows with held drafts, grouped by depth, each group one specMulti: it drafts, verifies and commits.
