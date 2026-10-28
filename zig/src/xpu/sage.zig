@@ -521,6 +521,7 @@ pub const Runner = struct {
     verifying: bool = false, // forward runs a block for verify: every row's token, states kept for commit
     gdn_old: u8 = 0, // XPU_GDN_OLD: 1 the 16-row gdn_step windows (the base's prompt GDN), 2 one gdn_pre and one gdn_step over the chunk
     gdn_check: bool = false, // XPU_GDN_CHECK=1: gdn_step beside the chunk kernels, the difference printed (gdnCheck)
+    attn_fa: bool = false, // XPU_ATTN_FA=1: attn_prompt8_fa (the FA2 orientation) for the int8 prompt attention
     gdn_probe: bool = false, // XPU_GDN_PROBE=1: the overflow probe after each prompt chunk's GDN (gdnProbe)
     block: [WINDOW]i32 = undefined, // the last verified block's greedy tokens, a row each
     block_rows: u32 = 0,
@@ -578,6 +579,7 @@ pub const Runner = struct {
         r.rope_host = try alloc.alloc([3]i32, CHUNK);
         q.prof.on = std.c.getenv("XPU_PROFILE") != null; // not during the load
         r.gdn_probe = std.c.getenv("XPU_GDN_PROBE") != null;
+        r.attn_fa = std.c.getenv("XPU_ATTN_FA") != null;
         r.gdn_check = std.c.getenv("XPU_GDN_CHECK") != null;
         if (std.c.getenv("XPU_GDN_OLD")) |v| r.gdn_old = std.mem.span(v)[0] - '0';
         r.acts = try Acts.init(d, z);
@@ -956,7 +958,9 @@ pub const Runner = struct {
             const ns: u32 = (p0 + T + sp - 1) / sp;
             try d.launch(r.mk.attn_span, .{ .x = ns, .y = s.kv_heads * (s.q_heads / s.kv_heads / QPG), .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, p32, @as(i32, @intCast(ns)), @as(i32, @intCast(sp)), @as(f32, 1.0 / 16.0), nul, nul, r.cap, pt });
             try d.launch(r.mk.merge_span, .{ .x = s.q_heads, .y = T }, .{ a.pm, a.pl, a.po, a.y, p32, @as(i32, @intCast(ns)), @as(i32, @intCast(sp)), nul });
-        } else if (r.cap > 0)
+        } else if (r.cap > 0 and r.attn_fa)
+            try d.launch(d.k.attn_prompt8_fa, .{ .x = (T + 15) / 16, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p32, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0), r.cap, pt })
+        else if (r.cap > 0)
             try d.launch(d.k.attn_prompt8, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p32, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0), r.cap, pt })
         else
             try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p32, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0), pt });
@@ -1469,7 +1473,9 @@ pub const Runner = struct {
             if (l.attn) {
                 const p0: i32 = @intCast(r.pos);
                 try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, p0, EPS, nul, nul, nul, zero, r.cap, rope, pt });
-                if (r.cap > 0)
+                if (r.cap > 0 and r.attn_fa)
+                    try d.launch(d.k.attn_prompt8_fa, .{ .x = (T + 15) / 16, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p0, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0), r.cap, pt })
+                else if (r.cap > 0)
                     try d.launch(d.k.attn_prompt8, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p0, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0), r.cap, pt })
                 else
                     try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p0, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0), pt });
@@ -1708,6 +1714,7 @@ fn kernels(d: *Dev, mk: *MoeKernels) !void {
         .rot_heads = try d.kernel(mg, "rot_heads", 16),
         .attn_prompt = try d.kernel(md, "attn_prompt", 128),
         .attn_prompt8 = try d.kernel(md, "attn_prompt8", 128),
+        .attn_prompt8_fa = try d.kernel(md, "attn_prompt8_fa", 256),
         .embed_dense = try d.kernel(mg, "embed_dense", 256),
         .dense_rows = try d.kernel(mg, "dense_rows", 256),
         .repack_gptq = try d.kernel(mg, "repack_gptq", 16),

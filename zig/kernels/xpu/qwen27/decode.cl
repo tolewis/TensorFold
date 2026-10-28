@@ -542,6 +542,147 @@ kernel void attn_prompt8(global const ushort *Q, global const char *KC, global c
 }
 #endif // Q27_GQA == 6 || Q27_GQA == 8
 
+#if Q27_GQA == 8
+// Prompt attention over the int8 cache in the FlashAttention-2 orientation: a sub-group holds 8 query rows of one
+// head (the DPAS A operand, Q in int8), the 16 sub-groups of a work-group 16 rows x the 8 heads of a K/V head. K is
+// the B operand straight from a transposed 2d block read, the scores come back as C tiles (lane = key, element =
+// row), which is the fp16 A layout, so P goes to the PV DPAS without SLM. V is converted to fp16 B tiles once a
+// work-group (64 keys in SLM, 16 dims a sub-group). P carries 4096 before the half conversion (an unscaled fp16 P
+// underflows at long context), divided out with 1/l at the end. Grid ((T + 15) / 16, Q27_AKV); the 9 arguments of
+// attn_prompt8.
+#define FA_SCALE 4096.0f
+__attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(256, 1, 1)))
+kernel void attn_prompt8_fa(global const ushort *Q, global const char *KC, global const char *VC, global ushort *O,
+                            int p0, int T, float scale, int cap, global const uint *PT) {
+  local uint VH[16 * 4 * 8 * 16];                          // (16 column tiles of 16 dims, 4 key tiles of 16, word) x lane
+  const int t0 = get_group_id(0) * 16, hk = get_group_id(1), sg = get_sub_group_id(), lane = get_sub_group_local_id();
+  const int hq = sg % 8, r0 = t0 + (sg / 8) * 8;           // the sub-group's rows r0 .. r0 + 7 of head Q27_GQA hk + hq
+  const int nkeys = p0 + min(t0 + 15, T - 1) + 1;
+  const int qlo = p0 + r0;                                 // the first row's position: keys past it need the mask
+  global const float *KS = (global const float *)(KC + (long)cap * Q27_KVROW), *VS = (global const float *)(VC + (long)cap * Q27_KVROW);
+  short8 qa[8];                                            // Q in int8 as A tiles: qa[ds][r] = dims 32 ds + 2 lane, + 1 of row r
+  float qsl[8];
+  for (int r = 0; r < 8; r++) {
+    const bool ok = r0 + r < T;
+    global const ushort *qrow = Q + ((long)(r0 + r) * Q27_AQ + hk * Q27_GQA + hq) * 256;
+    float mq = 0.0f;
+    if (ok) {
+      const ushort16 x = vload16(lane, qrow);
+      for (int b = 0; b < 16; b++) mq = fmax(mq, fabs(bf2f(x[b])));
+    }
+    mq = sub_group_reduce_max(mq);
+    const float qs = mq > 0.0f ? mq / 127.0f : 1.0f, iq = 1.0f / qs;
+    qsl[r] = qs * scale * M_LOG2E_F;
+    __attribute__((opencl_unroll_hint))
+    for (int ds = 0; ds < 8; ds++) {
+      const ushort2 x = ok ? vload2(ds * 16 + lane, qrow) : (ushort2)(0);
+      const uint lo = (uchar)(char)rint(bf2f(x.s0) * iq), hi = (uchar)(char)rint(bf2f(x.s1) * iq);
+      qa[ds][r] = (short)(lo | (hi << 8));
+    }
+  }
+  float8 o[16];
+  for (int c = 0; c < 16; c++) o[c] = 0.0f;
+  float m[8], l[8];                                        // the row max (uniform) and the lane's part of the row sum
+  for (int r = 0; r < 8; r++) {
+    m[r] = -INFINITY;
+    l[r] = 0.0f;
+  }
+  for (int kb = 0; kb < nkeys; kb += 64) {                 // 64 keys: a page
+    global const char *kpage = KC, *vpage = VC;
+    global const float *ksp = KS, *vsp = VS;
+    int krows = nkeys, ky = kb, kbase = 0;
+    if (PT) {
+      const long pb = (long)PT[kb / Q27_PAGE] * Q27_PAGE8;
+      kpage = KC + pb;
+      vpage = VC + pb;
+      krows = min(Q27_PAGE, nkeys - kb);
+      ky = 0;
+      kbase = kb;
+      ksp = (global const float *)(kpage + (long)Q27_PAGE * Q27_KVROW);
+      vsp = (global const float *)(vpage + (long)Q27_PAGE * Q27_KVROW);
+    }
+    __attribute__((opencl_unroll_hint))
+    for (int h2 = 0; h2 < 2; h2++) {                       // V -> fp16 B tiles: this sub-group's 16 dims, 32 keys a read
+      uint w8[8];                                          // lane: dim 16 sg + lane; word j: keys 4j .. 4j + 3
+      intel_sub_group_2d_block_read_transform_8b_32r16x1c((global void *)(vpage + hk * 256), 256, krows, Q27_AKV * 256,
+                                                          (int2)(sg * 16, ky + h2 * 32), w8);
+      __attribute__((opencl_unroll_hint))
+      for (int hc = 0; hc < 2; hc++)
+        __attribute__((opencl_unroll_hint))
+        for (int j = 0; j < 4; j++) {
+          const half4 h = convert_half4(as_char4(w8[hc * 4 + j]));
+          local uint *vt = VH + ((sg * 4 + h2 * 2 + hc) * 8) * 16 + lane;
+          vt[(2 * j) * 16] = as_uint(h.s01);
+          vt[(2 * j + 1) * 16] = as_uint(h.s23);
+        }
+    }
+    int8 si[4];
+    for (int t = 0; t < 4; t++) si[t] = 0;
+    __attribute__((opencl_unroll_hint))
+    for (int ds = 0; ds < 8; ds++)                         // S = Q K^T in 32-dim steps, K the B operand (lane = key)
+      __attribute__((opencl_unroll_hint))
+      for (int t = 0; t < 4; t++) {
+        uint8 kw;
+        intel_sub_group_2d_block_read_transpose_32b_16r8x1c((global void *)(kpage + hk * 256), 256, krows, Q27_AKV * 256,
+                                                            (int2)(ds * 8, ky + t * 16), (private uint *)&kw);
+        si[t] = intel_sub_group_i8_i8_matrix_mad_k32(qa[ds], as_int8(kw), si[t]);
+      }
+    float ksc[4], vsc[4];                                  // the lane's key of each tile
+    for (int t = 0; t < 4; t++) {
+      const int key = kb + t * 16 + lane;
+      const bool in = key < nkeys;
+      ksc[t] = in ? ksp[(long)(key - kbase) * Q27_AKV + hk] : 0.0f;
+      vsc[t] = in ? vsp[(long)(key - kbase) * Q27_AKV + hk] * FA_SCALE : 0.0f;
+    }
+    float8 s[4];
+    const bool masked = kb + 63 > qlo;
+    __attribute__((opencl_unroll_hint))
+    for (int t = 0; t < 4; t++)
+      __attribute__((opencl_unroll_hint))
+      for (int r = 0; r < 8; r++)
+        s[t][r] = masked && kb + t * 16 + lane > qlo + r ? -INFINITY : (float)si[t][r] * ksc[t] * qsl[r];
+    float mn[8];
+    __attribute__((opencl_unroll_hint))
+    for (int r = 0; r < 8; r++) {
+      const float mx = sub_group_reduce_max(fmax(fmax(s[0][r], s[1][r]), fmax(s[2][r], s[3][r])));
+      mn[r] = fmax(m[r], mx);
+      const float alpha = mn[r] == -INFINITY ? 1.0f : native_exp2(m[r] - mn[r]);
+      m[r] = mn[r];
+      if (alpha != 1.0f) {                                 // uniform: the row max moved
+        l[r] *= alpha;
+        __attribute__((opencl_unroll_hint))
+        for (int c = 0; c < 16; c++) o[c][r] *= alpha;
+      }
+    }
+    short8 pa[4];                                          // P as fp16 A tiles, straight from the C layout
+    __attribute__((opencl_unroll_hint))
+    for (int t = 0; t < 4; t++)
+      __attribute__((opencl_unroll_hint))
+      for (int r = 0; r < 8; r++) {
+        const float p = mn[r] == -INFINITY ? 0.0f : native_exp2(s[t][r] - mn[r]);
+        l[r] += p;
+        pa[t][r] = as_short(convert_half(p * vsc[t]));
+      }
+    barrier(CLK_LOCAL_MEM_FENCE);                          // VH filled
+    __attribute__((opencl_unroll_hint))
+    for (int c = 0; c < 16; c++)
+      __attribute__((opencl_unroll_hint))
+      for (int t = 0; t < 4; t++) {
+        const int8 vb = as_int8(intel_sub_group_block_read8(VH + (c * 4 + t) * 128));
+        o[c] = intel_sub_group_f16_f16_matrix_mad_k16(pa[t], vb, o[c]);
+      }
+    barrier(CLK_LOCAL_MEM_FENCE);                          // VH free
+  }
+  for (int r = 0; r < 8; r++) {
+    const float inv = 1.0f / (sub_group_reduce_add(l[r]) * FA_SCALE);
+    if (r0 + r >= T) continue;
+    global ushort *dst = O + ((long)(r0 + r) * Q27_AQ + hk * Q27_GQA + hq) * 256 + lane;
+    __attribute__((opencl_unroll_hint))
+    for (int c = 0; c < 16; c++) dst[c * 16] = f2bf(o[c][r] * inv);
+  }
+}
+#endif // Q27_GQA == 8
+
 // Decode attention for long caches: as attn_decode, but a slice holds `span` keys (a launch argument), so the partials
 // stay few at any context. Rows: one stream each (MT, POS), or a window at p0 (row t at position p0 + t). Grid (NS,
 // Q27_AKV * Q27_QPARTS, rows). cap > 0: int8 cache. PT (if non-null): the stream's page table (with MT, MT[8t + 2]).

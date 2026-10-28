@@ -147,6 +147,7 @@ pub const Dev = struct {
         rot_heads: ze.H,
         attn_prompt: ze.H,
         attn_prompt8: ze.H,
+        attn_prompt8_fa: ze.H = null, // Sage only: the FA2-orientation prompt attention (XPU_ATTN_FA=1)
         embed_dense: ze.H,
         dense_rows: ze.H,
         repack_gptq: ze.H,
