@@ -40,6 +40,7 @@ pub const Slots = struct {
     masked_vals: ?[]f64 = null, // a structured sampled row's allowed candidates
     masked_ids: ?[]u64 = null,
     fed: [sage.MAX_SLOTS]u32 = @splat(1), // rows the last verify fed each slot
+    from: [sage.MAX_SLOTS]?u32 = @splat(null), // where the last verify's specMulti block of the slot starts (null: none)
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
     vision: ?*Vision = null, // --vision
@@ -448,6 +449,7 @@ pub const Slots = struct {
             const pos = if (slot == r.cur) r.pos else r.spos[slot];
             if (w.positions[0] != pos + 1) return error.PositionMismatch;
             b.fed[slot] = 1;
+            b.from[slot] = null;
             if (w.rows() == 2) continue;
             slots[n] = slot;
             toks[n] = @intCast(w.pending);
@@ -481,7 +483,7 @@ pub const Slots = struct {
 
     /// The windows with held drafts, grouped by depth, each group one specMulti: it drafts, verifies and commits.
     /// A window's rows report the kept tokens, and its drafts are the kept ones then one that differs, so the lane
-    /// core keeps exactly the rows specMulti committed.
+    /// core keeps the rows specMulti committed, or fewer when it cuts the round (keepFn).
     fn verifyDrafted(b: *Slots, windows: []const be.Window, out: []be.Verified) !void {
         const r = b.r;
         var depth: u32 = 1;
@@ -516,6 +518,7 @@ pub const Slots = struct {
                 const o = out[wi];
                 b.held[slot] = 0;
                 b.fed[slot] = @intCast(k);
+                b.from[slot] = @intCast(windows[wi].positions[0] - 1);
                 for (o.sampled, 0..) |*x, j| x.* = @intCast(t[@min(j, k - 1)]);
                 for (o.drafts, 0..) |*x, j| x.* = if (j + 1 < k) @intCast(t[j]) else @intCast(t[k - 1] ^ 1);
             }
@@ -575,13 +578,19 @@ pub const Slots = struct {
         return b.drawMasked(w.stream, try b.fetchRow(row), w.positions[j], w.masks[j * words ..][0..words]);
     }
 
-    /// A window keeps at most the rows its verify fed (one, or two when the forced token landed). A shorter path
-    /// ends the stream; a next verify of it would fail its position check.
+    /// A window keeps at most the rows its verify fed (one, or two when the forced token landed, or specMulti's). The
+    /// lane core keeps fewer of specMulti's rows when it cuts the round (the thinking budget's cut, the loop guard's):
+    /// the slot goes back to the kept rows (Runner.rewind). A shorter path of the two-row window ends the stream; a
+    /// next verify of it would fail its position check.
     fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
         const b = of(ptr);
         for (windows, paths) |w, p| {
             const slot = b.slotOf(w.stream) orelse return error.UnknownStream;
             if (p.len == 0 or p.len > b.fed[slot]) return error.KeepMismatch;
+            if (p.len == b.fed[slot]) continue;
+            const from = b.from[slot] orelse continue;
+            try b.r.rewind(slot, from, @intCast(p.len));
+            b.fed[slot] = @intCast(p.len);
         }
     }
 

@@ -1028,7 +1028,8 @@ pub const Runner = struct {
     /// One speculative step of several greedy slots (MTP on, `slots` distinct): each slot's drafts (up to `k`, fewer
     /// when all the blocks would pass WINDOW rows), one forward of every slot's block as a window, each slot's kept
     /// rows committed, and all kept rows absorbed in one MTP forward. Slot i's tokens go to out[i][0..n[i]]; the
-    /// newest of them is its last, not yet fed. With `judge`, a slot it samples keeps the rows judge.keep picks, and
+    /// newest of them is its last, not yet fed. Each slot's stash and rec_save keep the block's inputs and entry
+    /// state, so `rewind` can take kept rows back. With `judge`, a slot it samples keeps the rows judge.keep picks, and
     /// its next first draft is judge.draft's draw.
     pub fn specMulti(r: *Runner, slots: []const u32, k: u32, out: [][WINDOW]i32, n: []usize, judge: ?Judge) !void {
         const mt = r.mtp orelse return error.NoMtpHead;
@@ -1102,13 +1103,13 @@ pub const Runner = struct {
             const k32: i32 = @intCast(keep);
             for (m.layers) |*l| if (!l.attn) {
                 const st = &l.st[slot];
-                if (keep == wn[i]) {
-                    std.mem.swap(?*anyopaque, &st.rec, &st.rec_save);
-                    continue;
+                if (keep < wn[i]) { // the kept rows again from the entry state, into rec_save
+                    const sb = st.stash.?;
+                    try d.launch(d.k.gdn_step, .{ .x = 16, .y = s.gdn_v_heads, .z = 1 }, .{ sb, off(sb, at.k), off(sb, at.v), off(sb, at.g), off(sb, at.b), st.rec.?, st.rec_save.?, a.y, k32, nul, nul, nul, nul });
+                    try d.launch(d.k.conv_commit, .{ .x = z.nconv / 256 }, .{ st.conv[1 - st.conv_cur].?, off(sb, at.p), st.conv[st.conv_cur].?, k32, nul });
                 }
-                const sb = st.stash.?;
-                try d.launch(d.k.gdn_step, .{ .x = 16, .y = s.gdn_v_heads, .z = 1 }, .{ sb, off(sb, at.k), off(sb, at.v), off(sb, at.g), off(sb, at.b), st.rec.?, st.rec.?, a.y, k32, nul, nul, nul, nul });
-                try d.launch(d.k.conv_commit, .{ .x = z.nconv / 256 }, .{ st.conv[1 - st.conv_cur].?, off(sb, at.p), st.conv[st.conv_cur].?, k32, nul });
+                // rec_save holds the state after the kept rows: it becomes the state, and rec_save keeps the entry (rewind)
+                std.mem.swap(?*anyopaque, &st.rec, &st.rec_save);
             };
             r.spos[slot] += keep;
             r.slast[slot] = blk[keep - 1];
@@ -1235,6 +1236,32 @@ pub const Runner = struct {
         r.pos += keep;
         r.last = r.block[keep - 1];
         r.block_rows = 0;
+    }
+
+    /// Takes back the rows of `slot`'s last specMulti block, which starts at position `from`, past its first `n` (1
+    /// to the rows the block kept). Only before the slot's next forward. Each GDN layer replays the n rows from the
+    /// block's entry state (rec_save) and rebuilds its convolution state from the block's entry, as specMulti does for
+    /// a block that keeps n rows. The K/V rows and MTP rows past them are written again by later forwards.
+    pub fn rewind(r: *Runner, slot: u32, from: u32, n: u32) !void {
+        if (slot >= r.slots) return error.BadSlot;
+        try r.use(r.cur); // store the current slot's fields
+        if (n == 0 or from + n >= r.spos[slot] or r.spos[slot] - from > WINDOW) return error.BadRewind;
+        const d = &r.d;
+        const z = r.z;
+        const s = z.s;
+        const at = StashAt.of(z);
+        const nul: ?*anyopaque = null;
+        const n32: i32 = @intCast(n);
+        for (r.model.layers) |*l| if (!l.attn) {
+            const st = &l.st[slot];
+            const sb = st.stash.?;
+            try d.launch(d.k.gdn_step, .{ .x = 16, .y = s.gdn_v_heads, .z = 1 }, .{ sb, off(sb, at.k), off(sb, at.v), off(sb, at.g), off(sb, at.b), st.rec_save.?, st.rec.?, r.acts.y, n32, nul, nul, nul, nul });
+            // the block's forward flipped conv_cur: conv[1 - cur] still holds the entry
+            try d.launch(d.k.conv_commit, .{ .x = z.nconv / 256 }, .{ st.conv[1 - st.conv_cur].?, off(sb, at.p), st.conv[st.conv_cur].?, n32, nul });
+        };
+        r.spos[slot] = from + n;
+        r.mpos[slot] = from + n;
+        r.enter(r.cur);
     }
 
     /// One forward over at most WINDOW rows at r.pos; the last row's greedy token when `want`, else -1.
