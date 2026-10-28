@@ -266,7 +266,7 @@ pub fn main(init: std.process.Init) !void {
         defer r.deinit();
         return loop(r);
     }
-    const steps: usize = if (argv.len > 3 and !std.mem.eql(u8, argv[3], "--nll")) try std.fmt.parseInt(usize, argv[3], 10) else 32;
+    const steps: usize = if (argv.len > 3 and !std.mem.eql(u8, argv[3], "--nll") and !std.mem.eql(u8, argv[3], "--kl")) try std.fmt.parseInt(usize, argv[3], 10) else 32;
     var ids: std.ArrayList(i32) = .empty;
     const path = try std.fmt.allocPrintSentinel(alloc, "{s}", .{argv[2]}, 0);
     const fd = open(path.ptr, 0);
@@ -280,6 +280,7 @@ pub fn main(init: std.process.Init) !void {
     defer r.deinit();
     std.debug.print("loaded in {d:.1} s\n", .{now() - t_load});
     if (argv.len > 3 and std.mem.eql(u8, argv[3], "--nll")) return nll(r, ids.items);
+    if (argv.len > 4 and std.mem.eql(u8, argv[3], "--kl")) return klDump(r, ids.items, argv[4]);
     if (slots > 1) if (std.c.getenv("XPU_SPEC")) |v| return specMultiCheck(r, ids.items, steps, try std.fmt.parseInt(u32, std.mem.span(v), 10));
     if (slots > 1) return multiCheck(r, ids.items, steps);
     if (std.c.getenv("XPU_SPEC_CHECK")) |v| return specCheck(r, ids.items, steps, try std.fmt.parseInt(u32, std.mem.span(v), 10));
@@ -368,6 +369,30 @@ fn nll(r: *sage.Runner, ids: []const i32) !void {
     }
     const n: f64 = @floatFromInt(ids.len - 1);
     std.debug.print("nll: {d} tokens, mean {d:.4}, top-1 {d:.3}\n", .{ ids.len - 1, sum / n, @as(f64, @floatFromInt(top1)) / n });
+}
+
+/// `--kl OUT`: the prompt path over all but the last KL_ROWS ids, then the fp16 logits before each of those ids (teacher
+/// forced through the decode path), raw to OUT as [KL_ROWS, vocab] fp16: a KL check of one prompt path against another.
+const KL_ROWS = 64;
+fn klDump(r: *sage.Runner, ids: []const i32, out: []const u8) !void {
+    if (ids.len <= KL_ROWS) return error.BadWindow;
+    const logits = try alloc.alloc(f16, r.z.s.vocab);
+    defer alloc.free(logits);
+    const path = try std.fmt.allocPrintSentinel(alloc, "{s}", .{out}, 0);
+    const fd = open(path.ptr, 0o1101, @as(c_int, 0o644)); // O_WRONLY | O_CREAT | O_TRUNC
+    if (fd < 0) return error.FileNotFound;
+    const n = ids.len - KL_ROWS;
+    const t0 = now();
+    try r.prompt(ids[0..n]);
+    const t1 = now();
+    @import("dev.zig").profReport("prompt");
+    for (0..KL_ROWS) |i| {
+        if (i > 0) try r.step(ids[n + i - 1]);
+        try r.logits(logits);
+        const bytes = std.mem.sliceAsBytes(logits);
+        if (write(fd, bytes.ptr, bytes.len) != @as(isize, @intCast(bytes.len))) return error.WriteFailed;
+    }
+    std.debug.print("prompt: {d} tokens in {d:.3} s ({d:.0} tok/s); kl: {d} rows of {d} fp16 logits to {s}\n", .{ n, t1 - t0, @as(f64, @floatFromInt(n)) / (t1 - t0), KL_ROWS, r.z.s.vocab, out });
 }
 
 /// `--tower IMAGE OUT`: the image's patches through the vision tower, as a check against a reference: OUT.grid (gh gw),

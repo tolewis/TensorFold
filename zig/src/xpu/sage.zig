@@ -142,6 +142,13 @@ pub const Acts = struct {
     g: *anyopaque,
     beta: *anyopaque,
     y: *anyopaque,
+    la: *anyopaque, // fp32 [HV, CHUNK / 64, 64]: the chunk kernels' cumulative log decay (forward.zig's la)
+    wb: *anyopaque, // wb, hs, vn: hi and lo fp16 planes of an fp32 operand, then its row exponents (float)
+    u0: *anyopaque,
+    hs: *anyopaque,
+    vn: *anyopaque,
+    zeros: *anyopaque, // padding rows of a GDN chunk to a multiple of 64: k = v = 0, beta = 0 ...
+    ones: *anyopaque, // ... and g = 1, so the state does not move
     pm: *anyopaque,
     pl: *anyopaque,
     po: *anyopaque,
@@ -177,6 +184,8 @@ pub const Acts = struct {
         const widest_in: usize = @max(s.hidden, @max(z.vd, z.od));
         const ns: usize = SLICES;
         const pairs: usize = c * (s.top_k + 1);
+        const nc: usize = c / 64; // GDN chunks of 64 rows in a prompt chunk
+        const hv: usize = s.gdn_v_heads;
         return .{
             .x = try d.alloc_(c * s.hidden * 4),
             .h = try d.alloc_(c * widest_in * 2),
@@ -185,11 +194,18 @@ pub const Acts = struct {
             .r = try d.alloc_(c * s.hidden * 2),
             .p = try d.alloc_(c * @max(z.gdn_in, z.att_in) * 2),
             .q = try d.alloc_(c * @max(s.q_heads * 256, s.gdn_k_heads * 128) * 2),
-            .k = try d.alloc_(w * s.gdn_k_heads * 128 * 2),
-            .v = try d.alloc_(w * z.vd * 2),
-            .g = try d.alloc_(w * s.gdn_v_heads * 4),
-            .beta = try d.alloc_(w * s.gdn_v_heads * 4),
+            .k = try d.alloc_(c * s.gdn_k_heads * 128 * 2), // a whole chunk's rows: the chunk GDN kernels read them at once
+            .v = try d.alloc_(c * z.vd * 2),
+            .g = try d.alloc_(c * s.gdn_v_heads * 4),
+            .beta = try d.alloc_(c * s.gdn_v_heads * 4),
             .y = try d.alloc_(c * @max(z.vd, z.od) * 2),
+            .la = try d.alloc_(hv * nc * 64 * 4),
+            .wb = try d.alloc_(3 * nc * hv * 64 * 128 * 2),
+            .u0 = try d.alloc_(nc * hv * 64 * 128 * 4),
+            .hs = try d.alloc_(3 * nc * hv * 128 * 128 * 2),
+            .vn = try d.alloc_(3 * nc * hv * 128 * 64 * 2),
+            .zeros = try d.alloc_(64 * z.vd * 2),
+            .ones = try d.alloc_(64 * hv * 4),
             .pm = try d.alloc_(w * s.q_heads * ns * 4),
             .pl = try d.alloc_(w * s.q_heads * ns * 4),
             .po = try d.alloc_(w * s.q_heads * ns * 256 * 4),
@@ -555,6 +571,8 @@ pub const Runner = struct {
         r.rope_host = try alloc.alloc([3]i32, CHUNK);
         q.prof.on = std.c.getenv("XPU_PROFILE") != null; // not during the load
         r.acts = try Acts.init(d, z);
+        try d.fill(r.acts.zeros, @as(u16, 0), 64 * z.vd * 2);
+        try d.fill(r.acts.ones, @as(f32, 1.0), 64 * z.s.gdn_v_heads * 4);
         for (0..slots) |i| {
             try r.use(@intCast(i));
             try r.reset();
@@ -1360,22 +1378,29 @@ pub const Runner = struct {
                     try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p0, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0), pt });
                 try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo, gs, zero, nul, nul, zero });
             }
-            const pin = l.mixer_in.n;
-            const hk = l.mixer_out.k;
-            var j: u32 = 0;
-            while (!l.attn and j < T) : (j += WINDOW) {
-                const w = @min(WINDOW, T - j);
-                const w32: i32 = @intCast(w);
-                const pj = off(a.p, @as(usize, j) * pin * 2);
-                const hj = off(a.h, @as(usize, j) * hk * 2);
-                const hij = off(a.ahi, @as(usize, j) * (hk / 64) * 2);
-                const loj = off(a.alo, @as(usize, j) * (hk / 64) * 2);
+            if (!l.attn) { // the chunk GDN (gdn_chunk.cl, as forward.zig's wide path): the whole chunk at once
+                const t32: i32 = @intCast(T);
                 const cin = l.conv[l.conv_cur].?;
                 const cout = l.conv[1 - l.conv_cur].?;
                 l.conv_cur = 1 - l.conv_cur;
-                try d.launch(d.k.gdn_pre, .{ .x = w, .y = z.nconv / 256 }, .{ pj, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, w32, nul, nul });
-                try d.launch(d.k.gdn_step, .{ .x = 16, .y = s.gdn_v_heads, .z = 1 }, .{ a.q, a.k, a.v, a.g, a.beta, l.rec.?, l.rec.?, a.y, w32, nul, nul, nul, nul });
-                try d.launch(d.k.gated_norm, .{ .x = w }, .{ a.y, pj, l.gnorm.?, hj, hij, loj, EPS, gs, zero, nul, nul, zero });
+                try d.launch(d.k.gdn_pre, .{ .x = T, .y = z.nconv / 256 }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32, nul, nul });
+                const tp: u32 = (T + 63) / 64 * 64;
+                if (tp > T) { // neutral padding rows: the state does not move
+                    const pad = tp - T;
+                    const qk = s.gdn_k_heads * 128 * 2;
+                    try dev.copy(d, off(a.k, T * qk), a.zeros, pad * qk);
+                    try dev.copy(d, off(a.v, T * z.vd * 2), a.zeros, pad * z.vd * 2);
+                    try dev.copy(d, off(a.beta, T * s.gdn_v_heads * 4), a.zeros, pad * s.gdn_v_heads * 4);
+                    try dev.copy(d, off(a.g, T * s.gdn_v_heads * 4), a.ones, pad * s.gdn_v_heads * 4);
+                }
+                const nc: i32 = @intCast(tp / 64);
+                const hk: i32 = @intCast(s.gdn_k_heads);
+                const hv: i32 = @intCast(s.gdn_v_heads);
+                // the state S stays fp32 in l.rec, read and written in place (as gdn_step leaves it for decode); Y is bf16
+                try d.launch(d.k.gdn_prep, .{ .x = tp / 64, .y = s.gdn_v_heads }, .{ a.k, a.v, a.g, a.beta, a.la, a.wb, a.u0, hk, hv, nc, zero });
+                try d.launch(d.k.gdn_state, .{ .x = s.gdn_v_heads }, .{ a.k, a.wb, a.u0, a.la, l.rec.?, l.rec.?, a.hs, a.vn, hk, hv, nc });
+                try d.launch(d.k.gdn_out, .{ .x = tp / 64, .y = s.gdn_v_heads }, .{ a.q, a.k, a.la, a.hs, a.vn, a.y, hk, hv, nc });
+                try d.launch(d.k.gated_norm, .{ .x = T }, .{ a.y, a.p, l.gnorm.?, a.h, a.ahi, a.alo, EPS, gs, zero, nul, nul, zero });
             }
             try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_out, a.r, T);
             try d.launch(d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, D, EPS, @as(i32, 1), gs, nul, nul, zero, zero });
