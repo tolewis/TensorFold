@@ -37,6 +37,9 @@ pub const MAXL = sage.WINDOW;
 const MAXB = sage.WINDOW;
 /// Ring positions past a window: a block's rows and a margin (drafter.zig CAP).
 const SLACK = MAXL + 17;
+/// Context positions a split of the block attention reads (dattn_part): at 30k rows, one subgroup a row and head over
+/// the whole context took 36 ms a round, 43 % of the GPU time.
+const SP = 256;
 /// Context rows the full-attention layer sees by default (XPU_DFLASH_FULL): the checkpoint was trained on sequences of
 /// 40k; 32k keeps a ring of 134 MB a slot.
 pub const default_full: u32 = 32767;
@@ -87,7 +90,7 @@ const Config = struct {
 
 pub const Drafter = struct {
     r: *sage.Runner,
-    k: struct { dprep: ze.H, dattn: ze.H, rowsums_rows: ze.H, taps_in: ze.H, to_res: ze.H, quantize4: ze.H, dswiglu: ze.H, tap: ze.H },
+    k: struct { dprep: ze.H, dpart: ze.H, dmerge: ze.H, rowsums_rows: ze.H, taps_in: ze.H, to_res: ze.H, quantize4: ze.H, dswiglu: ze.H, tap: ze.H },
     layers: [LAYERS]Layer,
     fc: Proj,
     hidden_norm: *anyopaque,
@@ -117,6 +120,9 @@ pub const Drafter = struct {
     o: *anyopaque, // fp16 [MAXB, NH HD]
     ids: *anyopaque, // i32 [MAXB]
     pscr: *anyopaque,
+    pm: *anyopaque = undefined, // fp32 [MAXB, NH, splits]: dattn_part's partial maxima
+    pl: *anyopaque = undefined, // and sums
+    po: *anyopaque = undefined, // fp32 [MAXB, NH, splits, HD]: and outputs
 
     /// bf16 weights [n_i, k] stacked on N, quantized to affine 4/64 on the device, then repacked (drafter.zig).
     fn quantized(dr: *Drafter, c: *const dev.Checkpoint, names: []const []const u8, wide: bool, stage: *anyopaque) !Proj {
@@ -177,7 +183,7 @@ pub const Drafter = struct {
         const C: usize = sage.CHUNK;
         dr.* = .{
             .r = r,
-            .k = .{ .dprep = try kern(d, m, "dprep", 16), .dattn = try kern(d, m, "dattn_win", 16), .rowsums_rows = try kern(d, m, "rowsums_rows", 256), .taps_in = try kern(d, m, "taps_in", 256), .to_res = try kern(d, m, "to_res", 256), .quantize4 = try kern(d, m, "quantize4", 16), .dswiglu = try kern(d, m, "dswiglu", 256), .tap = try kern(d, m, "tap_rows", 256) },
+            .k = .{ .dprep = try kern(d, m, "dprep", 16), .dpart = try kern(d, m, "dattn_part", 16), .dmerge = try kern(d, m, "dattn_merge", 16), .rowsums_rows = try kern(d, m, "rowsums_rows", 256), .taps_in = try kern(d, m, "taps_in", 256), .to_res = try kern(d, m, "to_res", 256), .quantize4 = try kern(d, m, "quantize4", 16), .dswiglu = try kern(d, m, "dswiglu", 256), .tap = try kern(d, m, "tap_rows", 256) },
             .layers = undefined,
             .fc = undefined,
             .hidden_norm = undefined,
@@ -253,6 +259,10 @@ pub const Drafter = struct {
                 .causal = sliding,
             };
         }
+        const splits: usize = (dr.fullWindow() + MAXL + SP - 1) / SP;
+        dr.pm = try d.alloc_(MAXB * NH * splits * 4);
+        dr.pl = try d.alloc_(MAXB * NH * splits * 4);
+        dr.po = try d.alloc_(MAXB * NH * splits * HD * 4);
         var invf: [HD / 2]f32 = undefined;
         for (&invf, 0..) |*f, i| f.* = @floatCast(1.0 / std.math.pow(f64, theta, @as(f64, @floatFromInt(2 * i)) / HD));
         dr.invf = try d.upload(std.mem.sliceAsBytes(&invf));
@@ -421,7 +431,11 @@ pub const Drafter = struct {
             try d.launch(d.k.add_rmsnorm_dec, .{ .x = R }, .{ dr.x, dr.r16, l.in_norm, dr.h, dr.ahi, dr.alo, @as(i32, D), EPS, @as(i32, if (li == 0) 0 else 1), @as(i32, GS), nul, nul, zero, zero });
             try fwd.gemm(d, dr.pscr, dr.h, dr.ahi, dr.alo, l.qkv, dr.p, R);
             try d.launch(dr.k.dprep, .{ .x = R, .y = NH + 2 * NKV }, .{ dr.p, @as(i32, @intCast(l.qkv.n)), zero, l.qn, l.kn, dr.invf, dr.qb, kc, vc, @as(i32, @intCast(l.cap)), end_, EPS, rows_t, ptrs_t });
-            try d.launch(dr.k.dattn, .{ .x = R, .y = NKV }, .{ dr.qb, kc, vc, @as(i32, @intCast(l.cap)), start_, end_, L, @as(i32, @intCast(l.win)), @as(i32, @intFromBool(l.causal)), @as(f32, 1.0 / @sqrt(@as(f32, HD))), dr.o, rows_t, ptrs_t });
+            var span: u32 = 0; // the most positions a row sees
+            for (items) |it| span = @max(span, @min(dr.ctxs[it.slot].end - dr.ctxs[it.slot].start, l.win) + it.rows);
+            const ns: u32 = (span + SP - 1) / SP;
+            try d.launch(dr.k.dpart, .{ .x = R, .y = NKV, .z = ns }, .{ dr.qb, kc, vc, @as(i32, @intCast(l.cap)), start_, end_, L, @as(i32, @intCast(l.win)), @as(i32, @intFromBool(l.causal)), @as(f32, 1.0 / @sqrt(@as(f32, HD))), @as(i32, SP), dr.pm, dr.pl, dr.po, rows_t, ptrs_t });
+            try d.launch(dr.k.dmerge, .{ .x = R, .y = NH }, .{ dr.pm, dr.pl, dr.po, @as(i32, @intCast(ns)), dr.o });
             try d.launch(dr.k.rowsums_rows, .{ .x = R }, .{ dr.o, @as(i32, NH * HD), dr.ahi, dr.alo });
             try fwd.gemm(d, dr.pscr, dr.o, dr.ahi, dr.alo, l.o, dr.r16, R);
             try d.launch(d.k.add_rmsnorm_dec, .{ .x = R }, .{ dr.x, dr.r16, l.post_norm, dr.h, dr.ahi, dr.alo, @as(i32, D), EPS, @as(i32, 1), @as(i32, GS), nul, nul, zero, zero });

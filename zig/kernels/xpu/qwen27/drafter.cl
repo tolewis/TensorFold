@@ -284,6 +284,79 @@ KERNEL(16) void dattn_win(global const ushort *Q, global const ushort *KC, globa
     for (int i = 0; i < 8; i++) O[(long)r * NH * HD + (h * 4 + a) * HD + i * 16 + lane] = convert_half_rte(rbf(o[a][i] / l[a]));
 }
 
+// dattn_win over the context in splits of SP positions (grid rows, NKV, splits): split s of a row's visible positions
+// to its partial max, sum and output per head, fp32 PM, PL [rows, NH, NS] and PO [rows, NH, NS, HD]. An empty split
+// keeps max -inf and sum 0. dattn_merge combines the splits.
+KERNEL(16) void dattn_part(global const ushort *Q, global const ushort *KC, global const ushort *VC, int CAP, int c0,
+                           int pos0, int L, int WIN, int CAUSAL, float scale, int SP, global float *PM, global float *PL,
+                           global float *PO, global const int4 *ROWS, global const ulong *PTRS) {
+  const int r = get_group_id(0), h = get_group_id(1), sp = get_group_id(2), NS = get_num_groups(2);
+  const int lane = get_sub_group_local_id();
+  int p = pos0 + r, bs = pos0;
+  if (ROWS) {
+    const int4 ri = ROWS[r];
+    p = ri.x;
+    c0 = ri.y;
+    bs = ri.z;
+    KC = (global const ushort *)PTRS[ri.w * 2];
+    VC = (global const ushort *)PTRS[ri.w * 2 + 1];
+  }
+  float q[4][8], o[4][8], m[4], l[4];
+  for (int a = 0; a < 4; a++) {
+    for (int i = 0; i < 8; i++) {
+      q[a][i] = bf2f(Q[((long)r * NH + h * 4 + a) * HD + i * 16 + lane]);
+      o[a][i] = 0.0f;
+    }
+    m[a] = -INFINITY;
+    l[a] = 0.0f;
+  }
+  const int first = max(c0, min(bs, p - WIN)), last = CAUSAL ? p : bs + L - 1;
+  const int j0 = first + sp * SP, j1 = min(last + 1, j0 + SP);
+  for (int j = j0; j < j1; j++) {
+    float kv[8];
+    const long jr = (long)h * CAP + j % CAP;
+    for (int i = 0; i < 8; i++) kv[i] = bf2f(KC[jr * HD + i * 16 + lane]);
+    float sc[4];
+    for (int a = 0; a < 4; a++) {
+      float d = 0.0f;
+      for (int i = 0; i < 8; i++) d += q[a][i] * kv[i];
+      sc[a] = sub_group_reduce_add(d) * scale;
+    }
+    for (int i = 0; i < 8; i++) kv[i] = bf2f(VC[jr * HD + i * 16 + lane]);
+    for (int a = 0; a < 4; a++) {
+      const float mn = fmax(m[a], sc[a]);
+      const float al = exp(m[a] - mn), e = exp(sc[a] - mn);
+      l[a] = l[a] * al + e;
+      for (int i = 0; i < 8; i++) o[a][i] = o[a][i] * al + e * kv[i];
+      m[a] = mn;
+    }
+  }
+  for (int a = 0; a < 4; a++) {
+    const long at = ((long)r * NH + h * 4 + a) * NS + sp;
+    if (lane == 0) {
+      PM[at] = m[a];
+      PL[at] = l[a];
+    }
+    for (int i = 0; i < 8; i++) PO[at * HD + i * 16 + lane] = o[a][i];
+  }
+}
+
+// The splits of dattn_part combined (grid rows, NH): O = sum over splits of e^(m_s - m) o_s / sum of e^(m_s - m) l_s.
+KERNEL(16) void dattn_merge(global const float *PM, global const float *PL, global const float *PO, int NS, global half *O) {
+  const int r = get_group_id(0), hh = get_group_id(1), lane = get_sub_group_local_id();
+  const long base = ((long)r * NH + hh) * NS;
+  float mx = -INFINITY;
+  for (int s = 0; s < NS; s++) mx = fmax(mx, PM[base + s]);
+  float l = 0.0f, o[8];
+  for (int i = 0; i < 8; i++) o[i] = 0.0f;
+  for (int s = 0; s < NS; s++) {
+    const float w = PL[base + s] > 0.0f ? exp(PM[base + s] - mx) : 0.0f;
+    l += PL[base + s] * w;
+    for (int i = 0; i < 8; i++) o[i] += PO[(base + s) * HD + i * 16 + lane] * w;
+  }
+  for (int i = 0; i < 8; i++) O[(long)r * NH * HD + hh * HD + i * 16 + lane] = convert_half_rte(rbf(o[i] / l));
+}
+
 // SwiGLU of the drafter's gate|up rows (GU fp16 [n, NS], gate then up): act = fp16(bf16(SiLU(g)·u)) and its row
 // sums, a group of 256 per 1 024 columns.
 KERNEL(256) void dswiglu(global const half *GU, int NS, global half *H, global half *AHI, global half *ALO) {
