@@ -111,7 +111,7 @@ pub const Slots = struct {
     /// forward only for a width of 2 or more, so the width is 2 with copy drafts off: every window is one row.
     /// stepMulti's grouped expert kernels add in another order than step, so a near-tie can pick another token.
     pub fn facts(b: *const Slots) lanes.Model {
-        if (b.r.drafting()) return .{ .exact_width = b.depth + 1, .copy_drafts = false, .gpu_tokens = false, .mtp = true, .speculate = true, .speculate_early = false, .sampled_drafts = b.sampled_drafts, .drafts = b.depth, .draft_streams = true, .hidden_rows = true, .streams_exact = true, .batch_rows = sage.WINDOW, .max_streams = b.r.slots };
+        if (b.r.drafting()) return .{ .exact_width = b.depth + 1, .copy_drafts = false, .gpu_tokens = false, .mtp = true, .speculate = true, .speculate_early = false, .sampled_drafts = b.sampled_drafts, .grammar_drafts = b.depth == 1, .drafts = b.depth, .draft_streams = true, .hidden_rows = true, .streams_exact = true, .batch_rows = sage.WINDOW, .max_streams = b.r.slots };
         return .{ .exact_width = 2, .copy_drafts = false, .gpu_tokens = false, .mtp = false, .speculate = false, .speculate_early = false, .hidden_rows = true, .streams_exact = true, .batch_rows = b.r.slots, .max_streams = b.r.slots };
     }
 

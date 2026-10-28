@@ -100,8 +100,14 @@ pub fn modelWith(mtp: bool) !Config {
 
 /// Every case's emitted tokens, the cases admitted together and stepped until done.
 fn run(cases: []const Case) ![][]u32 {
+    return runWith(cases, true);
+}
+
+/// `run` on a family whose head drafts for grammar streams only when `grammar_drafts` (Model.grammar_drafts).
+fn runWith(cases: []const Case, grammar_drafts: bool) ![][]u32 {
     var cfg = try model();
     defer cfg.deinit(gpa);
+    cfg.grammar_drafts = grammar_drafts;
     var target: fake.Fake = .{ .gpa = gpa };
     defer target.deinit();
     var clock: fake.FixedClock = .{};
@@ -128,6 +134,7 @@ fn run(cases: []const Case) ![][]u32 {
         p.deinit();
     };
     for (streams) |*s| try engine.addStream(s);
+    for (cases, streams) |c, *s| try std.testing.expectEqual(c.drafts and (grammar_drafts or c.classes == null), s.drafts);
     while (engine.activeCount() > 0) try engine.step();
     for (cases, streams) |c, *s| if (c.logprobs) |k| try expectRows(c, s, k);
     const out = try gpa.alloc([]u32, cases.len);
@@ -358,6 +365,16 @@ test "structured output: drafted rounds commit the one-token decode, every token
         try std.testing.expectEqualSlices(u32, plain[0], drafted[0]);
         try expectInGrammar(drafted[0], .{});
     }
+}
+
+test "structured output: without grammar drafts a grammar stream decodes alone in its rows, a plain one still drafts" {
+    const cases = [_]Case{ .{ .prompt = &p1, .classes = .{} }, .{ .prompt = &p2, .max_new = 30 } };
+    const with = try run(&cases);
+    defer free(with);
+    const without = try runWith(&cases, false);
+    defer free(without);
+    for (with, without) |w, o| try std.testing.expectEqualSlices(u32, w, o);
+    try expectInGrammar(without[0], .{});
 }
 
 test "structured output: shared rounds with grammar and plain streams commit what each commits alone" {

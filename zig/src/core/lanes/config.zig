@@ -47,6 +47,7 @@ pub const Model = struct {
     copy_match: i64 = 8, // matching history tokens a copy needs
     lone_copies: bool = true, // a lone stream proposes copies (false: only streams in shared rounds do)
     sampled_drafts: bool = true, // the head drafts for sampled streams (false: a sampled stream decodes one row a round)
+    grammar_drafts: bool = true, // the head drafts for grammar streams (false: a grammar stream decodes one row a round)
 };
 
 pub const Config = struct {
@@ -94,6 +95,7 @@ pub const Config = struct {
     copy_rate: f64 = 0.94, // a copied token's chance of landing in allocation
     lone_copies: bool = true, // Model.lone_copies
     sampled_drafts: bool = true, // Model.sampled_drafts
+    grammar_drafts: bool = true, // Model.grammar_drafts
     k: Constants = .{},
 
     pub fn init(gpa: Allocator, m: Model, max_rows: u32, max_draft: u32) !Config {
@@ -134,6 +136,7 @@ pub const Config = struct {
             .enter_match = @max(1, m.copy_match),
             .lone_copies = m.lone_copies,
             .sampled_drafts = m.sampled_drafts,
+            .grammar_drafts = m.grammar_drafts,
             .lone_cost_tile = m.lone_cost_tile,
             .family_width = width,
             .max_copy = max_copy,

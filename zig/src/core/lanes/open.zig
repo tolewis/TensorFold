@@ -31,8 +31,10 @@ pub fn addCommitted(e: *Engine, s: *Stream, hook: ?be.Committed) !void {
 
 /// A sampled stream on a head that drafts greedily only takes no drafts: it decodes one row a round, alone or beside
 /// drafted greedy streams. The head's drafts and its verify keep argmax tokens, which a sampled draw does not match.
+/// A grammar stream on a backend whose grammar windows hold fewer rows than its head drafts does the same.
 pub fn greedyDrafts(e: *const Engine, s: *Stream) void {
     if (!e.cfg.sampled_drafts and s.sampling != null) s.drafts = false;
+    if (!e.cfg.grammar_drafts and s.grammar != null) s.drafts = false;
 }
 
 /// How a stream's first drafts are sized: the depth rule, or the head's whole reach under node probabilities.
