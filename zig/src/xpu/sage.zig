@@ -510,7 +510,6 @@ pub const Runner = struct {
     sdrawn: [MAX_SLOTS]bool = @splat(false), // the slot's first draft is a Judge.draft draw (else the MTP's argmax)
     mpos: [MAX_SLOTS]u32 = @splat(0), // each slot's next MTP slot to absorb
     verifying: bool = false, // forward runs a block for verify: every row's token, states kept for commit
-    group_verify: bool = false, // specMulti over several slots: the grouped expert kernels (each expert read once for its rows)
     attn_dpas: bool = true, // K1: attn_decode_dpas for rows of one position over int8 pages (XPU_ATTN_DPAS=0: never)
     attn_wave: u32 = 4, // K1: work-groups a core the split rule fills (XPU_ATTN_WAVE)
     dump_fd: c_int = -1, // XPU_DUMP=path: one-row decode attention outputs and logits, as (u32 bytes, bytes) records
@@ -1122,10 +1121,6 @@ pub const Runner = struct {
         // the blocks: the per-row kernels of verify, every row's greedy token into block
         r.verifying = true;
         defer r.verifying = false;
-        // one slot keeps the rows' own kernels, so its tokens stay those of the slot alone (step); several slots take
-        // the grouped kernels, as stepMulti does, and read each expert once for all its rows
-        r.group_verify = S > 1;
-        defer r.group_verify = false;
         try r.layersMulti(slots, wn[0..S], ids[0..T]);
         _ = try r.head(T, true);
         for (m.layers) |*l| if (!l.attn) for (slots) |slot| {
@@ -1559,7 +1554,7 @@ pub const Runner = struct {
         try d.launch(r.mk.route, .{ .x = T }, .{ a.mlog, a.mids, a.mwts, a.msw, s.experts, s.top_k });
         if (s.expert_ff != s.shared_ff) return error.SharedWidthNotWired; // one act stride for both (Sage: 512, 512)
         if (T > WINDOW) return r.moeTiles(l, T);
-        if (T > 1 and (!r.verifying or r.group_verify)) { // several rows: each expert's weights once for all its pairs (a lone slot's verify: the rows' own kernels, as one row)
+        if (T > 1 and !r.verifying) { // several rows: each expert's weights once for all its pairs (verify: the rows' own kernels, as one row)
             try d.launch(r.mk.group_plan, .{ .x = 1 }, .{ a.mids, a.mplan, s.experts, pairs, T });
             try d.launch(r.mk.group_swiglu, .{ .x = s.expert_ff, .y = pairs + 1 }, .{ l.experts.gu_w, l.experts.gu_s, l.experts.gu_b, l.shared.gu_w, l.shared.gu_s, l.shared.gu_b, a.h, a.mplan, a.mact, s.hidden, s.expert_ff, s.top_k, pairs, s.experts });
             try d.launch(r.mk.group_down, .{ .x = s.hidden / 16, .y = pairs + 1 }, .{ l.experts.dn_w, l.experts.dn_s, l.experts.dn_b, l.shared.dn_w, l.shared.dn_s, l.shared.dn_b, a.mact, a.mplan, a.my, s.hidden, s.expert_ff, s.experts });
