@@ -263,8 +263,8 @@ __kernel void sage_expert_down8(__global const uint *w, __global const ushort *s
 
 // One decode row: down of all its pairs and sage_moe_combine in one kernel. A sub-group takes CROWS output rows of
 // every pair (expert picks in order, then the shared expert) and adds them as the combine does, so no y round trip.
-// Every pair's weight words are loaded before the first FMA (MAX_TOPK + 1 pairs x CROWS rows, a uint4 a lane each),
-// so the launch's bytes are in flight at once; the per-lane partials, their order and the reduce are as before.
+// The next pair's weight words are loaded while this pair's FMAs run (one pair ahead), so two pairs are in flight;
+// the per-lane partials, their order and the reduce are as before.
 // out[i] = fp16(bf16(sum_k wts[k] y[k][i] + shared_w y_shared[i])). Grid (dim / (sub-groups a group * CROWS)); ff == 512.
 #define CROWS 2
 __attribute__((intel_reqd_sub_group_size(SG)))
@@ -274,21 +274,22 @@ __kernel void sage_down_combine(__global const uint *w, __global const ushort *s
                                 __global const float *shared_w, __global half *out, uint dim, uint top_k) {
     const uint lane = get_sub_group_local_id();
     const uint r0 = (get_group_id(0) * get_num_sub_groups() + get_sub_group_id()) * CROWS;
-    uint4 pk[MAX_TOPK + 1][CROWS];
-    __attribute__((opencl_unroll_hint))
-    for (uint p = 0; p <= MAX_TOPK; p++) {
-        if (p > top_k) break;
-        const bool shared = p == top_k;
-        __global const uint *wt = shared ? sh_w : w;
-        const ulong row0 = shared ? r0 : (ulong)ids[p] * dim + r0;
-        __attribute__((opencl_unroll_hint))
-        for (uint k = 0; k < CROWS; k++) pk[p][k] = vload4(lane, wt + (row0 + k) * (512 / 8));
+    uint4 nx[CROWS];                                    // pair 0 is a routed pick (top_k >= 1)
+    {
+        const ulong row0 = (ulong)ids[0] * dim + r0;
+        for (uint k = 0; k < CROWS; k++) nx[k] = vload4(lane, w + (row0 + k) * (512 / 8));
     }
     float sum = 0.0f;                                   // lane k < CROWS: output row r0 + k
-    __attribute__((opencl_unroll_hint))
-    for (uint p = 0; p <= MAX_TOPK; p++) {
-        if (p > top_k) break;
+    for (uint p = 0; p <= top_k; p++) {
         const bool shared = p == top_k;
+        uint4 pk[CROWS];
+        for (uint k = 0; k < CROWS; k++) pk[k] = nx[k];
+        if (p < top_k) {                                // pair p + 1's words, in flight during this pair's FMAs
+            const bool nshared = p + 1 == top_k;
+            __global const uint *nwt = nshared ? sh_w : w;
+            const ulong nrow0 = nshared ? r0 : (ulong)ids[p + 1] * dim + r0;
+            for (uint k = 0; k < CROWS; k++) nx[k] = vload4(lane, nwt + (nrow0 + k) * (512 / 8));
+        }
         __global const half *a = act + (ulong)(shared ? top_k : p) * 512;
         __global const ushort *st = shared ? sh_scales : scales, *bt = shared ? sh_biases : biases;
         const ulong row0 = shared ? r0 : (ulong)ids[p] * dim + r0;
@@ -308,7 +309,7 @@ __kernel void sage_down_combine(__global const uint *w, __global const ushort *s
             const float sc = bf(st[row * 8 + lane / 2]), bi = bf(bt[row * 8 + lane / 2]);
             float dot = 0.0f;
             for (uint q = 0; q < 4; q++) {
-                const uint u = ((const uint *)&pk[p][k])[q];
+                const uint u = ((const uint *)&pk[k])[q];
                 for (uint j = 0; j < 8; j++) dot = fma(xv[q * 8 + j], (float)((u >> (4 * j)) & 15u), dot);
             }
             const float acc = sub_group_reduce_add(sc * dot + bi * sx);
