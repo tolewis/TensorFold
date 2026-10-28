@@ -147,6 +147,8 @@ pub const Acts = struct {
     u0: *anyopaque,
     hs: *anyopaque,
     vn: *anyopaque,
+    srec: *anyopaque, // XPU_GDN_CHECK: a copy of a layer's state for the serial reference
+    ycheck: *anyopaque, // XPU_GDN_CHECK: the serial reference's Y
     zeros: *anyopaque, // padding rows of a GDN chunk to a multiple of 64: k = v = 0, beta = 0 ...
     ones: *anyopaque, // ... and g = 1, so the state does not move
     pm: *anyopaque,
@@ -204,6 +206,8 @@ pub const Acts = struct {
             .u0 = try d.alloc_(nc * hv * 64 * 128 * 4),
             .hs = try d.alloc_(3 * nc * hv * 128 * 128 * 2),
             .vn = try d.alloc_(3 * nc * hv * 128 * 64 * 2),
+            .srec = try d.alloc_(hv * 128 * 128 * 4),
+            .ycheck = try d.alloc_(c * z.vd * 2),
             .zeros = try d.alloc_(64 * z.vd * 2),
             .ones = try d.alloc_(64 * hv * 4),
             .pm = try d.alloc_(w * s.q_heads * ns * 4),
@@ -515,6 +519,8 @@ pub const Runner = struct {
     sdrawn: [MAX_SLOTS]bool = @splat(false), // the slot's first draft is a Judge.draft draw (else the MTP's argmax)
     mpos: [MAX_SLOTS]u32 = @splat(0), // each slot's next MTP slot to absorb
     verifying: bool = false, // forward runs a block for verify: every row's token, states kept for commit
+    gdn_old: u8 = 0, // XPU_GDN_OLD: 1 the 16-row gdn_step windows (the base's prompt GDN), 2 one gdn_pre and one gdn_step over the chunk
+    gdn_check: bool = false, // XPU_GDN_CHECK=1: gdn_step beside the chunk kernels, the difference printed (gdnCheck)
     gdn_probe: bool = false, // XPU_GDN_PROBE=1: the overflow probe after each prompt chunk's GDN (gdnProbe)
     block: [WINDOW]i32 = undefined, // the last verified block's greedy tokens, a row each
     block_rows: u32 = 0,
@@ -572,6 +578,8 @@ pub const Runner = struct {
         r.rope_host = try alloc.alloc([3]i32, CHUNK);
         q.prof.on = std.c.getenv("XPU_PROFILE") != null; // not during the load
         r.gdn_probe = std.c.getenv("XPU_GDN_PROBE") != null;
+        r.gdn_check = std.c.getenv("XPU_GDN_CHECK") != null;
+        if (std.c.getenv("XPU_GDN_OLD")) |v| r.gdn_old = std.mem.span(v)[0] - '0';
         r.acts = try Acts.init(d, z);
         try d.fill(r.acts.zeros, @as(u16, 0), 64 * z.vd * 2);
         try d.fill(r.acts.ones, @as(f32, 1.0), 64 * z.s.gdn_v_heads * 4);
@@ -1347,6 +1355,47 @@ pub const Runner = struct {
         return r.head(T, want);
     }
 
+    /// XPU_GDN_CHECK=1: the chunk kernels' Y and state against gdn_step's on the same inputs (acts.ycheck, acts.srec).
+    fn gdnCheck(r: *Runner, l: *const Layer, li: usize, T: u32) !void {
+        const d = &r.d;
+        const a = &r.acts;
+        const z = r.z;
+        const s = z.s;
+        const ya = try alloc.alloc(u16, T * z.vd);
+        defer alloc.free(ya);
+        const yb = try alloc.alloc(u16, T * z.vd);
+        defer alloc.free(yb);
+        const sa = try alloc.alloc(f32, s.gdn_v_heads * 128 * 128);
+        defer alloc.free(sa);
+        const sb = try alloc.alloc(f32, s.gdn_v_heads * 128 * 128);
+        defer alloc.free(sb);
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, ya.ptr, a.y, ya.len * 2, null, 0, null));
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, yb.ptr, a.ycheck, yb.len * 2, null, 0, null));
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, sa.ptr, l.rec.?, sa.len * 4, null, 0, null));
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, sb.ptr, a.srec, sb.len * 4, null, 0, null));
+        try d.sync();
+        var dy: f32 = 0;
+        var my: f32 = 0;
+        var dyrow: usize = 0;
+        for (ya, yb, 0..) |pa, pb, i| {
+            const f: f32 = @bitCast(@as(u32, pa) << 16);
+            const g: f32 = @bitCast(@as(u32, pb) << 16);
+            my = @max(my, @abs(g));
+            const e = @abs(f - g);
+            if (e > dy) {
+                dy = e;
+                dyrow = i / z.vd;
+            }
+        }
+        var ds: f32 = 0;
+        var ms: f32 = 0;
+        for (sa, sb) |pa, pb| {
+            ms = @max(ms, @abs(pb));
+            ds = @max(ds, @abs(pa - pb));
+        }
+        std.debug.print("gdn_check pos {d} layer {d} T {d}: max|dY| {d:.5} (row {d}) max|Y| {d:.4}, max|dS| {d:.5} max|S| {d:.4}\n", .{ r.pos, li, T, dy, dyrow, my, ds, ms });
+    }
+
     /// XPU_GDN_PROBE=1, after a prompt chunk's GDN: max|Y| and the NaN or inf count of Y (bf16), the NaN or inf count of
     /// h after the gated norm (fp16), max|S| and its NaN or inf count (the fp32 state), and the weakest chunk decay (the
     /// largest cumulative log decay at a 64-row chunk's last row over the heads: 0 is no decay). The overflow test of
@@ -1426,7 +1475,33 @@ pub const Runner = struct {
                     try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = s.kv_heads }, .{ a.q, l.kc.?, l.vc.?, a.y, p0, @as(i32, @intCast(T)), @as(f32, 1.0 / 16.0), pt });
                 try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo, gs, zero, nul, nul, zero });
             }
-            if (!l.attn) { // the chunk GDN (gdn_chunk.cl, as forward.zig's wide path): the whole chunk at once
+            if (!l.attn and r.gdn_old == 1) { // the base's prompt GDN: gdn_pre, gdn_step and gated_norm in 16-row windows
+                const pin = l.mixer_in.n;
+                const hk = l.mixer_out.k;
+                var j: u32 = 0;
+                while (j < T) : (j += WINDOW) {
+                    const w = @min(WINDOW, T - j);
+                    const w32: i32 = @intCast(w);
+                    const pj = off(a.p, @as(usize, j) * pin * 2);
+                    const hj = off(a.h, @as(usize, j) * hk * 2);
+                    const hij = off(a.ahi, @as(usize, j) * (hk / 64) * 2);
+                    const loj = off(a.alo, @as(usize, j) * (hk / 64) * 2);
+                    const cin = l.conv[l.conv_cur].?;
+                    const cout = l.conv[1 - l.conv_cur].?;
+                    l.conv_cur = 1 - l.conv_cur;
+                    try d.launch(d.k.gdn_pre, .{ .x = w, .y = z.nconv / 256 }, .{ pj, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, w32, nul, nul });
+                    try d.launch(d.k.gdn_step, .{ .x = 16, .y = s.gdn_v_heads, .z = 1 }, .{ a.q, a.k, a.v, a.g, a.beta, l.rec.?, l.rec.?, a.y, w32, nul, nul, nul, nul });
+                    try d.launch(d.k.gated_norm, .{ .x = w }, .{ a.y, pj, l.gnorm.?, hj, hij, loj, EPS, gs, zero, nul, nul, zero });
+                }
+            } else if (!l.attn and r.gdn_old == 2) { // one gdn_pre, one serial gdn_step over the chunk, one gated_norm
+                const t32: i32 = @intCast(T);
+                const cin = l.conv[l.conv_cur].?;
+                const cout = l.conv[1 - l.conv_cur].?;
+                l.conv_cur = 1 - l.conv_cur;
+                try d.launch(d.k.gdn_pre, .{ .x = T, .y = z.nconv / 256 }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32, nul, nul });
+                try d.launch(d.k.gdn_step, .{ .x = 16, .y = s.gdn_v_heads, .z = 1 }, .{ a.q, a.k, a.v, a.g, a.beta, l.rec.?, l.rec.?, a.y, t32, nul, nul, nul, nul });
+                try d.launch(d.k.gated_norm, .{ .x = T }, .{ a.y, a.p, l.gnorm.?, a.h, a.ahi, a.alo, EPS, gs, zero, nul, nul, zero });
+            } else if (!l.attn) { // the chunk GDN (gdn_chunk.cl, as forward.zig's wide path): the whole chunk at once
                 const t32: i32 = @intCast(T);
                 const cin = l.conv[l.conv_cur].?;
                 const cout = l.conv[1 - l.conv_cur].?;
@@ -1444,12 +1519,17 @@ pub const Runner = struct {
                 const nc: i32 = @intCast(tp / 64);
                 const hk: i32 = @intCast(s.gdn_k_heads);
                 const hv: i32 = @intCast(s.gdn_v_heads);
+                if (r.gdn_check) try dev.copy(d, a.srec, l.rec.?, s.gdn_v_heads * 128 * 128 * 4);
                 // the state S stays fp32 in l.rec, read and written in place (as gdn_step leaves it for decode); Y is bf16
                 try d.launch(d.k.gdn_prep, .{ .x = tp / 64, .y = s.gdn_v_heads }, .{ a.k, a.v, a.g, a.beta, a.la, a.wb, a.u0, hk, hv, nc, zero });
                 try d.launch(d.k.gdn_state, .{ .x = s.gdn_v_heads }, .{ a.k, a.wb, a.u0, a.la, l.rec.?, l.rec.?, a.hs, a.vn, hk, hv, nc });
                 try d.launch(d.k.gdn_out, .{ .x = tp / 64, .y = s.gdn_v_heads }, .{ a.q, a.k, a.la, a.hs, a.vn, a.y, hk, hv, nc });
                 try d.launch(d.k.gated_norm, .{ .x = T }, .{ a.y, a.p, l.gnorm.?, a.h, a.ahi, a.alo, EPS, gs, zero, nul, nul, zero });
                 if (r.gdn_probe) try r.gdnProbe(l, i, T);
+                if (r.gdn_check) {
+                    try d.launch(d.k.gdn_step, .{ .x = 16, .y = s.gdn_v_heads, .z = 1 }, .{ a.q, a.k, a.v, a.g, a.beta, a.srec, a.srec, a.ycheck, t32, nul, nul, nul, nul });
+                    try r.gdnCheck(l, i, T);
+                }
             }
             try fwd.gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_out, a.r, T);
             try d.launch(d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, D, EPS, @as(i32, 1), gs, nul, nul, zero, zero });
