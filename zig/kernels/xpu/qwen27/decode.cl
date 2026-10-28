@@ -664,6 +664,10 @@ KERNEL(256) void attn_merge_span(global const float *PM, global const float *PL,
 #if Q27_GQA == 8
 #define DPAS_TILE 256
 #define DPAS_ROWS 4
+// P is f16 with the V scale folded in: at 80k keys a p of 1e-5 times a V scale of 0.02 is 2e-7, below the f16
+// normal range (6e-5), so the tail of the softmax loses its bits while l is summed in fp32. P is scaled by
+// DPAS_PSCALE before the half conversion (p x vs at most about 0.5, so 2048 at most) and o divided once at the end.
+#define DPAS_PSCALE 4096.0f
 KERNEL(256) void attn_decode_dpas(global const ushort *Q, global const char *KC, global const char *VC,
                                   global float *PM, global float *PL, global float *PO, int p0, int NS, int span,
                                   float scale, global const ulong *MT, global const int *POS, int cap,
@@ -791,7 +795,7 @@ KERNEL(256) void attn_decode_dpas(global const ushort *Q, global const char *KC,
         for (int kk = 0; kk < 16; kk++) {
           const float pr = mn[p] == -INFINITY ? 0.0f : native_exp2(s[p][kk] - mn[p]);
           sum += pr;
-          P[(sg * 32 + p * 16 + lane) * 16 + kk] = as_ushort(convert_half(pr * sub_group_broadcast(vsc, kk)));
+          P[(sg * 32 + p * 16 + lane) * 16 + kk] = as_ushort(convert_half(pr * sub_group_broadcast(vsc, kk) * DPAS_PSCALE));
         }
       }
       SM[p][sg][lane] = sum;
@@ -854,6 +858,6 @@ KERNEL(256) void attn_decode_dpas(global const ushort *Q, global const char *KC,
     }
   for (int q = 0; q < nr; q++)
     __attribute__((opencl_unroll_hint))
-    for (int r = 0; r < 8; r++) PO[(((long)(t0 + q) * Q27_AQ + qh0 + r) * NS + sp) * 256 + sg * 16 + lane] = o[q][r];
+    for (int r = 0; r < 8; r++) PO[(((long)(t0 + q) * Q27_AQ + qh0 + r) * NS + sp) * 256 + sg * 16 + lane] = o[q][r] * (1.0f / DPAS_PSCALE);
 }
 #endif // Q27_GQA == 8
