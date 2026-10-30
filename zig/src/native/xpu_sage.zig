@@ -39,6 +39,7 @@ pub const Slots = struct {
     first_rows: [sage.MAX_SLOTS]?[]f32 = @splat(null), // a structured stream's prompt-row logits, for first_masked
     masked_vals: ?[]f64 = null, // a structured sampled row's allowed candidates
     masked_ids: ?[]u64 = null,
+    counts: ?[]u32 = null, // a penalized row's token counts (all zero between rows)
     fed: [sage.MAX_SLOTS]u32 = @splat(1), // rows the last verify fed each slot
     from: [sage.MAX_SLOTS]?u32 = @splat(null), // where the last verify's specMulti block of the slot starts (null: none)
     drawn: [ring]u32 = undefined,
@@ -85,6 +86,7 @@ pub const Slots = struct {
         b.gpa.free(b.ids);
         for (b.first_rows) |x| if (x) |row| b.gpa.free(row);
         if (b.masked_vals) |x| b.gpa.free(x);
+        if (b.counts) |x| b.gpa.free(x);
         if (b.masked_ids) |x| b.gpa.free(x);
         if (b.pool) |*p| {
             for (&b.leases) |*l| p.finish(l);
@@ -240,10 +242,41 @@ pub const Slots = struct {
 
     /// The stream's next token: the runner's greedy one, else drawn on the host from logits row `row` (null: the
     /// current slot's last forward) at `position`.
-    fn draw(b: *Slots, s: *const lanes.Stream, greedy: i32, row: ?u32, position: u64) !u32 {
+    fn draw(b: *Slots, s: *const lanes.Stream, greedy: i32, row: ?u32, position: u64, extra: []const u32) !u32 {
         const sp = s.sampling orelse return @intCast(greedy);
         if (sp.temperature <= 0) return @intCast(greedy);
-        return lane.draw(b.gpa, try b.fetchRow(row), sp, position);
+        const logits = try b.fetchRow(row);
+        try b.penalize(f32, logits, sp, s, u32, extra);
+        return lane.draw(b.gpa, logits, sp, position);
+    }
+
+    /// The presence and frequency penalties on a sampled row (vLLM's rule): each token of the reply so far (the
+    /// stream's emitted tokens, then `extra`, the window's rows fed before this one) loses presence + frequency x its
+    /// count from its logit. The prompt is not counted. Without a penalty the row is unchanged.
+    fn penalize(b: *Slots, comptime T: type, row: []T, sp: lanes.Sampling, s: *const lanes.Stream, comptime E: type, extra: []const E) !void {
+        if (!sp.penalized()) return;
+        const counts = b.counts orelse blk: {
+            const c = try b.gpa.alloc(u32, b.r.z.s.vocab);
+            @memset(c, 0);
+            b.counts = c;
+            break :blk c;
+        };
+        if (row.len > counts.len) return error.RowTooWide;
+        for (s.emitted()) |t| if (t < row.len) {
+            counts[t] += 1;
+        };
+        for (extra) |e| if (e >= 0 and e < row.len) {
+            counts[@intCast(e)] += 1;
+        };
+        for (s.emitted()) |t| if (t < row.len) b.penalizeOne(T, row, sp, counts, t);
+        for (extra) |e| if (e >= 0 and e < row.len) b.penalizeOne(T, row, sp, counts, @intCast(e));
+    }
+
+    fn penalizeOne(_: *Slots, comptime T: type, row: []T, sp: lanes.Sampling, counts: []u32, t: usize) void {
+        if (counts[t] == 0) return; // done for an earlier copy of this token
+        const v: f64 = row[t];
+        row[t] = @floatCast(v - sp.presence_penalty - sp.frequency_penalty * @as(f64, @floatFromInt(counts[t])));
+        counts[t] = 0;
     }
 
     /// Row `row` of the last forward (null: the current slot's last row) as f32 logits in b.row.
@@ -254,7 +287,13 @@ pub const Slots = struct {
     }
 
     /// Structured output: the draw among the tokens `mask` allows, greedy (first argmax) or sampled (keyed).
-    fn drawMasked(b: *Slots, s: *const lanes.Stream, row: []const f32, position: u64, mask: []const u32) !u32 {
+    fn drawMasked(b: *Slots, s: *const lanes.Stream, logits: []const f32, position: u64, mask: []const u32, extra: []const u32) !u32 {
+        var row = logits;
+        if (s.sampling) |sp| if (sp.temperature > 0 and sp.penalized()) {
+            if (row.ptr != b.row.ptr) @memcpy(b.row, row);
+            try b.penalize(f32, b.row, sp, s, u32, extra);
+            row = b.row;
+        };
         if (s.sampling) |sp| if (sp.temperature > 0) {
             const vals = b.masked_vals orelse try b.gpa.alloc(f64, row.len);
             b.masked_vals = vals;
@@ -402,7 +441,7 @@ pub const Slots = struct {
             b.first_rows[slot] = keep;
             @memcpy(keep, try b.fetchRow(null));
         }
-        const first = try b.draw(s, r.last, null, ids.len);
+        const first = try b.draw(s, r.last, null, ids.len, &.{});
         if (b.sampled_drafts and s.drafts and s.grammar == null and first != r.last) try r.refollow(@intCast(first));
         _ = b.push(first);
     }
@@ -411,7 +450,7 @@ pub const Slots = struct {
         const b = of(ptr);
         const slot = b.slotOf(s) orelse return error.UnknownStream;
         if (position != s.prompt_len) return error.PositionMismatch;
-        return b.push(try b.drawMasked(s, b.first_rows[slot] orelse return error.NoLogits, position, mask));
+        return b.push(try b.drawMasked(s, b.first_rows[slot] orelse return error.NoLogits, position, mask, &.{}));
     }
 
     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
@@ -541,6 +580,7 @@ pub const Slots = struct {
         var j: u32 = 0;
         while (j + 1 < rows) : (j += 1) {
             const pos = o.position + j;
+            try b.penalize(f16, x.rows[j * v ..][0..v], sp, o.s, i32, ids[1 .. j + 1]); // row j follows ids[0..j]
             const p = try x.dist(x.rows[j * v ..][0..v], sp, &x.p);
             const draft: u32 = @intCast(ids[j + 1]);
             const q: ?*const Dist = if (j == 0 and b.r.sdrawn[o.slot]) &x.q[o.slot] else null;
@@ -553,6 +593,7 @@ pub const Slots = struct {
             o.position += j + 1;
             return j + 1;
         }
+        try b.penalize(f16, x.rows[j * v ..][0..v], sp, o.s, i32, ids[1 .. j + 1]);
         const p = try x.dist(x.rows[j * v ..][0..v], sp, &x.p);
         out[j] = @intCast(p.pick(lanes.sampling.uniform(sp.seed, o.position + j, salt_bonus)));
         o.position += rows;
@@ -574,9 +615,10 @@ pub const Slots = struct {
 
     /// Row `j` of window `w` drawn: masked when the window has grammar masks, else greedy or sampled.
     fn drawRow(b: *Slots, w: be.Window, j: usize, greedy: i32, row: ?u32) !u32 {
-        if (w.masks.len == 0) return b.draw(w.stream, greedy, row, w.positions[j]);
+        const extra = w.tokens[0..@min(j, w.tokens.len)]; // row j follows the pending token, then tokens[0..j]
+        if (w.masks.len == 0) return b.draw(w.stream, greedy, row, w.positions[j], extra);
         const words = w.masks.len / w.rows();
-        return b.drawMasked(w.stream, try b.fetchRow(row), w.positions[j], w.masks[j * words ..][0..words]);
+        return b.drawMasked(w.stream, try b.fetchRow(row), w.positions[j], w.masks[j * words ..][0..words], extra);
     }
 
     /// A window keeps at most the rows its verify fed (one, or two when the forced token landed, or specMulti's). The
