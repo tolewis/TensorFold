@@ -248,6 +248,8 @@ pub const Server = struct {
             .top_k = @intCast(@min(@max(0, (if (options.get("top_k")) |k| k.int64() else null) orelse 0), std.math.maxInt(u32))),
             .top_p = @floatCast(number(options.get("top_p")) orelse 1.0),
             .min_p = @floatCast(number(options.get("min_p")) orelse 0.0),
+            .presence_penalty = number(options.get("presence_penalty")) orelse 0.0,
+            .frequency_penalty = number(options.get("frequency_penalty")) orelse 0.0,
         };
     }
 

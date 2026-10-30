@@ -212,7 +212,7 @@ fn sampling(a: std.mem.Allocator, io: std.Io, dir: []const u8, args: cli.Args) !
     if (std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20))) |bytes| {
         if ((try json.parse(a, bytes)) == .ok) {
             const cfg = (try json.parse(a, bytes)).ok;
-            for ([_][]const u8{ "temperature", "top_k", "top_p", "min_p" }) |k| if (cfg.field(k)) |v| try out.put(a, k, v);
+            for ([_][]const u8{ "temperature", "top_k", "top_p", "min_p", "presence_penalty", "frequency_penalty" }) |k| if (cfg.field(k)) |v| try out.put(a, k, v);
             if (cfg.get("do_sample")) |d| if (d == .bool) {
                 if (!d.bool) try out.put(a, "temperature", .{ .float = 0 }) else if (out.get("temperature") == null) try out.put(a, "temperature", .{ .float = 1 });
             };

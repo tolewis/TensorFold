@@ -12,6 +12,13 @@ pub const Sampling = struct {
     top_k: u32 = 20,
     top_p: f64 = 0.95,
     min_p: f64 = 0.0,
+    presence_penalty: f64 = 0.0, // subtracted from the logit of each token the reply already holds (OpenAI, as vLLM)
+    frequency_penalty: f64 = 0.0, // and this times its count in the reply
+
+    /// The reply's tokens change the draw (a penalty is set).
+    pub fn penalized(s: Sampling) bool {
+        return s.presence_penalty != 0 or s.frequency_penalty != 0;
+    }
 
     /// ln(min_p), -inf when off.
     pub fn minLog(s: Sampling) f64 {
