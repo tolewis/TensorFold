@@ -3,6 +3,7 @@ const std = @import("std");
 const q = @import("qwen27.zig");
 const dev = @import("dev.zig");
 const fwd = @import("forward.zig");
+const x3 = @import("qwen27_exl3.zig");
 const Checkpoint = dev.Checkpoint;
 const D = q.D;
 const Dev = dev.Dev;
@@ -15,7 +16,8 @@ const kvBytes = fwd.kvBytes;
 const off = dev.off;
 
 /// An int4 projection in the GEMM layout (words, fp16 scales, biases); `wide` picks the kernel family, `ilv` gate|up.
-pub const Proj = struct { w: *anyopaque, s: *anyopaque, bg: *anyopaque, n: u32, k: u32, wide: bool, gs: u32 = 64, ilv: bool = false };
+/// `x3`: an EXL3 projection (qwen27_exl3.zig); the int4 fields are then unused.
+pub const Proj = struct { w: *anyopaque, s: *anyopaque, bg: *anyopaque, n: u32, k: u32, wide: bool, gs: u32 = 64, ilv: bool = false, x3: ?*x3.Proj = null };
 
 pub const Layer = struct {
     in_norm: *anyopaque,
@@ -62,6 +64,8 @@ pub const Model = struct {
     norm: *anyopaque,
     head: Proj,
     invf: *anyopaque,
+    /// EXL3 checkpoints: the projections' pipelines, regions and plans (bound after Acts.init).
+    exl3: ?*x3.Weights = null,
 };
 
 pub fn bf16Tensor(d: *Dev, c: *const Checkpoint, name: []const u8) !*anyopaque {
@@ -187,6 +191,7 @@ pub fn vecTensor(d: *Dev, c: *const Checkpoint, name: []const u8, centred: bool)
 /// Qwen3.8-27B from a symmetric 4-bit GPTQ checkpoint (g128): int4 projections, fp16 embedding, head quantized to 4/64.
 pub fn loadGptq(d: *Dev, c: *const Checkpoint) !Model {
     var m: Model = undefined;
+    m.exl3 = null;
     const stage = try d.alloc_(800 << 20);
     const e = try c.get("model.embed_tokens.weight");
     if (!std.mem.eql(u8, e.dtype, "F16")) return error.UnexpectedDtype;
@@ -245,12 +250,14 @@ pub fn loadGptq(d: *Dev, c: *const Checkpoint) !Model {
 }
 
 pub fn load(d: *Dev, c: *const Checkpoint) !Model {
+    if (c.has("model.layers.0.linear_attn.in_proj_qkv.trellis")) return x3.loadExl3(d, c);
     if (c.has("in_proj_qkv.qweight")) {
         q.GS = 128;
         return loadGptq(d, c);
     }
     q.GS = 64;
     var m: Model = undefined;
+    m.exl3 = null;
     const stage = try d.alloc_(800 << 20);
     const e_w = try c.get("model.embed_tokens.weight");
     m.embed_w = try d.upload(e_w.bytes);

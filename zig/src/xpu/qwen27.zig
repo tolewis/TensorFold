@@ -315,6 +315,7 @@ pub const Runner = struct {
         r.model = try load(d, &ckpt);
         prof.on = prof_on;
         r.acts = try Acts.init(d);
+        if (r.model.exl3) |x| try x.bind(d, &r.model, &r.acts); // the EXL3 plans over the activations
         r.store(); // slot 0: the states the load allocated
         try d.fill(r.acts.zeros, @as(u16, 0), maxRows() * 48 * 128 * 2);
         try d.fill(r.acts.ones, @as(f32, 1.0), maxRows() * 48 * 4);
