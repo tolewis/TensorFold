@@ -146,7 +146,7 @@ pub fn chainTable() [16 * 17]i32 {
 pub fn mlpIn(d: *Dev, m: *const Model, a: *Acts, w: Proj, T: u32, gs: i32, pre: bool, wide: bool) !*anyopaque {
     if (w.x3) |e| { // EXL3: [gate | up] (ilv 0), then swiglu; the W4A8 and nGEN epilogues are int4 only
         try exl3.project(e, m.exl3.?, d, a.h, a.p, T, wide);
-        try d.launch(d.k.swiglu, .{ .x = T, .y = 17 }, .{ a.p, a.h, a.ahi, a.alo, gs, @as(i32, 0), q.rot_on });
+        try d.launch(d.k.swiglu, .{ .x = T, .y = (FF + 1023) / 1024 }, .{ a.p, a.h, a.ahi, a.alo, gs, @as(i32, 0), q.rot_on });
         return a.h;
     }
     if (q.prefill_int8 and wide and w.ilv and w.gs == 128) { // W4A8: SwiGLU epilogue; down quantizes its own input
@@ -163,7 +163,7 @@ pub fn mlpIn(d: *Dev, m: *const Model, a: *Acts, w: Proj, T: u32, gs: i32, pre: 
         return a.p;
     }
     try gemmRows(d, a.pscr, a.h, a.ahi, a.alo, w, a.p, T, wide);
-    try d.launch(d.k.swiglu, .{ .x = T, .y = 17 }, .{ a.p, a.h, a.ahi, a.alo, gs, @as(i32, @intFromBool(w.ilv)), q.rot_on });
+    try d.launch(d.k.swiglu, .{ .x = T, .y = (FF + 1023) / 1024 }, .{ a.p, a.h, a.ahi, a.alo, gs, @as(i32, @intFromBool(w.ilv)), q.rot_on });
     return a.h;
 }
 
