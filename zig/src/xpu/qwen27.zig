@@ -345,7 +345,10 @@ pub const Runner = struct {
 
     /// Gives back the card's memory, the shards' mappings and the host buffers; `r` is gone after it.
     pub fn deinit(r: *Runner) void {
-        if (tp.group) |*g| g.record(.close, 0, 0, 0, &.{}) catch {};
+        if (tp.group) |*g| {
+            g.record(.close, 0, 0, 0, &.{}) catch {};
+            tp.markClosed(g); // a rank that stops closes the group: its peer sees it at once, not after the wait
+        }
         r.d.deinit();
         prof.on = false;
         live = false;
