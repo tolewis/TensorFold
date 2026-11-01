@@ -87,8 +87,10 @@ const Pack = struct {
             return out;
         }
         // the rank's slice: tile rows [k0, k1) whole (contiguous), tiles [n0, n1) of each (strided)
-        if (cut.k1 > m.k or cut.n1 > m.n or cut.k0 >= cut.k1 or cut.n0 >= cut.n1) return error.UnexpectedShape;
-        if (cut.k0 % 128 != 0 or cut.k1 % 128 != 0 or cut.n0 % 128 != 0 or cut.n1 % 128 != 0) return error.UnexpectedShape;
+        if (cut.k1 > m.k or cut.n1 > m.n or cut.k0 >= cut.k1 or cut.n0 >= cut.n1 or cut.k0 % 128 != 0 or cut.k1 % 128 != 0 or cut.n0 % 128 != 0 or cut.n1 % 128 != 0) {
+            std.debug.print("exl3: {s} is {d} x {d}; the rank's cut rows [{d}, {d}) cols [{d}, {d}) is out of it or off a 128 boundary\n", .{ prefix, m.k, m.n, cut.k0, cut.k1, cut.n0, cut.n1 });
+            return error.UnexpectedShape;
+        }
         const tile = tr.shape[2] * 2; // bytes a 16 x 16 tile
         const n_tiles = m.n / 16;
         var out: Mat = .{ .k = cut.k1 - cut.k0, .n = cut.n1 - cut.n0, .halves = m.halves, .at = undefined };
@@ -364,8 +366,8 @@ pub fn loadExl3(d: *Dev, c: *const Checkpoint) !loader.Model {
             const qkv = f(&nb[0], i, "linear_attn.in_proj_qkv");
             const mi = if (tp1) try w.add(d, c, &.{ .{ .prefix = qkv }, .{ .prefix = f(&nb[1], i, "linear_attn.in_proj_z") } }, q.GDN_IN) else try w.add(d, c, &.{
                 .{ .prefix = qkv, .cut = Cut.cols(R * hk, hk, D) },
-                .{ .prefix = qkv, .cut = Cut.cols(2 * q.TP * hk + R * hk, hk, D) },
-                .{ .prefix = qkv, .cut = Cut.cols(4 * q.TP * hk + R * hv, hv, D) },
+                .{ .prefix = qkv, .cut = Cut.cols(q.TP * hk + R * hk, hk, D) },
+                .{ .prefix = qkv, .cut = Cut.cols(2 * q.TP * hk + R * hv, hv, D) },
                 .{ .prefix = f(&nb[1], i, "linear_attn.in_proj_z"), .cut = Cut.cols(R * hv, hv, D) },
             }, q.GDN_IN);
             if (mi.parts[mi.count - 1].col + mi.parts[mi.count - 1].m.n != q.GDN_AB) return error.UnexpectedShape;
