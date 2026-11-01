@@ -430,8 +430,10 @@ pub const Group = struct {
             g.direct = true;
             return;
         }
-        if (mode == 2 or peer_mode == 2) {
-            std.log.warn("qwen27-xpu: TP all-reduce stays host-staged: the peer's memory did not take this rank's writes (TF_TP_DEVFLAG)", .{});
+        if (mode != 0 or peer_mode != 0) {
+            // one rank asked for the device flag and the paths did not agree (a test failed, or the env differs): the
+            // blocks were allocated at different sizes, so both ranks take the host path
+            std.log.warn("qwen27-xpu: TP all-reduce stays host-staged: the device-flag paths did not agree (this rank {d}, the peer {d})", .{ mode, peer_mode });
             g.direct = false;
             return;
         }
