@@ -163,8 +163,8 @@ pub fn main() !void {
             }
         }
         // the plan at 8 streams, 16 rows a stream, for the handoff
-        var wf8 = [_]u32{0} ** 8;
-        var wn8 = [_]u32{16} ** 8;
+        var wf8: [8]u32 = @splat(0);
+        var wn8: [8]u32 = @splat(16);
         for (1..8) |i| wf8[i] = @intCast(i * 16);
         var grp8: [2 * 32]i32 = @splat(0);
         const ng8 = k1.rowGroups(&wf8, &wn8, &grp8);
