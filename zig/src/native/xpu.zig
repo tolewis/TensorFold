@@ -123,9 +123,34 @@ fn slotsThatFit(runner: *xq.Runner, want: u32, reserve: u64) !u32 {
 }
 
 fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter, o: api.Open, context: u32) !api.Opened {
-    const budget = cacheBudget(o);
-    const slots = try slotsThatFit(runner, @min(@max(o.lanes, 1), xq.MAX_SLOTS), budget);
-    if (slots == 0) return error.StreamDoesNotFit;
+    const want = @min(@max(o.lanes, 1), xq.MAX_SLOTS);
+    var budget: u64 = 0;
+    var slots: u32 = 0;
+    if (xq.kv_pool) {
+        // the shared K/V pool: what the card leaves after the load, the drafter, every stream's GDN states and the
+        // reserve; the streams are the ones its pages cover at --context tokens each
+        const cache_on = if (o.prompt_cache_gib) |gib| gib > 0 else true;
+        const drafter_ctx: u64 = if (drafter != null) @intCast(Drafter.ctxBytes()) else 0; // a stream's drafter context
+        const pages = try xq.poolPagesShared(runner, want, cache_on, drafter_ctx);
+        if (pages == 0) return error.PoolDoesNotFit;
+        const by_pool: u32 = @intCast(@min(@as(u64, want), (@as(u64, pages) * xq.PAGE) / context));
+        if (by_pool == 0) return error.StreamDoesNotFit;
+        slots = by_pool;
+        try runner.allocPool(pages);
+        // kept prompt states hold the pool's pages past the streams' contexts; their GDN copies have a reserve of their own
+        const e = (context + xq.PAGE - 1) / xq.PAGE;
+        const spare = pages -| slots * e;
+        budget = if (cache_on) @as(u64, spare) * runner.kvBytesPerToken() * xq.PAGE else 0;
+        if (o.prompt_cache_gib) |gib| {
+            if (gib > 0) budget = @min(budget, std.math.lossyCast(u64, gib * (1 << 30)));
+        }
+        std.log.info("qwen27-xpu: a shared K/V pool of {d} pages ({d} tokens, {d:.2} GB a card, int8), {d} stream(s) of at most {d} tokens, kept prompt states in up to {d:.1} GiB of it", .{ pages, runner.poolTokens(), @as(f64, @floatFromInt(runner.poolBytes())) / 1e9, slots, context, @as(f64, @floatFromInt(budget)) / (1 << 30) });
+        if (slots < want) std.log.warn("qwen27-xpu: the K/V pool holds {d} tokens, so {d} stream(s) are admitted of the {d} asked for (--kv-pool-tokens names a bigger pool)", .{ runner.poolTokens(), slots, want });
+    } else {
+        budget = cacheBudget(o);
+        slots = try slotsThatFit(runner, want, budget);
+        if (slots == 0) return error.StreamDoesNotFit;
+    }
     const h = try gpa.create(LaneServed);
     errdefer gpa.destroy(h);
     const gpa_box = try gpa.create(Allocator);
@@ -154,6 +179,10 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
     if (budget > 0) {
         // the prompt kernels compute in blocks of 64 rows from a call's start: kept and resumed at planned marks only
         h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = h, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, .{ .planned = true, .grid = 64 }, budget);
+        if (xq.kv_pool) { // kept states' GDN and drafter-context copies stay inside the reserve the pool left for them
+            const per = xq.gdnBytes(runner) + (if (drafter != null) Drafter.ctxBytes() else 0);
+            h.cache.?.most = @intCast(@max(1, (1536 << 20) / @max(per, 1)));
+        }
         h.host.cache = &h.cache.?;
         h.host.info_.prompt_cache = true;
         std.log.info("qwen27-xpu: prompt cache of {d:.1} GiB", .{@as(f64, @floatFromInt(budget)) / (1 << 30)});
@@ -181,6 +210,8 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
         problem.* = try std.fmt.allocPrint(a, "the XPU engine holds 1 to {d} tokens a stream, not {d}", .{ xq.limits.MAX_CONTEXT, o.context.? });
         return false;
     };
+    xq.pool_tokens = o.kv_pool_tokens;
+    if (o.kv_pool_tokens != null) xq.kv_pool = true;
     const runner = xq.Runner.init(o.dir, context) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "the XPU engine could not load {s}: {s}", .{ o.dir, @errorName(err) });
         return false;
@@ -189,6 +220,16 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
     if (xq.RANK == 0) {
         problem.* = try std.fmt.allocPrint(a, "a follower needs TF_TP_RANK above 0 (1 to {d})", .{xq.TP - 1});
         return false;
+    }
+    if (xq.kv_pool) { // the pool rank 0 sized: both ranks map the same page ids
+        const pages = xq.poolPagesShared(runner, @min(@max(o.lanes, 1), xq.MAX_SLOTS), true, 0) catch |err| {
+            problem.* = try std.fmt.allocPrint(a, "rank {d} could not size the K/V pool: {s}", .{ xq.RANK, @errorName(err) });
+            return false;
+        };
+        runner.allocPool(pages) catch |err| {
+            problem.* = try std.fmt.allocPrint(a, "rank {d} could not make a K/V pool of {d} pages: {s}", .{ xq.RANK, pages, @errorName(err) });
+            return false;
+        };
     }
     std.log.info("qwen27-xpu: rank {d} of {d} holds its half of {s} and follows rank 0", .{ xq.RANK, xq.TP, o.dir });
     xq.follow.run(runner) catch |err| {
@@ -209,6 +250,8 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         problem.* = try std.fmt.allocPrint(a, "the XPU engine holds 1 to {d} tokens a stream, not {d}", .{ xq.limits.MAX_CONTEXT, o.context.? });
         return null;
     };
+    xq.pool_tokens = o.kv_pool_tokens; // --kv-pool-tokens: the pool's size, or (null) what the card leaves
+    if (o.kv_pool_tokens != null) xq.kv_pool = true;
     const runner = xq.Runner.init(o.dir, context) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "the XPU engine could not load {s}: {s}", .{ o.dir, @errorName(err) });
         return null;
@@ -224,7 +267,11 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     return openLanes(gpa, io, runner, dr, o, context) catch |err| {
         if (dr) |x| x.deinit();
         runner.deinit();
-        problem.* = if (err == error.StreamDoesNotFit)
+        problem.* = if (err == error.StreamDoesNotFit and xq.kv_pool)
+            try std.fmt.allocPrint(a, "the XPU engine cannot hold the K/V pool and {d} stream(s) of {d} tokens beside {s} on this card: set a smaller --context, fewer --parallel slots, or a smaller --kv-pool-tokens", .{ @min(@max(o.lanes, 1), xq.MAX_SLOTS), context, o.dir })
+        else if (err == error.PoolDoesNotFit)
+            try std.fmt.allocPrint(a, "the XPU engine's K/V pool ({s}) does not fit beside {s} on this card", .{ if (o.kv_pool_tokens) |t| try std.fmt.allocPrint(a, "--kv-pool-tokens {d}", .{t}) else "what the card leaves", o.dir })
+        else if (err == error.StreamDoesNotFit)
             try std.fmt.allocPrint(
                 a,
                 "the XPU engine cannot hold a stream of {d} tokens and a {d:.1} GiB prompt cache " ++

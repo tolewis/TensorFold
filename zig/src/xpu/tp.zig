@@ -81,6 +81,25 @@ pub const Group = struct {
     fn consumed(g: *const Group) *std.atomic.Value(u64) {
         return @ptrCast(@alignCast(g.map.ptr + g.tp * line + 2 * g.tp * slot_bytes));
     }
+    /// Rank 0's K/V pool size in pages, in the unused tail of its counter line (the counters take one word a rank):
+    /// a follower sizes the same pool, so both ranks map the same page ids.
+    fn poolWord(g: *const Group) *std.atomic.Value(u64) {
+        return @ptrCast(@alignCast(g.map.ptr + 8));
+    }
+    pub fn setPool(g: *const Group, pages: u32) void {
+        if (g.rank == 0) g.poolWord().store(pages, .seq_cst);
+    }
+    /// The pages rank 0 published; null after `seconds` (rank 0 zeroes the pool before the first request).
+    pub fn awaitPool(g: *const Group, seconds: f64) ?u32 {
+        const deadline = q.now() + seconds;
+        while (q.now() < deadline) {
+            const n = g.poolWord().load(.seq_cst);
+            if (n != 0) return @intCast(n);
+            var ts: std.c.timespec = .{ .sec = 0, .nsec = 10_000_000 };
+            while (std.c.nanosleep(&ts, &ts) != 0) {}
+        }
+        return null;
+    }
     fn rec(g: *const Group, i: u64) *Rec {
         return @ptrCast(@alignCast(g.map.ptr + g.tp * line + 2 * g.tp * slot_bytes + line + (i % ring_len) * @sizeOf(Rec)));
     }

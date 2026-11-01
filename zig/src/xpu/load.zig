@@ -52,6 +52,11 @@ pub const Layer = struct {
     slot_cur: [MAX_SLOTS]u1 = @splat(0),
     slot_kc: [MAX_SLOTS]?*anyopaque = @splat(null),
     slot_vc: [MAX_SLOTS]?*anyopaque = @splat(null),
+    // K1 (XPU_K1) and the pool (lane p21-pool): the layer's K/V page pool as Sage's allocPool ([pool, PAGE, AKV, 256])
+    // and each slot's page table (u32 page ids, one an entry). Unused while `pt` is null.
+    pool: u32 = 0, // pages the pool holds
+    pt: ?*anyopaque = null, // the selected slot's page table
+    slot_pt: [MAX_SLOTS]?*anyopaque = @splat(null),
 };
 
 /// Sequences a runner holds at most (one a stream of the lane host).
@@ -218,8 +223,10 @@ pub fn loadGptq(d: *Dev, c: *const Checkpoint) !Model {
             l.mixer_out = try projectionGptq(d, c, f(p, "self_attn."), &.{"o_proj"}, false, 0, false, stage);
             l.qn = try vecTensor(d, c, f(p, "self_attn.q_norm.weight"), true);
             l.kn = try vecTensor(d, c, f(p, "self_attn.k_norm.weight"), true);
-            l.kc = try d.alloc_(kvBytes());
-            l.vc = try d.alloc_(kvBytes());
+            if (!q.kv_pool) { // the shared pool replaces the slot's own cache
+                l.kc = try d.alloc_(kvBytes());
+                l.vc = try d.alloc_(kvBytes());
+            }
         } else {
             l.mixer_in = try projectionGptq(d, c, f(p, "linear_attn."), &.{ "in_proj_qkv", "in_proj_z" }, true, GDN_IN, false, stage);
             l.mixer_out = try projectionGptq(d, c, f(p, "linear_attn."), &.{"out_proj"}, false, 0, false, stage);
@@ -282,8 +289,10 @@ pub fn load(d: *Dev, c: *const Checkpoint) !Model {
             l.mixer_out = try projection(d, c, f(p, "self_attn."), &.{"o_proj"}, false, false, stage);
             l.qn = try bf16Tensor(d, c, f(p, "self_attn.q_norm.weight"));
             l.kn = try bf16Tensor(d, c, f(p, "self_attn.k_norm.weight"));
-            l.kc = try d.alloc_(kvBytes());
-            l.vc = try d.alloc_(kvBytes());
+            if (!q.kv_pool) { // the shared pool replaces the slot's own cache
+                l.kc = try d.alloc_(kvBytes());
+                l.vc = try d.alloc_(kvBytes());
+            }
         } else {
             l.mixer_in = try projection(d, c, f(p, "linear_attn."), &.{ "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b" }, true, false, stage);
             l.mixer_out = try projection(d, c, f(p, "linear_attn."), &.{"out_proj"}, false, false, stage);

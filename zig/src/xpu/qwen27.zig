@@ -8,6 +8,8 @@ const tp = @import("tp.zig");
 const loader = @import("load.zig");
 const multi = @import("runner_multi.zig");
 const slot_states = @import("slot_states.zig");
+const pages_mod = @import("pages.zig");
+const k1mod = @import("k1.zig"); // XPU_K1: the split-K DPAS decode over int8 pool pages (lane p22-k1)
 pub const follow = @import("follow.zig");
 pub const limits = @import("limits.zig");
 const Prof = dev.Prof;
@@ -22,6 +24,7 @@ extern "c" fn close(fd: c_int) c_int;
 extern "c" fn munmap(addr: *anyopaque, len: usize) c_int;
 pub const MAX_SLOTS = loader.MAX_SLOTS;
 pub const freeAfterQueue = slot_states.freeAfterQueue;
+pub const gdnBytes = slot_states.gdnBytes;
 pub const Tensor = dev.Tensor;
 pub const Checkpoint = dev.Checkpoint;
 pub const Dev = dev.Dev;
@@ -75,6 +78,14 @@ pub fn chunkEnd(at: usize, len: usize) usize {
 pub var MAX_CTX: u32 = 4096; // KV cache rows (XPU_CTX)
 pub const SPLIT = 32; // keys per attention split (decode.cl)
 pub const EPS: f32 = 1e-6;
+
+/// K/V positions a page holds (shape.h Q27_PAGE): a stream's positions reach its pages through its page table.
+pub const PAGE: u32 = 64;
+/// Shared K/V pool (XPU_KV_POOL=1, or --kv-pool-tokens): int8 pages every slot reads through its own page table.
+/// Off by default: each slot keeps its own contiguous cache, as before the pool.
+pub var kv_pool = false;
+/// --kv-pool-tokens: the pool's size in tokens; null: what the card leaves after the load and the reserve.
+pub var pool_tokens: ?u32 = null;
 
 // Layout of a GDN layer's stash (bytes): q, k, v, g, β, then the qkv rows of P.
 pub const ST_Q = 0;
@@ -133,13 +144,15 @@ const Options = struct {
     a8_sites4: u32,
     embed_host: bool,
     chunk: u32,
+    kv_pool: bool,
+    pool_tokens: ?u32,
 };
 var defaults: ?Options = null;
 /// One runner at a time: the options, MAX_CTX and GS above belong to the process, not to a runner.
 var live = false;
 
 fn options() Options {
-    return .{ .dump_dir = dump_dir, .dump_h = dump_h, .a8_group = a8_group, .kv8 = kv8, .kv_i8 = kv_i8, .prefill_int4 = prefill_int4, .int4_sites = int4_sites, .prefill_int8 = prefill_int8, .a8_sites = a8_sites, .a8_rot = a8_rot, .a8_levels = a8_levels, .a8_sites4 = a8_sites4, .embed_host = embed_host, .chunk = CHUNK };
+    return .{ .dump_dir = dump_dir, .dump_h = dump_h, .a8_group = a8_group, .kv8 = kv8, .kv_i8 = kv_i8, .prefill_int4 = prefill_int4, .int4_sites = int4_sites, .prefill_int8 = prefill_int8, .a8_sites = a8_sites, .a8_rot = a8_rot, .a8_levels = a8_levels, .a8_sites4 = a8_sites4, .embed_host = embed_host, .chunk = CHUNK, .kv_pool = kv_pool, .pool_tokens = pool_tokens };
 }
 
 fn restore(o: Options) void {
@@ -157,6 +170,8 @@ fn restore(o: Options) void {
     a8_sites4 = o.a8_sites4;
     embed_host = o.embed_host;
     CHUNK = o.chunk;
+    kv_pool = o.kv_pool;
+    pool_tokens = o.pool_tokens;
 }
 
 extern "c" fn clock_gettime(clk: c_int, ts: *[2]i64) c_int;
@@ -191,6 +206,13 @@ pub const Runner = struct {
     multi_tree: bool = false, // the last verifyMulti had tree windows: every window's states are replayed at the keep
     mpath_host: [16 * 2 * 16]i32 = @splat(0),
     seqs: [MAX_SLOTS]struct { pos: u32 = 0, last: u32 = 0 } = @splat(.{}),
+    // the shared K/V pool (allocPool): every attention layer's pages, each slot's page table and the pages it holds
+    pool: u32 = 0, // pages in each attention layer's pool (0: per-slot caches)
+    page_bytes: usize = 0, // bytes of one K (or V) page of one layer: PAGE positions of the card's K/V heads
+    pt: [MAX_SLOTS]?*anyopaque = @splat(null), // each slot's page table on the device: u32 [ceil(context / PAGE)]
+    pt_host: [MAX_SLOTS][]u32 = @splat(&.{}), // and on the host, where the runner maps and keeps it
+    held: [MAX_SLOTS]u32 = @splat(0), // entries of each slot's table that map a page
+    pages: pages_mod.Pages = .{ .gpa = alloc, .count = 0, .refs = &.{} }, // the pool's references and free pages
     /// Target hidden states for a drafter: when on, every forward fills acts.taps and calls `on_taps` with its rows.
     taps_on: bool = false,
     on_taps: ?struct { ctx: *anyopaque, f: *const fn (*anyopaque, *anyopaque, u32) anyerror!void } = null,
@@ -217,7 +239,13 @@ pub const Runner = struct {
         if (std.c.getenv("XPU_DUMP_H")) |v| dump_h = open(v, 0o2101, @as(c_uint, 0o644)); // append
         if (std.c.getenv("XPU_CHUNK")) |v| CHUNK = try limits.chunk(std.mem.span(v));
         if (std.c.getenv("TF_TP_RANK")) |v| RANK = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+        k1mod.readEnv(); // XPU_K1, XPU_K1_WAVE
         if (RANK >= TP) return error.RankOutOfRange;
+        // the shared K/V pool: a page holds int8 rows and their scales, so pool mode is int8 K/V
+        if (std.c.getenv("XPU_KV_POOL")) |v| kv_pool = v[0] != '0';
+        if (std.c.getenv("XPU_KV_POOL_TOKENS")) |v| pool_tokens = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+        if (pool_tokens != null) kv_pool = true;
+        if (kv_pool) kv_i8 = true;
         MAX_CTX = try limits.context(context);
         {
             const marker = try std.fmt.allocPrintSentinel(alloc, "{s}/hadamard128", .{dir}, 0);
@@ -331,6 +359,15 @@ pub const Runner = struct {
         };
         // the shared rounds' kernels reach each slot's states through the per-row table (acts.mt)
         for ([_]ze.H{ d.k.attn_prep, d.k.attn_decode, d.k.gdn_pre, d.k.gdn_step }) |k| try d.g.indirect(k);
+        if (k1mod.on) { // XPU_K1: the K1 decode kernel (k1.cl), the scalar page-table kernel and the merge
+            const mk1 = try d.g.module(&kb.k1);
+            const kk = try k1mod.load(d, md, mk1);
+            d.k.attn_k1 = kk.decode;
+            d.k.attn_k1_16 = kk.decode16;
+            k1mod.have16 = kk.decode16 != null;
+            d.k.attn_span = kk.span;
+            d.k.merge_span = kk.merge;
+        }
         if (std.c.getenv("XPU_PROFILE") != null) {
             prof.on = true;
             prof.events = try d.g.events(4096);
@@ -357,6 +394,8 @@ pub const Runner = struct {
         live = false;
         r.ckpt.deinit();
         if (r.host_logits.len > 0) alloc.free(r.host_logits);
+        for (r.pt_host) |t| if (t.len > 0) alloc.free(t);
+        if (r.pages.count > 0) r.pages.deinit();
         alloc.destroy(r);
     }
 
@@ -372,6 +411,7 @@ pub const Runner = struct {
             if (l.attn) {
                 l.kc = l.slot_kc[slot];
                 l.vc = l.slot_vc[slot];
+                l.pt = l.slot_pt[slot];
             } else {
                 l.rec = l.slot_rec[slot];
                 l.rec_save = l.slot_save[slot];
@@ -399,6 +439,7 @@ pub const Runner = struct {
             if (l.attn) {
                 l.slot_kc[r.slot] = l.kc;
                 l.slot_vc[r.slot] = l.vc;
+                l.slot_pt[r.slot] = l.pt;
             } else {
                 l.slot_rec[r.slot] = l.rec;
                 l.slot_save[r.slot] = l.rec_save;
@@ -427,6 +468,144 @@ pub const Runner = struct {
             l.conv_cur = 0;
         };
         r.pos = 0;
+        if (r.pool != 0) r.releaseSlot(r.slot); // a fresh sequence takes fresh pages
+    }
+
+    // ------------------------------------------------------------ the shared K/V pool (XPU_KV_POOL)
+
+    /// Bytes of one K (or V) page of one attention layer: PAGE positions of the card's K/V heads, their values then
+    /// their scales (limits.KvLayout: Q27_KVROW is this rank's heads, half the model's at TP 2).
+    pub fn pageBytes(r: *const Runner) usize {
+        _ = r;
+        const lay = slot_states.kv();
+        return PAGE * (lay.row() + lay.scaleRow());
+    }
+
+    /// Bytes one position takes in K/V on this card: every attention layer, K and V.
+    pub fn kvBytesPerToken(r: *const Runner) usize {
+        _ = r;
+        const lay = slot_states.kv();
+        return (LAYERS / 4) * 2 * (lay.row() + lay.scaleRow());
+    }
+
+    /// The pool's device bytes: K pages then V pages in every attention layer.
+    pub fn poolBytes(r: *const Runner) usize {
+        var layers: usize = 0;
+        for (r.model.layers) |l| layers += @intFromBool(l.attn);
+        return @as(usize, r.pool) * r.page_bytes * 2 * layers;
+    }
+
+    /// The pool's tokens: what its pages hold for one stream.
+    pub fn poolTokens(r: *const Runner) u64 {
+        return @as(u64, r.pool) * PAGE;
+    }
+
+    /// The shared K/V pool: `pages` pages in each attention layer (K pages, then V pages, one allocation a layer,
+    /// zeroed so the card holds them now), and each slot's page table, mapping nothing.
+    pub fn allocPool(r: *Runner, pages: u32) !void {
+        if (r.pool != 0) return error.PoolTwice;
+        if (!kv_i8) return error.PoolNeedsInt8;
+        if (pages == 0) return error.EmptyPool;
+        r.pool = pages;
+        r.page_bytes = r.pageBytes();
+        const half = @as(usize, pages) * r.page_bytes;
+        for (&r.model.layers) |*l| {
+            if (!l.attn) continue;
+            const base = try r.d.alloc_(2 * half);
+            try zeroed(&r.d, base, 2 * half);
+            l.kc = base;
+            l.vc = off(base, half);
+            for (&l.slot_kc) |*x| x.* = base; // every slot's view is the pool: its table says which pages
+            for (&l.slot_vc) |*x| x.* = off(base, half);
+        }
+        const entries = (r.context + PAGE - 1) / PAGE;
+        for (0..MAX_SLOTS) |i| {
+            r.pt[i] = try r.d.alloc_(@as(usize, entries) * 4);
+            r.pt_host[i] = try alloc.alloc(u32, @as(usize, entries));
+            r.held[i] = 0;
+        }
+        r.pages = try pages_mod.Pages.init(alloc, pages);
+        // K1 (XPU_K1) and the paged launches read a slot's table through the layer: `slot_pt` is the runner's
+        // per-slot table (page ids into every attention layer's pool), `pt` the selected slot's.
+        for (&r.model.layers) |*l| {
+            if (!l.attn) continue;
+            for (0..MAX_SLOTS) |i| l.slot_pt[i] = r.pt[i];
+            l.pt = r.pt[r.slot];
+        }
+        try r.d.sync();
+        std.debug.print("K/V pool: {d} pages, {d} tokens, {d:.2} GB a card, int8\n", .{ pages, @as(u64, pages) * PAGE, @as(f64, @floatFromInt(r.poolBytes())) / 1e9 });
+    }
+
+    /// One reference to page `id` less; the page returns to the pool at zero.
+    pub fn releasePage(r: *Runner, id: u32) void {
+        r.pages.release(id);
+    }
+
+    /// One reference to page `id` more (a kept prompt state holds the pages it maps).
+    pub fn retainPage(r: *Runner, id: u32) void {
+        r.pages.retain(id);
+    }
+
+    /// Page ids `ids` into `slot`'s table from entry `from`; the slot maps from + ids.len on. The caller holds them.
+    pub fn mapPages(r: *Runner, slot: u32, from: u32, ids: []const u32) !void {
+        if (r.pool == 0) return;
+        if (slot >= MAX_SLOTS or r.pt[slot] == null or from > r.held[slot]) return error.BadSlot;
+        if (from + @as(u32, @intCast(ids.len)) > r.pt_host[slot].len) return error.ContextFull;
+        @memcpy(r.pt_host[slot][from..][0..ids.len], ids);
+        for (ids) |id| r.pages.retain(id);
+        r.held[slot] = from + @as(u32, @intCast(ids.len));
+        // the host table stays put until the next mapping: the queued copy reads it before the kernels that follow
+        try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, off(r.pt[slot].?, @as(usize, from) * 4), r.pt_host[slot].ptr + from, ids.len * 4, null, 0, null));
+    }
+
+    /// Pages for `slot`'s positions up to `upTo`, mapped in its table; error.ContextFull when the pool has none left.
+    pub fn ensurePages(r: *Runner, slot: u32, upTo: u32) !void {
+        if (r.pool == 0) return;
+        if (upTo > r.context) return error.ContextFull;
+        if (slot >= MAX_SLOTS or r.pt[slot] == null) return error.BadSlot;
+        const need = (upTo + PAGE - 1) / PAGE;
+        const from = r.held[slot];
+        if (need <= from) return;
+        var i = from;
+        var full = false;
+        while (i < need) : (i += 1) {
+            const id = r.pages.take() orelse {
+                full = true;
+                break;
+            };
+            r.pt_host[slot][i] = id; // take gave the slot's reference
+        }
+        if (i > from) {
+            r.held[slot] = i;
+            try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, off(r.pt[slot].?, @as(usize, from) * 4), r.pt_host[slot].ptr + from, (i - from) * 4, null, 0, null));
+        }
+        if (full) return error.ContextFull;
+    }
+
+    /// Drops `slot`'s hold on its pages: a fresh sequence, or a restore that maps a kept state's pages.
+    pub fn releaseSlot(r: *Runner, slot: u32) void {
+        if (r.pool == 0 or slot >= MAX_SLOTS or r.pt[slot] == null) return;
+        for (r.pt_host[slot][0..r.held[slot]]) |id| r.releasePage(id);
+        r.held[slot] = 0;
+    }
+
+    /// Positions `slot` may hold: what its pages cover, at most its context.
+    pub fn room(r: *const Runner, slot: u32) u32 {
+        if (r.pool == 0) return r.context;
+        if (slot >= MAX_SLOTS) return 0;
+        return @min(r.context, r.held[slot] * PAGE);
+    }
+
+    /// A pool that gives each slot its own run of ceil(context / PAGE) pages: a slot holds its context, as before the pool.
+    pub fn poolFixed(r: *Runner) !void {
+        const e = (r.context + PAGE - 1) / PAGE;
+        try r.allocPool(MAX_SLOTS * e);
+        const ids = try alloc.alloc(u32, @as(usize, e));
+        defer alloc.free(ids);
+        for (0..MAX_SLOTS) |i| {
+            for (ids, 0..) |*p, j| p.* = @intCast(i * e + j);
+            try r.mapPages(@intCast(i), 0, ids);
+        }
     }
 
     /// Feeds prompt tokens in chunks; `last`: the final chunk, whose last row's logits are kept.
@@ -437,7 +616,8 @@ pub const Runner = struct {
             const end = chunkEnd(at, ids.len);
             const want = last and end == ids.len;
             if (r.pos + (end - at) > r.context) return error.ContextFull;
-            if (try forward(&r.d, &r.model, &r.acts, @ptrCast(ids[at..end]), r.pos, .{ .prompt = true, .want = if (want) .last else .none, .taps = r.taps_on })) |t| r.last = @intCast(t);
+            try r.ensurePages(r.slot, r.pos + @as(u32, @intCast(end - at)));
+            if (try forward(&r.d, &r.model, &r.acts, @ptrCast(ids[at..end]), r.pos, .{ .prompt = true, .want = if (want) .last else .none, .taps = r.taps_on, .pt = r.pt[r.slot] })) |t| r.last = @intCast(t);
             if (r.taps_on) if (r.on_taps) |cb| try cb.f(cb.ctx, r.acts.taps, @intCast(end - at));
             r.pos += @intCast(end - at);
             at = end;
@@ -448,8 +628,9 @@ pub const Runner = struct {
     pub fn step(r: *Runner, token: u32) !void {
         if (tp.group) |*g| try g.record(.step, token, 0, 0, &.{});
         if (r.pos + 1 > r.context) return error.ContextFull;
+        try r.ensurePages(r.slot, r.pos + 1);
         const id: i32 = @intCast(token);
-        r.last = @intCast((try forward(&r.d, &r.model, &r.acts, &.{id}, r.pos, .{ .taps = r.taps_on })).?);
+        r.last = @intCast((try forward(&r.d, &r.model, &r.acts, &.{id}, r.pos, .{ .taps = r.taps_on, .pt = r.pt[r.slot] })).?);
         r.pos += 1;
         if (r.taps_on) if (r.on_taps) |cb| try cb.f(cb.ctx, r.acts.taps, 1);
     }
@@ -459,7 +640,8 @@ pub const Runner = struct {
         if (tp.group) |*g| try g.record(.verify, 0, 0, 0, ids);
         if (ids.len == 0 or ids.len > 16) return error.BadBlock;
         if (r.pos + ids.len > r.context) return error.ContextFull;
-        _ = try forward(&r.d, &r.model, &r.acts, @ptrCast(ids), r.pos, .{ .want = .rows, .stash = true, .taps = r.taps_on });
+        try r.ensurePages(r.slot, r.pos + @as(u32, @intCast(ids.len)));
+        _ = try forward(&r.d, &r.model, &r.acts, @ptrCast(ids), r.pos, .{ .want = .rows, .stash = true, .taps = r.taps_on, .pt = r.pt[r.slot] });
         var toks: [16]i32 = undefined;
         try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, &toks, r.acts.tok, ids.len * 4, null, 0, null));
         try r.d.sync();
@@ -522,8 +704,9 @@ pub const Runner = struct {
             }
         }
         if (r.pos + depth_max + 1 > r.context or r.pos + ids.len > r.context) return error.ContextFull;
+        try r.ensurePages(r.slot, r.pos + depth_max + 1);
         try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, r.acts.tree, &r.tree_host, ids.len * 17 * 4, null, 0, null));
-        _ = try forward(&r.d, &r.model, &r.acts, @ptrCast(ids), r.pos, .{ .want = .rows, .stash = true, .taps = r.taps_on, .tree = true });
+        _ = try forward(&r.d, &r.model, &r.acts, @ptrCast(ids), r.pos, .{ .want = .rows, .stash = true, .taps = r.taps_on, .tree = true, .pt = r.pt[r.slot] });
         var toks: [16]i32 = undefined;
         try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, &toks, r.acts.tok, ids.len * 4, null, 0, null));
         try r.d.sync();
@@ -547,7 +730,7 @@ pub const Runner = struct {
         const nul: ?*anyopaque = null;
         for (&r.model.layers) |*l| {
             if (l.attn) {
-                if (!straight) try r.d.launch(r.d.k.kv_move, .{ .x = ATT_KV_HEADS }, .{ l.kc.?, l.vc.?, @as(i32, @intCast(r.pos)), r.acts.path, keep, kvCap() });
+                if (!straight) try r.d.launch(r.d.k.kv_move, .{ .x = ATT_KV_HEADS }, .{ l.kc.?, l.vc.?, @as(i32, @intCast(r.pos)), r.acts.path, keep, kvCap(), r.pt[r.slot] });
                 continue;
             }
             const st = l.stash.?;
@@ -606,6 +789,64 @@ pub const Runner = struct {
         return std.mem.sliceTo(&r.d.g.props.name, 0);
     }
 };
+
+/// Zeroes `bytes` of device memory `p` in chunks: the pool's pages are held by the card now, not at a request.
+fn zeroed(d: *Dev, p: *anyopaque, bytes: usize) !void {    const first = @min(bytes, 64 << 20);
+    try d.fill(p, @as(u32, 0), first);
+    var at: usize = first;
+    while (at < bytes) {
+        const n = @min(first, bytes - at);
+        try dev.copy(d, off(p, at), p, n);
+        at += n;
+    }
+    try d.sync();
+}
+
+/// Card bytes a prompt pass and the driver hold beyond the counted load (Sage's measured 0.31 GB past the count).
+const pass_reserve: u64 = 650_000_000;
+/// Bytes the card holds beyond what Dev.allocated counts (the runtime's own buffers).
+const held_not_counted: u64 = 400_000_000;
+/// Card bytes kept for the GDN, convolution and drafter-context copies of kept prompt states (their K/V pages come
+/// from the pool).
+const cache_gdn: u64 = 1536 << 20;
+/// Pages a pool is rounded down to: both ranks of a TP 2 pair size the same pool, so they map the same page ids.
+const sync_pages: u32 = 256;
+
+/// The pool's pages: `tokens` rounded up to whole pages, else what the card leaves after the load, the drafter, the
+/// GDN states of `slots` streams, their drafter contexts (`extra` bytes a stream), the activations and the reserve
+/// (and, with a prompt cache, its GDN copies).
+pub fn poolPages(r: *Runner, slots: u32, tokens: ?u32, cache: bool, extra: u64) !u32 {
+    if (tokens) |t| return @max(1, (t + PAGE - 1) / PAGE);
+    const mem = try r.d.g.memory();
+    const keep = pass_reserve + held_not_counted + (if (cache) cache_gdn else 0);
+    const gdn: u64 = @intCast(slot_states.slotBytes(r));
+    const counted = @as(u64, r.d.allocated) + (gdn + extra) * @as(u64, if (slots > 1) slots - 1 else 0);
+    const left = (mem.size -| keep) -| counted;
+    var layers: usize = 0;
+    for (r.model.layers) |l| layers += @intFromBool(l.attn);
+    const page = @as(u64, r.pageBytes()) * 2 * layers; // one page id: K and V pages in every attention layer
+    const pages: u64 = left / page;
+    return @intCast(pages - pages % sync_pages);
+}
+
+/// The pool's pages for a TP 2 pair: rank 0 sizes it and publishes the count, a follower waits for it and takes the
+/// same, so both ranks map the same page ids.
+pub fn poolPagesShared(r: *Runner, slots: u32, cache: bool, extra: u64) !u32 {
+    const g = if (tp.group) |*x| x else return poolPages(r, slots, pool_tokens, cache, extra);
+    if (g.rank == 0) {
+        const pages = try poolPages(r, slots, pool_tokens, cache, extra);
+        g.setPool(pages);
+        return pages;
+    }
+    return g.awaitPool(600) orelse error.PoolNotPublished;
+}
+
+/// The pool for a runner opened on its own (qwen27_main): sized from the card, `slots` streams' GDN states counted.
+pub fn openPool(r: *Runner, slots: u32, drafter_ctx: u64) !void {
+    const pages = try poolPagesShared(r, slots, true, drafter_ctx);
+    if (pages == 0) return error.PoolDoesNotFit;
+    try r.allocPool(pages);
+}
 
 pub const drafter = @import("drafter.zig");
 /// The Sage-A1.5 (qwen3_5_moe) runner on the same device layer and kernels.
