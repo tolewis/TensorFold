@@ -10,10 +10,29 @@ fn zeModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.built
     return b.createModule(.{ .root_source_file = b.path("zig/src/xpu/ze.zig"), .target = target, .optimize = optimize, .link_libc = true });
 }
 
+var tp_ranks: u32 = 1;
+
+/// The qwen27 kernels whose compiled widths follow the rank (shape.h): the layer kernels, not the drafter's.
+fn tpKernel(name: []const u8) bool {
+    for ([_][]const u8{ "glue", "decode", "gemm", "gemm128", "gdn" }) |n| if (std.mem.eql(u8, name, n)) return true;
+    return false;
+}
+
+/// shape.h at TP 2: every head count and width halved, the hidden size and the vocabulary whole. The GDN input
+/// row is qkv 5120 | z 3072 | a 24 | b 24 = 8240, padded to 8448; the attention row (q | gate) x 12 | k 2 | v 2.
+const tp2_defines = " -DQ27_FF=8704 -DQ27_GK=8 -DQ27_GV=24 -DQ27_GVK=3 -DQ27_NQK=1024 -DQ27_NCONV=5120 -DQ27_VD=3072" ++
+    " -DQ27_GDN_IN=8448 -DQ27_GA=8192 -DQ27_GB=8216 -DQ27_AQ=12 -DQ27_AKV=2 -DQ27_AH=16 -DQ27_AV0=14 -DQ27_GQA=6 -DQ27_QPG=6" ++
+    " -DQ27_QPARTS=1 -DQ27_ATT_IN=7168 -DQ27_AK0=6144 -DQ27_AV0C=6656 -DQ27_OD=3072 -DQ27_OB=24 -DQ27_KVROW=512";
+
 pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Step.Options) void {
     const ocloc = b.option([]const u8, "ocloc", "Intel offline compiler") orelse "ocloc";
     const device = b.option([]const u8, "xpu-device", "ocloc device for the XPU kernels") orelse "bmg";
     const ngen_include = b.option([]const u8, "ngen-include", "nGEN header directory (oneDNN)") orelse "ngen";
+    // -Dtp=2: the two-card tensor-parallel rank of the 27B (lanes/qwen27/TP2-ASSESSMENT.md in Intel-B70-Recipe). The
+    // rank holds half the heads and half the MLP columns: the qwen27 kernels (not the drafter's, not Sage's) get
+    // the halved widths as defines, and xpu/qwen27.zig reads `tp` from kernel_options.
+    tp_ranks = b.option(u32, "tp", "tensor-parallel ranks of the XPU 27B build: 1 (default) or 2") orelse 1;
+    if (tp_ranks != 1 and tp_ranks != 2) @panic("-Dtp takes 1 or 2");
     const files = b.addWriteFiles();
     const opts = "-cl-std=CL3.0 -cl-intel-256-GRF-per-thread";
     for ([_]struct { []const u8, []const u8, []const u8 }{
@@ -31,7 +50,8 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     }) |k| {
         const c = b.addSystemCommand(&.{ ocloc, "compile", "-q", "-file" });
         c.addFileArg(b.path(k[1]));
-        c.addArgs(&.{ "-device", device, "-options", b.fmt("{s}{s} -I zig/kernels/xpu/qwen27", .{ opts, k[2] }), "-output_no_suffix", "-output", k[0], "-out_dir" });
+        const tp_defs = if (tp_ranks == 2 and tpKernel(k[0])) tp2_defines else "";
+        c.addArgs(&.{ "-device", device, "-options", b.fmt("{s}{s}{s} -I zig/kernels/xpu/qwen27", .{ opts, k[2], tp_defs }), "-output_no_suffix", "-output", k[0], "-out_dir" });
         c.setCwd(b.path("."));
         for ([_][]const u8{ "glue_attn.cl", "glue_quant.cl", "shape.h" }) |part| c.addFileInput(b.path(b.fmt("zig/kernels/xpu/qwen27/{s}", .{part})));
         const dir = c.addOutputDirectoryArg(b.fmt("ocloc-{s}", .{k[0]}));
@@ -198,6 +218,7 @@ fn exl3Matvec() [exl3_variants.all.len]Kernel {
 fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, images: []const std.Build.LazyPath, ze: *std.Build.Module) *std.Build.Module {
     const options = b.addOptions();
     options.addOption(bool, "with_kernels", images.len == kernels.len);
+    options.addOption(u32, "tp", tp_ranks);
     const xpu = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
     xpu.addOptions("kernel_options", options);
     xpu.addImport("ze", ze);

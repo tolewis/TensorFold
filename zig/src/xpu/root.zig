@@ -1,6 +1,8 @@
 //! TensorFold's Intel GPU runtime for Nemotron: ze.zig's Level Zero table, OpenCL C kernels as embedded SPIR-V.
 
 pub const ze = @import("ze");
+/// The build's kernel options (-Dtp and with_kernels), for the 27B modules that import this one.
+pub const kernel_options = @import("kernel_options");
 pub const Driver = @import("context.zig").Driver;
 pub const Error = @import("context.zig").Error;
 pub const context = @import("context.zig");

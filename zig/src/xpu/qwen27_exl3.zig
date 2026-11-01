@@ -243,6 +243,27 @@ pub fn project(p: *const Proj, w: *const Weights, d: *Dev, x: *anyopaque, out: *
     return exl3.encode(&w.p, w.stream(), &p.row_plan.?);
 }
 
+/// A bf16 tensor's rows [start, start + count) for each range, `row_bytes` a row, uploaded as one piece: a rank's
+/// heads of a per-head tensor. One range over every row is the whole tensor.
+fn rowsTensor(d: *Dev, c: *const Checkpoint, name: []const u8, row_bytes: usize, ranges: []const [2]u32) !*anyopaque {
+    const t = try c.get(name);
+    if (!std.mem.eql(u8, t.dtype, "BF16")) return error.UnexpectedDtype;
+    var total: usize = 0;
+    for (ranges) |r| total += r[1];
+    if (total * row_bytes == t.bytes.len) return d.upload(t.bytes);
+    const out = try alloc.alloc(u8, total * row_bytes);
+    defer alloc.free(out);
+    var at: usize = 0;
+    for (ranges) |r| {
+        const from = @as(usize, r[0]) * row_bytes;
+        const n = @as(usize, r[1]) * row_bytes;
+        if (from + n > t.bytes.len) return error.UnexpectedShape;
+        @memcpy(out[at .. at + n], t.bytes[from .. from + n]);
+        at += n;
+    }
+    return d.upload(out);
+}
+
 /// A BF16 norm weight; `centred`: stored as gamma − 1 (the Hugging Face Qwen3.5 form) gets its 1 back.
 fn normTensor(d: *Dev, c: *const Checkpoint, name: []const u8, centred: bool) !*anyopaque {
     const t = try c.get(name);
@@ -352,14 +373,17 @@ pub fn loadExl3(d: *Dev, c: *const Checkpoint) !loader.Model {
             l.mixer_out = shell(try w.add(d, c, &.{.{ .prefix = f(&nb[0], i, "linear_attn.out_proj"), .cut = if (tp1) .{} else Cut.rows(R * hv, hv, D) }}, D), false);
             const ta = try c.get(f(&nb[0], i, "linear_attn.in_proj_a.weight"));
             const tb = try c.get(f(&nb[1], i, "linear_attn.in_proj_b.weight"));
-            if (!std.mem.eql(u8, ta.dtype, "F16") or !std.mem.eql(u8, tb.dtype, "F16") or ta.bytes.len != HV * D * 2 or tb.bytes.len != HV * D * 2) return error.UnexpectedShape;
-            l.ab = try d.alloc_(96 * D * 2);
-            try d.copyIn(l.ab.?, ta.bytes);
-            try d.copyIn(off(l.ab.?, HV * D * 2), tb.bytes);
-            l.conv_w = try normTensor(d, c, f(&nb[0], i, "linear_attn.conv1d.weight"), false);
-            l.alog = try normTensor(d, c, f(&nb[0], i, "linear_attn.A_log"), false);
-            l.dt = try normTensor(d, c, f(&nb[0], i, "linear_attn.dt_bias"), false);
-            l.gnorm = try normTensor(d, c, f(&nb[0], i, "linear_attn.norm.weight"), false);
+            // the dense a and b gates: 48 rows of D (whole), the rank's 24 at TP 2
+            if (!std.mem.eql(u8, ta.dtype, "F16") or !std.mem.eql(u8, tb.dtype, "F16") or ta.bytes.len != 48 * D * 2 or tb.bytes.len != 48 * D * 2) return error.UnexpectedShape;
+            l.ab = try d.alloc_(2 * HV * D * 2);
+            try d.copyIn(l.ab.?, ta.bytes[R * HV * D * 2 ..][0 .. HV * D * 2]);
+            try d.copyIn(off(l.ab.?, HV * D * 2), tb.bytes[R * HV * D * 2 ..][0 .. HV * D * 2]);
+            // conv1d [10240 channels, 4 taps] bf16 by channel in qkv order, A_log and dt_bias by value head, the norm
+            // by value column: the rank's heads of each (whole at TP 1)
+            l.conv_w = try rowsTensor(d, c, f(&nb[0], i, "linear_attn.conv1d.weight"), 4 * 2, &.{ .{ R * hk, hk }, .{ q.TP * hk + R * hk, hk }, .{ 2 * q.TP * hk + R * hv, hv } });
+            l.alog = try rowsTensor(d, c, f(&nb[0], i, "linear_attn.A_log"), 2, &.{.{ R * q.GDN_V_HEADS, q.GDN_V_HEADS }});
+            l.dt = try rowsTensor(d, c, f(&nb[0], i, "linear_attn.dt_bias"), 2, &.{.{ R * q.GDN_V_HEADS, q.GDN_V_HEADS }});
+            l.gnorm = try rowsTensor(d, c, f(&nb[0], i, "linear_attn.norm.weight"), 2, &.{.{ R * hv, hv }});
             l.rec = try d.alloc_(HV * 128 * 128 * 4);
             l.rec_save = try d.alloc_(HV * 128 * 128 * 4);
             l.stash = try d.alloc_(q.STASH);

@@ -4,6 +4,7 @@ pub const ze = @import("ze");
 const kb = @import("xpu_qwen27_kernels");
 const dev = @import("dev.zig");
 const fwd = @import("forward.zig");
+const tp = @import("tp.zig");
 const loader = @import("load.zig");
 const multi = @import("runner_multi.zig");
 const slot_states = @import("slot_states.zig");
@@ -43,7 +44,7 @@ pub const FF = 17408;
 /// Tensor-parallel ranks of this build. TP 1 is the one-card engine. Every per-rank width below is the whole
 /// model's divided by TP: a rank holds its share of the heads and of the MLP columns, and the hidden state (D)
 /// whole (lanes/qwen27/TP2-ASSESSMENT.md in Intel-B70-Recipe, 2026-11-01).
-pub const TP: u32 = 1;
+pub const TP: u32 = @import("xpu").kernel_options.tp; // -Dtp (zig/build/xpu.zig), 1 by default
 /// This process's rank, 0 to TP - 1 (TF_TP_RANK at start). Rank 0 serves and drafts. 0 at TP 1.
 pub var RANK: u32 = 0;
 pub const GDN_K_HEADS = 16 / TP; // GDN query and key heads of 128
@@ -208,6 +209,8 @@ pub const Runner = struct {
         if (std.c.getenv("XPU_A8")) |v| a8_group = if (std.mem.eql(u8, std.mem.span(v), "token")) std.math.maxInt(u32) else try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_DUMP_H")) |v| dump_h = open(v, 0o2101, @as(c_uint, 0o644)); // append
         if (std.c.getenv("XPU_CHUNK")) |v| CHUNK = try limits.chunk(std.mem.span(v));
+        if (std.c.getenv("TF_TP_RANK")) |v| RANK = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+        if (RANK >= TP) return error.RankOutOfRange;
         MAX_CTX = try limits.context(context);
         {
             const marker = try std.fmt.allocPrintSentinel(alloc, "{s}/hadamard128", .{dir}, 0);
@@ -254,6 +257,7 @@ pub const Runner = struct {
         const r = try alloc.create(Runner);
         errdefer alloc.destroy(r);
         r.* = .{ .d = .{ .g = try ze.Gpu.open(0xe223), .list = undefined, .k = undefined }, .model = undefined, .acts = undefined, .context = context, .ckpt = ckpt };
+        tp.group = try tp.Group.open(&r.d); // null at TP 1
         const d = &r.d;
         errdefer d.g.close();
         d.list = try d.g.immediate(0, 0);
