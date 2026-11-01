@@ -175,9 +175,9 @@ pub fn flush(g: *ze.Gpu) void {
 /// One table for the row count just measured: class, ms, percent of the GPU time, launches, and the host gaps.
 pub fn report() void {
     if (!on) return;
-    total[@intFromEnum(.ar_wait)] += wait_s;
+    total[@intFromEnum(Class.ar_wait)] += wait_s;
     var gpu: f64 = 0;
-    for (total, 0..) |t, i| if (i != @intFromEnum(.ar_wait)) {
+    for (total, 0..) |t, i| if (i != @intFromEnum(Class.ar_wait)) {
         gpu += t;
     };
     const gap = wall - gpu - wait_s;
