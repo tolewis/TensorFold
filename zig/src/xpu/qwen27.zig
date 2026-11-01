@@ -44,6 +44,8 @@ pub const FF = 17408;
 /// model's divided by TP: a rank holds its share of the heads and of the MLP columns, and the hidden state (D)
 /// whole (lanes/qwen27/TP2-ASSESSMENT.md in Intel-B70-Recipe, 2026-11-01).
 pub const TP: u32 = 1;
+/// This process's rank, 0 to TP - 1 (TF_TP_RANK at start). Rank 0 serves and drafts. 0 at TP 1.
+pub var RANK: u32 = 0;
 pub const GDN_K_HEADS = 16 / TP; // GDN query and key heads of 128
 pub const GDN_V_HEADS = 48 / TP; // GDN value heads of 128 (and the z gate, a and b)
 pub const ATT_Q_HEADS = 24 / TP; // attention query heads of 256, each with a gate of 256
