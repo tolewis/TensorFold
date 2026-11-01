@@ -186,8 +186,9 @@ inline int8 tile_b(__global const uint *t, uint c) {
 }
 
 #ifndef DP
-#define DP (ROWS <= 8)                                // decode on XMX: tiles decoded in registers as DPAS B operands, rows padded to 8
+#define DP (ROWS <= 16)                               // decode on XMX: tiles decoded in registers as DPAS B operands, rows padded to 8
 #endif
+#define RB ((ROWS + 7) / 8)                           // DPAS row blocks of 8: one tile decode serves every block (B70 2026-11-01)
 #define RI (ROWS <= 4)
 #if RI
 inline void rotate_block(float vr[ROWS][8], __global const uchar *base, exl3_desc d, uint blk, uint lane) {
@@ -226,28 +227,32 @@ __kernel void exl3_matvec(__global const uchar *base, __global const exl3_desc *
     float vr[ROWS][8];  // fuse: the rotated block, K span a multiple of 128 (the host checks)
 #endif
 #if DP
-    float8 acc[NS];
-    for (uint s = 0; s < NS; s++) acc[s] = 0.0f;
+    float8 acc[NS][RB];
+    for (uint s = 0; s < NS; s++)
+        for (uint rb = 0; rb < RB; rb++) acc[s][rb] = 0.0f;
     for (uint kb = k0; kb < k0 + kspan; kb += 16, tile += tile_k) {
         float xr[ROWS];
         LOAD_XR(xr, kb, c)
-        short8 ah, al;
-        for (uint r = 0; r < 8; r++) {
-            const float f = r < ROWS ? xr[r] : 0.0f;
-            const half hv = convert_half_rte(f);
-            ah[r] = as_short(hv);
-            al[r] = as_short(convert_half_rte(f - (float)hv));
-        }
+        short8 ah[RB], al[RB];
+        for (uint rb = 0; rb < RB; rb++)
+            for (uint r = 0; r < 8; r++) {
+                const float f = rb * 8 + r < ROWS ? xr[rb * 8 + r] : 0.0f;
+                const half hv = convert_half_rte(f);
+                ah[rb][r] = as_short(hv);
+                al[rb][r] = as_short(convert_half_rte(f - (float)hv));
+            }
         for (uint s = 0; s < NS; s++) {
             const int8 b = tile_b(tile + s * RINGW, c);
-            acc[s] = DPH(ah, b, acc[s]);
-            acc[s] = DPH(al, b, acc[s]);
+            for (uint rb = 0; rb < RB; rb++) {
+                acc[s][rb] = DPH(ah[rb], b, acc[s][rb]);
+                acc[s][rb] = DPH(al[rb], b, acc[s][rb]);
+            }
         }
     }
     __global float *sums = AT(float, d.sums) + (ulong)split * d.rows * d.n;
     for (uint s = 0; s < NS; s++)
         for (uint r = 0; r < ROWS; r++)
-            if (r < d.rows) sums[(ulong)r * d.n + (tn0 + s) * 16 + c] = acc[s][r];
+            if (r < d.rows) sums[(ulong)r * d.n + (tn0 + s) * 16 + c] = acc[s][r / 8][r % 8];
 #elif HS && NS >= 2
     // HS: the half h = c / 8 takes strips h * NS / 2 and up, and each lane decodes both column halves of its
     // strips from the same words (g + 0 and g + 8). The h offset is then a compile-time constant: no shift.
