@@ -29,8 +29,13 @@ pub const all = blk: {
 };
 
 /// K splits for a launch of `sub_groups` sub-groups over groups whose K / 16 all divide by `k_tiles_gcd`.
-pub fn split(sub_groups: u32, k_tiles_gcd: u32) u32 {
+/// Wide launches stop at one wave (wide_wave); narrow ones go to sub_group_target.
+pub fn split(sub_groups: u32, k_tiles_gcd: u32, is_wide: bool) u32 {
     var ks: u32 = 1;
+    if (is_wide) {
+        while (ks < ks_max and sub_groups * ks * 2 <= wide_wave and k_tiles_gcd % (2 * ks) == 0 and k_tiles_gcd / (2 * ks) >= ks_min_tiles) ks *= 2;
+        return ks;
+    }
     while (ks < ks_max and sub_groups * ks < sub_group_target and k_tiles_gcd % (2 * ks) == 0 and k_tiles_gcd / (2 * ks) >= ks_min_tiles) ks *= 2;
     return ks;
 }
@@ -76,8 +81,16 @@ pub const moe = struct {
     }
 };
 
-/// Sub-groups a launch needs to fill the GPU; fewer strips a sub-group and K splits get it there.
+/// Sub-groups a launch needs to fill the GPU; fewer strips a sub-group and K splits get it there (narrow groups:
+/// Sage experts, N 512 and 2048, measured 2026-10-24 and -25).
 pub const sub_group_target = 4096;
+/// Wide groups (every strip count at or above wide_strips: the 27B's projections, N 5120 to 17408, and lm_head):
+/// NS 4 at every row bucket, and K splits up to one wave of resident sub-groups, no more. Measured on the B70 with
+/// tools/xpu/exl3_27b_bench.py (2026-11-01): the matvec is bound by the loads in flight a sub-group, so four strips
+/// a sub-group beat four times the sub-groups (gu 1 row: 245 GB/s at NS 1 and ks 8, 302 at NS 4 and ks 2), and a
+/// second partial wave costs more than it hides (gu: 2176 sub-groups 360 us, 1088 sub-groups 295 us).
+pub const wide_strips = 128;
+pub const wide_wave = 1536; // 24 Xe cores x 8 XVE x 8 threads on the B70 (BMG G31 cut)
 /// Most K splits (the sums scratch holds this many) and fewest 16-row K tiles a split.
 pub const ks_max = 16;
 const ks_min_tiles = 8;
@@ -92,13 +105,25 @@ pub fn pick(b: u32, r: u32, s: Strips) ?usize {
     const bucket = for (rows) |x| {
         if (x >= r) break x;
     } else return null;
-    var ns: u32 = if (s.min < 128) // few strips a group (expert gate/up, N 512): keep the sub-group count up
-        (if (bucket <= 4) 2 else 1)
-    else if (bucket <= 4) 4 else if (bucket <= 8) 2 else 1;
-    while (ns > 1 and s.total / ns < sub_group_target) ns /= 2;
+    var ns: u32 = undefined;
+    if (wide(s)) {
+        // see wide_strips. At 16 rows the DPAS path holds two row blocks of accumulators a strip, and NS 4 spills:
+        // gu 16 rows 442 us at NS 2 against 490 at NS 4, down 181 against 217 (sweep 3, 2026-11-01).
+        ns = if (bucket <= 8) 4 else 2;
+    } else {
+        ns = if (s.min < 128) // few strips a group (expert gate/up, N 512): keep the sub-group count up
+            (if (bucket <= 4) 2 else 1)
+        else if (bucket <= 4) 4 else if (bucket <= 8) 2 else 1;
+        while (ns > 1 and s.total / ns < sub_group_target) ns /= 2;
+    }
     while (s.gcd % ns != 0) ns /= 2;
     for (all, 0..) |v, i| if (v.bits == b and v.rows == bucket and v.ns == ns) return i;
     return null;
+}
+
+/// Whether a launch's groups are all wide (see wide_strips).
+pub fn wide(s: Strips) bool {
+    return s.min >= wide_strips;
 }
 
 test "picks follow the measured rule" {
@@ -109,16 +134,22 @@ test "picks follow the measured rule" {
     }.v;
     try std.testing.expectEqual(Variant{ .bits = 6, .rows = 1, .ns = 4, .hs = false }, at(6, 1, 15520, 15520));
     try std.testing.expectEqual(Variant{ .bits = 6, .rows = 4, .ns = 4, .hs = true }, at(6, 3, 15520, 15520));
-    try std.testing.expectEqual(Variant{ .bits = 4, .rows = 8, .ns = 2, .hs = false }, at(4, 5, 128, 128));
-    try std.testing.expectEqual(Variant{ .bits = 4, .rows = 16, .ns = 1, .hs = false }, at(4, 16, 128, 128));
+    // wide groups: NS 4 at every bucket (the 27B, 2026-11-01)
+    try std.testing.expectEqual(Variant{ .bits = 4, .rows = 8, .ns = 4, .hs = false }, at(4, 5, 128, 128));
+    try std.testing.expectEqual(Variant{ .bits = 4, .rows = 16, .ns = 2, .hs = false }, at(4, 16, 128, 128));
     try std.testing.expectEqual(Variant{ .bits = 4, .rows = 2, .ns = 2, .hs = true }, at(4, 2, 32, 32));
     try std.testing.expectEqual(Variant{ .bits = 4, .rows = 1, .ns = 1, .hs = false }, at(4, 1, 33, 33));
     try std.testing.expectEqual(@as(?usize, null), pick(5, 1, .{ .min = 128, .gcd = 128, .total = 1024 }));
     try std.testing.expectEqual(@as(?usize, null), pick(4, 17, .{ .min = 128, .gcd = 128, .total = 1024 }));
     // one layer's top-8: NS 1, then K splits up to the target
     try std.testing.expectEqual(@as(u32, 1), all[pick(4, 1, .{ .min = 32, .gcd = 32, .total = 256 }).?].ns);
-    try std.testing.expectEqual(@as(u32, 16), split(256, 128));
-    try std.testing.expectEqual(@as(u32, 4), split(1024, 32));
-    try std.testing.expectEqual(@as(u32, 2), split(3880, 128));
+    try std.testing.expectEqual(@as(u32, 16), split(256, 128, false));
+    try std.testing.expectEqual(@as(u32, 4), split(1024, 32, false));
+    try std.testing.expectEqual(@as(u32, 2), split(3880, 128, false));
+    // the 27B at NS 4: gate|up 544 sub-groups, down 80 over 1088 k tiles, in_proj_qkv 160, lm_head 3880
+    try std.testing.expectEqual(@as(u32, 2), split(544, 320, true));
+    try std.testing.expectEqual(@as(u32, 16), split(80, 1088, true));
+    try std.testing.expectEqual(@as(u32, 8), split(160, 320, true));
+    try std.testing.expectEqual(@as(u32, 1), split(3880, 320, true));
     try std.testing.expectEqualStrings("exl3_b6_r4_n4_hs", name(all[all.len - 7]));
 }

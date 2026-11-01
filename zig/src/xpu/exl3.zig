@@ -294,7 +294,8 @@ const Shape = struct { variant: usize, ks: u32 };
 fn shapeOf(plan: *const Plan, rows: u32, strips_total: u32) Error!Shape {
     const strips: variants.Strips = .{ .min = plan.strips.min, .gcd = plan.strips.gcd, .total = strips_total };
     const vi = variants.pick(plan.bits, rows, strips) orelse return error.Invalid;
-    var sh: Shape = .{ .variant = vi, .ks = variants.split(strips.total / variants.all[vi].ns, plan.k_tiles_gcd) };
+    const is_wide = variants.wide(strips);
+    var sh: Shape = .{ .variant = vi, .ks = variants.split(strips.total / variants.all[vi].ns, plan.k_tiles_gcd, is_wide) };
     // Bench knobs (tools/xpu/exl3_27b_bench.py): EXL3_NS picks the image of that NS in the row bucket, EXL3_KS the
     // K splits. Unset in a serving binary's environment, so the measured rule above decides.
     if (std.c.getenv("EXL3_NS")) |v| {
@@ -303,16 +304,20 @@ fn shapeOf(plan: *const Plan, rows: u32, strips_total: u32) Error!Shape {
         sh.variant = for (variants.all, 0..) |x, i| {
             if (x.bits == plan.bits and x.rows == bucket and x.ns == ns) break i;
         } else return error.Invalid;
-        sh.ks = variants.split(strips.total / ns, plan.k_tiles_gcd);
+        sh.ks = variants.split(strips.total / ns, plan.k_tiles_gcd, is_wide);
     }
     if (std.c.getenv("EXL3_KS")) |v| sh.ks = std.fmt.parseInt(u32, std.mem.span(v), 10) catch return error.Invalid;
+    // the sums scratch of a group holds splitBound(n) splits (scratchBytes); a launch holds groups of one width
+    sh.ks = @min(sh.ks, @as(u32, @intCast(splitBound(plan.n_max))));
     return sh;
 }
 
 /// The matvec rotates x itself (exl3.cl RI) at 1 to 4 rows when every K split is whole 128 blocks, on launches
 /// below fuse_n_max columns. Each sub-group repeats the rotation: on lm_head (N 248320, 3880 sub-groups) that took
 /// 797 to 815 us at 1 row and 1339 to 1477 us at 4 rows. On one layer's experts it saves a launch (B70, 2026-10-25).
-const fuse_n_max = 65536;
+/// 4096 (was 65536, 2026-11-01): on the 27B's wide groups (N 5120 to 17408) every sub-group repeating the rotation
+/// cost more than the rotate_in launch it saved (gu 4 rows: 715 us fused at NS 1 against 468 us at 8 rows unfused).
+const fuse_n_max = 4096;
 
 fn fused(rows: u32, n_max: u32, k_tiles_gcd: u32, ks: u32) bool {
     return rows <= 4 and n_max < fuse_n_max and (k_tiles_gcd / ks) % 8 == 0;
