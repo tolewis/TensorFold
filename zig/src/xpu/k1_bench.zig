@@ -55,13 +55,17 @@ pub fn main() !void {
         const pool = try gpa.alloc(u8, 2 * half);
         defer gpa.free(pool);
         // K pages then V pages: the K row of key k at page + (k % PAGE) * AKV * 256 + h * 256, the scales after
-        for (0..pages) |pg| for (0..PAGE) |r| for (0..AKV) |h| {
-            const row = pg * PAGE8 + r * (AKV * 256) + h * 256;
-            for (0..256) |i| pool[row + i] = @bitCast(@as(i8, @intCast(rnd.intRangeAtMost(i32, -127, 127))));
-            const sc = pg * PAGE8 + PAGE * (AKV * 256) + (r * AKV + h) * 4;
-            const s: f32 = 0.01 + 0.04 * rnd.float(f32);
-            @memcpy(pool[sc..][0..4], std.mem.asBytes(&s));
-        };
+        for (0..pages) |pg| {
+            for (0..PAGE) |r| {
+                for (0..AKV) |h| {
+                    const row = pg * PAGE8 + r * (AKV * 256) + h * 256;
+                    for (0..256) |i| pool[row + i] = @bitCast(@as(i8, @intCast(rnd.intRangeAtMost(i32, -127, 127))));
+                    const sc = pg * PAGE8 + PAGE * (AKV * 256) + (r * AKV + h) * 4;
+                    const sv: f32 = 0.01 + 0.04 * rnd.float(f32);
+                    @memcpy(pool[sc..][0..4], std.mem.asBytes(&sv));
+                }
+            }
+        }
         const dk = try d.upload(pool[0..half]);
         const dv = try d.upload(pool[half..]);
         const pt = try gpa.alloc(u32, pages);
@@ -126,7 +130,8 @@ pub fn main() !void {
             toF32(b2, a2);
             var wc: f64 = 1.0;
             var mr: f64 = 0.0;
-            for (0..rows) |t| for (0..AQ) |h| {
+            for (0..rows) |t| {
+                for (0..AQ) |h| {
                 var dot: f64 = 0;
                 var n1: f64 = 0;
                 var n2: f64 = 0;
@@ -142,6 +147,7 @@ pub fn main() !void {
                 const cos = if (n1 > 0 and n2 > 0) dot / @sqrt(n1 * n2) else 1.0;
                 wc = @min(wc, cos);
                 mr = @max(mr, rel / 256.0);
+                }
             }
             worst_cos = @min(worst_cos, wc);
             worst_rel = @max(worst_rel, mr);
