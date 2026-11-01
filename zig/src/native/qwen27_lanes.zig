@@ -180,7 +180,11 @@ pub const Metal = struct {
         var s = try lanes.Stream.init(b.gpa, .{ .id = "timing", .prompt = prompt, .max_new = 1 });
         defer s.deinit(b.gpa);
         const timer: WindowTimer = .{ .b = b, .s = &s, .prompt = prompt };
-        for (0..5) |_| _ = try timer.time(max_rows - 1); // the widest window first, while the GPU's clocks ramp up
+        // the widest window first, while the GPU's clocks ramp up: at least 5 windows and 2 s (the B70 ramps over
+        // about 1.5 s; five windows left the 1-row entry at 73 ms against 45 warm, 2026-11-01)
+        const warm_start = mtl.clock.seconds();
+        var warmed: usize = 0;
+        while (warmed < 5 or mtl.clock.seconds() - warm_start < 2.0) : (warmed += 1) _ = try timer.time(max_rows - 1);
         var ms: [max_rows]f64 = undefined;
         for (&ms, 0..) |*m, i| m.* = try lanes.cost_rule.fastest(timer, i);
         try lanes.cost_rule.smooth(timer, &ms);
