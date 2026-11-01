@@ -73,10 +73,10 @@ pub const Group = struct {
         for (0..g.tp) |r| if (r != g.rank) {
             const c = g.counter(@intCast(r));
             // the peer may still be loading its half at the first call: 180 s, then the peer is lost
-            const deadline = std.time.milliTimestamp() + 180_000;
+            const deadline = q.now() + 180.0;
             var spins: usize = 0;
             while (c.load(.seq_cst) < g.seq) : (spins += 1) {
-                if (spins % 4096 == 0 and std.time.milliTimestamp() > deadline) return error.PeerLost;
+                if (spins % 4096 == 0 and q.now() > deadline) return error.PeerLost;
                 std.atomic.spinLoopHint();
             }
         };
