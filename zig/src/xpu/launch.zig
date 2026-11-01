@@ -6,6 +6,7 @@ const Kernel = @import("module.zig").Kernel;
 const DeviceBuffer = @import("memory.zig").DeviceBuffer;
 const Stream = @import("stream.zig").Stream;
 const Error = @import("context.zig").Error;
+const winprof = @import("winprof.zig");
 
 /// How a launch argument is passed to the kernel parameter at its position.
 pub const ArgKind = enum { buffer, pointer, float, integer };
@@ -24,7 +25,9 @@ pub fn argKind(comptime T: type) ArgKind {
 pub fn launch(k: Kernel, s: Stream, groups: [3]u32) Error!void {
     const g: ze.GroupCount = .{ .x = groups[0], .y = groups[1], .z = groups[2] };
     if (g.x == 0 or g.y == 0 or g.z == 0) return error.Invalid;
-    try k.ctx.d.check(k.ctx.d.api.zeCommandListAppendLaunchKernel(s.list, k.handle, &g, null, 0, null), "zeCommandListAppendLaunchKernel");
+    // XPU_WINDOW_PROFILE: the launch takes an event (null when off) so the measure can read its GPU time
+    const ev = winprof.attach(&k.ctx.gpu, k.handle);
+    try k.ctx.d.check(k.ctx.d.api.zeCommandListAppendLaunchKernel(s.list, k.handle, &g, ev, 0, null), "zeCommandListAppendLaunchKernel");
 }
 
 /// Sets every argument of the tuple in order (buffer, device pointer, f32 or u32) and queues the kernel.

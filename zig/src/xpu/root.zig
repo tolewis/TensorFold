@@ -20,10 +20,13 @@ pub const stop = @import("stop.zig");
 pub const decode = @import("decode.zig");
 pub const kernels = @import("kernels.zig");
 pub const exl3 = @import("exl3.zig");
+/// XPU_WINDOW_PROFILE=1: the load-time window measure's per-class GPU time, one table a row count.
+pub const winprof = @import("winprof.zig");
 
 test {
     _ = context;
     _ = launch;
     _ = decode;
     _ = exl3;
+    _ = winprof;
 }

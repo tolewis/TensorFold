@@ -28,6 +28,7 @@ pub const Dev = dev.Dev;
 pub const copy = dev.copy;
 pub const off = dev.off;
 pub const profReport = dev.profReport;
+pub const winprof = @import("xpu").winprof;
 pub const Proj = loader.Proj;
 pub const Model = loader.Model;
 pub const Acts = fwd.Acts;
@@ -332,8 +333,16 @@ pub const Runner = struct {
         }
         const prof_on = prof.on;
         prof.on = false; // not during the load
+        if (std.c.getenv("XPU_WINDOW_PROFILE") != null and !prof_on) {
+            // XPU_WINDOW_PROFILE: the window measure's per-class events; the runner's kernels by handle
+            try winprof.enable(&d.g);
+            winprof.register(d.k);
+        }
+        const win_on = winprof.on;
+        winprof.on = false; // not during the load either
         r.model = try load(d, &ckpt);
         prof.on = prof_on;
+        winprof.on = win_on;
         r.acts = try Acts.init(d);
         if (r.model.exl3) |x| try x.bind(d, &r.model, &r.acts); // the EXL3 plans over the activations
         r.store(); // slot 0: the states the load allocated

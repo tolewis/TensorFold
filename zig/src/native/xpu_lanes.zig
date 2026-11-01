@@ -78,9 +78,31 @@ pub const Lanes = struct {
             }
         }.f;
         for (0..3) |_| _ = try time(r, slot, ids[0..16], &one); // the widest first, while the clocks ramp up
+        const wp = xq.winprof.on;
         for (&b.costs, 1..) |*c, w| {
+            if (wp) xq.winprof.beginRow(@intCast(w));
             var best: f64 = 1e9;
-            for (0..3) |_| best = @min(best, try time(r, slot, ids[0..w], &one));
+            for (0..3) |_| {
+                if (wp) xq.winprof.beginPass();
+                best = @min(best, try time(r, slot, ids[0..w], &one));
+                if (wp) xq.winprof.endPass();
+            }
+            if (wp and b.drafter != null) { // the drafter's own pass, classed apart from the window's
+                const d = b.drafter.?;
+                try d.use(slot);
+                d.restart(r.pos);
+                xq.winprof.setTag(.drafter);
+                xq.winprof.beginPass();
+                const items = [1]xq.drafter.Block{.{ .slot = slot, .pending = 0 }};
+                try d.latticeMulti(items[0..], b.block - 1);
+                try r.d.sync();
+                xq.winprof.endPass();
+                xq.winprof.setTag(.other);
+            }
+            if (wp) {
+                xq.winprof.flush(&r.d.g);
+                xq.winprof.report();
+            }
             c.* = .{ .width = @intCast(w), .ms = best * 1e3 };
         }
         b.timed = b.costs.len;
