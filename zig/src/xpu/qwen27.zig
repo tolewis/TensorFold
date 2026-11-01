@@ -545,8 +545,7 @@ pub const Runner = struct {
                 full = true;
                 break;
             };
-            r.pt_host[slot][i] = id;
-            r.pages.retain(id);
+            r.pt_host[slot][i] = id; // take gave the slot's reference
         }
         if (i > from) {
             r.held[slot] = i;

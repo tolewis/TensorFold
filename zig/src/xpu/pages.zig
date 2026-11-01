@@ -20,12 +20,16 @@ pub const Pages = struct {
         p.free.deinit(p.gpa);
     }
 
-    /// A page no reference holds: from the freed pages, else never handed out yet; null when the pool is spent.
-    /// The caller takes the reference it needs (`retain`).
+    /// A page no reference holds, with the caller's reference on it: from the freed pages, else never handed out
+    /// yet; null when the pool is spent.
     pub fn take(p: *Pages) ?u32 {
-        while (p.free.pop()) |id| if (p.refs[id] == 0) return id;
+        while (p.free.pop()) |id| if (p.refs[id] == 0) {
+            p.refs[id] = 1;
+            return id;
+        };
         if (p.next >= p.count) return null;
         p.next += 1;
+        p.refs[p.next - 1] = 1;
         return p.next - 1;
     }
 
@@ -58,14 +62,16 @@ test "a page is handed out once, and comes back only when no reference holds it"
     const a = p.take().?;
     const b = p.take().?;
     try std.testing.expect(a != b);
-    p.retain(a);
+    try std.testing.expectEqual(@as(u32, 1), p.held(a)); // the caller's reference
+    p.retain(a); // a kept state holds it too
     p.release(a);
-    try std.testing.expectEqual(@as(u32, 1), p.held(a)); // a kept state still holds it
+    try std.testing.expectEqual(@as(u32, 1), p.held(a)); // the kept state still does
     p.release(a);
     try std.testing.expectEqual(@as(u32, 0), p.held(a));
-    try std.testing.expectEqual(@as(u32, 2), p.spare()); // b is held, a and one unused page are free
+    try std.testing.expectEqual(@as(u32, 3), p.spare()); // b is held, a and one unused page are free
     const c = p.take().?;
-    try std.testing.expect(c == a or c == b + 1); // the freed page before a new one
+    try std.testing.expectEqual(a, c); // the freed page before a new one
+    try std.testing.expectEqual(@as(u32, 1), p.held(c));
 }
 
 test "the pool refuses a page it does not have, and a release of nothing does not wrap" {
