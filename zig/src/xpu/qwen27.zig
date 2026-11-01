@@ -22,6 +22,7 @@ extern "c" fn close(fd: c_int) c_int;
 extern "c" fn munmap(addr: *anyopaque, len: usize) c_int;
 pub const MAX_SLOTS = loader.MAX_SLOTS;
 pub const freeAfterQueue = slot_states.freeAfterQueue;
+pub const gdnBytes = slot_states.gdnBytes;
 pub const Tensor = dev.Tensor;
 pub const Checkpoint = dev.Checkpoint;
 pub const Dev = dev.Dev;
@@ -434,7 +435,6 @@ pub const Runner = struct {
 
     pub const Snap = slot_states.Snap;
     pub const slotBytes = slot_states.slotBytes;
-    pub const gdnBytes = slot_states.gdnBytes;
     pub const snapBytes = slot_states.snapBytes;
     pub const saveSlot = slot_states.saveSlot;
     pub const restoreSlot = slot_states.restoreSlot;

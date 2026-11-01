@@ -95,7 +95,8 @@ pub const Group = struct {
         while (q.now() < deadline) {
             const n = g.poolWord().load(.seq_cst);
             if (n != 0) return @intCast(n);
-            std.Thread.sleep(10_000_000);
+            var ts: std.c.timespec = .{ .sec = 0, .nsec = 10_000_000 };
+            while (std.c.nanosleep(&ts, &ts) != 0) {}
         }
         return null;
     }
