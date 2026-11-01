@@ -23,6 +23,7 @@ const Model = loader.Model;
 const Proj = loader.Proj;
 const SPLIT = q.SPLIT;
 const limits = @import("limits.zig");
+const k1mod = @import("k1.zig"); // XPU_K1: the split-K DPAS decode over int8 pool pages
 const ST_B = q.ST_B;
 const ST_G = q.ST_G;
 const ST_K = q.ST_K;
@@ -81,6 +82,7 @@ pub const Acts = struct {
     mpos: *anyopaque, // i32 [16]: and positions
     a8: *anyopaque, // W4A8 prompt: activations int8 [maxRows, FF] (permuted by blocks of 8) …
     sa: *anyopaque, // … and their scales fp32 [FF / 128, maxRows + 32]
+    grp: *anyopaque, // i32 [16, 2]: K1's row groups (first row, rows)
 
     pub fn init(d: *Dev) !Acts {
         const rows = q.maxRows();
@@ -129,6 +131,7 @@ pub const Acts = struct {
             .mpos = try d.alloc_(16 * 4),
             .a8 = try d.alloc_(rows * FF),
             .sa = try d.alloc_((FF / 128) * (rows + 32) * 4),
+            .grp = try d.alloc_(16 * 2 * 4),
         };
     }
 };
@@ -306,7 +309,11 @@ pub var gemm_probe: ?*const fn (*Dev, *Acts, Proj, *anyopaque, u32, usize, u32) 
 /// XPU_FP64_REF: called after a prompt's chunked GDN from position 0, with the state it left (layer i).
 pub var gdn_probe: ?*const fn (*Dev, *Acts, *anyopaque, u32, usize) anyerror!void = null;
 /// prompt: a prompt chunk, prompt kernels at any rows; tree: rows see their ancestors; multi: one row a slot.
-pub const Mode = struct { prompt: bool = false, want: Want = .last, stash: bool = false, taps: bool = false, tree: bool = false, multi: ?struct { mt: *anyopaque, pos: *anyopaque, max_pos: u32 } = null };
+/// multi.win: the windows' (first row, rows) pairs, as verifyMulti's win_host holds them (K1's row groups).
+pub const Mode = struct { prompt: bool = false, want: Want = .last, stash: bool = false, taps: bool = false, tree: bool = false, multi: ?struct { mt: *anyopaque, pos: *anyopaque, max_pos: u32, win: []const i32 = &.{} } = null };
+
+/// K1: the row groups of the forward's attn_k1 launch; a copy of it is queued, so it lives as long as the process.
+var grp_host: [32]i32 = undefined;
 
 /// One forward over `ids` (< q.maxRows() rows) at p0..; the last row's greedy token; ≤ 16 non-prompt rows: GDN serial.
 pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) !?i32 {
@@ -356,8 +363,36 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
             } else if (wide) {
                 try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = AKV }, .{ a.q, l.kc.?, l.vc.?, a.y, @as(i32, @intCast(p0)), t32, @as(f32, 1.0 / 16.0), @as(?*anyopaque, null) });
             } else {
-                try d.launch(d.k.attn_decode, .{ .x = ns, .y = AKV, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), @as(f32, 1.0 / 16.0), if (mode.multi != null) tree else table, mt, mpos, kvCap() });
-                try d.launch(d.k.attn_merge, .{ .x = HQ, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), table, mpos });
+                const k1on = k1mod.on and !mode.tree and l.pt != null and d.k.attn_k1 != null;
+                if (k1on) { // K1: split-K DPAS over the slot's int8 pages, a row group a work-group
+                    var ng: u32 = 0;
+                    if (mode.multi) |mm| {
+                        if (mm.win.len > 0) {
+                            ng = k1mod.groupsWin(mm.win, &grp_host);
+                        } else { // no window boundaries: a row a group
+                            var j: u32 = 0;
+                            while (j < T) : (j += k1mod.ROWS) {
+                                grp_host[2 * ng] = @intCast(j);
+                                grp_host[2 * ng + 1] = @intCast(@min(k1mod.ROWS, T - j));
+                                ng += 1;
+                            }
+                        }
+                    } else {
+                        var j: u32 = 0;
+                        while (j < T) : (j += k1mod.ROWS) {
+                            grp_host[2 * ng] = @intCast(j);
+                            grp_host[2 * ng + 1] = @intCast(@min(k1mod.ROWS, T - j));
+                            ng += 1;
+                        }
+                    }
+                    const plan = k1mod.plan(ctx, ng, AKV, k1mod.wave);
+                    try k1mod.queueGroups(d, a.grp, &grp_host, ng);
+                    try d.launch(d.k.attn_k1, .{ .x = plan.ns, .y = AKV, .z = ng }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(plan.ns)), plan.span, @as(f32, 1.0 / 16.0), mt, mpos, kvCap(), l.pt.?, a.grp });
+                    try d.launch(d.k.merge_span, .{ .x = HQ, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(plan.ns)), plan.span, mpos });
+                } else {
+                    try d.launch(d.k.attn_decode, .{ .x = ns, .y = AKV, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), @as(f32, 1.0 / 16.0), if (mode.multi != null) tree else table, mt, mpos, kvCap() });
+                    try d.launch(d.k.attn_merge, .{ .x = HQ, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), table, mpos });
+                }
             }
             if (q.kv8 & 1 != 0) try d.launch(d.k.rot_heads, .{ .x = T, .y = HQ }, .{a.y});
             try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo, gs, q.rot_on, q8oa, q8os, q8ms });

@@ -52,6 +52,11 @@ pub const Layer = struct {
     slot_cur: [MAX_SLOTS]u1 = @splat(0),
     slot_kc: [MAX_SLOTS]?*anyopaque = @splat(null),
     slot_vc: [MAX_SLOTS]?*anyopaque = @splat(null),
+    // K1 (XPU_K1) and the pool (lane p21-pool): the layer's K/V page pool as Sage's allocPool ([pool, PAGE, AKV, 256])
+    // and each slot's page table (u32 page ids, one an entry). Unused while `pt` is null.
+    pool: u32 = 0, // pages the pool holds
+    pt: ?*anyopaque = null, // the selected slot's page table
+    slot_pt: [MAX_SLOTS]?*anyopaque = @splat(null),
 };
 
 /// Sequences a runner holds at most (one a stream of the lane host).

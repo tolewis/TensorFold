@@ -109,6 +109,7 @@ pub fn verifyMulti(r: *Runner, wins: []const Win) !void {
             if (l.attn) {
                 e[0] = @intFromPtr(l.slot_kc[w.slot].?);
                 e[1] = @intFromPtr(l.slot_vc[w.slot].?);
+                e[2] = if (l.slot_pt[w.slot]) |pt| @intFromPtr(pt) else 0; // K1: the slot's page table
             } else {
                 const cur = l.slot_cur[w.slot];
                 e[2] = @intFromPtr(l.slot_conv[w.slot][cur].?);
@@ -121,7 +122,7 @@ pub fn verifyMulti(r: *Runner, wins: []const Win) !void {
     const d = &r.d;
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, r.acts.mt, &r.mt_host, LAYERS * 16 * 8 * 8, null, 0, null));
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, r.acts.mpos, &r.pos_host, T * 4, null, 0, null));
-    _ = try forward(d, &r.model, &r.acts, @ptrCast(r.ids_host[0..T]), 0, .{ .want = .rows, .stash = true, .taps = r.taps_on, .tree = tree, .multi = .{ .mt = r.acts.mt, .pos = r.acts.mpos, .max_pos = max_pos } });
+    _ = try forward(d, &r.model, &r.acts, @ptrCast(r.ids_host[0..T]), 0, .{ .want = .rows, .stash = true, .taps = r.taps_on, .tree = tree, .multi = .{ .mt = r.acts.mt, .pos = r.acts.mpos, .max_pos = max_pos, .win = r.win_host[0 .. 2 * wins.len] } });
     var toks: [16]i32 = undefined;
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &toks, r.acts.tok, T * 4, null, 0, null));
     try d.sync();
