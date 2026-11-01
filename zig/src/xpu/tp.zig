@@ -428,7 +428,7 @@ pub const Group = struct {
     /// rank writes a magic into the peer's flag word, the peer does the same, each waits for the other's write to
     /// land (a byte over the socket), reads its own flag word and resets it.
     fn selfTest(g: *Group, d: *Dev, list: ze.H, conn: linux.fd_t) !bool {
-        const st = @as([*]u64, @ptrCast(try d.g.hostAlloc(64));
+        const st = @as([*]u64, @ptrCast(try d.g.hostAlloc(64)));
         @memset(st[0..8], 0);
         st[0] = tp_magic + g.rank;
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(list, off(g.peer_blk.?, blk_flag), @ptrCast(st), 8, null, 0, null));
