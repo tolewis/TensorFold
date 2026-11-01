@@ -14,8 +14,7 @@ const GDN_AB = q.GDN_AB;
 const HK = q.GDN_K_HEADS;
 const HV = q.GDN_V_HEADS;
 const HQ = q.ATT_Q_HEADS;
-const MIX_OUT = q.GDN_Z;
-const tp = @import("tp.zig"); // a mixer's output width a rank: 48 value heads of 128, or 24 attention heads of 256, at TP 1
+const MIX_OUT = q.GDN_Z; // a mixer's output width a rank: 48 value heads of 128, or 24 attention heads of 256, at TP 1
 const GDN_IN = q.GDN_IN;
 const LAYERS = q.LAYERS;
 const MASK_WORDS = q.MASK_WORDS;
@@ -32,6 +31,7 @@ const ST_V = q.ST_V;
 const TAP_LAYERS = q.TAP_LAYERS;
 const VOCAB = q.VOCAB;
 const alloc = q.alloc;
+const ranks = @import("tp.zig"); // the TP ranks' all-reduce (null at TP 1)
 extern "c" fn close(fd: c_int) c_int;
 const copy = dev.copy;
 const off = dev.off;
@@ -416,7 +416,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
         }
         try a8(d, a, a.h, MIX_OUT, T, 2);
         try pgemm(d, m, a, a.h, l.mixer_out, a.r, T, q8out, 0, q.int4_sites & 2 != 0, wide);
-        if (tp.group) |*g| try g.allReduce(d, a.r, T); // TP: the ranks' partial out-projections summed
+        if (ranks.group) |*g| try g.allReduce(d, a.r, T); // TP: the ranks' partial out-projections summed
         if (gemm_probe) |f| try f(d, a, l.mixer_out, a.h, T, i, 1);
         if (probe) try dumpBuf(d, "r0", a.r, T * D, .f16);
         try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs, q8a, q8s, q8ms, q.rot_on });
@@ -425,7 +425,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
         const act = try mlpIn(d, m, a, l.gu, T, gs, q8on, wide);
         try a8(d, a, act, FF, T, 8);
         try pgemm(d, m, a, act, l.down, a.r, T, false, if (act == a.p) q.rot_on else 0, q.int4_sites & 8 != 0, wide);
-        if (tp.group) |*g| try g.allReduce(d, a.r, T); // TP: the ranks' partial down projections summed
+        if (ranks.group) |*g| try g.allReduce(d, a.r, T); // TP: the ranks' partial down projections summed
         if (gemm_probe) |f| try f(d, a, l.down, act, T, i, 3);
         if (p0 == 0 and i < 4) try dump(d, a, T, try std.fmt.allocPrint(alloc, "{d}", .{i}), true);
         if (mode.taps) for (TAP_LAYERS, 0..) |tl, slot| if (tl == i)
