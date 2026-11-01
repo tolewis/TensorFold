@@ -606,7 +606,7 @@ const HeadPiece = struct { t0: u32, t1: u32, c0: u32, c1: u32, row: u32 };
 
 const HeadJob = struct {
     w: exl3_format.Width,
-    cb: exl3_layout.Codebook,
+    cb: exl3_format.Codebook,
     trellis: []const u8, // i16 [tiles_k][tiles_n][words], as stored (any alignment)
     tiles_k: usize,
     tiles_n: usize,
@@ -667,7 +667,8 @@ fn headExl3(c: *const q.Checkpoint, out: *[]f16) !u32 {
     const svh_t = try c.get("lm_head.svh");
     const mul1 = try c.get("lm_head.mul1");
     if (!std.mem.eql(u8, tr.dtype, "I16") or tr.rank != 3 or mul1.bytes.len != 4) return error.UnexpectedShape;
-    const cb = try exl3_layout.fromMarker(std.mem.readInt(u32, mul1.bytes[0..4], .little));
+    // the marker's codebook (exl3_load's enum) as exl3_format's: the same tags
+    const cb = std.meta.stringToEnum(exl3_format.Codebook, @tagName(try exl3_layout.fromMarker(std.mem.readInt(u32, mul1.bytes[0..4], .little)))).?;
     const tiles_k: usize = @intCast(tr.shape[0]);
     const tiles_n: usize = @intCast(tr.shape[1]);
     const w: exl3_format.Width = .{ .halves = @intCast(tr.shape[2] / 8) };
