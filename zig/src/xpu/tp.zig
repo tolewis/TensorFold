@@ -329,6 +329,23 @@ pub const Group = struct {
         try dev.copy(d, off(g.peer_blk.?, blk_pcons + par * 8), off(g.own_cons.?, par * 8), 8);
     }
 
+    /// TF_TP_EXBENCH=1: at load, the cost of 128 exchanges (a round) at 1, 8, 16 and 32 rows in the group's
+    /// mode. Both ranks run it, so the pair times as it does in a forward. The host waits a mode has are inside
+    /// the figure, which is what the gate asks for.
+    pub fn exchangeBench(g: *Group, d: *Dev, partial: *anyopaque) !void {
+        const counts = [_]u32{ 1, 8, 16, 32 };
+        var out: [4]f64 = @splat(0);
+        for (counts, 0..) |rows, i| {
+            try g.allReduce(d, partial, rows); // warm
+            d.settle();
+            const t0 = q.now();
+            for (0..128) |_| try g.allReduce(d, partial, rows);
+            d.settle();
+            out[i] = (q.now() - t0) * 1e3;
+        }
+        std.log.info("qwen27-xpu: exchange ms a round (128 exchanges) by rows: 1 {d:.2}, 8 {d:.2}, 16 {d:.2}, 32 {d:.2}", .{ out[0], out[1], out[2], out[3] });
+    }
+
     /// After a settle: a device-flag exchange that timed out (the peer went away) is PeerLost.
     pub fn check(g: *Group, d: *Dev) !void {
         if (!g.devflag) return;

@@ -343,6 +343,9 @@ pub const Runner = struct {
         try d.fill(r.acts.zeros, @as(u16, 0), maxRows() * GDN_V_HEADS * 128 * 2);
         try d.fill(r.acts.ones, @as(f32, 1.0), maxRows() * GDN_V_HEADS * 4);
         r.host_logits = try alloc.alloc(f32, VOCAB);
+        // TF_TP_EXBENCH=1: the exchange cost a round at 1, 8, 16 and 32 rows, in the mode the group opened in.
+        // Both ranks run it at load (the same count of exchanges), so the pair times as it does in a forward.
+        if (tp.group) |*g| if (std.c.getenv("TF_TP_EXBENCH") != null) try g.exchangeBench(d, r.acts.r);
         return r;
     }
 
