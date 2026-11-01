@@ -39,6 +39,27 @@ KERNEL(256) void tp_add(global ushort *out, global const ushort *a, global const
   out[i] = as_ushort((half)s);
 }
 
+// The peer's partial is already in `peer` (pushed over PCIe before the flag). Wait for the flag, then add.
+KERNEL(256) void tp_add_flag(global ushort *out, global const ushort *peer, int n,
+                             global volatile ulong *flag, ulong seq, global volatile uint *timeout) {
+  const int i = get_global_id(0), lid = get_local_id(0);
+  if (lid == 0) tp_wait(flag, seq, timeout);
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (i >= n) return;
+  const float s = (float)as_half(out[i]) + (float)as_half(peer[i]);
+  out[i] = as_ushort((half)s);
+}
+
+// This rank has read the peer's slot: publish its consumed counter, then wait until the peer consumed the slot the
+// next exchange writes again (a two-slot ring, so a rank cannot overrun its peer by more than one exchange).
+KERNEL(16) void tp_consume(global ulong *mine, ulong seq, global volatile ulong *theirs, ulong need,
+                           global volatile uint *timeout) {
+  if (get_global_id(0) != 0) return;
+  atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_release, memory_scope_device);
+  *mine = seq;
+  tp_wait(theirs, need, timeout);
+}
+
 KERNEL(16) void rot_heads(global ushort *O) {
   const int t = get_group_id(0), hh = get_group_id(1), lane = get_sub_group_local_id();
   global ushort *o = O + ((long)t * Q27_AQ + hh) * 256;

@@ -330,6 +330,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
     const q8os: ?*anyopaque = if (q8out) a.sa else null;
     const table = if (mode.tree) a.tree else a.chain;
     const mpos: ?*anyopaque = if (mode.multi) |mm| mm.pos else null;
+    var fused = false; // the device-flag exchange ran the residual add and norm itself (TF_TP_DEVFLAG)
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.ids, ids.ptr, ids.len * 4, null, 0, null));
     errdefer d.settle(); // the queued copy reads the caller's ids: an error returns only once the queue is idle
     try embedRows(d, m, a.ids, a.x, T);
@@ -417,10 +418,15 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
         }
         try a8(d, a, a.h, MIX_OUT, T, 2);
         try pgemm(d, m, a, a.h, l.mixer_out, a.r, T, q8out, 0, q.int4_sites & 2 != 0, wide);
-        if (ranks.group) |*g| try g.allReduce(d, a.r, T); // TP: the ranks' partial out-projections summed
+        if (ranks.group) |*g| { // TP: the ranks' partial out-projections summed
+            if (!wide and g.devflag) { // TF_TP_DEVFLAG: the add fused into the residual add and norm below
+                try g.allReduceNorm(d, a.r, T, .{ .x = a.x, .w = l.post_norm, .h = a.h, .ahi = a.ahi, .alo = a.alo, .a8 = q8a, .sa = q8s, .ms = q8ms, .eps = EPS, .has_r = 1, .gs = gs, .rot = q.rot_on });
+                fused = true;
+            } else try g.allReduce(d, a.r, T);
+        }
         if (gemm_probe) |f| try f(d, a, l.mixer_out, a.h, T, i, 1);
         if (probe) try dumpBuf(d, "r0", a.r, T * D, .f16);
-        try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs, q8a, q8s, q8ms, q.rot_on });
+        if (!fused) try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs, q8a, q8s, q8ms, q.rot_on });
         try a8(d, a, a.h, D, T, 4);
         if (gemm_probe) |f| try f(d, a, l.gu, a.h, T, i, 2);
         const act = try mlpIn(d, m, a, l.gu, T, gs, q8on, wide);
@@ -434,6 +440,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
     }
     if (!want and q.dump_h == null) { // x is per token: nothing carries to the next chunk
         try d.sync();
+        if (ranks.group) |*g| try g.check(d);
         return null;
     }
     const hgs: i32 = @intCast(m.head.gs);
@@ -455,5 +462,6 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
     var toks: [16]i32 = undefined;
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &toks, a.tok, rows * 4, null, 0, null));
     try d.sync();
+    if (ranks.group) |*g| try g.check(d); // TF_TP_DEVFLAG: a timed-out exchange (the peer went away) is PeerLost
     return toks[rows - 1];
 }

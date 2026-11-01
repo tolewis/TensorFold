@@ -159,6 +159,23 @@ KERNEL(128) void add_rmsnorm(global float *X, global const half *R, global const
   out_rows(hl, D, H, t, rot, gs, A8, SA, MS, AHI, ALO);
 }
 
+// TP 2 device flag (TF_TP_DEVFLAG): a work-group polls a flag word the peer's copy engine writes over PCIe before
+// it uses the peer's slot. The bound is generous: at about 75 ns an iteration 2^32 is about 5 minutes, so a peer
+// that has gone away ends the spin and the host reports it at the next settle (the group's timeout word).
+#define TP_SPIN_MAX 0xFFFFFFFFull
+
+static ulong tp_wait(global volatile ulong *p, ulong want, global volatile uint *timeout) {
+  ulong spins = 0;
+  while (*p < want) {
+    if (++spins > TP_SPIN_MAX) {
+      *timeout = 1u;
+      break;
+    }
+  }
+  atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_acquire, memory_scope_device);
+  return *p;
+}
+
 // Same computation, 512 work-items per row: for decode and verification (16 rows at most).
 KERNEL(512) void add_rmsnorm_dec(global float *X, global const half *R, global const ushort *WN, global half *H,
                                   global half *AHI, global half *ALO, int D, float eps, int has_r, int gs,
@@ -172,6 +189,49 @@ KERNEL(512) void add_rmsnorm_dec(global float *X, global const half *R, global c
     float x = e < D ? X[(long)t * D + e] : 0.0f;
     if (has_r && e < D) {
       x = rbf(x + (float)R[(long)t * D + e]);
+      X[(long)t * D + e] = x;
+    }
+    xv[i] = x;
+    ss += x * x;
+  }
+  const float s = sub_group_reduce_add(ss);
+  if (get_sub_group_local_id() == 0) red[get_sub_group_id()] = s;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float tot = 0.0f;
+  for (int i = 0; i < 32; i++) tot += red[i];
+  const float inv = rsqrt(tot / D + eps);
+  for (int i = 0; i < Q27_D512; i++) {
+    const int e = lid + i * 512;
+    if (e >= D) continue;
+    const half v = convert_half_rte(rbf(xv[i] * inv * bf2f(WN[e])));
+    if (!rot) H[(long)t * D + e] = v;
+    hl[e] = v;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  out_rows(hl, D, H, t, rot, gs, A8, SA, MS, AHI, ALO);
+}
+
+// TP 2 device flag (TF_TP_DEVFLAG): the exchange fused into the residual add and norm that reads it once.
+// X += f16(f32(R) + f32(PEER)) after the peer's flag says its push landed, and R keeps the sum (the same bits as
+// tp_add, so the two forms agree). Grid T, one work-group of 512 a row.
+KERNEL(512) void add_rmsnorm_dec_tp(global float *X, global half *R, global const ushort *PEER,
+                                   global volatile ulong *flag, ulong seq, global volatile uint *timeout,
+                                   global const ushort *WN, global half *H, global half *AHI, global half *ALO,
+                                   int D, float eps, int has_r, int gs, global char *A8, global float *SA, int MS,
+                                   int rot) {
+  local float red[32];
+  local half hl[Q27_D];
+  const int t = get_group_id(0), lid = get_local_id(0);
+  if (lid == 0) tp_wait(flag, seq, timeout);
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float xv[Q27_D512], ss = 0.0f;
+  for (int i = 0; i < Q27_D512; i++) {
+    const int e = lid + i * 512;
+    float x = e < D ? X[(long)t * D + e] : 0.0f;
+    if (has_r && e < D) {
+      const ushort sb = as_ushort((half)((float)as_half(R[(long)t * D + e]) + (float)as_half(PEER[(long)t * D + e])));
+      R[(long)t * D + e] = sb;
+      x = rbf(x + (float)as_half(sb));
       X[(long)t * D + e] = x;
     }
     xv[i] = x;
