@@ -13,6 +13,16 @@
 //! copy brings the peer's slot over PCIe and a kernel adds it into this rank's buffer (ze_ipc.py: 10 KB in 10.9 us, 9.2 MB in 283 us). The
 //! host settle before the counter stays.
 //!
+//! The device-flag path (TF_TP_DEVFLAG=1, default off; it needs a build with the tp_add_flag, add_rmsnorm_dec_tp and
+//! tp_consume kernels): no host wait an exchange. Each rank pushes its partial into the peer's exported slot over
+//! PCIe (a copy into the IPC-opened block), then writes the exchange's sequence number into the peer's flag word on
+//! the same in-order list. The peer's add kernel polls that flag in device memory, adds, and a small kernel publishes
+//! the consumed counter and waits until the peer consumed the slot the next exchange writes again (two slots, so a
+//! rank cannot overrun its peer by more than one exchange). A rank that times out sets a timeout word and the host
+//! reports PeerLost at the next settle. The mixer's exchange is fused into the residual add and norm that reads the
+//! reduced tensor once (add_rmsnorm_dec_tp). At open the path proves that the peer's memory takes this rank's writes
+//! and both ranks agree on the mode over the socket; any failure leaves the host path in place.
+//!
 //! The file: TF_TP_SHM names it (default /dev/shm/tf-tp-qwen27). Rank 0 creates and sizes it, rank 1 opens it.
 //! Layout: a header of TP sequence counters (u64, cache-line apart), then two slots a rank of `rows_max` x D fp16
 //! (call `seq` uses slot seq % 2: a rank one call ahead writes the other slot, so a slow reader's data stays), then
@@ -27,6 +37,7 @@ const q = @import("qwen27.zig");
 const dev = @import("dev.zig");
 const ze = @import("ze");
 const Dev = dev.Dev;
+const off = dev.off;
 const D = q.D;
 
 const line = 64;
@@ -34,6 +45,15 @@ const rows_max = 1024 + 128 + 16; // the widest forward (q.maxRows at XPU_CHUNK 
 const slot_bytes = rows_max * D * 2;
 const ring_len = 64;
 const peer_dead = 10.0; // seconds without an all-reduce: a silent rank is gone, the pair cannot run
+// the exported block a rank: the peer's pushed partials (2 slots), the flag words the peer writes (2), the peer's
+// consumed counters (2), a timeout word
+const blk_slots = 2 * slot_bytes;
+const blk_flag = blk_slots;
+const blk_pcons = blk_flag + 16;
+const blk_timeout = blk_pcons + 16;
+const blk_devflag_bytes = blk_timeout + 64;
+const blk_legacy_bytes = 4 * slot_bytes; // the device-direct path: this rank's two slots, then its two peer copies
+const fh_ring = 512; // host staging slots for the flag value (a round queues at most 128 exchanges before a settle)
 pub const rec_words = 1024; // 4 KiB a record
 pub const rec_data = rec_words - 8;
 
@@ -47,10 +67,32 @@ comptime {
     std.debug.assert(@sizeOf(Rec) == rec_words * 4);
 }
 
+/// The residual add and norm the device-flag exchange can be fused into (add_rmsnorm_dec_tp).
+pub const Norm = struct {
+    x: *anyopaque, // fp32 residual [rows, D]
+    w: *anyopaque, // the norm weight (bf16)
+    h: *anyopaque, // fp16 normed output [rows, D]
+    ahi: *anyopaque,
+    alo: *anyopaque,
+    a8: ?*anyopaque = null, // the W4A8 quantized copy, when the site asks for it
+    sa: ?*anyopaque = null,
+    ms: i32 = 0,
+    eps: f32,
+    has_r: i32,
+    gs: i32,
+    rot: i32,
+};
+
+/// The magic a rank writes into the peer's flag word at open (plus its rank), to prove the host-to-peer write
+/// lands. `tp_magic2` does the same for the device-to-peer write the partial push uses.
+const tp_magic: u64 = 0x5450_464c_4147_3100;
+const tp_magic2: u64 = 0x5055_5348_5000_0000;
+
 /// The group this process is in, opened by Runner.init; null at TP 1.
 pub var group: ?Group = null;
 var one_slot = false;
 var trace = false;
+var devflag = false; // TF_TP_DEVFLAG: the device-flag all-reduce (default off)
 
 pub const Group = struct {
     map: []align(std.heap.page_size_min) u8,
@@ -69,6 +111,15 @@ pub const Group = struct {
     /// (zeCommandListAppendLaunchKernel: invalid argument), a device copy from it works.
     pbuf: [2]*anyopaque = undefined,
     direct: bool = false,
+    /// The device-flag path (TF_TP_DEVFLAG): one exported block a rank (`blk`: the peer's pushed partials, the flag
+    /// words the peer writes, the peer's consumed counters, a timeout word) and the peer's block opened here.
+    /// `own_cons` holds this rank's consumed counters, which it pushes into the peer's block.
+    blk: ?*anyopaque = null,
+    peer_blk: ?*anyopaque = null,
+    own_cons: ?*anyopaque = null,
+    /// Host staging ring for a flag value (seq % fh_ring): the copy that carries it is queued on the in-order list.
+    fh: [*]u64 = undefined,
+    devflag: bool = false,
 
     fn counter(g: *const Group, r: u32) *std.atomic.Value(u64) {
         return @ptrCast(@alignCast(g.map.ptr + r * line));
@@ -134,6 +185,7 @@ pub const Group = struct {
         if (q.TP == 1) return null;
         one_slot = std.c.getenv("TF_TP_ONE_SLOT") != null;
         trace = std.c.getenv("TF_TP_TRACE") != null;
+        devflag = std.c.getenv("TF_TP_DEVFLAG") != null;
         const name: [*:0]const u8 = if (std.c.getenv("TF_TP_SHM")) |v| v else "/dev/shm/tf-tp-qwen27";
         const size = q.TP * line + 2 * q.TP * slot_bytes + line + ring_len * @sizeOf(Rec);
         // the file as the fabric's mailbox opens its own (fabric/tp/mailbox.zig): either rank may create it
@@ -161,7 +213,7 @@ pub const Group = struct {
             std.log.warn("qwen27-xpu: TP all-reduce stays host-staged: {s}", .{@errorName(err)});
             g.direct = false;
         };
-        std.log.info("qwen27-xpu: TP {d} rank {d}: all-reduce {s}", .{ g.tp, g.rank, if (g.direct) "device-direct (the peer's slots over PCIe)" else "host-staged" });
+        std.log.info("qwen27-xpu: TP {d} rank {d}: all-reduce {s}", .{ g.tp, g.rank, if (g.devflag) "device-flag (the peer's slot pushed over PCIe, the add polls a flag)" else if (g.direct) "device-direct (the peer's slots over PCIe)" else "host-staged" });
         return g;
     }
 
@@ -250,6 +302,20 @@ pub const Group = struct {
         if (rows > rows_max) return error.TooManyRows;
         const n: usize = @as(usize, rows) * D;
         g.seq += 1;
+        if (g.devflag) {
+            const par: usize = @intCast(g.seq % 2);
+            try g.push(d, partial, n, par);
+            try d.launch(d.k.tp_add_flag, .{ .x = @intCast((n + 255) / 256) }, .{
+                partial,                                   // out: this rank's partial, the sum lands here
+                off(g.blk.?, par * slot_bytes),            // the peer's push (read after the flag)
+                @as(i32, @intCast(n)),                     //
+                off(g.blk.?, blk_flag + par * 8),          // the flag the peer wrote
+                g.seq,                                     //
+                off(g.blk.?, blk_timeout),                 //
+            });
+            try g.consume(d, par);
+            return;
+        }
         if (g.direct) { // the partial into this rank's slot, the counter, then the add kernel reads the peer's slot
             const par: usize = @intCast(g.seq % 2);
             try dev.copy(d, g.dslot[par], partial, n * 2);
@@ -283,19 +349,103 @@ pub const Group = struct {
         d.settle();
     }
 
+    /// The mixer's exchange fused into the residual add and norm that reads the reduced tensor once
+    /// (add_rmsnorm_dec_tp, TF_TP_DEVFLAG): the same bits as the separate add and norm. `partial` keeps the sum.
+    pub fn allReduceNorm(g: *Group, d: *Dev, partial: *anyopaque, rows: u32, nrm: Norm) !void {
+        if (!g.devflag) return error.NotDeviceFlag;
+        if (rows > rows_max) return error.TooManyRows;
+        const n: usize = @as(usize, rows) * D;
+        g.seq += 1;
+        const par: usize = @intCast(g.seq % 2);
+        try g.push(d, partial, n, par);
+        try d.launch(d.k.tp_norm_tp, .{ .x = rows }, .{
+            nrm.x,                                    // X fp32 residual
+            partial,                                  // R fp16, keeps the sum
+            off(g.blk.?, par * slot_bytes),           // the peer's push
+            off(g.blk.?, blk_flag + par * 8),         //
+            g.seq,                                    //
+            off(g.blk.?, blk_timeout),                //
+            nrm.w,                                    // WN
+            nrm.h,                                    //
+            nrm.ahi,                                  //
+            nrm.alo,                                  //
+            @as(i32, D),                              //
+            nrm.eps,                                  //
+            nrm.has_r,                                //
+            nrm.gs,                                   //
+            nrm.a8,                                   //
+            nrm.sa,                                   //
+            nrm.ms,                                   //
+            nrm.rot,                                  //
+        });
+        try g.consume(d, par);
+    }
+
+    /// Pushes this rank's partial into the peer's slot and then the flag, both on the in-order list: the peer's
+    /// kernel sees the partial complete before the flag.
+    fn push(g: *Group, d: *Dev, partial: *anyopaque, n: usize, par: usize) !void {
+        const pb = g.peer_blk.?;
+        try dev.copy(d, off(pb, par * slot_bytes), partial, n * 2);
+        const hi: usize = @intCast(g.seq % fh_ring);
+        g.fh[hi] = g.seq;
+        try dev.copy(d, off(pb, blk_flag + par * 8), @ptrCast(&g.fh[hi]), 8);
+    }
+
+    /// Publishes this rank's consumed counter for the slot and waits until the peer consumed the slot the next
+    /// exchange writes again (two slots). Runs after the add kernel, so the slot's data is read out first.
+    fn consume(g: *Group, d: *Dev, par: usize) !void {
+        const need: u64 = if (g.seq >= 2) g.seq - 1 else 0;
+        try d.launch(d.k.tp_consume, .{ .x = 1 }, .{
+            off(g.own_cons.?, par * 8),                 // this rank's consumed counter, pushed to the peer next
+            g.seq,                                      //
+            off(g.blk.?, blk_pcons + (1 - par) * 8),    // the peer's consumption of the slot the next exchange reuses
+            need,                                       //
+            off(g.blk.?, blk_timeout),                  //
+        });
+        try dev.copy(d, off(g.peer_blk.?, blk_pcons + par * 8), off(g.own_cons.?, par * 8), 8);
+    }
+
+    /// TF_TP_EXBENCH=1: at load, the cost of 128 exchanges (a round) at 1, 8, 16 and 32 rows in the group's
+    /// mode. Both ranks run it, so the pair times as it does in a forward. The host waits a mode has are inside
+    /// the figure, which is what the gate asks for.
+    pub fn exchangeBench(g: *Group, d: *Dev, partial: *anyopaque) !void {
+        const counts = [_]u32{ 1, 8, 16, 32 };
+        var out: [4]f64 = @splat(0);
+        for (counts, 0..) |rows, i| {
+            try g.allReduce(d, partial, rows); // warm
+            d.settle();
+            const t0 = q.now();
+            for (0..128) |_| try g.allReduce(d, partial, rows);
+            d.settle();
+            out[i] = (q.now() - t0) * 1e3;
+        }
+        std.log.info("qwen27-xpu: exchange ms a round (128 exchanges) by rows: 1 {d:.2}, 8 {d:.2}, 16 {d:.2}, 32 {d:.2}", .{ out[0], out[1], out[2], out[3] });
+    }
+
+    /// After a settle: a device-flag exchange that timed out (the peer went away) is PeerLost. Lane p2-int: the
+    /// group-close rule of lane p28-ops has no flag, so this mode closes the segment and exits as the other modes do
+    /// (the kernel spin cannot see the peer's host liveness word, so its timeout word is the only detector here).
+    pub fn check(g: *Group, d: *Dev) !void {
+        if (!g.devflag) return;
+        var t: u32 = 0;
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &t, off(g.blk.?, blk_timeout), 4, null, 0, null));
+        try d.sync();
+        if (t != 0) {
+            std.debug.print("rank {d}: the device-flag all-reduce timed out after record {d}\n", .{ g.rank, g.step });
+            waitGroupLost(g, error.PeerLost);
+        }
+    }
+
     /// Opens the device-direct path: two device slots exported to the peer, the peer's two opened here. The
     /// handles cross over a unix socket beside the shm file (rank 0 listens, rank 1 connects, SCM_RIGHTS carries
     /// the dma-buf fds). Any failure leaves the host path in place.
     fn openDirect(g: *Group, d: *Dev) !void {
         if (g.tp != 2) return error.DirectNeedsTwoRanks;
-        var handles: [2]ze.IpcHandle = undefined;
-        var fds: [2]i32 = undefined;
-        for (0..2) |i| {
-            g.dslot[i] = try d.g.deviceAlloc(slot_bytes);
-            g.pbuf[i] = try d.g.deviceAlloc(slot_bytes);
-            try ze.check(d.g.api.zeMemGetIpcHandle(d.g.context, g.dslot[i], &handles[i]));
-            fds[i] = std.mem.readInt(i32, handles[i].data[0..4], .little);
-        }
+        const want_flag = devflag;
+        const blk = try d.g.deviceAlloc(if (want_flag) blk_devflag_bytes else blk_legacy_bytes);
+        var handle: ze.IpcHandle = undefined;
+        try ze.check(d.g.api.zeMemGetIpcHandle(d.g.context, blk, &handle));
+        var fds = [1]i32{std.mem.readInt(i32, handle.data[0..4], .little)};
         const name: [*:0]const u8 = if (std.c.getenv("TF_TP_SHM")) |v| v else "/dev/shm/tf-tp-qwen27";
         const base = std.mem.span(name);
         var addr: linux.sockaddr.un = .{ .path = @splat(0) };
@@ -330,17 +480,77 @@ pub const Group = struct {
             _ = linux.close(conn);
             _ = linux.unlink(@ptrCast(&addr.path));
         };
-        try sendFds(conn, std.mem.asBytes(&handles), &fds);
-        var theirs: [2]ze.IpcHandle = undefined;
-        var their_fds: [2]i32 = undefined;
+        try sendFds(conn, std.mem.asBytes(&handle), &fds);
+        var theirs: ze.IpcHandle = undefined;
+        var their_fds = [1]i32{0};
         try recvFds(conn, std.mem.asBytes(&theirs), &their_fds);
+        std.mem.writeInt(i32, theirs.data[0..4], their_fds[0], .little);
+        var p: ?*anyopaque = null;
+        try ze.check(d.g.api.zeMemOpenIpcHandle(d.g.context, d.g.device, theirs, 0, &p));
+        g.blk = blk;
+        g.peer_blk = p;
+        // The mode byte keeps both ranks in the same path: 0 the device-direct path, 1 the device-flag path,
+        // 2 the device-flag path failed its own test (then both take the host path).
+        var mode: u8 = 0;
+        if (want_flag) {
+            g.fh = @ptrCast(@alignCast(try d.g.hostAlloc(fh_ring * 8)));
+            g.own_cons = try d.g.deviceAlloc(64);
+            const list = try d.g.immediate(0, 0);
+            mode = if (try g.selfTest(d, list, conn)) 1 else 2;
+        }
+        var peer_mode: u8 = 0;
+        try sendByte(conn, mode);
+        try recvByte(conn, &peer_mode);
+        if (mode == 1 and peer_mode == 1) {
+            g.devflag = true;
+            g.direct = true;
+            return;
+        }
+        if (mode != 0 or peer_mode != 0) {
+            // one rank asked for the device flag and the paths did not agree (a test failed, or the env differs): the
+            // blocks were allocated at different sizes, so both ranks take the host path
+            std.log.warn("qwen27-xpu: TP all-reduce stays host-staged: the device-flag paths did not agree (this rank {d}, the peer {d})", .{ mode, peer_mode });
+            g.direct = false;
+            return;
+        }
         for (0..2) |i| {
-            std.mem.writeInt(i32, theirs[i].data[0..4], their_fds[i], .little);
-            var p: ?*anyopaque = null;
-            try ze.check(d.g.api.zeMemOpenIpcHandle(d.g.context, d.g.device, theirs[i], 0, &p));
-            g.peer[i] = p;
+            g.dslot[i] = off(blk, i * slot_bytes);
+            g.pbuf[i] = off(blk, (2 + i) * slot_bytes);
+            g.peer[i] = off(p.?, i * slot_bytes);
         }
         g.direct = true;
+    }
+
+    /// Proves both writes the device-flag path uses before it is trusted: a host-to-peer write (the flag) and a
+    /// device-to-peer write (the partial push). Each rank writes its magics into the peer's block, waits for the
+    /// peer's writes to land (a byte over the socket), reads its own flag and peer-consumed words, checks them and
+    /// resets them.
+    fn selfTest(g: *Group, d: *Dev, list: ze.H, conn: linux.fd_t) !bool {
+        const st = @as([*]u64, @ptrCast(@alignCast(try d.g.hostAlloc(64))));
+        @memset(st[0..8], 0);
+        st[0] = tp_magic + g.rank; // the flag: a host-to-peer write
+        st[1] = tp_magic2 + g.rank; // the push: a device-to-peer write
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(list, off(g.peer_blk.?, blk_flag), @ptrCast(st), 8, null, 0, null));
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(list, g.own_cons.?, @ptrCast(st + 1), 8, null, 0, null));
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(list, off(g.peer_blk.?, blk_pcons), g.own_cons.?, 8, null, 0, null));
+        try ze.check(d.g.api.zeCommandListHostSynchronize(list, std.math.maxInt(u64)));
+        const b: u8 = 1;
+        var r: u8 = 0;
+        try sendByte(conn, b);
+        try recvByte(conn, &r);
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(list, @ptrCast(st + 1), off(g.blk.?, blk_flag), 24, null, 0, null));
+        try ze.check(d.g.api.zeCommandListHostSynchronize(list, std.math.maxInt(u64)));
+        const got_flag = st[1];
+        const got_push = st[3]; // flag[0], flag[1], then pcons[0]
+        const ok = got_flag == tp_magic + (1 - g.rank) and got_push == tp_magic2 + (1 - g.rank);
+        // reset this rank's flag and peer-consumed words and its own consumed counters (both ranks wrote before the
+        // byte exchange, so neither can land here after the reset)
+        @memset(st[1..5], 0);
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(list, off(g.blk.?, blk_flag), @ptrCast(st + 1), 32, null, 0, null));
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(list, g.own_cons.?, @ptrCast(st + 1), 16, null, 0, null));
+        try ze.check(d.g.api.zeCommandListHostSynchronize(list, std.math.maxInt(u64)));
+        if (!ok) std.log.warn("qwen27-xpu: TP rank {d}: the peer's block did not take the writes (flag 0x{x}, push 0x{x})", .{ g.rank, got_flag, got_push });
+        return ok;
     }
 };
 
@@ -351,6 +561,24 @@ fn failed(rc: usize) bool {
     return @as(isize, @bitCast(rc)) < 0;
 }
 const scm_rights = 1;
+
+fn sendByte(sock: linux.fd_t, b: u8) !void {
+    var v = [1]u8{b};
+    const rc = linux.write(sock, &v, 1);
+    if (failed(rc) or rc != 1) return error.ByteSend;
+}
+
+fn recvByte(sock: linux.fd_t, b: *u8) !void {
+    var v = [1]u8{0};
+    var got: usize = 0;
+    while (got < 1) {
+        const rc = linux.read(sock, v[got..].ptr, 1);
+        if (failed(rc)) return error.ByteRecv;
+        if (rc == 0) return error.ByteRecv;
+        got += rc;
+    }
+    b.* = v[0];
+}
 
 fn sendFds(sock: linux.fd_t, data: []const u8, fds: []const i32) !void {
     var iov = [1]std.posix.iovec_const{.{ .base = data.ptr, .len = data.len }};

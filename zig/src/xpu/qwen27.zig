@@ -328,6 +328,9 @@ pub const Runner = struct {
             .exl3_gemv = try d.kernel(md, "exl3_gemv", 16),
             .rot_heads = try d.kernel(mg, "rot_heads", 16),
             .tp_add = try d.kernel(mg, "tp_add", 256),
+            .tp_add_flag = try d.kernel(mg, "tp_add_flag", 256),
+            .tp_norm_tp = try d.kernel(mg, "add_rmsnorm_dec_tp", 512),
+            .tp_consume = try d.kernel(mg, "tp_consume", 16),
             .attn_prompt = try d.kernel(md, "attn_prompt", 128),
             .attn_prompt8 = try d.kernel(md, "attn_prompt8", 128),
             .embed_dense = try d.kernel(mg, "embed_dense", 256),
@@ -383,6 +386,9 @@ pub const Runner = struct {
         try d.fill(r.acts.zeros, @as(u16, 0), maxRows() * GDN_V_HEADS * 128 * 2);
         try d.fill(r.acts.ones, @as(f32, 1.0), maxRows() * GDN_V_HEADS * 4);
         r.host_logits = try alloc.alloc(f32, VOCAB);
+        // TF_TP_EXBENCH=1: the exchange cost a round at 1, 8, 16 and 32 rows, in the mode the group opened in.
+        // Both ranks run it at load (the same count of exchanges), so the pair times as it does in a forward.
+        if (tp.group) |*g| if (std.c.getenv("TF_TP_EXBENCH") != null) try g.exchangeBench(d, r.acts.r);
         return r;
     }
 
