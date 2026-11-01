@@ -89,12 +89,13 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/qwen27_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     module.addImport("xpu_qwen27_kernels", embedded);
     // the FP64 references of the weight formats (core/quant), for XPU_FP64_REF and XPU_FIDELITY
-    module.addImport("core", b.createModule(.{
+    const core27 = b.createModule(.{
         .root_source_file = b.path("zig/src/core/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-    }));
+    });
+    module.addImport("core", core27);
     module.addImport("ze", ze_mod);
     module.addImport("xpu", nem.xpu);
     const exe = b.addExecutable(.{ .name = "xpu-qwen27", .root_module = module });
@@ -118,6 +119,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         m.addImport("xpu_qwen27_kernels", embedded);
         m.addImport("ze", ze_mod);
         m.addImport("xpu", nem.xpu);
+        m.addImport("core", core27); // the drafter's EXL3 head (core/exl3_format.zig)
         tests_step.dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = t[0], .root_module = m }), .{}).step);
     }
 
@@ -126,6 +128,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     qwen27.addImport("xpu_qwen27_kernels", embedded);
     qwen27.addImport("ze", ze_mod);
     qwen27.addImport("xpu", nem.xpu);
+    qwen27.addImport("core", core27);
     qwen27.addImport("sage_config", sage_mod.import_table.get("sage_config").?);
     qwen27.addImport("sage_load", sage_mod.import_table.get("sage_load").?);
     // the runner's open rules (one runner at a time, every option back to the process's own), run on this host

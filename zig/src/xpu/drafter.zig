@@ -1,6 +1,9 @@
 //! DFlash2 drafter for the XPU runner: int4 projections on the target's GEMM, target taps as context.
 const std = @import("std");
 const ze = @import("ze");
+const core = @import("core");
+const exl3_format = core.exl3_format;
+const exl3_layout = core.exl3_layout;
 const kb = @import("xpu_qwen27_kernels");
 const q = @import("qwen27.zig");
 const dtree = @import("drafter_tree.zig");
@@ -246,8 +249,23 @@ pub const Drafter = struct {
         };
         // the head: the target's lm_head rows of the two spans, quantized as the target's head is
         if (!r.ckpt.has("lm_head.scales")) {
-            const w = try r.ckpt.get("lm_head.weight");
-            const kk: u32 = @intCast(w.shape[1]);
+            // dense f16 rows [n, kk]: the stored lm_head.weight (row = vocab id), or an EXL3 head decoded on the host
+            // into the two spans back to back (row = span row)
+            const exl3_head = r.ckpt.has("lm_head.trellis");
+            var dense: []f16 = &.{};
+            defer if (dense.len > 0) alloc.free(dense);
+            var kk: u32 = undefined;
+            var bytes: []const u8 = undefined;
+            var row0: [2]u32 = .{ 0, SPAN_HI0 };
+            if (exl3_head) {
+                kk = try headExl3(&r.ckpt, &dense);
+                bytes = std.mem.sliceAsBytes(dense);
+                row0 = .{ 0, SPAN_LO };
+            } else {
+                const w = try r.ckpt.get("lm_head.weight");
+                kk = @intCast(w.shape[1]);
+                bytes = w.bytes;
+            }
             const raw = try d.alloc_(32768 * @as(usize, kk) * 2);
             defer d.g.free(raw);
             var parts: [2]Mlx = undefined;
@@ -264,7 +282,7 @@ pub const Drafter = struct {
                 var r0: u32 = 0;
                 while (r0 < n) : (r0 += 32768) {
                     const nr = @min(32768, n - r0);
-                    const src = w.bytes[@as(usize, span[0] + r0) * kk * 2 ..][0 .. @as(usize, nr) * kk * 2];
+                    const src = bytes[@as(usize, row0[j] + r0) * kk * 2 ..][0 .. @as(usize, nr) * kk * 2];
                     try d.copyIn(raw, src);
                     try d.launch(d.k.quantize_mlx, .{ .x = (nr + 15) / 16, .y = kk / 64 }, .{ raw, @as(i32, @intCast(nr)), @as(i32, @intCast(kk)), q.off(pw, @as(usize, r0) * (kk / 8) * 4), q.off(ps, @as(usize, r0) * (kk / GS) * 2), q.off(pb, @as(usize, r0) * (kk / GS) * 2) });
                     try d.sync();
@@ -580,3 +598,116 @@ pub const Drafter = struct {
 pub const Draw = dtree.Draw;
 pub const Round = dtree.Round;
 pub const treeRound = dtree.treeRound;
+
+/// N tiles a piece of the EXL3 head decode at most (1 024 columns: about 125 MB of f64 work a thread).
+const HEAD_PIECE_TILES = 64;
+
+const HeadPiece = struct { t0: u32, t1: u32, c0: u32, c1: u32, row: u32 };
+
+const HeadJob = struct {
+    w: exl3_format.Width,
+    cb: exl3_layout.Codebook,
+    trellis: []const u8, // i16 [tiles_k][tiles_n][words], as stored (any alignment)
+    tiles_k: usize,
+    tiles_n: usize,
+    suh: []const f16,
+    svh: []const u8, // f16 [N], as stored
+    pieces: []const HeadPiece,
+    next: std.atomic.Value(usize) = .init(0),
+    kk: usize,
+    out: []f16, // [HEAD_N][kk]
+    failed: std.atomic.Value(bool) = .init(false),
+
+    fn run(j: *HeadJob) void {
+        j.work() catch j.failed.store(true, .release);
+    }
+
+    fn work(j: *HeadJob) !void {
+        const words = j.w.tileWords();
+        const most = HEAD_PIECE_TILES * 16;
+        const tr = try alloc.alloc(i16, j.tiles_k * HEAD_PIECE_TILES * words);
+        defer alloc.free(tr);
+        const svh = try alloc.alloc(f16, most);
+        defer alloc.free(svh);
+        const res = try alloc.alloc(f64, j.kk * most);
+        defer alloc.free(res);
+        const scratch = try alloc.alloc(f64, 2 * j.kk * most);
+        defer alloc.free(scratch);
+        while (true) {
+            const i = j.next.fetchAdd(1, .monotonic);
+            if (i >= j.pieces.len) return;
+            const p = j.pieces[i];
+            const nt: usize = p.t1 - p.t0;
+            const np = nt * 16;
+            // the piece's N tiles of every K tile row, contiguous: [tiles_k][nt][words]
+            const row_bytes = j.tiles_n * words * 2;
+            const piece_bytes = nt * words * 2;
+            const trb = std.mem.sliceAsBytes(tr);
+            for (0..j.tiles_k) |tk| @memcpy(trb[tk * piece_bytes ..][0..piece_bytes], j.trellis[tk * row_bytes + @as(usize, p.t0) * words * 2 ..][0..piece_bytes]);
+            @memcpy(std.mem.sliceAsBytes(svh[0..np]), j.svh[@as(usize, p.t0) * 32 ..][0 .. np * 2]);
+            exl3_format.dequantize(j.w, j.cb, tr[0 .. j.tiles_k * nt * words], j.tiles_k, nt, j.suh, svh[0..np], res[0 .. j.kk * np], scratch[0 .. 2 * j.kk * np]);
+            // W [K, N] to dense rows [n][k]
+            const base = @as(usize, p.t0) * 16;
+            for (p.c0..p.c1, p.row..) |c, row| {
+                const dst = j.out[row * j.kk ..][0..j.kk];
+                const col = c - base;
+                for (dst, 0..) |*o, k| o.* = @floatCast(res[k * np + col]);
+            }
+        }
+    }
+};
+
+/// The target's EXL3 lm_head rows of the drafter's two spans as dense f16 rows [HEAD_N, K] (`out`, from alloc), by
+/// the core host decoder. Pieces are whole Hadamard blocks of N (8 tiles), so a span's edge piece decodes some
+/// columns it does not keep. Returns K.
+fn headExl3(c: *const q.Checkpoint, out: *[]f16) !u32 {
+    const t0 = q.now();
+    const tr = try c.get("lm_head.trellis");
+    const suh_t = try c.get("lm_head.suh");
+    const svh_t = try c.get("lm_head.svh");
+    const mul1 = try c.get("lm_head.mul1");
+    if (!std.mem.eql(u8, tr.dtype, "I16") or tr.rank != 3 or mul1.bytes.len != 4) return error.UnexpectedShape;
+    const cb = try exl3_layout.fromMarker(std.mem.readInt(u32, mul1.bytes[0..4], .little));
+    const tiles_k: usize = @intCast(tr.shape[0]);
+    const tiles_n: usize = @intCast(tr.shape[1]);
+    const w: exl3_format.Width = .{ .halves = @intCast(tr.shape[2] / 8) };
+    if (w.tileWords() != tr.shape[2] or tiles_n * 16 != q.VOCAB or tiles_k % 8 != 0 or tiles_n % 8 != 0) return error.UnexpectedShape;
+    const kk = tiles_k * 16;
+    if (suh_t.bytes.len != kk * 2 or svh_t.bytes.len != tiles_n * 32) return error.UnexpectedShape;
+    const suh = try alloc.alloc(f16, kk);
+    defer alloc.free(suh);
+    @memcpy(std.mem.sliceAsBytes(suh), suh_t.bytes);
+    var pieces: std.ArrayList(HeadPiece) = .empty;
+    defer pieces.deinit(alloc);
+    var row: u32 = 0;
+    for ([_][2]u32{ .{ 0, SPAN_LO }, .{ SPAN_HI0, q.VOCAB } }) |span| {
+        const first: u32 = span[0] / 16 / 8 * 8;
+        const end: u32 = @min(@as(u32, @intCast(tiles_n)), (span[1] + 127) / 128 * 8);
+        var a = first;
+        while (a < end) : (a += HEAD_PIECE_TILES) {
+            const b = @min(end, a + HEAD_PIECE_TILES);
+            const c0 = @max(a * 16, span[0]);
+            const c1 = @min(b * 16, span[1]);
+            if (c1 <= c0) continue;
+            try pieces.append(alloc, .{ .t0 = a, .t1 = b, .c0 = c0, .c1 = c1, .row = row });
+            row += c1 - c0;
+        }
+    }
+    if (row != HEAD_N) return error.UnexpectedShape;
+    out.* = try alloc.alloc(f16, @as(usize, HEAD_N) * kk);
+    errdefer alloc.free(out.*);
+    var job: HeadJob = .{ .w = w, .cb = cb, .trellis = tr.bytes, .tiles_k = tiles_k, .tiles_n = tiles_n, .suh = suh, .svh = svh_t.bytes, .pieces = pieces.items, .kk = kk, .out = out.* };
+    const n_threads = @min(@max(std.Thread.getCpuCount() catch 1, 1), 32, pieces.items.len);
+    const threads = try alloc.alloc(std.Thread, n_threads);
+    defer alloc.free(threads);
+    var started: usize = 0;
+    for (threads) |*t| {
+        t.* = std.Thread.spawn(.{}, HeadJob.run, .{&job}) catch break;
+        started += 1;
+    }
+    if (started == 0) job.run();
+    for (threads[0..started]) |t| t.join();
+    if (job.failed.load(.acquire)) return error.OutOfMemory;
+    std.debug.print("  drafter head from the EXL3 lm_head: {d} rows, {d} pieces, {d} threads, {d:.1} s\n", .{ HEAD_N, pieces.items.len, @max(started, 1), q.now() - t0 });
+    return @intCast(kk);
+}
