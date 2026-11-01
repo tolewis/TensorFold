@@ -25,7 +25,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const q = @import("qwen27.zig");
 const dev = @import("dev.zig");
-const ze = @import("ze.zig");
+const ze = @import("ze");
 const Dev = dev.Dev;
 const D = q.D;
 
