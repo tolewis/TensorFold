@@ -485,7 +485,7 @@ pub const Runner = struct {
     pub fn verifyTree(r: *Runner, ids: []const u32, parents: []const i32) ![]const u32 {
         if (tp.group) |*g| { // ids then parents, each ids.len words
             var both: [32]u32 = undefined;
-            const n = @min(ids.len, 16);
+            const n: usize = @min(ids.len, 16); // usize: @min with 16 narrows to u5, and 2 * n would wrap to 0
             @memcpy(both[0..n], ids[0..n]);
             for (parents[0..@min(parents.len, n)], 0..) |p, i| both[n + i] = @bitCast(p);
             try g.record(.verify_tree, @intCast(n), 0, 0, both[0 .. 2 * n]);
