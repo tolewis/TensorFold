@@ -65,9 +65,13 @@ pub const moe = struct {
     /// Prompt rows (P3.4, the same image): exl3.cl GEMM_M rows a sub-group and GEMM_S strips a work-group of
     /// exl3_gemm, GEMM_KC k tiles a local-memory step, TILE_NS strips a sub-group of exl3_moe_tile, and the most rows
     /// of a prompt launch. The kernel defaults are these values.
-    pub const gemm_m = 16;
+    /// 24 rows a sub-group and 4 k tiles a local-memory step since 2026-11-01 (was 16 and 8): on the 27B's 896-row
+    /// chunks 2.6x on gate|up (14.3 to 5.6 ms a layer), 3.4x on down. 32 rows spill (13.6 ms), 8 rows and KC 16 lose:
+    /// the decoded tiles in local memory are the bound, so more rows a sub-group and a smaller step both pay.
+    /// Measured by tools/xpu/exl3_27b_bench.py at ROWS=896 (lanes/qwen27/OPT-matvec.md in Intel-B70-Recipe).
+    pub const gemm_m = 24;
     pub const gemm_s = 4;
-    pub const gemm_kc = 8;
+    pub const gemm_kc = 4;
     pub const tile_ns = 2;
     pub const tile_rows = 16;
     pub const prompt_rows_max = 1024;
