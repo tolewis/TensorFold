@@ -8,6 +8,7 @@ const tp = @import("tp.zig");
 const loader = @import("load.zig");
 const multi = @import("runner_multi.zig");
 const slot_states = @import("slot_states.zig");
+const pages_mod = @import("pages.zig");
 pub const follow = @import("follow.zig");
 pub const limits = @import("limits.zig");
 const Prof = dev.Prof;
@@ -205,9 +206,7 @@ pub const Runner = struct {
     pt: [MAX_SLOTS]?*anyopaque = @splat(null), // each slot's page table on the device: u32 [ceil(context / PAGE)]
     pt_host: [MAX_SLOTS][]u32 = @splat(&.{}), // and on the host, where the runner maps and keeps it
     held: [MAX_SLOTS]u32 = @splat(0), // entries of each slot's table that map a page
-    refs: []u32 = &.{}, // host: references to each pool page (a slot's table, a kept prompt state)
-    free_pages: std.ArrayList(u32) = .empty, // pages no reference holds
-    next_page: u32 = 0, // pages never handed out yet
+    pages: pages_mod.Pages = .{ .gpa = alloc, .count = 0, .refs = &.{} }, // the pool's references and free pages
     /// Target hidden states for a drafter: when on, every forward fills acts.taps and calls `on_taps` with its rows.
     taps_on: bool = false,
     on_taps: ?struct { ctx: *anyopaque, f: *const fn (*anyopaque, *anyopaque, u32) anyerror!void } = null,
@@ -379,8 +378,7 @@ pub const Runner = struct {
         r.ckpt.deinit();
         if (r.host_logits.len > 0) alloc.free(r.host_logits);
         for (r.pt_host) |t| if (t.len > 0) alloc.free(t);
-        if (r.refs.len > 0) alloc.free(r.refs);
-        r.free_pages.deinit(alloc);
+        if (r.pages.count > 0) r.pages.deinit();
         alloc.destroy(r);
     }
 
@@ -505,31 +503,19 @@ pub const Runner = struct {
             r.pt_host[i] = try alloc.alloc(u32, @as(usize, entries));
             r.held[i] = 0;
         }
-        r.refs = try alloc.alloc(u32, pages);
-        @memset(r.refs, 0);
-        r.next_page = 0;
+        r.pages = try pages_mod.Pages.init(alloc, pages);
         try r.d.sync();
         std.debug.print("K/V pool: {d} pages, {d} tokens, {d:.2} GB a card, int8\n", .{ pages, @as(u64, pages) * PAGE, @as(f64, @floatFromInt(r.poolBytes())) / 1e9 });
     }
 
-    /// A page no reference holds: from the freed pages, else never handed out yet; null when the pool is spent.
-    fn takePage(r: *Runner) ?u32 {
-        while (r.free_pages.pop()) |id| if (r.refs[id] == 0) return id;
-        if (r.next_page >= r.pool) return null;
-        r.next_page += 1;
-        return r.next_page - 1;
-    }
-
     /// One reference to page `id` less; the page returns to the pool at zero.
     pub fn releasePage(r: *Runner, id: u32) void {
-        if (id >= r.refs.len or r.refs[id] == 0) return;
-        r.refs[id] -= 1;
-        if (r.refs[id] == 0) r.free_pages.append(alloc, id) catch {};
+        r.pages.release(id);
     }
 
     /// One reference to page `id` more (a kept prompt state holds the pages it maps).
     pub fn retainPage(r: *Runner, id: u32) void {
-        if (id < r.refs.len) r.refs[id] += 1;
+        r.pages.retain(id);
     }
 
     /// Page ids `ids` into `slot`'s table from entry `from`; the slot maps from + ids.len on. The caller holds them.
@@ -538,7 +524,7 @@ pub const Runner = struct {
         if (slot >= MAX_SLOTS or r.pt[slot] == null or from > r.held[slot]) return error.BadSlot;
         if (from + @as(u32, @intCast(ids.len)) > r.pt_host[slot].len) return error.ContextFull;
         @memcpy(r.pt_host[slot][from..][0..ids.len], ids);
-        for (ids) |id| r.refs[id] += 1;
+        for (ids) |id| r.pages.retain(id);
         r.held[slot] = from + @as(u32, @intCast(ids.len));
         // the host table stays put until the next mapping: the queued copy reads it before the kernels that follow
         try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, off(r.pt[slot].?, @as(usize, from) * 4), r.pt_host[slot].ptr + from, ids.len * 4, null, 0, null));
@@ -555,12 +541,12 @@ pub const Runner = struct {
         var i = from;
         var full = false;
         while (i < need) : (i += 1) {
-            const id = r.takePage() orelse {
+            const id = r.pages.take() orelse {
                 full = true;
                 break;
             };
             r.pt_host[slot][i] = id;
-            r.refs[id] = 1;
+            r.pages.retain(id);
         }
         if (i > from) {
             r.held[slot] = i;
