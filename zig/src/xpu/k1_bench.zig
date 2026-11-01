@@ -78,7 +78,7 @@ pub fn main() !void {
             var wf = [_]u32{0};
             var wn = [_]u32{rows};
             var grp: [2 * 16]i32 = @splat(0);
-            const ng = k1.groups(&wf, &wn, &grp);
+            const ng = k1.rowGroups(&wf, &wn, &grp);
             const pl = k1.plan(ctx, ng, AKV, k1.wave);
             const dgrp = try d.upload(std.mem.sliceAsBytes(grp[0 .. @as(usize, 2 * ng)]));
             const pm = try d.alloc_(16 * AQ * pl.ns * 4);
@@ -161,7 +161,7 @@ pub fn main() !void {
         var wn8 = [_]u32{16} ** 8;
         for (1..8) |i| wf8[i] = @intCast(i * 16);
         var grp8: [2 * 32]i32 = @splat(0);
-        const ng8 = k1.groups(&wf8, &wn8, &grp8);
+        const ng8 = k1.rowGroups(&wf8, &wn8, &grp8);
         const p8 = k1.plan(ctx, ng8, AKV, k1.wave);
         const b8 = @as(f64, @floatFromInt(k1.bytes(ctx, ng8, AKV))) / 1e9;
         std.debug.print("ctx {d}, 8 streams x 16 rows: {d} work-groups (ns {d}, span {d}, groups {d}), {d:.2} MB a round, at 605 GB/s {d:.1} ms\n", .{

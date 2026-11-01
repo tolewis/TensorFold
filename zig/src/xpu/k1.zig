@@ -55,7 +55,7 @@ pub fn plan(keys: u32, groups: u32, kv_heads: u32, wave_: u32) Plan {
 
 /// The row groups of windows at rows wf[i] of wn[i] rows, ROWS rows a group, into `host` (2 ints a group).
 /// Returns the group count (the launch's z).
-pub fn groups(wf: []const u32, wn: []const u32, host: []i32) u32 {
+pub fn rowGroups(wf: []const u32, wn: []const u32, host: []i32) u32 {
     var n: u32 = 0;
     for (wf, wn) |f, w| {
         var j: u32 = 0;
