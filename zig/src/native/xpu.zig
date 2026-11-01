@@ -180,7 +180,7 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
         // the prompt kernels compute in blocks of 64 rows from a call's start: kept and resumed at planned marks only
         h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = h, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, .{ .planned = true, .grid = 64 }, budget);
         if (xq.kv_pool) { // kept states' GDN and drafter-context copies stay inside the reserve the pool left for them
-            const per = xq.gdnBytes(runner) + (if (drafter) |dd| dd.ctxBytes() else 0);
+            const per = xq.gdnBytes(runner) + (if (drafter != null) Drafter.ctxBytes() else 0);
             h.cache.?.most = @intCast(@max(1, (1536 << 20) / @max(per, 1)));
         }
         h.host.cache = &h.cache.?;
