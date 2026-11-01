@@ -76,8 +76,11 @@ pub const moe = struct {
         return std.fmt.comptimePrint("exl3_moe_b{d}", .{b});
     }
 
+    /// exl3_gemm x planes: 1 = hi + lo fp16 (two DPAS a tile), 0 = fp16 x alone (prompt rows only; bench knob).
+    pub const gemm_lo = 1;
+
     pub fn options(comptime b: u32) []const u8 {
-        return std.fmt.comptimePrint("-cl-std=CL3.0 -DEXL3_ABS -DBITS={d} -DMOE_P={d} -DMOE_PD={d} -DMOE_DS={d} -DMOE_KMAX={d}", .{ b, p, pd, ds, k_max });
+        return std.fmt.comptimePrint("-cl-std=CL3.0 -DEXL3_ABS -DBITS={d} -DMOE_P={d} -DMOE_PD={d} -DMOE_DS={d} -DMOE_KMAX={d} -DGEMM_M={d} -DGEMM_S={d} -DGEMM_KC={d} -DGEMM_LO={d}", .{ b, p, pd, ds, k_max, gemm_m, gemm_s, gemm_kc, gemm_lo });
     }
 };
 
