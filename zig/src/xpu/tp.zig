@@ -41,12 +41,14 @@ pub const Group = struct {
     /// Opens the group this process is in. Null at TP 1 (nothing to reduce).
     pub fn open(d: *Dev) !?Group {
         if (q.TP == 1) return null;
-        const name = if (std.c.getenv("TF_TP_SHM")) |v| std.mem.span(v) else "/dev/shm/tf-tp-qwen27";
+        const name: [*:0]const u8 = if (std.c.getenv("TF_TP_SHM")) |v| v else "/dev/shm/tf-tp-qwen27";
         const size = q.TP * line + q.TP * slot_bytes;
-        const f = try std.fs.cwd().createFile(name, .{ .read = true, .truncate = false, .mode = 0o600 });
-        defer f.close();
-        try f.setEndPos(size);
-        const map = try std.posix.mmap(null, size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, f.handle, 0);
+        // the file as the fabric's mailbox opens its own (fabric/tp/mailbox.zig): either rank may create it
+        const fd = std.c.open(name, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, @as(std.c.mode_t, 0o600));
+        if (fd < 0) return error.ShmOpenFailed;
+        defer _ = std.c.close(fd);
+        if (std.c.ftruncate(fd, @intCast(size)) != 0) return error.ShmSizeFailed;
+        const map = try std.posix.mmap(null, size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
         var g: Group = .{
             .map = map,
             .rank = q.RANK,
