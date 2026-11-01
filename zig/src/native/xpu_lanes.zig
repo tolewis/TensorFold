@@ -79,6 +79,10 @@ pub const Lanes = struct {
         }.f;
         for (0..3) |_| _ = try time(r, slot, ids[0..16], &one); // the widest first, while the clocks ramp up
         const wp = xq.winprof.on;
+        if (wp) { // the warmup's launches took events too: read and reset them before the tables
+            try r.d.sync();
+            xq.winprof.flush(&r.d.g);
+        }
         for (&b.costs, 1..) |*c, w| {
             if (wp) xq.winprof.beginRow(@intCast(w));
             var best: f64 = 1e9;
