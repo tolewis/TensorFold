@@ -76,8 +76,10 @@ pub const moe = struct {
         return std.fmt.comptimePrint("exl3_moe_b{d}", .{b});
     }
 
-    /// exl3_gemm x planes: 1 = hi + lo fp16 (two DPAS a tile), 0 = fp16 x alone (prompt rows only; bench knob).
-    pub const gemm_lo = 1;
+    /// exl3_gemm x planes: 1 = hi + lo fp16 (two DPAS a tile), 0 = fp16 x alone. Prompt rows only. 0 since
+    /// 2026-11-01: 1.5x on the 27B's 896-row chunks (gu 14.3 to 9.6 ms, down 10.1 to 6.1), x in fp16 as the
+    /// MLX prompt path has it; the 41-item eval gates the change.
+    pub const gemm_lo = 0;
 
     pub fn options(comptime b: u32) []const u8 {
         return std.fmt.comptimePrint("-cl-std=CL3.0 -DEXL3_ABS -DBITS={d} -DMOE_P={d} -DMOE_PD={d} -DMOE_DS={d} -DMOE_KMAX={d} -DGEMM_M={d} -DGEMM_S={d} -DGEMM_KC={d} -DGEMM_LO={d}", .{ b, p, pd, ds, k_max, gemm_m, gemm_s, gemm_kc, gemm_lo });
