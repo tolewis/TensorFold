@@ -2,6 +2,7 @@
 const std = @import("std");
 const ze = @import("ze");
 const q = @import("qwen27.zig");
+const tp = @import("tp.zig");
 const dev = @import("dev.zig");
 const fwd = @import("forward.zig");
 const GDN_IN = q.GDN_IN;
@@ -24,6 +25,23 @@ pub const Win = struct { slot: u32, ids: []const u32, parents: ?[]const i32 = nu
 
 /// Every window in one forward (16 rows at most): each row's greedy token in `block`; nothing moves until `keepMulti`.
 pub fn verifyMulti(r: *Runner, wins: []const Win) !void {
+    if (tp.group) |*g| { // a window: slot, rows, has parents, the ids, the parents
+        var words: [16 * 35]u32 = undefined;
+        var at: usize = 0;
+        for (wins[0..@min(wins.len, 16)]) |w| {
+            const n = @min(w.ids.len, 16);
+            words[at] = w.slot;
+            words[at + 1] = @intCast(n);
+            words[at + 2] = @intFromBool(w.parents != null);
+            @memcpy(words[at + 3 .. at + 3 + n], w.ids[0..n]);
+            at += 3 + n;
+            if (w.parents) |ps| {
+                for (ps[0..@min(ps.len, n)], 0..) |p, i| words[at + i] = @bitCast(p);
+                at += n;
+            }
+        }
+        try g.record(.verify_multi, @intCast(@min(wins.len, 16)), 0, 0, words[0..at]);
+    }
     if (wins.len == 0 or wins.len > 16) return error.BadBlock;
     r.store();
     var T: usize = 0;
@@ -115,6 +133,7 @@ pub fn verifyMulti(r: *Runner, wins: []const Win) !void {
 
 /// Keeps the first `keep[i]` rows of window i of the last verifyMulti: whole windows keep their state, others replay.
 pub fn keepMulti(r: *Runner, keep: []const u32) !void {
+    if (tp.group) |*g| try g.record(.keep_multi, 0, 0, 0, keep);
     var rows: [16]u32 = undefined;
     for (&rows, 0..) |*x, i| x.* = @intCast(i);
     var paths: [16][]const u32 = undefined;
@@ -125,6 +144,17 @@ pub fn keepMulti(r: *Runner, keep: []const u32) !void {
 
 /// Keeps window i's root path `paths[i]`: a whole chain window keeps its state, otherwise GDN states replay, K/V move.
 pub fn keepPaths(r: *Runner, paths: []const []const u32) !void {
+    if (tp.group) |*g| { // a path: its length, then its rows
+        var words: [16 * 17]u32 = undefined;
+        var at: usize = 0;
+        for (paths[0..@min(paths.len, 16)]) |p| {
+            const n = @min(p.len, 16);
+            words[at] = @intCast(n);
+            @memcpy(words[at + 1 .. at + 1 + n], p[0..n]);
+            at += 1 + n;
+        }
+        try g.record(.keep_paths, @intCast(@min(paths.len, 16)), 0, 0, words[0..at]);
+    }
     if (paths.len != r.multi_count) return error.BadCommit;
     const d = &r.d;
     const nul: ?*anyopaque = null;
@@ -185,6 +215,13 @@ pub fn keepPaths(r: *Runner, paths: []const []const u32) !void {
 /// One token for each of several slots: a verifyMulti of one-row windows, all kept.
 pub fn stepMulti(r: *Runner, slots: []const u32, tokens: []const u32) !void {
     var wins: [16]Win = undefined;
+    if (tp.group) |*g| { // the slots, then the tokens
+        var words: [32]u32 = undefined;
+        const n = @min(slots.len, 16);
+        @memcpy(words[0..n], slots[0..n]);
+        @memcpy(words[n .. 2 * n], tokens[0..@min(tokens.len, n)]);
+        try g.record(.step_multi, @intCast(n), 0, 0, words[0 .. 2 * n]);
+    }
     if (slots.len > 16 or tokens.len != slots.len) return error.BadBlock;
     for (slots, tokens, 0..) |sl, *t, i| wins[i] = .{ .slot = sl, .ids = t[0..1] };
     try r.verifyMulti(wins[0..slots.len]);

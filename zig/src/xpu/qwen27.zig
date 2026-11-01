@@ -8,6 +8,7 @@ const tp = @import("tp.zig");
 const loader = @import("load.zig");
 const multi = @import("runner_multi.zig");
 const slot_states = @import("slot_states.zig");
+pub const follow = @import("follow.zig");
 pub const limits = @import("limits.zig");
 const Prof = dev.Prof;
 const a8 = fwd.a8;
@@ -343,6 +344,7 @@ pub const Runner = struct {
 
     /// Gives back the card's memory, the shards' mappings and the host buffers; `r` is gone after it.
     pub fn deinit(r: *Runner) void {
+        if (tp.group) |*g| g.record(.close, 0, 0, 0, &.{}) catch {};
         r.d.deinit();
         prof.on = false;
         live = false;
@@ -353,6 +355,7 @@ pub const Runner = struct {
 
     /// Makes `slot` the one every call works on (states allocated on first use); other slots keep their state.
     pub fn select(r: *Runner, slot: u32) !void {
+        if (tp.group) |*g| try g.record(.select, slot, 0, 0, &.{});
         if (slot >= MAX_SLOTS) return error.NoSuchSlot;
         if (slot == r.slot) return;
         try r.ensure(slot);
@@ -384,6 +387,7 @@ pub const Runner = struct {
 
     /// The selected slot's state pointers back into its slot arrays (a verify's commit may have swapped them).
     pub fn store(r: *Runner) void {
+        if (tp.group) |*g| g.record(.store, 0, 0, 0, &.{}) catch {};
         for (&r.model.layers) |*l| {
             if (l.attn) {
                 l.slot_kc[r.slot] = l.kc;
@@ -409,6 +413,7 @@ pub const Runner = struct {
 
     /// A fresh sequence: GDN and convolution states to zero (the KV cache is overwritten position by position).
     pub fn reset(r: *Runner) !void {
+        if (tp.group) |*g| try g.record(.reset, 0, 0, 0, &.{});
         for (&r.model.layers) |*l| if (!l.attn) {
             try r.d.fill(l.rec.?, @as(u32, 0), GDN_V_HEADS * 128 * 128 * 4);
             for (l.conv) |cv| try r.d.fill(cv.?, @as(u16, 0), 3 * GDN_QKV * 2);
@@ -419,6 +424,7 @@ pub const Runner = struct {
 
     /// Feeds prompt tokens in chunks; `last`: the final chunk, whose last row's logits are kept.
     pub fn prompt(r: *Runner, ids: []const u32, last: bool) !void {
+        if (tp.group) |*g| try g.record(.prompt, @intFromBool(last), 0, 0, ids);
         var at: usize = 0;
         while (at < ids.len) {
             const end = chunkEnd(at, ids.len);
@@ -433,6 +439,7 @@ pub const Runner = struct {
 
     /// One decoded token in; the next one's logits kept.
     pub fn step(r: *Runner, token: u32) !void {
+        if (tp.group) |*g| try g.record(.step, token, 0, 0, &.{});
         if (r.pos + 1 > r.context) return error.ContextFull;
         const id: i32 = @intCast(token);
         r.last = @intCast((try forward(&r.d, &r.model, &r.acts, &.{id}, r.pos, .{ .taps = r.taps_on })).?);
@@ -442,6 +449,7 @@ pub const Runner = struct {
 
     /// Verifies a block: `ids` (≤ 16 rows) run from `pos`, each row's greedy token returned; state moves till `commit`.
     pub fn verify(r: *Runner, ids: []const u32) ![]const u32 {
+        if (tp.group) |*g| try g.record(.verify, 0, 0, 0, ids);
         if (ids.len == 0 or ids.len > 16) return error.BadBlock;
         if (r.pos + ids.len > r.context) return error.ContextFull;
         _ = try forward(&r.d, &r.model, &r.acts, @ptrCast(ids), r.pos, .{ .want = .rows, .stash = true, .taps = r.taps_on });
@@ -455,6 +463,7 @@ pub const Runner = struct {
 
     /// Keeps the first `keep` rows of the last verified block: GDN and convolution states replay those rows from entry.
     pub fn commit(r: *Runner, keep: u32) !void {
+        if (tp.group) |*g| try g.record(.commit, keep, 0, 0, &.{});
         if (keep == 0 or keep > r.block_rows or r.tree_on) return error.BadCommit;
         const nul: ?*anyopaque = null;
         for (&r.model.layers) |*l| if (!l.attn) {
@@ -474,6 +483,13 @@ pub const Runner = struct {
 
     /// Verifies a tree: row 0 is the pending token, `parents[t]` the row below row t; returns each row's greedy token.
     pub fn verifyTree(r: *Runner, ids: []const u32, parents: []const i32) ![]const u32 {
+        if (tp.group) |*g| { // ids then parents, each ids.len words
+            var both: [32]u32 = undefined;
+            const n = @min(ids.len, 16);
+            @memcpy(both[0..n], ids[0..n]);
+            for (parents[0..@min(parents.len, n)], 0..) |p, i| both[n + i] = @bitCast(p);
+            try g.record(.verify_tree, @intCast(n), 0, 0, both[0 .. 2 * n]);
+        }
         if (ids.len == 0 or ids.len > 16 or parents.len != ids.len) return error.BadBlock;
         var depth_max: u32 = 0;
         for (0..ids.len) |t| {
@@ -512,6 +528,7 @@ pub const Runner = struct {
 
     /// Keeps the root path `path` of the last verified tree: states replayed along it, K/V moved, taps gathered.
     pub fn commitPath(r: *Runner, path: []const u32) !void {
+        if (tp.group) |*g| try g.record(.commit_path, 0, 0, 0, path);
         if (!r.tree_on or path.len == 0 or path.len > r.block_rows or path[0] != 0) return error.BadCommit;
         var straight = true;
         for (path, 0..) |row, dd| {

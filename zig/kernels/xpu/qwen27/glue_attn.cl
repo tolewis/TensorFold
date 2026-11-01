@@ -145,20 +145,22 @@ KERNEL(256) void attn_gate(global const ushort *O, global const half *P, global 
 
 // SwiGLU: act = fp16(bf16(SiLU(g)·u)) and its row sums, a group of 256 per 1 024 columns; ilv: gate|up by 16.
 KERNEL(256) void swiglu(global const half *GU, global half *H, global half *AHI, global half *ALO, int gs, int ilv,
-                        int rot) {
+                        int rot, int ff) {
+  // ff: the MLP width of this call ([gate | up] is 2 ff a row, H is ff a row): a TP rank's FF_R, or the drafter's
+  // whole 17 408 (the drafter runs whole on rank 0 with the same kernel build)
   // Grid (T, ceil(Q27_FF / 1024)). A TP rank's 8 704 columns end half way through the last group: the columns past
   // Q27_FF read as zero and are not stored (the 1 024-column block is a multiple of 128, so the rotation is whole).
   local half hl[1024];
   const int t = get_group_id(0), blk = get_group_id(1), lid = get_local_id(0);
-  const int live = min(1024, Q27_FF - blk * 1024);     // this group's columns in range
+  const int live = min(1024, ff - blk * 1024);         // this group's columns in range
   {                                                   // 4 consecutive columns per work-item, vector reads and write
     const int e = lid * 4, c = blk * 1024 + e;
     half4 o = (half4)(0.0h);
     if (e < live) {
-      const long gc = ilv ? (c / 16) * 32 + c % 16 : c, uc = ilv ? gc + 16 : Q27_FF + c;
-      const half4 gv = vload4(0, GU + (long)t * (2 * Q27_FF) + gc), uv = vload4(0, GU + (long)t * (2 * Q27_FF) + uc);
+      const long gc = ilv ? (c / 16) * 32 + c % 16 : c, uc = ilv ? gc + 16 : ff + c;
+      const half4 gv = vload4(0, GU + (long)t * (2 * ff) + gc), uv = vload4(0, GU + (long)t * (2 * ff) + uc);
       for (int i = 0; i < 4; i++) o[i] = convert_half_rte(rbf(silu((float)gv[i]) * (float)uv[i]));
-      if (!rot) vstore4(o, 0, H + (long)t * Q27_FF + c);
+      if (!rot) vstore4(o, 0, H + (long)t * ff + c);
     }
     vstore4(o, 0, hl + e);
   }
@@ -169,7 +171,7 @@ KERNEL(256) void swiglu(global const half *GU, global half *H, global half *AHI,
       vstore8(rot128_reg(vload8(0, hl + o)), 0, hl + o);
     }
     barrier(CLK_LOCAL_MEM_FENCE);
-    if (lid * 4 < live) vstore4(vload4(0, hl + lid * 4), 0, H + (long)t * Q27_FF + blk * 1024 + lid * 4);
+    if (lid * 4 < live) vstore4(vload4(0, hl + lid * 4), 0, H + (long)t * ff + blk * 1024 + lid * 4);
   }
   const int lane = get_sub_group_local_id(), per = gs / 16, ng = live / gs;
   for (int g = get_sub_group_id(); g < ng; g += 16) {
@@ -178,8 +180,8 @@ KERNEL(256) void swiglu(global const half *GU, global half *H, global half *AHI,
     s = sub_group_reduce_add(s) * (1.0f / gs);
     if (lane == 0) {
       const half hi = convert_half_rte(s * ASC);
-      AHI[(long)t * (Q27_FF / gs) + blk * ng + g] = hi;
-      ALO[(long)t * (Q27_FF / gs) + blk * ng + g] = convert_half_rte(s * ASC - (float)hi);
+      AHI[(long)t * (ff / gs) + blk * ng + g] = hi;
+      ALO[(long)t * (ff / gs) + blk * ng + g] = convert_half_rte(s * ASC - (float)hi);
     }
   }
 }

@@ -1,5 +1,6 @@
 //! A slot's states: allocation on first use, and the prompt cache's snapshots (save, restore, drop).
 const q = @import("qwen27.zig");
+const tp = @import("tp.zig");
 const dev = @import("dev.zig");
 const fwd = @import("forward.zig");
 const Runner = q.Runner;
@@ -31,6 +32,13 @@ pub fn snapBytes(r: *const Runner, at: u32) usize {
 
 /// Copies `slot`'s state standing at `at` tokens into new device memory.
 pub fn saveSlot(r: *Runner, slot: u32, at: u32) !Snap {
+    const snap = try saveSlotHere(r, slot, at);
+    // recorded after the save: the follower saves its own half under the buffer's address as the id
+    if (tp.group) |*g| try g.record(.save_slot, slot, at, @intFromPtr(snap.buf), &.{});
+    return snap;
+}
+
+fn saveSlotHere(r: *Runner, slot: u32, at: u32) !Snap {
     try r.select(slot);
     if (r.pos != at or r.multi_count != 0) return error.SlotNotThere;
     const d = &r.d;
@@ -59,6 +67,7 @@ pub fn saveSlot(r: *Runner, slot: u32, at: u32) !Snap {
 
 /// Makes `slot` stand where `snap` was taken (its prompt pass goes on from snap.at).
 pub fn restoreSlot(r: *Runner, slot: u32, snap: Snap) !void {
+    if (tp.group) |*g| try g.record(.restore_slot, slot, 0, @intFromPtr(snap.buf), &.{});
     try r.select(slot);
     const d = &r.d;
     const at = snap.at;
@@ -86,6 +95,7 @@ pub fn restoreSlot(r: *Runner, slot: u32, snap: Snap) !void {
 }
 
 pub fn dropSnap(r: *Runner, snap: Snap) void {
+    if (tp.group) |*g| g.record(.drop_snap, 0, 0, @intFromPtr(snap.buf), &.{}) catch {};
     freeAfterQueue(&r.d, snap.buf);
 }
 
@@ -106,6 +116,7 @@ pub fn unallocatedSlots(r: *const Runner, slots: u32) u32 {
 
 /// `slot`'s states, allocated (zero) on its first use: all of them, or none when an allocation fails.
 pub fn ensure(r: *Runner, slot: u32) !void {
+    if (tp.group) |*g| try g.record(.ensure, slot, 0, 0, &.{});
     const d = &r.d;
     var had: [q.LAYERS]bool = undefined;
     for (&r.model.layers, &had) |*l, *h| h.* = if (l.attn) l.slot_kc[slot] != null else l.slot_rec[slot] != null;

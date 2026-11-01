@@ -162,6 +162,40 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
     return .{ .engine = h.host.engine(), .close = LaneServed.close, .ctx = h };
 }
 
+/// A tensor-parallel rank above 0 (`--rank 1` with TF_TP_RANK=1 and ZE_AFFINITY_MASK on its card, a -Dtp=2 build):
+/// holds its half of the 27B and replays rank 0's calls until rank 0 closes. False with `problem` if it cannot.
+pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !bool {
+    _ = gpa;
+    _ = io;
+    if (!std.mem.eql(u8, o.model_type, "qwen3_5")) {
+        problem.* = try std.fmt.allocPrint(a, "the XPU engine has tensor-parallel ranks for Qwen3.8-27B (qwen3_5) only, not {s}", .{o.model_type});
+        return false;
+    }
+    if (xq.TP == 1) {
+        problem.* = try std.fmt.allocPrint(a, "this build has no tensor-parallel ranks: build the XPU engine with -Dtp=2", .{});
+        return false;
+    }
+    const context = xq.limits.context(o.context orelse 32768) catch {
+        problem.* = try std.fmt.allocPrint(a, "the XPU engine holds 1 to {d} tokens a stream, not {d}", .{ xq.limits.MAX_CONTEXT, o.context.? });
+        return false;
+    };
+    const runner = xq.Runner.init(o.dir, context) catch |err| {
+        problem.* = try std.fmt.allocPrint(a, "the XPU engine could not load {s}: {s}", .{ o.dir, @errorName(err) });
+        return false;
+    };
+    defer runner.deinit();
+    if (xq.RANK == 0) {
+        problem.* = try std.fmt.allocPrint(a, "a follower needs TF_TP_RANK above 0 (1 to {d})", .{xq.TP - 1});
+        return false;
+    }
+    std.log.info("qwen27-xpu: rank {d} of {d} holds its half of {s} and follows rank 0", .{ xq.RANK, xq.TP, o.dir });
+    xq.follow.run(runner) catch |err| {
+        problem.* = try std.fmt.allocPrint(a, "rank {d} stopped: {s}", .{ xq.RANK, @errorName(err) });
+        return false;
+    };
+    return true;
+}
+
 pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
     if (nem.serves(o.model_type)) return nem.open(a, gpa, io, o, problem);
     if (std.mem.eql(u8, o.model_type, sage.model_type)) return sage.open(a, gpa, io, o, problem);
