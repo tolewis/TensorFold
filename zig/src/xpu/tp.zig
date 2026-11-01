@@ -196,7 +196,7 @@ pub const Group = struct {
         for (0..g.tp) |r| if (r != g.rank) {
             const c = g.counter(@intCast(r));
             const alive = aliveWord(g, @intCast(r));
-            var deadline = q.now() + 180.0; // the peer may still be loading
+            const deadline = q.now() + 180.0; // the peer may still be loading
             var spins: usize = 0;
             while (c.load(.seq_cst) < g.seq) : (spins += 1) {
                 if (spins % 4096 == 0) {
