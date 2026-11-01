@@ -540,7 +540,7 @@ pub const Runner = struct {
         const nul: ?*anyopaque = null;
         for (&r.model.layers) |*l| {
             if (l.attn) {
-                if (!straight) try r.d.launch(r.d.k.kv_move, .{ .x = 4 }, .{ l.kc.?, l.vc.?, @as(i32, @intCast(r.pos)), r.acts.path, keep, kvCap() });
+                if (!straight) try r.d.launch(r.d.k.kv_move, .{ .x = ATT_KV_HEADS }, .{ l.kc.?, l.vc.?, @as(i32, @intCast(r.pos)), r.acts.path, keep, kvCap() });
                 continue;
             }
             const st = l.stash.?;

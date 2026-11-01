@@ -14,6 +14,7 @@ const GDN_AB = q.GDN_AB;
 const HK = q.GDN_K_HEADS;
 const HV = q.GDN_V_HEADS;
 const HQ = q.ATT_Q_HEADS;
+const AKV = q.ATT_KV_HEADS;
 const MIX_OUT = q.GDN_Z; // a mixer's output width a rank: 48 value heads of 128, or 24 attention heads of 256, at TP 1
 const GDN_IN = q.GDN_IN;
 const LAYERS = q.LAYERS;
@@ -351,11 +352,11 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
             const ns = (ctx + SPLIT - 1) / SPLIT;
             try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, @as(i32, @intCast(p0)), EPS, tree, mt, mpos, q.kv8, kvCap(), @as(?*anyopaque, null), @as(?*anyopaque, null) });
             if (wide and q.kv_i8) {
-                try d.launch(d.k.attn_prompt8, .{ .x = (T + 7) / 8, .y = 4 }, .{ a.q, l.kc.?, l.vc.?, a.y, @as(i32, @intCast(p0)), t32, @as(f32, 1.0 / 16.0), kvCap(), @as(?*anyopaque, null) });
+                try d.launch(d.k.attn_prompt8, .{ .x = (T + 7) / 8, .y = AKV }, .{ a.q, l.kc.?, l.vc.?, a.y, @as(i32, @intCast(p0)), t32, @as(f32, 1.0 / 16.0), kvCap(), @as(?*anyopaque, null) });
             } else if (wide) {
-                try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = 4 }, .{ a.q, l.kc.?, l.vc.?, a.y, @as(i32, @intCast(p0)), t32, @as(f32, 1.0 / 16.0), @as(?*anyopaque, null) });
+                try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = AKV }, .{ a.q, l.kc.?, l.vc.?, a.y, @as(i32, @intCast(p0)), t32, @as(f32, 1.0 / 16.0), @as(?*anyopaque, null) });
             } else {
-                try d.launch(d.k.attn_decode, .{ .x = ns, .y = 4, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), @as(f32, 1.0 / 16.0), if (mode.multi != null) tree else table, mt, mpos, kvCap() });
+                try d.launch(d.k.attn_decode, .{ .x = ns, .y = AKV, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), @as(f32, 1.0 / 16.0), if (mode.multi != null) tree else table, mt, mpos, kvCap() });
                 try d.launch(d.k.attn_merge, .{ .x = HQ, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), table, mpos });
             }
             if (q.kv8 & 1 != 0) try d.launch(d.k.rot_heads, .{ .x = T, .y = HQ }, .{a.y});

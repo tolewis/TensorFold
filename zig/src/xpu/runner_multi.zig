@@ -180,7 +180,7 @@ pub fn keepPaths(r: *Runner, paths: []const []const u32) !void {
         const wrows = off(r.acts.mpath, (i * 2 + 1) * 16 * 4); // and of the window
         for (&r.model.layers) |*l| {
             if (l.attn) {
-                if (!straight) try d.launch(d.k.kv_move, .{ .x = 4 }, .{ l.slot_kc[sl].?, l.slot_vc[sl].?, @as(i32, @intCast(r.seqs[sl].pos)), wrows, @as(i32, @intCast(k)), kvCap() });
+                if (!straight) try d.launch(d.k.kv_move, .{ .x = q.ATT_KV_HEADS }, .{ l.slot_kc[sl].?, l.slot_vc[sl].?, @as(i32, @intCast(r.seqs[sl].pos)), wrows, @as(i32, @intCast(k)), kvCap() });
                 continue;
             }
             const cur = l.slot_cur[sl];
