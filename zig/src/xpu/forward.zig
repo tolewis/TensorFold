@@ -93,7 +93,7 @@ pub const Acts = struct {
             .r = try d.alloc_(rows * D * 2),
             .p = try d.alloc_(rows * 2 * FF * 2),
             .q = try d.alloc_(rows * HQ * 256 * 2),
-            .k = try d.alloc_(rows * 16 * 128 * 2),
+            .k = try d.alloc_(rows * HK * 128 * 2),
             .v = try d.alloc_(rows * HV * 128 * 2),
             .g = try d.alloc_(rows * HV * 4),
             .beta = try d.alloc_(rows * HV * 4),
@@ -376,7 +376,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
                         try ze.check(dd.g.api.zeCommandListAppendMemoryCopy(dd.list, dst, src, n, null, 0, null));
                     }
                 }.f;
-                try cp(d, off(a.k, T * 16 * 128 * 2), a.zeros, pad * 16 * 128 * 2);
+                try cp(d, off(a.k, T * HK * 128 * 2), a.zeros, pad * HK * 128 * 2);
                 try cp(d, off(a.v, T * HV * 128 * 2), a.zeros, pad * HV * 128 * 2);
                 try cp(d, off(a.beta, T * HV * 4), a.zeros, pad * HV * 4);
                 try cp(d, off(a.g, T * HV * 4), a.ones, pad * HV * 4);
@@ -384,8 +384,8 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
             if (!wide) {
                 if (mode.stash) { // inputs, for Runner.commit's replay
                     const st = l.stash.?;
-                    try copy(d, off(st, ST_Q), a.q, T * 16 * 128 * 2);
-                    try copy(d, off(st, ST_K), a.k, T * 16 * 128 * 2);
+                    try copy(d, off(st, ST_Q), a.q, T * HK * 128 * 2);
+                    try copy(d, off(st, ST_K), a.k, T * HK * 128 * 2);
                     try copy(d, off(st, ST_V), a.v, T * HV * 128 * 2);
                     try copy(d, off(st, ST_G), a.g, T * HV * 4);
                     try copy(d, off(st, ST_B), a.beta, T * HV * 4);
@@ -396,7 +396,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
             } else {
                 const nc: i32 = @intCast(tp / 64);
                 const ncu: u32 = tp / 64;
-                const hk: i32 = 16;
+                const hk: i32 = HK;
                 const hv: i32 = HV;
                 try d.launch(d.k.gdn_prep, .{ .x = ncu, .y = HV }, .{ a.k, a.v, a.g, a.beta, a.la, a.wb, a.u0, hk, hv, nc, @as(i32, 0) });
                 try d.launch(d.k.gdn_state, .{ .x = HV }, .{ a.k, a.wb, a.u0, a.la, l.rec.?, l.rec.?, a.hs, a.vn, hk, hv, nc });
