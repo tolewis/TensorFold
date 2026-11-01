@@ -58,6 +58,7 @@ pub fn verifyMulti(r: *Runner, wins: []const Win) !void {
             r.ids_host[T + j] = id;
         }
         max_pos = @max(max_pos, p + @as(u32, @intCast(w.ids.len)) - 1);
+        try r.ensurePages(w.slot, p + @as(u32, @intCast(w.ids.len)));
         T += w.ids.len;
     }
     // tree windows: one tree table for the block, each row at its window's position plus its depth
@@ -109,6 +110,7 @@ pub fn verifyMulti(r: *Runner, wins: []const Win) !void {
             if (l.attn) {
                 e[0] = @intFromPtr(l.slot_kc[w.slot].?);
                 e[1] = @intFromPtr(l.slot_vc[w.slot].?);
+                e[2] = if (r.pt[w.slot]) |p| @intFromPtr(p) else 0; // the slot's page table (0: no pool)
             } else {
                 const cur = l.slot_cur[w.slot];
                 e[2] = @intFromPtr(l.slot_conv[w.slot][cur].?);
@@ -180,7 +182,7 @@ pub fn keepPaths(r: *Runner, paths: []const []const u32) !void {
         const wrows = off(r.acts.mpath, (i * 2 + 1) * 16 * 4); // and of the window
         for (&r.model.layers) |*l| {
             if (l.attn) {
-                if (!straight) try d.launch(d.k.kv_move, .{ .x = q.ATT_KV_HEADS }, .{ l.slot_kc[sl].?, l.slot_vc[sl].?, @as(i32, @intCast(r.seqs[sl].pos)), wrows, @as(i32, @intCast(k)), kvCap() });
+                if (!straight) try d.launch(d.k.kv_move, .{ .x = q.ATT_KV_HEADS }, .{ l.slot_kc[sl].?, l.slot_vc[sl].?, @as(i32, @intCast(r.seqs[sl].pos)), wrows, @as(i32, @intCast(k)), kvCap(), r.pt[sl] });
                 continue;
             }
             const cur = l.slot_cur[sl];

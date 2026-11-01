@@ -357,8 +357,10 @@ pub fn loadExl3(d: *Dev, c: *const Checkpoint) !loader.Model {
             l.mixer_out = shell(try w.add(d, c, &.{.{ .prefix = f(&nb[0], i, "self_attn.o_proj"), .cut = if (tp1) .{} else Cut.rows(R * q.GDN_Z, q.GDN_Z, D) }}, D), false);
             l.qn = try normTensor(d, c, f(&nb[0], i, "self_attn.q_norm.weight"), true);
             l.kn = try normTensor(d, c, f(&nb[0], i, "self_attn.k_norm.weight"), true);
-            l.kc = try d.alloc_(fwd.kvBytes());
-            l.vc = try d.alloc_(fwd.kvBytes());
+            if (!q.kv_pool) { // the shared pool replaces the slot's own cache
+                l.kc = try d.alloc_(fwd.kvBytes());
+                l.vc = try d.alloc_(fwd.kvBytes());
+            }
         } else {
             // [qkv 10240 | z 6144] in a row of GDN_IN; the dense a and b gates go to columns 16384 on (forward.zig)
             const hk = q.GDN_K_HEADS * 128; // a rank's q (and k) columns of in_proj_qkv: [q 16 heads | k 16 | v 48] whole

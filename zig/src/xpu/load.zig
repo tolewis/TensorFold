@@ -218,8 +218,10 @@ pub fn loadGptq(d: *Dev, c: *const Checkpoint) !Model {
             l.mixer_out = try projectionGptq(d, c, f(p, "self_attn."), &.{"o_proj"}, false, 0, false, stage);
             l.qn = try vecTensor(d, c, f(p, "self_attn.q_norm.weight"), true);
             l.kn = try vecTensor(d, c, f(p, "self_attn.k_norm.weight"), true);
-            l.kc = try d.alloc_(kvBytes());
-            l.vc = try d.alloc_(kvBytes());
+            if (!q.kv_pool) { // the shared pool replaces the slot's own cache
+                l.kc = try d.alloc_(kvBytes());
+                l.vc = try d.alloc_(kvBytes());
+            }
         } else {
             l.mixer_in = try projectionGptq(d, c, f(p, "linear_attn."), &.{ "in_proj_qkv", "in_proj_z" }, true, GDN_IN, false, stage);
             l.mixer_out = try projectionGptq(d, c, f(p, "linear_attn."), &.{"out_proj"}, false, 0, false, stage);
@@ -282,8 +284,10 @@ pub fn load(d: *Dev, c: *const Checkpoint) !Model {
             l.mixer_out = try projection(d, c, f(p, "self_attn."), &.{"o_proj"}, false, false, stage);
             l.qn = try bf16Tensor(d, c, f(p, "self_attn.q_norm.weight"));
             l.kn = try bf16Tensor(d, c, f(p, "self_attn.k_norm.weight"));
-            l.kc = try d.alloc_(kvBytes());
-            l.vc = try d.alloc_(kvBytes());
+            if (!q.kv_pool) { // the shared pool replaces the slot's own cache
+                l.kc = try d.alloc_(kvBytes());
+                l.vc = try d.alloc_(kvBytes());
+            }
         } else {
             l.mixer_in = try projection(d, c, f(p, "linear_attn."), &.{ "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b" }, true, false, stage);
             l.mixer_out = try projection(d, c, f(p, "linear_attn."), &.{"out_proj"}, false, false, stage);

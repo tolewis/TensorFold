@@ -77,17 +77,24 @@ KERNEL(16) void gdn_step(global const ushort *Q, global const ushort *K, global 
 #define SPLIT 32
 KERNEL(16) void attn_decode(global const ushort *Q, global const ushort *KC, global const ushort *VC, global float *PM,
                             global float *PL, global float *PO, int p0, int NS, float scale, global const int *TREE,
-                            global const ulong *MT, global const int *POS, int cap) {
+                            global const ulong *MT, global const int *POS, int cap, global const uint *PT) {
   // MT (if non-null): several streams, one row each; with TREE, tree windows; cap > 0: int8 cache (256 bytes per row).
+  // PT (if non-null): the stream's page table: a key's row comes from its page (with MT, MT[8t + 2] is the row's table).
   const int sp = get_group_id(0), hk = get_group_id(1) / Q27_QPARTS, t = get_group_id(2), lane = get_sub_group_local_id();
   const int qh0 = hk * Q27_GQA + (get_group_id(1) % Q27_QPARTS) * Q27_QPG; // the first query head held
   int base = p0, wf = 0;
   if (MT) {
     KC = (global const ushort *)MT[t * 8];
     VC = (global const ushort *)MT[t * 8 + 1];
+    PT = (global const uint *)MT[t * 8 + 2];
     wf = (int)MT[t * 8 + 6];
     base = TREE ? POS[wf] : 0x7fffffff;
   }
+  // the cache's surface: the flat cache, or the page of the key's row
+  global const char *kc8 = (global const char *)KC, *vc8 = (global const char *)VC;
+  global const float *ksc = (global const float *)((global const char *)KC + (long)cap * Q27_KVROW);
+  global const float *vsc = (global const float *)((global const char *)VC + (long)cap * Q27_KVROW);
+  long pg = -1;
   const int last = MT ? POS[t] : p0 + DEPTH(t), j0 = sp * SPLIT, j1 = min(j0 + SPLIT, last + 1);
   float q[Q27_QPG][16], o[Q27_QPG][16], m[Q27_QPG], l[Q27_QPG];
   for (int a = 0; a < Q27_QPG; a++) {
@@ -100,13 +107,22 @@ KERNEL(16) void attn_decode(global const ushort *Q, global const ushort *KC, glo
   }
   for (int j = j0; j < j1; j++) {
     const long kr = j < base ? j : base + ANC(t, j - base) - wf; // cache row of key j
+    if (PT && kr / Q27_PAGE != pg) { // the key's page: its rows, then its scales
+      pg = kr / Q27_PAGE;
+      const long pb = (long)PT[pg] * (cap ? Q27_PAGE8 : Q27_PAGE16);
+      kc8 = (global const char *)KC + pb;
+      vc8 = (global const char *)VC + pb;
+      ksc = (global const float *)(kc8 + (long)Q27_PAGE * Q27_KVROW);
+      vsc = (global const float *)(vc8 + (long)Q27_PAGE * Q27_KVROW);
+    }
+    const long row = PT ? kr % Q27_PAGE : kr; // the row within the page, or of the flat cache
     float kv[16];
     if (cap) {
-      const global char *k8 = (const global char *)KC + (kr * Q27_AKV + hk) * 256;
-      const float ks = ((const global float *)((const global char *)KC + (long)cap * Q27_KVROW))[kr * Q27_AKV + hk];
+      const global char *k8 = kc8 + (row * Q27_AKV + hk) * 256;
+      const float ks = ksc[row * Q27_AKV + hk];
       for (int i = 0; i < 16; i++) kv[i] = (float)k8[i * 16 + lane] * ks;
     } else
-      for (int i = 0; i < 16; i++) kv[i] = bf2f(KC[(kr * Q27_AKV + hk) * 256 + i * 16 + lane]);
+      for (int i = 0; i < 16; i++) kv[i] = bf2f(((global const ushort *)kc8)[(row * Q27_AKV + hk) * 256 + i * 16 + lane]);
     float sc[Q27_QPG];
     for (int a = 0; a < Q27_QPG; a++) {
       float d = 0.0f;
@@ -114,11 +130,11 @@ KERNEL(16) void attn_decode(global const ushort *Q, global const ushort *KC, glo
       sc[a] = sub_group_reduce_add(d) * scale;
     }
     if (cap) {
-      const global char *v8 = (const global char *)VC + (kr * Q27_AKV + hk) * 256;
-      const float vs = ((const global float *)((const global char *)VC + (long)cap * Q27_KVROW))[kr * Q27_AKV + hk];
+      const global char *v8 = vc8 + (row * Q27_AKV + hk) * 256;
+      const float vs = vsc[row * Q27_AKV + hk];
       for (int i = 0; i < 16; i++) kv[i] = (float)v8[i * 16 + lane] * vs;
     } else
-      for (int i = 0; i < 16; i++) kv[i] = bf2f(VC[(kr * Q27_AKV + hk) * 256 + i * 16 + lane]);
+      for (int i = 0; i < 16; i++) kv[i] = bf2f(((global const ushort *)vc8)[(row * Q27_AKV + hk) * 256 + i * 16 + lane]);
     for (int a = 0; a < Q27_QPG; a++) {
       const float mn = fmax(m[a], sc[a]);
       const float al = exp(m[a] - mn), p = exp(sc[a] - mn);
@@ -156,28 +172,37 @@ KERNEL(16) void attn_merge(global const float *PM, global const float *PL, globa
 }
 
 // Commit of a kept path: its K, V rows move to positions p0 + depth in depth order, never overwriting an unread row.
-KERNEL(16) void kv_move(global ushort *KC, global ushort *VC, int p0, global const int *PATH, int n, int cap) {
+KERNEL(16) void kv_move(global ushort *KC, global ushort *VC, int p0, global const int *PATH, int n, int cap,
+                        global const uint *PT) {
+  // PT (if non-null): the cache is a pool of pages: a position's row comes from page PT[pos / Q27_PAGE], at
+  // pos % Q27_PAGE, and the int8 scales from that page.
   const int hk = get_group_id(0), lane = get_sub_group_local_id();
   for (int d = 0; d < n; d++) {
-    const long src = ((long)(p0 + PATH[d]) * Q27_AKV + hk) * 256, dst = ((long)(p0 + d) * Q27_AKV + hk) * 256;
-    if (src == dst) continue;
+    const long sp = p0 + PATH[d], dp = p0 + d;
+    const long sb = PT ? (long)PT[sp / Q27_PAGE] * (cap ? Q27_PAGE8 : Q27_PAGE16) : 0;
+    const long db = PT ? (long)PT[dp / Q27_PAGE] * (cap ? Q27_PAGE8 : Q27_PAGE16) : 0;
+    const long src = ((PT ? sp % Q27_PAGE : sp) * Q27_AKV + hk) * 256, dst = ((PT ? dp % Q27_PAGE : dp) * Q27_AKV + hk) * 256;
+    if (sb + src == db + dst) continue;
+    global char *kc = (global char *)KC, *vc = (global char *)VC;
     if (cap) {                                         // int8: 256 bytes (16 per lane) and the scale
-      global uint *k = (global uint *)KC, *v = (global uint *)VC;
       for (int i = 0; i < 4; i++) {
-        k[dst / 4 + i * 16 + lane] = k[src / 4 + i * 16 + lane];
-        v[dst / 4 + i * 16 + lane] = v[src / 4 + i * 16 + lane];
+        ((global uint *)(kc + db))[dst / 4 + i * 16 + lane] = ((global uint *)(kc + sb))[src / 4 + i * 16 + lane];
+        ((global uint *)(vc + db))[dst / 4 + i * 16 + lane] = ((global uint *)(vc + sb))[src / 4 + i * 16 + lane];
       }
       if (lane == 0) {
-        global float *ks = (global float *)((global char *)KC + (long)cap * Q27_KVROW),
-                     *vs = (global float *)((global char *)VC + (long)cap * Q27_KVROW);
-        ks[dst / 256] = ks[src / 256];
-        vs[dst / 256] = vs[src / 256];
+        const long so = (long)(PT ? Q27_PAGE : cap) * Q27_KVROW;
+        global float *ks = (global float *)(kc + sb + so), *kd = (global float *)(kc + db + so),
+                     *vs = (global float *)(vc + sb + so), *vd = (global float *)(vc + db + so);
+        kd[dst / 256] = ks[src / 256];
+        vd[dst / 256] = vs[src / 256];
       }
       continue;
     }
+    global ushort *ks = (global ushort *)(kc + sb), *kd = (global ushort *)(kc + db),
+                  *vs = (global ushort *)(vc + sb), *vd = (global ushort *)(vc + db);
     for (int i = 0; i < 16; i++) {
-      KC[dst + i * 16 + lane] = KC[src + i * 16 + lane];
-      VC[dst + i * 16 + lane] = VC[src + i * 16 + lane];
+      kd[dst + i * 16 + lane] = ks[src + i * 16 + lane];
+      vd[dst + i * 16 + lane] = vs[src + i * 16 + lane];
     }
   }
 }
