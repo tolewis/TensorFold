@@ -12,6 +12,8 @@ const admit = @import("xpu_admit.zig");
 const Allocator = std.mem.Allocator;
 
 pub const backends: []const []const u8 = &.{"xpu"};
+/// `--tp 2 --rank 1` names a follower rank of the 27B (a -Dtp=2 build; the flag is accepted on every build and refused in `follow`).
+pub const serves: []const []const u8 = &.{"--tp"};
 pub const families: []const api.Family = &.{ .{ .model_type = "qwen3_5", .formats = &.{ "mlx-q4g64", "gptq-int4-g128" } }, .{ .model_type = "nemotron_h", .formats = &.{"mlx-q4g64"} }, .{ .model_type = sage.model_type, .formats = &.{ "mlx-q4g64", "gptq-int4-g128" } } };
 
 pub fn chip(_: Allocator) ?[]const u8 {
