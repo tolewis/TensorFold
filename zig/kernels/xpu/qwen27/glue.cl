@@ -365,9 +365,11 @@ KERNEL(256) void gdn_one(global const half *P, global const half *CIN, global ha
 KERNEL(256) void gdn_pre_rows(global const half *P, global const half *CIN, global half *COUT, global const ushort *CW,
                               global const ushort *ALOG, global const ushort *DT, global ushort *Q, global ushort *K,
                               global ushort *V, global float *G, global float *BETA, int T) {
-  // Grid (⌈T/8⌉, 5): 8 rows and 16 heads per group; the window slides through registers, same bits as row by row.
+  // Grid (⌈T/8⌉, ⌈heads/16⌉): 8 rows and 16 heads per group; the window slides through registers, same bits as row
+  // by row. A TP rank's 40 heads (NCONV / 128) fill 2.5 groups: the subgroups past the last head return (no barrier).
   const int t0 = get_group_id(0) * 8, sg = get_sub_group_id(), lane = get_sub_group_local_id(), lid = get_local_id(0);
   const int head = get_group_id(1) * 16 + sg;
+  if (head >= NCONV / 128) return;
   // subgroup block reads and writes: element i of the lane is channel 128 head + 16 i + lane
 #define ROW8(r) as_half8((r) < 3 ? intel_sub_group_block_read_us8((global const ushort *)(CIN + (r) * NCONV + head * 128)) \
                                  : intel_sub_group_block_read_us8((global const ushort *)(P + (long)((r) - 3) * Q27_GDN_IN + head * 128)))
