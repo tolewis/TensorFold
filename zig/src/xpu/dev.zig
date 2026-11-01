@@ -145,6 +145,7 @@ pub const Dev = struct {
         kv_move: ze.H,
         exl3_gemv: ze.H,
         rot_heads: ze.H,
+        tp_add: ze.H,
         attn_prompt: ze.H,
         attn_prompt8: ze.H,
         embed_dense: ze.H,

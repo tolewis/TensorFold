@@ -293,6 +293,7 @@ pub const Runner = struct {
             .kv_move = try d.kernel(md, "kv_move", 16),
             .exl3_gemv = try d.kernel(md, "exl3_gemv", 16),
             .rot_heads = try d.kernel(mg, "rot_heads", 16),
+            .tp_add = try d.kernel(mg, "tp_add", 256),
             .attn_prompt = try d.kernel(md, "attn_prompt", 128),
             .attn_prompt8 = try d.kernel(md, "attn_prompt8", 128),
             .embed_dense = try d.kernel(mg, "embed_dense", 256),

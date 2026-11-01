@@ -7,6 +7,12 @@
 //! the host and copies the sum back. 128 all-reduces a token: 4.5 ms measured at 1 row
 //! (lanes/qwen27/TP2-ASSESSMENT.md in Intel-B70-Recipe, 2026-11-01). At TP 1 every call returns at once.
 //!
+//! The device-direct path (the default when it opens, TF_TP_HOST=1 forces the host path): each rank keeps two
+//! slots in device memory and exports them (zeMemGetIpcHandle). The handles cross over a unix socket beside the
+//! shm file, the peer opens them (zeMemOpenIpcHandle), and after the counter says a partial is written a kernel
+//! adds the peer's slot into this rank's buffer over PCIe (ze_ipc.py: 10 KB in 10.9 us, 9.2 MB in 283 us). The
+//! host settle before the counter stays.
+//!
 //! The file: TF_TP_SHM names it (default /dev/shm/tf-tp-qwen27). Rank 0 creates and sizes it, rank 1 opens it.
 //! Layout: a header of TP sequence counters (u64, cache-line apart), then two slots a rank of `rows_max` x D fp16
 //! (call `seq` uses slot seq % 2: a rank one call ahead writes the other slot, so a slow reader's data stays), then
@@ -16,8 +22,10 @@
 //! rank above 0 replays the same call with the same arguments, so the two forwards meet at every all-reduce. A
 //! prompt longer than a record continues in `more` records.
 const std = @import("std");
+const linux = std.os.linux;
 const q = @import("qwen27.zig");
 const dev = @import("dev.zig");
+const ze = @import("ze.zig");
 const Dev = dev.Dev;
 const D = q.D;
 
@@ -53,6 +61,10 @@ pub const Group = struct {
     /// Host-visible staging for this rank's partial and for the sum (Level Zero host memory, so the copies are DMA).
     mine: [*]u16,
     sum: [*]u16,
+    /// The device-direct path: this rank's two device slots and the peer's two, opened here. `direct` false: host path.
+    dslot: [2]*anyopaque = undefined,
+    peer: [2]?*anyopaque = .{ null, null },
+    direct: bool = false,
 
     fn counter(g: *const Group, r: u32) *std.atomic.Value(u64) {
         return @ptrCast(@alignCast(g.map.ptr + r * line));
@@ -95,6 +107,11 @@ pub const Group = struct {
             g.consumed().store(0, .seq_cst);
             for (0..ring_len) |i| @atomicStore(u64, &g.rec(i).seq, 0, .seq_cst);
         }
+        if (std.c.getenv("TF_TP_HOST") == null) g.openDirect(d) catch |err| {
+            std.log.warn("qwen27-xpu: TP all-reduce stays host-staged: {s}", .{@errorName(err)});
+            g.direct = false;
+        };
+        std.log.info("qwen27-xpu: TP {d} rank {d}: all-reduce {s}", .{ g.tp, g.rank, if (g.direct) "device-direct (the peer's slots over PCIe)" else "host-staged" });
         return g;
     }
 
@@ -142,29 +159,42 @@ pub const Group = struct {
         g.consumed().store(g.step, .release);
     }
 
-    /// `partial` on the device holds `rows` x D fp16: on return it holds the ranks' sum. Every rank calls this the
-    /// same number of times in the same order.
-    pub fn allReduce(g: *Group, d: *Dev, partial: *anyopaque, rows: u32) !void {
-        if (rows > rows_max) return error.TooManyRows;
-        const n: usize = @as(usize, rows) * D;
-        try dev.copy(d, @ptrCast(g.mine), partial, n * 2);
-        d.settle();
-        g.seq += 1;
-        @memcpy(g.slot(g.rank, g.seq)[0..n], g.mine[0..n]);
-        g.counter(g.rank).store(g.seq, .seq_cst);
+    /// Waits until every peer's counter reached this rank's sequence number (180 s: the peer may still be loading).
+    fn waitPeers(g: *Group) !void {
         for (0..g.tp) |r| if (r != g.rank) {
             const c = g.counter(@intCast(r));
-            // the peer may still be loading its half at the first call: 180 s, then the peer is lost
             const deadline = q.now() + 180.0;
             var spins: usize = 0;
             while (c.load(.seq_cst) < g.seq) : (spins += 1) {
                 if (spins % 4096 == 0 and q.now() > deadline) {
-                    std.debug.print("rank {d}: all-reduce {d} of {d} rows after record {d}: the peer is at {d}\n", .{ g.rank, g.seq, rows, g.step, c.load(.seq_cst) });
+                    std.debug.print("rank {d}: all-reduce {d} after record {d}: the peer is at {d}\n", .{ g.rank, g.seq, g.step, c.load(.seq_cst) });
                     return error.PeerLost;
                 }
                 std.atomic.spinLoopHint();
             }
         };
+    }
+
+    /// `partial` on the device holds `rows` x D fp16: on return it holds the ranks' sum. Every rank calls this the
+    /// same number of times in the same order.
+    pub fn allReduce(g: *Group, d: *Dev, partial: *anyopaque, rows: u32) !void {
+        if (rows > rows_max) return error.TooManyRows;
+        const n: usize = @as(usize, rows) * D;
+        g.seq += 1;
+        if (g.direct) { // the partial into this rank's slot, the counter, then the add kernel reads the peer's slot
+            const par: usize = @intCast(g.seq % 2);
+            try dev.copy(d, g.dslot[par], partial, n * 2);
+            d.settle();
+            g.counter(g.rank).store(g.seq, .seq_cst);
+            try g.waitPeers();
+            try d.launch(d.k.tp_add, .{ .x = @intCast((n + 255) / 256) }, .{ partial, g.dslot[par], g.peer[par].?, @as(i32, @intCast(n)) });
+            return;
+        }
+        try dev.copy(d, @ptrCast(g.mine), partial, n * 2);
+        d.settle();
+        @memcpy(g.slot(g.rank, g.seq)[0..n], g.mine[0..n]);
+        g.counter(g.rank).store(g.seq, .seq_cst);
+        try g.waitPeers();
         // the sum in fp32, rounded once: the ranks add in the same order, so both hold the same bits
         for (0..n) |i| {
             var acc: f32 = 0;
@@ -174,7 +204,87 @@ pub const Group = struct {
         try dev.copy(d, partial, @ptrCast(g.sum), n * 2);
         d.settle();
     }
+
+    /// Opens the device-direct path: two device slots exported to the peer, the peer's two opened here. The
+    /// handles cross over a unix socket beside the shm file (rank 0 listens, rank 1 connects, SCM_RIGHTS carries
+    /// the dma-buf fds). Any failure leaves the host path in place.
+    fn openDirect(g: *Group, d: *Dev) !void {
+        if (g.tp != 2) return error.DirectNeedsTwoRanks;
+        var handles: [2]ze.IpcHandle = undefined;
+        var fds: [2]i32 = undefined;
+        for (0..2) |i| {
+            g.dslot[i] = try d.g.deviceAlloc(slot_bytes);
+            try ze.check(d.g.api.zeMemGetIpcHandle(d.g.context, g.dslot[i], &handles[i]));
+            fds[i] = std.mem.readInt(i32, handles[i].data[0..4], .little);
+        }
+        const name: [*:0]const u8 = if (std.c.getenv("TF_TP_SHM")) |v| v else "/dev/shm/tf-tp-qwen27";
+        const base = std.mem.span(name);
+        var addr: linux.sockaddr.un = .{ .path = @splat(0) };
+        if (base.len + 6 >= addr.path.len) return error.PathTooLong;
+        @memcpy(addr.path[0..base.len], base);
+        @memcpy(addr.path[base.len .. base.len + 5], ".sock");
+        const alen: linux.socklen_t = @intCast(@offsetOf(linux.sockaddr.un, "path") + base.len + 6);
+        const sock = try std.posix.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+        defer std.posix.close(sock);
+        var conn: std.posix.socket_t = sock;
+        if (g.rank == 0) {
+            _ = std.c.unlink(@ptrCast(&addr.path));
+            try std.posix.bind(sock, @ptrCast(&addr), alen);
+            try std.posix.listen(sock, 1);
+            var pfd = [1]std.posix.pollfd{.{ .fd = sock, .events = std.posix.POLL.IN, .revents = 0 }};
+            if (try std.posix.poll(&pfd, 180_000) == 0) return error.PeerLost;
+            conn = try std.posix.accept(sock, null, null, 0);
+        } else {
+            const deadline = q.now() + 180.0;
+            while (true) {
+                if (std.posix.connect(sock, @ptrCast(&addr), alen)) |_| break else |_| {}
+                if (q.now() > deadline) return error.PeerLost;
+                var ts: std.c.timespec = .{ .sec = 0, .nsec = 50_000_000 };
+                _ = std.c.nanosleep(&ts, null);
+            }
+        }
+        defer if (g.rank == 0) {
+            std.posix.close(conn);
+            _ = std.c.unlink(@ptrCast(&addr.path));
+        };
+        try sendFds(conn, std.mem.asBytes(&handles), &fds);
+        var theirs: [2]ze.IpcHandle = undefined;
+        var their_fds: [2]i32 = undefined;
+        try recvFds(conn, std.mem.asBytes(&theirs), &their_fds);
+        for (0..2) |i| {
+            std.mem.writeInt(i32, theirs[i].data[0..4], their_fds[i], .little);
+            var p: ?*anyopaque = null;
+            try ze.check(d.g.api.zeMemOpenIpcHandle(d.g.context, d.g.device, theirs[i], 0, &p));
+            g.peer[i] = p;
+        }
+        g.direct = true;
+    }
 };
+
+const cmsg_space = ((@sizeOf(linux.cmsghdr) + 2 * 4 + 7) / 8) * 8; // a control message with two fds
+const scm_rights = 1;
+
+fn sendFds(sock: std.posix.socket_t, data: []const u8, fds: []const i32) !void {
+    var iov = [1]std.posix.iovec_const{.{ .base = data.ptr, .len = data.len }};
+    var cbuf: [cmsg_space]u8 align(8) = @splat(0);
+    const h: *linux.cmsghdr = @ptrCast(&cbuf);
+    h.* = .{ .len = @sizeOf(linux.cmsghdr) + fds.len * 4, .level = linux.SOL.SOCKET, .type = scm_rights };
+    @memcpy(cbuf[@sizeOf(linux.cmsghdr) .. @sizeOf(linux.cmsghdr) + fds.len * 4], std.mem.sliceAsBytes(fds));
+    const msg: linux.msghdr_const = .{ .name = null, .namelen = 0, .iov = &iov, .iovlen = 1, .control = &cbuf, .controllen = cbuf.len, .flags = 0 };
+    const rc = linux.sendmsg(sock, &msg, 0);
+    if (@as(isize, @bitCast(rc)) < 0 or rc != data.len) return error.FdSend;
+}
+
+fn recvFds(sock: std.posix.socket_t, data: []u8, fds: []i32) !void {
+    var iov = [1]std.posix.iovec{.{ .base = data.ptr, .len = data.len }};
+    var cbuf: [cmsg_space]u8 align(8) = @splat(0);
+    var msg: linux.msghdr = .{ .name = null, .namelen = 0, .iov = &iov, .iovlen = 1, .control = &cbuf, .controllen = cbuf.len, .flags = 0 };
+    const rc = linux.recvmsg(sock, &msg, linux.MSG.WAITALL);
+    if (@as(isize, @bitCast(rc)) < 0 or rc != data.len) return error.FdRecv;
+    const h: *const linux.cmsghdr = @ptrCast(&cbuf);
+    if (h.level != linux.SOL.SOCKET or h.type != scm_rights or h.len != @sizeOf(linux.cmsghdr) + fds.len * 4) return error.FdRecv;
+    @memcpy(std.mem.sliceAsBytes(fds), cbuf[@sizeOf(linux.cmsghdr) .. @sizeOf(linux.cmsghdr) + fds.len * 4]);
+}
 
 test "an fp16 sum rounds once from fp32" {
     const a: f16 = 1.0009765625; // 1 + 2^-10, the fp16 step above 1

@@ -30,6 +30,15 @@ static void quant8_head(float v[16], float levels) {
 }
 
 // Attention output brought back from the rotated basis (KV8 & 1): O bf16 [T, 24, 256], grid (T, 24).
+// TP 2 all-reduce on the device: out = a + b over n fp16 values (the sum in fp32, rounded once). `b` is the peer
+// rank's slot, opened through an IPC handle and read over PCIe.
+KERNEL(256) void tp_add(global ushort *out, global const ushort *a, global const ushort *b, int n) {
+  const int i = get_global_id(0);
+  if (i >= n) return;
+  const float s = (float)as_half(a[i]) + (float)as_half(b[i]);
+  out[i] = as_ushort((half)s);
+}
+
 KERNEL(16) void rot_heads(global ushort *O) {
   const int t = get_group_id(0), hh = get_group_id(1), lane = get_sub_group_local_id();
   global ushort *o = O + ((long)t * Q27_AQ + hh) * 256;

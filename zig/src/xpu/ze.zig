@@ -4,6 +4,10 @@ const std = @import("std");
 pub const H = ?*anyopaque;
 pub const Error = error{ LoaderUnavailable, MissingSymbol, ZeFailed, NoDevice, OutOfMemory };
 
+/// A device allocation's handle for another process (ze_ipc_mem_handle_t): the Intel driver puts a dma-buf fd in
+/// the first four bytes, which the receiver replaces with the fd it got over a unix socket.
+pub const IpcHandle = extern struct { data: [64]u8 };
+
 pub const Api = struct {
     zeInit: *const fn (u32) callconv(.c) u32,
     zeDriverGet: *const fn (*u32, ?[*]H) callconv(.c) u32,
@@ -24,6 +28,9 @@ pub const Api = struct {
     zeMemAllocDevice: *const fn (H, *const DeviceAllocDesc, usize, usize, H, *?*anyopaque) callconv(.c) u32,
     zeMemAllocHost: *const fn (H, *const HostAllocDesc, usize, usize, *?*anyopaque) callconv(.c) u32,
     zeMemFree: *const fn (H, ?*anyopaque) callconv(.c) u32,
+    zeMemGetIpcHandle: *const fn (H, *const anyopaque, *IpcHandle) callconv(.c) u32,
+    zeMemOpenIpcHandle: *const fn (H, H, IpcHandle, u32, *?*anyopaque) callconv(.c) u32,
+    zeMemCloseIpcHandle: *const fn (H, *const anyopaque) callconv(.c) u32,
     zeModuleCreate: *const fn (H, H, *const ModuleDesc, *H, ?*H) callconv(.c) u32,
     zeKernelCreate: *const fn (H, *const KernelDesc, *H) callconv(.c) u32,
     zeKernelSetGroupSize: *const fn (H, u32, u32, u32) callconv(.c) u32,
