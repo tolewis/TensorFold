@@ -32,17 +32,37 @@ def write_case(path, mats, rows, x):
     return k, n
 
 
+FREQ = os.environ.get("ACT_FREQ", "/sys/devices/pci0000:61/0000:61:02.0/0000:62:00.0/0000:63:01.0/0000:64:00.0/tile0/gt0/freq0/act_freq")
+
+
+def act_freq():
+    try:
+        return int(open(FREQ).read())
+    except OSError:
+        return 0
+
+
+def split_bound(n, ks_max=16, target=4096):
+    """exl3.zig splitBound: the sums scratch holds this many K splits for a group of width n."""
+    strips = n // 16
+    b = 1
+    while b < -(-target // strips):
+        b *= 2
+    return min(ks_max, b)
+
+
 def run(prog, case, out, reps, env):
     e = dict(os.environ)
     e.pop("EXL3_NS", None)
     e.pop("EXL3_KS", None)
     e.update(env)
     r = subprocess.run([prog, case, out, str(reps)], capture_output=True, text=True, env=e)
+    mhz = act_freq()
     if r.returncode != 0:
-        return None, (r.stderr.strip().splitlines() or ["?"])[-1][:120]
+        return None, (r.stderr.strip().splitlines() or ["?"])[-1][:120], mhz
     line = r.stderr.strip().splitlines()[-1]  # call 123.4 us, weights 89.13 MB, 400.1 GB/s
     f = line.replace(",", "").split()
-    return (float(f[1]), float(f[4]), float(f[6])), line
+    return (float(f[1]), float(f[4]), float(f[6])), line, mhz
 
 
 def main():
@@ -50,7 +70,7 @@ def main():
     reps = int(sys.argv[4]) if len(sys.argv) > 4 else 50
     os.makedirs(work, exist_ok=True)
     st = ref.SafeTensors(ckpt)
-    rows_list = [int(r) for r in os.environ.get("ROWS", "1,4,8,16").split(",")]
+    rows_list = [int(r) for r in os.environ.get("ROWS", "1,2,4,8,16").split(",")]
     ns_list = os.environ.get("NS", "rule,1,2,4").split(",")
     ks_list = os.environ.get("KS", "rule,1,2,4,8").split(",")
     g = st.group
@@ -90,8 +110,10 @@ def main():
                     if key in seen:
                         continue
                     seen.add(key)
-                    res, line = run(prog, case, out, reps, env)
-                    note = ""
+                    if ks != "rule" and int(ks) > split_bound(n):
+                        continue  # the sums scratch holds splitBound(n) splits: more fails at the launch
+                    res, line, mhz = run(prog, case, out, reps, env)
+                    note = f"{mhz} MHz"
                     if res is None:
                         print(f"{name:6} {k:6} {n:6} {rows:4} {ns:>4} {ks:>4} {'fail':>9} {'':>7}  {line}", flush=True)
                         results.append({"case": name, "k": k, "n": n, "rows": rows, "ns": ns, "ks": ks, "error": line})
@@ -102,7 +124,7 @@ def main():
                     if check:
                         ref_y = np.fromfile(os.path.join(work, f"{name}-r{rows}-{check}.bin"), np.float32)
                         err = np.abs(y - ref_y)
-                        note = f"max abs {err.max():.3e} rel {err.max() / (np.abs(ref_y).max() + 1e-30):.2e}"
+                        note += f" max abs {err.max():.3e} rel {err.max() / (np.abs(ref_y).max() + 1e-30):.2e}"
                     us, mb, gbs = res
                     print(f"{name:6} {k:6} {n:6} {rows:4} {ns:>4} {ks:>4} {us:9.1f} {gbs:7.1f}  {note}", flush=True)
                     results.append({"case": name, "k": k, "n": n, "rows": rows, "ns": ns, "ks": ks, "us": us, "mb": mb, "gbs": gbs, "note": note})

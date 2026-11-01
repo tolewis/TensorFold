@@ -144,6 +144,8 @@ pub fn main(init: std.process.Init) !u8 {
         defer plan.deinit();
         try exl3.encode(&p, s, &plan);
         if (reps > 0) {
+            // warm-up of the same length: the GPU clock ramps over the first tens of ms of a window (B70, 2026-11-01)
+            for (0..reps) |_| try exl3.encode(&p, s, &plan);
             try s.synchronize();
             const t0 = std.Io.Clock.awake.now(io);
             for (0..reps) |_| try exl3.encode(&p, s, &plan);
