@@ -130,8 +130,8 @@ pub const Group = struct {
         };
         g.counter(g.rank).store(0, .seq_cst);
         // a fresh group: no close flag and every rank lives until its next all-reduce (its peers wait for them)
-        closed(g).store(0, .seq_cst);
-        for (0..g.tp) |r| aliveWord(g, @intCast(r)).store(@intFromFloat(q.now()), .release);
+        g.closed().store(0, .seq_cst);
+        for (0..g.tp) |r| g.aliveWord(@intCast(r)).store(@intFromFloat(q.now()), .release);
         if (g.rank == 0) { // a fresh ring: the followers start at record 0
             g.consumed().store(0, .seq_cst);
             for (0..ring_len) |i| @atomicStore(u64, &g.rec(i).seq, 0, .seq_cst);
