@@ -8,8 +8,9 @@
 //! (lanes/qwen27/TP2-ASSESSMENT.md in Intel-B70-Recipe, 2026-11-01). At TP 1 every call returns at once.
 //!
 //! The file: TF_TP_SHM names it (default /dev/shm/tf-tp-qwen27). Rank 0 creates and sizes it, rank 1 opens it.
-//! Layout: a header of TP sequence counters (u64, cache-line apart), then TP slots of `rows_max` x D fp16, then the
-//! follower's consumed counter and a ring of `ring_len` step records.
+//! Layout: a header of TP sequence counters (u64, cache-line apart), then two slots a rank of `rows_max` x D fp16
+//! (call `seq` uses slot seq % 2: a rank one call ahead writes the other slot, so a slow reader's data stays), then
+//! the follower's consumed counter and a ring of `ring_len` step records.
 //!
 //! The step records: rank 0 writes one before every state-changing Runner call (follow.zig lists them) and the
 //! rank above 0 replays the same call with the same arguments, so the two forwards meet at every all-reduce. A
@@ -54,21 +55,22 @@ pub const Group = struct {
     fn counter(g: *const Group, r: u32) *std.atomic.Value(u64) {
         return @ptrCast(@alignCast(g.map.ptr + r * line));
     }
-    fn slot(g: *const Group, r: u32) [*]u16 {
-        return @ptrCast(@alignCast(g.map.ptr + g.tp * line + r * slot_bytes));
+    /// Rank r's slot for call `seq` (1-based: the value of g.seq after the bump).
+    fn slot(g: *const Group, r: u32, seq: u64) [*]u16 {
+        return @ptrCast(@alignCast(g.map.ptr + g.tp * line + (2 * r + @as(u32, @intCast(seq % 2))) * slot_bytes));
     }
     fn consumed(g: *const Group) *std.atomic.Value(u64) {
-        return @ptrCast(@alignCast(g.map.ptr + g.tp * line + g.tp * slot_bytes));
+        return @ptrCast(@alignCast(g.map.ptr + g.tp * line + 2 * g.tp * slot_bytes));
     }
     fn rec(g: *const Group, i: u64) *Rec {
-        return @ptrCast(@alignCast(g.map.ptr + g.tp * line + g.tp * slot_bytes + line + (i % ring_len) * @sizeOf(Rec)));
+        return @ptrCast(@alignCast(g.map.ptr + g.tp * line + 2 * g.tp * slot_bytes + line + (i % ring_len) * @sizeOf(Rec)));
     }
 
     /// Opens the group this process is in. Null at TP 1 (nothing to reduce).
     pub fn open(d: *Dev) !?Group {
         if (q.TP == 1) return null;
         const name: [*:0]const u8 = if (std.c.getenv("TF_TP_SHM")) |v| v else "/dev/shm/tf-tp-qwen27";
-        const size = q.TP * line + q.TP * slot_bytes + line + ring_len * @sizeOf(Rec);
+        const size = q.TP * line + 2 * q.TP * slot_bytes + line + ring_len * @sizeOf(Rec);
         // the file as the fabric's mailbox opens its own (fabric/tp/mailbox.zig): either rank may create it
         const fd = std.c.open(name, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, @as(std.c.mode_t, 0o600));
         if (fd < 0) return error.ShmOpenFailed;
@@ -140,8 +142,8 @@ pub const Group = struct {
         const n: usize = @as(usize, rows) * D;
         try dev.copy(d, @ptrCast(g.mine), partial, n * 2);
         d.settle();
-        @memcpy(g.slot(g.rank)[0..n], g.mine[0..n]);
         g.seq += 1;
+        @memcpy(g.slot(g.rank, g.seq)[0..n], g.mine[0..n]);
         g.counter(g.rank).store(g.seq, .seq_cst);
         for (0..g.tp) |r| if (r != g.rank) {
             const c = g.counter(@intCast(r));
@@ -156,7 +158,7 @@ pub const Group = struct {
         // the sum in fp32, rounded once: the ranks add in the same order, so both hold the same bits
         for (0..n) |i| {
             var acc: f32 = 0;
-            for (0..g.tp) |r| acc += @floatCast(@as(f16, @bitCast(g.slot(@intCast(r))[i])));
+            for (0..g.tp) |r| acc += @floatCast(@as(f16, @bitCast(g.slot(@intCast(r), g.seq)[i])));
             g.sum[i] = @bitCast(@as(f16, @floatCast(acc)));
         }
         try dev.copy(d, partial, @ptrCast(g.sum), n * 2);
