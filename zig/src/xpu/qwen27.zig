@@ -112,6 +112,9 @@ pub var a8_sites: u32 = 15; // XPU_A8_SITES: 1 mixer in, 2 mixer out, 4 gate|up,
 pub var a8_rot: i32 = 0; // XPU_A8_ROT=1: Hadamard by blocks of 128 before the quantization (weights rotated too)
 pub var a8_levels: i32 = 127; // XPU_A8_BITS=4: int4 activations (7 levels a side)
 pub var a8_sites4: u32 = 15; // XPU_A8_SITES4: the sites in int4 when XPU_A8_BITS=4 (the others in int8)
+/// Host-backed embedding table (XPU_EMBED_HOST=1): `embedTable` keeps the fp16 table in pinned host memory for
+/// the kernels to read over PCIe, so a card frees ~2.5 GB of VRAM (a research arm, off by default).
+pub var embed_host: bool = false;
 pub var prof: Prof = .{};
 
 /// The XPU_* options as the process had them before its first open, put back at every open (Runner.init).
@@ -128,6 +131,7 @@ const Options = struct {
     a8_rot: i32,
     a8_levels: i32,
     a8_sites4: u32,
+    embed_host: bool,
     chunk: u32,
 };
 var defaults: ?Options = null;
@@ -135,7 +139,7 @@ var defaults: ?Options = null;
 var live = false;
 
 fn options() Options {
-    return .{ .dump_dir = dump_dir, .dump_h = dump_h, .a8_group = a8_group, .kv8 = kv8, .kv_i8 = kv_i8, .prefill_int4 = prefill_int4, .int4_sites = int4_sites, .prefill_int8 = prefill_int8, .a8_sites = a8_sites, .a8_rot = a8_rot, .a8_levels = a8_levels, .a8_sites4 = a8_sites4, .chunk = CHUNK };
+    return .{ .dump_dir = dump_dir, .dump_h = dump_h, .a8_group = a8_group, .kv8 = kv8, .kv_i8 = kv_i8, .prefill_int4 = prefill_int4, .int4_sites = int4_sites, .prefill_int8 = prefill_int8, .a8_sites = a8_sites, .a8_rot = a8_rot, .a8_levels = a8_levels, .a8_sites4 = a8_sites4, .embed_host = embed_host, .chunk = CHUNK };
 }
 
 fn restore(o: Options) void {
@@ -151,6 +155,7 @@ fn restore(o: Options) void {
     a8_rot = o.a8_rot;
     a8_levels = o.a8_levels;
     a8_sites4 = o.a8_sites4;
+    embed_host = o.embed_host;
     CHUNK = o.chunk;
 }
 
@@ -199,6 +204,7 @@ pub const Runner = struct {
         errdefer live = false;
         if (std.c.getenv("XPU_DUMP")) |v| dump_dir = std.mem.span(v);
         if (std.c.getenv("XPU_PREFILL_INT8") != null) prefill_int8 = true;
+        if (std.c.getenv("XPU_EMBED_HOST") != null) embed_host = true; // host-backed embedding table (research arm)
         if (std.c.getenv("XPU_KV_INT8") != null) kv_i8 = true;
         if (std.c.getenv("XPU_PREFILL_INT4") != null) prefill_int4 = true;
         if (std.c.getenv("XPU_PREFILL_INT4_SITES")) |v| int4_sites = try std.fmt.parseInt(u32, std.mem.span(v), 10);
