@@ -38,7 +38,7 @@ const Case = struct { ctx: u32, streams: u32, rows: u32, k16: bool };
 var worst_cos: f64 = 1.0;
 var worst_rel: f64 = 0.0;
 
-fn run(d: *dev.Dev, gpa: std.mem.Allocator, kk: k1.Kernels, evs: []ze.H, rnd: std.Random, c: Case) !void {
+fn run(d: *dev.Dev, gpa: std.mem.Allocator, kk: k1.Kernels, evs: []const ze.H, rnd: std.Random, c: Case) !void {
     const t = c.streams * c.rows; // rows of the round
     const tn: usize = @intCast(t);
     const pages: usize = (@as(usize, c.ctx) + PAGE - 1) / PAGE;
@@ -213,7 +213,7 @@ pub fn main() !void {
         // 8 streams at 40k, each its own pages: the round the spec's byte table describes
         .{ .ctx = 40000, .streams = 8, .rows = 16, .k16 = false },
         .{ .ctx = 40000, .streams = 8, .rows = 16, .k16 = true },
-    }) |c| try run(&d, gpa, kk, evs, rnd, c);
+    }) |c| try run(&d, gpa, kk, &evs, rnd, c);
 
     std.debug.print("worst cosine {d:.5}, worst mean relative error {d:.4} (bounds {d}, {d})\n", .{ worst_cos, worst_rel, MIN_COS, MAX_MEAN_REL });
     std.debug.print("ok\n", .{});
