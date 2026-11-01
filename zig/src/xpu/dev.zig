@@ -142,6 +142,10 @@ pub const Dev = struct {
         gdn_step: ze.H,
         attn_decode: ze.H,
         attn_merge: ze.H,
+        attn_k1: ze.H = null, // XPU_K1: the split-K DPAS decode over int8 pool pages (k1.cl)
+        attn_k1_16: ze.H = null, // XPU_K1_R16: the 16-row single-group variant (k1.cl)
+        attn_span: ze.H = null, // the scalar page-table slice kernel (decode.cl), K1's reference
+        merge_span: ze.H = null, // the merge of slice partials (decode.cl)
         kv_move: ze.H,
         exl3_gemv: ze.H,
         rot_heads: ze.H,

@@ -14,7 +14,7 @@ var tp_ranks: u32 = 1;
 
 /// The qwen27 kernels whose compiled widths follow the rank (shape.h): the layer kernels, not the drafter's.
 fn tpKernel(name: []const u8) bool {
-    for ([_][]const u8{ "glue", "decode", "gemm", "gemm128", "gdn" }) |n| if (std.mem.eql(u8, name, n)) return true;
+    for ([_][]const u8{ "glue", "decode", "gemm", "gemm128", "gdn", "k1" }) |n| if (std.mem.eql(u8, name, n)) return true;
     return false;
 }
 
@@ -38,6 +38,8 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     for ([_]struct { []const u8, []const u8, []const u8 }{
         .{ "glue", "zig/kernels/xpu/qwen27/glue.cl", "" },
         .{ "decode", "zig/kernels/xpu/qwen27/decode.cl", "" },
+        // K1: the split-K DPAS decode attention over int8 pool pages for the 27B (lane p22-k1)
+        .{ "k1", "zig/kernels/xpu/qwen27/k1.cl", "" },
         .{ "gemm", "zig/kernels/xpu/qwen27/gemm.cl", " -DGSZ=64" },
         .{ "gemm128", "zig/kernels/xpu/qwen27/gemm.cl", " -DGSZ=128" },
         .{ "gdn", "zig/kernels/xpu/qwen27/gdn_chunk.cl", "" },
@@ -53,7 +55,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         const tp_defs = if (tp_ranks == 2 and tpKernel(k[0])) tp2_defines else "";
         c.addArgs(&.{ "-device", device, "-options", b.fmt("{s}{s}{s} -I zig/kernels/xpu/qwen27", .{ opts, k[2], tp_defs }), "-output_no_suffix", "-output", k[0], "-out_dir" });
         c.setCwd(b.path("."));
-        for ([_][]const u8{ "glue_attn.cl", "glue_quant.cl", "shape.h" }) |part| c.addFileInput(b.path(b.fmt("zig/kernels/xpu/qwen27/{s}", .{part})));
+        for ([_][]const u8{ "glue_attn.cl", "glue_quant.cl", "shape.h", "k1_body.h" }) |part| c.addFileInput(b.path(b.fmt("zig/kernels/xpu/qwen27/{s}", .{part})));
         const dir = c.addOutputDirectoryArg(b.fmt("ocloc-{s}", .{k[0]}));
         _ = files.addCopyFile(dir.path(b, b.fmt("{s}.bin", .{k[0]})), b.fmt("{s}.bin", .{k[0]}));
     }
@@ -83,6 +85,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const embedded = b.createModule(.{ .root_source_file = files.add("xpu_qwen27_kernels.zig",
         \\pub const glue align(8) = @embedFile("glue.bin").*;
         \\pub const decode align(8) = @embedFile("decode.bin").*;
+        \\pub const k1 align(8) = @embedFile("k1.bin").*;
         \\pub const gemm align(8) = @embedFile("gemm.bin").*;
         \\pub const gemm128 align(8) = @embedFile("gemm128.bin").*;
         \\pub const gdn align(8) = @embedFile("gdn.bin").*;
@@ -134,6 +137,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .{ "tf-xpu-qwen27-means-test", "zig/src/xpu/means_test.zig" },
         .{ "tf-xpu-qwen27-seam-test", "zig/src/xpu/seam_test.zig" },
         .{ "tf-xpu-qwen27-close-test", "zig/src/xpu/close_test.zig" },
+        .{ "tf-xpu-qwen27-k1-bench", "zig/src/xpu/k1_bench.zig" },
     }) |t| {
         const m = b.createModule(.{ .root_source_file = b.path(t[1]), .target = target, .optimize = optimize, .link_libc = true });
         m.addImport("xpu_qwen27_kernels", embedded);

@@ -9,6 +9,7 @@ const loader = @import("load.zig");
 const multi = @import("runner_multi.zig");
 const slot_states = @import("slot_states.zig");
 const pages_mod = @import("pages.zig");
+const k1mod = @import("k1.zig"); // XPU_K1: the split-K DPAS decode over int8 pool pages (lane p22-k1)
 pub const follow = @import("follow.zig");
 pub const limits = @import("limits.zig");
 const Prof = dev.Prof;
@@ -232,6 +233,7 @@ pub const Runner = struct {
         if (std.c.getenv("XPU_DUMP_H")) |v| dump_h = open(v, 0o2101, @as(c_uint, 0o644)); // append
         if (std.c.getenv("XPU_CHUNK")) |v| CHUNK = try limits.chunk(std.mem.span(v));
         if (std.c.getenv("TF_TP_RANK")) |v| RANK = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+        k1mod.readEnv(); // XPU_K1, XPU_K1_WAVE
         if (RANK >= TP) return error.RankOutOfRange;
         // the shared K/V pool: a page holds int8 rows and their scales, so pool mode is int8 K/V
         if (std.c.getenv("XPU_KV_POOL")) |v| kv_pool = v[0] != '0';
@@ -351,6 +353,15 @@ pub const Runner = struct {
         };
         // the shared rounds' kernels reach each slot's states through the per-row table (acts.mt)
         for ([_]ze.H{ d.k.attn_prep, d.k.attn_decode, d.k.gdn_pre, d.k.gdn_step }) |k| try d.g.indirect(k);
+        if (k1mod.on) { // XPU_K1: the K1 decode kernel (k1.cl), the scalar page-table kernel and the merge
+            const mk1 = try d.g.module(&kb.k1);
+            const kk = try k1mod.load(d, md, mk1);
+            d.k.attn_k1 = kk.decode;
+            d.k.attn_k1_16 = kk.decode16;
+            k1mod.have16 = kk.decode16 != null;
+            d.k.attn_span = kk.span;
+            d.k.merge_span = kk.merge;
+        }
         if (std.c.getenv("XPU_PROFILE") != null) {
             prof.on = true;
             prof.events = try d.g.events(4096);
@@ -394,6 +405,7 @@ pub const Runner = struct {
             if (l.attn) {
                 l.kc = l.slot_kc[slot];
                 l.vc = l.slot_vc[slot];
+                l.pt = l.slot_pt[slot];
             } else {
                 l.rec = l.slot_rec[slot];
                 l.rec_save = l.slot_save[slot];
@@ -421,6 +433,7 @@ pub const Runner = struct {
             if (l.attn) {
                 l.slot_kc[r.slot] = l.kc;
                 l.slot_vc[r.slot] = l.vc;
+                l.slot_pt[r.slot] = l.pt;
             } else {
                 l.slot_rec[r.slot] = l.rec;
                 l.slot_save[r.slot] = l.rec_save;
@@ -506,6 +519,13 @@ pub const Runner = struct {
             r.held[i] = 0;
         }
         r.pages = try pages_mod.Pages.init(alloc, pages);
+        // K1 (XPU_K1) and the paged launches read a slot's table through the layer: `slot_pt` is the runner's
+        // per-slot table (page ids into every attention layer's pool), `pt` the selected slot's.
+        for (&r.model.layers) |*l| {
+            if (!l.attn) continue;
+            for (0..MAX_SLOTS) |i| l.slot_pt[i] = r.pt[i];
+            l.pt = r.pt[r.slot];
+        }
         try r.d.sync();
         std.debug.print("K/V pool: {d} pages, {d} tokens, {d:.2} GB a card, int8\n", .{ pages, @as(u64, pages) * PAGE, @as(f64, @floatFromInt(r.poolBytes())) / 1e9 });
     }
