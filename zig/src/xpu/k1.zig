@@ -87,14 +87,14 @@ pub fn rowGroups(wf: []const u32, wn: []const u32, host: []i32) u32 {
 
 /// The row groups of windows given as pairs (first row, rows), as verifyMulti's win_host holds them.
 pub fn groupsWin(win: []const i32, host: []i32) u32 {
-    return groups(win, 0, host).n;
+    return roundGroups(win, 0, host).n;
 }
 
 /// A round's row groups: `k16` when a window has more than ROWS rows and XPU_K1_R16 is on (one group a
 /// window, 16 rows), else ROWS rows a group. `n` is the launch's z (the group count).
 pub const Round = struct { k16: bool, rows: u32, n: u32 };
 
-pub fn groups(win: []const i32, t: u32, host: []i32) Round {
+pub fn roundGroups(win: []const i32, t: u32, host: []i32) Round {
     var maxr: u32 = t;
     if (win.len > 0) {
         maxr = 0;

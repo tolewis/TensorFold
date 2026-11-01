@@ -82,7 +82,7 @@ fn run(d: *dev.Dev, gpa: std.mem.Allocator, kk: k1.Kernels, evs: []ze.H, rnd: st
     }
     k1.r16 = c.k16;
     var grp: [2 * 16]i32 = @splat(0);
-    const rd = k1.groups(win, @intCast(t), &grp);
+    const rd = k1.roundGroups(win, @intCast(t), &grp);
     const tile: u32 = if (rd.k16) k1.TILE16 else k1.TILE;
     const pl = k1.planTile(c.ctx, rd.n, AKV, k1.wave, tile);
     const dgrp = try d.upload(std.mem.sliceAsBytes(grp[0 .. @as(usize, 2 * rd.n)]));

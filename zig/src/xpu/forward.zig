@@ -369,7 +369,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
             } else {
                 const k1on = k1mod.on and !mode.tree and l.pt != null and d.k.attn_k1 != null;
                 if (k1on) { // K1: split-K DPAS over the slot's int8 pages, one work-group a row group of a stream
-                    const rd = k1mod.groups(if (mode.multi) |mm| mm.win else &.{}, T, &grp_host);
+                    const rd = k1mod.roundGroups(if (mode.multi) |mm| mm.win else &.{}, T, &grp_host);
                     const tile = if (rd.k16) k1mod.TILE16 else k1mod.TILE;
                     const plan = k1mod.planTile(ctx, rd.n, AKV, k1mod.wave, tile);
                     const kern = if (rd.k16) d.k.attn_k1_16.? else d.k.attn_k1.?;
