@@ -123,7 +123,10 @@ pub const Group = struct {
         const r = g.rec(g.step);
         var spins: usize = 0;
         while (@atomicLoad(u64, &r.seq, .acquire) != g.step + 1) : (spins += 1) {
-            if (spins > 20_000) std.Thread.sleep(20_000) else std.atomic.spinLoopHint();
+            if (spins > 20_000) {
+                var ts: std.c.timespec = .{ .sec = 0, .nsec = 20_000 };
+                _ = std.c.nanosleep(&ts, null);
+            } else std.atomic.spinLoopHint();
         }
         out.* = r.*;
         g.step += 1;
