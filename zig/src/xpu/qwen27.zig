@@ -502,7 +502,7 @@ pub const Runner = struct {
         const entries = (r.context + PAGE - 1) / PAGE;
         for (0..MAX_SLOTS) |i| {
             r.pt[i] = try r.d.alloc_(@as(usize, entries) * 4);
-            r.pt_host[i] = try alloc.alloc(u32, entries);
+            r.pt_host[i] = try alloc.alloc(u32, @as(usize, entries));
             r.held[i] = 0;
         }
         r.refs = try alloc.alloc(u32, pages);
@@ -587,7 +587,7 @@ pub const Runner = struct {
     pub fn poolFixed(r: *Runner) !void {
         const e = (r.context + PAGE - 1) / PAGE;
         try r.allocPool(MAX_SLOTS * e);
-        const ids = try alloc.alloc(u32, e);
+        const ids = try alloc.alloc(u32, @as(usize, e));
         defer alloc.free(ids);
         for (0..MAX_SLOTS) |i| {
             for (ids, 0..) |*p, j| p.* = @intCast(i * e + j);
@@ -833,7 +833,8 @@ pub fn openPool(r: *Runner, slots: u32) !void {
     try r.allocPool(pages);
 }
 
-pub const drafter = @import("drafter.zig");/// The Sage-A1.5 (qwen3_5_moe) runner on the same device layer and kernels.
+pub const drafter = @import("drafter.zig");
+/// The Sage-A1.5 (qwen3_5_moe) runner on the same device layer and kernels.
 pub const sage = @import("sage.zig");
 pub const vision = @import("vision.zig");
 

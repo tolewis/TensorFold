@@ -63,7 +63,7 @@ fn saveSlotHere(r: *Runner, slot: u32, at: u32) !Snap {
         try copyGdnOut(d, r, buf);
         const entries = (at + q.PAGE - 1) / q.PAGE;
         if (entries > r.held[slot]) return error.SlotNotThere;
-        const pages = try alloc.alloc(u32, entries);
+        const pages = try alloc.alloc(u32, @as(usize, entries));
         errdefer alloc.free(pages);
         @memcpy(pages, r.pt_host[slot][0..entries]);
         for (pages) |id| r.retainPage(id); // the state holds them until dropSnap

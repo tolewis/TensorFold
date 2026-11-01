@@ -140,7 +140,9 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
         const e = (context + xq.PAGE - 1) / xq.PAGE;
         const spare = pages -| slots * e;
         budget = if (cache_on) @as(u64, spare) * runner.kvBytesPerToken() * xq.PAGE else 0;
-        if (o.prompt_cache_gib) |gib| if (gib > 0) budget = @min(budget, std.math.lossyCast(u64, gib * (1 << 30)));
+        if (o.prompt_cache_gib) |gib| {
+            if (gib > 0) budget = @min(budget, std.math.lossyCast(u64, gib * (1 << 30)));
+        }
         std.log.info("qwen27-xpu: a shared K/V pool of {d} pages ({d} tokens, {d:.2} GB a card, int8), {d} stream(s) of at most {d} tokens, kept prompt states in up to {d:.1} GiB of it", .{ pages, runner.poolTokens(), @as(f64, @floatFromInt(runner.poolBytes())) / 1e9, slots, context, @as(f64, @floatFromInt(budget)) / (1 << 30) });
         if (slots < want) std.log.warn("qwen27-xpu: the K/V pool holds {d} tokens, so {d} stream(s) are admitted of the {d} asked for (--kv-pool-tokens names a bigger pool)", .{ runner.poolTokens(), slots, want });
     } else {
