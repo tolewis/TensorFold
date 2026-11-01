@@ -398,7 +398,7 @@ pub const Group = struct {
         // 2 the device-flag path failed its own test (then both take the host path).
         var mode: u8 = 0;
         if (want_flag) {
-            g.fh = @ptrCast(try d.g.hostAlloc(fh_ring * 8));
+            g.fh = @ptrCast(@alignCast(try d.g.hostAlloc(fh_ring * 8)));
             g.own_cons = try d.g.deviceAlloc(64);
             const list = try d.g.immediate(0, 0);
             mode = if (try g.selfTest(d, list, conn)) 1 else 2;
@@ -433,7 +433,7 @@ pub const Group = struct {
         st[0] = tp_magic + g.rank;
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(list, off(g.peer_blk.?, blk_flag), @ptrCast(st), 8, null, 0, null));
         try ze.check(d.g.api.zeCommandListHostSynchronize(list, std.math.maxInt(u64)));
-        var b: u8 = 1;
+        const b: u8 = 1;
         var r: u8 = 0;
         try sendByte(conn, b);
         try recvByte(conn, &r);
