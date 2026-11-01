@@ -147,8 +147,15 @@ pub fn main(init: std.process.Init) !u8 {
             // warm-up of the same length: the GPU clock ramps over the first tens of ms of a window (B70, 2026-11-01)
             for (0..reps) |_| try exl3.encode(&p, s, &plan);
             try s.synchronize();
+            // EXL3_SYNC=1: a host wait after every call. Back-to-back calls overlap one launch's tail with the next
+            // launch, which favours few large sub-groups: the one-wave rule that sweep 2 picked lost 16 ms a token in
+            // the engine, where every matvec waits on the launch before it (B70, 2026-11-01).
+            const sync = if (std.c.getenv("EXL3_SYNC")) |v| v[0] == '1' else false;
             const t0 = std.Io.Clock.awake.now(io);
-            for (0..reps) |_| try exl3.encode(&p, s, &plan);
+            for (0..reps) |_| {
+                try exl3.encode(&p, s, &plan);
+                if (sync) try s.synchronize();
+            }
             try s.synchronize();
             report(io, t0, reps, weight_bytes);
         }

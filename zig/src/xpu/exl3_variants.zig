@@ -29,7 +29,7 @@ pub const all = blk: {
 };
 
 /// K splits for a launch of `sub_groups` sub-groups over groups whose K / 16 all divide by `k_tiles_gcd`.
-/// Wide launches stop at one wave (wide_wave); narrow ones go to sub_group_target.
+/// Wide launches above wide_wave_rows stop at one wave (wide_wave); every other launch goes to sub_group_target.
 pub fn split(sub_groups: u32, k_tiles_gcd: u32, is_wide: bool) u32 {
     var ks: u32 = 1;
     if (is_wide) {
@@ -93,13 +93,17 @@ pub const moe = struct {
 /// Sub-groups a launch needs to fill the GPU; fewer strips a sub-group and K splits get it there (narrow groups:
 /// Sage experts, N 512 and 2048, measured 2026-10-24 and -25).
 pub const sub_group_target = 4096;
-/// Wide groups (every strip count at or above wide_strips: the 27B's projections, N 5120 to 17408, and lm_head):
-/// NS 4 at every row bucket, and K splits up to one wave of resident sub-groups, no more. Measured on the B70 with
-/// tools/xpu/exl3_27b_bench.py (2026-11-01): the matvec is bound by the loads in flight a sub-group, so four strips
-/// a sub-group beat four times the sub-groups (gu 1 row: 245 GB/s at NS 1 and ks 8, 302 at NS 4 and ks 2), and a
-/// second partial wave costs more than it hides (gu: 2176 sub-groups 360 us, 1088 sub-groups 295 us).
+/// Wide groups (every strip count at or above wide_strips: the 27B's projections, N 5120 to 17408, and lm_head).
+/// Measured in the engine's window table on the B70 (the 27B, 2026-11-01, ms a window at 1, 8 and 16 rows):
+///   NS 4, one wave: 73.0, 70.0, 89.6    NS 1, one wave: 59.5, 89.1, 121.2    NS 2, one wave: 56.5, 74.2, 89.5
+///   NS 4, target:   71.2, 81.3, 100.4   NS 1, target:   51.8, 85.5, 112.4    NS 2, target:   53.6, 82.4, 99.7
+/// So NS 1 and the sub-group target up to wide_wave_rows (the 1-row path: 51.8 against the 56.6 of the 2026-10-25
+/// rule), NS 4 and one wave of sub-groups (wide_wave) at 8 rows, NS 2 and one wave at 16. The back-to-back loop of
+/// tools/xpu/exl3_27b_bench.py had picked NS 4 and one wave at every row count: it overlaps one launch's tail with
+/// the next, which the engine's dependent launches cannot (EXL3_SYNC=1 in the test program times them apart).
 pub const wide_strips = 128;
 pub const wide_wave = 1536; // 24 Xe cores x 8 XVE x 8 threads on the B70 (BMG G31 cut)
+pub const wide_wave_rows = 4; // launches of more rows than this on wide groups stop at one wave
 /// Most K splits (the sums scratch holds this many) and fewest 16-row K tiles a split.
 pub const ks_max = 16;
 const ks_min_tiles = 8;
@@ -118,7 +122,7 @@ pub fn pick(b: u32, r: u32, s: Strips) ?usize {
     if (wide(s)) {
         // see wide_strips. At 16 rows the DPAS path holds two row blocks of accumulators a strip, and NS 4 spills:
         // gu 16 rows 442 us at NS 2 against 490 at NS 4, down 181 against 217 (sweep 3, 2026-11-01).
-        ns = if (bucket <= 8) 4 else 2;
+        ns = if (bucket <= wide_wave_rows) 1 else if (bucket <= 8) 4 else 2;
     } else {
         ns = if (s.min < 128) // few strips a group (expert gate/up, N 512): keep the sub-group count up
             (if (bucket <= 4) 2 else 1)
@@ -143,7 +147,9 @@ test "picks follow the measured rule" {
     }.v;
     try std.testing.expectEqual(Variant{ .bits = 6, .rows = 1, .ns = 4, .hs = false }, at(6, 1, 15520, 15520));
     try std.testing.expectEqual(Variant{ .bits = 6, .rows = 4, .ns = 4, .hs = true }, at(6, 3, 15520, 15520));
-    // wide groups: NS 4 at every bucket (the 27B, 2026-11-01)
+    // wide groups: NS 1 to 4 rows, NS 4 at 8, NS 2 at 16 (the 27B, 2026-11-01)
+    try std.testing.expectEqual(Variant{ .bits = 4, .rows = 1, .ns = 1, .hs = false }, at(4, 1, 128, 128));
+    try std.testing.expectEqual(Variant{ .bits = 4, .rows = 4, .ns = 1, .hs = false }, at(4, 3, 128, 128));
     try std.testing.expectEqual(Variant{ .bits = 4, .rows = 8, .ns = 4, .hs = false }, at(4, 5, 128, 128));
     try std.testing.expectEqual(Variant{ .bits = 4, .rows = 16, .ns = 2, .hs = false }, at(4, 16, 128, 128));
     try std.testing.expectEqual(Variant{ .bits = 4, .rows = 2, .ns = 2, .hs = true }, at(4, 2, 32, 32));
@@ -155,8 +161,11 @@ test "picks follow the measured rule" {
     try std.testing.expectEqual(@as(u32, 16), split(256, 128, false));
     try std.testing.expectEqual(@as(u32, 4), split(1024, 32, false));
     try std.testing.expectEqual(@as(u32, 2), split(3880, 128, false));
-    // the 27B at NS 4: gate|up 544 sub-groups, down 80 over 1088 k tiles, in_proj_qkv 160, lm_head 3880
+    // the 27B at 8 rows and NS 4: gate|up 544 sub-groups, down 80 over 1088 k tiles, in_proj_qkv 160, lm_head 3880
     try std.testing.expectEqual(@as(u32, 2), split(544, 320, true));
+    // the 27B at 1 row and NS 1: gate|up 2176 sub-groups to the target, down 320 to 16 splits
+    try std.testing.expectEqual(@as(u32, 2), split(2176, 320, false));
+    try std.testing.expectEqual(@as(u32, 16), split(320, 1088, false));
     try std.testing.expectEqual(@as(u32, 16), split(80, 1088, true));
     try std.testing.expectEqual(@as(u32, 8), split(160, 320, true));
     try std.testing.expectEqual(@as(u32, 1), split(3880, 320, true));

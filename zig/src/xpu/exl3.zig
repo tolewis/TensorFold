@@ -294,7 +294,7 @@ const Shape = struct { variant: usize, ks: u32 };
 fn shapeOf(plan: *const Plan, rows: u32, strips_total: u32) Error!Shape {
     const strips: variants.Strips = .{ .min = plan.strips.min, .gcd = plan.strips.gcd, .total = strips_total };
     const vi = variants.pick(plan.bits, rows, strips) orelse return error.Invalid;
-    const is_wide = variants.wide(strips);
+    const is_wide = variants.wide(strips) and rows > variants.wide_wave_rows;
     var sh: Shape = .{ .variant = vi, .ks = variants.split(strips.total / variants.all[vi].ns, plan.k_tiles_gcd, is_wide) };
     // Bench knobs (tools/xpu/exl3_27b_bench.py): EXL3_NS picks the image of that NS in the row bucket, EXL3_KS the
     // K splits. Unset in a serving binary's environment, so the measured rule above decides.
