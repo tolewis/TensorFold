@@ -33,6 +33,7 @@ const line = 64;
 const rows_max = 1024 + 128 + 16; // the widest forward (q.maxRows at XPU_CHUNK 1024) and a decode window
 const slot_bytes = rows_max * D * 2;
 const ring_len = 64;
+const peer_dead = 10.0; // seconds without an all-reduce: a silent rank is gone, the pair cannot run
 pub const rec_words = 1024; // 4 KiB a record
 pub const rec_data = rec_words - 8;
 
@@ -81,10 +82,34 @@ pub const Group = struct {
     fn consumed(g: *const Group) *std.atomic.Value(u64) {
         return @ptrCast(@alignCast(g.map.ptr + g.tp * line + 2 * g.tp * slot_bytes));
     }
+    /// Rank r's liveness word in the shared segment (right after rank r's counter, in its cache line): this rank
+    /// writes the current time into it at every all-reduce, so a peer that dies silently is seen by its peer before
+    /// the 180 s wait even though no signal reaches it. The pair can no longer run when its last all-reduce is
+    /// older than `peer_dead` (one round takes about 40 ms).
+    fn aliveWord(g: *const Group, r: u32) *std.atomic.Value(u64) {
+        const at = @as(usize, r) * line + 8;
+        return @ptrCast(@alignCast(g.map.ptr + at));
+    }
+
+    /// The group's close flag in the shared segment (the header padding after the consumed counter, before the ring):
+    /// a rank sets it when its session ends or errors, so a peer that waits for it returns an error at once instead of
+    /// the 180 s timeout. A fresh open clears it: each group generation starts live.
+    fn closed(g: *const Group) *std.atomic.Value(u64) {
+        const at = g.tp * line + 2 * g.tp * slot_bytes + line - @sizeOf(u64);
+        return @ptrCast(@alignCast(g.map.ptr + at));
+    }
+
+    /// A rank closes the shared segment (the group's flag and its peers' view of it) when its session ends or errors.
+    pub fn markClosed(g: *Group) void {
+        closed(g).store(1, .release);
+    }
+
     /// Rank 0's K/V pool size in pages, in the unused tail of its counter line (the counters take one word a rank):
     /// a follower sizes the same pool, so both ranks map the same page ids.
+    /// Lane p2-int: the liveness word of lane p28-ops took offset 8 of rank 0's line, so this word moved to offset 16
+    /// (rank 0's line: counter 0, liveness 8, pool 16). Rank 0's liveness is written at +8, so the two never collide.
     fn poolWord(g: *const Group) *std.atomic.Value(u64) {
-        return @ptrCast(@alignCast(g.map.ptr + 8));
+        return @ptrCast(@alignCast(g.map.ptr + 16));
     }
     pub fn setPool(g: *const Group, pages: u32) void {
         if (g.rank == 0) g.poolWord().store(pages, .seq_cst);
@@ -125,6 +150,9 @@ pub const Group = struct {
             .sum = @ptrCast(@alignCast(try d.g.hostAlloc(slot_bytes))),
         };
         g.counter(g.rank).store(0, .seq_cst);
+        // a fresh group: no close flag and every rank lives until its next all-reduce (its peers wait for them)
+        g.closed().store(0, .seq_cst);
+        for (0..g.tp) |r| g.aliveWord(@intCast(r)).store(@intFromFloat(q.now()), .release);
         if (g.rank == 0) { // a fresh ring: the followers start at record 0
             g.consumed().store(0, .seq_cst);
             for (0..ring_len) |i| @atomicStore(u64, &g.rec(i).seq, 0, .seq_cst);
@@ -182,19 +210,38 @@ pub const Group = struct {
     }
 
     /// Waits until every peer's counter reached this rank's sequence number (180 s: the peer may still be loading).
+    /// It returns an error at once when the shared segment says its group closed or the peer is silent: a rank that
+    /// dies does not update its liveness word, so its peer sees it before the 180 s wait.
     fn waitPeers(g: *Group) !void {
+        const closed_word = closed(g);
         for (0..g.tp) |r| if (r != g.rank) {
             const c = g.counter(@intCast(r));
-            const deadline = q.now() + 180.0;
+            const alive = aliveWord(g, @intCast(r));
+            const deadline = q.now() + 180.0; // the peer may still be loading
             var spins: usize = 0;
             while (c.load(.seq_cst) < g.seq) : (spins += 1) {
-                if (spins % 4096 == 0 and q.now() > deadline) {
-                    std.debug.print("rank {d}: all-reduce {d} after record {d}: the peer is at {d}\n", .{ g.rank, g.seq, g.step, c.load(.seq_cst) });
-                    return error.PeerLost;
+                if (spins % 4096 == 0) {
+                    const now = q.now();
+                    // a closed segment or a silent peer: the peer is gone, not just late
+                    if (closed_word.load(.acquire) != 0 and c.load(.seq_cst) < g.seq) return error.PeerLost;
+                    if (now - @as(f64, @floatFromInt(alive.load(.acquire))) > peer_dead) return error.PeerLost;
+                    if (now > deadline) {
+                        std.debug.print("rank {d}: all-reduce {d} after record {d}: the peer is at {d}\n", .{ g.rank, g.seq, g.step, c.load(.seq_cst) });
+                        return error.PeerLost;
+                    }
                 }
                 std.atomic.spinLoopHint();
             }
         };
+    }
+
+    /// A rank that lost its group closes the shared segment (its peer sees it at once) and exits non-zero so systemd
+    /// restarts the pair instead of serving broken rounds until an operator restarts them. The pair can no longer run
+    /// when one of its ranks is gone, so every rank leaves a zero exit code.
+    fn waitGroupLost(g: *Group, e: anyerror) noreturn {
+        markClosed(g);
+        std.log.err("rank {d}: all-reduce {d}: the group is lost ({s})\n", .{ g.rank, g.seq, @errorName(e) });
+        std.process.exit(1);
     }
 
     /// `partial` on the device holds `rows` x D fp16: on return it holds the ranks' sum. Every rank calls this the
@@ -207,8 +254,12 @@ pub const Group = struct {
             const par: usize = @intCast(g.seq % 2);
             try dev.copy(d, g.dslot[par], partial, n * 2);
             d.settle();
-            g.counter(g.rank).store(g.seq, .seq_cst);
-            try g.waitPeers();
+            g.counter(g.rank).store(g.seq, .seq_cst); // the counter and the liveness word are the rank's heartbeat
+            aliveWord(g, g.rank).store(@intFromFloat(q.now()), .release);
+            if (g.waitPeers()) |_| {} else |e| {
+                // the group is lost: this rank closes it and exits instead of waiting 180 s or serving broken rounds
+                waitGroupLost(g, e);
+            }
             try dev.copy(d, g.pbuf[par], g.peer[par].?, n * 2); // over PCIe, on the in-order list
             try d.launch(d.k.tp_add, .{ .x = @intCast((n + 255) / 256) }, .{ partial, g.dslot[par], g.pbuf[par], @as(i32, @intCast(n)) });
             return;
@@ -216,8 +267,12 @@ pub const Group = struct {
         try dev.copy(d, @ptrCast(g.mine), partial, n * 2);
         d.settle();
         @memcpy(g.slot(g.rank, g.seq)[0..n], g.mine[0..n]);
-        g.counter(g.rank).store(g.seq, .seq_cst);
-        try g.waitPeers();
+        g.counter(g.rank).store(g.seq, .seq_cst); // the counter and the liveness word are the rank's heartbeat
+        aliveWord(g, g.rank).store(@intFromFloat(q.now()), .release);
+        if (g.waitPeers()) |_| {} else |e| {
+            // the group is lost: this rank closes it and exits instead of waiting 180 s or serving broken rounds
+            waitGroupLost(g, e);
+        }
         // the sum in fp32, rounded once: the ranks add in the same order, so both hold the same bits
         for (0..n) |i| {
             var acc: f32 = 0;
