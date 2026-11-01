@@ -454,17 +454,19 @@ pub const Runner = struct {
 
     // ------------------------------------------------------------ the shared K/V pool (XPU_KV_POOL)
 
-    /// Bytes of one K (or V) page of one attention layer: PAGE positions of the card's K/V heads and their scales.
+    /// Bytes of one K (or V) page of one attention layer: PAGE positions of the card's K/V heads, their values then
+    /// their scales (limits.KvLayout: Q27_KVROW is this rank's heads, half the model's at TP 2).
     pub fn pageBytes(r: *const Runner) usize {
         _ = r;
-        return PAGE * ATT_KV_HEADS * (256 + 4);
+        const lay = slot_states.kv();
+        return PAGE * (lay.row() + lay.scaleRow());
     }
 
     /// Bytes one position takes in K/V on this card: every attention layer, K and V.
     pub fn kvBytesPerToken(r: *const Runner) usize {
-        var layers: usize = 0;
-        for (r.model.layers) |l| layers += @intFromBool(l.attn);
-        return layers * 2 * ATT_KV_HEADS * (256 + 4);
+        _ = r;
+        const lay = slot_states.kv();
+        return (LAYERS / 4) * 2 * (lay.row() + lay.scaleRow());
     }
 
     /// The pool's device bytes: K pages then V pages in every attention layer.

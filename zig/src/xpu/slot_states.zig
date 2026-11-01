@@ -20,7 +20,7 @@ pub fn gdnBytes(r: *const Runner) usize {
 
 /// Bytes a slot's states take: GDN and convolution states, and the K/V cache of `context` positions (none with the pool).
 pub fn slotBytes(r: *const Runner) usize {
-    return gdnBytes(r) + if (q.kv_pool) 0 else 16 * 2 * kvBytes();
+    return gdnBytes(r) + if (q.kv_pool) 0 else (q.LAYERS / 4) * 2 * kvBytes();
 }
 
 /// A slot's state after `at` prompt tokens (prompt cache): GDN and convolution states, K/V rows 0 .. at, one buffer.

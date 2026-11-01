@@ -265,8 +265,9 @@ pub fn dumpBuf(d: *Dev, name: []const u8, p: *anyopaque, n: usize, kind: enum { 
 
 /// What a forward leaves: nothing, the last row's logits and greedy token, or every row's (verification, ≤ 16 rows).
 pub const Want = enum { none, last, rows };
+/// Bytes of one layer's K (or V) cache on this rank: its own K/V heads (4 at TP 1, 2 at TP 2), not the model's.
 pub fn kvBytes() usize {
-    return @as(usize, q.MAX_CTX) * 4 * @as(usize, if (q.kv_i8) 256 + 4 else 256 * 2);
+    return @as(usize, q.MAX_CTX) * @as(usize, q.ATT_KV_HEADS) * @as(usize, if (q.kv_i8) 256 + 4 else 256 * 2);
 }
 pub fn kvCap() i32 {
     return if (q.kv_i8) @intCast(q.MAX_CTX) else 0;
