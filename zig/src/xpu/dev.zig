@@ -199,6 +199,12 @@ pub const Dev = struct {
         return d.g.deviceAlloc(@max(bytes, 64));
     }
 
+    /// Pinned host USM (`zeMemAllocHost`): the kernels read it over PCIe (the embedding table at XPU_EMBED_HOST=1),
+    /// so it takes no device memory. The driver maps it into the GPU's address space and reads resolve over PCIe.
+    pub fn hostAlloc(d: *Dev, bytes: usize) !*anyopaque {
+        return try d.g.hostAlloc(bytes);
+    }
+
     pub fn upload(d: *Dev, bytes: []const u8) !*anyopaque {
         const p = try d.alloc_(bytes.len);
         try d.copyIn(p, bytes);

@@ -169,6 +169,8 @@ pub fn mlpIn(d: *Dev, m: *const Model, a: *Acts, w: Proj, T: u32, gs: i32, pre: 
 }
 
 /// The rows' embeddings: x fp32 [T, D] (bf16 values) for the token ids at `ids` on the device.
+/// `m.embed_w` is device memory by default; with XPU_EMBED_HOST=1 it is pinned host USM and `embed_dense`
+/// reads its rows over PCIe, so no gather or staging buffer is needed on the host side.
 pub fn embedRows(d: *Dev, m: *const Model, ids: *anyopaque, x: *anyopaque, rows: u32) !void {
     if (m.embed_s) |es|
         try d.launch(d.k.embed, .{ .x = rows }, .{ ids, m.embed_w, es, m.embed_b.?, x, @as(i32, D) })

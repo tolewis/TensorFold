@@ -282,16 +282,25 @@ fn normTensor(d: *Dev, c: *const Checkpoint, name: []const u8, centred: bool) !*
     return d.upload(std.mem.sliceAsBytes(out));
 }
 
-/// The BF16 embedding table to the fp16 table embed_dense reads, in row blocks through the host.
+/// The fp16 embedding table `embed_dense` reads by row (row `ids[t]`): device memory by default, pinned host USM
+/// when `q.embed_host` is set. Returns the pointer the kernel gets; with the flag it is host memory read over PCIe.
 fn embedTable(d: *Dev, c: *const Checkpoint) !*anyopaque {
     const t = try c.get("model.embed_tokens.weight");
     if (!std.mem.eql(u8, t.dtype, "BF16") or t.shape[1] != D) return error.UnexpectedDtype;
-    const out = try d.alloc_(t.bytes.len);
+    // fp16 rows: vocab x D (a card frees ~2.5 GB of VRAM when the table stays on the host).
+    const bytes = t.bytes.len;
+    if (q.embed_host) {
+        const out = try d.hostAlloc(bytes); // zeMemAllocHost, pinned: `embed_dense` reads its rows over PCIe
+        const n = bytes / 2; // fp16 rows
+        for (0..n) |i| (@as([*]f16, @ptrCast(out))[i]) = @floatCast(@as(f32, @bitCast(@as(u32, std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little)) << 16)));
+        return out;
+    }
+    const out = try d.alloc_(bytes);
     const block = 4096 * D;
     const buf = try alloc.alloc(f16, block);
     defer alloc.free(buf);
     var at: usize = 0;
-    const n = t.bytes.len / 2;
+    const n = bytes / 2;
     while (at < n) {
         const m = @min(block, n - at);
         for (buf[0..m], 0..) |*o, i| o.* = @floatCast(@as(f32, @bitCast(@as(u32, std.mem.readInt(u16, t.bytes[2 * (at + i) ..][0..2], .little)) << 16)));
@@ -399,5 +408,7 @@ pub fn loadExl3(d: *Dev, c: *const Checkpoint) !loader.Model {
         if (i % 8 == 7) std.debug.print("  EXL3 layers loaded: {d}/{d}\n", .{ i + 1, q.LAYERS });
     }
     try d.sync();
+    // XPU_EMBED_HOST=1: the fp16 table stays on the host; its bytes take no VRAM on this card.
+    if (q.embed_host) std.debug.print("embed on the host: {d:.2} GB of device memory saved ({d} x {d} fp16 rows)\n", .{ q.VOCAB * D * 2 / 1e9, q.VOCAB, D });
     return m;
 }
