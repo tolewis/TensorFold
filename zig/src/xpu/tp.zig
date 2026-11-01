@@ -82,8 +82,10 @@ pub const Norm = struct {
     rot: i32,
 };
 
-/// The magic a rank writes into the peer's flag word at open (plus its rank), to prove the write lands.
+/// The magic a rank writes into the peer's flag word at open (plus its rank), to prove the host-to-peer write
+/// lands. `tp_magic2` does the same for the device-to-peer write the partial push uses.
 const tp_magic: u64 = 0x5450_464c_4147_3100;
+const tp_magic2: u64 = 0x5055_5348_5000_0000;
 
 /// The group this process is in, opened by Runner.init; null at TP 1.
 pub var group: ?Group = null;
@@ -441,32 +443,35 @@ pub const Group = struct {
         g.direct = true;
     }
 
-    /// Proves that the peer's exported block takes this rank's writes before the device-flag path is trusted: this
-    /// rank writes a magic into the peer's flag word, the peer does the same, each waits for the other's write to
-    /// land (a byte over the socket), reads its own flag word and resets it.
+    /// Proves both writes the device-flag path uses before it is trusted: a host-to-peer write (the flag) and a
+    /// device-to-peer write (the partial push). Each rank writes its magics into the peer's block, waits for the
+    /// peer's writes to land (a byte over the socket), reads its own flag and peer-consumed words, checks them and
+    /// resets them.
     fn selfTest(g: *Group, d: *Dev, list: ze.H, conn: linux.fd_t) !bool {
         const st = @as([*]u64, @ptrCast(@alignCast(try d.g.hostAlloc(64))));
         @memset(st[0..8], 0);
-        st[0] = tp_magic + g.rank;
+        st[0] = tp_magic + g.rank; // the flag: a host-to-peer write
+        st[1] = tp_magic2 + g.rank; // the push: a device-to-peer write
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(list, off(g.peer_blk.?, blk_flag), @ptrCast(st), 8, null, 0, null));
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(list, g.own_cons.?, @ptrCast(st + 1), 8, null, 0, null));
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(list, off(g.peer_blk.?, blk_pcons), g.own_cons.?, 8, null, 0, null));
         try ze.check(d.g.api.zeCommandListHostSynchronize(list, std.math.maxInt(u64)));
         const b: u8 = 1;
         var r: u8 = 0;
         try sendByte(conn, b);
         try recvByte(conn, &r);
-        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(list, @ptrCast(st + 1), off(g.blk.?, blk_flag), 8, null, 0, null));
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(list, @ptrCast(st + 1), off(g.blk.?, blk_flag), 24, null, 0, null));
         try ze.check(d.g.api.zeCommandListHostSynchronize(list, std.math.maxInt(u64)));
-        const got = st[1];
-        const ok = got == tp_magic + (1 - g.rank);
-        // reset this rank's flag and consumed words (both ranks wrote before the byte exchange)
-        st[1] = 0;
-        st[2] = 0;
-        st[3] = 0;
-        st[4] = 0;
+        const got_flag = st[1];
+        const got_push = st[3]; // flag[0], flag[1], then pcons[0]
+        const ok = got_flag == tp_magic + (1 - g.rank) and got_push == tp_magic2 + (1 - g.rank);
+        // reset this rank's flag and peer-consumed words and its own consumed counters (both ranks wrote before the
+        // byte exchange, so neither can land here after the reset)
+        @memset(st[1..5], 0);
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(list, off(g.blk.?, blk_flag), @ptrCast(st + 1), 32, null, 0, null));
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(list, g.own_cons.?, @ptrCast(st + 1), 16, null, 0, null));
         try ze.check(d.g.api.zeCommandListHostSynchronize(list, std.math.maxInt(u64)));
-        if (!ok) std.log.warn("qwen27-xpu: TP rank {d}: the peer's block did not take a write (read 0x{x})", .{ g.rank, got });
+        if (!ok) std.log.warn("qwen27-xpu: TP rank {d}: the peer's block did not take the writes (flag 0x{x}, push 0x{x})", .{ g.rank, got_flag, got_push });
         return ok;
     }
 };
