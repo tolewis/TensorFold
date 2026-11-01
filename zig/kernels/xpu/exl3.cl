@@ -169,11 +169,15 @@ __kernel void exl3_rotate_in(__global const uchar *base, __global const exl3_des
 // exl3_rotate_in does. After hadamard128 lane c holds k = blk + c + 16 j in v[j]: the xr of k tile j.
 #define DPH(a, b, c) intel_sub_group_f16_f16_matrix_mad_k16(as_short8(a), as_int8(b), c)
 
-inline int8 tile_b(__global const uint *t, uint c) {
-    const uint g = c % 8, h = c / 8;
+// The lane's LOADW stream words of one tile: issued apart from the decode so that KU tiles' loads are in flight together.
+inline void tile_load(__global const uint *t, uint c, uint raw[LOADW]) {
+    const uint g = c % 8;
     const uint wbase = ((32 * g * BITS + BITS + 32 * RINGW - 16) / 32) % RINGW;
-    uint raw[LOADW], w[USEW];
     for (uint j = 0; j < LOADW; j++) raw[j] = t[(wbase + j) % RINGW];
+}
+inline int8 tile_decode(const uint raw[LOADW], uint c) {
+    const uint h = c / 8;
+    uint w[USEW];
     for (uint j = 0; j < USEW; j++) w[j] = h ? (SHB ? (raw[j + SHW] << SHB) | (raw[j + SHW + 1] >> (32 - SHB)) : raw[j + SHW]) : raw[j];
     half kv[16];
     for (uint v = 0; v < 16; v++) {
@@ -183,6 +187,11 @@ inline int8 tile_b(__global const uint *t, uint c) {
     int8 b;
     for (uint j = 0; j < 8; j++) ((int *)&b)[j] = as_int((half2)(kv[2 * j], kv[2 * j + 1]));
     return b;
+}
+inline int8 tile_b(__global const uint *t, uint c) {
+    uint raw[LOADW];
+    tile_load(t, c, raw);
+    return tile_decode(raw, c);
 }
 
 #ifndef DP
@@ -227,25 +236,33 @@ __kernel void exl3_matvec(__global const uchar *base, __global const exl3_desc *
     float vr[ROWS][8];  // fuse: the rotated block, K span a multiple of 128 (the host checks)
 #endif
 #if DP
+#ifndef KU
+#define KU 1                                          // k tiles a loop step: KU x NS tiles' loads in flight before any decode
+#endif
     float8 acc[NS][RB];
     for (uint s = 0; s < NS; s++)
         for (uint rb = 0; rb < RB; rb++) acc[s][rb] = 0.0f;
-    for (uint kb = k0; kb < k0 + kspan; kb += 16, tile += tile_k) {
-        float xr[ROWS];
-        LOAD_XR(xr, kb, c)
-        short8 ah[RB], al[RB];
-        for (uint rb = 0; rb < RB; rb++)
-            for (uint r = 0; r < 8; r++) {
-                const float f = rb * 8 + r < ROWS ? xr[rb * 8 + r] : 0.0f;
-                const half hv = convert_half_rte(f);
-                ah[rb][r] = as_short(hv);
-                al[rb][r] = as_short(convert_half_rte(f - (float)hv));
-            }
-        for (uint s = 0; s < NS; s++) {
-            const int8 b = tile_b(tile + s * RINGW, c);
-            for (uint rb = 0; rb < RB; rb++) {
-                acc[s][rb] = DPH(ah[rb], b, acc[s][rb]);
-                acc[s][rb] = DPH(al[rb], b, acc[s][rb]);
+    for (uint kb = k0; kb < k0 + kspan; kb += 16 * KU, tile += tile_k * KU) {  // the host keeps K / 16 / ks a multiple of KU
+        uint raw[KU][NS][LOADW];
+        for (uint u = 0; u < KU; u++)
+            for (uint s = 0; s < NS; s++) tile_load(tile + u * tile_k + s * RINGW, c, raw[u][s]);
+        for (uint u = 0; u < KU; u++) {
+            float xr[ROWS];
+            LOAD_XR(xr, kb + 16 * u, c)
+            short8 ah[RB], al[RB];
+            for (uint rb = 0; rb < RB; rb++)
+                for (uint r = 0; r < 8; r++) {
+                    const float f = rb * 8 + r < ROWS ? xr[rb * 8 + r] : 0.0f;
+                    const half hv = convert_half_rte(f);
+                    ah[rb][r] = as_short(hv);
+                    al[rb][r] = as_short(convert_half_rte(f - (float)hv));
+                }
+            for (uint s = 0; s < NS; s++) {
+                const int8 b = tile_decode(raw[u][s], c);
+                for (uint rb = 0; rb < RB; rb++) {
+                    acc[s][rb] = DPH(ah[rb], b, acc[s][rb]);
+                    acc[s][rb] = DPH(al[rb], b, acc[s][rb]);
+                }
             }
         }
     }

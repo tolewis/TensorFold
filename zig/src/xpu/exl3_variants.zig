@@ -39,8 +39,11 @@ pub fn name(comptime v: Variant) []const u8 {
     return std.fmt.comptimePrint("exl3_b{d}_r{d}_n{d}{s}", .{ v.bits, v.rows, v.ns, if (v.hs) "_hs" else "" });
 }
 
+/// K tiles a matvec loop step on the DPAS path (exl3.cl KU): that many tiles' loads are in flight before a decode.
+pub const ku: u32 = 1;
+
 pub fn options(comptime v: Variant) []const u8 {
-    return std.fmt.comptimePrint("-cl-std=CL3.0 -DEXL3_ABS -DBITS={d} -DROWS={d} -DNS={d} -DHS={d}", .{ v.bits, v.rows, v.ns, @intFromBool(v.hs) });
+    return std.fmt.comptimePrint("-cl-std=CL3.0 -DEXL3_ABS -DBITS={d} -DROWS={d} -DNS={d} -DHS={d} -DKU={d}", .{ v.bits, v.rows, v.ns, @intFromBool(v.hs), ku });
 }
 
 /// The fused routed MLP (exl3_moe_*): one image a width. K splits and strips measured on the B70 with one Sage
