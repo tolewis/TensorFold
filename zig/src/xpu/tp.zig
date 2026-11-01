@@ -100,6 +100,11 @@ pub const Group = struct {
         return @ptrCast(@alignCast(g.map.ptr + at));
     }
 
+    /// A rank closes the shared segment (the group's flag and its peers' view of it) when its session ends or errors.
+    pub fn markClosed(g: *Group) void {
+        closed(g).store(1, .release);
+    }
+
     fn rec(g: *const Group, i: u64) *Rec {
         return @ptrCast(@alignCast(g.map.ptr + g.tp * line + 2 * g.tp * slot_bytes + line + (i % ring_len) * @sizeOf(Rec)));
     }
@@ -318,11 +323,6 @@ pub const Group = struct {
         g.direct = true;
     }
 };
-
-/// A rank closes the shared segment (the group's flag and its peers' view of it) when its session ends or errors.
-pub fn markClosed(g: *Group) void {
-    closed(g).store(1, .release);
-}
 
 const cmsg_space = ((@sizeOf(linux.cmsghdr) + 2 * 4 + 7) / 8) * 8; // a control message with two fds
 
