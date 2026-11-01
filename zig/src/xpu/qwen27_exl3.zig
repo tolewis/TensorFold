@@ -378,12 +378,13 @@ pub fn loadExl3(d: *Dev, c: *const Checkpoint) !loader.Model {
             l.ab = try d.alloc_(2 * HV * D * 2);
             try d.copyIn(l.ab.?, ta.bytes[R * HV * D * 2 ..][0 .. HV * D * 2]);
             try d.copyIn(off(l.ab.?, HV * D * 2), tb.bytes[R * HV * D * 2 ..][0 .. HV * D * 2]);
-            // conv1d [10240 channels, 4 taps] bf16 by channel in qkv order, A_log and dt_bias by value head, the norm
-            // by value column: the rank's heads of each (whole at TP 1)
+            // conv1d [10240 channels, 4 taps] bf16 by channel in qkv order, A_log and dt_bias by value head: the
+            // rank's heads of each (whole at TP 1). The GDN norm weight is [128], one row of head dim shared by every
+            // head: whole at every TP.
             l.conv_w = try rowsTensor(d, c, f(&nb[0], i, "linear_attn.conv1d.weight"), 4 * 2, &.{ .{ R * hk, hk }, .{ q.TP * hk + R * hk, hk }, .{ 2 * q.TP * hk + R * hv, hv } });
             l.alog = try rowsTensor(d, c, f(&nb[0], i, "linear_attn.A_log"), 2, &.{.{ R * q.GDN_V_HEADS, q.GDN_V_HEADS }});
             l.dt = try rowsTensor(d, c, f(&nb[0], i, "linear_attn.dt_bias"), 2, &.{.{ R * q.GDN_V_HEADS, q.GDN_V_HEADS }});
-            l.gnorm = try rowsTensor(d, c, f(&nb[0], i, "linear_attn.norm.weight"), 2, &.{.{ R * hv, hv }});
+            l.gnorm = try normTensor(d, c, f(&nb[0], i, "linear_attn.norm.weight"), false);
             l.rec = try d.alloc_(HV * 128 * 128 * 4);
             l.rec_save = try d.alloc_(HV * 128 * 128 * 4);
             l.stash = try d.alloc_(q.STASH);
