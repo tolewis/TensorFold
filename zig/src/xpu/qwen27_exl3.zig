@@ -292,7 +292,7 @@ fn embedTable(d: *Dev, c: *const Checkpoint) !*anyopaque {
     if (q.embed_host) {
         const out = try d.hostAlloc(bytes); // zeMemAllocHost, pinned: `embed_dense` reads its rows over PCIe
         const n = bytes / 2; // fp16 rows
-        for (0..n) |i| (@as([*]f16, @ptrCast(out))[i]) = @floatCast(@as(f32, @bitCast(@as(u32, std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little)) << 16)));
+        for (0..n) |i| (@as([*]f16, @ptrCast(@alignCast(out)))[i]) = @floatCast(@as(f32, @bitCast(@as(u32, std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little)) << 16)));
         return out;
     }
     const out = try d.alloc_(bytes);
