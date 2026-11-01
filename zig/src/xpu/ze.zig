@@ -244,7 +244,12 @@ pub const Gpu = struct {
         return true;
     }
 
+    /// Opens the `XPU_DEVICE`-th (default the first) device with PCI id `device_id`. The context spans every device
+    /// the driver shows: a TP rank that imports the other card's memory must see that card, so TP 2 ranks run with
+    /// XPU_DEVICE and no ZE_AFFINITY_MASK (a masked driver hides the peer and the import fails at the first launch).
     pub fn open(device_id: u32) Error!Gpu {
+        const want: u32 = if (std.c.getenv("XPU_DEVICE")) |v| std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0 else 0;
+        var seen: u32 = 0;
         var lib = std.DynLib.open("libze_loader.so.1") catch return error.LoaderUnavailable;
         errdefer lib.close();
         const api = try resolve(Api, &lib);
@@ -260,6 +265,10 @@ pub const Gpu = struct {
                 var p: DeviceProperties = .{};
                 try check(api.zeDeviceGetProperties(dev, &p));
                 if (p.deviceId != device_id) continue;
+                if (seen != want) {
+                    seen += 1;
+                    continue;
+                }
                 var ctx: H = null;
                 try check(api.zeContextCreate(drv, &.{}, &ctx));
                 return .{ .lib = lib, .api = api, .driver = drv, .device = dev, .context = ctx, .props = p };
