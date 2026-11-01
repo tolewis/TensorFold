@@ -217,7 +217,7 @@ pub fn stepMulti(r: *Runner, slots: []const u32, tokens: []const u32) !void {
     var wins: [16]Win = undefined;
     if (tp.group) |*g| { // the slots, then the tokens
         var words: [32]u32 = undefined;
-        const n = @min(slots.len, 16);
+        const n: usize = @min(slots.len, 16); // usize: see verifyTree
         @memcpy(words[0..n], slots[0..n]);
         @memcpy(words[n .. 2 * n], tokens[0..@min(tokens.len, n)]);
         try g.record(.step_multi, @intCast(n), 0, 0, words[0 .. 2 * n]);
