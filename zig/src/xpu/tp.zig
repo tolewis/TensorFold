@@ -41,6 +41,7 @@ comptime {
 /// The group this process is in, opened by Runner.init; null at TP 1.
 pub var group: ?Group = null;
 var one_slot = false;
+var trace = false;
 
 pub const Group = struct {
     map: []align(std.heap.page_size_min) u8,
@@ -73,6 +74,7 @@ pub const Group = struct {
     pub fn open(d: *Dev) !?Group {
         if (q.TP == 1) return null;
         one_slot = std.c.getenv("TF_TP_ONE_SLOT") != null;
+        trace = std.c.getenv("TF_TP_TRACE") != null;
         const name: [*:0]const u8 = if (std.c.getenv("TF_TP_SHM")) |v| v else "/dev/shm/tf-tp-qwen27";
         const size = q.TP * line + 2 * q.TP * slot_bytes + line + ring_len * @sizeOf(Rec);
         // the file as the fabric's mailbox opens its own (fabric/tp/mailbox.zig): either rank may create it
@@ -100,6 +102,7 @@ pub const Group = struct {
     /// words. Waits while the ring is full (a follower 64 records behind).
     pub fn record(g: *Group, op: Op, a: u32, b: u32, id: u64, data: []const u32) !void {
         if (g.rank != 0) return;
+        if (trace) std.debug.print("record {d}: {s} a {d} b {d} n {d} data[0] {d}\n", .{ g.step, @tagName(op), a, b, data.len, if (data.len > 0) data[0] else 0 });
         var at: usize = 0;
         var first = true;
         while (first or at < data.len) {
@@ -155,7 +158,10 @@ pub const Group = struct {
             const deadline = q.now() + 180.0;
             var spins: usize = 0;
             while (c.load(.seq_cst) < g.seq) : (spins += 1) {
-                if (spins % 4096 == 0 and q.now() > deadline) return error.PeerLost;
+                if (spins % 4096 == 0 and q.now() > deadline) {
+                    std.debug.print("rank {d}: all-reduce {d} of {d} rows after record {d}: the peer is at {d}\n", .{ g.rank, g.seq, rows, g.step, c.load(.seq_cst) });
+                    return error.PeerLost;
+                }
                 std.atomic.spinLoopHint();
             }
         };
