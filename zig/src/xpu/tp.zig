@@ -419,7 +419,7 @@ pub const Group = struct {
         for (0..2) |i| {
             g.dslot[i] = off(blk, i * slot_bytes);
             g.pbuf[i] = off(blk, (2 + i) * slot_bytes);
-            g.peer[i] = off(p, i * slot_bytes);
+            g.peer[i] = off(p.?, i * slot_bytes);
         }
         g.direct = true;
     }
