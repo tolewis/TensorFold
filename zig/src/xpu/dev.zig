@@ -227,7 +227,7 @@ pub const Dev = struct {
             ev = q.prof.events[q.prof.used];
             q.prof.kernel[q.prof.used] = k;
             q.prof.used += 1;
-        } else ev = winprof.attach(&d.g, k);
+        } else ev = winprof.attach(k);
         try ze.check(d.g.api.zeCommandListAppendLaunchKernel(d.list, k, &groups, ev, 0, null));
     }
 

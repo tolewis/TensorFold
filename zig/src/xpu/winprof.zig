@@ -24,7 +24,7 @@ pub const Class = enum(u8) {
     other,
 };
 
-const nclasses = @typeInfo(Class).@"enum".fields.len;
+const nclasses = @typeInfo(Class).@"enum".field_names.len;
 
 pub const class_names = [_][]const u8{
     "exl3 mixer in (qkv, gdn in)",
@@ -94,9 +94,10 @@ pub fn classOfName(name: []const u8) Class {
 pub fn register(ks: anytype) void {
     inline for (@typeInfo(@TypeOf(ks)).@"struct".field_names) |name| {
         const h = @field(ks, name);
-        if (h == null or reg_n == reg.len) continue;
-        reg[reg_n] = .{ .h = h, .c = classOfName(name) };
-        reg_n += 1;
+        if (h != null and reg_n < reg.len) {
+            reg[reg_n] = .{ .h = h, .c = classOfName(name) };
+            reg_n += 1;
+        }
     }
 }
 
@@ -107,7 +108,7 @@ fn classOf(h: ze.H) Class {
 }
 
 /// The event a launch on this class takes, or null (profile off, or the pool full: the launch is then untimed).
-pub fn attach(g: *ze.Gpu, h: ze.H) ze.H {
+pub fn attach(h: ze.H) ze.H {
     if (!on) return null;
     if (used == events.len) {
         dropped += 1;
@@ -181,7 +182,7 @@ pub fn report() void {
     };
     const gap = wall - gpu - wait_s;
     std.debug.print("-- window profile, rows {d}, {d} passes: wall {d:.1} ms, gpu {d:.1} ms ({d:.1} %), host gaps {d:.1} ms\n", .{ rows, passes, wall * 1e3, gpu * 1e3, if (wall > 0) gpu / wall * 100 else 0, gap * 1e3 });
-    std.debug.print("   {s:<28} {s:>9} {s:>6} {s:>9}\n", .{ "class", "ms", "%", "launches" });
+    std.debug.print("   {s:<28} {s:>9} {s:>6} {s:>9}\n", .{ "class", "ms", "% gpu", "launches" });
     for (class_names, total, calls) |name, t, n| {
         if (t <= 0 and n == 0) continue;
         std.debug.print("   {s:<28} {d:>9.2} {d:>5.1} {d:>9}\n", .{ name, t * 1e3, if (gpu > 0) t / gpu * 100 else 0, n });

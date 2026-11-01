@@ -26,7 +26,7 @@ pub fn launch(k: Kernel, s: Stream, groups: [3]u32) Error!void {
     const g: ze.GroupCount = .{ .x = groups[0], .y = groups[1], .z = groups[2] };
     if (g.x == 0 or g.y == 0 or g.z == 0) return error.Invalid;
     // XPU_WINDOW_PROFILE: the launch takes an event (null when off) so the measure can read its GPU time
-    const ev = winprof.attach(&k.ctx.gpu, k.handle);
+    const ev = winprof.attach(k.handle);
     try k.ctx.d.check(k.ctx.d.api.zeCommandListAppendLaunchKernel(s.list, k.handle, &g, ev, 0, null), "zeCommandListAppendLaunchKernel");
 }
 

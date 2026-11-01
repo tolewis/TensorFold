@@ -94,7 +94,7 @@ pub const Lanes = struct {
                 xq.winprof.setTag(.drafter);
                 xq.winprof.beginPass();
                 const items = [1]xq.drafter.Block{.{ .slot = slot, .pending = 0 }};
-                try d.latticeMulti(items[0..], b.block - 1);
+                try d.latticeMulti(items[0..], @max(b.block - 1, 1));
                 try r.d.sync();
                 xq.winprof.endPass();
                 xq.winprof.setTag(.other);
