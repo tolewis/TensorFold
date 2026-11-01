@@ -145,7 +145,7 @@ pub const Dev = struct {
         kv_move: ze.H,
         exl3_gemv: ze.H,
         rot_heads: ze.H,
-        tp_add: ze.H,
+        tp_add: ze.H = null, // the TP 2 all-reduce add (the 27B loads it, Sage has none)
         attn_prompt: ze.H,
         attn_prompt8: ze.H,
         embed_dense: ze.H,
