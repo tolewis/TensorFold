@@ -780,19 +780,21 @@ fn zeroed(d: *Dev, p: *anyopaque, bytes: usize) !void {    const first = @min(by
 const pass_reserve: u64 = 650_000_000;
 /// Bytes the card holds beyond what Dev.allocated counts (the runtime's own buffers).
 const held_not_counted: u64 = 400_000_000;
-/// Card bytes kept for the GDN and convolution copies of kept prompt states (their K/V pages come from the pool).
-const cache_gdn: u64 = 1 << 30;
+/// Card bytes kept for the GDN, convolution and drafter-context copies of kept prompt states (their K/V pages come
+/// from the pool).
+const cache_gdn: u64 = 1536 << 20;
 /// Pages a pool is rounded down to: both ranks of a TP 2 pair size the same pool, so they map the same page ids.
 const sync_pages: u32 = 256;
 
 /// The pool's pages: `tokens` rounded up to whole pages, else what the card leaves after the load, the drafter, the
-/// GDN states of `slots` streams, the activations and the reserve (and, with a prompt cache, its GDN copies).
-pub fn poolPages(r: *Runner, slots: u32, tokens: ?u32, cache: bool) !u32 {
+/// GDN states of `slots` streams, their drafter contexts (`extra` bytes a stream), the activations and the reserve
+/// (and, with a prompt cache, its GDN copies).
+pub fn poolPages(r: *Runner, slots: u32, tokens: ?u32, cache: bool, extra: u64) !u32 {
     if (tokens) |t| return @max(1, (t + PAGE - 1) / PAGE);
     const mem = try r.d.g.memory();
     const keep = pass_reserve + held_not_counted + (if (cache) cache_gdn else 0);
     const gdn: u64 = @intCast(slot_states.slotBytes(r));
-    const counted = @as(u64, r.d.allocated) + gdn * @as(u64, if (slots > 1) slots - 1 else 0);
+    const counted = @as(u64, r.d.allocated) + (gdn + extra) * @as(u64, if (slots > 1) slots - 1 else 0);
     const left = (mem.size -| keep) -| counted;
     var layers: usize = 0;
     for (r.model.layers) |l| layers += @intFromBool(l.attn);
@@ -803,10 +805,10 @@ pub fn poolPages(r: *Runner, slots: u32, tokens: ?u32, cache: bool) !u32 {
 
 /// The pool's pages for a TP 2 pair: rank 0 sizes it and publishes the count, a follower waits for it and takes the
 /// same, so both ranks map the same page ids.
-pub fn poolPagesShared(r: *Runner, slots: u32, cache: bool) !u32 {
-    const g = if (tp.group) |*x| x else return poolPages(r, slots, pool_tokens, cache);
+pub fn poolPagesShared(r: *Runner, slots: u32, cache: bool, extra: u64) !u32 {
+    const g = if (tp.group) |*x| x else return poolPages(r, slots, pool_tokens, cache, extra);
     if (g.rank == 0) {
-        const pages = try poolPages(r, slots, pool_tokens, cache);
+        const pages = try poolPages(r, slots, pool_tokens, cache, extra);
         g.setPool(pages);
         return pages;
     }
@@ -814,8 +816,8 @@ pub fn poolPagesShared(r: *Runner, slots: u32, cache: bool) !u32 {
 }
 
 /// The pool for a runner opened on its own (qwen27_main): sized from the card, `slots` streams' GDN states counted.
-pub fn openPool(r: *Runner, slots: u32) !void {
-    const pages = try poolPagesShared(r, slots, true);
+pub fn openPool(r: *Runner, slots: u32, drafter_ctx: u64) !void {
+    const pages = try poolPagesShared(r, slots, true, drafter_ctx);
     if (pages == 0) return error.PoolDoesNotFit;
     try r.allocPool(pages);
 }

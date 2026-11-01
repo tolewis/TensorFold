@@ -130,7 +130,8 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
         // the shared K/V pool: what the card leaves after the load, the drafter, every stream's GDN states and the
         // reserve; the streams are the ones its pages cover at --context tokens each
         const cache_on = if (o.prompt_cache_gib) |gib| gib > 0 else true;
-        const pages = try xq.poolPagesShared(runner, want, cache_on);
+        const drafter_ctx: u64 = if (drafter != null) @intCast(Drafter.ctxBytes()) else 0; // a stream's drafter context
+        const pages = try xq.poolPagesShared(runner, want, cache_on, drafter_ctx);
         if (pages == 0) return error.PoolDoesNotFit;
         const by_pool: u32 = @intCast(@min(@as(u64, want), (@as(u64, pages) * xq.PAGE) / context));
         if (by_pool == 0) return error.StreamDoesNotFit;
@@ -178,9 +179,9 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
     if (budget > 0) {
         // the prompt kernels compute in blocks of 64 rows from a call's start: kept and resumed at planned marks only
         h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = h, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, .{ .planned = true, .grid = 64 }, budget);
-        if (xq.kv_pool) { // kept states' GDN copies stay inside the reserve the pool left for them
-            const gdn = xq.gdnBytes(runner);
-            h.cache.?.most = @intCast(@max(1, (1 << 30) / @max(gdn, 1)));
+        if (xq.kv_pool) { // kept states' GDN and drafter-context copies stay inside the reserve the pool left for them
+            const per = xq.gdnBytes(runner) + (if (drafter) |dd| dd.ctxBytes() else 0);
+            h.cache.?.most = @intCast(@max(1, (1536 << 20) / @max(per, 1)));
         }
         h.host.cache = &h.cache.?;
         h.host.info_.prompt_cache = true;
@@ -221,7 +222,7 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
         return false;
     }
     if (xq.kv_pool) { // the pool rank 0 sized: both ranks map the same page ids
-        const pages = xq.poolPagesShared(runner, @min(@max(o.lanes, 1), xq.MAX_SLOTS), true) catch |err| {
+        const pages = xq.poolPagesShared(runner, @min(@max(o.lanes, 1), xq.MAX_SLOTS), true, 0) catch |err| {
             problem.* = try std.fmt.allocPrint(a, "rank {d} could not size the K/V pool: {s}", .{ xq.RANK, @errorName(err) });
             return false;
         };
