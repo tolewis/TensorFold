@@ -294,7 +294,19 @@ const Shape = struct { variant: usize, ks: u32 };
 fn shapeOf(plan: *const Plan, rows: u32, strips_total: u32) Error!Shape {
     const strips: variants.Strips = .{ .min = plan.strips.min, .gcd = plan.strips.gcd, .total = strips_total };
     const vi = variants.pick(plan.bits, rows, strips) orelse return error.Invalid;
-    return .{ .variant = vi, .ks = variants.split(strips.total / variants.all[vi].ns, plan.k_tiles_gcd) };
+    var sh: Shape = .{ .variant = vi, .ks = variants.split(strips.total / variants.all[vi].ns, plan.k_tiles_gcd) };
+    // Bench knobs (tools/xpu/exl3_27b_bench.py): EXL3_NS picks the image of that NS in the row bucket, EXL3_KS the
+    // K splits. Unset in a serving binary's environment, so the measured rule above decides.
+    if (std.c.getenv("EXL3_NS")) |v| {
+        const ns = std.fmt.parseInt(u32, std.mem.span(v), 10) catch return error.Invalid;
+        const bucket = variants.all[vi].rows;
+        sh.variant = for (variants.all, 0..) |x, i| {
+            if (x.bits == plan.bits and x.rows == bucket and x.ns == ns) break i;
+        } else return error.Invalid;
+        sh.ks = variants.split(strips.total / ns, plan.k_tiles_gcd);
+    }
+    if (std.c.getenv("EXL3_KS")) |v| sh.ks = std.fmt.parseInt(u32, std.mem.span(v), 10) catch return error.Invalid;
+    return sh;
 }
 
 /// The matvec rotates x itself (exl3.cl RI) at 1 to 4 rows when every K split is whole 128 blocks, on launches
