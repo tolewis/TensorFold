@@ -33,7 +33,8 @@ const line = 64;
 const rows_max = 1024 + 128 + 16; // the widest forward (q.maxRows at XPU_CHUNK 1024) and a decode window
 const slot_bytes = rows_max * D * 2;
 const ring_len = 64;
-const peer_dead = 10.0; // seconds without an all-reduce: a silent rank is gone, the pair cannot runpub const rec_words = 1024; // 4 KiB a record
+const peer_dead = 10.0; // seconds without an all-reduce: a silent rank is gone, the pair cannot run
+pub const rec_words = 1024; // 4 KiB a record
 pub const rec_data = rec_words - 8;
 
 /// A state-changing Runner call. `more`: the rest of the previous record's data.
@@ -191,7 +192,7 @@ pub const Group = struct {
     /// It returns an error at once when the shared segment says its group closed or the peer is silent: a rank that
     /// dies does not update its liveness word, so its peer sees it before the 180 s wait.
     fn waitPeers(g: *Group) !void {
-        const closed = closed(g);
+        const closed_word = closed(g);
         for (0..g.tp) |r| if (r != g.rank) {
             const c = g.counter(@intCast(r));
             const alive = aliveWord(g, @intCast(r));
@@ -201,7 +202,7 @@ pub const Group = struct {
                 if (spins % 4096 == 0) {
                     const now = q.now();
                     // a closed segment or a silent peer: the peer is gone, not just late
-                    if (closed.load(.acquire) != 0 and c.load(.seq_cst) < g.seq) return error.PeerLost;
+                    if (closed_word.load(.acquire) != 0 and c.load(.seq_cst) < g.seq) return error.PeerLost;
                     if (now - @as(f64, @floatFromInt(alive.load(.acquire))) > peer_dead) return error.PeerLost;
                     if (now > deadline) {
                         std.debug.print("rank {d}: all-reduce {d} after record {d}: the peer is at {d}\n", .{ g.rank, g.seq, g.step, c.load(.seq_cst) });
