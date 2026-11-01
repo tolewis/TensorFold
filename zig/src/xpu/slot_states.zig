@@ -19,14 +19,15 @@ pub const Snap = struct { at: u32, buf: *anyopaque, bytes: usize };
 
 pub const REC_BYTES = q.GDN_V_HEADS * 128 * 128 * 4;
 pub const CONV_BYTES = 3 * q.GDN_QKV * 2;
-pub fn kvRow() usize {
-    return if (q.kv_i8) 4 * 256 else 4 * 256 * 2;
+/// The K/V cache layout of this rank: its own K/V heads (half at TP 2), as the kernels index it (Q27_KVROW).
+pub fn kv() q.limits.KvLayout {
+    return .{ .heads = q.ATT_KV_HEADS, .cap = q.MAX_CTX, .int8 = q.kv_i8 };
 }
 
 /// The bytes saveSlot takes at `at` tokens.
 pub fn snapBytes(r: *const Runner, at: u32) usize {
     var n: usize = 0;
-    for (&r.model.layers) |*l| n += if (l.attn) 2 * @as(usize, at) * (kvRow() + if (q.kv_i8) @as(usize, 16) else 0) else REC_BYTES + CONV_BYTES;
+    for (&r.model.layers) |*l| n += if (l.attn) 2 * kv().snapBytes(at) else REC_BYTES + CONV_BYTES;
     return n;
 }
 
@@ -45,15 +46,16 @@ fn saveSlotHere(r: *Runner, slot: u32, at: u32) !Snap {
     const bytes = r.snapBytes(at);
     const buf = try d.alloc_(bytes);
     errdefer freeAfterQueue(d, buf); // copies into it may be queued
+    const lay = kv();
     var o: usize = 0;
     for (&r.model.layers) |*l| {
         if (l.attn) {
             for ([_]*anyopaque{ l.kc.?, l.vc.? }) |c| {
-                try copy(d, off(buf, o), c, @as(usize, at) * kvRow());
-                o += @as(usize, at) * kvRow();
-                if (q.kv_i8) { // the scales after the cap's rows
-                    try copy(d, off(buf, o), off(c, @as(usize, q.MAX_CTX) * 1024), @as(usize, at) * 16);
-                    o += @as(usize, at) * 16;
+                try copy(d, off(buf, o), c, @as(usize, at) * lay.row());
+                o += @as(usize, at) * lay.row();
+                if (q.kv_i8) { // the scales after the cap's rows (cap * Q27_KVROW: this rank's heads, not the model's)
+                    try copy(d, off(buf, o), off(c, lay.scales()), @as(usize, at) * lay.scaleRow());
+                    o += @as(usize, at) * lay.scaleRow();
                 }
             }
             continue;
@@ -71,15 +73,16 @@ pub fn restoreSlot(r: *Runner, slot: u32, snap: Snap) !void {
     try r.select(slot);
     const d = &r.d;
     const at = snap.at;
+    const lay = kv();
     var o: usize = 0;
     for (&r.model.layers) |*l| {
         if (l.attn) {
             for ([_]*anyopaque{ l.kc.?, l.vc.? }) |c| {
-                try copy(d, c, off(snap.buf, o), @as(usize, at) * kvRow());
-                o += @as(usize, at) * kvRow();
+                try copy(d, c, off(snap.buf, o), @as(usize, at) * lay.row());
+                o += @as(usize, at) * lay.row();
                 if (q.kv_i8) {
-                    try copy(d, off(c, @as(usize, q.MAX_CTX) * 1024), off(snap.buf, o), @as(usize, at) * 16);
-                    o += @as(usize, at) * 16;
+                    try copy(d, off(c, lay.scales()), off(snap.buf, o), @as(usize, at) * lay.scaleRow());
+                    o += @as(usize, at) * lay.scaleRow();
                 }
             }
             continue;
