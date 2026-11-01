@@ -9,8 +9,8 @@
 //!
 //! The device-direct path (the default when it opens, TF_TP_HOST=1 forces the host path): each rank keeps two
 //! slots in device memory and exports them (zeMemGetIpcHandle). The handles cross over a unix socket beside the
-//! shm file, the peer opens them (zeMemOpenIpcHandle), and after the counter says a partial is written a kernel
-//! adds the peer's slot into this rank's buffer over PCIe (ze_ipc.py: 10 KB in 10.9 us, 9.2 MB in 283 us). The
+//! shm file, the peer opens them (zeMemOpenIpcHandle), and after the counter says a partial is written a device
+//! copy brings the peer's slot over PCIe and a kernel adds it into this rank's buffer (ze_ipc.py: 10 KB in 10.9 us, 9.2 MB in 283 us). The
 //! host settle before the counter stays.
 //!
 //! The file: TF_TP_SHM names it (default /dev/shm/tf-tp-qwen27). Rank 0 creates and sizes it, rank 1 opens it.
@@ -64,6 +64,9 @@ pub const Group = struct {
     /// The device-direct path: this rank's two device slots and the peer's two, opened here. `direct` false: host path.
     dslot: [2]*anyopaque = undefined,
     peer: [2]?*anyopaque = .{ null, null },
+    /// A local copy of the peer's slot: a kernel on this card cannot take the other card's memory as an argument
+    /// (zeCommandListAppendLaunchKernel: invalid argument), a device copy from it works.
+    pbuf: [2]*anyopaque = undefined,
     direct: bool = false,
 
     fn counter(g: *const Group, r: u32) *std.atomic.Value(u64) {
@@ -187,7 +190,8 @@ pub const Group = struct {
             d.settle();
             g.counter(g.rank).store(g.seq, .seq_cst);
             try g.waitPeers();
-            try d.launch(d.k.tp_add, .{ .x = @intCast((n + 255) / 256) }, .{ partial, g.dslot[par], g.peer[par].?, @as(i32, @intCast(n)) });
+            try dev.copy(d, g.pbuf[par], g.peer[par].?, n * 2); // over PCIe, on the in-order list
+            try d.launch(d.k.tp_add, .{ .x = @intCast((n + 255) / 256) }, .{ partial, g.dslot[par], g.pbuf[par], @as(i32, @intCast(n)) });
             return;
         }
         try dev.copy(d, @ptrCast(g.mine), partial, n * 2);
@@ -214,6 +218,7 @@ pub const Group = struct {
         var fds: [2]i32 = undefined;
         for (0..2) |i| {
             g.dslot[i] = try d.g.deviceAlloc(slot_bytes);
+            g.pbuf[i] = try d.g.deviceAlloc(slot_bytes);
             try ze.check(d.g.api.zeMemGetIpcHandle(d.g.context, g.dslot[i], &handles[i]));
             fds[i] = std.mem.readInt(i32, handles[i].data[0..4], .little);
         }
