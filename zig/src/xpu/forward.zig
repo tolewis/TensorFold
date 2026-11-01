@@ -404,8 +404,8 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
                 if (gdn_probe) |f| if (p0 == 0) try f(d, a, l.rec.?, T, i);
             }
             if (probe) {
-                try dumpBuf(d, "q0", a.q, T * 2048, .bf16);
-                try dumpBuf(d, "k0", a.k, T * 2048, .bf16);
+                try dumpBuf(d, "q0", a.q, T * HK * 128, .bf16);
+                try dumpBuf(d, "k0", a.k, T * HK * 128, .bf16);
                 try dumpBuf(d, "v0", a.v, T * MIX_OUT, .bf16);
                 try dumpBuf(d, "g0", a.g, T * HV, .f32);
                 try dumpBuf(d, "beta0", a.beta, T * HV, .f32);
