@@ -409,6 +409,9 @@ pub fn loadExl3(d: *Dev, c: *const Checkpoint) !loader.Model {
     }
     try d.sync();
     // XPU_EMBED_HOST=1: the fp16 table stays on the host; its bytes take no VRAM on this card.
-    if (q.embed_host) std.debug.print("embed on the host: {d:.2} GB of device memory saved ({d} x {d} fp16 rows)\n", .{ q.VOCAB * D * 2 / 1e9, q.VOCAB, D });
+    if (q.embed_host) {
+        const E_BYTES = @as(f64, q.VOCAB * D * 2) / 1e9; // GB of device memory the table no longer takes
+        std.debug.print("embed on the host: {d:.2} GB of device memory saved ({d} x {d} fp16 rows)\n", .{E_BYTES, q.VOCAB, D});
+    }
     return m;
 }
