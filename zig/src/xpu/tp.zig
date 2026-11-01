@@ -224,28 +224,32 @@ pub const Group = struct {
         @memcpy(addr.path[0..base.len], base);
         @memcpy(addr.path[base.len .. base.len + 5], ".sock");
         const alen: linux.socklen_t = @intCast(@offsetOf(linux.sockaddr.un, "path") + base.len + 6);
-        const sock = try std.posix.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
-        defer std.posix.close(sock);
-        var conn: std.posix.socket_t = sock;
+        const sock_rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+        if (failed(sock_rc)) return error.SocketFailed;
+        const sock: linux.fd_t = @intCast(sock_rc);
+        defer _ = linux.close(sock);
+        var conn: linux.fd_t = sock;
         if (g.rank == 0) {
-            _ = std.c.unlink(@ptrCast(&addr.path));
-            try std.posix.bind(sock, @ptrCast(&addr), alen);
-            try std.posix.listen(sock, 1);
-            var pfd = [1]std.posix.pollfd{.{ .fd = sock, .events = std.posix.POLL.IN, .revents = 0 }};
-            if (try std.posix.poll(&pfd, 180_000) == 0) return error.PeerLost;
-            conn = try std.posix.accept(sock, null, null, 0);
+            _ = linux.unlink(@ptrCast(&addr.path));
+            if (failed(linux.bind(sock, @ptrCast(&addr), alen))) return error.BindFailed;
+            if (failed(linux.listen(sock, 1))) return error.ListenFailed;
+            var pfd = [1]linux.pollfd{.{ .fd = sock, .events = linux.POLL.IN, .revents = 0 }};
+            const ready = linux.poll(&pfd, 1, 180_000);
+            if (failed(ready) or ready == 0) return error.PeerLost;
+            const acc = linux.accept4(sock, null, null, linux.SOCK.CLOEXEC);
+            if (failed(acc)) return error.AcceptFailed;
+            conn = @intCast(acc);
         } else {
             const deadline = q.now() + 180.0;
-            while (true) {
-                if (std.posix.connect(sock, @ptrCast(&addr), alen)) |_| break else |_| {}
+            while (failed(linux.connect(sock, @ptrCast(&addr), alen))) {
                 if (q.now() > deadline) return error.PeerLost;
                 var ts: std.c.timespec = .{ .sec = 0, .nsec = 50_000_000 };
                 _ = std.c.nanosleep(&ts, null);
             }
         }
         defer if (g.rank == 0) {
-            std.posix.close(conn);
-            _ = std.c.unlink(@ptrCast(&addr.path));
+            _ = linux.close(conn);
+            _ = linux.unlink(@ptrCast(&addr.path));
         };
         try sendFds(conn, std.mem.asBytes(&handles), &fds);
         var theirs: [2]ze.IpcHandle = undefined;
@@ -262,9 +266,14 @@ pub const Group = struct {
 };
 
 const cmsg_space = ((@sizeOf(linux.cmsghdr) + 2 * 4 + 7) / 8) * 8; // a control message with two fds
+
+/// A raw syscall's return: negative is -errno.
+fn failed(rc: usize) bool {
+    return @as(isize, @bitCast(rc)) < 0;
+}
 const scm_rights = 1;
 
-fn sendFds(sock: std.posix.socket_t, data: []const u8, fds: []const i32) !void {
+fn sendFds(sock: linux.fd_t, data: []const u8, fds: []const i32) !void {
     var iov = [1]std.posix.iovec_const{.{ .base = data.ptr, .len = data.len }};
     var cbuf: [cmsg_space]u8 align(8) = @splat(0);
     const h: *linux.cmsghdr = @ptrCast(&cbuf);
@@ -272,15 +281,15 @@ fn sendFds(sock: std.posix.socket_t, data: []const u8, fds: []const i32) !void {
     @memcpy(cbuf[@sizeOf(linux.cmsghdr) .. @sizeOf(linux.cmsghdr) + fds.len * 4], std.mem.sliceAsBytes(fds));
     const msg: linux.msghdr_const = .{ .name = null, .namelen = 0, .iov = &iov, .iovlen = 1, .control = &cbuf, .controllen = cbuf.len, .flags = 0 };
     const rc = linux.sendmsg(sock, &msg, 0);
-    if (@as(isize, @bitCast(rc)) < 0 or rc != data.len) return error.FdSend;
+    if (failed(rc) or rc != data.len) return error.FdSend;
 }
 
-fn recvFds(sock: std.posix.socket_t, data: []u8, fds: []i32) !void {
+fn recvFds(sock: linux.fd_t, data: []u8, fds: []i32) !void {
     var iov = [1]std.posix.iovec{.{ .base = data.ptr, .len = data.len }};
     var cbuf: [cmsg_space]u8 align(8) = @splat(0);
     var msg: linux.msghdr = .{ .name = null, .namelen = 0, .iov = &iov, .iovlen = 1, .control = &cbuf, .controllen = cbuf.len, .flags = 0 };
     const rc = linux.recvmsg(sock, &msg, linux.MSG.WAITALL);
-    if (@as(isize, @bitCast(rc)) < 0 or rc != data.len) return error.FdRecv;
+    if (failed(rc) or rc != data.len) return error.FdRecv;
     const h: *const linux.cmsghdr = @ptrCast(&cbuf);
     if (h.level != linux.SOL.SOCKET or h.type != scm_rights or h.len != @sizeOf(linux.cmsghdr) + fds.len * 4) return error.FdRecv;
     @memcpy(std.mem.sliceAsBytes(fds), cbuf[@sizeOf(linux.cmsghdr) .. @sizeOf(linux.cmsghdr) + fds.len * 4]);
