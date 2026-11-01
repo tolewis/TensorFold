@@ -90,6 +90,10 @@ pub fn main() !void {
             const po = try d.alloc_(16 * AQ * pl.ns * 256 * 4);
             const out = try d.alloc_(rows * AQ * 256 * 2);
             const out2 = try d.alloc_(rows * AQ * 256 * 2);
+            // the scalar path gets its own partials, so a scalar launch that writes nothing cannot pass by reading K1's
+            const pm2 = try d.alloc_(16 * AQ * pl.ns * 4);
+            const plb2 = try d.alloc_(16 * AQ * pl.ns * 4);
+            const po2 = try d.alloc_(16 * AQ * pl.ns * 256 * 4);
             const scale: f32 = 1.0 / 16.0;
             const p0i: i32 = @intCast(p0);
             const nsi: i32 = @intCast(pl.ns);
@@ -108,8 +112,8 @@ pub fn main() !void {
             // the scalar page-table kernel, timed the same way
             var best2: f64 = 1e9;
             for (0..3) |_| {
-                try launchTimed(&d, kk.span, .{ .x = pl.ns, .y = AKV, .z = rows }, .{ dq, dk, dv, pm, plb, po, p0i, nsi, pl.span, scale, nul, nul, @as(i32, 1), dpt }, evs[0]);
-                try launchTimed(&d, kk.merge, .{ .x = AQ, .y = rows }, .{ pm, plb, po, out2, p0i, nsi, pl.span, nul }, evs[1]);
+                try launchTimed(&d, kk.span, .{ .x = pl.ns, .y = AKV, .z = rows }, .{ dq, dk, dv, pm2, plb2, po2, p0i, nsi, pl.span, scale, nul, nul, @as(i32, 1), dpt }, evs[0]);
+                try launchTimed(&d, kk.merge, .{ .x = AQ, .y = rows }, .{ pm2, plb2, po2, out2, p0i, nsi, pl.span, nul }, evs[1]);
                 try d.sync();
                 best2 = @min(best2, try d.g.seconds(evs[0]) + try d.g.seconds(evs[1]));
                 try ze.check(d.g.api.zeEventHostReset(evs[0]));
