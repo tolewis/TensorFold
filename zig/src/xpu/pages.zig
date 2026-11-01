@@ -85,7 +85,7 @@ test "the pool refuses a page it does not have, and a release of nothing does no
     p.release(1);
     try std.testing.expectEqual(@as(u32, 1), p.spare());
     try std.testing.expectEqual(@as(u32, 1), p.take().?);
-    try std.testing.expectEqual(@as(u32, 0), p.held(1));
+    try std.testing.expectEqual(@as(u32, 1), p.held(1)); // the reference the take gave
 }
 
 test "a page released twice is not handed out twice at once" {
