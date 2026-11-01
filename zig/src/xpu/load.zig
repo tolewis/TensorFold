@@ -8,6 +8,7 @@ const Checkpoint = dev.Checkpoint;
 const D = q.D;
 const Dev = dev.Dev;
 const GDN_IN = q.GDN_IN;
+const HV = q.GDN_V_HEADS;
 const LAYERS = q.LAYERS;
 const STASH = q.STASH;
 const alloc = q.alloc;
@@ -224,21 +225,21 @@ pub fn loadGptq(d: *Dev, c: *const Checkpoint) !Model {
             l.mixer_out = try projectionGptq(d, c, f(p, "linear_attn."), &.{"out_proj"}, false, 0, false, stage);
             const ta = try c.get(f(p, "linear_attn.in_proj_a.weight"));
             const tb = try c.get(f(p, "linear_attn.in_proj_b.weight"));
-            if (!std.mem.eql(u8, ta.dtype, "F16") or ta.bytes.len != 48 * D * 2 or tb.bytes.len != 48 * D * 2) return error.UnexpectedShape;
+            if (!std.mem.eql(u8, ta.dtype, "F16") or ta.bytes.len != HV * D * 2 or tb.bytes.len != HV * D * 2) return error.UnexpectedShape;
             l.ab = try d.alloc_(96 * D * 2);
             try d.copyIn(l.ab.?, ta.bytes);
-            try d.copyIn(off(l.ab.?, 48 * D * 2), tb.bytes);
+            try d.copyIn(off(l.ab.?, HV * D * 2), tb.bytes);
             l.conv_w = try vecTensor(d, c, f(p, "linear_attn.conv1d.weight"), false);
             l.alog = try vecTensor(d, c, f(p, "linear_attn.A_log"), false);
             l.dt = try vecTensor(d, c, f(p, "linear_attn.dt_bias"), false);
             l.gnorm = try vecTensor(d, c, f(p, "linear_attn.norm.weight"), false);
-            l.rec = try d.alloc_(48 * 128 * 128 * 4);
-            l.rec_save = try d.alloc_(48 * 128 * 128 * 4);
+            l.rec = try d.alloc_(HV * 128 * 128 * 4);
+            l.rec_save = try d.alloc_(HV * 128 * 128 * 4);
             l.stash = try d.alloc_(STASH);
-            try d.fill(l.rec.?, @as(u32, 0), 48 * 128 * 128 * 4);
+            try d.fill(l.rec.?, @as(u32, 0), HV * 128 * 128 * 4);
             for (&l.conv) |*cv| {
-                cv.* = try d.alloc_(3 * 10240 * 2);
-                try d.fill(cv.*.?, @as(u16, 0), 3 * 10240 * 2);
+                cv.* = try d.alloc_(3 * q.GDN_QKV * 2);
+                try d.fill(cv.*.?, @as(u16, 0), 3 * q.GDN_QKV * 2);
             }
         }
         if (i % 8 == 7) std.debug.print("  layers loaded: {d}/{d}\n", .{ i + 1, LAYERS });
@@ -290,13 +291,13 @@ pub fn load(d: *Dev, c: *const Checkpoint) !Model {
             l.alog = try bf16Tensor(d, c, f(p, "linear_attn.A_log"));
             l.dt = try bf16Tensor(d, c, f(p, "linear_attn.dt_bias"));
             l.gnorm = try bf16Tensor(d, c, f(p, "linear_attn.norm.weight"));
-            l.rec = try d.alloc_(48 * 128 * 128 * 4);
-            l.rec_save = try d.alloc_(48 * 128 * 128 * 4);
+            l.rec = try d.alloc_(HV * 128 * 128 * 4);
+            l.rec_save = try d.alloc_(HV * 128 * 128 * 4);
             l.stash = try d.alloc_(STASH);
-            try d.fill(l.rec.?, @as(u32, 0), 48 * 128 * 128 * 4);
+            try d.fill(l.rec.?, @as(u32, 0), HV * 128 * 128 * 4);
             for (&l.conv) |*cv| {
-                cv.* = try d.alloc_(3 * 10240 * 2);
-                try d.fill(cv.*.?, @as(u16, 0), 3 * 10240 * 2);
+                cv.* = try d.alloc_(3 * q.GDN_QKV * 2);
+                try d.fill(cv.*.?, @as(u16, 0), 3 * q.GDN_QKV * 2);
             }
         }
         if (i % 8 == 7) std.debug.print("  layers loaded: {d}/{d}\n", .{ i + 1, LAYERS });

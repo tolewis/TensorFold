@@ -12,7 +12,8 @@ const fwd = @import("forward.zig");
 const Dev = dev.Dev;
 const Checkpoint = dev.Checkpoint;
 const D = q.D;
-const FF = q.FF;
+const FF = q.FF_R;
+const HV = q.GDN_V_HEADS;
 const alloc = q.alloc;
 const off = dev.off;
 
@@ -281,26 +282,26 @@ pub fn loadExl3(d: *Dev, c: *const Checkpoint) !loader.Model {
         } else {
             // [qkv 10240 | z 6144] in a row of GDN_IN; the dense a and b gates go to columns 16384 on (forward.zig)
             const mi = try w.add(d, c, &.{ f(&nb[0], i, "linear_attn.in_proj_qkv"), f(&nb[1], i, "linear_attn.in_proj_z") }, q.GDN_IN);
-            if (mi.parts[1].col + mi.parts[1].m.n != 16384) return error.UnexpectedShape;
+            if (mi.parts[1].col + mi.parts[1].m.n != q.GDN_AB) return error.UnexpectedShape;
             l.mixer_in = shell(mi, true);
             l.mixer_out = shell(try w.add(d, c, &.{f(&nb[0], i, "linear_attn.out_proj")}, D), false);
             const ta = try c.get(f(&nb[0], i, "linear_attn.in_proj_a.weight"));
             const tb = try c.get(f(&nb[1], i, "linear_attn.in_proj_b.weight"));
-            if (!std.mem.eql(u8, ta.dtype, "F16") or !std.mem.eql(u8, tb.dtype, "F16") or ta.bytes.len != 48 * D * 2 or tb.bytes.len != 48 * D * 2) return error.UnexpectedShape;
+            if (!std.mem.eql(u8, ta.dtype, "F16") or !std.mem.eql(u8, tb.dtype, "F16") or ta.bytes.len != HV * D * 2 or tb.bytes.len != HV * D * 2) return error.UnexpectedShape;
             l.ab = try d.alloc_(96 * D * 2);
             try d.copyIn(l.ab.?, ta.bytes);
-            try d.copyIn(off(l.ab.?, 48 * D * 2), tb.bytes);
+            try d.copyIn(off(l.ab.?, HV * D * 2), tb.bytes);
             l.conv_w = try normTensor(d, c, f(&nb[0], i, "linear_attn.conv1d.weight"), false);
             l.alog = try normTensor(d, c, f(&nb[0], i, "linear_attn.A_log"), false);
             l.dt = try normTensor(d, c, f(&nb[0], i, "linear_attn.dt_bias"), false);
             l.gnorm = try normTensor(d, c, f(&nb[0], i, "linear_attn.norm.weight"), false);
-            l.rec = try d.alloc_(48 * 128 * 128 * 4);
-            l.rec_save = try d.alloc_(48 * 128 * 128 * 4);
+            l.rec = try d.alloc_(HV * 128 * 128 * 4);
+            l.rec_save = try d.alloc_(HV * 128 * 128 * 4);
             l.stash = try d.alloc_(q.STASH);
-            try d.fill(l.rec.?, @as(u32, 0), 48 * 128 * 128 * 4);
+            try d.fill(l.rec.?, @as(u32, 0), HV * 128 * 128 * 4);
             for (&l.conv) |*cv| {
-                cv.* = try d.alloc_(3 * 10240 * 2);
-                try d.fill(cv.*.?, @as(u16, 0), 3 * 10240 * 2);
+                cv.* = try d.alloc_(3 * q.GDN_QKV * 2);
+                try d.fill(cv.*.?, @as(u16, 0), 3 * q.GDN_QKV * 2);
             }
         }
         if (i % 8 == 7) std.debug.print("  EXL3 layers loaded: {d}/{d}\n", .{ i + 1, q.LAYERS });

@@ -8,7 +8,13 @@ const exl3 = @import("qwen27_exl3.zig");
 const D = q.D;
 const Dev = dev.Dev;
 const EPS = q.EPS;
-const FF = q.FF;
+const FF = q.FF_R;
+const GDN_QKV = q.GDN_QKV;
+const GDN_AB = q.GDN_AB;
+const HK = q.GDN_K_HEADS;
+const HV = q.GDN_V_HEADS;
+const HQ = q.ATT_Q_HEADS;
+const MIX_OUT = q.GDN_Z; // a mixer's output width a rank: 48 value heads of 128, or 24 attention heads of 256, at TP 1
 const GDN_IN = q.GDN_IN;
 const LAYERS = q.LAYERS;
 const MASK_WORDS = q.MASK_WORDS;
@@ -85,21 +91,21 @@ pub const Acts = struct {
             .alo = try d.alloc_(rows * (FF / 64) * 2),
             .r = try d.alloc_(rows * D * 2),
             .p = try d.alloc_(rows * 2 * FF * 2),
-            .q = try d.alloc_(rows * 24 * 256 * 2),
+            .q = try d.alloc_(rows * HQ * 256 * 2),
             .k = try d.alloc_(rows * 16 * 128 * 2),
-            .v = try d.alloc_(rows * 48 * 128 * 2),
-            .g = try d.alloc_(rows * 48 * 4),
-            .beta = try d.alloc_(rows * 48 * 4),
-            .y = try d.alloc_(rows * 6144 * 2),
-            .la = try d.alloc_(48 * nc * 64 * 4),
-            .wb = try d.alloc_(3 * nc * 48 * 64 * 128 * 2),
-            .u0 = try d.alloc_(nc * 48 * 64 * 128 * 4),
-            .hs = try d.alloc_(3 * nc * 48 * 128 * 128 * 2),
-            .vn = try d.alloc_(3 * nc * 48 * 128 * 64 * 2),
+            .v = try d.alloc_(rows * HV * 128 * 2),
+            .g = try d.alloc_(rows * HV * 4),
+            .beta = try d.alloc_(rows * HV * 4),
+            .y = try d.alloc_(rows * MIX_OUT * 2),
+            .la = try d.alloc_(HV * nc * 64 * 4),
+            .wb = try d.alloc_(3 * nc * HV * 64 * 128 * 2),
+            .u0 = try d.alloc_(nc * HV * 64 * 128 * 4),
+            .hs = try d.alloc_(3 * nc * HV * 128 * 128 * 2),
+            .vn = try d.alloc_(3 * nc * HV * 128 * 64 * 2),
             // decode attention partials: at most 16 rows (the prompt kernel needs none)
-            .pm = try d.alloc_(16 * 24 * ns * 4),
-            .pl = try d.alloc_(16 * 24 * ns * 4),
-            .po = try d.alloc_(16 * 24 * ns * 256 * 4),
+            .pm = try d.alloc_(16 * HQ * ns * 4),
+            .pl = try d.alloc_(16 * HQ * ns * 4),
+            .po = try d.alloc_(16 * HQ * ns * 256 * 4),
             .pscr = try d.alloc_(rows * D * 4),
             .logits = try d.alloc_(16 * VOCAB * 2),
             .tok = try d.alloc_(16 * 4),
@@ -110,13 +116,13 @@ pub const Acts = struct {
             .mtok = try d.alloc_(16 * 4),
             .taps = try d.alloc_(rows * 5 * D * 2),
             .ids = try d.alloc_(rows * 4),
-            .zeros = try d.alloc_(rows * 48 * 128 * 2),
-            .ones = try d.alloc_(rows * 48 * 4),
+            .zeros = try d.alloc_(rows * HV * 128 * 2),
+            .ones = try d.alloc_(rows * HV * 4),
             .chain = try d.upload(std.mem.sliceAsBytes(&chainTable())),
             .tree = try d.alloc_(16 * 17 * 4),
             .path = try d.alloc_(16 * 4),
             .mpath = try d.alloc_(16 * 2 * 16 * 4),
-            .sl = try d.alloc_(16 * 48 * 128 * 128 * 4),
+            .sl = try d.alloc_(16 * HV * 128 * 128 * 4),
             .mt = try d.alloc_(LAYERS * 16 * 8 * 8),
             .mpos = try d.alloc_(16 * 4),
             .a8 = try d.alloc_(rows * FF),
@@ -336,7 +342,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
         try a8(d, a, min_in, D, T, 1);
         try pgemm(d, m, a, min_in, l.mixer_in, a.p, T, q8on, 0, false, wide);
         if (gemm_probe) |f| try f(d, a, l.mixer_in, min_in, T, i, 0);
-        if (l.ab) |ab| try d.launch(d.k.dense_rows, .{ .x = (T + 15) / 16, .y = 96 / 16 }, .{ a.h, ab, a.p, t32, @as(i32, GDN_IN), @as(i32, 16384) });
+        if (l.ab) |ab| try d.launch(d.k.dense_rows, .{ .x = (T + 15) / 16, .y = 2 * HV / 16 }, .{ a.h, ab, a.p, t32, @as(i32, GDN_IN), @as(i32, GDN_AB) });
         if (probe) try dumpBuf(d, "p0", a.p, T * GDN_IN, .f16);
         if (l.attn) {
             const ctx = if (mode.multi) |mm| mm.max_pos + 1 else p0 + T; // tree rows see fewer slices
@@ -349,9 +355,9 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
                 try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = 4 }, .{ a.q, l.kc.?, l.vc.?, a.y, @as(i32, @intCast(p0)), t32, @as(f32, 1.0 / 16.0), @as(?*anyopaque, null) });
             } else {
                 try d.launch(d.k.attn_decode, .{ .x = ns, .y = 4, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), @as(f32, 1.0 / 16.0), if (mode.multi != null) tree else table, mt, mpos, kvCap() });
-                try d.launch(d.k.attn_merge, .{ .x = 24, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), table, mpos });
+                try d.launch(d.k.attn_merge, .{ .x = HQ, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), table, mpos });
             }
-            if (q.kv8 & 1 != 0) try d.launch(d.k.rot_heads, .{ .x = T, .y = 24 }, .{a.y});
+            if (q.kv8 & 1 != 0) try d.launch(d.k.rot_heads, .{ .x = T, .y = HQ }, .{a.y});
             try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo, gs, q.rot_on, q8oa, q8os, q8ms });
         } else {
             const cin = l.conv[l.conv_cur].?;
@@ -359,9 +365,9 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
             const gmt: ?*anyopaque = if (mode.multi) |mm| off(mm.mt, i * 16 * 8 * 8) else null;
             if (mode.multi == null) l.conv_cur = 1 - l.conv_cur; // multi: each slot's flips after the forward
             if (wide)
-                try d.launch(d.k.gdn_pre_rows, .{ .x = (T + 7) / 8, .y = 5 }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32 })
+                try d.launch(d.k.gdn_pre_rows, .{ .x = (T + 7) / 8, .y = GDN_QKV / 2048 }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32 })
             else
-                try d.launch(d.k.gdn_pre, .{ .x = T, .y = 40 }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32, tree, gmt });
+                try d.launch(d.k.gdn_pre, .{ .x = T, .y = GDN_QKV / 256 }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32, tree, gmt });
             if (wide and tp > T) { // neutral padding rows: the state does not move
                 const pad = tp - T;
                 const cp = struct {
@@ -370,44 +376,44 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
                     }
                 }.f;
                 try cp(d, off(a.k, T * 16 * 128 * 2), a.zeros, pad * 16 * 128 * 2);
-                try cp(d, off(a.v, T * 48 * 128 * 2), a.zeros, pad * 48 * 128 * 2);
-                try cp(d, off(a.beta, T * 48 * 4), a.zeros, pad * 48 * 4);
-                try cp(d, off(a.g, T * 48 * 4), a.ones, pad * 48 * 4);
+                try cp(d, off(a.v, T * HV * 128 * 2), a.zeros, pad * HV * 128 * 2);
+                try cp(d, off(a.beta, T * HV * 4), a.zeros, pad * HV * 4);
+                try cp(d, off(a.g, T * HV * 4), a.ones, pad * HV * 4);
             }
             if (!wide) {
                 if (mode.stash) { // inputs, for Runner.commit's replay
                     const st = l.stash.?;
                     try copy(d, off(st, ST_Q), a.q, T * 16 * 128 * 2);
                     try copy(d, off(st, ST_K), a.k, T * 16 * 128 * 2);
-                    try copy(d, off(st, ST_V), a.v, T * 48 * 128 * 2);
-                    try copy(d, off(st, ST_G), a.g, T * 48 * 4);
-                    try copy(d, off(st, ST_B), a.beta, T * 48 * 4);
+                    try copy(d, off(st, ST_V), a.v, T * HV * 128 * 2);
+                    try copy(d, off(st, ST_G), a.g, T * HV * 4);
+                    try copy(d, off(st, ST_B), a.beta, T * HV * 4);
                     try copy(d, off(st, ST_P), a.p, T * GDN_IN * 2);
                 }
                 // verification: post-block state to rec_save, rec keeps the entry; tree: states to acts.sl
-                try d.launch(d.k.gdn_step, .{ .x = 16, .y = 48, .z = if (mode.multi != null) T else 1 }, .{ a.q, a.k, a.v, a.g, a.beta, l.rec.?, if (mode.stash) l.rec_save.? else l.rec.?, a.y, t32, nul, tree, a.sl, gmt });
+                try d.launch(d.k.gdn_step, .{ .x = 16, .y = HV, .z = if (mode.multi != null) T else 1 }, .{ a.q, a.k, a.v, a.g, a.beta, l.rec.?, if (mode.stash) l.rec_save.? else l.rec.?, a.y, t32, nul, tree, a.sl, gmt });
             } else {
                 const nc: i32 = @intCast(tp / 64);
                 const ncu: u32 = tp / 64;
                 const hk: i32 = 16;
-                const hv: i32 = 48;
-                try d.launch(d.k.gdn_prep, .{ .x = ncu, .y = 48 }, .{ a.k, a.v, a.g, a.beta, a.la, a.wb, a.u0, hk, hv, nc, @as(i32, 0) });
-                try d.launch(d.k.gdn_state, .{ .x = 48 }, .{ a.k, a.wb, a.u0, a.la, l.rec.?, l.rec.?, a.hs, a.vn, hk, hv, nc });
-                try d.launch(d.k.gdn_out, .{ .x = ncu, .y = 48 }, .{ a.q, a.k, a.la, a.hs, a.vn, a.y, hk, hv, nc });
+                const hv: i32 = HV;
+                try d.launch(d.k.gdn_prep, .{ .x = ncu, .y = HV }, .{ a.k, a.v, a.g, a.beta, a.la, a.wb, a.u0, hk, hv, nc, @as(i32, 0) });
+                try d.launch(d.k.gdn_state, .{ .x = HV }, .{ a.k, a.wb, a.u0, a.la, l.rec.?, l.rec.?, a.hs, a.vn, hk, hv, nc });
+                try d.launch(d.k.gdn_out, .{ .x = ncu, .y = HV }, .{ a.q, a.k, a.la, a.hs, a.vn, a.y, hk, hv, nc });
                 if (gdn_probe) |f| if (p0 == 0) try f(d, a, l.rec.?, T, i);
             }
             if (probe) {
                 try dumpBuf(d, "q0", a.q, T * 2048, .bf16);
                 try dumpBuf(d, "k0", a.k, T * 2048, .bf16);
-                try dumpBuf(d, "v0", a.v, T * 6144, .bf16);
-                try dumpBuf(d, "g0", a.g, T * 48, .f32);
-                try dumpBuf(d, "beta0", a.beta, T * 48, .f32);
-                try dumpBuf(d, "y0", a.y, T * 6144, .bf16);
+                try dumpBuf(d, "v0", a.v, T * MIX_OUT, .bf16);
+                try dumpBuf(d, "g0", a.g, T * HV, .f32);
+                try dumpBuf(d, "beta0", a.beta, T * HV, .f32);
+                try dumpBuf(d, "y0", a.y, T * MIX_OUT, .bf16);
             }
             try d.launch(d.k.gated_norm, .{ .x = T }, .{ a.y, a.p, l.gnorm.?, a.h, a.ahi, a.alo, EPS, gs, q.rot_on, q8oa, q8os, q8ms });
-            if (probe) try dumpBuf(d, "o0", a.h, T * 6144, .f16);
+            if (probe) try dumpBuf(d, "o0", a.h, T * MIX_OUT, .f16);
         }
-        try a8(d, a, a.h, 6144, T, 2);
+        try a8(d, a, a.h, MIX_OUT, T, 2);
         try pgemm(d, m, a, a.h, l.mixer_out, a.r, T, q8out, 0, q.int4_sites & 2 != 0, wide);
         if (gemm_probe) |f| try f(d, a, l.mixer_out, a.h, T, i, 1);
         if (probe) try dumpBuf(d, "r0", a.r, T * D, .f16);

@@ -5,6 +5,8 @@ const q = @import("qwen27.zig");
 const dev = @import("dev.zig");
 const fwd = @import("forward.zig");
 const GDN_IN = q.GDN_IN;
+const HK = q.GDN_K_HEADS;
+const HV = q.GDN_V_HEADS;
 const LAYERS = q.LAYERS;
 const Runner = q.Runner;
 const ST_B = q.ST_B;
@@ -156,12 +158,12 @@ pub fn keepPaths(r: *Runner, paths: []const []const u32) !void {
                 std.mem.swap(?*anyopaque, &l.slot_rec[sl], &l.slot_save[sl]);
             } else if (straight and !r.multi_tree) {
                 const st = l.stash.?;
-                try d.launch(d.k.gdn_step, .{ .x = 16, .y = 48 }, .{ off(st, ST_Q + first * 16 * 128 * 2), off(st, ST_K + first * 16 * 128 * 2), off(st, ST_V + first * 48 * 128 * 2), off(st, ST_G + first * 48 * 4), off(st, ST_B + first * 48 * 4), l.slot_rec[sl].?, l.slot_rec[sl].?, r.acts.y, @as(i32, @intCast(k)), nul, nul, nul, nul });
-                try d.launch(d.k.conv_commit, .{ .x = 40 }, .{ l.slot_conv[sl][cur].?, off(st, ST_P + first * GDN_IN * 2), l.slot_conv[sl][1 - cur].?, @as(i32, @intCast(k)), nul });
+                try d.launch(d.k.gdn_step, .{ .x = 16, .y = HV }, .{ off(st, ST_Q + first * HK * 128 * 2), off(st, ST_K + first * HK * 128 * 2), off(st, ST_V + first * HV * 128 * 2), off(st, ST_G + first * HV * 4), off(st, ST_B + first * HV * 4), l.slot_rec[sl].?, l.slot_rec[sl].?, r.acts.y, @as(i32, @intCast(k)), nul, nul, nul, nul });
+                try d.launch(d.k.conv_commit, .{ .x = q.GDN_QKV / 256 }, .{ l.slot_conv[sl][cur].?, off(st, ST_P + first * GDN_IN * 2), l.slot_conv[sl][1 - cur].?, @as(i32, @intCast(k)), nul });
             } else {
                 const st = l.stash.?;
-                try d.launch(d.k.gdn_step, .{ .x = 16, .y = 48 }, .{ off(st, ST_Q), off(st, ST_K), off(st, ST_V), off(st, ST_G), off(st, ST_B), l.slot_rec[sl].?, l.slot_rec[sl].?, r.acts.y, @as(i32, @intCast(k)), brows, nul, nul, nul });
-                try d.launch(d.k.conv_commit, .{ .x = 40 }, .{ l.slot_conv[sl][cur].?, off(st, ST_P), l.slot_conv[sl][1 - cur].?, @as(i32, @intCast(k)), brows });
+                try d.launch(d.k.gdn_step, .{ .x = 16, .y = HV }, .{ off(st, ST_Q), off(st, ST_K), off(st, ST_V), off(st, ST_G), off(st, ST_B), l.slot_rec[sl].?, l.slot_rec[sl].?, r.acts.y, @as(i32, @intCast(k)), brows, nul, nul, nul });
+                try d.launch(d.k.conv_commit, .{ .x = q.GDN_QKV / 256 }, .{ l.slot_conv[sl][cur].?, off(st, ST_P), l.slot_conv[sl][1 - cur].?, @as(i32, @intCast(k)), brows });
             }
             l.slot_cur[sl] = 1 - cur;
         }

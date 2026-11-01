@@ -173,7 +173,7 @@ fn overlapProbe(r: *q.Runner) !void {
     const nc: i32 = @intCast(T / 64);
     const ncu: u32 = T / 64;
     const hk: i32 = 16;
-    const hv: i32 = 48;
+    const hv: i32 = q.GDN_V_HEADS;
     const runA = struct {
         fn f(dd: *q.Dev, aa: *q.Acts, l: anytype, t: u32) !void {
             try q.gemm(dd, aa.pscr, aa.h, aa.ahi, aa.alo, l.gu, aa.p, t);
@@ -181,9 +181,9 @@ fn overlapProbe(r: *q.Runner) !void {
     }.f;
     const runB = struct {
         fn f(dd: *q.Dev, aa: *q.Acts, l: anytype, ncv: i32, ncuv: u32, hkv: i32, hvv: i32) !void {
-            try dd.launch(dd.k.gdn_prep, .{ .x = ncuv, .y = 48 }, .{ aa.k, aa.v, aa.g, aa.beta, aa.la, aa.wb, aa.u0, hkv, hvv, ncv, @as(i32, 0) });
-            try dd.launch(dd.k.gdn_state, .{ .x = 48 }, .{ aa.k, aa.wb, aa.u0, aa.la, l.rec.?, l.rec.?, aa.hs, aa.vn, hkv, hvv, ncv });
-            try dd.launch(dd.k.gdn_out, .{ .x = ncuv, .y = 48 }, .{ aa.q, aa.k, aa.la, aa.hs, aa.vn, aa.y, hkv, hvv, ncv });
+            try dd.launch(dd.k.gdn_prep, .{ .x = ncuv, .y = q.GDN_V_HEADS }, .{ aa.k, aa.v, aa.g, aa.beta, aa.la, aa.wb, aa.u0, hkv, hvv, ncv, @as(i32, 0) });
+            try dd.launch(dd.k.gdn_state, .{ .x = q.GDN_V_HEADS }, .{ aa.k, aa.wb, aa.u0, aa.la, l.rec.?, l.rec.?, aa.hs, aa.vn, hkv, hvv, ncv });
+            try dd.launch(dd.k.gdn_out, .{ .x = ncuv, .y = q.GDN_V_HEADS }, .{ aa.q, aa.k, aa.la, aa.hs, aa.vn, aa.y, hkv, hvv, ncv });
         }
     }.f;
     var best = [5]f64{ 1e9, 1e9, 1e9, 1e9, 1e9 };

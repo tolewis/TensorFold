@@ -40,13 +40,25 @@ pub const alloc = std.heap.c_allocator;
 // Qwen3.8-27B shape (checked against config.json at load).
 pub const D = 5120;
 pub const FF = 17408;
+/// Tensor-parallel ranks of this build. TP 1 is the one-card engine. Every per-rank width below is the whole
+/// model's divided by TP: a rank holds its share of the heads and of the MLP columns, and the hidden state (D)
+/// whole (lanes/qwen27/TP2-ASSESSMENT.md in Intel-B70-Recipe, 2026-11-01).
+pub const TP: u32 = 1;
+pub const GDN_K_HEADS = 16 / TP; // GDN query and key heads of 128
+pub const GDN_V_HEADS = 48 / TP; // GDN value heads of 128 (and the z gate, a and b)
+pub const ATT_Q_HEADS = 24 / TP; // attention query heads of 256, each with a gate of 256
+pub const ATT_KV_HEADS = 4 / TP; // attention key and value heads of 256
+pub const FF_R = FF / TP; // gate and up columns a rank, down rows a rank
+pub const GDN_QKV = (2 * GDN_K_HEADS + GDN_V_HEADS) * 128; // 10240 at TP 1
+pub const GDN_Z = GDN_V_HEADS * 128; // 6144 at TP 1
+pub const GDN_AB = GDN_QKV + GDN_Z; // the dense a and b gates' first column (16384 at TP 1)
 pub const LAYERS = 64;
 pub const VOCAB = 248320;
 pub const MASK_WORDS = (VOCAB + 31) / 32; // a grammar row's bits (structured output), one a token
 /// The layers' quantization group (64: MLX affine, 128: GPTQ), set at load; the head and the drafter keep 64.
 pub var GS: u32 = 64;
-pub const GDN_IN = 16640; // qkv 10240 | z 6144 | a 48 | b 48 = 16480, padded to the GEMM tile (256)
-pub const ATT_IN = 14336; // (q 256 | gate 256) × 24 | k 1024 | v 1024
+pub const GDN_IN = (GDN_AB + 2 * GDN_V_HEADS + 255) / 256 * 256; // qkv 10240 | z 6144 | a 48 | b 48 = 16480, padded to the GEMM tile (256): 16640 at TP 1
+pub const ATT_IN = ATT_Q_HEADS * 512 + 2 * ATT_KV_HEADS * 256; // (q 256 | gate 256) × 24 | k 1024 | v 1024: 14336 at TP 1
 pub var CHUNK: u32 = 1024; // prompt rows per forward (XPU_CHUNK, a multiple of 64)
 /// A forward's rows at most: a chunk, plus a rest under 128 rows joined to a prompt's last chunk.
 pub fn maxRows() u32 {
@@ -62,11 +74,11 @@ pub const EPS: f32 = 1e-6;
 
 // Layout of a GDN layer's stash (bytes): q, k, v, g, β, then the qkv rows of P.
 pub const ST_Q = 0;
-pub const ST_K = ST_Q + 16 * 16 * 128 * 2;
-pub const ST_V = ST_K + 16 * 16 * 128 * 2;
-pub const ST_G = ST_V + 16 * 48 * 128 * 2;
-pub const ST_B = ST_G + 16 * 48 * 4;
-pub const ST_P = ST_B + 16 * 48 * 4;
+pub const ST_K = ST_Q + 16 * GDN_K_HEADS * 128 * 2;
+pub const ST_V = ST_K + 16 * GDN_K_HEADS * 128 * 2;
+pub const ST_G = ST_V + 16 * GDN_V_HEADS * 128 * 2;
+pub const ST_B = ST_G + 16 * GDN_V_HEADS * 4;
+pub const ST_P = ST_B + 16 * GDN_V_HEADS * 4;
 pub const STASH = ST_P + 16 * GDN_IN * 2;
 /// Target layers whose hidden states feed the DFlash2 drafter (its config's target_layer_ids).
 pub const TAP_LAYERS = [5]usize{ 5, 19, 33, 47, 61 };
@@ -317,8 +329,8 @@ pub const Runner = struct {
         r.acts = try Acts.init(d);
         if (r.model.exl3) |x| try x.bind(d, &r.model, &r.acts); // the EXL3 plans over the activations
         r.store(); // slot 0: the states the load allocated
-        try d.fill(r.acts.zeros, @as(u16, 0), maxRows() * 48 * 128 * 2);
-        try d.fill(r.acts.ones, @as(f32, 1.0), maxRows() * 48 * 4);
+        try d.fill(r.acts.zeros, @as(u16, 0), maxRows() * GDN_V_HEADS * 128 * 2);
+        try d.fill(r.acts.ones, @as(f32, 1.0), maxRows() * GDN_V_HEADS * 4);
         r.host_logits = try alloc.alloc(f32, VOCAB);
         return r;
     }
@@ -392,8 +404,8 @@ pub const Runner = struct {
     /// A fresh sequence: GDN and convolution states to zero (the KV cache is overwritten position by position).
     pub fn reset(r: *Runner) !void {
         for (&r.model.layers) |*l| if (!l.attn) {
-            try r.d.fill(l.rec.?, @as(u32, 0), 48 * 128 * 128 * 4);
-            for (l.conv) |cv| try r.d.fill(cv.?, @as(u16, 0), 3 * 10240 * 2);
+            try r.d.fill(l.rec.?, @as(u32, 0), GDN_V_HEADS * 128 * 128 * 4);
+            for (l.conv) |cv| try r.d.fill(cv.?, @as(u16, 0), 3 * GDN_QKV * 2);
             l.conv_cur = 0;
         };
         r.pos = 0;
@@ -445,9 +457,9 @@ pub const Runner = struct {
                 continue;
             }
             const st = l.stash.?;
-            try r.d.launch(r.d.k.gdn_step, .{ .x = 16, .y = 48 }, .{ off(st, ST_Q), off(st, ST_K), off(st, ST_V), off(st, ST_G), off(st, ST_B), l.rec.?, l.rec.?, r.acts.y, @as(i32, @intCast(keep)), nul, nul, nul, nul });
+            try r.d.launch(r.d.k.gdn_step, .{ .x = 16, .y = GDN_V_HEADS }, .{ off(st, ST_Q), off(st, ST_K), off(st, ST_V), off(st, ST_G), off(st, ST_B), l.rec.?, l.rec.?, r.acts.y, @as(i32, @intCast(keep)), nul, nul, nul, nul });
             // the block's forward flipped conv_cur: conv[cur] is the state after all rows, conv[1 - cur] the entry
-            try r.d.launch(r.d.k.conv_commit, .{ .x = 40 }, .{ l.conv[1 - l.conv_cur].?, off(st, ST_P), l.conv[l.conv_cur].?, @as(i32, @intCast(keep)), nul });
+            try r.d.launch(r.d.k.conv_commit, .{ .x = GDN_QKV / 256 }, .{ l.conv[1 - l.conv_cur].?, off(st, ST_P), l.conv[l.conv_cur].?, @as(i32, @intCast(keep)), nul });
         };
         r.pos += keep;
         r.last = r.block[keep - 1];
@@ -509,8 +521,8 @@ pub const Runner = struct {
                 continue;
             }
             const st = l.stash.?;
-            try r.d.launch(r.d.k.gdn_step, .{ .x = 16, .y = 48 }, .{ off(st, ST_Q), off(st, ST_K), off(st, ST_V), off(st, ST_G), off(st, ST_B), l.rec.?, l.rec.?, r.acts.y, keep, r.acts.path, nul, nul, nul });
-            try r.d.launch(r.d.k.conv_commit, .{ .x = 40 }, .{ l.conv[1 - l.conv_cur].?, off(st, ST_P), l.conv[l.conv_cur].?, keep, r.acts.path });
+            try r.d.launch(r.d.k.gdn_step, .{ .x = 16, .y = GDN_V_HEADS }, .{ off(st, ST_Q), off(st, ST_K), off(st, ST_V), off(st, ST_G), off(st, ST_B), l.rec.?, l.rec.?, r.acts.y, keep, r.acts.path, nul, nul, nul });
+            try r.d.launch(r.d.k.conv_commit, .{ .x = GDN_QKV / 256 }, .{ l.conv[1 - l.conv_cur].?, off(st, ST_P), l.conv[l.conv_cur].?, keep, r.acts.path });
         }
         if (r.taps_on and !straight) for (path, 0..) |row, dd| if (row != dd)
             try copy(&r.d, off(r.acts.taps, dd * 5 * D * 2), off(r.acts.taps, row * 5 * D * 2), 5 * D * 2);

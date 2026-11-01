@@ -10,14 +10,14 @@ const off = dev.off;
 /// Bytes a slot's states take: GDN and convolution states, and the K/V cache of `context` positions.
 pub fn slotBytes(r: *const Runner) usize {
     _ = r;
-    return 48 * (2 * 48 * 128 * 128 * 4 + 2 * 3 * 10240 * 2) + 16 * 2 * kvBytes();
+    return 48 * (2 * q.GDN_V_HEADS * 128 * 128 * 4 + 2 * 3 * q.GDN_QKV * 2) + 16 * 2 * kvBytes();
 }
 
 /// A slot's state after `at` prompt tokens (prompt cache): GDN and convolution states, K/V rows 0 .. at, one buffer.
 pub const Snap = struct { at: u32, buf: *anyopaque, bytes: usize };
 
-pub const REC_BYTES = 48 * 128 * 128 * 4;
-pub const CONV_BYTES = 3 * 10240 * 2;
+pub const REC_BYTES = q.GDN_V_HEADS * 128 * 128 * 4;
+pub const CONV_BYTES = 3 * q.GDN_QKV * 2;
 pub fn kvRow() usize {
     return if (q.kv_i8) 4 * 256 else 4 * 256 * 2;
 }
@@ -126,12 +126,12 @@ pub fn ensure(r: *Runner, slot: u32) !void {
             l.slot_vc[slot] = try d.alloc_(kvBytes());
         } else {
             if (l.slot_rec[slot] != null) continue;
-            l.slot_rec[slot] = try d.alloc_(48 * 128 * 128 * 4);
-            l.slot_save[slot] = try d.alloc_(48 * 128 * 128 * 4);
-            try d.fill(l.slot_rec[slot].?, @as(u32, 0), 48 * 128 * 128 * 4);
+            l.slot_rec[slot] = try d.alloc_(q.GDN_V_HEADS * 128 * 128 * 4);
+            l.slot_save[slot] = try d.alloc_(q.GDN_V_HEADS * 128 * 128 * 4);
+            try d.fill(l.slot_rec[slot].?, @as(u32, 0), q.GDN_V_HEADS * 128 * 128 * 4);
             for (&l.slot_conv[slot]) |*cv| {
-                cv.* = try d.alloc_(3 * 10240 * 2);
-                try d.fill(cv.*.?, @as(u16, 0), 3 * 10240 * 2);
+                cv.* = try d.alloc_(3 * q.GDN_QKV * 2);
+                try d.fill(cv.*.?, @as(u16, 0), 3 * q.GDN_QKV * 2);
             }
             l.slot_cur[slot] = 0;
         }
