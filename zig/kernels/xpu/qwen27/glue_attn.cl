@@ -173,15 +173,16 @@ KERNEL(256) void swiglu(global const half *GU, global half *H, global half *AHI,
     barrier(CLK_LOCAL_MEM_FENCE);
     if (lid * 4 < live) vstore4(vload4(0, hl + lid * 4), 0, H + (long)t * ff + blk * 1024 + lid * 4);
   }
-  const int lane = get_sub_group_local_id(), per = gs / 16, ng = live / gs;
+  // the groups of gs in this block's live columns; a block holds 1024 / gs scales (the index), the last one fewer
+  const int lane = get_sub_group_local_id(), per = gs / 16, ng = live / gs, per_blk = 1024 / gs;
   for (int g = get_sub_group_id(); g < ng; g += 16) {
     float s = 0.0f;
     for (int k = 0; k < per; k++) s += (float)hl[g * gs + lane * per + k];
     s = sub_group_reduce_add(s) * (1.0f / gs);
     if (lane == 0) {
       const half hi = convert_half_rte(s * ASC);
-      AHI[(long)t * (ff / gs) + blk * ng + g] = hi;
-      ALO[(long)t * (ff / gs) + blk * ng + g] = convert_half_rte(s * ASC - (float)hi);
+      AHI[(long)t * (ff / gs) + blk * per_blk + g] = hi;
+      ALO[(long)t * (ff / gs) + blk * per_blk + g] = convert_half_rte(s * ASC - (float)hi);
     }
   }
 }

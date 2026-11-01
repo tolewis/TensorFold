@@ -40,6 +40,7 @@ comptime {
 
 /// The group this process is in, opened by Runner.init; null at TP 1.
 pub var group: ?Group = null;
+var one_slot = false;
 
 pub const Group = struct {
     map: []align(std.heap.page_size_min) u8,
@@ -55,9 +56,11 @@ pub const Group = struct {
     fn counter(g: *const Group, r: u32) *std.atomic.Value(u64) {
         return @ptrCast(@alignCast(g.map.ptr + r * line));
     }
-    /// Rank r's slot for call `seq` (1-based: the value of g.seq after the bump).
+    /// Rank r's slot for call `seq` (1-based: the value of g.seq after the bump). TF_TP_ONE_SLOT=1 (a debug switch)
+    /// uses one slot a rank as the first form did.
     fn slot(g: *const Group, r: u32, seq: u64) [*]u16 {
-        return @ptrCast(@alignCast(g.map.ptr + g.tp * line + (2 * r + @as(u32, @intCast(seq % 2))) * slot_bytes));
+        const parity: u32 = if (one_slot) 0 else @intCast(seq % 2);
+        return @ptrCast(@alignCast(g.map.ptr + g.tp * line + (2 * r + parity) * slot_bytes));
     }
     fn consumed(g: *const Group) *std.atomic.Value(u64) {
         return @ptrCast(@alignCast(g.map.ptr + g.tp * line + 2 * g.tp * slot_bytes));
@@ -69,6 +72,7 @@ pub const Group = struct {
     /// Opens the group this process is in. Null at TP 1 (nothing to reduce).
     pub fn open(d: *Dev) !?Group {
         if (q.TP == 1) return null;
+        one_slot = std.c.getenv("TF_TP_ONE_SLOT") != null;
         const name: [*:0]const u8 = if (std.c.getenv("TF_TP_SHM")) |v| v else "/dev/shm/tf-tp-qwen27";
         const size = q.TP * line + 2 * q.TP * slot_bytes + line + ring_len * @sizeOf(Rec);
         // the file as the fabric's mailbox opens its own (fabric/tp/mailbox.zig): either rank may create it
