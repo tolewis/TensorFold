@@ -34,6 +34,7 @@ pub fn main(init: std.process.Init) !void {
     q.verbose = true;
     const t_load = q.now();
     const r = try q.Runner.init(argv[1], ctx);
+    defer r.deinit(); // at TP 2 the close record lets a follower stop
     std.debug.print("loaded in {d:.1} s\n", .{q.now() - t_load});
     if (std.c.getenv("TF_TP_FOLLOW") != null) return q.follow.run(r); // a rank above 0 replays rank 0's calls
     if (std.c.getenv("XPU_FIDELITY") != null) return fp64_ref.fidelity(r, ids.items);

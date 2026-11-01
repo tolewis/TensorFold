@@ -13,6 +13,7 @@ const alloc = q.alloc;
 
 pub fn run(r: *q.Runner) !void {
     const g = if (tp.group) |*x| x else return error.NotARank;
+    const trace = std.c.getenv("TF_TP_TRACE") != null; // every record to stderr
     if (g.rank == 0) return error.NotAFollower;
     var snaps: std.AutoHashMapUnmanaged(u64, slot_states.Snap) = .empty;
     defer snaps.deinit(alloc);
@@ -33,6 +34,7 @@ pub fn run(r: *q.Runner) !void {
         }
         const data = buf.items;
         const id = @as(u64, rec.lo) | (@as(u64, rec.hi) << 32);
+        if (trace) std.debug.print("follow: {s} a {d} b {d} n {d} data[0] {d}\n", .{ @tagName(op), rec.a, rec.b, rec.n, if (data.len > 0) data[0] else 0 });
         const n: usize = rec.a;
         const done = switch (op) {
             .select => r.select(rec.a),
