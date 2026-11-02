@@ -100,3 +100,7 @@ test "a later turn's shorter prompt is a rewind, not a supersede: the longer sta
     try std.testing.expect(!s.subsumes(p3, 5, 4, s.entries.items[ai]));
     try std.testing.expect(s.subsumed(p3, 5, 4) == null);
 }
+
+test {
+    _ = @import("scratch_keepone_trace.zig");
+}
