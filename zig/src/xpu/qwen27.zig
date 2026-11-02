@@ -268,6 +268,8 @@ pub const Runner = struct {
         if (pool_tokens != null) kv_pool = true;
         if (kv_pool) kv_i8 = true;
         if (std.c.getenv("XPU_KEEP_SHARED")) |v| keep_shared = v[0] != '0';
+        // K1 tree (XPU_K1=1 with XPU_K1_TREE=1) needs the int8 pool; print once so a run shows which path it takes
+        if (k1mod.on and k1mod.tree and kv_i8) std.debug.print("K1 tree verify is on\n", .{});
         MAX_CTX = try limits.context(context);
         {
             const marker = try std.fmt.allocPrintSentinel(alloc, "{s}/hadamard128", .{dir}, 0);
@@ -389,6 +391,7 @@ pub const Runner = struct {
             const kk = try k1mod.load(d, md, mk1);
             d.k.attn_k1 = kk.decode;
             d.k.attn_k1_16 = kk.decode16;
+            d.k.attn_k1_draft = kk.draft;
             k1mod.have16 = kk.decode16 != null;
             d.k.attn_span = kk.span;
             d.k.merge_span = kk.merge;
@@ -759,7 +762,9 @@ pub fn deinit(r: *Runner) void {
             }
         }
         if (r.pos + depth_max + 1 > r.context or r.pos + ids.len > r.context) return error.ContextFull;
-        try r.ensurePages(r.slot, r.pos + depth_max + 1);
+        // The draft K/V rows sit at pos + the row index, which reaches ids.len - 1: the tree table's rows past
+        // depth_max - 1 (a comb's row 15) need the same pages as the draft (lane p22-k1tree, issue 3).
+        try r.ensurePages(r.slot, r.pos + @as(u32, @intCast(ids.len)));
         try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, r.acts.tree, &r.tree_host, ids.len * 17 * 4, null, 0, null));
         _ = try forward(&r.d, &r.model, &r.acts, @ptrCast(ids), r.pos, .{ .want = .rows, .stash = true, .taps = r.taps_on, .tree = true, .pt = r.pt[r.slot] });
         var toks: [16]i32 = undefined;

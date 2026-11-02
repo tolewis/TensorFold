@@ -83,6 +83,9 @@ pub const Acts = struct {
     a8: *anyopaque, // W4A8 prompt: activations int8 [maxRows, FF] (permuted by blocks of 8) …
     sa: *anyopaque, // … and their scales fp32 [FF / 128, maxRows + 32]
     grp: *anyopaque, // i32 [16, 2]: K1's row groups (first row, rows)
+    kmt: *anyopaque, // u64 [16, 8]: the K1 tree verify's MT table (the slot's kc, vc, page table)
+    kpos: *anyopaque, // i32 [16]: its K1 POS (every row's last prefix key, p0 - 1)
+    kposm: *anyopaque, // i32 [16]: its merge POS (p0 + span - 1, so the draft's slice NS joins)
 
     pub fn init(d: *Dev) !Acts {
         const rows = q.maxRows();
@@ -132,6 +135,9 @@ pub const Acts = struct {
             .a8 = try d.alloc_(rows * FF),
             .sa = try d.alloc_((FF / 128) * (rows + 32) * 4),
             .grp = try d.alloc_(16 * 2 * 4),
+            .kmt = try d.alloc_(16 * 8 * 8),
+            .kpos = try d.alloc_(16 * 4),
+            .kposm = try d.alloc_(16 * 4),
         };
     }
 };
@@ -371,7 +377,35 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
                 try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = AKV }, .{ a.q, l.kc.?, l.vc.?, a.y, @as(i32, @intCast(p0)), t32, @as(f32, 1.0 / 16.0), pt });
             } else {
                 const k1on = k1mod.on and !mode.tree and l.pt != null and d.k.attn_k1 != null;
-                if (k1on) { // K1: split-K DPAS over the slot's int8 pages, one work-group a row group of a stream
+                const k1t = k1mod.tree and mode.tree and mode.multi == null and q.kv_i8 and l.pt != null and d.k.attn_k1 != null and d.k.attn_k1_draft != null;
+                if (k1t) { // K1 tree (lane p22-k1tree): the prefix keys through the 8-row groups, the draft keys
+                           // through attn_k1_draft into slice NS, merged as one row of partials a (row, head)
+                    const wf: [1]u32 = .{0};
+                    const wn: [1]u32 = .{T};
+                    const n = k1mod.rowGroups(&wf, &wn, grp_host[0..32]);
+                    const plan = k1mod.planTile(p0, n, AKV, k1mod.wave, k1mod.TILE);
+                    const p0i: i32 = @intCast(p0);
+                    const posm: i32 = @as(i32, @intCast(plan.ns)) * plan.span + plan.span - 1; // used = NS + 1
+                    for (0..16) |r| {
+                        k1mod.mt_host[r * 8] = @intFromPtr(l.kc.?);
+                        k1mod.mt_host[r * 8 + 1] = @intFromPtr(l.vc.?);
+                        k1mod.mt_host[r * 8 + 2] = @intFromPtr(l.pt.?);
+                    }
+                    for (0..16) |r| {
+                        k1mod.pos_host[r] = p0i - 1;
+                        k1mod.posm_host[r] = posm;
+                    }
+                    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.kmt, &k1mod.mt_host, 16 * 8 * 8, null, 0, null));
+                    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.kpos, &k1mod.pos_host, 16 * 4, null, 0, null));
+                    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.kposm, &k1mod.posm_host, 16 * 4, null, 0, null));
+                    try k1mod.queueGroups(d, a.grp, grp_host[0 .. 2 * n], n);
+                    // the partials' stride is ns + 1 (k1.cl attn_k1_draft): the prefix launch and the merge take it as NS,
+                    // the draft takes ns as its slice index
+                    const ns_stride: i32 = @as(i32, @intCast(plan.ns)) + 1;
+                    try d.launch(d.k.attn_k1.?, .{ .x = plan.ns, .y = AKV, .z = n }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, p0i), ns_stride, plan.span, @as(f32, 1.0 / 16.0), a.kmt, a.kpos, kvCap(), l.pt.?, a.grp });
+                    try d.launch(d.k.attn_k1_draft.?, .{ .x = 1, .y = AKV, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, p0i), @as(i32, @intCast(plan.ns)), @as(f32, 1.0 / 16.0), a.tree, l.pt.? });
+                    try d.launch(d.k.merge_span, .{ .x = HQ, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, p0i), ns_stride, plan.span, a.kposm });
+                } else if (k1on) { // K1: split-K DPAS over the slot's int8 pages, one work-group a row group of a stream
                     const rd = k1mod.roundGroups(if (mode.multi) |mm| mm.win else &.{}, T, &grp_host);
                     const tile = if (rd.k16) k1mod.TILE16 else k1mod.TILE;
                     const plan = k1mod.planTile(ctx, rd.n, AKV, k1mod.wave, tile);

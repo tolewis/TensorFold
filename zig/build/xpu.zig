@@ -132,12 +132,13 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const sage_install = b.addInstallArtifact(b.addExecutable(.{ .name = "xpu-sage", .root_module = sage_mod }), .{});
     b.step("xpu-sage", "Build the Sage-A1.5 (qwen3_5_moe) XPU runner, first form (MLX 4/64, decode kernels)").dependOn(&sage_install.step);
     // device tests: a skip message and exit 0 without a Level Zero device or a model (`xpu-tests` is Nemotron's, -Dxpu)
-    const tests_step = b.step("xpu-qwen27-tests", "Build the 27B XPU device tests (tf-xpu-qwen27-means-test, -seam-test, -close-test)");
+    const tests_step = b.step("xpu-qwen27-tests", "Build the 27B XPU device tests (tf-xpu-qwen27-means-test, -seam-test, -close-test, -k1-bench, -tree-test)");
     for ([_][2][]const u8{
         .{ "tf-xpu-qwen27-means-test", "zig/src/xpu/means_test.zig" },
         .{ "tf-xpu-qwen27-seam-test", "zig/src/xpu/seam_test.zig" },
         .{ "tf-xpu-qwen27-close-test", "zig/src/xpu/close_test.zig" },
         .{ "tf-xpu-qwen27-k1-bench", "zig/src/xpu/k1_bench.zig" },
+        .{ "tf-xpu-qwen27-tree-test", "zig/src/xpu/tree_test.zig" },
     }) |t| {
         const m = b.createModule(.{ .root_source_file = b.path(t[1]), .target = target, .optimize = optimize, .link_libc = true });
         m.addImport("xpu_qwen27_kernels", embedded);
