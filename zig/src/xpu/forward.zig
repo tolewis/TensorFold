@@ -378,6 +378,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
             } else {
                 const k1on = k1mod.on and !mode.tree and l.pt != null and d.k.attn_k1 != null;
                 const k1t = k1mod.tree and mode.tree and mode.multi == null and q.kv_i8 and l.pt != null and d.k.attn_k1 != null and d.k.attn_k1_draft != null;
+                const k1mt = k1mod.multi_tree and mode.multi != null and mode.tree and q.kv_i8 and l.pt != null and d.k.attn_k1 != null and d.k.attn_k1_draft_mt != null;
                 if (k1t) { // K1 tree (lane p22-k1tree): the prefix keys through the 8-row groups, the draft keys
                            // through attn_k1_draft into slice NS, merged as one row of partials a (row, head)
                     const wf: [1]u32 = .{0};
@@ -405,6 +406,28 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
                     try d.launch(d.k.attn_k1.?, .{ .x = plan.ns, .y = AKV, .z = n }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, p0i), ns_stride, plan.span, @as(f32, 1.0 / 16.0), a.kmt, a.kpos, kvCap(), l.pt.?, a.grp });
                     try d.launch(d.k.attn_k1_draft.?, .{ .x = 1, .y = AKV, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, p0i), @as(i32, @intCast(plan.ns)), @as(f32, 1.0 / 16.0), a.tree, l.pt.? });
                     try d.launch(d.k.merge_span, .{ .x = HQ, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, p0i), ns_stride, plan.span, a.kposm });
+                } else if (k1mt) { // K1 multi-tree (lane p33-multitree, XPU_MULTI_TREE): the prefix keys through the
+                                   // decode kernels with per-row POS (a chain row its mpos, a tree row its window base
+                                   // - 1), the tree rows' draft keys (their ancestors and themselves) through
+                                   // attn_k1_draft_mt into slice NS, one attn_merge_span join. A tree row's empty
+                                   // prefix slices hold PM = -inf (k1_body writes them), so its merge reads all
+                                   // ns + 1 slices; a chain row skips the draft slice (k1.zig mergePos)
+                    const mm2 = mode.multi.?;
+                    const rd = k1mod.roundGroups(mm2.win, T, &grp_host);
+                    const tile = if (rd.k16) k1mod.TILE16 else k1mod.TILE;
+                    const plan = k1mod.planTile(ctx, rd.n, AKV, k1mod.wave, tile);
+                    const kern = if (rd.k16) d.k.attn_k1_16.? else d.k.attn_k1.?;
+                    var posm_host: [16]i32 = undefined;
+                    k1mod.mergePos(mm2.kkind, mm2.kpos, plan.ns, plan.span, &posm_host);
+                    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.kpos, mm2.kpos, 16 * 4, null, 0, null));
+                    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.kposm, &posm_host, 16 * 4, null, 0, null));
+                    try k1mod.queueGroups(d, a.grp, grp_host[0 .. 2 * rd.n], rd.n);
+                    // the partials' stride is ns + 1 (k1.cl attn_k1_draft_mt): the prefix launch and the merge take
+                    // it as NS, the draft takes ns as its slice index
+                    const ns_stride: i32 = @as(i32, @intCast(plan.ns)) + 1;
+                    try d.launch(kern, .{ .x = plan.ns, .y = AKV, .z = rd.n }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), ns_stride, plan.span, @as(f32, 1.0 / 16.0), mt, a.kpos, kvCap(), l.pt.?, a.grp });
+                    try d.launch(d.k.attn_k1_draft_mt.?, .{ .x = 1, .y = AKV, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(plan.ns)), @as(f32, 1.0 / 16.0), a.tree, mt, mm2.pos });
+                    try d.launch(d.k.merge_span, .{ .x = HQ, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), ns_stride, plan.span, a.kposm });
                 } else if (k1on) { // K1: split-K DPAS over the slot's int8 pages, one work-group a row group of a stream
                     const rd = k1mod.roundGroups(if (mode.multi) |mm| mm.win else &.{}, T, &grp_host);
                     const tile = if (rd.k16) k1mod.TILE16 else k1mod.TILE;

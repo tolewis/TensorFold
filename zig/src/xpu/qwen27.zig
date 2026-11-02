@@ -214,6 +214,8 @@ pub const Runner = struct {
     slot: u32 = 0, // the selected sequence (select)
     mt_host: [LAYERS * 16 * 8]u64 = @splat(0), // verifyMulti's per-row state addresses, by layer
     pos_host: [16]i32 = @splat(0),
+    kpos_host: [16]i32 = @splat(0), // XPU_MULTI_TREE: each row's last prefix key (chain: mpos, tree: the window base - 1)
+    kkind_host: [16]u8 = @splat(0), // and 1 for a tree row, 0 for a chain row
     win_host: [32]i32 = @splat(0), // and each window's first row and width (keepMulti)
     ids_host: [16]u32 = @splat(0),
     multi_slots: [16]u32 = @splat(0), // the last verifyMulti's slots, by window
@@ -319,7 +321,7 @@ pub const Runner = struct {
         tp.group = try tp.Group.open(&r.d); // null at TP 1
         if (tp.group) |*g| {
             if (g.rank != 0 and g.readMode() != modeWord()) {
-                std.log.err("rank {d}: the mode word does not match rank 0's: this rank's XPU_KV_POOL, XPU_KEEP_SHARED, XPU_KV_INT8, XPU_EMBED_HOST, XPU_K1, XPU_K1_TREE, XPU_K1_R16 or XPU_K1_WAVE diverges, and the pair sizes its cards differently\n", .{ RANK });
+                std.log.err("rank {d}: the mode word does not match rank 0's: this rank's XPU_KV_POOL, XPU_KEEP_SHARED, XPU_KV_INT8, XPU_EMBED_HOST, XPU_K1, XPU_K1_TREE, XPU_MULTI_TREE, XPU_K1_R16 or XPU_K1_WAVE diverges, and the pair sizes its cards differently\n", .{ RANK });
                 g.markClosed(); // rank 0 sees the closed segment at its first all-reduce and exits at once
                 return error.ModeMismatch;
             }
@@ -393,12 +395,13 @@ pub const Runner = struct {
         };
         // the shared rounds' kernels reach each slot's states through the per-row table (acts.mt)
         for ([_]ze.H{ d.k.attn_prep, d.k.attn_decode, d.k.gdn_pre, d.k.gdn_step }) |k| try d.g.indirect(k);
-        if (k1mod.on) { // XPU_K1: the K1 decode kernel (k1.cl), the scalar page-table kernel and the merge
+        if (k1mod.on or k1mod.multi_tree) { // XPU_K1: the K1 decode kernel (k1.cl), the scalar page-table kernel and the merge
             const mk1 = try d.g.module(&kb.k1);
             const kk = try k1mod.load(d, md, mk1);
             d.k.attn_k1 = kk.decode;
             d.k.attn_k1_16 = kk.decode16;
             d.k.attn_k1_draft = kk.draft;
+            d.k.attn_k1_draft_mt = kk.draft_mt;
             k1mod.have16 = kk.decode16 != null;
             d.k.attn_span = kk.span;
             d.k.merge_span = kk.merge;
@@ -897,7 +900,7 @@ pub fn poolPages(r: *Runner, slots: u32, tokens: ?u32, cache: bool, extra: u64) 
 }
 
 /// The run flags a pair must agree on: one bit each for kv_pool, keep_shared, kv_i8, embed_host, k1, k1_tree and
-/// k1 r16, then four bits for the k1 wave (XPU_K1_WAVE, a small count).
+/// k1 r16, four bits for the k1 wave (XPU_K1_WAVE, a small count), then multi_tree (XPU_MULTI_TREE).
 pub fn modeWord() u64 {
     var w: u64 = 0;
     w |= @as(u64, @intFromBool(kv_pool));
@@ -908,6 +911,7 @@ pub fn modeWord() u64 {
     w |= @as(u64, @intFromBool(k1mod.tree)) << 5;
     w |= @as(u64, @intFromBool(k1mod.r16)) << 6;
     w |= (@as(u64, k1mod.wave) & 15) << 7;
+    w |= @as(u64, @intFromBool(k1mod.multi_tree)) << 11;
     return w;
 }
 
@@ -918,6 +922,7 @@ test "mode word: each flag sits at the bit both ranks agree on" {
     const saved_embed = embed_host;
     const saved_on = k1mod.on;
     const saved_tree = k1mod.tree;
+    const saved_mt = k1mod.multi_tree;
     const saved_r16 = k1mod.r16;
     const saved_wave = k1mod.wave;
     defer {
@@ -927,6 +932,7 @@ test "mode word: each flag sits at the bit both ranks agree on" {
         embed_host = saved_embed;
         k1mod.on = saved_on;
         k1mod.tree = saved_tree;
+        k1mod.multi_tree = saved_mt;
         k1mod.r16 = saved_r16;
         k1mod.wave = saved_wave;
     }
@@ -936,17 +942,22 @@ test "mode word: each flag sits at the bit both ranks agree on" {
     embed_host = false;
     k1mod.on = false;
     k1mod.tree = false;
+    k1mod.multi_tree = false;
     k1mod.r16 = true;
     k1mod.wave = 4;
     try std.testing.expectEqual(@as(u64, 1) << 6 | @as(u64, 4) << 7, modeWord());
+    k1mod.multi_tree = true;
+    try std.testing.expectEqual(@as(u64, 1) << 6 | @as(u64, 4) << 7 | @as(u64, 1) << 11, modeWord());
     kv_pool = true;
     keep_shared = true;
     kv_i8 = true;
     embed_host = true;
     k1mod.on = true;
     k1mod.tree = true;
-    try std.testing.expectEqual(@as(u64, 0x7F) | (@as(u64, 4) << 7), modeWord());
+    try std.testing.expectEqual(@as(u64, 0x7F) | (@as(u64, 4) << 7) | (@as(u64, 1) << 11), modeWord());
     k1mod.wave = 5;
+    try std.testing.expectEqual(@as(u64, 0x7F) | (@as(u64, 5) << 7) | (@as(u64, 1) << 11), modeWord());
+    k1mod.multi_tree = false;
     try std.testing.expectEqual(@as(u64, 0x7F) | (@as(u64, 5) << 7), modeWord());
 }
 

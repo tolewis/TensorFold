@@ -5,6 +5,7 @@ const q = @import("qwen27.zig");
 const tp = @import("tp.zig");
 const dev = @import("dev.zig");
 const fwd = @import("forward.zig");
+const k1mod = @import("k1.zig"); // XPU_MULTI_TREE: the shared tree round's host fill and the merge's per-row used
 const GDN_IN = q.GDN_IN;
 const HK = q.GDN_K_HEADS;
 const HV = q.GDN_V_HEADS;
@@ -22,6 +23,29 @@ const off = dev.off;
 
 /// A window of a shared verify: `ids` (pending token, then drafts) from its position; `parents` for a tree, else chain.
 pub const Win = struct { slot: u32, ids: []const u32, parents: ?[]const i32 = null };
+
+/// XPU_MULTI_TREE host inputs (lane p33-multitree): a chain row (a window without parents) takes its mpos as its
+/// last prefix key, kkind 0; a tree row takes its window base - 1, kkind 1: the window region is owned by the
+/// draft kernel. The window base is the window first row's mpos. When `sent`, a chain row's tree-table row
+/// carries the NO_DRAFT sentinel (bit 1024) so the draft kernel skips it; the scalar path never reads bit 1024.
+pub fn k1mtFill(win_host: []const i32, pos_host: []const i32, tree_host: []i32, wins: []const Win, kpos: []i32, kkind: []u8, sent: bool) void {
+    for (wins, 0..) |w, i| {
+        const first: i32 = @intCast(win_host[2 * i]);
+        const width: i32 = @intCast(win_host[2 * i + 1]);
+        const base: i32 = pos_host[first]; // the window first row's mpos is the window base
+        for (0..width) |j| {
+            const t: i32 = first + @as(i32, @intCast(j));
+            if (w.parents != null) {
+                kkind[t] = 1;
+                kpos[t] = base - 1;
+            } else {
+                kkind[t] = 0;
+                kpos[t] = pos_host[t];
+                if (sent) tree_host[t * 17] |= 1024;
+            }
+        }
+    }
+}
 
 /// Every window in one forward (16 rows at most): each row's greedy token in `block`; nothing moves until `keepMulti`.
 pub fn verifyMulti(r: *Runner, wins: []const Win) !void {
@@ -105,6 +129,9 @@ pub fn verifyMulti(r: *Runner, wins: []const Win) !void {
         }
         try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, r.acts.tree, &r.tree_host, T * 17 * 4, null, 0, null));
     }
+    // XPU_MULTI_TREE host inputs, after the tree table (k1mtFill): chain rows their mpos, tree rows the window
+    // base - 1; the NO_DRAFT sentinel on the chain rows' table rows when the draft kernel will read the table
+    k1mtFill(r.win_host[0 .. 2 * wins.len], &r.pos_host, &r.tree_host, wins, &r.kpos_host, &r.kkind_host, k1mod.multi_tree and tree);
     for (&r.model.layers, 0..) |*l, i| for (wins, 0..) |w, wi| {
         const first: usize = @intCast(r.win_host[2 * wi]);
         for (0..w.ids.len) |j| {
@@ -128,7 +155,7 @@ pub fn verifyMulti(r: *Runner, wins: []const Win) !void {
     const d = &r.d;
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, r.acts.mt, &r.mt_host, LAYERS * 16 * 8 * 8, null, 0, null));
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, r.acts.mpos, &r.pos_host, T * 4, null, 0, null));
-    _ = try forward(d, &r.model, &r.acts, @ptrCast(r.ids_host[0..T]), 0, .{ .want = .rows, .stash = true, .taps = r.taps_on, .tree = tree, .multi = .{ .mt = r.acts.mt, .pos = r.acts.mpos, .max_pos = max_pos, .win = r.win_host[0 .. 2 * wins.len] } });
+    _ = try forward(d, &r.model, &r.acts, @ptrCast(r.ids_host[0..T]), 0, .{ .want = .rows, .stash = true, .taps = r.taps_on, .tree = tree, .multi = .{ .mt = r.acts.mt, .pos = r.acts.mpos, .max_pos = max_pos, .win = r.win_host[0 .. 2 * wins.len], .kpos = r.kpos_host[0..16], .kkind = r.kkind_host[0..16] } });
     var toks: [16]i32 = undefined;
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &toks, r.acts.tok, T * 4, null, 0, null));
     try d.sync();
@@ -234,4 +261,47 @@ pub fn stepMulti(r: *Runner, slots: []const u32, tokens: []const u32) !void {
     try r.verifyMulti(wins[0..slots.len]);
     const ones: [16]u32 = @splat(1);
     try r.keepMulti(ones[0..slots.len]);
+}
+
+test "k1 mt: the host fill keeps chain rows on their mpos and cuts tree rows at the window base" {
+    // two windows: a 4-row tree window at base 40000 (rows 0..3), a 2-row chain window at 41000 (rows 4..5)
+    const parents: [4]i32 = .{ -1, 0, 1, 1 };
+    const ids: [4]u32 = .{ 1, 2, 3, 4 };
+    const cids: [2]u32 = .{ 5, 6 };
+    const wins = [_]Win{.{ .slot = 1, .ids = &ids, .parents = &parents }, .{ .slot = 2, .ids = &cids }};
+    const win_host = [32]i32{ 0, 4, 4, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    var pos_host: [16]i32 = @splat(0);
+    for (0..4) |j| pos_host[j] = 40000 + @as(i32, @intCast(j));
+    for (4..6) |j| pos_host[j] = 41000 + @as(i32, j - 4);
+    var tree_host: [16 * 17]i32 = @splat(0);
+    var kpos: [16]i32 = @splat(99);
+    var kkind: [16]u8 = @splat(99);
+    k1mtFill(&win_host, &pos_host, &tree_host, &wins, &kpos, &kkind, true);
+    for (0..4) |j| {
+        try std.testing.expectEqual(@as(u8, 1), kkind[j]);
+        try std.testing.expectEqual(@as(i32, 39999), kpos[j]);
+        try std.testing.expectEqual(@as(i32, 0), tree_host[j * 17]);
+    }
+    for (4..6) |j| {
+        try std.testing.expectEqual(@as(u8, 0), kkind[j]);
+        try std.testing.expectEqual(pos_host[j], kpos[j]);
+        try std.testing.expectEqual(@as(i32, 1024), tree_host[j * 17]); // the NO_DRAFT sentinel
+    }
+    // without sent, the table rows stay as the tree table left them
+    var kpos2: [16]i32 = @splat(99);
+    var kkind2: [16]u8 = @splat(99);
+    k1mtFill(&win_host, &pos_host, &tree_host, &wins, &kpos2, &kkind2, false);
+    try std.testing.expectEqual(@as(i32, 1024), tree_host[4 * 17]); // already set; the fill never clears it
+}
+
+test "k1 mt: the merge per-row used reads all slices for a tree row and the chain rows up to their mpos" {
+    const kkind: [16]u8 = .{ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const kpos: [16]i32 = .{ 39999, 41000, 41001, 40960, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    var out: [16]i32 = undefined;
+    k1mod.mergePos(&kkind, &kpos, 3, 128, &out);
+    try std.testing.expectEqual(@as(i32, 3 * 128 + 127), out[0]); // tree row: every slice incl. the draft
+    try std.testing.expectEqual(@as(i32, 41000), out[1]); // chain row: up to its mpos, the draft slice skipped
+    try std.testing.expectEqual(@as(i32, 41001), out[2]);
+    try std.testing.expectEqual(@as(i32, 40960), out[3]); // exactly at a span edge: 40960 / 128 + 1 slices
+    try std.testing.expectEqual(@as(i32, 0), out[4]);
 }

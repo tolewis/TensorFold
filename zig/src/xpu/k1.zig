@@ -27,12 +27,19 @@ pub var have16 = false;
 /// XPU_K1_TREE: the single-stream tree verify's prefix goes through K1, its draft keys through attn_k1_draft
 /// (lane p22-k1tree). Default off: the tree path keeps the scalar attn_decode + attn_merge.
 pub var tree = false;
+/// XPU_MULTI_TREE: a shared round with tree windows runs K1: the prefix keys through the decode kernels with
+/// per-row POS, the rows' draft keys (their ancestors and themselves) through attn_k1_draft_mt, one
+/// attn_merge_span join (lane p33-multitree, design/multitree-k1.md). Default off: the tree rows keep the
+/// scalar attn_decode + attn_merge. Production runs XPU_K1_TREE=1; this flag is separate, so the new binary
+/// changes no behavior until it is set.
+pub var multi_tree = false;
 
 pub fn readEnv() void {
     if (std.c.getenv("XPU_K1")) |v| on = v[0] != '0';
     if (std.c.getenv("XPU_K1_WAVE")) |v| wave = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 4;
     if (std.c.getenv("XPU_K1_R16")) |v| r16 = v[0] != '0';
     if (std.c.getenv("XPU_K1_TREE")) |v| tree = v[0] != '0';
+    if (std.c.getenv("XPU_MULTI_TREE")) |v| multi_tree = v[0] != '0';
 }
 
 /// The tree verify's MT table and POS: the slot's own kc, vc and page table, every row's last prefix key p0 - 1.
@@ -46,6 +53,7 @@ pub const Kernels = struct {
     decode: ze.H = null, // attn_k1_decode (k1.cl): 8-row groups
     decode16: ze.H = null, // attn_k1_decode16 (k1.cl): 16-row groups, 128-key tiles
     draft: ze.H = null, // attn_k1_draft (k1.cl): the tree verify's draft keys into slice NS
+    draft_mt: ze.H = null, // attn_k1_draft_mt (k1.cl): the shared round's tree rows' draft keys (XPU_MULTI_TREE)
     span: ze.H = null, // attn_decode_span (decode.cl): the scalar page-table kernel K1 is checked against
     merge: ze.H = null, // attn_merge_span (decode.cl): the merge of slice partials
     dec: ze.H = null, // attn_decode (decode.cl): the scalar table kernel, the tree bench's reference
@@ -58,6 +66,7 @@ pub fn load(d: *dev.Dev, md: ze.H, mk1: ze.H) !Kernels {
         .decode = try d.kernel(mk1, "attn_k1_decode", 256),
         .decode16 = try d.kernel(mk1, "attn_k1_decode16", 256),
         .draft = try d.kernel(mk1, "attn_k1_draft", 16),
+        .draft_mt = try d.kernel(mk1, "attn_k1_draft_mt", 16),
         .span = try d.kernel(md, "attn_decode_span", 16),
         .merge = try d.kernel(md, "attn_merge_span", 256),
         .dec = try d.kernel(md, "attn_decode", 16),
@@ -142,6 +151,14 @@ pub fn roundGroups(win: []const i32, t: u32, host: []i32) Round {
         }
     }
     return .{ .k16 = k16, .rows = per, .n = n };
+}
+
+/// The merge's per-row used for a shared tree round: a tree row (kkind 1) reads all ns + 1 slices, so its kposm
+/// is ns * span + span - 1; its empty prefix slices hold PM = -inf (k1_body writes them). A chain row reads its
+/// prefix slices only, so its kposm is its kpos, and the draft's slice NS is skipped.
+pub fn mergePos(kkind: []const u8, kpos: []const i32, ns: u32, span: i32, out: []i32) void {
+    const all: i32 = @as(i32, @intCast(ns)) * span + span - 1;
+    for (out, kkind, kpos) |*o, k, kp| o.* = if (k != 0) all else kp;
 }
 
 /// Queues the groups of `wf`/`wn` into `grp`: the host buffer must stay alive until the list drains.

@@ -102,4 +102,68 @@ KERNEL(16) void attn_k1_draft(global const ushort *Q, global const char *KC, glo
 }
 #undef DEPTH
 #undef ANC
+
+// Shared-round tree draft (lane p33-multitree, XPU_MULTI_TREE): attn_k1_draft across the block's tree table, the
+// rows of several streams. A tree row reads its D + 1 draft keys - its own cache row and its ancestors' - through
+// its slot's page table (MT[t*8+2]), at key POS[wk] + the ancestor row - wk: wk, the row's window first row
+// (MT[t*8+6]), and POS the round's per-row positions, so POS[wk] is the window base. A chain row carries the
+// NO_DRAFT sentinel (bit 1024) and skips, its merge slice skipped by its kposm. The partials write slice NS at
+// the row's NS + 1 stride, as attn_k1_draft. Grid (1, AKV, rows).
+#define DEPTH(t) (TREE[(t) * 17] & 255)
+#define ANC(t, d) TREE[(t) * 17 + 1 + (d)]
+#define NODR(t) (TREE[(t) * 17] & 1024)
+KERNEL(16) void attn_k1_draft_mt(global const ushort *Q, global const char *KC, global const char *VC,
+                                 global float *PM, global float *PL, global float *PO, int p0, int NS,
+                                 float scale, global const int *TREE, global const ulong *MT, global const int *POS) {
+  const int hk = get_group_id(1), t = get_group_id(2), lane = get_sub_group_local_id();
+  if (NODR(t)) return;
+  const int D = DEPTH(t), wk = (int)MT[(t) * 8 + 6], b = POS[wk];
+  const global const char *kc8 = (global const char *)MT[(t) * 8];
+  const global const char *vc8 = (global const char *)MT[(t) * 8 + 1];
+  const global const uint *PT = (global const uint *)MT[(t) * 8 + 2];
+  const int qh0 = hk * Q27_GQA;
+  float q[Q27_GQA][16], o[Q27_GQA][16], m[Q27_GQA], l[Q27_GQA];
+  for (int a = 0; a < Q27_GQA; a++) {
+    for (int i = 0; i < 16; i++) {
+      q[a][i] = bf2f(Q[((long)t * Q27_AQ + qh0 + a) * 256 + lane * 16 + i]) * scale * M_LOG2E_F;
+      o[a][i] = 0.0f;
+    }
+    m[a] = -INFINITY;
+    l[a] = 0.0f;
+  }
+  for (int d = 0; d <= D; d++) {            // its own row and its ancestors' cache rows
+    const int cr = b + ANC(t, d) - wk;
+    const long pb = (long)PT[cr / Q27_PAGE] * Q27_PAGE8;
+    const int pr = cr % Q27_PAGE;
+    const long kr = (long)pr * Q27_AKV + hk;
+    const char16 k8 = vload16(lane, kc8 + pb + kr * 256);
+    const float ks = ((global const float *)(kc8 + pb + (long)Q27_PAGE * Q27_KVROW))[pr * Q27_AKV + hk];
+    float sc[Q27_GQA];
+    for (int a = 0; a < Q27_GQA; a++) {
+      float dd = 0.0f;
+      for (int i = 0; i < 16; i++) dd += q[a][i] * (float)k8[i] * ks;
+      sc[a] = sub_group_reduce_add(dd);
+    }
+    const char16 v8 = vload16(lane, vc8 + pb + kr * 256);
+    const float vs = ((global const float *)(vc8 + pb + (long)Q27_PAGE * Q27_KVROW))[pr * Q27_AKV + hk];
+    for (int a = 0; a < Q27_GQA; a++) {
+      const float mn = fmax(m[a], sc[a]);
+      const float al = native_exp2(m[a] - mn), p = native_exp2(sc[a] - mn);
+      l[a] = l[a] * al + p;
+      for (int i = 0; i < 16; i++) o[a][i] = o[a][i] * al + p * (float)v8[i] * vs;
+      m[a] = mn;
+    }
+  }
+  for (int a = 0; a < Q27_GQA; a++) {              // slice NS: the partials' layout as attn_k1_decode's
+    const long base = ((long)t * Q27_AQ + qh0 + a) * (NS + 1) + NS;
+    if (lane == 0) {
+      PM[base] = m[a];
+      PL[base] = l[a];
+    }
+    for (int i = 0; i < 16; i++) PO[base * 256 + lane * 16 + i] = o[a][i];
+  }
+}
+#undef DEPTH
+#undef ANC
+#undef NODR
 #endif // Q27_GQA == 6

@@ -163,6 +163,9 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     // the rank mode word's bit layout: a pure host test, run by name only, so no runner opens and no card is touched
     const mode_step = b.step("test-mode-word", "The TP 2 rank mode word's bit layout (no card)");
     if (target.result.cpu.arch == host.cpu.arch and target.result.os.tag == host.os.tag) mode_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = qwen27, .filters = &.{"mode word:"} })).step);
+    // XPU_MULTI_TREE: the shared tree round's host fill and the merge's per-row used (lane p33-multitree), no card
+    const mt_step = b.step("test-k1-mt", "The shared tree round's host fill and merge per-row used (no card)");
+    if (target.result.cpu.arch == host.cpu.arch and target.result.os.tag == host.os.tag) mt_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = qwen27, .filters = &.{"k1 mt:"} })).step);
     if (target.result.cpu.arch == host.cpu.arch and target.result.os.tag == host.os.tag) tests_build.dependOn(&b.addTest(.{ .root_module = qwen27 }).step);
     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
     // core (the image processor, M-RoPE layouts) for the engines' --vision as for the server: one module, one copy
