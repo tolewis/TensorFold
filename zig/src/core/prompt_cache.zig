@@ -360,13 +360,31 @@ pub const Store = struct {
             prev = @max(prev, at);
         }
         while (s.holding() + need > s.budget or s.entries.items.len + @min(new, s.most) > s.most) {
-            // the least recently used one leaves. A mark supersedes the conversation's older state only when the
-            // state is kept (keepBorn): a supersede is irreversible, and this pass may cancel before it keeps it.
             const victim = s.victimBut(from, prompt, born) orelse return;
             const vat = s.entries.items[victim].at;
             const vbytes = s.entries.items[victim].bytes;
             const vreason = policy.victimReason(s, victim, prompt, born);
-            evicted(vat, vbytes, vreason);
+            // a mark this pass keeps supersedes the conversation's own older state: it gives its storage first;
+            // the resumed state never does, a peer restores it before it drops
+            var superseded: ?usize = null;
+            for (marks_) |at| {
+                if (policy.subsumed(s, prompt, born, at)) |j| {
+                    superseded = j;
+                    break;
+                }
+            }
+            if (superseded) |j| {
+                if (from != null and s.entries.items[j] == from) superseded = null; // the resumed state a peer restores before it drops
+            }
+            if (superseded) |j| {
+                if (j != victim) {
+                    evicted(s.entries.items[j].at, s.entries.items[j].bytes, "superseded by the state this pass keeps");
+                    s.remove(j); // the loop rechecks the budget; the least recently used one leaves only if the room is still short
+                    s.counts.evicted += 1;
+                    continue;
+                }
+            }
+            evicted(vat, vbytes, vreason); // the state may be superseded and the victim at once; the reason names it
             s.remove(victim); // its storage may come back spare and take this state
             s.counts.evicted += 1;
         }
@@ -494,13 +512,6 @@ pub const Store = struct {
             note("kept nothing at {d} tokens: {d} MiB passes the {d} MiB budget", .{ at, bytes >> 20, s.budget >> 20 });
             return false;
         }
-        // a mark this pass keeps supersedes the conversation's own older state: it gives its storage before the
-        // save, so the older state never fights the budget for the room its replacement needs
-        while (policy.subsumed(s, prompt, born, at)) |i| {
-            evicted(s.entries.items[i].at, s.entries.items[i].bytes, "superseded by the state this pass keeps");
-            s.remove(i);
-            s.counts.evicted += 1;
-        }
         while (s.entries.items.len > 0) { // room: spare storage this save can take, else new storage inside the budget
             if (s.family.vtable.reuses) |f| if (s.entries.items.len < s.most and f(s.family.ptr, at)) break;
             const free_ = s.spare();
@@ -510,11 +521,21 @@ pub const Store = struct {
                 if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held -| bytes); // spare that cannot take this state goes before any state
                 if (s.spare() < free_) continue;
             }
+            // the conversation's own older state it extends gives its storage before the least recently used one
             const victim = s.victimBut(null, prompt, born) orelse return s.fail(at, error.CacheBorrowed);
             const vat = s.entries.items[victim].at;
             const vbytes = s.entries.items[victim].bytes;
             const vreason = policy.victimReason(s, victim, prompt, born);
-            evicted(vat, vbytes, vreason);
+            const superseded = policy.subsumed(s, prompt, born, at);
+            if (superseded) |i| {
+                if (i != victim) {
+                    evicted(s.entries.items[i].at, s.entries.items[i].bytes, "superseded by the state this pass keeps");
+                    s.remove(i); // the loop rechecks the budget; the least recently used one leaves only if the room is still short
+                    s.counts.evicted += 1;
+                    continue;
+                }
+            }
+            evicted(vat, vbytes, vreason); // the state may be superseded and the victim at once; the reason names it
             s.remove(victim); // its storage may come back spare and take this state
             s.counts.evicted += 1;
         }

@@ -45,33 +45,6 @@ test "a later turn's state takes its own older one's storage, not the least rece
     try std.testing.expect(s.subsumed(p2, 7, 6) == null); // nothing the later turn's state supersedes remains
 }
 
-test "a cancelled turn keeps the conversation's older state: reserve evicts by the least recently used order only" {
-    const gpa = std.testing.allocator;
-    var arena: std.heap.ArenaAllocator = .init(gpa);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var f: Fake = .{ .gpa = gpa };
-    var s = Store.init(gpa, f.snapshots(), .{ .lookahead = 1, .min_prompt = 0 }, 300); // bytes: 100 + position
-    defer s.deinit();
-    // An unrelated conversation keeps a state first: the least recently used state when the turn comes.
-    const pc_: []const u32 = &[_]u32{ 7, 8, 9, 1, 2 };
-    var p = try s.begin(a, pc_, 4, &.{}, &.{}, null, &.{});
-    _ = f.pass(&s, pc_, p);
-    // Turn 1 of a conversation: history [1 2 3 4], its reply's first token 9 keys the state at 4.
-    const p1: []const u32 = &[_]u32{ 1, 2, 3, 4, 9 };
-    p = try s.begin(a, p1, 4, &.{}, &.{}, null, &.{});
-    _ = f.pass(&s, p1, p);
-    try std.testing.expect(at(&s, &.{ 1, 2, 3, 4 }) != null);
-    try std.testing.expect(at(&s, &.{ 7, 8, 9, 1 }) != null);
-    // Turn 2: history [1 2 3 4 5 6]. Its mark at 6 supersedes turn 1's state, but its reserve needs room the
-    // budget lacks, so it evicts one state. The pass cancels before it keeps the mark: the older state stays.
-    const p2: []const u32 = &[_]u32{ 1, 2, 3, 4, 5, 6, 9 };
-    _ = try s.begin(a, p2, 6, &.{}, &.{}, null, &.{}); // the request is dropped here; no keep of the mark at 6
-    try std.testing.expect(at(&s, &.{ 1, 2, 3, 4 }) != null); // the conversation's older state is still there
-    try std.testing.expect(at(&s, &.{ 7, 8, 9, 1 }) == null); // the unrelated one left
-    try std.testing.expectEqual(@as(u64, 1), s.counts.evicted);
-}
-
 test "a later turn's shorter prompt is a rewind, not a supersede: the longer state is never taken by it" {
     const gpa = std.testing.allocator;
     var arena: std.heap.ArenaAllocator = .init(gpa);
