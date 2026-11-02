@@ -161,6 +161,9 @@ pub const Pipelines = struct {
     route: mod.Kernel,
     matvec_modules: [variants.all.len]mod.Module,
     matvec: [variants.all.len]mod.Kernel,
+    /// The rows 1 4-bit decode image (exl3_mv3.cl): loaded only when XPU_EXL3_MV3 is set, null otherwise.
+    mv3_module: ?mod.Module = null,
+    mv3: ?mod.Kernel = null,
     moe_modules: [variants.moe.bits.len]mod.Module,
     moe: [variants.moe.bits.len]MoeKernels,
 
@@ -194,6 +197,26 @@ pub const Pipelines = struct {
             };
             done += 1;
         }
+        // XPU_EXL3_MV3: the second rows-1 4-bit decode form. A load failure falls back to exl3_matvec.
+        if (std.c.getenv("XPU_EXL3_MV3")) |v| {
+            const on = v.len > 0 and v[0] != '0';
+            if (on) {
+                p.mv3_module = mod.Module.load(ctx, kernels.exl3_mv3) catch |e| blk: {
+                    std.log.warn("exl3: the rows 1 4-bit mv3 image did not load ({s}); the matvec stays", .{@errorName(e)});
+                    break :blk null;
+                };
+                if (p.mv3_module) |mm| {
+                    p.mv3 = mm.kernel("exl3_matvec3", local_matvec) catch |e| blk: {
+                        std.log.warn("exl3: exl3_matvec3 is not in the mv3 image ({s}); the matvec stays", .{@errorName(e)});
+                        break :blk null;
+                    };
+                    if (p.mv3) |k| {
+                        try k.indirect();
+                        std.log.info("exl3: XPU_EXL3_MV3 is on: rows 1 4-bit launches use exl3_matvec3 (exl3_mv3.cl); 6-bit and rows 2 to 16 stay on exl3_matvec", .{});
+                    }
+                }
+            }
+        }
         var moe_done: usize = 0;
         errdefer for (0..moe_done) |i| {
             p.moe[i].deinit();
@@ -211,6 +234,8 @@ pub const Pipelines = struct {
     }
 
     pub fn deinit(p: *Pipelines) void {
+        if (p.mv3) |k| k.deinit();
+        if (p.mv3_module) |m| m.unload();
         for (&p.moe, &p.moe_modules) |*k, *m| {
             k.deinit();
             m.unload();
@@ -325,15 +350,18 @@ fn fused(rows: u32, n_max: u32, k_tiles_gcd: u32, ks: u32) bool {
 
 /// Queues the stages over a table of `count` groups (no host wait): rotate_in (unless fused), matvec, rotate_out.
 fn stages(p: *const Pipelines, s: Stream, table: ?*anyopaque, count: u32, rows: u32, k_max: u32, n_max: u32, k_tiles_gcd: u32, sh: Shape) Error!void {
-    const mv = p.matvec[sh.variant];
-    const ns = variants.all[sh.variant].ns;
-    const fuse = fused(rows, n_max, k_tiles_gcd, sh.ks);
+    // XPU_EXL3_MV3: the rows 1 4-bit decode image, one strip a sub-group and no fused rotate. Any other width, row
+    // count or shape stays on exl3_matvec.
+    const mv3 = p.mv3 != null and rows == 1 and variants.all[sh.variant].bits == 4;
+    const mv = if (mv3) p.mv3.? else p.matvec[sh.variant];
+    const ns = if (mv3) 1 else variants.all[sh.variant].ns;
+    const fuse = !mv3 and fused(rows, n_max, k_tiles_gcd, sh.ks);
     for ([_]mod.Kernel{ p.rotate_in, mv, p.rotate_out }) |k| {
         try k.setPtr(0, null); // base: unused with -DEXL3_ABS
         try k.setPtr(1, table);
     }
     try mv.setU32(2, sh.ks);
-    try mv.setU32(3, @intFromBool(fuse));
+    if (!mv3) try mv.setU32(3, @intFromBool(fuse)); // exl3_matvec3 has three arguments
     try p.rotate_out.setU32(2, sh.ks);
     if (!fuse) try launch(p.rotate_in, s, .{ k_max / 128, rows, count });
     try launch(mv, s, .{ std.math.divCeil(u32, n_max / 16 / ns, local_matvec[0] / 16) catch unreachable, count, sh.ks });
@@ -649,4 +677,96 @@ test "descriptor layout and scratch" {
 
 test {
     _ = variants;
+}
+
+fn bf16Bits(f: f32) u16 {
+    const u: u32 = @bitCast(f);
+    return @truncate(u >> 16);
+}
+
+/// XPU_EXL3_MV3_CHECK: at open, run exl3_matvec3 and the exl3_matvec image the engine would pick on the same
+/// input of one 4-bit matrix, and print the largest relative difference with one PASS or FAIL line at 1e-3.
+/// Runs only when the variable is set, and only when the mv3 image loaded.
+pub fn mv3Check(ctx: *const Context, s: Stream, gpa: std.mem.Allocator, p: *const Pipelines, m: Matrix) Error!void {
+    const mvc = p.mv3 orelse {
+        std.log.info("exl3 mv3 check: no mv3 image, skipped", .{});
+        return;
+    };
+    try m.validate();
+    if (m.halves != 8) {
+        std.log.info("exl3 mv3 check: {d}-bit matrix, skipped (4-bit only)", .{m.halves / 2});
+        return;
+    }
+    const k: usize = m.k;
+    const n: usize = m.n;
+    const strips: variants.Strips = .{ .min = n / 16, .gcd = n / 16, .total = n / 16 };
+    const vi = variants.pick(4, 1, strips) orelse {
+        std.log.info("exl3 mv3 check: no rows 1 4-bit matvec image, skipped", .{});
+        return;
+    };
+    const ns = variants.all[vi].ns;
+    const rot_b = rotBytes(k, 1);
+    const sums_b = std.mem.alignForward(usize, n * 4, 256);
+    const xh = try gpa.alloc(u16, k);
+    defer gpa.free(xh);
+    for (xh, 0..) |*v, i| {
+        const f = @as(f32, @floatFromInt((i * 37 + 11) % 251)) / 128.0 - 1.0;
+        v.* = bf16Bits(f);
+    }
+    var xb = try DeviceBuffer.fromHost(ctx, s, std.mem.sliceAsBytes(xh));
+    defer xb.free();
+    var sb = try DeviceBuffer.alloc(ctx, rot_b + 2 * sums_b);
+    defer sb.free();
+    const rot: u64 = @intFromPtr(sb.ptr.?);
+    var d1 = Desc{
+        .trellis = m.trellis,
+        .suh = m.suh,
+        .svh = m.svh,
+        .x = @intFromPtr(xb.ptr.?),
+        .rot = rot,
+        .sums = rot + rot_b,
+        .out = 0,
+        .k = m.k,
+        .n = m.n,
+        .halves = m.halves,
+        .rows = 1,
+        .x_stride = m.k,
+        .out_stride = m.n,
+        .out_type = @intFromEnum(Output.f32),
+        .x_f16 = @intFromEnum(Input.bf16),
+    };
+    var d2 = d1;
+    d2.sums = rot + rot_b + sums_b;
+    var t1 = try DeviceBuffer.fromHost(ctx, s, std.mem.asBytes(&d1));
+    defer t1.free();
+    var t2 = try DeviceBuffer.fromHost(ctx, s, std.mem.asBytes(&d2));
+    defer t2.free();
+    const mv = p.matvec[vi];
+    try p.rotate_in.setPtr(0, null);
+    try p.rotate_in.setPtr(1, t1.ptr);
+    try launch(p.rotate_in, s, .{ m.k / 128, 1, 1 });
+    try mv.setPtr(0, null);
+    try mv.setPtr(1, t1.ptr);
+    try mv.setU32(2, 1);
+    try mv.setU32(3, 0);
+    try launch(mv, s, .{ std.math.divCeil(u32, n / 16 / ns, local_matvec[0] / 16) catch unreachable, 1, 1 });
+    try mvc.setPtr(0, null);
+    try mvc.setPtr(1, t2.ptr);
+    try mvc.setU32(2, 1);
+    try launch(mvc, s, .{ std.math.divCeil(u32, n / 16, local_matvec[0] / 16) catch unreachable, 1, 1 });
+    const a = try gpa.alloc(f32, n);
+    defer gpa.free(a);
+    const b = try gpa.alloc(f32, n);
+    defer gpa.free(b);
+    try sb.download(s, rot_b, std.mem.sliceAsBytes(a));
+    try sb.download(s, rot_b + sums_b, std.mem.sliceAsBytes(b));
+    var mx: f32 = 0;
+    var md: f32 = 0;
+    for (a, b) |x, y| {
+        mx = @max(mx, @abs(x));
+        md = @max(md, @abs(x - y));
+    }
+    const rel: f32 = if (mx > 0) md / mx else md;
+    std.log.info("exl3 mv3 check: K {d} N {d}, max|mv3 - matvec| = {e:.3}, relative = {e:.3}, bar 1e-3", .{ k, n, md, rel });
+    if (rel <= 1e-3) std.log.info("exl3 mv3 check: PASS", .{}) else std.log.info("exl3 mv3 check: FAIL", .{});
 }

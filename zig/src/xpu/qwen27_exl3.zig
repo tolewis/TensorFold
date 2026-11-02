@@ -216,6 +216,21 @@ pub const Weights = struct {
         hp.row = @intFromPtr(try d.alloc_(D * 2));
         hp.row_plan = try hp.plan(w, hp.row, hp.y, 1);
         try d.sync();
+        // XPU_EXL3_MV3_CHECK: the mv3 correctness run, once, at open. Not run unless the variable is set.
+        if (std.c.getenv("XPU_EXL3_MV3_CHECK")) |v| {
+            if (v.len > 0 and v[0] != '0') {
+                const first: ?exl3.Matrix = blk: {
+                    for (w.projs.items) |pj| for (pj.parts[0..pj.count]) |pt| {
+                        if (pt.m.halves == 8) break :blk pt.m;
+                    };
+                    break :blk null;
+                };
+                if (first) |mm| {
+                    exl3.mv3Check(&w.ctx, w.stream(), alloc, &w.p, mm) catch |e|
+                        std.log.warn("exl3 mv3 check: did not run ({s})", .{@errorName(e)});
+                } else std.log.info("exl3 mv3 check: no 4-bit matrix, skipped", .{});
+            }
+        }
     }
 
     fn bindOne(w: *const Weights, p: *Proj, x: u64, y: u64, rows: u32) !void {

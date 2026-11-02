@@ -27,6 +27,8 @@ pub const nem_attn_dec: []const u8 = if (available) &Blob("spv_nem_attn_dec").by
 /// Sage-A1.5 (qwen3_5_moe): the first EXL3 projection form. Its MoE ops are in the qwen27 images.
 pub const sage_exl3: []const u8 = if (available) &Blob("spv_sage_exl3").bytes else &.{};
 pub const exl3: []const u8 = if (available) &Blob("spv_exl3").bytes else &.{};
+/// The rows 1 4-bit decode image (exl3_mv3.cl). Loaded only when XPU_EXL3_MV3 is set.
+pub const exl3_mv3: []const u8 = if (available) &Blob("spv_exl3_mv3").bytes else &.{};
 /// exl3_matvec, one image a variant of exl3_variants.all (same order).
 pub const exl3_matvec: [exl3_variants.all.len][]const u8 = blk: {
     var out: [exl3_variants.all.len][]const u8 = undefined;

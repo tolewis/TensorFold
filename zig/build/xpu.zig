@@ -205,6 +205,7 @@ const kernels = [_]Kernel{
     .{ .name = "nem_attn_dec", .options = cl3 },
     .{ .name = "sage_exl3", .options = cl3 },
     .{ .name = "exl3", .options = cl3 ++ " -DEXL3_ABS" },
+    .{ .name = "exl3_mv3", .options = cl3 ++ " -DEXL3_ABS -DBITS=4" }, // rows 1 4-bit decode, XPU_EXL3_MV3
 } ++ exl3Matvec() ++ exl3Moe();
 
 /// Fused routed MLP images: one a width of exl3_variants.moe.
