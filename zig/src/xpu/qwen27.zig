@@ -274,6 +274,10 @@ pub const Runner = struct {
         if (std.c.getenv("XPU_KEEP_SHARED")) |v| keep_shared = v[0] != '0';
         // K1 tree (XPU_K1=1 with XPU_K1_TREE=1) needs the int8 pool; print once so a run shows which path it takes
         if (k1mod.on and k1mod.tree and kv_i8) std.debug.print("K1 tree verify is on\n", .{});
+        if (k1mod.on or k1mod.tree or k1mod.multi_tree) {
+            var cov: [200]u8 = undefined;
+            std.debug.print("{s}\n", .{k1mod.coverageLine(&cov, k1mod.on and kv_i8, k1mod.tree and kv_i8, k1mod.multi_tree and kv_i8)});
+        }
         MAX_CTX = try limits.context(context);
         {
             const marker = try std.fmt.allocPrintSentinel(alloc, "{s}/hadamard128", .{dir}, 0);
