@@ -75,10 +75,11 @@ pub fn run(r: *q.Runner) !void {
             .step_multi => multi.stepMulti(r, data[0..n], data[n .. 2 * n]),
             .save_slot => blk: {
                 const s = slot_states.saveSlot(r, rec.a, rec.b) catch |e| break :blk e;
+                if (snaps.getEntry(id)) |_| break :blk error.DuplicateSnap; // the buffer address is reused only after a drop; a save before it is a divergence
                 break :blk snaps.put(alloc, id, s);
             },
             .restore_slot => if (snaps.get(id)) |s| slot_states.restoreSlot(r, rec.a, s) else error.NoSuchSnap,
-            .drop_snap => if (snaps.fetchRemove(id)) |kv| slot_states.dropSnap(r, kv.value) else {},
+            .drop_snap => if (snaps.fetchRemove(id)) |kv| slot_states.dropSnap(r, kv.value) else error.NoSuchSnap, // an unknown id is a lost or reordered drop: exit before the pools drift
             .ensure => slot_states.ensure(r, rec.a),
             .close => return,
             .more => error.BadRecord,

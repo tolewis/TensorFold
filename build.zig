@@ -46,6 +46,14 @@ const kimiMetallib = metal_build.kimiMetallib;
 /// A module whose `bytes` is the metallib at `lib`, embedded at compile time.
 const embedded = metal_build.embedded;
 
+/// The prompt cache's keep-one rule: a later turn's state takes its own older one's storage, and a cancelled
+/// turn keeps its older state.
+fn keepOneCheck(b: *std.Build, target: std.Build.ResolvedTarget, step: *std.Build.Step) void {
+    const lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = .Debug, .link_libc = true });
+    const keepone = b.createModule(.{ .root_source_file = b.path("zig/src/core/prompt_cache_keepone_test.zig"), .target = target, .optimize = .Debug, .link_libc = true, .imports = &.{ .{ .name = "lanes", .module = lanes } } });
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = keepone })).step);
+}
+
 /// The page pool's own tests, and its checks under engine_api's paged store and lane host (kv_pool a module of its...
 fn poolChecks(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Build.Step) void {
     const pool = b.createModule(.{ .root_source_file = b.path("zig/src/core/kv_pool.zig"), .target = target, .optimize = .Debug });
@@ -111,6 +119,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/limits.zig"), .target = target }) })).step);
     // the K/V pool's page references: which pages a slot or a kept prompt state holds
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/pages.zig"), .target = target }) })).step);
+    // the prompt cache's keep-one rule, its own step: a later turn's state takes its own older one's storage
+    const keepone_step = b.step("test-prompt-cache-keepone", "the prompt cache keep-one rule: a later turn's state takes its own older one's storage");
+    keepOneCheck(b, target, keepone_step);
     const cost_cases = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("zig/cost_rule_cases.zig"),
         .target = target,

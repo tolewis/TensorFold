@@ -57,6 +57,7 @@ fn saveSlotHere(r: *Runner, slot: u32, at: u32) !Snap {
     const d = &r.d;
     const bytes = r.snapBytes(at);
     if (q.kv_pool) {
+        if (at % q.PAGE != 0) return error.SlotNotThere; // the last page is partial: a restore maps it, and two streams write into it
         const gdn = gdnBytes(r);
         const buf = try d.alloc_(gdn);
         errdefer freeAfterQueue(d, buf); // copies into it may be queued
