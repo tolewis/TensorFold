@@ -47,6 +47,24 @@ def run_moe(prog, work, experts, shared, x, ids, topk, formats=1):
     return (ck.from_bf16(y) if formats & 0xff == 0 else y.astype(np.float32)).reshape(-1, k)
 
 
+def run_capture(prog, work, mode, mats, rows, x, case, out):
+    """run() that captures the program's stderr: returns (y, stderr text) so a caller can check a marker line."""
+    k, n = mats[0][0].shape[0] * 16, mats[0][0].shape[1] * 16
+    halves = mats[0][0].shape[2] // 8
+    parts = [struct.pack("<10I", MAGIC, mode, len(mats), k, n, halves, rows, 0, 0, 1)]
+    for tr, suh, svh, mul1 in mats:
+        ck.refuse(halves, mul1)
+        parts += [np.ascontiguousarray(a).tobytes() for a in (tr, suh, svh)]
+    parts.append(np.ascontiguousarray(x).tobytes())
+    open(case, "wb").write(b"".join(parts))
+    r = subprocess.run([prog, case, out], check=True, capture_output=True, text=True)
+    used = "exl3_mv2 image" in r.stderr
+    if not used:
+        raise AssertionError(f"XPU_EXL3_MV2 set but no exl3_mv2 image was used (stderr: {r.stderr[-200:]})")
+    y = np.fromfile(out, np.float32)
+    return y
+
+
 def main():
     repo, sage, prog, work = sys.argv[1:5]
     os.makedirs(work, exist_ok=True)
@@ -70,6 +88,26 @@ def main():
             worst = max(worst, err)
             print(f"zig {label} rows={rows:2d}: max|y-ref|/max|ref| = {err:.2e}, bit-exact vs PyOpenCL host: {same}")
             assert same and err <= 1e-3
+    # exl3_mv2, rows 1 through the 2-operand image. Its accumulation order differs from the PyOpenCL host, so the
+    # bits do not match; the numpy error and the XPU_EXL3_MV2_VERIFY marker (the host says the launch took an mv2
+    # image) are the check.
+    for sel in ("2_1", "4_2", "8_4"):
+        os.environ["XPU_EXL3_MV2"] = sel
+        os.environ["XPU_EXL3_MV2_VERIFY"] = "1"
+        for label, name in list(ck.SAGE.items())[:2]:
+            tr, suh, svh, mul1 = st.group(name)
+            tr = np.ascontiguousarray(tr[:, :1024]); svh = svh[: 1024 * 16]
+            kt, nt, w = tr.shape
+            W = ref.dequantize(w // 8, 2, tr, suh, svh)
+            x = ck.to_bf16(rng.standard_normal((1, kt * 16)).astype(np.float32))
+            case, out = os.path.join(work, "case.bin"), os.path.join(work, "y.bin")
+            y = run_capture(prog, work, 0, [(tr, suh, svh, mul1)], 1, x, case, out)
+            yr = ck.from_bf16(x).astype(np.float64) @ W
+            err = np.abs(y - yr).max() / np.abs(yr).max()
+            worst = max(worst, err)
+            print(f"zig mv2 {sel} {label}: max|y-ref|/max|ref| = {err:.2e}")
+            assert err <= 1e-3
+        del os.environ["XPU_EXL3_MV2"], os.environ["XPU_EXL3_MV2_VERIFY"]
     # eight groups in one launch, bf16 output
     groups = [st.group(f"model.language_model.layers.0.mlp.experts.{i}.gate_proj") for i in range(8)]
     rows = 2

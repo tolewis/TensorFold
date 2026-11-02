@@ -492,6 +492,7 @@ fn mv2Pick(p: *const Pipelines, bits: u32, rows: u32, n_max: u32, k_tiles_gcd: u
 /// Queues the stages over a table of `count` groups (no host wait): rotate_in (unless fused), matvec, rotate_out.
 fn stages(p: *const Pipelines, s: Stream, table: ?*anyopaque, count: u32, rows: u32, k_max: u32, n_max: u32, k_tiles_gcd: u32, sh: Shape) Error!void {
     const mv2 = mv2Pick(p, variants.all[sh.variant].bits, rows, n_max, k_tiles_gcd, sh.ks);
+    if (mv2 != null and std.c.getenv("XPU_EXL3_MV2_VERIFY") != null) std.debug.print("exl3: the rows 1 launch uses an exl3_mv2 image\n", .{});
     const mv = if (mv2) |i| p.mv2[i] else p.matvec[sh.variant];
     const ns = if (mv2) |i| variants.mv2.nsOf(i) else variants.all[sh.variant].ns;
     const fuse = fused(rows, n_max, k_tiles_gcd, sh.ks);
