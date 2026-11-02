@@ -18,6 +18,23 @@ const NKV = 8;
 const HD = 128;
 const FF = 17408;
 pub const WIN = 2047; // context rows a block row sees (sliding_window − 1)
+/// XPU_DRAFT_WIN=N (1 .. WIN, default WIN, lane p40-roundcost): a block row sees only the last N context rows. Less
+/// attention work a round, fewer accepted drafts if the model needs the far rows. Off: WIN, the stored window.
+pub var win: u32 = WIN;
+
+/// The first context row a block row at `end` reads: the last `w` rows, none before `start`.
+pub fn windowStart(end: u32, start: u32, w: u32) u32 {
+    return @max(end -| w, start);
+}
+
+/// XPU_DRAFT_WIN's text as a window: unset or empty is WIN, a count above WIN is WIN, 0 or junk is refused.
+pub fn parseWin(text: ?[]const u8) !u32 {
+    const t = text orelse return WIN;
+    if (t.len == 0) return WIN;
+    const n = try std.fmt.parseInt(u32, t, 10);
+    if (n == 0) return error.InvalidDraftWindow;
+    return @min(n, WIN);
+}
 const MASK_ID = 248070;
 pub const MAXL = 16; // block rows at most
 pub const MAXS = 16; // blocks (sequences) a batched lattice or absorb at most
@@ -315,7 +332,16 @@ pub const Drafter = struct {
             }
             dr.head = try pack(d, &parts, kk, true);
         }
+        win = try parseWin(if (std.c.getenv("XPU_DRAFT_WIN")) |v| std.mem.span(v) else null);
+        if (win != WIN) std.debug.print("drafter window: the last {d} context rows (XPU_DRAFT_WIN)\n", .{win});
         dr.logits = try d.alloc_(MAXB * @as(usize, dr.head.n) * 2);
+        // XPU_PROFILE: the drafter's own kernels get a place in the table (they are not in the target's kernel list)
+        if (q.prof.on) inline for (@typeInfo(@TypeOf(dr.k)).@"struct".field_names) |name| {
+            for (&q.prof.names) |*slot| if (slot.name.len == 0) {
+                slot.* = .{ .k = @field(dr.k, name), .name = "dr_" ++ name };
+                break;
+            };
+        };
         var invf: [64]f32 = undefined;
         for (&invf, 0..) |*f, i| f.* = @floatCast(1.0 / std.math.pow(f64, 1e7, @as(f64, @floatFromInt(2 * i)) / 128.0));
         dr.invf = try d.upload(std.mem.sliceAsBytes(&invf));
@@ -516,7 +542,7 @@ pub const Drafter = struct {
             if (one) continue;
             try dr.use(it.slot);
             const c = dr.ctx();
-            const c0: i32 = @intCast(@max(c.end -| WIN, c.start));
+            const c0: i32 = @intCast(windowStart(c.end, c.start, win));
             for (0..L) |i| dr.rows_host[b * L + i] = .{ @intCast(c.end + i), c0, @intCast(c.end), @intCast(b) };
             for (0..LAYERS) |li| dr.ptrs_host[li][b] = .{ @intFromPtr(c.kc[li]), @intFromPtr(c.vc[li]) };
         }
@@ -530,7 +556,7 @@ pub const Drafter = struct {
         const l32: i32 = @intCast(L);
         const c = dr.ctx(); // a single block's (S = 1)
         const end_: i32 = @intCast(c.end);
-        const c0: i32 = @intCast(@max(c.end -| WIN, c.start));
+        const c0: i32 = @intCast(windowStart(c.end, c.start, win));
         for (&dr.layers, c.kc, c.vc, 0..) |*l, kc, vc, li| {
             const ptrs_t: ?*anyopaque = if (one) nul else q.off(dr.ptrs_dev, li * MAXS * 16);
             try d.launch(d.k.add_rmsnorm, .{ .x = R }, .{ dr.x, dr.r16, l.in_norm, dr.h, dr.ahi, dr.alo, @as(i32, D), HIDDEN_NORM_EPS, @as(i32, 0), @as(i32, GS), q.no_q8, q.no_q8, @as(i32, 0), @as(i32, 0) });
@@ -538,7 +564,7 @@ pub const Drafter = struct {
             try d.launch(dr.k.dconv, .{ .x = R, .y = D / 512 }, .{ dr.h, dr.dyn, @as(i32, @intCast(l.kp_attn.n)), l.base_attn, @as(i32, 0), dr.x, @as(i32, 0), dr.h2, dr.ahi, dr.alo, l32 });
             try q.gemm(d, dr.pscr, dr.h2, dr.ahi, dr.alo, l.qkv, dr.p, R);
             try d.launch(dr.k.dprep, .{ .x = R, .y = 48 }, .{ dr.p, @as(i32, @intCast(l.qkv.n)), @as(i32, 0), l.qn, l.kn, dr.invf, dr.qb, kc, vc, @as(i32, CAP), end_, HIDDEN_NORM_EPS, rows_t, ptrs_t });
-            try d.launch(dr.k.dattn, .{ .x = R, .y = NKV }, .{ dr.qb, kc, vc, @as(i32, CAP), c0, end_, l32, @as(i32, WIN), @as(f32, 1.0 / @sqrt(@as(f32, HD))), dr.o, rows_t, ptrs_t });
+            try d.launch(dr.k.dattn, .{ .x = R, .y = NKV }, .{ dr.qb, kc, vc, @as(i32, CAP), c0, end_, l32, @as(i32, @intCast(win)), @as(f32, 1.0 / @sqrt(@as(f32, HD))), dr.o, rows_t, ptrs_t });
             try d.launch(dr.k.rowsums_rows, .{ .x = R }, .{ dr.o, @as(i32, NH * HD), dr.ahi, dr.alo });
             try q.gemm(d, dr.pscr, dr.o, dr.ahi, dr.alo, l.o, dr.r16, R);
             try d.launch(dr.k.dconv, .{ .x = R, .y = D / 512 }, .{ dr.r16, dr.dyn, @as(i32, @intCast(l.kp_attn.n)), l.base_attn, @as(i32, 1), dr.x, @as(i32, 1), dr.h2, dr.ahi, dr.alo, l32 });
@@ -711,4 +737,17 @@ fn headExl3(c: *const q.Checkpoint, out: *[]f16) !u32 {
     if (job.failed.load(.acquire)) return error.OutOfMemory;
     std.debug.print("  drafter head from the EXL3 lm_head: {d} rows, {d} pieces, {d} threads, {d:.1} s\n", .{ HEAD_N, pieces.items.len, @max(started, 1), q.now() - t0 });
     return @intCast(kk);
+}
+
+test "draft win: the window start, and the flag's text" {
+    try std.testing.expectEqual(@as(u32, 0), windowStart(100, 0, WIN));
+    try std.testing.expectEqual(@as(u32, 5000 - WIN), windowStart(5000, 0, WIN));
+    try std.testing.expectEqual(@as(u32, 4488), windowStart(5000, 0, 512));
+    try std.testing.expectEqual(@as(u32, 4900), windowStart(5000, 4900, 512)); // never before the context's start
+    try std.testing.expectEqual(@as(u32, WIN), try parseWin(null));
+    try std.testing.expectEqual(@as(u32, WIN), try parseWin(""));
+    try std.testing.expectEqual(@as(u32, 512), try parseWin("512"));
+    try std.testing.expectEqual(@as(u32, WIN), try parseWin("9999"));
+    try std.testing.expectError(error.InvalidDraftWindow, parseWin("0"));
+    try std.testing.expectError(error.InvalidCharacter, parseWin("x"));
 }
