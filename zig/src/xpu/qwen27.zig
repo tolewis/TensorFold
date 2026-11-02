@@ -618,7 +618,7 @@ pub const Runner = struct {
         const from = r.held[slot];
         if (need <= from) return;
         const want = need - from;
-        while (!pages_mod.roomFor(&r.pages, want, r.reserve)) {
+        while (!r.pages.roomFor(want, r.reserve)) {
             if (!e.f(e.ctx)) break; // no kept state left: the pass takes what the pool has
         }
     }
