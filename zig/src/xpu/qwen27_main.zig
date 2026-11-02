@@ -449,9 +449,7 @@ fn multiTest(r: *q.Runner, prompt: []const u32, n: u32) !void {
 }
 
 /// EXL3 speed probe (no weights, random trellis bits): the mul1 decode GEMV at 4, 3 and 2 bits against our int4 GEMM.
-fn off(p: *anyopaque, bytes: usize) *anyopaque {
-    return @ptrFromInt(@intFromPtr(p) + bytes);
-}
+
 
 /// The int4 many-row decode against the 16-row decode it replaces: one layer's gate|up (wide) and one layer's down
 /// (narrow), on hash-filled A. Four 16-row launches and one 64-row launch, two 16-row launches and one 32-row
@@ -512,13 +510,13 @@ fn w4rCheck(r: *q.Runner) !bool {
         try d.launch(mr64, .{ .x = 1, .y = N / 64 }, .{ dA, w.w, w.s, w.bg, dC, @as(i32, 64), N32, K32, dHi, dLo, @as(i32, 64), G32 });
         for (0..4) |rb| {
             const r0 = rb * 16;
-            try d.launch(dec, .{ .x = 1, .y = N / 128 }, .{ off(dA, r0 * K * 2), w.w, w.s, w.bg, off(dS, r0 * N * 2), @as(i32, 16), N32, K32, off(dHi, r0 * G * 2), off(dLo, r0 * G * 2), @as(i32, 16), G32 });
+            try d.launch(dec, .{ .x = 1, .y = N / 128 }, .{ q.off(dA, r0 * K * 2), w.w, w.s, w.bg, q.off(dS, r0 * N * 2), @as(i32, 16), N32, K32, q.off(dHi, r0 * G * 2), q.off(dLo, r0 * G * 2), @as(i32, 16), G32 });
         }
         // 32 rows in one launch, then two 16-row launches
         try d.launch(mr32, .{ .x = 1, .y = N / 128 }, .{ dA, w.w, w.s, w.bg, dT, @as(i32, 32), N32, K32, dHi, dLo, @as(i32, 32), G32 });
         try d.sync();
-        try d.copy(hc.ptr, dC, rows * N * 2);
-        try d.copy(hs.ptr, dS, rows * N * 2);
+        try q.copy(d, hc.ptr, dC, rows * N * 2);
+        try q.copy(d, hs.ptr, dS, rows * N * 2);
         try d.sync();
         var worst64: f32 = 0;
         for (hc, hs) |x, y| {
@@ -530,8 +528,8 @@ fn w4rCheck(r: *q.Runner) !bool {
         ok = ok and p64;
         std.debug.print("w4r check: {s} rows 64 max rel err {e:.3} {s}\n", .{ cs.name, worst64, if (p64) "PASS" else "FAIL" });
         @memset(hs, 0);
-        try d.copy(hc.ptr, dT, rows * N * 2);
-        try d.copy(hs.ptr, dS, 32 * N * 2);
+        try q.copy(d, hc.ptr, dT, rows * N * 2);
+        try q.copy(d, hs.ptr, dS, 32 * N * 2);
         try d.sync();
         var worst32: f32 = 0;
         for (hc[0 .. 32 * N], hs[0 .. 32 * N]) |x, y| {
