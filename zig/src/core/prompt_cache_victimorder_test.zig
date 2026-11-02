@@ -1,8 +1,9 @@
 //! The W5-m2b victim order (item 20 part K): a multi-conversation working set evicts interior cuts before
 //! history marks, and a pass's own superseded states before both. A fake family's snapshots are host memory;
 //! a state's bytes are 100 + position. Six conversations keep a 10 000-token user message each: its interior
-//! cut at 7936 and its history mark at 9984. A cap of 8 states holds four of them whole and evicts four cuts, so all
-//! six history marks survive. A miss never evicts another conversation's history mark while an interior cut is free.
+//! cut at 7936 and its history mark at 9984. Twelve states ask for a cap of eight: four interior cuts go, all six
+//! history marks survive (the two most recent cuts stay). A miss never evicts another conversation's history mark
+//! while an interior cut is free.
 //! A live continuation of conversation 0 resumes its history mark (the probe ranks it first), and its own cut keeps
 //! with its mark while the other conversations' history marks survive.
 const std = @import("std");
