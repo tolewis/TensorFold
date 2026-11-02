@@ -163,6 +163,10 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     // the rank mode word's bit layout: a pure host test, run by name only, so no runner opens and no card is touched
     const mode_step = b.step("test-mode-word", "The TP 2 rank mode word's bit layout (no card)");
     if (target.result.cpu.arch == host.cpu.arch and target.result.os.tag == host.os.tag) mode_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = qwen27, .filters = &.{"mode word:"} })).step);
+    // MLX 4/64 rank slices (lane p36-mlx-tp2): pure host slicing and a CPU reference matvec, no card
+    const mlx_step = b.step("test-mlx-tp-slice", "MLX 4/64 TP rank slices: concat for column splits, sum for row splits (no card)");
+    const mlx_mod = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/mlx_tp.zig"), .target = target, .optimize = optimize });
+    if (target.result.cpu.arch == host.cpu.arch and target.result.os.tag == host.os.tag) mlx_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mlx_mod })).step);
     // XPU_MULTI_TREE: the shared tree round's host fill and the merge's per-row used (lane p33-multitree), no card
     const mt_step = b.step("test-k1-mt", "The shared tree round's host fill and merge per-row used (no card)");
     if (target.result.cpu.arch == host.cpu.arch and target.result.os.tag == host.os.tag) mt_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = qwen27, .filters = &.{"k1 mt:"} })).step);

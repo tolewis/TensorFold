@@ -247,7 +247,7 @@ pub fn project(p: *const Proj, w: *const Weights, d: *Dev, x: *anyopaque, out: *
 
 /// A bf16 tensor's rows [start, start + count) for each range, `row_bytes` a row, uploaded as one piece: a rank's
 /// heads of a per-head tensor. One range over every row is the whole tensor.
-fn rowsTensor(d: *Dev, c: *const Checkpoint, name: []const u8, row_bytes: usize, ranges: []const [2]u32) !*anyopaque {
+pub fn rowsTensor(d: *Dev, c: *const Checkpoint, name: []const u8, row_bytes: usize, ranges: []const [2]u32) !*anyopaque {
     const t = try c.get(name);
     if (!std.mem.eql(u8, t.dtype, "BF16")) return error.UnexpectedDtype;
     var total: usize = 0;

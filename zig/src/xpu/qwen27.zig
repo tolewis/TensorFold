@@ -133,6 +133,8 @@ pub var a8_sites4: u32 = 15; // XPU_A8_SITES4: the sites in int4 when XPU_A8_BIT
 /// Host-backed embedding table (XPU_EMBED_HOST=1): `embedTable` keeps the fp16 table in pinned host memory for
 /// the kernels to read over PCIe, so a card frees ~2.5 GB of VRAM (a research arm, off by default).
 pub var embed_host: bool = false;
+/// The checkpoint is MLX 4/64 (not EXL3 or GPTQ): a bit of the mode word, so a pair of mixed models fails at start.
+pub var fmt_mlx: bool = false;
 pub var prof: Prof = .{};
 
 /// The XPU_* options as the process had them before its first open, put back at every open (Runner.init).
@@ -318,10 +320,11 @@ pub const Runner = struct {
         const r = try alloc.create(Runner);
         errdefer alloc.destroy(r);
         r.* = .{ .d = .{ .g = try ze.Gpu.open(0xe223), .list = undefined, .k = undefined }, .model = undefined, .acts = undefined, .context = context, .ckpt = ckpt, .keep_shared = keep_shared };
+        fmt_mlx = !ckpt.has("layers.0.linear_attn.in_proj_qkv.trellis") and !ckpt.has("in_proj_qkv.qweight") and ckpt.has("lm_head.scales");
         tp.group = try tp.Group.open(&r.d); // null at TP 1
         if (tp.group) |*g| {
             if (g.rank != 0 and g.readMode() != modeWord()) {
-                std.log.err("rank {d}: the mode word does not match rank 0's: this rank's XPU_KV_POOL, XPU_KEEP_SHARED, XPU_KV_INT8, XPU_EMBED_HOST, XPU_K1, XPU_K1_TREE, XPU_MULTI_TREE, XPU_K1_R16 or XPU_K1_WAVE diverges, and the pair sizes its cards differently\n", .{ RANK });
+                std.log.err("rank {d}: the mode word does not match rank 0's: this rank's XPU_KV_POOL, XPU_KEEP_SHARED, XPU_KV_INT8, XPU_EMBED_HOST, XPU_K1, XPU_K1_TREE, XPU_MULTI_TREE, XPU_K1_R16 or XPU_K1_WAVE diverges, or this rank loads a different weight format (EXL3 or MLX), and the pair sizes its cards differently\n", .{ RANK });
                 g.markClosed(); // rank 0 sees the closed segment at its first all-reduce and exits at once
                 return error.ModeMismatch;
             }
@@ -900,7 +903,8 @@ pub fn poolPages(r: *Runner, slots: u32, tokens: ?u32, cache: bool, extra: u64) 
 }
 
 /// The run flags a pair must agree on: one bit each for kv_pool, keep_shared, kv_i8, embed_host, k1, k1_tree and
-/// k1 r16, four bits for the k1 wave (XPU_K1_WAVE, a small count), then multi_tree (XPU_MULTI_TREE).
+/// k1 r16, four bits for the k1 wave (XPU_K1_WAVE, a small count), then multi_tree (XPU_MULTI_TREE), then the weight
+/// format (bit 12: MLX).
 pub fn modeWord() u64 {
     var w: u64 = 0;
     w |= @as(u64, @intFromBool(kv_pool));
@@ -912,6 +916,7 @@ pub fn modeWord() u64 {
     w |= @as(u64, @intFromBool(k1mod.r16)) << 6;
     w |= (@as(u64, k1mod.wave) & 15) << 7;
     w |= @as(u64, @intFromBool(k1mod.multi_tree)) << 11;
+    w |= @as(u64, @intFromBool(fmt_mlx)) << 12; // 0: EXL3, 1: MLX 4/64
     return w;
 }
 
@@ -925,7 +930,9 @@ test "mode word: each flag sits at the bit both ranks agree on" {
     const saved_mt = k1mod.multi_tree;
     const saved_r16 = k1mod.r16;
     const saved_wave = k1mod.wave;
+    const saved_fmt = fmt_mlx;
     defer {
+        fmt_mlx = saved_fmt;
         kv_pool = saved_pool;
         keep_shared = saved_keep;
         kv_i8 = saved_i8;
@@ -945,7 +952,11 @@ test "mode word: each flag sits at the bit both ranks agree on" {
     k1mod.multi_tree = false;
     k1mod.r16 = true;
     k1mod.wave = 4;
+    fmt_mlx = false;
     try std.testing.expectEqual(@as(u64, 1) << 6 | @as(u64, 4) << 7, modeWord());
+    fmt_mlx = true; // the format bit: a pair of an EXL3 rank and an MLX rank differs
+    try std.testing.expectEqual(@as(u64, 1) << 6 | @as(u64, 4) << 7 | @as(u64, 1) << 12, modeWord());
+    fmt_mlx = false;
     k1mod.multi_tree = true;
     try std.testing.expectEqual(@as(u64, 1) << 6 | @as(u64, 4) << 7 | @as(u64, 1) << 11, modeWord());
     kv_pool = true;

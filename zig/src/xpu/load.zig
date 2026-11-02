@@ -4,6 +4,7 @@ const q = @import("qwen27.zig");
 const dev = @import("dev.zig");
 const fwd = @import("forward.zig");
 const x3 = @import("qwen27_exl3.zig");
+const mlx = @import("mlx_tp.zig");
 const Checkpoint = dev.Checkpoint;
 const D = q.D;
 const Dev = dev.Dev;
@@ -257,6 +258,170 @@ pub fn loadGptq(d: *Dev, c: *const Checkpoint) !Model {
     return m;
 }
 
+/// One part of a rank-sliced MLX projection: the tensor (prefix + name) and the rank's cut of it.
+pub const PartCut = struct { name: []const u8, cut: mlx.Cut = .{} };
+
+/// `projection` for TP: parts stacked on N, each cut to the rank's rows (a column split) or K range (a row split) on the
+/// host, then repacked by the same kernel. Padding rule as `projection`: N padded to 256, padding scales and biases zero.
+pub fn projectionCut(d: *Dev, c: *const Checkpoint, prefix: []const u8, parts: []const PartCut, wide: bool, ilv: bool, stage: *anyopaque) !Proj {
+    var n_total: u32 = 0;
+    var k: u32 = 0;
+    for (parts) |p| {
+        const w = try c.get(try std.fmt.allocPrint(alloc, "{s}{s}.weight", .{ prefix, p.name }));
+        const sp = try mlx.span(p.cut, @intCast(w.shape[0]), @intCast(w.shape[1] * 8));
+        if (k != 0 and sp.k != k) return error.UnexpectedShape;
+        k = sp.k;
+        n_total += sp.n;
+    }
+    const n_real = n_total;
+    n_total = (n_total + 255) / 256 * 256;
+    const out: Proj = .{ .w = try d.alloc_(@as(usize, k / 8) * n_total * 4), .s = try d.alloc_(@as(usize, k / 64) * n_total * 2), .bg = try d.alloc_(@as(usize, k / 64) * n_total * 2), .n = n_total, .k = k, .wide = wide, .ilv = ilv };
+    if (ilv and (parts.len != 2 or n_real != n_total)) return error.BadInterleave;
+    if (n_real != n_total) {
+        try d.fill(out.s, @as(u16, 0), @as(usize, k / 64) * n_total * 2);
+        try d.fill(out.bg, @as(u16, 0), @as(usize, k / 64) * n_total * 2);
+    }
+    var n0: u32 = 0;
+    for (parts, 0..) |p, pi| {
+        const nm = try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, p.name });
+        const w = try c.get(try std.fmt.allocPrint(alloc, "{s}.weight", .{nm}));
+        const s = try c.get(try std.fmt.allocPrint(alloc, "{s}.scales", .{nm}));
+        const b = try c.get(try std.fmt.allocPrint(alloc, "{s}.biases", .{nm}));
+        const n_all: u32 = @intCast(w.shape[0]);
+        const k_all: u32 = @intCast(w.shape[1] * 8);
+        const sp = try mlx.span(p.cut, n_all, k_all);
+        const wb = mlx.wordBytes(sp.n, sp.k);
+        const gb = mlx.groupBytes(sp.n, sp.k);
+        const host = try alloc.alloc(u8, wb + 2 * gb);
+        defer alloc.free(host);
+        try mlx.slice(host[0..wb], host[wb..][0..gb], host[wb + gb ..][0..gb], w.bytes, s.bytes, b.bytes, n_all, k_all, p.cut);
+        const ss = off(stage, wb);
+        const sb = off(ss, gb);
+        try d.copyIn(stage, host[0..wb]);
+        try d.copyIn(ss, host[wb..][0..gb]);
+        try d.copyIn(sb, host[wb + gb ..][0..gb]);
+        try d.launch(d.k.repack, .{ .x = (sp.n + 15) / 16, .y = sp.k / 8 }, .{ stage, ss, sb, out.w, out.s, out.bg, @as(i32, @intCast(sp.n)), @as(i32, @intCast(sp.k)), @as(i32, @intCast(n_total)), @as(i32, @intCast(n0)), @as(i32, if (ilv) @intCast(pi + 1) else 0) });
+        try d.sync();
+        n0 += sp.n;
+    }
+    return out;
+}
+
+/// XPU_EMBED_HOST on an MLX checkpoint: the 4/64 table dequantized to the fp16 rows `embed_dense` reads, in pinned host
+/// memory. Each value is q * s + b rounded to bf16, as the device `embed` kernel computes it, then held as fp16 (exact).
+fn embedHost(d: *Dev, c: *const Checkpoint) !*anyopaque {
+    const w = try c.get("model.embed_tokens.weight");
+    const s = try c.get("model.embed_tokens.scales");
+    const b = try c.get("model.embed_tokens.biases");
+    if (w.shape[1] * 8 != D) return error.UnexpectedShape;
+    const rows = w.shape[0];
+    const out: [*]f16 = @ptrCast(@alignCast(try d.hostAlloc(rows * D * 2)));
+    const bf = struct {
+        fn f(bytes: []const u8, i: usize) f32 {
+            return @bitCast(@as(u32, std.mem.readInt(u16, bytes[2 * i ..][0..2], .little)) << 16);
+        }
+        fn r(v: f32) f32 {
+            const u: u32 = @bitCast(v);
+            return @bitCast(((u + 0x7FFF + ((u >> 16) & 1)) >> 16) << 16);
+        }
+    };
+    for (0..rows) |row| {
+        for (0..D) |e| {
+            const word = std.mem.readInt(u32, w.bytes[(row * (D / 8) + e / 8) * 4 ..][0..4], .little);
+            const qv: f32 = @floatFromInt((word >> @intCast(4 * (e % 8))) & 0xF);
+            const g = row * (D / 64) + e / 64;
+            out[row * D + e] = @floatCast(bf.r(qv * bf.f(s.bytes, g) + bf.f(b.bytes, g)));
+        }
+    }
+    return @ptrCast(out);
+}
+
+fn openEmbedHost() void {
+    // the same line as the EXL3 loader: the gate looks for it on both ranks
+    const E_BYTES = @as(f64, q.VOCAB * D / 2 + 2 * q.VOCAB * (D / 64) * 2) / 1e9; // GB the int4 table took on the device
+    std.debug.print("embed on the host: {d:.2} GB of device memory saved ({d} x {d} fp16 rows)\n", .{ E_BYTES, q.VOCAB, D });
+}
+
+/// Qwen3.8-27B MLX 4/64 at TP 2 (or any TP): rank R's slices of every projection, head and embedding whole.
+/// Column splits take output rows, row splits take K ranges, all on 64-input group boundaries (mlx_tp.zig).
+pub fn loadMlxTp(d: *Dev, c: *const Checkpoint) !Model {
+    q.GS = 64;
+    const R = q.RANK;
+    var m: Model = undefined;
+    m.exl3 = null;
+    const stage = try d.alloc_(800 << 20);
+    const e_w = try c.get("model.embed_tokens.weight");
+    if (q.embed_host) {
+        m.embed_w = try embedHost(d, c);
+        m.embed_s = null;
+        m.embed_b = null;
+    } else {
+        m.embed_w = try d.upload(e_w.bytes);
+        m.embed_s = try bf16Tensor(d, c, "model.embed_tokens.scales");
+        m.embed_b = try bf16Tensor(d, c, "model.embed_tokens.biases");
+    }
+    m.norm = try bf16Tensor(d, c, "model.norm.weight");
+    m.head = try projection(d, c, "lm_head", &.{""}, true, false, stage); // whole on every rank: the hidden state is whole
+    var invf: [32]f32 = undefined;
+    for (&invf, 0..) |*f, i| f.* = @floatCast(std.math.pow(f64, 1e7, -@as(f64, @floatFromInt(i)) / 32.0));
+    m.invf = try d.upload(std.mem.sliceAsBytes(&invf));
+    const FF = q.FF_R;
+    const hk: u32 = q.GDN_K_HEADS * 128; // a rank's q (and k) rows of in_proj_qkv; stored [q 16 heads | k 16 | v 48]
+    const hv: u32 = q.GDN_V_HEADS * 128;
+    const Cut = mlx.Cut;
+    for (&m.layers, 0..) |*l, i| {
+        const p = try std.fmt.allocPrint(alloc, "model.layers.{d}.", .{i});
+        const f = struct {
+            fn n(pp: []const u8, s: []const u8) []const u8 {
+                return std.fmt.allocPrint(alloc, "{s}{s}", .{ pp, s }) catch unreachable;
+            }
+        }.n;
+        l.* = .{ .in_norm = try bf16Tensor(d, c, f(p, "input_layernorm.weight")), .post_norm = try bf16Tensor(d, c, f(p, "post_attention_layernorm.weight")), .attn = isAttention(i), .mixer_in = undefined, .mixer_out = undefined, .gu = try projectionCut(d, c, f(p, "mlp."), &.{ .{ .name = "gate_proj", .cut = Cut.cols(R * FF, FF) }, .{ .name = "up_proj", .cut = Cut.cols(R * FF, FF) } }, true, true, stage), .down = try projectionCut(d, c, f(p, "mlp."), &.{.{ .name = "down_proj", .cut = Cut.rows(R * FF, FF) }}, false, false, stage) };
+        if (l.attn) {
+            const qw: u32 = q.ATT_Q_HEADS * 512; // a rank's q heads with their gates
+            const kw: u32 = q.ATT_KV_HEADS * 256;
+            l.mixer_in = try projectionCut(d, c, f(p, "self_attn."), &.{ .{ .name = "q_proj", .cut = Cut.cols(R * qw, qw) }, .{ .name = "k_proj", .cut = Cut.cols(R * kw, kw) }, .{ .name = "v_proj", .cut = Cut.cols(R * kw, kw) } }, true, false, stage);
+            l.mixer_out = try projectionCut(d, c, f(p, "self_attn."), &.{.{ .name = "o_proj", .cut = Cut.rows(R * q.GDN_Z, q.GDN_Z) }}, false, false, stage);
+            l.qn = try bf16Tensor(d, c, f(p, "self_attn.q_norm.weight"));
+            l.kn = try bf16Tensor(d, c, f(p, "self_attn.k_norm.weight"));
+            if (!q.kv_pool) { // the shared pool replaces the slot's own cache
+                l.kc = try d.alloc_(kvBytes());
+                l.vc = try d.alloc_(kvBytes());
+            }
+        } else {
+            // [q | k | v | z | a | b] of the rank, a and b as quantized parts of the fused projection (as at TP 1)
+            l.mixer_in = try projectionCut(d, c, f(p, "linear_attn."), &.{
+                .{ .name = "in_proj_qkv", .cut = Cut.cols(R * hk, hk) },
+                .{ .name = "in_proj_qkv", .cut = Cut.cols(q.TP * hk + R * hk, hk) },
+                .{ .name = "in_proj_qkv", .cut = Cut.cols(2 * q.TP * hk + R * hv, hv) },
+                .{ .name = "in_proj_z", .cut = Cut.cols(R * hv, hv) },
+                .{ .name = "in_proj_a", .cut = Cut.cols(R * HV, HV) },
+                .{ .name = "in_proj_b", .cut = Cut.cols(R * HV, HV) },
+            }, true, false, stage);
+            if (l.mixer_in.n != GDN_IN) return error.UnexpectedShape;
+            l.mixer_out = try projectionCut(d, c, f(p, "linear_attn."), &.{.{ .name = "out_proj", .cut = Cut.rows(R * hv, hv) }}, false, false, stage);
+            l.conv_w = try x3.rowsTensor(d, c, f(p, "linear_attn.conv1d.weight"), 4 * 2, &.{ .{ R * hk, hk }, .{ q.TP * hk + R * hk, hk }, .{ 2 * q.TP * hk + R * hv, hv } });
+            l.alog = try x3.rowsTensor(d, c, f(p, "linear_attn.A_log"), 2, &.{.{ R * HV, HV }});
+            l.dt = try x3.rowsTensor(d, c, f(p, "linear_attn.dt_bias"), 2, &.{.{ R * HV, HV }});
+            l.gnorm = try bf16Tensor(d, c, f(p, "linear_attn.norm.weight"));
+            l.rec = try d.alloc_(HV * 128 * 128 * 4);
+            l.rec_save = try d.alloc_(HV * 128 * 128 * 4);
+            l.stash = try d.alloc_(STASH);
+            try d.fill(l.rec.?, @as(u32, 0), HV * 128 * 128 * 4);
+            for (&l.conv) |*cv| {
+                cv.* = try d.alloc_(3 * q.GDN_QKV * 2);
+                try d.fill(cv.*.?, @as(u16, 0), 3 * q.GDN_QKV * 2);
+            }
+        }
+        if (i % 8 == 7) std.debug.print("  MLX TP layers loaded: {d}/{d}\n", .{ i + 1, LAYERS });
+    }
+    try d.sync();
+    d.g.free(stage);
+    d.allocated -= 800 << 20; // the staging area is gone
+    if (q.embed_host) openEmbedHost();
+    return m;
+}
+
 pub fn load(d: *Dev, c: *const Checkpoint) !Model {
     if (c.has("model.layers.0.linear_attn.in_proj_qkv.trellis")) return x3.loadExl3(d, c);
     if (c.has("in_proj_qkv.qweight")) {
@@ -264,13 +429,20 @@ pub fn load(d: *Dev, c: *const Checkpoint) !Model {
         return loadGptq(d, c);
     }
     q.GS = 64;
+    if (q.TP > 1) return loadMlxTp(d, c);
     var m: Model = undefined;
     m.exl3 = null;
     const stage = try d.alloc_(800 << 20);
     const e_w = try c.get("model.embed_tokens.weight");
-    m.embed_w = try d.upload(e_w.bytes);
-    m.embed_s = try bf16Tensor(d, c, "model.embed_tokens.scales");
-    m.embed_b = try bf16Tensor(d, c, "model.embed_tokens.biases");
+    if (q.embed_host) {
+        m.embed_w = try embedHost(d, c);
+        m.embed_s = null;
+        m.embed_b = null;
+    } else {
+        m.embed_w = try d.upload(e_w.bytes);
+        m.embed_s = try bf16Tensor(d, c, "model.embed_tokens.scales");
+        m.embed_b = try bf16Tensor(d, c, "model.embed_tokens.biases");
+    }
     m.norm = try bf16Tensor(d, c, "model.norm.weight");
     m.head = try projection(d, c, "lm_head", &.{""}, true, false, stage);
     var invf: [32]f32 = undefined;
@@ -314,5 +486,6 @@ pub fn load(d: *Dev, c: *const Checkpoint) !Model {
     try d.sync();
     d.g.free(stage);
     d.allocated -= 800 << 20; // the staging area is gone
+    if (q.embed_host) openEmbedHost();
     return m;
 }
