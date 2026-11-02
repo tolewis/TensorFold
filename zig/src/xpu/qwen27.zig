@@ -15,6 +15,8 @@ pub const limits = @import("limits.zig");
 const Prof = dev.Prof;
 const a8 = fwd.a8;
 const forward = fwd.forward;
+const forwardOverlap = fwd.forwardOverlap;
+const overlap = @import("overlap.zig"); // XPU_PREFILL_OVERLAP: the split prompt chunk's plan
 const kvCap = fwd.kvCap;
 const load = loader.load;
 extern "c" fn lseek(fd: c_int, off: i64, whence: c_int) i64;
@@ -186,6 +188,9 @@ pub const Runner = struct {
     d: Dev,
     model: Model,
     acts: Acts,
+    /// XPU_PREFILL_OVERLAP: the second sub-chunk's activation set (null: the flag is off or no chunk splits).
+    acts2: ?*Acts = null,
+    ov_sub: u32 = 0, // its rows: the largest second sub-chunk
     pos: u32 = 0,
     last: u32 = 0, // greedy next token of the last forward
     context: u32,
@@ -238,6 +243,7 @@ pub const Runner = struct {
         if (std.c.getenv("XPU_A8")) |v| a8_group = if (std.mem.eql(u8, std.mem.span(v), "token")) std.math.maxInt(u32) else try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_DUMP_H")) |v| dump_h = open(v, 0o2101, @as(c_uint, 0o644)); // append
         if (std.c.getenv("XPU_CHUNK")) |v| CHUNK = try limits.chunk(std.mem.span(v));
+        overlap.read(); // XPU_PREFILL_OVERLAP, XPU_OVERLAP_ROWS
         if (std.c.getenv("TF_TP_RANK")) |v| RANK = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         k1mod.readEnv(); // XPU_K1, XPU_K1_WAVE
         if (RANK >= TP) return error.RankOutOfRange;
@@ -382,6 +388,18 @@ pub const Runner = struct {
         prof.on = prof_on;
         r.acts = try Acts.init(d);
         if (r.model.exl3) |x| try x.bind(d, &r.model, &r.acts); // the EXL3 plans over the activations
+        const ov_ok = if (tp.group) |*gg| gg.devflag else false;
+        if (overlap.on and TP == 2 and ov_ok) { // XPU_PREFILL_OVERLAP: the second sub-chunk's set and its plans
+            // (Group.open has already refused to start unless both ranks agreed and the device-flag path opened)
+            const sub = maxRows() / 2 + 64;
+            const a2 = try alloc.create(Acts);
+            a2.* = try Acts.initPrompt(d, sub, r.acts.taps);
+            r.acts2 = a2;
+            r.ov_sub = sub;
+            if (r.model.exl3) |x| try x.bind2(d, &r.model, a2);
+            try d.fill(a2.zeros, @as(u16, 0), sub * GDN_V_HEADS * 128 * 2);
+            try d.fill(a2.ones, @as(f32, 1.0), sub * GDN_V_HEADS * 4);
+        }
         r.store(); // slot 0: the states the load allocated
         try d.fill(r.acts.zeros, @as(u16, 0), maxRows() * GDN_V_HEADS * 128 * 2);
         try d.fill(r.acts.ones, @as(f32, 1.0), maxRows() * GDN_V_HEADS * 4);
@@ -399,6 +417,7 @@ pub const Runner = struct {
             g.markClosed(); // a rank that stops closes the group: its peer sees it at once, not after the wait
         }
         r.d.deinit();
+        if (r.acts2) |a2| alloc.destroy(a2); // the device memory is the Gpu's, freed above
         prof.on = false;
         live = false;
         r.ckpt.deinit();
@@ -626,7 +645,20 @@ pub const Runner = struct {
             const want = last and end == ids.len;
             if (r.pos + (end - at) > r.context) return error.ContextFull;
             try r.ensurePages(r.slot, r.pos + @as(u32, @intCast(end - at)));
-            if (try forward(&r.d, &r.model, &r.acts, @ptrCast(ids[at..end]), r.pos, .{ .prompt = true, .want = if (want) .last else .none, .taps = r.taps_on, .pt = r.pt[r.slot] })) |t| r.last = @intCast(t);
+            const rows: u32 = @intCast(end - at);
+            const md: Mode = .{ .prompt = true, .want = if (want) .last else .none, .taps = r.taps_on, .pt = r.pt[r.slot] };
+            if (r.acts2) |a2| {
+                if (overlap.planFor(rows)) |pl| { // XPU_PREFILL_OVERLAP: the two sub-chunks, interleaved
+                    if (pl.b > r.ov_sub) return error.OverlapTooWide;
+                    a2.taps = off(r.acts.taps, pl.a * 5 * D * 2); // the taps are one buffer, by row
+                    if (try forwardOverlap(&r.d, &r.model, &r.acts, a2, @ptrCast(ids[at..end]), r.pos, md, pl)) |t| r.last = @intCast(t);
+                    r.pos += rows;
+                    at = end;
+                    if (r.taps_on) if (r.on_taps) |cb| try cb.f(cb.ctx, r.acts.taps, rows);
+                    continue;
+                }
+            }
+            if (try forward(&r.d, &r.model, &r.acts, @ptrCast(ids[at..end]), r.pos, md)) |t| r.last = @intCast(t);
             if (r.taps_on) if (r.on_taps) |cb| try cb.f(cb.ctx, r.acts.taps, @intCast(end - at));
             r.pos += @intCast(end - at);
             at = end;

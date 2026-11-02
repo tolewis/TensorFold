@@ -41,6 +41,9 @@ pub const Api = struct {
     zeEventCreate: *const fn (H, *const EventDesc, *H) callconv(.c) u32,
     zeEventHostSynchronize: *const fn (H, u64) callconv(.c) u32,
     zeEventHostReset: *const fn (H) callconv(.c) u32,
+    zeCommandListAppendEventReset: *const fn (H, H) callconv(.c) u32,
+    zeCommandListAppendSignalEvent: *const fn (H, H) callconv(.c) u32,
+    zeCommandListAppendWaitOnEvents: *const fn (H, u32, [*]H) callconv(.c) u32,
     zeEventQueryKernelTimestamp: *const fn (H, *KernelTimestampResult) callconv(.c) u32,
     zeEventDestroy: *const fn (H) callconv(.c) u32,
     zeEventPoolDestroy: *const fn (H) callconv(.c) u32,
@@ -377,6 +380,20 @@ pub const Gpu = struct {
         var out: [n]H = @splat(null);
         for (&out, 0..) |*e, i| {
             try check(g.api.zeEventCreate(pool, &.{ .index = @intCast(i) }, e));
+            _ = try keep(&g.owned.events, e.*, g.api.zeEventDestroy);
+        }
+        return out;
+    }
+
+    /// Device-scoped events (no host visibility, no timestamps): cross-queue ordering (a copy queue waits for a
+    /// compute queue's signal). The scope is ZE_EVENT_SCOPE_FLAG_DEVICE, so both queue groups see it.
+    pub fn eventsDevice(g: *Gpu, comptime n: usize) Error![n]H {
+        var pool: H = null;
+        try check(g.api.zeEventPoolCreate(g.context, &.{ .flags = 0, .count = n }, 1, @ptrCast(&g.device), &pool));
+        _ = try keep(&g.owned.pools, pool, g.api.zeEventPoolDestroy);
+        var out: [n]H = @splat(null);
+        for (&out, 0..) |*e, i| {
+            try check(g.api.zeEventCreate(pool, &.{ .index = @intCast(i), .signal = 1 << 1, .wait = 1 << 1 }, e));
             _ = try keep(&g.owned.events, e.*, g.api.zeEventDestroy);
         }
         return out;

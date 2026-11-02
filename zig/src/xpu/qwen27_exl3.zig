@@ -129,6 +129,10 @@ pub const Proj = struct {
     row: u64 = 0,
     row_plan: ?exl3.Plan = null,
     head: bool = false,
+    /// XPU_PREFILL_OVERLAP: the same plans over the second activation set (the other sub-chunk's buffers).
+    x2: u64 = 0,
+    y2: u64 = 0,
+    chunk2: ?exl3.Plan = null,
 
     fn groups(p: *const Proj, w: *const Weights, x: u64, y: u64, rows: u32, out: *[4]exl3.Group) []exl3.Group {
         for (p.parts[0..p.count], out[0..p.count], 0..) |pt, *g, j| g.* = .{
@@ -218,6 +222,28 @@ pub const Weights = struct {
         try d.sync();
     }
 
+    /// XPU_PREFILL_OVERLAP: the same prompt plans over a second activation set, so the two sub-chunks of a chunk each
+    /// run their own kernels on their own buffers. The scratch is shared: launches run in order on one compute list.
+    pub fn bind2(w: *Weights, d: *Dev, m: *loader.Model, a: *fwd.Acts) !void {
+        const rows = q.maxRows();
+        const h: u64 = @intFromPtr(a.h);
+        const pp: u64 = @intFromPtr(a.p);
+        const r: u64 = @intFromPtr(a.r);
+        for (&m.layers) |*l| {
+            try w.bindOne2(l.mixer_in.x3.?, h, pp, rows);
+            try w.bindOne2(l.mixer_out.x3.?, h, r, rows);
+            try w.bindOne2(l.gu.x3.?, h, pp, rows);
+            try w.bindOne2(l.down.x3.?, h, r, rows);
+        }
+        try d.sync();
+    }
+
+    fn bindOne2(w: *const Weights, p: *Proj, x: u64, y: u64, rows: u32) !void {
+        p.x2 = x;
+        p.y2 = y;
+        p.chunk2 = try p.plan(w, x, y, rows);
+    }
+
     fn bindOne(w: *const Weights, p: *Proj, x: u64, y: u64, rows: u32) !void {
         p.x = x;
         p.y = y;
@@ -230,19 +256,29 @@ pub const Weights = struct {
 pub fn project(p: *const Proj, w: *const Weights, d: *Dev, x: *anyopaque, out: *anyopaque, T: u32, wide: bool) !void {
     const xa: u64 = @intFromPtr(x);
     const ya: u64 = @intFromPtr(out);
-    if (ya != p.y) return error.Exl3Unbound;
+    if (p.head) { // the head: one row t of h (the forward's last row), from either activation set
+        if (ya != p.y or T != 1) return error.Exl3Unbound;
+        if (xa >= p.x and (xa - p.x) % (D * 2) == 0) {
+            const t = (xa - p.x) / (D * 2);
+            if (t < WINDOW) return exl3.encode(&w.p, w.stream(), &p.last[t]);
+        }
+        // any other row (a prompt chunk's last row, or the second set's): copy it and run the 1-row plan
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, @ptrFromInt(p.row), x, D * 2, null, 0, null));
+        return exl3.encode(&w.p, w.stream(), &p.row_plan.?);
+    }
+    if (ya != p.y and (p.y2 == 0 or ya != p.y2)) return error.Exl3Unbound;
     if (xa == p.x) {
         if (!wide and T <= WINDOW) return exl3.encode(&w.p, w.stream(), &p.dec[T - 1]);
         if (p.chunk) |*c| return exl3.encodeRows(&w.p, w.stream(), c, T);
         if (T <= WINDOW) return exl3.encode(&w.p, w.stream(), &p.dec[T - 1]);
         return error.Exl3Unbound;
     }
-    // the head: one row t of h (the forward's last row)
-    if (!p.head or T != 1 or xa < p.x or (xa - p.x) % (D * 2) != 0) return error.Exl3Unbound;
-    const t = (xa - p.x) / (D * 2);
-    if (t < WINDOW) return exl3.encode(&w.p, w.stream(), &p.last[t]);
-    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, @ptrFromInt(p.row), x, D * 2, null, 0, null));
-    return exl3.encode(&w.p, w.stream(), &p.row_plan.?);
+    // XPU_PREFILL_OVERLAP: the second activation set (a sub-chunk of a prompt chunk)
+    if (p.x2 != 0 and xa == p.x2) {
+        const c = p.chunk2 orelse return error.Exl3Unbound;
+        return exl3.encodeRows(&w.p, w.stream(), &c, T);
+    }
+    return error.Exl3Unbound;
 }
 
 /// A bf16 tensor's rows [start, start + count) for each range, `row_bytes` a row, uploaded as one piece: a rank's
