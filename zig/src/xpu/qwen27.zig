@@ -1016,4 +1016,5 @@ test "every open starts from the process's options, and a second runner is refus
 
 test {
     _ = @import("runner_drain_test.zig");
+    _ = @import("drafter.zig"); // test-draft-win
 }
