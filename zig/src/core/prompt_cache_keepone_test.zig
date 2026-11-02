@@ -66,8 +66,7 @@ test "a cancelled turn keeps the conversation's older state: reserve evicts by t
     // Turn 2: history [1 2 3 4 5 6]. Its mark at 6 supersedes turn 1's state, but its reserve needs room the
     // budget lacks, so it evicts one state. The pass cancels before it keeps the mark: the older state stays.
     const p2: []const u32 = &[_]u32{ 1, 2, 3, 4, 5, 6, 9 };
-    p = try s.begin(a, p2, 6, &.{}, &.{}, null, &.{});
-    _ = p; // the request is dropped here; no keep of the mark at 6
+    _ = try s.begin(a, p2, 6, &.{}, &.{}, null, &.{}); // the request is dropped here; no keep of the mark at 6
     try std.testing.expect(at(&s, &.{ 1, 2, 3, 4 }) != null); // the conversation's older state is still there
     try std.testing.expect(at(&s, &.{ 7, 8, 9, 1 }) == null); // the unrelated one left
     try std.testing.expectEqual(@as(u64, 1), s.counts.evicted);
