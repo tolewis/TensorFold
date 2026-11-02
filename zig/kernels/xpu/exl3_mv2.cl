@@ -106,8 +106,8 @@ __kernel void exl3_mv2(__global const uchar *base, __global const exl3_desc *des
     const ulong tile0 = ((ulong)k0 / 16) * tile_k;
     const __global const half *suh = AT(const half, d.suh);
     const __global const ushort *x = AT(const ushort, d.x);
-    const __global float *rot = AT(const float, d.rot);
-    const __global float *sums = AT(float, d.sums) + (ulong)split * d.n;
+    const __global const float *rot = AT(const float, d.rot);
+    __global float *sums = AT(float, d.sums) + (ulong)split * d.n;
 
     float8 acc[NS] = {0};
     float vr[8];
