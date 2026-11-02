@@ -186,9 +186,10 @@ const cl3 = "-cl-std=CL3.0";
 
 /// An explicit list: other files in the folder never join the build. The SPIR-V is device independent.
 /// A function with the eval branch quota raised: the comptime prints of the variant names pass the 73000 default.
-fn allKernels() [_]Kernel {
+const kernel_count = 16 + exl3_variants.all.len + exl3_variants.mv2.count + exl3_variants.moe.bits.len + exl3_variants.w4a8.bits.len + exl3_variants.gemm2.count;
+fn allKernels() [kernel_count]Kernel {
     @setEvalBranchQuota(1_000_000);
-    return [_]Kernel{
+    const base = [_]Kernel{
         .{ .name = "attn", .options = cl3 },
     .{ .name = "basic", .options = cl3 },
     .{ .name = "moe", .options = cl3 },
@@ -206,8 +207,8 @@ fn allKernels() [_]Kernel {
     .{ .name = "sage_exl3", .options = cl3 },
     .{ .name = "exl3", .options = cl3 ++ " -DEXL3_ABS" },
     } ++ exl3Matvec() ++ exl3Mv2() ++ exl3Moe() ++ exl3Int8() ++ exl3Gemm2();
+    return base;
 }
-
 const kernels = allKernels();
 
 /// The prompt GEMM with the A tile in local memory (exl3_gemm2.cl): one image a tile and a width of
