@@ -670,10 +670,15 @@ pub fn absorbPrompt(m: *Mtp, slot: u32, ids: []const u32, p0: u32, last_token: u
 /// cache at the kept positions, the newest row's state kept for the next window's first draft.
 pub fn absorbKept(m: *Mtp, items: []const Kept) !void {
     var total: usize = 0;
+    const cap: u32 = layout().cap;
     for (items) |it| {
         if (it.block.len != it.follow.len or it.block.len == 0) return error.BadKept;
         // a slot that has not run a prompt absorb has no cache yet: open it here (the pool sizing reserved its bytes)
         if (m.kv[it.slot] == null) try m.open(it.slot);
+        // every row's cache position and its target row must fit the cache and the target's row buffer: a row past
+        // either writes past a card buffer and the next drain returns DEVICE_LOST instead of a named error
+        if (it.pos + @as(u32, @intCast(it.block.len)) > cap) return error.MtpPosOverCap;
+        for (it.block) |r| if (r >= q.maxRows()) return error.MtpRowOverMax;
         total += it.block.len;
     }
     if (total > @as(usize, q.windowRows())) return error.BadKept;
@@ -687,7 +692,10 @@ pub fn absorbKept(m: *Mtp, items: []const Kept) !void {
             m.ids_host[row] = @intCast(it.follow[j]);
             m.mt_host[row * 8 + 0] = @intFromPtr(kv);
             m.mt_host[row * 8 + 1] = @intFromPtr(off(kv, m.kvHalf()));
-            m.mt_host[row * 8 + 2] = 0;
+            m.mt_host[row * 8 + 2] = 0; // no page table: the head's cache is its own allocation
+            m.mt_host[row * 8 + 3] = 0; // the GDN state pointers: the head has no GDN layer, but gdn_step reads them
+            m.mt_host[row * 8 + 4] = 0;
+            m.mt_host[row * 8 + 5] = 0;
             m.mt_host[row * 8 + 6] = 0;
             m.mt_host[row * 8 + 7] = 1;
             m.pos_host[row] = @intCast(it.pos + @as(u32, @intCast(j)));
@@ -709,8 +717,15 @@ pub fn absorbKept(m: *Mtp, items: []const Kept) !void {
 /// The next window's drafts for each stream: the first draft from the newest absorbed row's head, then each later draft
 /// from the previous row's output and the draft before it (cuda_mtp.zig's hold), at positions newest + step - 1.
 pub fn draft(m: *Mtp, asks: []const Ask) !void {
-    if (asks.len == 0 or asks.len > ROWS) return error.BadDrafts;
-    for (asks) |a| if (m.kv[a.slot] == null) return error.NoSlot;
+    // the head's row buffers (hb, logits, mt, mpos, ids, the decode partials) are sized for windowRows, not for ROWS:
+    // a window holds windowRows rows in all, so more streams than that is a bad request, not a card fault
+    if (asks.len == 0 or asks.len > @as(usize, q.windowRows())) return error.BadDrafts;
+    const cap: u32 = layout().cap;
+    for (asks) |a| {
+        if (m.kv[a.slot] == null) return error.NoSlot;
+        const d = @min(@max(a.depth, 1), most);
+        if (draftPos(m.pos[a.slot], d) >= cap) return error.MtpPosOverCap;
+    }
     if (!m.quiet) if (tp.group) |*g| try g.record(.mtp_draft, @intCast(asks.len), 0, 0, m.askWords(asks));
     var n: usize = 0;
     for (asks) |a| {
@@ -742,6 +757,9 @@ pub fn draft(m: *Mtp, asks: []const Ask) !void {
             m.mt_host[cnt * 8 + 0] = @intFromPtr(m.kv[a.slot].?);
             m.mt_host[cnt * 8 + 1] = @intFromPtr(off(m.kv[a.slot].?, m.kvHalf()));
             m.mt_host[cnt * 8 + 2] = 0;
+            m.mt_host[cnt * 8 + 3] = 0;
+            m.mt_host[cnt * 8 + 4] = 0;
+            m.mt_host[cnt * 8 + 5] = 0;
             m.mt_host[cnt * 8 + 6] = 0;
             m.mt_host[cnt * 8 + 7] = 1;
             m.pos_host[cnt] = @intCast(draftPos(m.pos[a.slot], step));
