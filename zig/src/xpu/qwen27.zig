@@ -938,6 +938,19 @@ pub fn poolPages(r: *Runner, slots: u32, tokens: ?u32, cache: bool, extra: u64) 
     return @intCast(pages - pages % sync_pages);
 }
 
+/// The window widths `measure` times: 1 to the smaller of the cost table and XPU_ROWS_MAX. A wider window is refused
+/// by the runner (BadBlock), so at the default cap of 16 the table keeps its 16 entries, as before the many-row lane.
+pub fn timedWidths(table: usize, cap: u32) usize {
+    return @min(table, @as(usize, cap));
+}
+
+test "measure widths: never a window above XPU_ROWS_MAX" {
+    try std.testing.expectEqual(@as(usize, 16), timedWidths(ROWS_CAP, 16));
+    try std.testing.expectEqual(@as(usize, 32), timedWidths(ROWS_CAP, 32));
+    try std.testing.expectEqual(@as(usize, 64), timedWidths(ROWS_CAP, 64));
+    try std.testing.expectEqual(@as(usize, 16), timedWidths(16, 64));
+}
+
 /// The run flags a pair must agree on: one bit each for kv_pool, keep_shared, kv_i8, embed_host, k1, k1_tree and
 /// k1 r16, four bits for the k1 wave (XPU_K1_WAVE, a small count), then multi_tree (XPU_MULTI_TREE), then the weight
 /// format (bit 12: MLX), the rows cap (bits 13 and 14) and the kept state count (XPU_KEEP_STATES, bits 15 to 26,

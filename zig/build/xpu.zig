@@ -174,6 +174,9 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const w4r_step = b.step("test-w4rows-ref", "The int4 many-row decode's plan and CPU tiling reference (no card)");
     const w4r_mod = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/w4rows.zig"), .target = target, .optimize = optimize });
     if (target.result.cpu.arch == host.cpu.arch and target.result.os.tag == host.os.tag) w4r_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = w4r_mod })).step);
+    // measure()'s window widths stay within XPU_ROWS_MAX (item 23 BadBlock), no card
+    const mw_step = b.step("test-measure-widths", "measure() times no window wider than XPU_ROWS_MAX (no card)");
+    if (target.result.cpu.arch == host.cpu.arch and target.result.os.tag == host.os.tag) mw_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = qwen27, .filters = &.{"measure widths:"} })).step);
     // XPU_MULTI_TREE: the shared tree round's host fill and the merge's per-row used (lane p33-multitree), no card
     const mt_step = b.step("test-k1-mt", "The shared tree round's host fill and merge per-row used (no card)");
     if (target.result.cpu.arch == host.cpu.arch and target.result.os.tag == host.os.tag) mt_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = qwen27, .filters = &.{"k1 mt:"} })).step);
