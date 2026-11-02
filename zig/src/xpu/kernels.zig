@@ -45,3 +45,14 @@ pub const exl3_int8: [exl3_variants.w4a8.bits.len][]const u8 = blk: {
     for (exl3_variants.w4a8.bits, &out) |b, *image| image.* = if (available) &Blob("spv_" ++ exl3_variants.w4a8.name(b)).bytes else &.{};
     break :blk out;
 };
+/// The prompt GEMM with the A tile in local memory, one image a tile and a width of exl3_variants.gemm2 (same
+/// order as exl3_variants.gemm2.index).
+pub const exl3_gemm2: [exl3_variants.gemm2.count][]const u8 = blk: {
+    var out: [exl3_variants.gemm2.count][]const u8 = undefined;
+    for (exl3_variants.gemm2.tiles, 0..) |_, v| {
+        for (exl3_variants.gemm2.widths, 0..) |b, i| {
+            out[exl3_variants.gemm2.index(v, i)] = if (available) &Blob("spv_" ++ exl3_variants.gemm2.name(v, b)).bytes else &.{};
+        }
+    }
+    break :blk out;
+};

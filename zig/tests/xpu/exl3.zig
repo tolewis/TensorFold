@@ -3,11 +3,13 @@
 //! Usage: tf-xpu-exl3-test <case.bin> <out.bin> [reps]
 //! With reps: the same call queued reps times back to back, then the wall time a call and the weight GB/s
 //! (launch gaps included). Routed: every slot counts its expert's weight once.
-//! Case: u32 magic "EXL3", mode (0 project, 1 routed, 2 fused MLP), count (groups or experts), k, n, halves, rows
+//! Case: u32 magic "EXL3", mode (0 project, 1 routed, 2 fused MLP, 3 prompt GEMM A/B), count (groups or experts), k, n, halves, rows
 //! (or tokens), topk, x_per_slot (fused MLP: 1 if the last expert is the shared expert), formats (output in the low
 //! byte: 0 bf16, 1 fp32, 2 fp16; input in the next: 0 bf16, 1 fp16); then per group or
 //! expert trellis, suh, svh (fused MLP: gate and up [k, n], then down [n, k]); then u32 ids [tokens][topk] (routed,
 //! fused MLP); then bf16 x. Project groups each read their own x [rows][k]. Fused MLP: y [slots][k].
+//! Mode 3: prompt rows only. Times exl3_gemm and exl3_gemm2 (XPU_PROMPT_GEMM2=1) on the same case and reports
+//! both, the speedup and the max abs and relative difference between their outputs.
 
 const std = @import("std");
 const xpu = @import("xpu");
@@ -35,6 +37,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (h.magic != 0x334C5845) return error.BadCase;
     const routed = h.mode == 1;
     const fused = h.mode == 2;
+    const ab = h.mode == 3; // prompt GEMM: exl3_gemm against exl3_gemm2
     const tile_bytes: usize = 16 * h.halves;
     const tr_bytes = (h.k / 16) * (h.n / 16) * tile_bytes;
     const shared = fused and h.x_per_slot != 0;
@@ -142,22 +145,51 @@ pub fn main(init: std.process.Init) !u8 {
         for (groups, ms, 0..) |*g, m, i| g.* = .{ .m = m, .rows = h.rows, .x = base + x_off + i * h.rows * h.k * 2, .x_stride = h.k, .y = base + y_off + i * h.rows * h.n * y_elem, .y_stride = h.n, .output = output, .input = input, .scratch = base + scratch_off + i * per };
         var plan = try exl3.Plan.init(&ctx, s, gpa, groups);
         defer plan.deinit();
-        try exl3.encode(&p, s, &plan);
-        if (reps > 0) {
-            // warm-up of the same length: the GPU clock ramps over the first tens of ms of a window (B70, 2026-11-01)
-            for (0..reps) |_| try exl3.encode(&p, s, &plan);
-            try s.synchronize();
-            // EXL3_SYNC=1: a host wait after every call. Back-to-back calls overlap one launch's tail with the next
-            // launch, which favours few large sub-groups: the one-wave rule that sweep 2 picked lost 16 ms a token in
-            // the engine, where every matvec waits on the launch before it (B70, 2026-11-01).
-            const sync = if (std.c.getenv("EXL3_SYNC")) |v| v[0] == '1' else false;
-            const t0 = std.Io.Clock.awake.now(io);
-            for (0..reps) |_| {
-                try exl3.encode(&p, s, &plan);
-                if (sync) try s.synchronize();
+        if (ab) {
+            // prompt rows only: exl3_gemm (live) against each exl3_gemm2 tile, same case, both timed, outputs compared
+            if (plan.rows <= exl3.variants.rows_max) return error.BadCase;
+            const y_bytes = y_rows * y_n * y_elem;
+            const base_y = try gpa.alloc(u8, y_bytes);
+            defer gpa.free(base_y);
+            const g2_y = try gpa.alloc(u8, y_bytes);
+            defer gpa.free(g2_y);
+            const us_base = try abTime(io, &p, s, &plan, null, reps);
+            try buf.download(s, y_off, base_y);
+            std.debug.print("gemm2 base exl3_gemm: {d:.1} us (n {d}, k {d}, rows {d})\n", .{ us_base, plan.n_max, plan.k_max, plan.rows });
+            for (0..exl3.variants.gemm2.tiles.len) |v| {
+                const t = exl3.variants.gemm2.tiles[v];
+                const i = exl3.gemm2Index(&plan, v) orelse {
+                    std.debug.print("gemm2 tile {d} (m {d}, s {d}, kc {d}): does not apply\n", .{ v, t.m, t.s, t.kc });
+                    continue;
+                };
+                if (i >= p.gemm2_count) {
+                    std.debug.print("gemm2 tile {d} (m {d}, s {d}, kc {d}): image did not load\n", .{ v, t.m, t.s, t.kc });
+                    continue;
+                }
+                const us_g2 = try abTime(io, &p, s, &plan, v, reps);
+                try buf.download(s, y_off, g2_y);
+                const e = diff(base_y, g2_y);
+                std.debug.print("gemm2 tile {d} (m {d}, s {d}, kc {d}): {d:.1} us, speedup {d:.2}x, max abs {e:.3}, rel {e:.2}, {d} of {d} values differ\n", .{ v, t.m, t.s, t.kc, us_g2, if (us_g2 > 0) us_base / us_g2 else 0, e.max_abs, e.max_abs / (e.max_ref + 1e-30), e.n_diff, e.n });
             }
-            try s.synchronize();
-            report(io, t0, reps, weight_bytes);
+            // the output of the last flag run is what the Python side reads
+        } else {
+            try exl3.encode(&p, s, &plan);
+            if (reps > 0) {
+                // warm-up of the same length: the GPU clock ramps over the first tens of ms of a window (B70, 2026-11-01)
+                for (0..reps) |_| try exl3.encode(&p, s, &plan);
+                try s.synchronize();
+                // EXL3_SYNC=1: a host wait after every call. Back-to-back calls overlap one launch's tail with the next
+                // launch, which favours few large sub-groups: the one-wave rule that sweep 2 picked lost 16 ms a token in
+                // the engine, where every matvec waits on the launch before it (B70, 2026-11-01).
+                const sync = if (std.c.getenv("EXL3_SYNC")) |v| v[0] == '1' else false;
+                const t0 = std.Io.Clock.awake.now(io);
+                for (0..reps) |_| {
+                    try exl3.encode(&p, s, &plan);
+                    if (sync) try s.synchronize();
+                }
+                try s.synchronize();
+                report(io, t0, reps, weight_bytes);
+            }
         }
     }
     const y = try gpa.alloc(u8, y_rows * y_n * y_elem);
@@ -175,4 +207,35 @@ fn matBytes(kn: [2]u32, tr_bytes: usize) [3]usize {
 fn report(io: std.Io, t0: std.Io.Timestamp, reps: usize, weight_bytes: f64) void {
     const dt = @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0.toNanoseconds())) / 1e9 / @as(f64, @floatFromInt(reps));
     std.debug.print("call {d:.1} us, weights {d:.2} MB, {d:.1} GB/s\n", .{ dt * 1e6, weight_bytes / 1e6, weight_bytes / dt / 1e9 });
+}
+
+/// Us a call of encodeRowsMode (null: the live kernel), after a warm-up of the same length. 0 when reps is 0.
+fn abTime(io: std.Io, p: *const exl3.Pipelines, s: xpu.Stream, plan: *const exl3.Plan, variant: ?usize, reps: usize) !f64 {
+    if (reps == 0) {
+        try exl3.encodeRowsMode(p, s, plan, plan.rows, variant);
+        return 0;
+    }
+    for (0..reps) |_| try exl3.encodeRowsMode(p, s, plan, plan.rows, variant);
+    try s.synchronize();
+    const t0 = std.Io.Clock.awake.now(io);
+    for (0..reps) |_| try exl3.encodeRowsMode(p, s, plan, plan.rows, variant);
+    try s.synchronize();
+    const ns = std.Io.Clock.awake.now(io).toNanoseconds() - t0.toNanoseconds();
+    return @as(f64, @floatFromInt(ns)) / 1e3 / @as(f64, @floatFromInt(reps));
+}
+
+/// How far a flag output is from the live kernel's: max abs, the reference's max abs, and how many values differ.
+const Diff = struct { max_abs: f32, max_ref: f32, n_diff: usize, n: usize };
+
+fn diff(ref_bytes: []const u8, got_bytes: []const u8) Diff {
+    const a = std.mem.bytesAsSlice(f32, ref_bytes);
+    const b = std.mem.bytesAsSlice(f32, got_bytes);
+    var d: Diff = .{ .max_abs = 0, .max_ref = 0, .n_diff = 0, .n = @min(a.len, b.len) };
+    for (a, b) |x, z| {
+        const e = @abs(x - z);
+        if (e > d.max_abs) d.max_abs = e;
+        if (@abs(x) > d.max_ref) d.max_ref = @abs(x);
+        if (e != 0) d.n_diff += 1;
+    }
+    return d;
 }

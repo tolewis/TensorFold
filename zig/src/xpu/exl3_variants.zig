@@ -114,6 +114,43 @@ pub const w4a8 = struct {
     }
 };
 
+/// The prompt GEMM with the A tile in local memory (exl3_gemm2.cl, lane p26-gemm). Prompt rows only, behind
+/// XPU_PROMPT_GEMM2=1, default off. One image a width and tile.
+/// m: rows a sub-group, s: 16-column strips a sub-group, kc: k tiles a local-memory step. Three tiles to measure:
+/// 0 is the safe one, 1 spends registers on rows (a lower decode cost a row block), 2 spends registers on column
+/// reuse instead (fewer A reads a work-group). The host picks a tile by the flag's value: 1, 2 or 3.
+pub const gemm2 = struct {
+    pub const widths = [_]u32{ 4, 6 };
+    pub const Tile = struct { m: u32, s: u32, kc: u32 };
+    pub const tiles = [_]Tile{
+        .{ .m = 24, .s = 8, .kc = 2 },
+        .{ .m = 48, .s = 8, .kc = 2 },
+        .{ .m = 24, .s = 16, .kc = 2 },
+    };
+    pub const count = tiles.len * widths.len;
+
+    pub fn name(comptime v: usize, comptime b: u32) []const u8 {
+        return std.fmt.comptimePrint("exl3_gemm2_t{d}_b{d}", .{ v, b });
+    }
+
+    pub fn options(comptime v: usize, comptime b: u32) []const u8 {
+        const t = tiles[v];
+        return std.fmt.comptimePrint("-cl-std=CL3.0 -DEXL3_ABS -DBITS={d} -DGEMM2_M={d} -DGEMM2_S={d} -DGEMM2_KC={d}", .{ b, t.m, t.s, t.kc });
+    }
+
+    /// Local memory an image asks for: the A tile of a step (8 * m rows of 16 * kc halves), then the decoded B
+    /// tiles (kc * s * 16 lanes of 32 bytes).
+    pub fn localBytes(v: usize) usize {
+        const t = tiles[v];
+        return 8 * t.m * 16 * t.kc * 2 + t.kc * t.s * 16 * 32;
+    }
+
+    /// The image index of a tile and a width, as kernels.exl3_gemm2 lists them.
+    pub fn index(v: usize, b: usize) usize {
+        return v * widths.len + b;
+    }
+};
+
 /// Sub-groups a launch needs to fill the GPU; fewer strips a sub-group and K splits get it there (narrow groups:
 /// Sage experts, N 512 and 2048, measured 2026-10-24 and -25).
 pub const sub_group_target = 4096;

@@ -202,7 +202,19 @@ const kernels = [_]Kernel{
     .{ .name = "nem_attn_dec", .options = cl3 },
     .{ .name = "sage_exl3", .options = cl3 },
     .{ .name = "exl3", .options = cl3 ++ " -DEXL3_ABS" },
-} ++ exl3Matvec() ++ exl3Moe() ++ exl3Int8();
+} ++ exl3Matvec() ++ exl3Moe() ++ exl3Int8() ++ exl3Gemm2();
+
+/// The prompt GEMM with the A tile in local memory (exl3_gemm2.cl): one image a tile and a width of
+/// exl3_variants.gemm2.
+fn exl3Gemm2() [exl3_variants.gemm2.count]Kernel {
+    var out: [exl3_variants.gemm2.count]Kernel = undefined;
+    inline for (exl3_variants.gemm2.tiles, 0..) |_, v| {
+        inline for (exl3_variants.gemm2.widths, 0..) |b, i| {
+            out[exl3_variants.gemm2.index(v, i)] = .{ .name = exl3_variants.gemm2.name(v, b), .src = "exl3_gemm2", .options = exl3_variants.gemm2.options(v, b) };
+        }
+    }
+    return out;
+}
 
 /// Fused routed MLP images: one a width of exl3_variants.moe.
 fn exl3Moe() [exl3_variants.moe.bits.len]Kernel {
