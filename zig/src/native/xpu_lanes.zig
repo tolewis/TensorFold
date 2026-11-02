@@ -40,6 +40,10 @@ pub const Lanes = struct {
     chain: [xq.MAX_SLOTS][16]u32 = undefined, // each slot's DFlash2 drafts for its next window (a tree)
     chain_par: [xq.MAX_SLOTS][16]i32 = undefined, // and each one's parent (−1: the pending token)
     chain_n: [xq.MAX_SLOTS]u32 = @splat(0),
+    adaptive_k: bool = false, // XPU_ADAPTIVE_K=1: the draft length from a per-slot acceptance average
+    acc: [xq.MAX_SLOTS]f64 = @splat(0), // the slot's moving average of accepted tokens a round
+    acc_have: [xq.MAX_SLOTS]bool = @splat(false), // the slot's average is seeded
+    last_len: [xq.MAX_SLOTS]u32 = @splat(0), // the slot's last drafted length (the log line)
     prompt_skip: u32 = 0, // a prefill's first rows the drafter never reads (further than WIN from the prompt's end)
     costs: [16]lanes.config.Cost = undefined, // a window's ms by rows (verify and keep), timed by measure()
     timed: usize = 0,
@@ -139,6 +143,25 @@ pub const Lanes = struct {
         var paths: [16][]const u32 = undefined;
         for (paths[0..n], b.widths[0..n]) |*p, w| p.* = all[0..w];
         try b.keepRows(paths[0..n]);
+    }
+
+    /// `slot`'s next draft length (XPU_ADAPTIVE_K): its acceptance average plus one, clamped to [1, max].
+    fn nextLen(b: *const Lanes, slot: u32, max: u32) u32 {
+        if (!b.adaptive_k or !b.acc_have[slot]) return max;
+        const est: u32 = @intFromFloat(std.math.floor(b.acc[slot] + 0.5));
+        return @min(@max(est + 1, 1), max);
+    }
+
+    /// One round's accepted tokens into `slot`'s moving average (XPU_ADAPTIVE_K).
+    fn accUpdate(b: *Lanes, slot: u32, accepted: u32) void {
+        if (!b.adaptive_k) return;
+        const a: f64 = @floatFromInt(accepted);
+        if (b.acc_have[slot]) { // the slot's average is seeded: blend this round in
+            b.acc[slot] = 0.5 * a + 0.5 * b.acc[slot];
+        } else { // the slot's first round seeds the average
+            b.acc[slot] = a;
+            b.acc_have[slot] = true;
+        }
     }
 
     fn slotOf(b: *const Lanes, s: *const lanes.Stream) ?u32 {
@@ -415,6 +438,14 @@ pub const Lanes = struct {
         const b = self(ptr);
         if (windows.len != b.count or paths.len != b.count) return error.NothingToKeep;
         for (paths) |p| if (p.len == 0) return error.NothingToKeep;
+        if (b.adaptive_k) { // XPU_ADAPTIVE_K: each window's accepted into its slot's average
+            for (paths, 0..) |p, i| {
+                const slot = b.wslots[i];
+                const accepted: u32 = @intCast(p.len - 1);
+                b.accUpdate(slot, accepted);
+                std.log.info("qwen27-xpu: adaptive k: slot {d} draft {d}, accepted {d} (avg {d:.1})", .{ slot, b.last_len[slot], accepted, b.acc[slot] });
+            }
+        }
         b.count = 0;
         try b.keepRows(paths);
     }
@@ -445,6 +476,8 @@ pub const Lanes = struct {
             if (q.depth == 0 or ni == items.len) continue;
             items[ni] = .{ .slot = slot, .pending = if (q.rows != null) q.follow[q.follow.len - 1] else try b.value(q.first orelse return error.NoFirstToken) };
             asked[ni] = @min(q.depth, b.nodes);
+            if (b.adaptive_k) asked[ni] = @min(asked[ni], b.nextLen(slot, b.nodes)); // XPU_ADAPTIVE_K: the slot's length
+            b.last_len[slot] = asked[ni];
             reqs[ni] = &q;
             depth = @max(depth, @min(asked[ni], b.block - 1));
             ni += 1;
@@ -550,10 +583,15 @@ pub const Lanes = struct {
             defer r.taps_on = false;
             var sampled: Sampled = .{ .b = b, .s = s.sampling orelse .{ .seed = 0 } };
             const drawer: ?xq.drafter.Draw = if (s.sampling) |sp| .{ .ctx = &sampled, .row = Sampled.row, .gumbel = Sampled.gumbel, .temperature = sp.temperature } else null;
-            const round = try xq.drafter.treeRound(d, pending, b.block - 1, b.nodes, drawer, &out);
+            const k = b.nextLen(slot, b.nodes); // XPU_ADAPTIVE_K: the slot's length from its acceptance average
+            const depths = @min(k, b.block - 1);
+            b.last_len[slot] = k;
+            const round = try xq.drafter.treeRound(d, pending, depths, k, drawer, &out);
             s.rounds += 1;
             s.drafted += round.drafted;
             s.accepted += round.accepted;
+            b.accUpdate(slot, round.accepted);
+            if (b.adaptive_k) std.log.info("qwen27-xpu: adaptive k: slot {d} draft {d}, accepted {d} (avg {d:.1})", .{ slot, k, round.accepted, b.acc[slot] });
             var landed: [17]u32 = undefined;
             const n = round.tokens.len - 1;
             @memcpy(landed[0..n], round.tokens[1..]);
