@@ -141,6 +141,7 @@ pub const Store = struct {
     budget: u64,
     most: usize = std.math.maxInt(usize), // states kept at most: a family's snapshot slots, one a state
     held: u64 = 0,
+    forced: u64 = 0, // states a live stream's page need took (XPU_KEEP_SHARED), beside the budget's own evictions
     clock: u64 = 0,
     entries: std.ArrayList(*Entry) = .empty,
     counts: Counts = .{},
@@ -169,6 +170,16 @@ pub const Store = struct {
         s.gpa.free(e.decode_spans);
         s.gpa.free(e.last);
         s.gpa.destroy(e);
+    }
+
+    /// Drops the least recently used kept state a stream's page need makes room with (never a borrowed one, and the
+    /// rewind state last); false when no state is left to drop. The family's drop returns the state's pages.
+    pub fn evictOne(s: *Store) bool {
+        const i = s.victimBut(null, &.{}, 0) orelse return false;
+        s.remove(i);
+        s.counts.evicted += 1;
+        s.forced += 1;
+        return true;
     }
 
     pub fn remove(s: *Store, i: usize) void {
@@ -556,7 +567,7 @@ pub const Store = struct {
     /// One log line after a prompt pass: where it resumed, how many states it kept, and what the store holds.
     pub fn report(s: *const Store, prompt: usize, from: u32, kept: u64) void {
         if (@import("builtin").is_test) return;
-        std.log.info("prompt cache: {d} tokens, resumed at {d}, kept {d}; {d} states, {d} MiB and {d} MiB spare of {d} MiB (hits {d}, misses {d}, evicted {d}, refused {d}, failed {d})", .{ prompt, from, kept, s.entries.items.len, s.holding() >> 20, s.spare() >> 20, s.budget >> 20, s.counts.hits, s.counts.misses, s.counts.evicted, s.counts.refused, s.counts.failed });
+        std.log.info("prompt cache: {d} tokens, resumed at {d}, kept {d}; {d} states, {d} MiB and {d} MiB spare of {d} MiB (hits {d}, misses {d}, evicted {d}, {d} for streams, refused {d}, failed {d})", .{ prompt, from, kept, s.entries.items.len, s.holding() >> 20, s.spare() >> 20, s.budget >> 20, s.counts.hits, s.counts.misses, s.counts.evicted, s.forced, s.counts.refused, s.counts.failed });
     }
 
     fn fail(s: *Store, at: u32, err: anyerror) bool {
