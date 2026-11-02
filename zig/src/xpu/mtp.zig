@@ -567,7 +567,7 @@ pub fn measure(m: *Mtp) !void {
 /// each row). The K/V rows go to each row's cache at `p0` (wide, one slot) or at MT's POS[t] (mt, any slots). The
 /// output rows land in `h` (the final normed state) and `x` (the residual).
 /// XPU_MTP_SYNC: drain after this launch so a fault names it.
-fn step(m: *Mtp) !void {
+fn afterLaunch(m: *Mtp) !void {
     if (sync_each) try m.r.d.sync();
 }
 
@@ -585,7 +585,7 @@ fn layer(m: *Mtp, slot: u32, n: u32, p0: u32, wide: bool, mt: bool) !void {
     const nrm = if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec;
     // the embedding of the follow tokens, its norm; then the hidden state's norm (R = tgt, X = 0: one fp32 copy)
     try d.launch(d.k.embed_dense, .{ .x = n }, .{ m.ids, m.r.model.embed_w, m.x, @as(i32, D) });
-    try step(m);
+    try afterLaunch(m);
     try d.launch(nrm, .{ .x = n }, .{ m.x, m.pr, m.norm_e, m.en, m.ahi, m.alo, @as(i32, D), EPS, @as(i32, 0), gs, nul, nul, ms, rot });
     try copy(d, m.x, m.zero, @as(usize, n) * D * 4);
     try d.launch(nrm, .{ .x = n }, .{ m.x, m.tgt, m.norm_h, m.hn, m.ahi, m.alo, @as(i32, D), EPS, @as(i32, 1), gs, nul, nul, ms, rot });
@@ -593,11 +593,11 @@ fn layer(m: *Mtp, slot: u32, n: u32, p0: u32, wide: bool, mt: bool) !void {
     try d.launch(d.k.dense_rows, .{ .x = (n + 15) / 16, .y = m.fc_n / 16 }, .{ m.en, m.fc_e, m.pr, t32, @as(i32, D), @as(i32, 0) });
     try d.launch(d.k.dense_rows, .{ .x = (n + 15) / 16, .y = m.fc_n / 16 }, .{ m.hn, m.fc_h, m.r2, t32, @as(i32, D), @as(i32, 0) });
     try d.launch(d.k.tp_add, .{ .x = (n * D + 255) / 256 }, .{ m.pr, m.pr, m.r2, @as(i32, @intCast(n * D)) });
-    try step(m);
+    try afterLaunch(m);
     try copy(d, m.x, m.zero, @as(usize, n) * D * 4);
     try d.launch(nrm, .{ .x = n }, .{ m.x, m.pr, m.in_norm, m.h, m.ahi, m.alo, @as(i32, D), EPS, @as(i32, 1), gs, nul, nul, ms, rot });
     try m.runPlans(&m.plans.qkv, n, wide);
-    try step(m);
+    try afterLaunch(m);
     // q, k, v with their norms and rope; K and V to each row's cache row
     if (mt)
         try d.launch(d.k.attn_prep, .{ .x = n }, .{ m.p, m.q_norm, m.k_norm, m.r.model.invf, m.qb, nul, nul, @as(i32, 0), EPS, nul, m.mt, m.mpos, @as(i32, q.kv8), cap, nul, nul })
@@ -616,24 +616,24 @@ fn layer(m: *Mtp, slot: u32, n: u32, p0: u32, wide: bool, mt: bool) !void {
         for (m.pos_host[0..n]) |v| far = @max(far, v);
         const ns: u32 = @intCast((@as(u32, @intCast(far)) + q.SPLIT) / q.SPLIT);
         try d.launch(d.k.attn_decode, .{ .x = ns, .y = AKV, .z = n }, .{ m.qb, nul, nul, m.r.acts.pm, m.r.acts.pl, m.r.acts.po, @as(i32, 0), @as(i32, @intCast(ns)), scale, nul, m.mt, m.mpos, cap, nul });
-        try step(m);
+        try afterLaunch(m);
         try d.launch(d.k.attn_merge, .{ .x = HQ, .y = n }, .{ m.r.acts.pm, m.r.acts.pl, m.r.acts.po, m.y, @as(i32, 0), @as(i32, @intCast(ns)), nul, m.mpos });
     }
     // XPU_KV8 & 1 rotates q, k, v by Hadamard in attn_prep, so the merged output is un-rotated before the gate, as the
     // target's forward does. Off with XPU_KV8 unset (the live pair's setting), where the launch is skipped.
     if (q.kv8 & 1 != 0) try d.launch(d.k.rot_heads, .{ .x = n, .y = HQ }, .{m.y});
     try d.launch(d.k.attn_gate, .{ .x = n }, .{ m.y, m.p, m.h, m.ahi, m.alo, gs, rot, nul, nul, ms });
-    try step(m);
+    try afterLaunch(m);
     try m.runPlans(&m.plans.o, n, wide);
-    try step(m);
+    try afterLaunch(m);
     if (tp.group) |*g| try g.allReduce(d, m.pr, n);
     try d.launch(nrm, .{ .x = n }, .{ m.x, m.pr, m.post_norm, m.h, m.ahi, m.alo, @as(i32, D), EPS, @as(i32, 1), gs, nul, nul, ms, rot });
     try m.runPlans(&m.plans.gu, n, wide);
-    try step(m);
+    try afterLaunch(m);
     try d.launch(d.k.swiglu, .{ .x = n, .y = (FFR + 1023) / 1024 }, .{ m.guv, m.act, m.ahi, m.alo, gs, @as(i32, 0), rot, @as(i32, FFR) });
-    try step(m);
+    try afterLaunch(m);
     try m.runPlans(&m.plans.down, n, wide);
-    try step(m);
+    try afterLaunch(m);
     if (tp.group) |*g| try g.allReduce(d, m.pr, n);
     try d.launch(nrm, .{ .x = n }, .{ m.x, m.pr, m.norm, m.h, m.ahi, m.alo, @as(i32, D), EPS, @as(i32, 1), gs, nul, nul, ms, rot });
 }
