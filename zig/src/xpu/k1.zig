@@ -98,7 +98,8 @@ pub const Kernels = struct {
     draft: ze.H = null, // attn_k1_draft (k1.cl): the tree verify's draft keys into slice NS
     draft_mt: ze.H = null, // attn_k1_draft_mt (k1.cl): the shared round's tree rows' draft keys (XPU_MULTI_TREE)
     span: ze.H = null, // attn_decode_span (decode.cl): the scalar page-table kernel K1 is checked against
-    merge: ze.H = null, // attn_merge_span (decode.cl): the merge of slice partials
+    merge: ze.H = null, // attn_merge_span (decode.cl): the merge of natural-base slice partials (the scalar span kernel)
+    merge2: ze.H = null, // attn_merge_span2 (decode.cl): the merge of K1's log2-base partials
     dec: ze.H = null, // attn_decode (decode.cl): the scalar table kernel, the tree bench's reference
     tmerge: ze.H = null, // attn_merge (decode.cl): the scalar tree merge
 };
@@ -112,6 +113,7 @@ pub fn load(d: *dev.Dev, md: ze.H, mk1: ze.H) !Kernels {
         .draft_mt = try d.kernel(mk1, "attn_k1_draft_mt", 16),
         .span = try d.kernel(md, "attn_decode_span", 16),
         .merge = try d.kernel(md, "attn_merge_span", 256),
+        .merge2 = try d.kernel(md, "attn_merge_span2", 256),
         .dec = try d.kernel(md, "attn_decode", 16),
         .tmerge = try d.kernel(md, "attn_merge", 16),
     };

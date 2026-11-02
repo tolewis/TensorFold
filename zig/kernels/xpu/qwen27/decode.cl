@@ -678,6 +678,43 @@ KERNEL(256) void attn_merge_span(global const float *PM, global const float *PL,
   O[((long)t * Q27_AQ + hh) * 256 + e] = f2bf(so / sl);
 }
 
+// K1 writes PM in log2 units (q scaled by log2 e, exp2 in its softmax), so its slices join with exp2: the weight of a
+// slice is 2^(PM - m). attn_merge_span above weights with exp (the natural base of attn_decode_span) and is wrong for K1
+// (lane p39-k1cover). Same body, exp2.
+// Merge of K1 slices (attn_k1_decode, attn_k1_draft, attn_k1_draft_mt): O bf16 [T, Q27_AQ, 256]. One work-group of 16 subgroups per (head, row), each
+// subgroup takes every 16th slice, then the work-group adds the 16 partials.
+KERNEL(256) void attn_merge_span2(global const float *PM, global const float *PL, global const float *PO,
+                                 global ushort *O, int p0, int NS, int span, global const int *POS) {
+  const int hh = get_group_id(0), t = get_group_id(1), g = get_sub_group_id(), lane = get_sub_group_local_id();
+  const int used = (POS ? POS[t] : p0 + t) / span + 1;
+  const long base = ((long)t * Q27_AQ + hh) * NS;
+  local float lm[16], ll[16], lo[16][256];
+  float m = -INFINITY;
+  for (int s = g; s < used; s += 16) m = fmax(m, PM[base + s]);
+  m = sub_group_reduce_max(m);
+  if (lane == 0) lm[g] = m;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  m = -INFINITY;
+  for (int i = 0; i < 16; i++) m = fmax(m, lm[i]);
+  float l = 0.0f, o[16];
+  for (int i = 0; i < 16; i++) o[i] = 0.0f;
+  for (int s = g; s < used; s += 16) {
+    const float w = exp2(PM[base + s] - m);
+    l += PL[base + s] * w;
+    for (int i = 0; i < 16; i++) o[i] += PO[(base + s) * 256 + i * 16 + lane] * w;
+  }
+  if (lane == 0) ll[g] = l;
+  for (int i = 0; i < 16; i++) lo[g][i * 16 + lane] = o[i];
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const int e = get_local_id(0);
+  float sl = 0.0f, so = 0.0f;
+  for (int i = 0; i < 16; i++) {
+    sl += ll[i];
+    so += lo[i][e];
+  }
+  O[((long)t * Q27_AQ + hh) * 256 + e] = f2bf(so / sl);
+}
+
 // Decode attention over int8 pool pages on the XMX (K1): one work-group of 16 sub-groups per (split, K/V head, row
 // group). A row group is up to DPAS_ROWS rows of one stream (a verify window's rows, or one row): its (row, query
 // head) pairs are the DPAS columns, 16 a pass, so each K and V row is read once for the whole group. A tile is 256

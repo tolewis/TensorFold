@@ -173,6 +173,9 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     // K1 coverage (lane p39-k1cover): the attention path of every stream count and window split, no card
     const cover_step = b.step("test-k1-cover", "K1 serves streams 1 to 6 and every window split of a 16-row round (no card)");
     if (target.result.cpu.arch == host.cpu.arch and target.result.os.tag == host.os.tag) cover_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = qwen27, .filters = &.{"k1 cover:"} })).step);
+    // K1's slice merge (lane p39-k1cover): the exp2 merge against the one-pass softmax, no card
+    const merge_step = b.step("test-k1-merge", "K1 slice merge: exp2 joins log2-base partials exactly, exp does not (no card)");
+    if (target.result.cpu.arch == host.cpu.arch and target.result.os.tag == host.os.tag) merge_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = qwen27, .filters = &.{"k1 merge:"} })).step);
     if (target.result.cpu.arch == host.cpu.arch and target.result.os.tag == host.os.tag) tests_build.dependOn(&b.addTest(.{ .root_module = qwen27 }).step);
     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
     // core (the image processor, M-RoPE layouts) for the engines' --vision as for the server: one module, one copy

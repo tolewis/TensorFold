@@ -405,3 +405,58 @@ test "k1 cover: streams 1 to 6 and every window split of 16 rows take a K1 path"
     try std.testing.expectEqualStrings("K1 coverage: chain windows K1, lone tree K1, shared tree windows K1 (streams 1 to 6, up to 16 rows a round)", k1mod.coverageLine(&buf, true, true, true));
     try std.testing.expectEqualStrings("K1 coverage: chain windows K1, lone tree K1, shared tree windows scalar (streams 1 to 6, up to 16 rows a round)", k1mod.coverageLine(&buf, true, true, false));
 }
+
+/// Split-K partials as K1 writes them (m the slice max, l the sum of 2^(s - m), o the unnormalized sum of 2^(s - m) v;
+/// scores s in log2 units) joined with the weight base `base` (attn_merge_span: e, attn_merge_span2: 2), against the
+/// one-pass softmax 2^s over every key. Returns the largest absolute error over the head dimension.
+fn mergeError(delta: f64, slices: usize, per: usize, base: f64) f64 {
+    const dim = 4;
+    var m: [8]f64 = undefined;
+    var l: [8]f64 = undefined;
+    var o: [8][dim]f64 = undefined;
+    var ref_num: [dim]f64 = @splat(0);
+    var ref_den: f64 = 0;
+    var mx: f64 = -1e300;
+    for (0..slices) |k| for (0..per) |j| mx = @max(mx, -@as(f64, @floatFromInt(k)) * delta - 0.5 * @as(f64, @floatFromInt(j)));
+    for (0..slices) |k| {
+        m[k] = -1e300;
+        for (0..per) |j| m[k] = @max(m[k], -@as(f64, @floatFromInt(k)) * delta - 0.5 * @as(f64, @floatFromInt(j)));
+        l[k] = 0;
+        o[k] = @splat(0);
+        for (0..per) |j| {
+            const s = -@as(f64, @floatFromInt(k)) * delta - 0.5 * @as(f64, @floatFromInt(j));
+            const w = std.math.pow(f64, 2.0, s - m[k]);
+            l[k] += w;
+            const wg = std.math.pow(f64, 2.0, s - mx);
+            ref_den += wg;
+            for (0..dim) |d| {
+                const v = @as(f64, @floatFromInt(k + 1)) * (@as(f64, @floatFromInt(d)) - 1.5) + 0.1 * @as(f64, @floatFromInt(j)); // differs by slice
+                o[k][d] += w * v;
+                ref_num[d] += wg * v;
+            }
+        }
+    }
+    var gm: f64 = -1e300;
+    for (0..slices) |k| gm = @max(gm, m[k]);
+    var num: [dim]f64 = @splat(0);
+    var den: f64 = 0;
+    for (0..slices) |k| {
+        const w = std.math.pow(f64, base, m[k] - gm);
+        den += l[k] * w;
+        for (0..dim) |d| num[d] += o[k][d] * w;
+    }
+    var err: f64 = 0;
+    for (0..dim) |d| err = @max(err, @abs(num[d] / den - ref_num[d] / ref_den));
+    return err;
+}
+
+test "k1 merge: the exp2 merge joins K1 slices exactly, the exp merge does not" {
+    // slice maxima 1 to 20 log2 units apart, 3 to 8 slices (the plan makes 16 to 64; the sum is the same shape)
+    var delta: f64 = 1;
+    while (delta <= 20) : (delta += 1) {
+        for ([_]usize{ 3, 5, 8 }) |slices| {
+            try std.testing.expect(mergeError(delta, slices, 16, 2.0) < 1e-12); // attn_merge_span2
+            if (delta <= 8) try std.testing.expect(mergeError(delta, slices, 16, std.math.e) > 1e-3); // attn_merge_span on K1 partials
+        }
+    }
+}
