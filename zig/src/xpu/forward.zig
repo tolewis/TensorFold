@@ -389,15 +389,15 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
                     const p0i: i32 = @intCast(p0);
                     const posm: i32 = @as(i32, @intCast(plan.ns)) * plan.span + plan.span - 1; // used = NS + 1
                     for (0..16) |r| {
-                        k1mod.mt_host[r * 8] = @intFromPtr(l.kc.?);
-                        k1mod.mt_host[r * 8 + 1] = @intFromPtr(l.vc.?);
-                        k1mod.mt_host[r * 8 + 2] = @intFromPtr(l.pt.?);
+                        k1mod.mt_host[i][r * 8] = @intFromPtr(l.kc.?);
+                        k1mod.mt_host[i][r * 8 + 1] = @intFromPtr(l.vc.?);
+                        k1mod.mt_host[i][r * 8 + 2] = @intFromPtr(l.pt.?);
                     }
                     for (0..16) |r| {
                         k1mod.pos_host[r] = p0i - 1;
                         k1mod.posm_host[r] = posm;
                     }
-                    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.kmt, &k1mod.mt_host, 16 * 8 * 8, null, 0, null));
+                    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.kmt, &k1mod.mt_host[i], 16 * 8 * 8, null, 0, null));
                     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.kpos, &k1mod.pos_host, 16 * 4, null, 0, null));
                     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.kposm, &k1mod.posm_host, 16 * 4, null, 0, null));
                     try k1mod.queueGroups(d, a.grp, grp_host[0 .. 2 * n], n);

@@ -202,7 +202,8 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
     h.host.health = .{ .ctx = @ptrCast(h), .read = healthRead };
     if (drafter != null) {
         h.back.initDrafts();
-        h.host.lone = .{ .ctx = &h.back, .run = XpuLanes.lone, .resumes = true, .sampled = true };
+        // XPU_TREE=0: no DFlash2 trees, so no lone-tree loop: a lone stream runs the shared round's chain windows (K1 chain)
+        if (h.back.nodes != 0) h.host.lone = .{ .ctx = &h.back, .run = XpuLanes.lone, .resumes = true, .sampled = true };
     }
     if (budget > 0) {
         // the prompt kernels compute in blocks of 64 rows from a call's start: kept and resumed at planned marks only

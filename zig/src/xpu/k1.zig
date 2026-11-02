@@ -85,7 +85,9 @@ pub fn coverageLine(buf: []u8, k1_on: bool, k1_tree: bool, k1_mt: bool) []const 
 
 /// The tree verify's MT table and POS: the slot's own kc, vc and page table, every row's last prefix key p0 - 1.
 /// The host buffers must stay alive until the command list drains (the queued copies read them).
-pub var mt_host: [16 * 8]u64 = undefined;
+/// One table a layer: the layers' kc, vc and page table differ, and a queued copy reads its host buffer when the
+/// list runs, which at TP 1 (no per-layer host wait) is after the host has filled the later layers' tables.
+pub var mt_host: [64][16 * 8]u64 = undefined;
 pub var pos_host: [16]i32 = undefined;
 /// The merge's POS: p0 + span - 1, so the draft's slice NS joins (used = NS + 1).
 pub var posm_host: [16]i32 = undefined;

@@ -547,7 +547,7 @@ pub const Lanes = struct {
             };
             if (q.depth == 0 or ni == items.len) continue;
             items[ni] = .{ .slot = slot, .pending = if (q.rows != null) q.follow[q.follow.len - 1] else try b.value(q.first orelse return error.NoFirstToken) };
-            asked[ni] = @min(q.depth, b.nodes);
+            asked[ni] = if (b.nodes == 0) q.depth else @min(q.depth, b.nodes); // XPU_TREE=0: chains of the asked depth
             reqs[ni] = &q;
             depth = @max(depth, @min(asked[ni], b.block - 1));
             ni += 1;
@@ -567,7 +567,7 @@ pub const Lanes = struct {
             if (sp) |x| for (0..depth) |dd| for (0..xq.drafter.TOPK) |j| {
                 noise[dd][j] = -@log(-@log(lanes.sampling.uniform(x.seed, q.position + dd, d.cand[dd][j])));
             };
-            if (n < TREE_MIN) { // few drafts: a chain goes deeper than a tree of siblings
+            if (n < TREE_MIN or b.nodes == 0) { // few drafts (or XPU_TREE=0): a chain goes deeper than a tree of siblings
                 d.chain(it.pending, n, b.chain[it.slot][0..n]);
                 for (b.chain_par[it.slot][0..n], 0..) |*x, j| x.* = @as(i32, @intCast(j)) - 1;
                 b.chain_n[it.slot] = n;
