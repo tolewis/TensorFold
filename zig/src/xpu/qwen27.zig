@@ -276,7 +276,7 @@ pub const Runner = struct {
             if (rows_max != 16 and rows_max != 32 and rows_max != 64) return error.BadRowsMax;
         }
         // the window probe: the row counts a shared verify round may take
-        if (rows_max > 16) std.debug.print("rows: XPU_ROWS_MAX={d}: a shared verify round may take {d} rows (buckets 16, 32 and 64); the head stays at 16-row buckets\n", .{ rows_max, rows_max });
+        if (rows_max > 16) std.debug.print("rows: XPU_ROWS_MAX={d}: a shared verify round may take {d} rows (buckets 16, 32 and 64), the head stays at 16-row buckets\n", .{ rows_max, rows_max });
         if (RANK >= TP) return error.RankOutOfRange;
         // the shared K/V pool: a page holds int8 rows and their scales, so pool mode is int8 K/V
         if (std.c.getenv("XPU_KV_POOL")) |v| kv_pool = v[0] != '0';
