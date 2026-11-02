@@ -4,6 +4,7 @@ const std = @import("std");
 const exlr8_build = @import("exlr8.zig");
 const sage_config = @import("../src/families/qwen3_5/sage_config.zig");
 const exl3_variants = @import("../src/xpu/exl3_variants.zig");
+comptime { @setEvalBranchQuota(1_000_000); }
 
 /// ze.zig as its own module: the Qwen27 runner and the Nemotron runtime share one Level Zero table.
 fn zeModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
