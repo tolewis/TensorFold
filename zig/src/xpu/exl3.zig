@@ -470,8 +470,8 @@ fn mv2Sel() ?Mv2Sel {
     const at = std.mem.lastIndexOfScalar(u8, s, '_') orelse return null;
     const ns = std.fmt.parseInt(u32, s[0..at], 10) catch return null;
     const ku = std.fmt.parseInt(u32, s[at + 1 ..], 10) catch return null;
-    if (std.mem.indexOfScalar(u32, &variants.mv2.ns, ns) == null) return null;
-    if (std.mem.indexOfScalar(u32, &variants.mv2.ku, ku) == null) return null;
+    if (std.mem.indexOfScalar(u32, &variants.mv2.mns, ns) == null) return null;
+    if (std.mem.indexOfScalar(u32, &variants.mv2.mku, ku) == null) return null;
     return .{ .ns = ns, .ku = ku };
 }
 
