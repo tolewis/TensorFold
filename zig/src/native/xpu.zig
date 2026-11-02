@@ -21,6 +21,12 @@ pub fn chip(_: Allocator) ?[]const u8 {
 }
 
 /// A sampled draw of `row`'s logits at `position`: over the top_k candidates only (top_k <= 256), else all of them.
+/// The 27B host's health source: the pair's idle check, then healthy. It runs on /health and on admission.
+fn healthRead(_: *anyopaque) bool {
+    xq.checkIdle();
+    return true;
+}
+
 fn pickCtx(ctx: *anyopaque, row: []const f32, position: u64, s: api.Sampling) !u32 {
     const gpa: *const Allocator = @ptrCast(@alignCast(ctx));
     return pickRow(gpa.*, row, position, s);
@@ -172,6 +178,9 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
     errdefer h.core.deinit();
     // the engine cuts its prompts on its own grid from position 0 (prefill_step 0): the same ids give the same bits
     h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "qwen27-xpu", .lanes = slots, .context_window = context, .prefill_step = 0, .structures = true });
+    // /health runs the pair's idle check: a follower that died with the pair idle exits rank 0 there, so the health
+    // route stops answering 200 instead of waiting for the next request to notice
+    h.host.health = .{ .ctx = @ptrCast(h), .read = healthRead };
     if (drafter != null) {
         h.back.initDrafts();
         h.host.lone = .{ .ctx = &h.back, .run = XpuLanes.lone, .resumes = true, .sampled = true };

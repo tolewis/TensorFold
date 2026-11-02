@@ -181,6 +181,12 @@ pub fn now() f64 {
     return @as(f64, @floatFromInt(ts[0])) + @as(f64, @floatFromInt(ts[1])) * 1e-9;
 }
 
+/// The pair's idle check: rank 0 exits when the follower's liveness stamp is stale. The XPU health source calls it,
+/// so a follower that dies with the pair idle is found at /health instead of at the next request.
+pub fn checkIdle() void {
+    if (tp.group) |*g| g.checkIdle();
+}
+
 /// The whole model on the device and one sequence's state: what a serial host drives.
 pub const Runner = struct {
     d: Dev,
@@ -393,7 +399,7 @@ pub const Runner = struct {
     }
 
     /// Gives back the card's memory, the shards' mappings and the host buffers; `r` is gone after it.
-    pub fn deinit(r: *Runner) void {
+pub fn deinit(r: *Runner) void {
         if (tp.group) |*g| {
             g.record(.close, 0, 0, 0, &.{}) catch {};
             g.markClosed(); // a rank that stops closes the group: its peer sees it at once, not after the wait

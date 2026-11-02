@@ -52,6 +52,11 @@ const peer_dead = 10.0; // seconds without an all-reduce: a silent rank is gone,
 /// Seconds rank 0 waits for the follower to consume a step record before it calls the pair lost. TF_TP_RECORD_WAIT
 /// raises it (a replayed step that is legitimately slow); 180 s is the load and ring deadline the ring already had.
 var record_wait: f64 = 180.0;
+/// Seconds a follower's liveness stamp may age before rank 0 calls the pair lost. 30 s, not `peer_dead`: a live
+/// follower can spend a few seconds in a call stretch with no all-reduce, and this check runs on every record.
+const follower_dead = 30.0;
+/// The 5 s warning has fired for the current stale stretch, so a slow follower logs one line, not one a round.
+var late_warned = false;
 // the exported block a rank: the peer's pushed partials (2 slots), the flag words the peer writes (2), the peer's
 // consumed counters (2), a timeout word
 const blk_slots = 2 * slot_bytes;
@@ -311,15 +316,34 @@ pub const Group = struct {
         g.aliveWord(g.rank).store(@intFromFloat(q.now()), .release);
     }
 
-    /// Rank 0: a follower whose stamp is older than `peer_dead` is gone, even though no record is due. A follower
-    /// stamps at every all-reduce and about once a second while it waits, so a fresh stamp means it is alive.
+    /// Rank 0: a follower whose stamp is older than `follower_dead` is gone, even though no record is due. A follower
+    /// stamps at every all-reduce and about once a second while it waits, so a fresh stamp means it is alive. The
+    /// 5 s warning fires once for a stale stretch, so a follower that is merely slow shows in the journal without
+    /// ending the pair.
     fn checkFollower(g: *Group) void {
         if (g.rank != 0 or g.tp < 2) return;
         const beat = g.aliveWord(1).load(.acquire);
-        if (beat == 0) return; // it has not reduced yet: it is loading
+        if (beat == 0) {
+            late_warned = false; // it has not reduced yet: it is loading
+            return;
+        }
         const age = q.now() - @as(f64, @floatFromInt(beat));
-        if (age > peer_dead)
+        if (age <= 5.0) {
+            late_warned = false;
+            return;
+        }
+        if (!late_warned) {
+            late_warned = true;
+            std.log.warn("qwen27-xpu: the follower's liveness stamp is {d:.1} s old (the pair is called lost at {d:.0} s)", .{ age, follower_dead });
+        }
+        if (age > follower_dead)
             lostAt(g, "rank 0: the follower's liveness stamp is {d:.1} s old: the group is lost\n", .{age});
+    }
+
+    /// Rank 0's idle check, for a caller that runs while no request is in flight (the /health handler): a follower that
+    /// died with the pair idle leaves its stamp behind, and rank 0 exits here instead of waiting for the next request.
+    pub fn checkIdle(g: *Group) void {
+        checkFollower(g);
     }
 
     /// Rank 0's K/V pool size in pages, in the unused tail of its counter line (the counters take one word a rank):
@@ -356,7 +380,12 @@ pub const Group = struct {
         record_wait = 180.0;
         if (std.c.getenv("TF_TP_RECORD_WAIT")) |v| {
             const want = std.fmt.parseFloat(f64, std.mem.span(v)) catch 180.0;
-            if (want >= 10.0) record_wait = want else std.log.warn("qwen27-xpu: TF_TP_RECORD_WAIT={d} is under 10 s, so 180 s is used", .{want});
+            // nan and inf parse; inf would turn the ring guard off, so only a finite value of 10 s or more is taken
+            if (std.math.isFinite(want) and want >= 10.0) {
+                record_wait = want;
+            } else {
+                std.log.warn("qwen27-xpu: TF_TP_RECORD_WAIT={d} is not finite or is under 10 s, so 180 s is used", .{want});
+            }
             std.log.info("qwen27-xpu: TP record wait {d:.0} s (TF_TP_RECORD_WAIT)", .{record_wait});
         }
         const name: [*:0]const u8 = if (std.c.getenv("TF_TP_SHM")) |v| v else "/dev/shm/tf-tp-qwen27";
