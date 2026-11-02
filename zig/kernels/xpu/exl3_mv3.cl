@@ -57,6 +57,13 @@ __kernel void exl3_matvec3(__global const uchar *base, __global const exl3_desc 
     const uint split = get_group_id(2), kspan = d.k / ks, k0 = split * kspan;
     tile += (ulong)(k0 / 16) * tile_k;
     float8 acc = 0.0f;
+    // The DPAS A operand is eight halves a row block and only row 0 is real at rows 1, so the seven zero slots are
+    // built once here and only slot 0 is written in the loop.
+    short8 ah, al;
+    for (uint r = 0; r < 8; r++) {
+        ah[r] = 0;
+        al[r] = 0;
+    }
     // h 0 needs the window 16 bits later than h 1. Both fit in the 64-bit pair at index m, so one runtime shift
     // covers both and every window offset stays a constant.
     const uint sh = (OFF0 + 16) - SHB * h;
@@ -65,11 +72,8 @@ __kernel void exl3_matvec3(__global const uchar *base, __global const exl3_desc 
         for (uint j = 0; j < 4; j++) p[j] = *(__global const ulong *)(tile + ((wbase + 2 * j) % RINGW));
         const float xv = rot[(ulong)kb + c];
         const half hv = convert_half_rte(xv);
-        short8 ah, al;
-        for (uint r = 0; r < 8; r++) {
-            ah[r] = r == 0 ? as_short(hv) : (short)0;
-            al[r] = r == 0 ? as_short(convert_half_rte(xv - (float)hv)) : (short)0;
-        }
+        ah[0] = as_short(hv);
+        al[0] = as_short(convert_half_rte(xv - (float)hv));
         int8 b;
         for (uint m = 0; m < 4; m++) {
             const ulong u = (m & 1) ? ((p[m >> 1] >> 32) | (p[(m >> 1) + 1] << 32)) : p[m >> 1];
