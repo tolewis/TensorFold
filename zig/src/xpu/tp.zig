@@ -780,7 +780,9 @@ pub const Group = struct {
             return;
         }
         for (0..2) |i| {
-            g.dslot[i] = off(blk, i * 2 * slot_bytes);
+            // slot i of this rank's block is where the peer reads it (the peer's block has the same layout): slot 0,
+            // slot 1, pbuf 0, pbuf 1. An odd sequence number's exchange writes slot 1, so it must not be 2 * slot_bytes.
+            g.dslot[i] = off(blk, i * slot_bytes);
             g.pbuf[i] = off(blk, (2 + i) * slot_bytes);
             g.peer[i] = off(p.?, i * slot_bytes);
         }
@@ -903,6 +905,41 @@ test "the shared segment's header words do not collide" {
     try std.testing.expectEqual(@as(usize, hdr + line + 8), words[5]);
     try std.testing.expectEqual(@as(usize, hdr + 2 * line + 2 * 2 * slot_bytes + line - 8), words[7]);
     try std.testing.expectEqual(@as(usize, hdr + 2 * line + 2 * 2 * slot_bytes + line), words[8]);
+}
+
+test "the device-direct block: a rank's slot i is where its peer reads it, and the four regions do not overlap" {
+    // lane p2-int-wedge: W4 wrote slot i at 2 * slot_bytes, so an odd exchange wrote pbuf 0 and the peer read stale
+    // memory at slot 1. This test pins the layout that allReduce uses: this rank's block is slot 0, slot 1, pbuf 0,
+    // pbuf 1, and the peer reads slot i at i * slot_bytes of its own block.
+    const blk: *anyopaque = @ptrFromInt(0x1000_0000);
+    const peer: *anyopaque = @ptrFromInt(0x2000_0000);
+    for (0..2) |i| {
+        const mine = @intFromPtr(off(blk, i * slot_bytes));
+        const theirs = @intFromPtr(off(peer, i * slot_bytes));
+        try std.testing.expectEqual(@intFromPtr(blk) + i * slot_bytes, mine);
+        try std.testing.expectEqual(@intFromPtr(peer) + i * slot_bytes, theirs);
+        // the peer's slot i is the same offset inside its block as this rank's slot i: one all-reduce layout
+        try std.testing.expectEqual(mine - @intFromPtr(blk), theirs - @intFromPtr(peer));
+    }
+    // the four regions of this rank's block: slot 0, slot 1, pbuf 0, pbuf 1
+    const starts = [_]usize{
+        @intFromPtr(off(blk, 0)),
+        @intFromPtr(off(blk, slot_bytes)),
+        @intFromPtr(off(blk, 2 * slot_bytes)),
+        @intFromPtr(off(blk, 3 * slot_bytes)),
+    };
+    for (starts, 0..) |a, i| {
+        try std.testing.expectEqual(@intFromPtr(blk) + i * slot_bytes, a);
+        for (starts, 0..) |b, j| {
+            if (i == j) continue;
+            // the regions are slot_bytes wide and back to back: no overlap, and no gap
+            try std.testing.expect(a + slot_bytes <= b or b + slot_bytes <= a);
+        }
+    }
+    try std.testing.expectEqual(4 * slot_bytes, blk_legacy_bytes);
+    // the device-flag block holds the same two slots and then the flags, so its slots have the same offsets
+    try std.testing.expectEqual(2 * slot_bytes, blk_slots);
+    try std.testing.expect(blk_devflag_bytes > blk_slots);
 }
 
 test "a fresh generation is never zero" {
