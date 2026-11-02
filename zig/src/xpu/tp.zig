@@ -356,6 +356,19 @@ pub const Group = struct {
     pub fn setPool(g: *const Group, pages: u32) void {
         if (g.rank == 0) g.poolWord().store(pages, .seq_cst);
     }
+
+    /// The mode word (header offset 24): rank 0's run flags (kv_pool, keep_shared, kv_i8, embed_host, k1, k1_tree).
+    /// Rank 0 stores it at open before the generation; a follower reads it right after open and exits on a
+    /// mismatch before it allocates (item 18 keep-one: a rank 1 with no pool kept every state whole on its card).
+    fn modeWord(g: *const Group) *std.atomic.Value(u64) {
+        return @ptrCast(@alignCast(g.map.ptr + hdr + 24));
+    }
+    pub fn setMode(g: *Group) void {
+        if (g.rank == 0) g.modeWord().store(q.modeWord(), .seq_cst);
+    }
+    pub fn mode(g: *const Group) u64 {
+        return g.modeWord().load(.seq_cst);
+    }
     /// The pages rank 0 published; null after `seconds` (rank 0 zeroes the pool before the first request).
     pub fn awaitPool(g: *const Group, seconds: f64) ?u32 {
         const deadline = q.now() + seconds;
@@ -430,6 +443,7 @@ pub const Group = struct {
             g.magicWord().store(magic, .seq_cst);
             g.closed().store(0, .seq_cst);
             g.poolWord().store(0, .seq_cst);
+            g.modeWord().store(q.modeWord(), .seq_cst); // before the generation: a follower that sees it reads rank 0's flags
             // no liveness stamp yet: zero means "this rank has not reduced yet", so its peers wait for it up to the
             // 180 s load deadline instead of calling it dead. The weights load for minutes between `open` and the
             // first all-reduce (lane p2-int: a stamp at open would read as a silent rank there).
@@ -890,6 +904,7 @@ test "the shared segment's header words do not collide" {
         @intFromPtr(g.poolWord()) - base,
         @intFromPtr(g.closed()) - base,
         @intFromPtr(g.rec(0)) - base,
+        @intFromPtr(g.modeWord()) - base,
     };
     for (words, 0..) |a, i| {
         try std.testing.expect(a % 8 == 0);
@@ -905,6 +920,7 @@ test "the shared segment's header words do not collide" {
     try std.testing.expectEqual(@as(usize, hdr + line + 8), words[5]);
     try std.testing.expectEqual(@as(usize, hdr + 2 * line + 2 * 2 * slot_bytes + line - 8), words[7]);
     try std.testing.expectEqual(@as(usize, hdr + 2 * line + 2 * 2 * slot_bytes + line), words[8]);
+    try std.testing.expectEqual(@as(usize, hdr + 24), words[9]);
 }
 
 test "the device-direct block: a rank's slot i is where its peer reads it, and the four regions do not overlap" {

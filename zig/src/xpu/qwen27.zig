@@ -317,6 +317,14 @@ pub const Runner = struct {
         errdefer alloc.destroy(r);
         r.* = .{ .d = .{ .g = try ze.Gpu.open(0xe223), .list = undefined, .k = undefined }, .model = undefined, .acts = undefined, .context = context, .ckpt = ckpt, .keep_shared = keep_shared };
         tp.group = try tp.Group.open(&r.d); // null at TP 1
+        if (tp.group) |*g| {
+            if (g.rank == 0) {
+                g.setMode(); // rank 0 publishes its flags: the follower compares them before it allocates
+            } else if (g.mode() != modeWord()) {
+                std.log.err("rank {d}: the mode word does not match rank 0's: this rank's XPU_KV_POOL, XPU_KEEP_SHARED, XPU_KV_INT8, XPU_EMBED_HOST, XPU_K1 or XPU_K1_TREE diverges, and the pair sizes its cards differently\n", .{ RANK });
+                return error.ModeMismatch;
+            }
+        }
         const d = &r.d;
         errdefer d.g.close();
         d.list = try d.g.immediate(0, 0);
@@ -891,6 +899,17 @@ pub fn poolPages(r: *Runner, slots: u32, tokens: ?u32, cache: bool, extra: u64) 
 
 /// The pool's pages for a TP 2 pair: rank 0 sizes it and publishes the count, a follower waits for it and takes the
 /// same, so both ranks map the same page ids.
+/// The run flags a pair must agree on, one bit each: kv_pool, keep_shared, kv_i8, embed_host, k1, k1_tree.
+pub fn modeWord() u64 {
+    var w: u64 = 0;
+    w |= @as(u64, @intFromBool(kv_pool));
+    w |= @as(u64, @intFromBool(keep_shared)) << 1;
+    w |= @as(u64, @intFromBool(kv_i8)) << 2;
+    w |= @as(u64, @intFromBool(embed_host)) << 3;
+    w |= @as(u64, @intFromBool(k1mod.on)) << 4;
+    w |= @as(u64, @intFromBool(k1mod.tree)) << 5;
+    return w;
+}
 pub fn poolPagesShared(r: *Runner, slots: u32, cache: bool, extra: u64) !u32 {
     const g = if (tp.group) |*x| x else return poolPages(r, slots, pool_tokens, cache, extra);
     if (g.rank == 0) {

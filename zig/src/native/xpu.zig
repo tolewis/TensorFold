@@ -238,7 +238,11 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
     xq.pool_tokens = o.kv_pool_tokens;
     if (o.kv_pool_tokens != null) xq.kv_pool = true;
     const runner = xq.Runner.init(o.dir, context) catch |err| {
-        problem.* = try std.fmt.allocPrint(a, "the XPU engine could not load {s}: {s}", .{ o.dir, @errorName(err) });
+        if (err == error.ModeMismatch) {
+            problem.* = "the XPU engine mode diverges from rank 0's (ModeMismatch): this rank's XPU_KV_POOL, XPU_KEEP_SHARED, XPU_KV_INT8, XPU_EMBED_HOST, XPU_K1 or XPU_K1_TREE differs, so the pair cannot run";
+        } else {
+            problem.* = try std.fmt.allocPrint(a, "the XPU engine could not load {s}: {s}", .{ o.dir, @errorName(err) });
+        }
         return false;
     };
     defer runner.deinit();
