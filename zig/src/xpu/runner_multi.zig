@@ -32,9 +32,9 @@ pub fn k1mtFill(win_host: []const i32, pos_host: []const i32, tree_host: []i32, 
     for (wins, 0..) |w, i| {
         const first: i32 = @intCast(win_host[2 * i]);
         const width: i32 = @intCast(win_host[2 * i + 1]);
-        const base: i32 = pos_host[first]; // the window first row's mpos is the window base
+        const base: i32 = pos_host[@intCast(first)]; // the window first row's mpos is the window base
         for (0..width) |j| {
-            const t: i32 = first + @as(i32, @intCast(j));
+            const t: usize = @intCast(first) + @as(usize, @intCast(j));
             if (w.parents != null) {
                 kkind[t] = 1;
                 kpos[t] = base - 1;
