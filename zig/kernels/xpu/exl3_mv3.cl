@@ -67,7 +67,6 @@ __kernel void exl3_matvec3(__global const uchar *base, __global const exl3_desc 
     // h 0 needs the window 16 bits later than h 1. Both fit in the 64-bit pair at index m, so one runtime shift
     // covers both and every window offset stays a constant.
     const uint sh = (OFF0 + 16) - SHB * h;
-#pragma unroll 2
     for (uint kb = k0; kb < k0 + kspan; kb += 16, tile += tile_k) {
         ulong p[4];
         for (uint j = 0; j < 4; j++) p[j] = *(__global const ulong *)(tile + ((wbase + 2 * j) % RINGW));
@@ -75,7 +74,7 @@ __kernel void exl3_matvec3(__global const uchar *base, __global const exl3_desc 
         const half hv = convert_half_rte(xv);
         ah[0] = as_short(hv);
         al[0] = as_short(convert_half_rte(xv - (float)hv));
-        int8 b;
+        half2 bv[8];
         for (uint m = 0; m < 4; m++) {
             const ulong u = (m & 1) ? ((p[m >> 1] >> 32) | (p[(m >> 1) + 1] << 32)) : p[m >> 1];
             const ulong y = u >> sh;
@@ -83,9 +82,10 @@ __kernel void exl3_matvec3(__global const uchar *base, __global const exl3_desc 
             const half v1 = mul1_half((uint)(ushort)(y >> 4));
             const half v2 = mul1_half((uint)(ushort)(y >> 8));
             const half v3 = mul1_half((uint)(ushort)(y >> 12));
-            ((int *)&b)[m] = as_int((half2)(v0, v1));      // tile rows 2m, 2m + 1
-            ((int *)&b)[m + 4] = as_int((half2)(v2, v3));  // tile rows 2m + 8, 2m + 9
+            bv[m] = (half2)(v0, v1);      // tile rows 2m, 2m + 1
+            bv[m + 4] = (half2)(v2, v3);  // tile rows 2m + 8, 2m + 9
         }
+        const int8 b = as_int8(*(int8 *)&bv);
         acc = DPH(ah, b, acc);
         acc = DPH(al, b, acc);
     }
