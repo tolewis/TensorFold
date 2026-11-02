@@ -24,18 +24,32 @@ pub var wave: u32 = 4;
 pub var r16 = true;
 /// Set when the k1 image carries attn_k1_decode16 (k1.load); groups() only picks it when it does.
 pub var have16 = false;
+/// XPU_K1_TREE: the single-stream tree verify's prefix goes through K1, its draft keys through attn_k1_draft
+/// (lane p22-k1tree). Default off: the tree path keeps the scalar attn_decode + attn_merge.
+pub var tree = false;
 
 pub fn readEnv() void {
     if (std.c.getenv("XPU_K1")) |v| on = v[0] != '0';
     if (std.c.getenv("XPU_K1_WAVE")) |v| wave = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 4;
     if (std.c.getenv("XPU_K1_R16")) |v| r16 = v[0] != '0';
+    if (std.c.getenv("XPU_K1_TREE")) |v| tree = v[0] != '0';
 }
+
+/// The tree verify's MT table and POS: the slot's own kc, vc and page table, every row's last prefix key p0 - 1.
+/// The host buffers must stay alive until the command list drains (the queued copies read them).
+pub var mt_host: [16 * 8]u64 = undefined;
+pub var pos_host: [16]i32 = undefined;
+/// The merge's POS: p0 + span - 1, so the draft's slice NS joins (used = NS + 1).
+pub var posm_host: [16]i32 = undefined;
 
 pub const Kernels = struct {
     decode: ze.H = null, // attn_k1_decode (k1.cl): 8-row groups
     decode16: ze.H = null, // attn_k1_decode16 (k1.cl): 16-row groups, 128-key tiles
+    draft: ze.H = null, // attn_k1_draft (k1.cl): the tree verify's draft keys into slice NS
     span: ze.H = null, // attn_decode_span (decode.cl): the scalar page-table kernel K1 is checked against
     merge: ze.H = null, // attn_merge_span (decode.cl): the merge of slice partials
+    dec: ze.H = null, // attn_decode (decode.cl): the scalar table kernel, the tree bench's reference
+    tmerge: ze.H = null, // attn_merge (decode.cl): the scalar tree merge
 };
 
 /// Loads K1's kernels: the decode kernels from the k1 image, the scalar reference and the merge from decode.
@@ -43,8 +57,11 @@ pub fn load(d: *dev.Dev, md: ze.H, mk1: ze.H) !Kernels {
     const k = Kernels{
         .decode = try d.kernel(mk1, "attn_k1_decode", 256),
         .decode16 = try d.kernel(mk1, "attn_k1_decode16", 256),
+        .draft = try d.kernel(mk1, "attn_k1_draft", 16),
         .span = try d.kernel(md, "attn_decode_span", 16),
         .merge = try d.kernel(md, "attn_merge_span", 256),
+        .dec = try d.kernel(md, "attn_decode", 16),
+        .tmerge = try d.kernel(md, "attn_merge", 16),
     };
     try d.g.indirect(k.decode);
     try d.g.indirect(k.decode16);

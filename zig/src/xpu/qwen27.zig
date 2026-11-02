@@ -367,6 +367,7 @@ pub const Runner = struct {
             const kk = try k1mod.load(d, md, mk1);
             d.k.attn_k1 = kk.decode;
             d.k.attn_k1_16 = kk.decode16;
+            d.k.attn_k1_draft = kk.draft;
             k1mod.have16 = kk.decode16 != null;
             d.k.attn_span = kk.span;
             d.k.merge_span = kk.merge;
@@ -713,7 +714,9 @@ pub const Runner = struct {
             }
         }
         if (r.pos + depth_max + 1 > r.context or r.pos + ids.len > r.context) return error.ContextFull;
-        try r.ensurePages(r.slot, r.pos + depth_max + 1);
+        // The draft K/V rows sit at pos + the row index, which reaches ids.len - 1: the tree table's rows past
+        // depth_max - 1 (a comb's row 15) need the same pages as the draft (lane p22-k1tree, issue 3).
+        try r.ensurePages(r.slot, r.pos + @as(u32, @intCast(ids.len)));
         try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, r.acts.tree, &r.tree_host, ids.len * 17 * 4, null, 0, null));
         _ = try forward(&r.d, &r.model, &r.acts, @ptrCast(ids), r.pos, .{ .want = .rows, .stash = true, .taps = r.taps_on, .tree = true, .pt = r.pt[r.slot] });
         var toks: [16]i32 = undefined;
