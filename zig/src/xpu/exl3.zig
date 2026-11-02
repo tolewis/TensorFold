@@ -581,7 +581,6 @@ fn encodeRowsInt8(p: *const Pipelines, s: Stream, plan: *const Plan, rows: u32) 
     const m = variants.w4a8;
     const mi = std.mem.indexOfScalar(u32, &m.bits, plan.bits) orelse return error.Invalid;
     const mh = std.mem.indexOfScalar(u32, &variants.moe.bits, plan.bits) orelse return error.Invalid;
-    if (plan.rows > variants.moe.prompt_rows_max) return error.InvalidExl3Rows;
     if (plan.k_max % 32 != 0 or plan.k_max % (16 * m.gemm_kc) != 0 or plan.n_max % (16 * m.gemm_s) != 0) return error.Invalid;
     const k = p.moe[mh]; // exl3_rotate_in_h and exl3_rotate_out_rows are in the fused MLP image
     const ik = p.int8[mi];
