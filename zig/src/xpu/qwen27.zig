@@ -252,6 +252,8 @@ pub const Runner = struct {
         if (std.c.getenv("XPU_KV_POOL_TOKENS")) |v| pool_tokens = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (pool_tokens != null) kv_pool = true;
         if (kv_pool) kv_i8 = true;
+        // K1 tree (XPU_K1=1 with XPU_K1_TREE=1) needs the int8 pool; print once so a run shows which path it takes
+        if (k1mod.on and k1mod.tree and kv_i8) std.debug.print("K1 tree verify is on\n", .{});
         MAX_CTX = try limits.context(context);
         {
             const marker = try std.fmt.allocPrintSentinel(alloc, "{s}/hadamard128", .{dir}, 0);
