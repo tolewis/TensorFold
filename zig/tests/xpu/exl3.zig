@@ -138,7 +138,7 @@ pub fn main(init: std.process.Init) !u8 {
     } else {
         const groups = try gpa.alloc(exl3.Group, h.count);
         defer gpa.free(groups);
-        const per = std.mem.alignForward(usize, exl3.scratchBytes(h.k, h.n, h.rows), 256);
+        const per = std.mem.alignForward(usize, @max(exl3.scratchBytes(h.k, h.n, h.rows), exl3.promptInt8ScratchBytes(h.k, h.n, h.rows)), 256);
         for (groups, ms, 0..) |*g, m, i| g.* = .{ .m = m, .rows = h.rows, .x = base + x_off + i * h.rows * h.k * 2, .x_stride = h.k, .y = base + y_off + i * h.rows * h.n * y_elem, .y_stride = h.n, .output = output, .input = input, .scratch = base + scratch_off + i * per };
         var plan = try exl3.Plan.init(&ctx, s, gpa, groups);
         defer plan.deinit();

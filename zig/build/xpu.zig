@@ -202,12 +202,19 @@ const kernels = [_]Kernel{
     .{ .name = "nem_attn_dec", .options = cl3 },
     .{ .name = "sage_exl3", .options = cl3 },
     .{ .name = "exl3", .options = cl3 ++ " -DEXL3_ABS" },
-} ++ exl3Matvec() ++ exl3Moe();
+} ++ exl3Matvec() ++ exl3Moe() ++ exl3Int8();
 
 /// Fused routed MLP images: one a width of exl3_variants.moe.
 fn exl3Moe() [exl3_variants.moe.bits.len]Kernel {
     var out: [exl3_variants.moe.bits.len]Kernel = undefined;
     inline for (exl3_variants.moe.bits, &out) |b, *k| k.* = .{ .name = exl3_variants.moe.name(b), .src = "exl3", .options = exl3_variants.moe.options(b) };
+    return out;
+}
+
+/// Prompt int8 (W4A8) images of exl3_int8.cl: one a width of exl3_variants.w4a8.
+fn exl3Int8() [exl3_variants.w4a8.bits.len]Kernel {
+    var out: [exl3_variants.w4a8.bits.len]Kernel = undefined;
+    inline for (exl3_variants.w4a8.bits, &out) |b, *k| k.* = .{ .name = exl3_variants.w4a8.name(b), .src = "exl3_int8", .options = exl3_variants.w4a8.options(b) };
     return out;
 }
 

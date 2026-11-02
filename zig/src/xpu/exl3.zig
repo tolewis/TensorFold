@@ -100,11 +100,26 @@ pub fn promptScratchBytes(k: usize, n: usize, rows: usize) usize {
     return promptRotBytes(k, rows) + n * rows * 4;
 }
 
+/// XPU_PROMPT_INT8: prompt GEMMs on int8 DPAS (exl3_int8.cl), W4A8 on the decoded trellis tiles. Off unless set.
+pub fn promptInt8() bool {
+    return std.c.getenv("XPU_PROMPT_INT8") != null;
+}
+
+/// The int8 planes before the rotated input: A8 [rows][k] int8 and SA [rows][k / 32] fp32 (the activation scales).
+pub fn promptInt8PlaneBytes(k: usize, rows: usize) usize {
+    return std.mem.alignForward(usize, k * rows, 256) + std.mem.alignForward(usize, rows * (k / 32) * 4, 256);
+}
+
+/// A prompt group on the int8 path: A8, SA, the rotated input, then fp32 sums [rows][n] (exl3_int8.cl's layout).
+pub fn promptInt8ScratchBytes(k: usize, n: usize, rows: usize) usize {
+    return promptInt8PlaneBytes(k, rows) + promptScratchBytes(k, n, rows);
+}
+
 pub fn descriptor(g: Group) !Desc {
     try g.m.validate();
     if (g.rows == 0 or g.rows > variants.moe.prompt_rows_max) return error.InvalidExl3Rows;
     if (g.x_stride < g.m.k or g.y_stride < g.m.n) return error.InvalidExl3Stride;
-    const rot = if (g.rows > variants.rows_max) promptRotBytes(g.m.k, g.rows) else rotBytes(g.m.k, g.rows);
+    const rot = if (g.rows > variants.rows_max) promptRotBytes(g.m.k, g.rows) + (if (promptInt8()) promptInt8PlaneBytes(g.m.k, g.rows) else 0) else rotBytes(g.m.k, g.rows);
     return .{
         .trellis = g.m.trellis,
         .suh = g.m.suh,
@@ -162,6 +177,31 @@ const MoeKernels = struct {
     }
 };
 
+/// The prompt int8 kernels of exl3_int8.cl (one image a width): the activation quantizer and the W4A8 GEMM.
+const Int8Kernels = struct {
+    quant: mod.Kernel,
+    gemm: mod.Kernel,
+
+    const names = [_][:0]const u8{ "exl3_int8_quant", "exl3_int8_gemm" };
+    const locals = [_][3]u32{ .{ 16, 1, 1 }, .{ 128, 1, 1 } };
+
+    fn load(m: mod.Module) Error!Int8Kernels {
+        var ks: [names.len]mod.Kernel = undefined;
+        var done: usize = 0;
+        errdefer for (ks[0..done]) |*k| k.deinit();
+        for (&ks, names, locals) |*k, n, l| {
+            k.* = try m.kernel(n, l);
+            done += 1;
+            try k.indirect();
+        }
+        return .{ .quant = ks[0], .gemm = ks[1] };
+    }
+
+    fn deinit(ik: *Int8Kernels) void {
+        inline for (.{ &ik.quant, &ik.gemm }) |k| k.deinit();
+    }
+};
+
 pub const Pipelines = struct {
     base: mod.Module,
     rotate_in: mod.Kernel,
@@ -171,6 +211,8 @@ pub const Pipelines = struct {
     matvec: [variants.all.len]mod.Kernel,
     moe_modules: [variants.moe.bits.len]mod.Module,
     moe: [variants.moe.bits.len]MoeKernels,
+    int8_modules: [variants.w4a8.bits.len]mod.Module,
+    int8: [variants.w4a8.bits.len]Int8Kernels,
 
     pub fn load(ctx: *const Context) Error!Pipelines {
         var p: Pipelines = undefined;
@@ -215,10 +257,27 @@ pub const Pipelines = struct {
             };
             moe_done += 1;
         }
+        var int8_done: usize = 0;
+        errdefer for (0..int8_done) |i| {
+            p.int8[i].deinit();
+            p.int8_modules[i].unload();
+        };
+        for (kernels.exl3_int8, 0..) |image, i| {
+            p.int8_modules[i] = try mod.Module.load(ctx, image);
+            p.int8[i] = Int8Kernels.load(p.int8_modules[i]) catch |e| {
+                p.int8_modules[i].unload();
+                return e;
+            };
+            int8_done += 1;
+        }
         return p;
     }
 
     pub fn deinit(p: *Pipelines) void {
+        for (&p.int8, &p.int8_modules) |*k, *m| {
+            k.deinit();
+            m.unload();
+        }
         for (&p.moe, &p.moe_modules) |*k, *m| {
             k.deinit();
             m.unload();
@@ -267,6 +326,10 @@ pub const Plan = struct {
             const m = variants.moe;
             if (std.mem.indexOfScalar(u32, &m.bits, p.bits) == null) return error.UnsupportedExl3Width;
             if (p.strips.gcd % m.gemm_s != 0 or p.k_tiles_gcd % m.gemm_kc != 0) return error.UnsupportedExl3Shape;
+            if (promptInt8()) { // and the int8 path's tiles (exl3_int8_gemm)
+                if (std.mem.indexOfScalar(u32, &variants.w4a8.bits, p.bits) == null) return error.UnsupportedExl3Width;
+                if (p.strips.gcd % variants.w4a8.gemm_s != 0 or p.k_tiles_gcd % variants.w4a8.gemm_kc != 0) return error.UnsupportedExl3Shape;
+            }
         } else if (variants.pick(p.bits, p.rows, p.strips) == null) return error.UnsupportedExl3Width;
         p.table = try DeviceBuffer.fromHost(ctx, s, std.mem.sliceAsBytes(descs));
         return p;
@@ -497,6 +560,7 @@ pub fn encodeMoe(p: *const Pipelines, s: Stream, gate: *const Plan, up: *const P
 /// planes, exl3_gemm on XMX, rotate_out. One plan of the chunk size serves every chunk length.
 pub fn encodeRows(p: *const Pipelines, s: Stream, plan: *const Plan, rows: u32) Error!void {
     if (rows == 0 or rows > plan.rows or plan.rows <= variants.rows_max) return error.Invalid;
+    if (promptInt8()) return encodeRowsInt8(p, s, plan, rows);
     const m = variants.moe;
     const mi = std.mem.indexOfScalar(u32, &m.bits, plan.bits) orelse return error.Invalid;
     const k = p.moe[mi];
@@ -507,6 +571,28 @@ pub fn encodeRows(p: *const Pipelines, s: Stream, plan: *const Plan, rows: u32) 
     }
     try launch(k.rotate_in_h, s, .{ plan.k_max / 128, rows, plan.count });
     try launch(k.gemm, s, .{ plan.n_max / 16 / m.gemm_s, std.math.divCeil(u32, rows, 8 * m.gemm_m) catch unreachable, plan.count });
+    try launch(k.rotate_out_rows, s, .{ plan.n_max / 128, rows, plan.count });
+}
+
+/// The prompt int8 path (XPU_PROMPT_INT8): exl3_rotate_in_h to the fp16 hi plane, exl3_int8_quant (A8 and SA),
+/// exl3_int8_gemm (int8 DPAS on the quantized trellis tiles), exl3_rotate_out_rows. The scratch is
+/// promptInt8ScratchBytes of the same plan, which descriptor lays out.
+fn encodeRowsInt8(p: *const Pipelines, s: Stream, plan: *const Plan, rows: u32) Error!void {
+    const m = variants.w4a8;
+    const mi = std.mem.indexOfScalar(u32, &m.bits, plan.bits) orelse return error.Invalid;
+    const mh = std.mem.indexOfScalar(u32, &variants.moe.bits, plan.bits) orelse return error.Invalid;
+    if (plan.rows > variants.moe.prompt_rows_max) return error.InvalidExl3Rows;
+    if (plan.k_max % 32 != 0 or plan.k_max % (16 * m.gemm_kc) != 0 or plan.n_max % (16 * m.gemm_s) != 0) return error.Invalid;
+    const k = p.moe[mh]; // exl3_rotate_in_h and exl3_rotate_out_rows are in the fused MLP image
+    const ik = p.int8[mi];
+    for ([_]mod.Kernel{ k.rotate_in_h, ik.quant, ik.gemm, k.rotate_out_rows }) |kk| {
+        try kk.setPtr(0, null); // base: unused with -DEXL3_ABS
+        try kk.setPtr(1, plan.table.ptr);
+        try kk.setU32(2, rows);
+    }
+    try launch(k.rotate_in_h, s, .{ plan.k_max / 128, rows, plan.count });
+    try launch(ik.quant, s, .{ plan.k_max / 32, rows, plan.count });
+    try launch(ik.gemm, s, .{ plan.n_max / 16 / m.gemm_s, std.math.divCeil(u32, rows, 8 * m.gemm_m) catch unreachable, plan.count });
     try launch(k.rotate_out_rows, s, .{ plan.n_max / 128, rows, plan.count });
 }
 
@@ -650,6 +736,9 @@ test "descriptor layout and scratch" {
     try std.testing.expectError(error.InvalidExl3Rows, descriptor(.{ .m = m, .rows = 1281, .x = 0, .x_stride = 2048, .y = 0, .y_stride = 512, .scratch = 0 }));
     // prompt rows: one split, the rotated input as the image reads it (hi alone at GEMM_LO 0)
     try std.testing.expectEqual(@as(usize, 2048 * 512 * 2 * @as(usize, variants.moe.gemm_lo + 1) + 512 * 512 * 4), promptScratchBytes(2048, 512, 512));
+    // the int8 planes (A8, SA) sit before the rotated input: exl3_int8.cl computes them from d.rot
+    const planes = std.mem.alignForward(usize, 2048 * 512, 256) + std.mem.alignForward(usize, 512 * (2048 / 32) * 4, 256);
+    try std.testing.expectEqual(planes + 2048 * 512 * 2 * @as(usize, variants.moe.gemm_lo + 1) + 512 * 512 * 4, promptInt8ScratchBytes(2048, 512, 512));
     const dp = try descriptor(.{ .m = m, .rows = 512, .x = 0, .x_stride = 2048, .y = 0, .y_stride = 512, .scratch = 0x10000 });
     try std.testing.expectEqual(@as(u64, 0x10000 + 2048 * 512 * 2 * @as(u64, variants.moe.gemm_lo + 1)), dp.sums);
     try std.testing.expectError(error.UnsupportedExl3Shape, (Matrix{ .trellis = 0, .suh = 0, .svh = 0, .k = 100, .n = 512, .halves = 8 }).validate());
@@ -659,4 +748,5 @@ test "descriptor layout and scratch" {
 
 test {
     _ = variants;
+    _ = @import("exl3_int8_ref.zig");
 }
