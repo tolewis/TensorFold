@@ -167,6 +167,7 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
     h.back = .{ .gpa = gpa, .runner = runner, .drafter = drafter, .pick = pickCtx, .pick_ctx = gpa_box, .slots = slots };
     if (std.c.getenv("XPU_BLOCK")) |v| h.back.block = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 8;
     if (std.c.getenv("XPU_TREE")) |v| h.back.nodes = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 15;
+    h.back.adaptive_k = std.mem.eql(u8, std.mem.span(std.c.getenv("XPU_ADAPTIVE_K") orelse "0"), "1");
     if (drafter != null) {
         try h.back.measure();
         std.log.info("qwen27-xpu: window ms by rows: 1 {d:.1}, 2 {d:.1}, 4 {d:.1}, 8 {d:.1}, 16 {d:.1}", .{ h.back.costs[0].ms, h.back.costs[1].ms, h.back.costs[3].ms, h.back.costs[7].ms, h.back.costs[15].ms });
@@ -198,7 +199,7 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
     }
     errdefer if (h.cache) |*store| store.deinit();
     try h.host.start();
-    std.log.info("qwen27-xpu: {d} streams of {d} tokens{s}", .{ slots, context, if (drafter != null) ", DFlash2 trees for a lone stream" else "" });
+    std.log.info("qwen27-xpu: {d} streams of {d} tokens{s}{s}", .{ slots, context, if (drafter != null) ", DFlash2 trees for a lone stream" else "", if (h.back.adaptive_k) ", adaptive draft length" else "" });
     return .{ .engine = h.host.engine(), .close = LaneServed.close, .ctx = h };
 }
 
