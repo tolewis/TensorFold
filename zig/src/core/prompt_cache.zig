@@ -133,7 +133,9 @@ pub const Plan = struct { from: u32 = 0, marks: []const u32 = &.{} };
 /// The borrowed entry a backend restores; the caller must report resumed or release it, even on cancellation.
 pub const Lookup = struct { entry: ?*Entry = null, marks: []const u32 = &.{} };
 
-/// One engine's store. A store is one conversation, never two: one lane per store, one turn in flight at a time.
+/// One engine's store. The engine deploys one store to 6 to 8 lanes, one turn in flight per lane at a time. The
+/// rewind protection here covers only the last lookup's rewind state, and another lane's rewind state may be
+/// evicted. The cost is cold: a rewind edit reprefills.
 /// The conversation grows one reply at a time and its turns never share a prompt, so a request's states never
 /// supersede each other. The one that supersedes them is a later turn's state of the same conversation, and it
 /// takes its storage before the least recently used one leaves. A shorter prompt from a later turn (a rewind)
