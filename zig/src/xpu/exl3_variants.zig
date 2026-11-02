@@ -30,6 +30,36 @@ pub const all = blk: {
     break :blk out;
 };
 
+/// exl3_mv2: the 1 row matvec with the trellis tile staged in local memory (XPU_EXL3_MV2, lane p29-exl3bw): one
+/// image a (bits, NS, KU), the NS strips and KU k tiles of a sub-group against the staging. The host picks one
+/// when rows are 1 and the group is wide.
+pub const mv2 = struct {
+    pub const bits = [_]u32{ 4, 6 };
+    pub const ns = [_]u32{ 2, 4, 8 };
+    pub const ku = [_]u32{ 1, 2, 4 };
+
+    pub const count = bits.len * ns.len * ku.len;
+
+    pub fn index(b: u32, n: u32, k: u32) u32 {
+        const bi = std.mem.indexOfScalar(u32, &bits, b) orelse unreachable;
+        const ni = std.mem.indexOfScalar(u32, &ns, n) orelse unreachable;
+        const ki = std.mem.indexOfScalar(u32, &ku, k) orelse unreachable;
+        return (bi * ns.len + ni) * ku.len + ki;
+    }
+
+    pub fn nsOf(v: u32) u32 {
+        return ns[(v / ku.len) % ns.len];
+    }
+
+    pub fn name(comptime v: u32) []const u8 {
+        return std.fmt.comptimePrint("exl3_mv2_b{d}_ns{d}_ku{d}", .{ bits[v / (ns.len * ku.len)], ns[(v / ku.len) % ns.len], v % ku.len });
+    }
+
+    pub fn options(comptime v: u32) []const u8 {
+        return std.fmt.comptimePrint("-cl-std=CL3.0 -DEXL3_ABS -DBITS={d} -DNS={d} -DKU={d}", .{ bits[v / (ns.len * ku.len)], ns[(v / ku.len) % ns.len], v % ku.len });
+    }
+};
+
 /// K splits for a launch of `sub_groups` sub-groups over groups whose K / 16 all divide by `k_tiles_gcd`.
 /// Wide launches above wide_wave_rows stop at one wave (wide_wave); every other launch goes to sub_group_target.
 pub fn split(sub_groups: u32, k_tiles_gcd: u32, is_wide: bool) u32 {

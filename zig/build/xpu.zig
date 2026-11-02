@@ -202,7 +202,7 @@ const kernels = [_]Kernel{
     .{ .name = "nem_attn_dec", .options = cl3 },
     .{ .name = "sage_exl3", .options = cl3 },
     .{ .name = "exl3", .options = cl3 ++ " -DEXL3_ABS" },
-} ++ exl3Matvec() ++ exl3Moe() ++ exl3Int8() ++ exl3Gemm2();
+} ++ exl3Matvec() ++ exl3Mv2() ++ exl3Moe() ++ exl3Int8() ++ exl3Gemm2();
 
 /// The prompt GEMM with the A tile in local memory (exl3_gemm2.cl): one image a tile and a width of
 /// exl3_variants.gemm2.
@@ -234,6 +234,13 @@ fn exl3Int8() [exl3_variants.w4a8.bits.len]Kernel {
 fn exl3Matvec() [exl3_variants.all.len]Kernel {
     var out: [exl3_variants.all.len]Kernel = undefined;
     inline for (exl3_variants.all, &out) |v, *k| k.* = .{ .name = exl3_variants.name(v), .src = "exl3", .options = exl3_variants.options(v) };
+    return out;
+}
+
+/// exl3_mv2 images: one a (bits, NS, KU) of exl3_variants.mv2.
+fn exl3Mv2() [exl3_variants.mv2.count]Kernel {
+    var out: [exl3_variants.mv2.count]Kernel = undefined;
+    for (0..exl3_variants.mv2.count) |v| out[v] = .{ .name = exl3_variants.mv2.name(v), .src = "exl3_mv2", .options = exl3_variants.mv2.options(v) };
     return out;
 }
 

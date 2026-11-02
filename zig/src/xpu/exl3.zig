@@ -209,6 +209,11 @@ pub const Pipelines = struct {
     route: mod.Kernel,
     matvec_modules: [variants.all.len]mod.Module,
     matvec: [variants.all.len]mod.Kernel,
+    /// exl3_mv2 images (XPU_EXL3_MV2): one a (bits, NS, KU). mv2_count is how many loaded: a driver that refuses
+    /// one only logs, and the knob falls back to exl3_matvec.
+    mv2_modules: [variants.mv2.count]mod.Module,
+    mv2: [variants.mv2.count]mod.Kernel,
+    mv2_loaded: [variants.mv2.count]bool,
     moe_modules: [variants.moe.bits.len]mod.Module,
     moe: [variants.moe.bits.len]MoeKernels,
     int8_modules: [variants.w4a8.bits.len]mod.Module,
@@ -249,6 +254,27 @@ pub const Pipelines = struct {
                 return e;
             };
             done += 1;
+        }
+        // The mv2 images are optional (XPU_EXL3_MV2 bench knob): a driver that refuses one logs and the knob
+        // falls back to exl3_matvec.
+        for (p.mv2_loaded) |*f| f.* = false;
+        for (kernels.exl3_mv2, 0..) |image, i| {
+            p.mv2_modules[i] = mod.Module.load(ctx, image) catch |e| {
+                std.log.warn("exl3_mv2 image {d} did not load, the XPU_EXL3_MV2 knob falls back to exl3_matvec: {t}", .{ i, e });
+                break;
+            };
+            p.mv2[i] = p.mv2_modules[i].kernel("exl3_mv2", local_matvec) catch |e| {
+                std.log.warn("exl3_mv2 image {d} has no kernel, the XPU_EXL3_MV2 knob falls back to exl3_matvec: {t}", .{ i, e });
+                p.mv2_modules[i].unload();
+                break;
+            };
+            p.mv2[i].indirect() catch |e| {
+                std.log.warn("exl3_mv2 image {d} indirect access failed, the XPU_EXL3_MV2 knob falls back to exl3_matvec: {t}", .{ i, e });
+                p.mv2[i].deinit();
+                p.mv2_modules[i].unload();
+                break;
+            };
+            p.mv2_loaded[i] = true;
         }
         var moe_done: usize = 0;
         errdefer for (0..moe_done) |i| {
@@ -301,6 +327,10 @@ pub const Pipelines = struct {
     }
 
     pub fn deinit(p: *Pipelines) void {
+        for (0..variants.mv2.count) |i| if (p.mv2_loaded[i]) {
+            p.mv2[i].deinit();
+            p.mv2_modules[i].unload();
+        }
         for (&p.int8, &p.int8_modules) |*k, *m| {
             k.deinit();
             m.unload();
@@ -431,10 +461,36 @@ fn fused(rows: u32, n_max: u32, k_tiles_gcd: u32, ks: u32) bool {
     return rows <= 4 and (n_max < fuse_n_max or (fuseAll() and rows <= 1)) and (k_tiles_gcd / ks) % 8 == 0;
 }
 
+/// XPU_EXL3_MV2: the exl3_mv2 image the bench forces, "NS_KU" (2_1, 8_4, ...).
+const Mv2Sel = struct { ns: u32, ku: u32 };
+
+fn mv2Sel() ?Mv2Sel {
+    const v = std.c.getenv("XPU_EXL3_MV2") orelse return null;
+    const s = std.mem.sliceTo(u8, v, 0);
+    const at = std.mem.lastIndexOfScalar(u8, s, '_') orelse return null;
+    const ns = std.fmt.parseInt(u32, s[0..at], 10) catch return null;
+    const ku = std.fmt.parseInt(u32, s[at + 1 ..], 10) catch return null;
+    if (std.mem.indexOfScalar(u32, &variants.mv2.ns, ns) == null) return null;
+    if (std.mem.indexOfScalar(u32, &variants.mv2.ku, ku) == null) return null;
+    return .{ .ns = ns, .ku = ku };
+}
+
+/// The exl3_mv2 image a launch uses: the rows 1 window only, the bench knob set, the image loaded, and the K span
+/// of each split a whole number of KU tiles (else the exl3_matvec variant, the same as before the knob).
+fn mv2Pick(p: *const Pipelines, bits: u32, rows: u32, n_max: u32, k_tiles_gcd: u32, ks: u32) ?u32 {
+    if (rows != 1 or n_max < 2048) return null;
+    const sel = mv2Sel() orelse return null;
+    if (k_tiles_gcd % ks != 0 or (k_tiles_gcd / ks) % sel.ku != 0) return null;
+    const idx = variants.mv2.index(bits, sel.ns, sel.ku);
+    if (!p.mv2_loaded[idx]) return null;
+    return idx;
+}
+
 /// Queues the stages over a table of `count` groups (no host wait): rotate_in (unless fused), matvec, rotate_out.
 fn stages(p: *const Pipelines, s: Stream, table: ?*anyopaque, count: u32, rows: u32, k_max: u32, n_max: u32, k_tiles_gcd: u32, sh: Shape) Error!void {
-    const mv = p.matvec[sh.variant];
-    const ns = variants.all[sh.variant].ns;
+    const mv2 = mv2Pick(p, variants.all[sh.variant].bits, rows, n_max, k_tiles_gcd, sh.ks);
+    const mv = if (mv2) |i| p.mv2[i] else p.matvec[sh.variant];
+    const ns = if (mv2) |i| variants.mv2.nsOf(i) else variants.all[sh.variant].ns;
     const fuse = fused(rows, n_max, k_tiles_gcd, sh.ks);
     for ([_]mod.Kernel{ p.rotate_in, mv, p.rotate_out }) |k| {
         try k.setPtr(0, null); // base: unused with -DEXL3_ABS
