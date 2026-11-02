@@ -41,7 +41,7 @@ const off = dev.off;
 const D = q.D;
 
 const line = 64;
-const rows_max = 1024 + 128 + q.MAX_ROWS; // the widest forward (q.maxRows at XPU_CHUNK 1024) and a decode window
+const rows_max = 1152 + 128 + q.MAX_ROWS; // the widest forward (q.maxRows at XPU_CHUNK 1152) and a decode window
 const slot_bytes = rows_max * D * 2;
 const ring_len = 64;
 const peer_dead = 10.0; // seconds without an all-reduce: a silent rank is gone, the pair cannot run

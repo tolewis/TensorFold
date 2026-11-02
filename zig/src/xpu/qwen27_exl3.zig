@@ -197,7 +197,8 @@ pub const Weights = struct {
         const wr: usize = q.windowRows();
         for (w.projs.items) |p| for (p.parts[0..p.count], 0..) |pt, j| {
             need[j] = @max(need[j], exl3.scratchBytes(pt.m.k, pt.m.n, wr));
-            if (!p.head) need[j] = @max(need[j], exl3.promptScratchBytes(pt.m.k, pt.m.n, rows));
+            // the prompt chunk: the fp16 path, or the int8 path's A8 and SA planes when XPU_PROMPT_INT8 is set
+            if (!p.head) need[j] = @max(need[j], if (exl3.promptInt8()) exl3.promptInt8ScratchBytes(pt.m.k, pt.m.n, rows) else exl3.promptScratchBytes(pt.m.k, pt.m.n, rows));
         };
         for (&w.scratch, need) |*sc, n| if (n > 0) {
             sc.* = @intFromPtr(try d.alloc_(n));

@@ -39,3 +39,9 @@ pub const exl3_moe: [exl3_variants.moe.bits.len][]const u8 = blk: {
     for (exl3_variants.moe.bits, &out) |b, *image| image.* = if (available) &Blob("spv_" ++ exl3_variants.moe.name(b)).bytes else &.{};
     break :blk out;
 };
+/// The prompt int8 (W4A8) kernels, one image a width of exl3_variants.w4a8.bits (same order).
+pub const exl3_int8: [exl3_variants.w4a8.bits.len][]const u8 = blk: {
+    var out: [exl3_variants.w4a8.bits.len][]const u8 = undefined;
+    for (exl3_variants.w4a8.bits, &out) |b, *image| image.* = if (available) &Blob("spv_" ++ exl3_variants.w4a8.name(b)).bytes else &.{};
+    break :blk out;
+};

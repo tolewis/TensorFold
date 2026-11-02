@@ -1,4 +1,5 @@
 //! The exl3_matvec builds in the binary: one SPIR-V image per (bits, rows, NS, HS), and the rule that picks one.
+//! The prompt int8 images (exl3_int8.cl) are one a width, and the fused routed MLP images (exl3_moe) one a width.
 //! zig/build/xpu.zig and zig/src/xpu/exl3.zig both import this file, so the images and the picks agree.
 
 const std = @import("std");
@@ -75,7 +76,10 @@ pub const moe = struct {
     pub const gemm_kc = 4;
     pub const tile_ns = 2;
     pub const tile_rows = 16;
-    pub const prompt_rows_max = 1024;
+    /// 1280 rows: q.maxRows() is XPU_CHUNK + 128, and 1152 (6 row blocks of 8 x GEMM_M 24, no partial block) is the
+    /// largest chunk the 27B prompt path takes (lane p26-prefill, 2026-11-01). Was 1024, which the default chunk of
+    /// 1024 rows already exceeded.
+    pub const prompt_rows_max = 1280;
 
     pub fn name(comptime b: u32) []const u8 {
         return std.fmt.comptimePrint("exl3_moe_b{d}", .{b});
@@ -88,6 +92,25 @@ pub const moe = struct {
 
     pub fn options(comptime b: u32) []const u8 {
         return std.fmt.comptimePrint("-cl-std=CL3.0 -DEXL3_ABS -DBITS={d} -DMOE_P={d} -DMOE_PD={d} -DMOE_DS={d} -DMOE_KMAX={d} -DGEMM_M={d} -DGEMM_S={d} -DGEMM_KC={d} -DGEMM_LO={d}", .{ b, p, pd, ds, k_max, gemm_m, gemm_s, gemm_kc, gemm_lo });
+    }
+};
+
+/// The prompt int8 (W4A8 on decoded tiles) images of exl3_int8.cl: one a width, behind XPU_PROMPT_INT8
+/// (exl3.encodeRows). Prompt rows only; the decode path never reads them.
+pub const w4a8 = struct {
+    pub const bits = [_]u32{ 4, 6 };
+    /// Rows a sub-group, 16-column strips a work-group, 16-row k tiles a local-memory step. The row count matches
+    /// exl3_gemm's measured tile (24 rows, 4 strips); the int8 DPAS takes two k tiles a step.
+    pub const gemm_m = 24;
+    pub const gemm_s = 4;
+    pub const gemm_kc = 8;
+
+    pub fn name(comptime b: u32) []const u8 {
+        return std.fmt.comptimePrint("exl3_int8_b{d}", .{b});
+    }
+
+    pub fn options(comptime b: u32) []const u8 {
+        return std.fmt.comptimePrint("-cl-std=CL3.0 -DEXL3_ABS -DBITS={d} -DGEMM_M={d} -DGEMM_S={d} -DGEMM_KC={d}", .{ b, gemm_m, gemm_s, gemm_kc });
     }
 };
 
@@ -146,6 +169,7 @@ test "picks follow the measured rule" {
             return all[pick(b, r, .{ .min = smin, .gcd = sgcd, .total = smin * 320 }).?];
         }
     }.v;
+    // lm_head: 15,520 strips, a wide group, so NS 1 at 1 to 4 rows as every wide group (the 2026-11-01 rule)
     try std.testing.expectEqual(Variant{ .bits = 6, .rows = 1, .ns = 1, .hs = false }, at(6, 1, 15520, 15520));
     try std.testing.expectEqual(Variant{ .bits = 6, .rows = 4, .ns = 1, .hs = false }, at(6, 3, 15520, 15520));
     // wide groups: NS 1 to 4 rows, NS 4 at 8, NS 2 at 16 (the 27B, 2026-11-01)

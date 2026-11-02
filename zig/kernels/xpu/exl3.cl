@@ -571,8 +571,9 @@ __kernel void exl3_moe_down(__global const uchar *base, __global const exl3_desc
 #endif
 
 
-// The rotated input of prompt rows as two fp16 planes, x = hi + lo: rot holds hi [rows][k], then lo. Grid (K_max / 128,
-// rows_max, groups) of one sub-group, as exl3_rotate_in.
+// The rotated input of prompt rows: rot holds hi [rows][k], then lo. Grid (K_max / 128, rows_max, groups) of one
+// sub-group, as exl3_rotate_in. GEMM_LO 1: two fp16 planes, x = hi + lo, both stored. GEMM_LO 0: the GEMM reads hi
+// only, so lo is not stored and the buffer is hi alone (exl3.promptScratchBytes sizes it).
 __attribute__((intel_reqd_sub_group_size(SG)))
 __kernel void exl3_rotate_in_h(__global const uchar *base, __global const exl3_desc *desc, uint rows) {
     exl3_desc d = desc[get_group_id(2)];
@@ -588,12 +589,16 @@ __kernel void exl3_rotate_in_h(__global const uchar *base, __global const exl3_d
     }
     hadamard128(v, lane);
     __global half *hi = AT(half, d.rot) + (ulong)row * d.k;
+#if GEMM_LO
     __global half *lo = AT(half, d.rot) + (ulong)desc[get_group_id(2)].rows * d.k + (ulong)row * d.k;
+#endif
     for (uint j = 0; j < 8; j++) {
         const float f = v[j] * INV_SQRT128;
         const half h = convert_half_rte(f);
         hi[blk * 128 + lane + SG * j] = h;
+#if GEMM_LO
         lo[blk * 128 + lane + SG * j] = convert_half_rte(f - (float)h);
+#endif
     }
 }
 
