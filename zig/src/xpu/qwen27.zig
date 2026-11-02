@@ -119,6 +119,9 @@ pub var prefill_int4 = false;
 pub var int4_sites: u32 = 8; // XPU_PREFILL_INT4_SITES: 8 is down only, 2 adds the mixers' out projections
 /// W4A8 prompt GEMMs (XPU_PREFILL_INT8, local option, GPTQ g128 only): int8 activations by (row, group of 128).
 pub var prefill_int8 = false;
+/// XPU_PREFILL_FUSE: the EXL3 prompt producers write the rotated input planes themselves, and the prompt GEMM skips
+/// exl3_rotate_in_h (the small row round trip the plane used to add).
+pub var prefill_fuse = false;
 pub var a8_sites: u32 = 15; // XPU_A8_SITES: 1 mixer in, 2 mixer out, 4 gate|up, 8 down
 pub var a8_rot: i32 = 0; // XPU_A8_ROT=1: Hadamard by blocks of 128 before the quantization (weights rotated too)
 pub var a8_levels: i32 = 127; // XPU_A8_BITS=4: int4 activations (7 levels a side)
@@ -138,6 +141,7 @@ const Options = struct {
     prefill_int4: bool,
     int4_sites: u32,
     prefill_int8: bool,
+    prefill_fuse: bool,
     a8_sites: u32,
     a8_rot: i32,
     a8_levels: i32,
@@ -152,7 +156,7 @@ var defaults: ?Options = null;
 var live = false;
 
 fn options() Options {
-    return .{ .dump_dir = dump_dir, .dump_h = dump_h, .a8_group = a8_group, .kv8 = kv8, .kv_i8 = kv_i8, .prefill_int4 = prefill_int4, .int4_sites = int4_sites, .prefill_int8 = prefill_int8, .a8_sites = a8_sites, .a8_rot = a8_rot, .a8_levels = a8_levels, .a8_sites4 = a8_sites4, .embed_host = embed_host, .chunk = CHUNK, .kv_pool = kv_pool, .pool_tokens = pool_tokens };
+    return .{ .dump_dir = dump_dir, .dump_h = dump_h, .a8_group = a8_group, .kv8 = kv8, .kv_i8 = kv_i8, .prefill_int4 = prefill_int4, .int4_sites = int4_sites, .prefill_int8 = prefill_int8, .prefill_fuse = prefill_fuse, .a8_sites = a8_sites, .a8_rot = a8_rot, .a8_levels = a8_levels, .a8_sites4 = a8_sites4, .embed_host = embed_host, .chunk = CHUNK, .kv_pool = kv_pool, .pool_tokens = pool_tokens };
 }
 
 fn restore(o: Options) void {
@@ -164,6 +168,7 @@ fn restore(o: Options) void {
     prefill_int4 = o.prefill_int4;
     int4_sites = o.int4_sites;
     prefill_int8 = o.prefill_int8;
+    prefill_fuse = o.prefill_fuse;
     a8_sites = o.a8_sites;
     a8_rot = o.a8_rot;
     a8_levels = o.a8_levels;
@@ -226,6 +231,7 @@ pub const Runner = struct {
         errdefer live = false;
         if (std.c.getenv("XPU_DUMP")) |v| dump_dir = std.mem.span(v);
         if (std.c.getenv("XPU_PREFILL_INT8") != null) prefill_int8 = true;
+        if (std.c.getenv("XPU_PREFILL_FUSE") != null) prefill_fuse = true;
         if (std.c.getenv("XPU_EMBED_HOST") != null) embed_host = true; // host-backed embedding table (research arm)
         if (std.c.getenv("XPU_KV_INT8") != null) kv_i8 = true;
         if (std.c.getenv("XPU_PREFILL_INT4") != null) prefill_int4 = true;
@@ -315,6 +321,11 @@ pub const Runner = struct {
             .attn_prep = try d.kernel(mg, "attn_prep", 256),
             .attn_gate = try d.kernel(mg, "attn_gate", 256),
             .swiglu = try d.kernel(mg, "swiglu", 256),
+            // XPU_PREFILL_FUSE: the prompt producers write the exl3 rotated input planes (glue.cl, glue_attn.cl).
+            .add_rmsnorm_x3 = try d.kernel(mg, "add_rmsnorm_x3", 128),
+            .gated_norm_x3 = try d.kernel(mg, "gated_norm_x3", 256),
+            .attn_gate_x3 = try d.kernel(mg, "attn_gate_x3", 256),
+            .swiglu_x3 = try d.kernel(mg, "swiglu_x3", 256),
             .argmax = try d.kernel(mg, "argmax", 256),
             .argmax_part = try d.kernel(mg, "argmax_part", 256),
             .argmax_part_masked = try d.kernel(mg, "argmax_part_masked", 256),

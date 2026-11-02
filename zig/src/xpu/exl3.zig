@@ -510,6 +510,22 @@ pub fn encodeRows(p: *const Pipelines, s: Stream, plan: *const Plan, rows: u32) 
     try launch(k.rotate_out_rows, s, .{ plan.n_max / 128, rows, plan.count });
 }
 
+/// Prompt rows when the producer wrote the rotated input planes itself (XPU_PREFILL_FUSE): encodeRows minus the
+/// rotate_in_h launch.
+pub fn encodeRowsFused(p: *const Pipelines, s: Stream, plan: *const Plan, rows: u32) Error!void {
+    if (rows == 0 or rows > plan.rows or plan.rows <= variants.rows_max) return error.Invalid;
+    const m = variants.moe;
+    const mi = std.mem.indexOfScalar(u32, &m.bits, plan.bits) orelse return error.Invalid;
+    const k = p.moe[mi];
+    for ([_]mod.Kernel{ k.gemm, k.rotate_out_rows }) |kk| {
+        try kk.setPtr(0, null); // base: unused with -DEXL3_ABS
+        try kk.setPtr(1, plan.table.ptr);
+        try kk.setU32(2, rows);
+    }
+    try launch(k.gemm, s, .{ plan.n_max / 16 / m.gemm_s, std.math.divCeil(u32, rows, 8 * m.gemm_m) catch unreachable, plan.count });
+    try launch(k.rotate_out_rows, s, .{ plan.n_max / 128, rows, plan.count });
+}
+
 /// A routed MLP over prompt rows on XMX, as encodeMoe (the same y and slot numbering). exl3_moe_sort groups the slots
 /// by expert into tiles of at most variants.moe.tile_rows slots, in buffers of the caller: order u32 [slots], tiles
 /// uint4 [tileBound], ntiles u32.

@@ -146,11 +146,32 @@ pub fn chainTable() [16 * 17]i32 {
     return t;
 }
 
+/// XPU_PREFILL_FUSE producer arguments: part j's suh and its plane in the runner's scratch (a part the projection
+/// does not have stays null), then the part count.
+const X3 = struct {
+    s: [4]?*anyopaque = .{ null, null, null, null },
+    r: [4]?*anyopaque = .{ null, null, null, null },
+    cnt: i32,
+
+    fn of(p: *const exl3.Proj, w: *const exl3.Weights) X3 {
+        var o: X3 = .{ .cnt = @intCast(p.count) };
+        for (0..@as(usize, p.count)) |j| {
+            o.s[j] = @ptrFromInt(p.suhOff(@intCast(j)));
+            o.r[j] = @ptrFromInt(w.scratch[j]);
+        }
+        return o;
+    }
+};
+
 /// gate|up and SwiGLU: the activation and its row sums; prompt rows via the GEMM epilogue, decode rows via `swiglu`.
-pub fn mlpIn(d: *Dev, m: *const Model, a: *Acts, w: Proj, T: u32, gs: i32, pre: bool, wide: bool) !*anyopaque {
+pub fn mlpIn(d: *Dev, m: *const Model, a: *Acts, w: Proj, down: Proj, T: u32, gs: i32, pre: bool, wide: bool) !*anyopaque {
     if (w.x3) |e| { // EXL3: [gate | up] (ilv 0), then swiglu; the W4A8 and nGEN epilogues are int4 only
         try exl3.project(e, m.exl3.?, d, a.h, a.p, T, wide);
-        try d.launch(d.k.swiglu, .{ .x = T, .y = (FF + 1023) / 1024 }, .{ a.p, a.h, a.ahi, a.alo, gs, @as(i32, 0), q.rot_on, @as(i32, FF) });
+        if (q.prefill_fuse and wide and q.a8_group == 0 and q.rot_on == 0 and down.x3 != null) { // XPU_PREFILL_FUSE: the plane for the down GEMM
+            const x = X3.of(down.x3.?, m.exl3.?);
+            try d.launch(d.k.swiglu_x3, .{ .x = T, .y = (FF + 1023) / 1024 }, .{ a.p, a.h, @as(i32, 0), @as(i32, FF), x.s[0], x.r[0], x.s[1], x.r[1], x.s[2], x.r[2], x.s[3], x.r[3], x.cnt });
+        } else
+            try d.launch(d.k.swiglu, .{ .x = T, .y = (FF + 1023) / 1024 }, .{ a.p, a.h, a.ahi, a.alo, gs, @as(i32, 0), q.rot_on, @as(i32, FF) });
         return a.h;
     }
     if (q.prefill_int8 and wide and w.ilv and w.gs == 128) { // W4A8: SwiGLU epilogue; down quantizes its own input
@@ -325,6 +346,10 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
     if (ids.len > q.maxRows()) return error.TooManyRows; // the scratch holds maxRows, padded to 64
     const T: u32 = @intCast(ids.len);
     const wide = T > 16 or mode.prompt; // the prompt kernels: a prompt chunk cuts the same bits at any length
+    // XPU_PREFILL_FUSE (EXL3): the prompt producers write the next GEMM's rotated input plane (glue.cl x3_planes),
+    // and the prompt GEMM skips exl3_rotate_in_h (exl3.encodeRowsFused). W4A8, the probes and rotated
+    // checkpoints off (the producers store H unrotated).
+    const fuse_on = q.prefill_fuse and wide and q.a8_group == 0 and q.rot_on == 0 and m.exl3 != null;
     const t32: i32 = @intCast(T);
     const tp = (T + 63) / 64 * 64; // GDN chunk rows (padded)
     const nul: ?*anyopaque = null;
@@ -347,7 +372,11 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
     try embedRows(d, m, a.ids, a.x, T);
     if (p0 == 0) try dump(d, a, T, "embed", false);
     for (&m.layers, 0..) |*l, i| {
-        try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.in_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, if (i == 0) 0 else 1), gs, q8a, q8s, q8ms, q.rot_on });
+        if (fuse_on and l.mixer_in.x3 != null) { // the plane feeds the GEMM; H too (the dense a and b gates read it)
+            const x = X3.of(l.mixer_in.x3.?, m.exl3.?);
+            try d.launch(d.k.add_rmsnorm_x3, .{ .x = T }, .{ a.x, a.r, l.in_norm, a.h, @as(i32, D), EPS, @as(i32, if (i == 0) 0 else 1), @as(i32, 1), x.s[0], x.r[0], x.s[1], x.r[1], x.s[2], x.r[2], x.s[3], x.r[3], x.cnt });
+        } else
+            try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.in_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, if (i == 0) 0 else 1), gs, q8a, q8s, q8ms, q.rot_on });
         const probe = p0 == 0 and i == 0;
         if (probe) try dumpBuf(d, "h0", a.h, T * D, .f16);
         // W4A8 study: the GEMM reads a quantized copy (in r, free until mixer_out); the dense a/b gates read h as is
@@ -385,7 +414,11 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
                 }
             }
             if (q.kv8 & 1 != 0) try d.launch(d.k.rot_heads, .{ .x = T, .y = HQ }, .{a.y});
-            try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo, gs, q.rot_on, q8oa, q8os, q8ms });
+            if (fuse_on and l.mixer_out.x3 != null) { // the plane alone; H too (the a8 sites and int4 fallbacks)
+                const x = X3.of(l.mixer_out.x3.?, m.exl3.?);
+                try d.launch(d.k.attn_gate_x3, .{ .x = T }, .{ a.y, a.p, a.h, x.s[0], x.r[0], x.s[1], x.r[1], x.s[2], x.r[2], x.s[3], x.r[3], x.cnt });
+            } else
+                try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo, gs, q.rot_on, q8oa, q8os, q8ms });
         } else {
             const cin = l.conv[l.conv_cur].?;
             const cout = l.conv[1 - l.conv_cur].?;
@@ -437,7 +470,11 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
                 try dumpBuf(d, "beta0", a.beta, T * HV, .f32);
                 try dumpBuf(d, "y0", a.y, T * MIX_OUT, .bf16);
             }
-            try d.launch(d.k.gated_norm, .{ .x = T }, .{ a.y, a.p, l.gnorm.?, a.h, a.ahi, a.alo, EPS, gs, q.rot_on, q8oa, q8os, q8ms });
+            if (fuse_on and l.mixer_out.x3 != null) { // the plane alone; H too (the a8 sites and int4 fallbacks)
+                const x = X3.of(l.mixer_out.x3.?, m.exl3.?);
+                try d.launch(d.k.gated_norm_x3, .{ .x = T }, .{ a.y, a.p, l.gnorm.?, a.h, EPS, x.s[0], x.r[0], x.s[1], x.r[1], x.s[2], x.r[2], x.s[3], x.r[3], x.cnt });
+            } else
+                try d.launch(d.k.gated_norm, .{ .x = T }, .{ a.y, a.p, l.gnorm.?, a.h, a.ahi, a.alo, EPS, gs, q.rot_on, q8oa, q8os, q8ms });
             if (probe) try dumpBuf(d, "o0", a.h, T * MIX_OUT, .f16);
         }
         try a8(d, a, a.h, MIX_OUT, T, 2);
@@ -450,10 +487,16 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
         }
         if (gemm_probe) |f| try f(d, a, l.mixer_out, a.h, T, i, 1);
         if (probe) try dumpBuf(d, "r0", a.r, T * D, .f16);
-        if (!fused) try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs, q8a, q8s, q8ms, q.rot_on });
+        if (!fused) {
+            if (fuse_on and l.gu.x3 != null) {
+                const x = X3.of(l.gu.x3.?, m.exl3.?);
+                try d.launch(d.k.add_rmsnorm_x3, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, @as(i32, D), EPS, @as(i32, 1), @as(i32, 1), x.s[0], x.r[0], x.s[1], x.r[1], x.s[2], x.r[2], x.s[3], x.r[3], x.cnt });
+            } else
+                try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs, q8a, q8s, q8ms, q.rot_on });
+        }
         try a8(d, a, a.h, D, T, 4);
         if (gemm_probe) |f| try f(d, a, l.gu, a.h, T, i, 2);
-        const act = try mlpIn(d, m, a, l.gu, T, gs, q8on, wide);
+        const act = try mlpIn(d, m, a, l.gu, l.down, T, gs, q8on, wide);
         try a8(d, a, act, FF, T, 8);
         try pgemm(d, m, a, act, l.down, a.r, T, false, if (act == a.p) q.rot_on else 0, q.int4_sites & 8 != 0, wide);
         if (ranks.group) |*g| try g.allReduce(d, a.r, T); // TP: the ranks' partial down projections summed

@@ -173,6 +173,22 @@ KERNEL(256) void attn_gate(global const ushort *O, global const half *P, global 
   out_rows(hl, Q27_OD, H, t, rot, gs, A8, SA, MS, AHI, ALO);
 }
 
+// XPU_PREFILL_FUSE: attn_gate, with the plane of the next EXL3 prompt GEMM written in place of the H store and
+// the later exl3_rotate_in_h.
+KERNEL(256) void attn_gate_x3(global const ushort *O, global const half *P, global half *H, global const half *S0,
+                              global half *R0, global const half *S1, global half *R1, global const half *S2,
+                              global half *R2, global const half *S3, global half *R3, int cnt) {
+  local half hl[Q27_OD];
+  const int t = get_group_id(0), lane = get_sub_group_local_id();
+  for (int b = get_sub_group_id(); b < Q27_OB; b += get_num_sub_groups()) {
+    const ushort8 ov = intel_sub_group_block_read_us8(O + (long)t * Q27_OD + b * 128);
+    const half8 gv = as_half8(intel_sub_group_block_read_us8((global const ushort *)(P + (long)t * Q27_ATT_IN + (b / 2) * 512 + 256 + (b % 2) * 128)));
+    for (int i = 0; i < 8; i++) hl[b * 128 + i * 16 + lane] = convert_half_rte(rbf(bf2f(ov[i]) * sigmoid_f((float)gv[i])));
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  x3_planes(hl, Q27_OD, cnt, t, 1, H, S0, R0, S1, R1, S2, R2, S3, R3);
+}
+
 // SwiGLU: act = fp16(bf16(SiLU(g)·u)) and its row sums, a group of 256 per 1 024 columns; ilv: gate|up by 16.
 KERNEL(256) void swiglu(global const half *GU, global half *H, global half *AHI, global half *ALO, int gs, int ilv,
                         int rot, int ff) {
@@ -213,6 +229,58 @@ KERNEL(256) void swiglu(global const half *GU, global half *H, global half *AHI,
       const half hi = convert_half_rte(s * ASC);
       AHI[(long)t * (ff / gs) + blk * per_blk + g] = hi;
       ALO[(long)t * (ff / gs) + blk * per_blk + g] = convert_half_rte(s * ASC - (float)hi);
+    }
+  }
+}
+
+// XPU_PREFILL_FUSE: swiglu, with the plane of the next EXL3 prompt GEMM (the down part) written in place of the
+// H store and the later exl3_rotate_in_h. S0, R0: the part's suh and plane (the gu parts' planes are written by
+// the post-norm producer of this same row).
+KERNEL(256) void swiglu_x3(global const half *GU, global half *H, int ilv, int ff, global const half *S0,
+                           global half *R0, global const half *S1, global half *R1, global const half *S2,
+                           global half *R2, global const half *S3, global half *R3, int cnt) {
+  local half hl[1024];
+  const int t = get_group_id(0), blk = get_group_id(1), lid = get_local_id(0);
+  const int live = min(1024, ff - blk * 1024);
+  {
+    const int e = lid * 4, c = blk * 1024 + e;
+    half4 o = (half4)(0.0h);
+    if (e < live) {
+      const long gc = ilv ? (c / 16) * 32 + c % 16 : c, uc = ilv ? gc + 16 : ff + c;
+      const half4 gv = vload4(0, GU + (long)t * (2 * ff) + gc), uv = vload4(0, GU + (long)t * (2 * ff) + uc);
+      for (int i = 0; i < 4; i++) o[i] = convert_half_rte(rbf(silu((float)gv[i]) * (float)uv[i]));
+    }
+    vstore4(o, 0, hl + e);
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  { // H as swiglu stores it (the down GEMM's fallbacks read H)
+    const int e = lid * 4, c = blk * 1024 + e;
+    if (c < ff) vstore4(vload4(0, hl + e), 0, H + (long)t * ff + c);
+  }
+  if (get_sub_group_id() < 8) {
+    const int b = get_sub_group_id(), lane = get_sub_group_local_id(), g0 = blk * 1024 + b * 128;
+    const global const half *Sp[4] = { S0, S1, S2, S3 };
+    global half *Rp[4] = { R0, R1, R2, R3 };
+    if (g0 < ff) {                                    // ff a multiple of 128: whole blocks in or out
+      for (int j = 0; j < cnt; j++) {
+        const global const half *S = Sp[j];
+        global half *R = Rp[j];
+        float v[8];
+        for (int u = 0; u < 8; u++) v[u] = (float)hl[b * 128 + lane + 16 * u] * (float)S[g0 + lane + 16 * u]; // float product: the rotate_in_h bits
+        for (int d = 1; d < 16; d *= 2)
+          for (int u = 0; u < 8; u++) {
+            const float peer = sub_group_shuffle_xor(v[u], d);
+            v[u] = (lane & d) ? peer - v[u] : v[u] + peer;
+          }
+        for (int d = 1; d < 8; d *= 2)
+          for (int u = 0; u < 8; u++)
+            if (!(u & d)) {
+              const float a = v[u], b2 = v[u + d];
+              v[u] = a + b2;
+              v[u + d] = a - b2;
+            }
+        for (int u = 0; u < 8; u++) R[(long)t * ff + g0 + lane + 16 * u] = convert_half_rte(v[u] * X3_INV_SQRT128);
+      }
     }
   }
 }

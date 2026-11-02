@@ -149,6 +149,11 @@ pub const Proj = struct {
         var gs: [4]exl3.Group = undefined;
         return exl3.Plan.init(&w.ctx, w.stream(), alloc, p.groups(w, x, y, rows, &gs));
     }
+
+    /// Part j's suh device offset (the XPU_PREFILL_FUSE producers scale the plane with it).
+    pub fn suhOff(p: *const Proj, j: u32) u64 {
+        return p.base + p.parts[j].m.at[1];
+    }
 };
 
 pub const Weights = struct {
@@ -233,7 +238,12 @@ pub fn project(p: *const Proj, w: *const Weights, d: *Dev, x: *anyopaque, out: *
     if (ya != p.y) return error.Exl3Unbound;
     if (xa == p.x) {
         if (!wide and T <= WINDOW) return exl3.encode(&w.p, w.stream(), &p.dec[T - 1]);
-        if (p.chunk) |*c| return exl3.encodeRows(&w.p, w.stream(), c, T);
+        if (p.chunk) |*c| {
+            // XPU_PREFILL_FUSE: the prompt producers wrote the rotated input planes themselves. GEMM_LO 1 reads a
+            // lo plane too, which the producers do not write, so that build keeps exl3_rotate_in_h.
+            if (wide and q.prefill_fuse and q.a8_group == 0 and q.rot_on == 0 and exl3.variants.moe.gemm_lo == 0) return exl3.encodeRowsFused(&w.p, w.stream(), c, T);
+            return exl3.encodeRows(&w.p, w.stream(), c, T);
+        }
         if (T <= WINDOW) return exl3.encode(&w.p, w.stream(), &p.dec[T - 1]);
         return error.Exl3Unbound;
     }

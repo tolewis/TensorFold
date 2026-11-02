@@ -130,6 +130,11 @@ pub const Dev = struct {
         gdn_pre: ze.H,
         gdn_pre_rows: ze.H,
         gated_norm: ze.H,
+        // XPU_PREFILL_FUSE: the prompt producers write the rotated input planes (the prompt GEMM skips exl3_rotate_in_h).
+        add_rmsnorm_x3: ze.H = null,
+        gated_norm_x3: ze.H = null,
+        attn_gate_x3: ze.H = null,
+        swiglu_x3: ze.H = null,
         attn_prep: ze.H,
         attn_gate: ze.H,
         swiglu: ze.H,
@@ -283,8 +288,8 @@ pub const Prof = struct {
     events: [4096]ze.H = @splat(null),
     kernel: [4096]ze.H = @splat(null),
     used: usize = 0,
-    names: [80]struct { k: ze.H = null, name: []const u8 = "" } = @splat(.{}),
-    total: [80]f64 = @splat(0),
+    names: [96]struct { k: ze.H = null, name: []const u8 = "" } = @splat(.{}),
+    total: [96]f64 = @splat(0),
 };
 
 pub fn profReport(label: []const u8) void {

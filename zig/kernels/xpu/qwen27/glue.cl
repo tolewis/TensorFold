@@ -159,6 +159,86 @@ KERNEL(128) void add_rmsnorm(global float *X, global const half *R, global const
   out_rows(hl, D, H, t, rot, gs, A8, SA, MS, AHI, ALO);
 }
 
+// XPU_PREFILL_FUSE (EXL3): a prompt producer stored its row in hl and writes the exl3 GEMM's rotated input plane
+// (scratch, [rows][K] fp16) in place of exl3_rotate_in_h: 128 blocks scaled by the part's suh, hadamard128
+// (exl3.cl, fixed FP32 order; lane c holds c + 16j), scaled by INV_SQRT128. sh: also store row t of hl to H
+// (the dense a and b gates read H directly).
+#define X3_INV_SQRT128 0.08838834764831845f
+static void x3_planes(local const half *hl, int K, int cnt, int t, int sh, global half *H, global const half *S0,
+                      global half *R0, global const half *S1, global half *R1, global const half *S2, global half *R2,
+                      global const half *S3, global half *R3) {
+  if (sh) {
+    const int lid = get_local_id(0), lb = (int)get_local_size(0) * 4; // one round is four columns a thread
+    for (int b = 0; b < K / lb; b++) vstore4(vload4(0, hl + b * lb + lid * 4), 0, H + (long)t * K + b * lb + lid * 4);
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const global const half *Sp[4] = { S0, S1, S2, S3 };
+  global half *Rp[4] = { R0, R1, R2, R3 };
+  const int c = get_sub_group_local_id(), per = K / 128;
+  for (int j = 0; j < cnt; j++) {
+    const global const half *S = Sp[j];
+    global half *R = Rp[j];
+    for (int b = get_sub_group_id(); b < per; b += get_num_sub_groups()) {
+      float v[8];
+      // float product: exl3_rotate_in_h converts the same half bits to float and multiplies in float, so this is
+      // bit for bit that plane (a half product would round once more).
+      for (int u = 0; u < 8; u++) v[u] = (float)hl[b * 128 + c + 16 * u] * (float)S[b * 128 + c + 16 * u];
+      for (int d = 1; d < 16; d *= 2)
+        for (int u = 0; u < 8; u++) {
+          const float peer = sub_group_shuffle_xor(v[u], d);
+          v[u] = (c & d) ? peer - v[u] : v[u] + peer;
+        }
+      for (int d = 1; d < 8; d *= 2)
+        for (int u = 0; u < 8; u++)
+          if (!(u & d)) {
+            const float a = v[u], b2 = v[u + d];
+            v[u] = a + b2;
+            v[u + d] = a - b2;
+          }
+      for (int u = 0; u < 8; u++) R[(long)t * K + b * 128 + c + 16 * u] = convert_half_rte(v[u] * X3_INV_SQRT128);
+    }
+  }
+}
+
+// XPU_PREFILL_FUSE: add_rmsnorm, with the plane of the next EXL3 prompt GEMM written in place of the H store and
+// the later exl3_rotate_in_h (no AHI, ALO, A8: the EXL3 GEMM reads the plane).
+KERNEL(128) void add_rmsnorm_x3(global float *X, global const half *R, global const ushort *WN, global half *H,
+                                int D, float eps, int has_r, int sh, global const half *S0, global half *R0,
+                                global const half *S1, global half *R1, global const half *S2, global half *R2,
+                                global const half *S3, global half *R3, int cnt) {
+  local float red[8];
+  local half hl[Q27_D];
+  const int t = get_group_id(0), lid = get_local_id(0);
+  float4 xv[Q27_D512];
+  float ss = 0.0f;
+  for (int i = 0; i < D / 512; i++) {
+    const int e = (i * 128 + lid) * 4;
+    float4 x = vload4(0, X + (long)t * D + e);
+    if (has_r) {
+      const float4 r = convert_float4(vload4(0, R + (long)t * D + e));
+      x = (float4)(rbf(x.s0 + r.s0), rbf(x.s1 + r.s1), rbf(x.s2 + r.s2), rbf(x.s3 + r.s3));
+      vstore4(x, 0, X + (long)t * D + e);
+    }
+    xv[i] = x;
+    ss += x.s0 * x.s0 + x.s1 * x.s1 + x.s2 * x.s2 + x.s3 * x.s3;
+  }
+  const float s = sub_group_reduce_add(ss);
+  if (get_sub_group_local_id() == 0) red[get_sub_group_id()] = s;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float tot = 0.0f;
+  for (int i = 0; i < 8; i++) tot += red[i];
+  const float inv = rsqrt(tot / D + eps);
+  for (int i = 0; i < D / 512; i++) {
+    const int e = (i * 128 + lid) * 4;
+    const ushort4 w = vload4(0, WN + e);
+    const half4 v = (half4)(convert_half_rte(rbf(xv[i].s0 * inv * bf2f(w.s0))), convert_half_rte(rbf(xv[i].s1 * inv * bf2f(w.s1))),
+                            convert_half_rte(rbf(xv[i].s2 * inv * bf2f(w.s2))), convert_half_rte(rbf(xv[i].s3 * inv * bf2f(w.s3))));
+    vstore4(v, 0, hl + e);
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  x3_planes(hl, D, cnt, t, sh, H, S0, R0, S1, R1, S2, R2, S3, R3);
+}
+
 // TP 2 device flag (TF_TP_DEVFLAG): a work-group polls a flag word the peer's copy engine writes over PCIe before
 // it uses the peer's slot. Every wait here is inside a round and is milliseconds when both ranks run, so the bound
 // only has to end a spin whose peer has gone away. Lane p2-int set it to 2^28 (about 20 s at 75 ns an iteration,
@@ -513,6 +593,35 @@ KERNEL(256) void gated_norm(global const ushort *Y, global const half *P, global
   }
   barrier(CLK_LOCAL_MEM_FENCE);
   out_rows(hl, Q27_VD, H, t, rot, gs, A8, SA, MS, AHI, ALO);
+}
+
+// XPU_PREFILL_FUSE: gated_norm, with the plane of the next EXL3 prompt GEMM written in place of the H store and
+// the later exl3_rotate_in_h.
+KERNEL(256) void gated_norm_x3(global const ushort *Y, global const half *P, global const ushort *WN, global half *H,
+                               float eps, global const half *S0, global half *R0, global const half *S1,
+                               global half *R1, global const half *S2, global half *R2, global const half *S3,
+                               global half *R3, int cnt) {
+  local half hl[Q27_VD];
+  const int t = get_group_id(0), sg = get_sub_group_id(), lane = get_sub_group_local_id();
+  const ushort8 wn = intel_sub_group_block_read_us8(WN);
+  for (int hh = sg; hh < Q27_GV; hh += 16) {
+    const ushort8 yv = intel_sub_group_block_read_us8(Y + ((long)t * Q27_GV + hh) * 128);
+    const half8 zv = as_half8(intel_sub_group_block_read_us8((global const ushort *)(P + (long)t * Q27_GDN_IN + Q27_NCONV + hh * 128)));
+    float v[8], ss = 0.0f;
+    for (int i = 0; i < 8; i++) {
+      v[i] = bf2f(yv[i]);
+      ss += v[i] * v[i];
+    }
+    const float inv = rsqrt(sub_group_reduce_add(ss) / 128.0f + eps);
+    half8 o;
+    for (int i = 0; i < 8; i++) {
+      const float yn = v[i] * inv * bf2f(wn[i]);
+      o[i] = convert_half_rte(rbf(silu((float)zv[i]) * yn));
+      hl[hh * 128 + i * 16 + lane] = o[i];
+    }
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  x3_planes(hl, Q27_VD, cnt, t, 1, H, S0, R0, S1, R1, S2, R2, S3, R3);
 }
 
 #include "glue_attn.cl"
