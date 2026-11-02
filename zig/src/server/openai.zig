@@ -176,6 +176,7 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
         if (p != .bool) return cx.refuse("parallel_tool_calls must be a boolean");
         policy.single = !p.bool;
     }
+    policy.tools = input.tools;
     const options = body.get("stream_options");
     return .{
         .input = input,
@@ -568,7 +569,10 @@ const Run = struct {
                 for (deltas) |d| r.emit(r.chunk(d, null) catch return) catch return;
             } else if (reply.content.len > 0 and !r.streamed_prose) {
                 r.emit(r.chunk(.{ .string = reply.content }, null) catch return) catch return;
-            } else if (r.plan.policy.kept(reply.content, r.prose_sent.items)) |rest| {
+            } else if (r.plan.policy.single and std.mem.eql(u8, reply.finish_reason, "length") and reply.content.len > r.prose_sent.items.len and std.mem.startsWith(u8, reply.content, r.prose_sent.items)) {
+                const rest = reply.content[r.prose_sent.items.len..];
+                if (rest.len > 0) r.emit(r.chunk(.{ .string = rest }, null) catch return) catch return;
+            } else if (r.plan.policy.kept(r.a, reply.content, r.prose_sent.items) catch return) |rest| {
                 r.emit(r.chunk(.{ .string = rest }, null) catch return) catch return;
             }
         }

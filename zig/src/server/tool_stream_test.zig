@@ -104,12 +104,25 @@ fn canonical(a: Allocator, text: []const u8) ![]const u8 {
     return json.stringify(a, (try json.parse(a, text)).ok, .{ .compact = true });
 }
 
+test "single-call filter keeps an unoffered JSON envelope byte by byte" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]")).ok.array;
+    var policy: Policy = .{ .single = true, .tools = tools };
+    const raw = "<tool_call>{\"name\":\"not_offered\",\"arguments\":{}}</tool_call>";
+    var sent: std.ArrayList(u8) = .empty;
+    for (raw) |b| try sent.appendSlice(a, try policy.text(a, &.{b}));
+    try sent.appendSlice(a, policy.flush());
+    try std.testing.expectEqualStrings(raw, sent.items);
+}
+
 test "a one-call reply retains an unoffered call and still hides an unclosed one" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]")).ok.array;
-    const single: Policy = .{ .single = true };
+    const single: Policy = .{ .single = true, .tools = tools };
     const text = "Launching. <tool_call><function=launch><parameter=when>now</function></tool_call>";
     // what attachCalls makes of the reply: the parse, then the policy's content
     const r = try tool_parse.parse(a, text, tools, single.maxCalls());
@@ -118,10 +131,10 @@ test "a one-call reply retains an unoffered call and still hides an unclosed one
     try std.testing.expectEqualStrings(text, try single.parsedContent(a, r.content));
     try std.testing.expectEqualStrings("Launching. ", try single.parsedContent(a, "Launching. <tool_call>{\"name\""));
     // a stream that sent the prose before the block ends with the block
-    try std.testing.expectEqualStrings(text["Launching. ".len..], single.kept(text, "\nLaunching. ").?);
-    try std.testing.expect(single.kept("Launching.", "Launching. ") == null);
+    try std.testing.expectEqualStrings(text["Launching. ".len..], (try single.kept(a, text, "\nLaunching. ")).?);
+    try std.testing.expect((try single.kept(a, "Launching.", "Launching. ")) == null);
     const parallel: Policy = .{};
-    try std.testing.expect(parallel.kept(text, "Launching. ") == null);
+    try std.testing.expect((try parallel.kept(a, text, "Launching. ")) == null);
 }
 
 const tool_parse = @import("tool_parse.zig");

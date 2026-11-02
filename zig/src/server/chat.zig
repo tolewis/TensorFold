@@ -238,7 +238,8 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     };
     release(srv, preparing); // a background request waits only while a foreground one prepares
     preparing = false;
-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = prepared.token_ids, .lp = if (request.logprobs != null) .{} else null };
+    const tool_call_single = if (input.fields.object.get("tool_call_single")) |v| v.truthy() else false;
+    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .tool_call_single = tool_call_single, .token_ids = prepared.token_ids, .lp = if (request.logprobs != null) .{} else null };
     defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
     const result: Failure!Reply = blk: {
@@ -288,6 +289,7 @@ const Generation = struct {
     max_tokens: u32,
     token_ids: bool, // "return_token_ids": the response's tensorfold block carries the reply's token ids
     tools: []const Value,
+    tool_call_single: bool = false,
     calls: ?tool_stream.Streamer = null,
     collected: std.ArrayList(u32) = .empty,
     visible: reply_text.Incremental = .{},
@@ -368,8 +370,11 @@ const Generation = struct {
             answer = split.answer;
         }
         answer = try tool_lfm2.dsml(g.a, answer, g.tools, false); // the answer only, so a call the reasoning mentions is not made
-        const shown = if (g.calls != null) try reply_text.hideInto(g.a, &g.hidden, answer, false) else answer;
-        const vis = reply_text.heldBack(reply_text.streamingVisible(shown), g.calls != null);
+        const shown = if (g.calls != null and !(g.tool_call_single and tool_stream.singleXmlFilter(answer)))
+            try reply_text.hideInto(g.a, &g.hidden, answer, false)
+        else
+            answer;
+        const vis = reply_text.heldBack(reply_text.streamingVisible(shown), g.tools.len > 0);
         const copied = @intFromPtr(vis.ptr) >= @intFromPtr(g.hidden.items.ptr) and @intFromPtr(vis.ptr) <= @intFromPtr(g.hidden.items.ptr) + g.hidden.items.len;
         const delta = g.streamed.after(vis, !copied);
         if (delta.len > 0) {
@@ -495,7 +500,7 @@ const Generation = struct {
             const thought = g.streamed_reasoning.text.items;
             if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)
                 try g.emit(sink, try deltaOf(a, "reasoning_content", r[thought.len..]));
-            const shown = if (g.calls != null) try tool_stream.endProse(a, content, if (g.thinking) content else text, g.tools, reason) else content;
+            const shown = if (g.tools.len > 0) try tool_stream.endProse(a, content, if (g.thinking) content else text, g.tools, reason, g.tool_call_single) else content;
             const sent = g.streamed.text.items;
             const rest = if (std.mem.startsWith(u8, shown, sent) and shown.len > sent.len) shown[sent.len..] else "";
             if (g.lp) |*l| (if (try l.delta(g.srv, a, g.thinking, g.ignore_eos, g.collected.items, rest, shown.len, true)) |d| try g.emit(sink, d)) else if (rest.len > 0) try g.emit(sink, .{ .string = rest });

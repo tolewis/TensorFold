@@ -317,9 +317,14 @@ pub const Streamer = struct {
 };
 
 /// A streamed reply's final prose: ``cutProse`` when max_tokens left a call open, else ``finishedProse``.
-pub fn endProse(a: Allocator, content: []const u8, text: []const u8, tools: []const Value, reason: []const u8) Allocator.Error![]const u8 {
+pub fn endProse(a: Allocator, content: []const u8, text: []const u8, tools: []const Value, reason: []const u8, single: bool) Allocator.Error![]const u8 {
+    if (single) {
+        const parsed = try tool_parse.parse(a, content, tools, 1);
+        var policy: Policy = .{ .single = true, .tools = tools };
+        return try policy.parsedContent(a, parsed.content);
+    }
     const cut = std.mem.eql(u8, reason, "length") and (try cutCalls(a, text, tools)) != null;
-    return if (cut) reply_text.cutProse(a, content) else reply_text.finishedProse(a, content);
+    return if (cut) try reply_text.cutProse(a, content) else try reply_text.finishedProse(a, content);
 }
 
 /// A reply max_tokens cut inside a call: the calls its stream sent, the cut one included; null when none was left open.
@@ -372,25 +377,31 @@ fn nameLike(s: []const u8) bool {
     return true;
 }
 
+/// Whether a whole envelope stays in the reply as text, not a call.
+fn envelopeKeptAsContent(a: Allocator, tools: []const Value, envelope: []const u8, max_calls: ?usize) Allocator.Error!bool {
+    if (tools.len == 0) return false;
+    const parsed = try tool_parse.parse(a, envelope, tools, max_calls);
+    return parsed.calls == null and parsed.rejected_envelopes > 0;
+}
+
 /// Hides tool envelopes from streamed prose, holding only a partial tag between deltas.
 pub const TextFilter = struct {
     pending: std.ArrayList(u8) = .empty,
     hidden: ?[]const u8 = null,
+    hidden_open: []const u8 = "",
 
-    pub fn feed(f: *TextFilter, a: Allocator, text: []const u8) Allocator.Error![]const u8 {
+    pub fn feed(f: *TextFilter, a: Allocator, tools: []const Value, max_calls: ?usize, text: []const u8) Allocator.Error![]const u8 {
         try f.pending.appendSlice(a, text);
         var out: std.ArrayList(u8) = .empty;
         while (f.pending.items.len > 0) {
             const p = f.pending.items;
             if (f.hidden) |name| {
                 const close = try std.mem.concat(a, u8, &.{ "</", name, ">" });
-                const end = std.ascii.findIgnoreCase(p, close) orelse {
-                    const keep = reply_text.charCount(close) - 1;
-                    const chars = reply_text.charCount(p);
-                    const tail = if (chars > keep) reply_text.afterChars(p, chars - keep) else p;
-                    try f.reset(a, tail);
-                    break;
-                };
+                const end = std.ascii.findIgnoreCase(p, close) orelse break;
+                const body = try std.mem.concat(a, u8, &.{ f.hidden_open, p[0 .. end + close.len] });
+                if (try envelopeKeptAsContent(a, tools, body, max_calls)) try out.appendSlice(a, body);
+                if (f.hidden_open.len > 0) a.free(f.hidden_open);
+                f.hidden_open = "";
                 try f.reset(a, p[end + close.len ..]);
                 f.hidden = null;
                 continue;
@@ -417,6 +428,7 @@ pub const TextFilter = struct {
             };
             const name = rest[1..end];
             if (callTag(name)) {
+                f.hidden_open = try a.dupe(u8, rest[0 .. end + 1]);
                 f.hidden = try std.ascii.allocLowerString(a, name);
             } else try out.appendSlice(a, rest[0 .. end + 1]);
             try f.reset(a, rest[end + 1 ..]);
@@ -437,6 +449,18 @@ pub const TextFilter = struct {
     }
 };
 
+/// Whether a single-call stream should filter XML ``tool_call`` envelopes in prose (not DSML).
+pub fn singleXmlFilter(text: []const u8) bool {
+    const dsml = tool_dsml.findOpen(text, 0);
+    var at: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, text, at, '<')) |start| : (at = start + 1) {
+        if (dsml) |o| if (o.at <= start) return false;
+        const close = std.mem.indexOfScalarPos(u8, text, start, '>') orelse return false;
+        if (callTag(text[start + 1 .. close])) return true;
+    }
+    return false;
+}
+
 /// ``(?:NAME:)?tool_call``, any case.
 fn callTag(name: []const u8) bool {
     if (std.ascii.eqlIgnoreCase(name, "tool_call")) return true;
@@ -447,6 +471,7 @@ fn callTag(name: []const u8) bool {
 /// ``parallel_tool_calls: false`` keeps one call and hides call markup from streamed prose.
 pub const Policy = struct {
     single: bool = false,
+    tools: []const Value = &.{},
     filter: TextFilter = .{},
 
     pub fn maxCalls(p: *const Policy) ?usize {
@@ -455,7 +480,7 @@ pub const Policy = struct {
 
     /// Filters a str delta's text (dict deltas lose tool_calls and filter content), or passes it through.
     pub fn text(p: *Policy, a: Allocator, s: []const u8) Allocator.Error![]const u8 {
-        return if (p.single) p.filter.feed(a, s) else s;
+        return if (p.single) p.filter.feed(a, p.tools, p.maxCalls(), s) else s;
     }
 
     pub fn flush(p: *Policy) []const u8 {
@@ -465,7 +490,7 @@ pub const Policy = struct {
     pub fn content(p: *const Policy, a: Allocator, s: []const u8) Allocator.Error![]const u8 {
         if (!p.single) return s;
         var f: TextFilter = .{};
-        const head = try f.feed(a, s);
+        const head = try f.feed(a, p.tools, p.maxCalls(), s);
         return std.mem.concat(a, u8, &.{ head, f.finish() });
     }
 
@@ -482,12 +507,35 @@ pub const Policy = struct {
         return out.items;
     }
 
+    /// Prose a single-call stream would show if the filter saw the whole reply (not the generation layer's call hiding).
+    pub fn streamedProse(p: *const Policy, a: Allocator, final: []const u8) Allocator.Error![]const u8 {
+        var f: TextFilter = .{};
+        var out: std.ArrayList(u8) = .empty;
+        for (final) |b| try out.appendSlice(a, try f.feed(a, p.tools, p.maxCalls(), &.{b}));
+        try out.appendSlice(a, f.finish());
+        return out.items;
+    }
+
     /// What the filter held back that the reply keeps as text (a malformed call): ``final`` past the prose ``sent``.
-    pub fn kept(p: *const Policy, final: []const u8, sent: []const u8) ?[]const u8 {
+    pub fn kept(p: *const Policy, a: Allocator, final: []const u8, sent: []const u8) Allocator.Error!?[]const u8 {
         if (!p.single) return null;
-        const shown = reply_text.pyLstrip(sent); // the parsed content starts stripped
-        if (!std.mem.startsWith(u8, final, shown)) return null;
-        const rest = final[shown.len..];
+        const want = try p.streamedProse(a, final);
+        const have = reply_text.pyLstrip(sent);
+        if (std.mem.eql(u8, want, have)) return null;
+        if (want.len > have.len and std.mem.startsWith(u8, want, have)) {
+            const rest = want[have.len..];
+            return if (reply_text.pyStrip(rest).len > 0) rest else null;
+        }
+        var i: usize = 0;
+        while (i < want.len and i < have.len and want[i] == have[i]) i += 1;
+        if (i >= have.len) {
+            const rest = want[have.len..];
+            return if (reply_text.pyStrip(rest).len > 0) rest else null;
+        }
+        const tail = have[i..];
+        const at = std.mem.indexOf(u8, want[i..], tail) orelse return null;
+        if (at == 0) return null;
+        const rest = want[i .. i + at];
         return if (reply_text.pyStrip(rest).len > 0) rest else null;
     }
 };
