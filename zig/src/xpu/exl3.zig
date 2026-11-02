@@ -548,7 +548,8 @@ pub fn promptGemm2() ?usize {
 /// The image index of exl3_gemm2 tile `v` for the plan's width, or null when the plan does not fit that tile: hi
 /// plane only (GEMM_LO 0, which is what exl3_rotate_in_h stores), whole 16 * s column blocks and whole 16 * kc K
 /// steps.
-pub fn gemm2Index(plan: *const Plan, comptime v: usize) ?usize {
+pub fn gemm2Index(plan: *const Plan, v: usize) ?usize {
+    if (v >= variants.gemm2.tiles.len) return null;
     const t = variants.gemm2.tiles[v];
     if (variants.moe.gemm_lo != 0) return null;
     const i = std.mem.indexOfScalar(u32, &variants.gemm2.widths, plan.bits) orelse return null;
@@ -565,12 +566,7 @@ pub fn encodeRowsMode(p: *const Pipelines, s: Stream, plan: *const Plan, rows: u
     const mi = std.mem.indexOfScalar(u32, &m.bits, plan.bits) orelse return error.Invalid;
     const k = p.moe[mi];
     const g2 = if (variant) |v| blk: {
-        const i = switch (v) {
-            0 => gemm2Index(plan, 0),
-            1 => gemm2Index(plan, 1),
-            2 => gemm2Index(plan, 2),
-            else => null,
-        } orelse break :blk null;
+        const i = gemm2Index(plan, v) orelse break :blk null;
         break :blk if (i < p.gemm2_count) i else null;
     } else null;
     const g2t = if (g2 != null) variants.gemm2.tiles[variant.?] else variants.gemm2.tiles[0];

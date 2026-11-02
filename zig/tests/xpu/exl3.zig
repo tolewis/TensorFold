@@ -156,7 +156,7 @@ pub fn main(init: std.process.Init) !u8 {
             const us_base = try abTime(io, &p, s, &plan, null, reps);
             try buf.download(s, y_off, base_y);
             std.debug.print("gemm2 base exl3_gemm: {d:.1} us (n {d}, k {d}, rows {d})\n", .{ us_base, plan.n_max, plan.k_max, plan.rows });
-            inline for (0..exl3.variants.gemm2.tiles.len) |v| {
+            for (0..exl3.variants.gemm2.tiles.len) |v| {
                 const t = exl3.variants.gemm2.tiles[v];
                 const i = exl3.gemm2Index(&plan, v) orelse {
                     std.debug.print("gemm2 tile {d} (m {d}, s {d}, kc {d}): does not apply\n", .{ v, t.m, t.s, t.kc });

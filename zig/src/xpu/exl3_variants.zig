@@ -119,13 +119,13 @@ pub const gemm2 = struct {
 
     /// Local memory an image asks for: the A tile of a step (8 * m rows of 16 * kc halves), then the decoded B
     /// tiles (kc * s * 16 lanes of 32 bytes).
-    pub fn localBytes(comptime v: usize) usize {
+    pub fn localBytes(v: usize) usize {
         const t = tiles[v];
         return 8 * t.m * 16 * t.kc * 2 + t.kc * t.s * 16 * 32;
     }
 
     /// The image index of a tile and a width, as kernels.exl3_gemm2 lists them.
-    pub fn index(comptime v: usize, comptime b: usize) usize {
+    pub fn index(v: usize, b: usize) usize {
         return v * widths.len + b;
     }
 };
