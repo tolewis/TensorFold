@@ -372,7 +372,7 @@ pub const Store = struct {
                     superseded = j;
                     break;
                 }
-            };
+            }
             if (superseded) |j| {
                 if (from != null and s.entries.items[j] == *from) superseded = null; // the resumed state a peer restores before it drops
             }
