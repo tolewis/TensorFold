@@ -14,6 +14,28 @@ const TREE_MIN = 5; // drafts from which a stream's window is a DFlash2 tree (be
 /// A kept prompt state (prompt cache): the slot's states after `at` tokens and its DFlash2 context.
 pub const Kept = struct { snap: xq.Runner.Snap, ctx: ?*anyopaque = null, range: [2]u32 = .{ 0, 0 } };
 
+/// XPU_ROUND_STATS=N (rank 0 only): host time per round, one line every N rounds. Off: `on` is false, one branch per call.
+/// A round opens at its verify and closes at the next verify, so its time runs to the last backend call it made.
+pub const RoundStats = struct {
+    on: bool = false,
+    every: u32 = 0,
+    open: bool = false,
+    t_start: f64 = 0, // the round's verify entry (seconds, monotonic)
+    t_last: f64 = 0, // the exit of the round's last backend call
+    t_verify: f64 = 0, // the round's verify call
+    t_draft: f64 = 0, // the round's drafter calls, summed
+    streams: u32 = 0, // the round's windows
+    rows: u32 = 0, // the round's rows, pending tokens included
+    win_acc: [16]u32 = @splat(0), // each window's accepted drafts: rows - 1 until a keep gives its kept path
+    rounds: u32 = 0, // closed rounds in this window
+    sum_streams: u64 = 0,
+    sum_rows: u64 = 0,
+    sum_acc: u64 = 0,
+    sum_round: f64 = 0,
+    sum_verify: f64 = 0,
+    sum_draft: f64 = 0,
+};
+
 pub const Lanes = struct {
     gpa: Allocator,
     runner: *xq.Runner,
@@ -43,6 +65,7 @@ pub const Lanes = struct {
     prompt_skip: u32 = 0, // a prefill's first rows the drafter never reads (further than WIN from the prompt's end)
     costs: [16]lanes.config.Cost = undefined, // a window's ms by rows (verify and keep), timed by measure()
     timed: usize = 0,
+    rs: RoundStats = .{}, // XPU_ROUND_STATS, set by the opener
 
     fn self(ptr: *anyopaque) *Lanes {
         return @ptrCast(@alignCast(ptr));
@@ -346,6 +369,10 @@ pub const Lanes = struct {
     fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const b = self(ptr);
         if (windows.len == 0 or windows.len > 16 or windows.len != out.len) return error.BadWindows;
+        if (b.rs.on) try b.rsOpen();
+        defer {
+            if (b.rs.on) b.rsVerified(windows);
+        }
         try b.settle();
         var wins: [16]xq.Runner.Win = undefined;
         var total: usize = 0;
@@ -415,13 +442,89 @@ pub const Lanes = struct {
         const b = self(ptr);
         if (windows.len != b.count or paths.len != b.count) return error.NothingToKeep;
         for (paths) |p| if (p.len == 0) return error.NothingToKeep;
+        if (b.rs.on) b.rsKept(paths);
         b.count = 0;
         try b.keepRows(paths);
+    }
+
+    /// Closes the open round into the window and opens a new one at its verify.
+    fn rsOpen(b: *Lanes) !void {
+        try b.rsClose();
+        const rs = &b.rs;
+        rs.open = true;
+        rs.t_start = xq.now();
+        rs.t_last = rs.t_start;
+        rs.t_verify = 0;
+        rs.t_draft = 0;
+    }
+
+    /// The verify's end: its time, its windows and rows, and each window's drafts (kept until a keep says otherwise).
+    fn rsVerified(b: *Lanes, windows: []const be.Window) void {
+        const rs = &b.rs;
+        if (!rs.open) return;
+        const t = xq.now();
+        rs.t_verify = t - rs.t_start;
+        rs.t_last = t;
+        rs.streams = @intCast(windows.len);
+        rs.rows = 0;
+        for (windows, 0..) |w, i| {
+            const n: u32 = @intCast(w.rows());
+            rs.rows += n;
+            rs.win_acc[i] = n - 1;
+        }
+    }
+
+    /// A keep gives each window's accepted drafts: its kept path less the pending row.
+    fn rsKept(b: *Lanes, paths: []const []const u32) void {
+        const rs = &b.rs;
+        if (!rs.open) return;
+        for (paths, 0..) |p, i| rs.win_acc[i] = @intCast(p.len - 1);
+        rs.t_last = xq.now();
+    }
+
+    fn rsDrafted(b: *Lanes, t0: f64) void {
+        const rs = &b.rs;
+        const t = xq.now();
+        if (rs.open) rs.t_draft += t - t0;
+        rs.t_last = t;
+    }
+
+    /// Adds the open round to the window. At `every` rounds: one line on stderr, then the XPU_PROFILE report (rank 0 only).
+    fn rsClose(b: *Lanes) !void {
+        const rs = &b.rs;
+        if (!rs.open) return;
+        rs.open = false;
+        rs.rounds += 1;
+        rs.sum_round += rs.t_last - rs.t_start;
+        rs.sum_verify += rs.t_verify;
+        rs.sum_draft += rs.t_draft;
+        rs.sum_streams += rs.streams;
+        rs.sum_rows += rs.rows;
+        for (rs.win_acc[0..rs.streams]) |x| rs.sum_acc += x;
+        if (rs.rounds < rs.every) return;
+        const n: f64 = @floatFromInt(rs.rounds);
+        const streams = @as(f64, @floatFromInt(rs.sum_streams)) / n;
+        const rows = @as(f64, @floatFromInt(rs.sum_rows)) / n;
+        const acc = @as(f64, @floatFromInt(rs.sum_acc)) / @as(f64, @floatFromInt(rs.sum_streams));
+        const round = rs.sum_round * 1e3 / n;
+        const draft = rs.sum_draft * 1e3 / n;
+        const verify = rs.sum_verify * 1e3 / n;
+        if (xq.prof.on) try b.runner.d.sync(); // drain the event ring into the totals before the report
+        std.debug.print("round stats: {d} rounds, streams {d:.2} (mean), rows {d:.1} (mean), accepted {d:.2} a stream a round, round {d:.2} ms, drafter {d:.2} ms, verify {d:.2} ms, other {d:.2} ms\n", .{ rs.rounds, streams, rows, acc, round, draft, verify, round - draft - verify });
+        if (xq.prof.on) {
+            var buf: [96]u8 = undefined;
+            xq.profReport(try std.fmt.bufPrint(&buf, "{d} rounds, {d:.2} streams a round", .{ rs.rounds, streams }));
+        }
+        rs.* = .{ .on = rs.on, .every = rs.every };
     }
 
     /// Each asked stream's DFlash2 chain for its next window in one drafter pass, after the kept rows' taps.
     fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
         const b = self(ptr);
+        const t0: f64 = if (b.rs.on) xq.now() else 0;
+        defer {
+            if (b.rs.on) b.rsDrafted(t0);
+        }
         const d = b.drafter orelse return;
         var which: [16]usize = undefined;
         var ps: [16][]const u32 = undefined;

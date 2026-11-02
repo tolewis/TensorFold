@@ -182,6 +182,10 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
     h.back = .{ .gpa = gpa, .runner = runner, .drafter = drafter, .pick = pickCtx, .pick_ctx = gpa_box, .slots = slots };
     if (std.c.getenv("XPU_BLOCK")) |v| h.back.block = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 8;
     if (std.c.getenv("XPU_TREE")) |v| h.back.nodes = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 15;
+    if (std.c.getenv("XPU_ROUND_STATS")) |v| { // rank 0 drafts and prints; a follower stays off
+        const every = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0;
+        if (every > 0 and xq.RANK == 0) h.back.rs = .{ .on = true, .every = every };
+    }
     if (drafter != null) {
         try h.back.measure();
         std.log.info("qwen27-xpu: window ms by rows: 1 {d:.1}, 2 {d:.1}, 4 {d:.1}, 8 {d:.1}, 16 {d:.1}", .{ h.back.costs[0].ms, h.back.costs[1].ms, h.back.costs[3].ms, h.back.costs[7].ms, h.back.costs[15].ms });
