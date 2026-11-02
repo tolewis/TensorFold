@@ -146,7 +146,7 @@ fn run(d: *dev.Dev, gpa: std.mem.Allocator, kk: k1.Kernels, evs: []const ze.H, r
             // the tree partials' stride is ns + 1 (k1.cl attn_k1_draft): the prefix and the merge take it, the draft ns
             try launchTimed(d, kk.decode, .{ .x = pl.ns, .y = AKV, .z = rd.n }, .{ dq, dk, dv, pm, plb, po, p0i, nsi + 1, pl.span, scale, dmt, dpos, @as(i32, 1), dpt1, dgrp }, evs[0]);
             try launchTimed(d, kk.draft, .{ .x = 1, .y = AKV, .z = @intCast(t) }, .{ dq, dk, dv, pm, plb, po, p0i, nsi, scale, dtree, dpt1 }, evs[1]);
-            try launchTimed(d, kk.merge, .{ .x = AQ, .y = @intCast(t) }, .{ pm, plb, po, out, p0i, nsi + 1, pl.span, mpos }, evs[2]);
+            try launchTimed(d, kk.merge2, .{ .x = AQ, .y = @intCast(t) }, .{ pm, plb, po, out, p0i, nsi + 1, pl.span, mpos }, evs[2]);
             try d.sync();
             best = @min(best, try d.g.seconds(evs[0]) + try d.g.seconds(evs[1]) + try d.g.seconds(evs[2]));
             try ze.check(d.g.api.zeEventHostReset(evs[0]));
@@ -155,7 +155,7 @@ fn run(d: *dev.Dev, gpa: std.mem.Allocator, kk: k1.Kernels, evs: []const ze.H, r
         } else {
             const kern = if (rd.k16) kk.decode16 else kk.decode;
             try launchTimed(d, kern, .{ .x = pl.ns, .y = AKV, .z = rd.n }, .{ dq, dk, dv, pm, plb, po, p0i, nsi, pl.span, scale, dmt, dpos, @as(i32, 1), dpt1, dgrp }, evs[0]);
-            try launchTimed(d, kk.merge, .{ .x = AQ, .y = @intCast(t) }, .{ pm, plb, po, out, p0i, nsi, pl.span, dpos }, evs[1]);
+            try launchTimed(d, kk.merge2, .{ .x = AQ, .y = @intCast(t) }, .{ pm, plb, po, out, p0i, nsi, pl.span, dpos }, evs[1]);
             try d.sync();
             best = @min(best, try d.g.seconds(evs[0]) + try d.g.seconds(evs[1]));
             try ze.check(d.g.api.zeEventHostReset(evs[0]));

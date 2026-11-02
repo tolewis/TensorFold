@@ -429,7 +429,7 @@ pub const Runner = struct {
             d.k.attn_k1_draft_mt = kk.draft_mt;
             k1mod.have16 = kk.decode16 != null;
             d.k.attn_span = kk.span;
-            d.k.merge_span = kk.merge;
+            d.k.merge_span = kk.merge2; // K1's partials are log2-base: the exp2 merge
         }
         if (std.c.getenv("XPU_PROFILE") != null) {
             prof.on = true;
