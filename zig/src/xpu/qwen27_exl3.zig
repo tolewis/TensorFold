@@ -326,12 +326,12 @@ test "the head's plan pick covers the window measure, the drafter and the second
     try std.testing.expectEqual(HeadPick{ .dec = 0 }, headPick(&p, X, Y, 1).?);
     // one row t of the main set (the forward's last row)
     try std.testing.expectEqual(HeadPick{ .last = 3 }, headPick(&p, X + 3 * D * 2, Y, 1).?);
-    try std.testing.expectEqual(HeadPick{ .row }, headPick(&p, X + 600 * D * 2, Y, 1).?);
+    try std.testing.expectEqual(HeadPick{ .row = {} }, headPick(&p, X + 600 * D * 2, Y, 1).?);
     // the second activation set: its own plans, its own logits buffer
     try std.testing.expectEqual(HeadPick{ .dec2 = 7 }, headPick(&p, X2, Y2, 8).?);
     try std.testing.expectEqual(HeadPick{ .last2 = 3 }, headPick(&p, X2 + 3 * D * 2, Y2, 1).?);
-    try std.testing.expectEqual(HeadPick{ .row2 }, headPick(&p, X2 + 600 * D * 2, Y2, 1).?);
-    try std.testing.expectEqual(HeadPick{ .chunk2 }, headPick(&p, X2, Y2, 17).?);
+    try std.testing.expectEqual(HeadPick{ .row2 = {} }, headPick(&p, X2 + 600 * D * 2, Y2, 1).?);
+    try std.testing.expectEqual(HeadPick{ .chunk2 = {} }, headPick(&p, X2, Y2, 17).?);
     // refusals: the wrong logits buffer, an unaligned row, a row above the plans with more than one row
     try std.testing.expectEqual(@as(?HeadPick, null), headPick(&p, X, Y2, 16));
     try std.testing.expectEqual(@as(?HeadPick, null), headPick(&p, X + 5, Y, 1));
