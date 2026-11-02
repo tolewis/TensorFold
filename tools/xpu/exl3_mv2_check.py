@@ -44,6 +44,9 @@ def main():
     st = ref.SafeTensors(root)
     group = os.environ.get("GROUP", GROUP)
     sels = os.environ.get("SELS", SELS).split(",")
+    # EXL3_KS=1: a deterministic K split so (k_tiles_gcd / ks) % ku is always 0 and the XPU_EXL3_MV2 image is taken
+    # (the marker fires). This is a correctness check of the mv2 image, not of the split rule.
+    os.environ["EXL3_KS"] = "1"
     tr, suh, svh, mul1 = st.group(group)
     tr = np.ascontiguousarray(tr)
     kt, nt, w = tr.shape
