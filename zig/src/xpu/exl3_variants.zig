@@ -44,7 +44,7 @@ pub const mv2 = struct {
         const bi = std.mem.indexOfScalar(u32, &mbits, b) orelse unreachable;
         const ni = std.mem.indexOfScalar(u32, &mns, n) orelse unreachable;
         const ki = std.mem.indexOfScalar(u32, &mku, k) orelse unreachable;
-        return @intCast(u32, (bi * mns.len + ni) * mku.len + ki);
+        return @intCast((bi * mns.len + ni) * mku.len + ki);
     }
 
     pub fn nsOf(v: u32) u32 {
