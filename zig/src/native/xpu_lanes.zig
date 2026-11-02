@@ -26,7 +26,7 @@ pub const RoundStats = struct {
     t_draft: f64 = 0, // the round's drafter calls, summed
     streams: u32 = 0, // the round's windows
     rows: u32 = 0, // the round's rows, pending tokens included
-    win_acc: [16]u32 = @splat(0), // each window's accepted drafts: rows - 1 until a keep gives its kept path
+    win_acc: [xq.ROWS_CAP]u32 = @splat(0), // each window's accepted drafts: rows - 1 until a keep gives its kept path
     rounds: u32 = 0, // closed rounds in this window
     sum_streams: u64 = 0,
     sum_rows: u64 = 0,
@@ -47,23 +47,23 @@ pub const Lanes = struct {
     nodes: u32 = 15,
     owners: [xq.MAX_SLOTS]?*lanes.Stream = @splat(null),
     first_logits: [xq.MAX_SLOTS]?[]f32 = @splat(null), // a sampled or structured stream's prompt-row logits, for `first`
-    mask_rows: [16]u32 = undefined, // a verify's greedy structured rows (argmaxMasked on the device)
+    mask_rows: [xq.ROWS_CAP]u32 = undefined, // a verify's greedy structured rows (argmaxMasked on the device)
     mask_bits: ?[]u32 = null, // and their grammar bits, gathered
     masked_vals: ?[]f64 = null, // a structured sampled row's allowed candidates
     masked_ids: ?[]u64 = null,
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
-    ids: [16]u32 = undefined, // the last verify's rows, window after window
-    widths: [16]u32 = undefined, // and each window's rows
+    ids: [xq.ROWS_CAP]u32 = undefined, // the last verify's rows, window after window
+    widths: [xq.ROWS_CAP]u32 = undefined, // and each window's rows
     count: usize = 0,
-    wslots: [16]u32 = undefined, // and each window's slot
-    wfirst: [16]u32 = undefined, // and its first row
-    absorbed: [16]bool = @splat(false), // the window's kept rows already in its slot's drafter context
+    wslots: [xq.ROWS_CAP]u32 = undefined, // and each window's slot
+    wfirst: [xq.ROWS_CAP]u32 = undefined, // and its first row
+    absorbed: [xq.ROWS_CAP]bool = @splat(false), // the window's kept rows already in its slot's drafter context
     chain: [xq.MAX_SLOTS][16]u32 = undefined, // each slot's DFlash2 drafts for its next window (a tree)
     chain_par: [xq.MAX_SLOTS][16]i32 = undefined, // and each one's parent (−1: the pending token)
     chain_n: [xq.MAX_SLOTS]u32 = @splat(0),
     prompt_skip: u32 = 0, // a prefill's first rows the drafter never reads (further than WIN from the prompt's end)
-    costs: [16]lanes.config.Cost = undefined, // a window's ms by rows (verify and keep), timed by measure()
+    costs: [xq.ROWS_CAP]lanes.config.Cost = undefined, // a window's ms by rows (verify and keep), timed by measure()
     timed: usize = 0,
     rs: RoundStats = .{}, // XPU_ROUND_STATS, set by the opener
 
@@ -128,7 +128,7 @@ pub const Lanes = struct {
     /// The last verify's windows `which`: each kept path's taps go into its slot's drafter context in one pass.
     fn absorb(b: *Lanes, which: []const usize, paths: []const []const u32) !void {
         const d = b.drafter orelse return;
-        var items: [16]xq.drafter.Absorb = undefined;
+        var items: [xq.ROWS_CAP]xq.drafter.Absorb = undefined;
         for (which, paths, items[0..which.len]) |i, path, *it| {
             var straight = true;
             for (path, 0..) |row, j| straight = straight and row == j;
@@ -140,8 +140,8 @@ pub const Lanes = struct {
 
     /// Keeps the root path `paths[i]` of the last verify's window i (its taps to the drafter, unless taken already).
     fn keepRows(b: *Lanes, paths: []const []const u32) !void {
-        var which: [16]usize = undefined;
-        var ps: [16][]const u32 = undefined;
+        var which: [xq.ROWS_CAP]usize = undefined;
+        var ps: [xq.ROWS_CAP][]const u32 = undefined;
         var n: usize = 0;
         for (paths, 0..) |p, i| if (!b.absorbed[i]) {
             which[n] = i;
@@ -159,7 +159,7 @@ pub const Lanes = struct {
         const n = b.count;
         b.count = 0;
         const all = [16]u32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
-        var paths: [16][]const u32 = undefined;
+        var paths: [xq.ROWS_CAP][]const u32 = undefined;
         for (paths[0..n], b.widths[0..n]) |*p, w| p.* = all[0..w];
         try b.keepRows(paths[0..n]);
     }
@@ -368,18 +368,20 @@ pub const Lanes = struct {
     /// Every stream's window (pending token, then its copied drafts as a chain) in one forward, drawn with its sampling
     fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const b = self(ptr);
-        if (windows.len == 0 or windows.len > 16 or windows.len != out.len) return error.BadWindows;
+        // XPU_ROWS_MAX: up to that many windows and that many rows in all (six windows of 11 rows at 64)
+        const cap: usize = @as(usize, xq.rows_max);
+        if (windows.len == 0 or windows.len > cap or windows.len != out.len) return error.BadWindows;
         if (b.rs.on) try b.rsOpen();
         defer {
             if (b.rs.on) b.rsVerified(windows);
         }
         try b.settle();
-        var wins: [16]xq.Runner.Win = undefined;
+        var wins: [xq.ROWS_CAP]xq.Runner.Win = undefined;
         var total: usize = 0;
         for (windows, 0..) |w, i| {
             if (w.held > 0) return error.HeldDrafts;
             const rows = w.rows();
-            if (total + rows > 16) return error.WindowTooWide;
+            if (total + rows > cap) return error.WindowTooWide;
             const ids = b.ids[total..][0..rows];
             ids[0] = w.pending;
             @memcpy(ids[1..], w.tokens);
@@ -401,7 +403,7 @@ pub const Lanes = struct {
             const words = w.masks.len / b.widths[i];
             if (mwords != 0 and words != mwords) return error.BadMasks;
             mwords = words;
-            const bits = b.mask_bits orelse try b.gpa.alloc(u32, 16 * xq.MASK_WORDS);
+            const bits = b.mask_bits orelse try b.gpa.alloc(u32, xq.ROWS_CAP * xq.MASK_WORDS);
             b.mask_bits = bits;
             if (words > xq.MASK_WORDS) return error.BadMasks;
             for (0..b.widths[i]) |j| {
@@ -410,7 +412,7 @@ pub const Lanes = struct {
                 nm += 1;
             }
         };
-        var mtok: [16]u32 = undefined;
+        var mtok: [xq.ROWS_CAP]u32 = undefined;
         if (nm > 0) try r.argmaxMasked(b.mask_rows[0..nm], b.mask_bits.?[0 .. nm * mwords], mwords, &mtok);
         var mi: usize = 0;
         var row: u32 = 0;
@@ -526,10 +528,10 @@ pub const Lanes = struct {
             if (b.rs.on) b.rsDrafted(t0);
         }
         const d = b.drafter orelse return;
-        var which: [16]usize = undefined;
-        var ps: [16][]const u32 = undefined;
+        var which: [xq.ROWS_CAP]usize = undefined;
+        var ps: [xq.ROWS_CAP][]const u32 = undefined;
         var na: usize = 0;
-        var items: [16]xq.drafter.Block = undefined;
+        var items: [xq.ROWS_CAP]xq.drafter.Block = undefined;
         var asked: [16]u32 = undefined;
         var reqs: [16]*const be.DraftRequest = undefined;
         var ni: usize = 0;

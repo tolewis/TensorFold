@@ -5,6 +5,7 @@ const q = @import("qwen27.zig");
 const dev = @import("dev.zig");
 const loader = @import("load.zig");
 const exl3 = @import("qwen27_exl3.zig");
+const w4rows = @import("w4rows.zig");
 const D = q.D;
 const Dev = dev.Dev;
 const EPS = q.EPS;
@@ -208,6 +209,22 @@ pub fn gemmRows(d: *Dev, pscr: *anyopaque, h: *anyopaque, ahi: *anyopaque, alo: 
     const ngen_wide = if (g128) k.ngen_wide_g128 else k.ngen_wide;
     const ngen_narrow = if (g128) k.ngen_narrow_g128 else k.ngen_narrow;
     const mp: i32 = @intCast((m + 7) / 8 * 8);
+    // XPU_ROWS_MAX above 16: the int4 many-row decode serves 17 rows up to the cap, one weight read a work-group
+    // for 2 or 4 row blocks of 16 rows (zig/kernels/xpu/qwen27/gemm.cl w4k1_mr32/mr64). Up to 16 rows and above
+    // the cap the path is today's.
+    const many = m > w4rows.window and q.rows_max > w4rows.window and m <= q.rows_max and w.n % 64 == 0 and
+        (m > 32 or w.n % w4rows.columns32 == 0);
+    if (many) {
+        const pl = w4rows.plan(m, w.n, q.rows_max);
+        const kern = switch (pl.kernel) {
+            .mr32 => if (g128) k.dec_mr32_g128 else k.dec_mr32,
+            .mr64 => if (g128) k.dec_mr64_g128 else k.dec_mr64,
+            else => unreachable,
+        };
+        try d.launch(kern, .{ .x = pl.grid[0], .y = pl.grid[1], .z = 1 }, .{ h, w.w, w.s, w.bg, out, M, N, K, ahi, alo, mp, G });
+        if (gemm_hook) |f| try f(d, h, w, out, m);
+        return;
+    }
     if (!wide) {
         if (w.wide)
             // 64 columns per subgroup for the widest shapes (gate|up, head), 32 below (measured end to end)

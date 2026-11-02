@@ -163,6 +163,8 @@ pub const Dev = struct {
         quantize_mlx: ze.H,
         dec_wide_g128: ze.H,
         dec_wide64_g128: ze.H,
+        dec_mr32_g128: ze.H, // w4k1_mr32: 32 rows from one weight read (XPU_ROWS_MAX)
+        dec_mr64_g128: ze.H, // w4k1_mr64: 64 rows from one weight read (XPU_ROWS_MAX)
         dec_narrow_g128: ze.H,
         ngen_wide_g128: ze.H,
         ngen_narrow_g128: ze.H,
@@ -177,6 +179,8 @@ pub const Dev = struct {
         quant_a4: ze.H,
         dec_wide: ze.H,
         dec_wide64: ze.H,
+        dec_mr32: ze.H,
+        dec_mr64: ze.H,
         dec_narrow: ze.H,
         gdn_prep: ze.H,
         gdn_state: ze.H,
