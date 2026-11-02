@@ -205,7 +205,7 @@ pub const Lanes = struct {
         }
         s.cached = 0;
         var at: usize = 0;
-        if (s.reuse.saved) |saved| if (b.mtp == null) { // a kept state of this prompt's prefix: the pass starts there
+        if (s.reuse.saved) |saved| { // a kept state of this prompt's prefix: the pass starts there
             const k: *const Kept = @ptrCast(@alignCast(saved));
             if (k.snap.at < ids.len) {
                 if (b.restoreKept(slot, k)) {
@@ -215,16 +215,13 @@ pub const Lanes = struct {
                     s.reuse_failed = true;
                     try r.select(slot);
                     try r.reset();
-                    if (b.drafter) |d| {
+                    if (b.mtp) |m| m.release(slot) else if (b.drafter) |d| {
                         try d.use(slot);
                         d.reset();
                     }
                 }
             } else s.reuse_failed = true;
-        } else if (s.reuse.saved != null) {
-            // the MTP head's cache is not in a kept state: the pass runs from 0 and absorbs every row again
-            s.reuse_failed = true;
-        };
+        }
         if (b.drafter != null) b.prompt_skip = @intCast((ids.len -| xq.drafter.WIN) -| at);
         // chunks cut where the request's chunks and the cache's marks are, as a fresh pass cuts them
         while (at < ids.len) {

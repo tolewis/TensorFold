@@ -50,6 +50,49 @@ pub fn readEnv() void {
     most = @min(@max(most, 1), ROWS - 1);
 }
 
+/// The host record a kept state keeps with the MTP part: the cache's newest absorbed position and the drafts it held.
+pub const SnapRecord = struct { pos: u32, chain_n: u32, chain: [ROWS]u32 };
+
+/// One half of a slot's MTP cache (its K or its V) as the kernels index it: Q27_KVROW a position for the values, then
+/// a float scale a head and position after `cap` positions.
+pub const Layout = struct { heads: usize, cap: usize, int8: bool };
+
+/// Bytes of one half of a slot's MTP cache: the values at every position, then the int8 scales.
+pub fn halfBytes(l: Layout) usize {
+    return l.cap * l.heads * 256 * @as(usize, if (l.int8) 1 else 2) + (if (l.int8) l.cap * l.heads * 4 else 0);
+}
+
+/// The MTP cache layout of this rank: its own K/V heads (half the model's at TP 2), as the kernels index it.
+pub fn layout() Layout {
+    return .{ .heads = AKV, .cap = q.MAX_CTX, .int8 = q.kv_i8 };
+}
+
+/// A copy a kept state's MTP part takes: `len` bytes of a cache half at `src` to the state's buffer at `dst`.
+pub const Region = struct { src: usize, dst: usize, len: usize };
+
+/// The copies of a slot's MTP cache at `at` positions: K values, K scales, V values, V scales (no scales at bf16).
+pub fn snapRegions(l: Layout, at: usize) [4]Region {
+    const row = l.heads * 256 * @as(usize, if (l.int8) 1 else 2);
+    const half = halfBytes(l);
+    const values = l.cap * l.heads * 256 * @as(usize, if (l.int8) 1 else 2);
+    const sc = if (l.int8) at * l.heads * 4 else 0;
+    return .{
+        .{ .src = 0, .dst = 0, .len = at * row },
+        .{ .src = values, .dst = at * row, .len = sc },
+        .{ .src = half, .dst = at * row + sc, .len = at * row },
+        .{ .src = half + values, .dst = 2 * at * row + sc, .len = sc },
+    };
+}
+
+/// Bytes a kept state's MTP part takes at `at` positions: both halves' values and scales, and the newest row's state.
+/// A state at 0 positions carries none.
+pub fn snapBytes(at: u32) u64 {
+    if (at == 0) return 0;
+    const l = layout();
+    const row: u64 = l.heads * 256 * @as(u64, if (l.int8) 1 else 2);
+    return 2 * @as(u64, at) * row + (if (l.int8) 2 * @as(u64, at) * l.heads * 4 else 0) + D * 2;
+}
+
 /// One stream's kept rows of a verify: the slot, the position of its first kept row, the target's block rows of the
 /// kept path (their final normed states are the head's inputs), and the token after each row.
 pub const Kept = struct { slot: u32, pos: u32, block: []const u32, follow: []const u32 };
@@ -119,17 +162,48 @@ pub const Mtp = struct {
     pos_host: [ROWS]i32 = @splat(0),
     ids_host: [SLICE]i32 = @splat(0),
 
-    /// Bytes one slot's MTP K/V cache takes on this card: the values of its K/V heads at every position, then the
-    /// int8 scales (int8: q.kv_i8, as the live pair runs).
+    /// Bytes one slot's MTP K/V cache takes on this card: two halves (K and V), each the values of its K/V heads at
+    /// every position and then the int8 scales (int8: q.kv_i8, as the live pair runs).
     pub fn slotBytes(m: *const Mtp) u64 {
         _ = m;
-        const values: u64 = @as(u64, q.MAX_CTX) * AKV * 256 * @as(u64, if (q.kv_i8) 1 else 2);
-        return 2 * values + (if (q.kv_i8) @as(u64, q.MAX_CTX) * AKV * 4 else 0);
+        return 2 * halfBytes(layout());
     }
 
     fn kvHalf(m: *const Mtp) usize {
         _ = m;
-        return @as(usize, q.MAX_CTX) * AKV * 256 * @as(usize, if (q.kv_i8) 1 else 2);
+        return halfBytes(layout());
+    }
+
+    /// Copies `slot`'s MTP cache at `at` positions into `buf` (snapRegions' order), then its newest row's state.
+    pub fn saveSnap(m: *Mtp, slot: u32, at: u32, buf: *anyopaque) !void {
+        if (slot >= q.MAX_SLOTS) return error.NoSuchSlot;
+        const kv = m.kv[slot] orelse return error.NoSlot;
+        const d = &m.r.d;
+        for (snapRegions(layout(), at)) |r| if (r.len > 0) try copy(d, off(buf, r.dst), off(kv, r.src), r.len);
+        try copy(d, off(buf, @intCast(snapBytes(at) - D * 2)), off(m.last, @as(usize, slot) * D * 2), D * 2);
+    }
+
+    /// A kept state's MTP part back into `slot`'s cache (allocated when the slot has none), then its newest row's
+    /// state. The slot's record (position, held drafts) goes back with applyRecord.
+    pub fn restoreSnap(m: *Mtp, slot: u32, at: u32, buf: *anyopaque) !void {
+        if (slot >= q.MAX_SLOTS) return error.NoSuchSlot;
+        if (m.kv[slot] == null) try m.open(slot);
+        const kv = m.kv[slot].?;
+        const d = &m.r.d;
+        for (snapRegions(layout(), at)) |r| if (r.len > 0) try copy(d, off(kv, r.src), off(buf, r.dst), r.len);
+        try copy(d, off(m.last, @as(usize, slot) * D * 2), off(buf, @intCast(snapBytes(at) - D * 2)), D * 2);
+    }
+
+    /// The host record a kept state keeps beside its MTP part: where the cache stood and the drafts it held.
+    pub fn snapRecord(m: *const Mtp, slot: u32) SnapRecord {
+        return .{ .pos = m.pos[slot], .chain_n = m.chain_n[slot], .chain = m.chain[slot] };
+    }
+
+    pub fn applyRecord(m: *Mtp, slot: u32, rec: SnapRecord) void {
+        if (slot >= q.MAX_SLOTS) return;
+        m.pos[slot] = rec.pos;
+        m.chain_n[slot] = rec.chain_n;
+        m.chain[slot] = rec.chain;
     }
 
     /// The MTP head of the runner's checkpoint onto the device: weights, plans and buffers. No all-reduce (a follower
@@ -325,6 +399,60 @@ pub fn open(m: *Mtp, slot: u32) !void {
     }
     m.pos[slot] = 0;
     m.chain_n[slot] = 0;
+}
+
+test "the MTP snapshot's regions tile its cache and its record round trips" {
+    const l: Layout = .{ .heads = 2, .cap = 8, .int8 = true };
+    const at: usize = 5;
+    const rowv = l.heads * 256;
+    const half = halfBytes(l);
+    try std.testing.expectEqual(@as(usize, 2 * 8 * 256 + 2 * 8 * 4), half);
+    // a cache filled as store_kv8 writes it: values at pos * Q27_KVROW + head * 256, the scale at cap * Q27_KVROW +
+    // (pos * heads + head) * 4
+    const cache = try std.testing.allocator.alloc(u8, 2 * half);
+    defer std.testing.allocator.free(cache);
+    @memset(cache, 0);
+    for (0..2) |v| for (0..at) |pos| for (0..l.heads) |h| {
+        for (0..256) |i| {
+            cache[v * half + pos * rowv + h * 256 + i] = @truncate(pos * 7 + h * 3 + i + v * 11);
+        }
+        std.mem.writeInt(u32, cache[v * half + l.cap * rowv + (pos * l.heads + h) * 4 ..][0..4], @intCast(0x1000 * v + pos * 100 + h), .little);
+    };
+    const bytes = 2 * at * rowv + 2 * at * l.heads * 4; // the cache part; the newest row's state follows it
+    const out = try std.testing.allocator.alloc(u8, bytes);
+    defer std.testing.allocator.free(out);
+    @memset(out, 0);
+    var covered: usize = 0;
+    for (snapRegions(l, at)) |r| {
+        try std.testing.expect(r.len > 0);
+        try std.testing.expect(r.dst >= covered and r.dst + r.len <= bytes); // no two regions overlap
+        covered = r.dst + r.len;
+        @memcpy(out[r.dst .. r.dst + r.len], cache[r.src .. r.src + r.len]);
+    }
+    try std.testing.expectEqual(bytes, covered);
+    for (0..2) |v| for (0..at) |pos| for (0..l.heads) |h| {
+        const o = if (v == 0) 0 else at * rowv + at * l.heads * 4;
+        try std.testing.expectEqualSlices(u8, cache[v * half + pos * rowv + h * 256 ..][0..256], out[o + pos * rowv + h * 256 ..][0..256]);
+        const so = o + at * rowv;
+        try std.testing.expectEqualSlices(u8, cache[v * half + l.cap * rowv + (pos * l.heads + h) * 4 ..][0..4], out[so + (pos * l.heads + h) * 4 ..][0..4]);
+    };
+    // the record
+    var m: Mtp = undefined;
+    m.pos = @splat(0);
+    m.chain_n = @splat(0);
+    for (&m.chain) |*c| for (c) |*x| {
+        x.* = 0;
+    };
+    var rec: SnapRecord = .{ .pos = 39, .chain_n = 3, .chain = @splat(0) };
+    rec.chain[0] = 11;
+    rec.chain[1] = 12;
+    rec.chain[2] = 13;
+    m.applyRecord(2, rec);
+    const back = m.snapRecord(2);
+    try std.testing.expectEqual(rec.pos, back.pos);
+    try std.testing.expectEqual(rec.chain_n, back.chain_n);
+    try std.testing.expectEqualSlices(u32, &rec.chain, &back.chain);
+    try std.testing.expectEqual(@as(u32, 0), m.pos[0]); // another slot's record is untouched
 }
 
 pub fn release(m: *Mtp, slot: u32) void {

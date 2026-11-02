@@ -23,9 +23,13 @@ pub fn slotBytes(r: *const Runner) usize {
     return gdnBytes(r) + if (q.kv_pool) 0 else (q.LAYERS / 4) * 2 * kvBytes();
 }
 
+/// A kept state's MTP part: the head's own K/V at `at` positions and its newest row's state, and the slot's record.
+pub const MtpSnap = struct { buf: *anyopaque, bytes: usize, rec: q.mtp.SnapRecord };
+
 /// A slot's state after `at` prompt tokens (prompt cache): GDN and convolution states, K/V rows 0 .. at, one buffer.
 /// With the pool: the GDN and convolution states only, and `pages`, the slot's page ids from entry 0 to ceil(at / PAGE).
-pub const Snap = struct { at: u32, buf: *anyopaque, bytes: usize, pages: []u32 = &.{} };
+/// With the MTP head: `mtp`, the head's cache and its record, in a buffer of its own.
+pub const Snap = struct { at: u32, buf: *anyopaque, bytes: usize, pages: []u32 = &.{}, mtp: ?MtpSnap = null };
 
 pub const REC_BYTES = q.GDN_V_HEADS * 128 * 128 * 4;
 pub const CONV_BYTES = 3 * q.GDN_QKV * 2;
@@ -36,8 +40,9 @@ pub fn kv() q.limits.KvLayout {
 
 /// The bytes saveSlot takes at `at` tokens; with the pool, the pages the state holds are charged too.
 pub fn snapBytes(r: *const Runner, at: u32) usize {
-    if (q.kv_pool) return gdnBytes(r) + @as(usize, at) * r.kvBytesPerToken();
-    var n: usize = 0;
+    const mtp_bytes: usize = if (r.mtp != null) @intCast(q.mtp.snapBytes(at)) else 0;
+    if (q.kv_pool) return gdnBytes(r) + @as(usize, at) * r.kvBytesPerToken() + mtp_bytes;
+    var n: usize = mtp_bytes;
     for (&r.model.layers) |*l| n += if (l.attn) 2 * kv().snapBytes(at) else REC_BYTES + CONV_BYTES;
     return n;
 }
@@ -51,11 +56,35 @@ pub fn saveSlot(r: *Runner, slot: u32, at: u32) !Snap {
     return snap;
 }
 
+/// The MTP part of a kept state at `at` (null without the head): its cache and its record, in a buffer of its own.
+/// The head's cache must be in step with the target's state (`pos` at `at - 1`), or the state is refused.
+fn saveMtp(r: *Runner, slot: u32, at: u32) !?MtpSnap {
+    const m = r.mtp orelse return null;
+    if (at == 0) return null; // no rows yet: the head's cache starts empty with the slot's reset
+    if (m.pos[slot] + 1 != at) return error.SlotNotThere;
+    const bytes: usize = @intCast(q.mtp.snapBytes(at));
+    const buf = try r.d.alloc_(bytes);
+    errdefer freeAfterQueue(&r.d, buf); // copies into it may be queued
+    try m.saveSnap(slot, at, buf);
+    return .{ .buf = buf, .bytes = bytes, .rec = m.snapRecord(slot) };
+}
+
+/// A kept state's MTP part back into `slot` (null without the head, or for a state saved without it).
+fn restoreMtp(r: *Runner, slot: u32, snap: ?MtpSnap) !void {
+    const s = snap orelse return;
+    const m = r.mtp orelse return error.MtpMissing;
+    try m.restoreSnap(slot, s.rec.pos + 1, s.buf);
+    m.applyRecord(slot, s.rec);
+}
+
 fn saveSlotHere(r: *Runner, slot: u32, at: u32) !Snap {
     try r.select(slot);
     if (r.pos != at or r.multi_count != 0) return error.SlotNotThere;
     const d = &r.d;
-    const bytes = r.snapBytes(at);
+    const mtp = try saveMtp(r, slot, at);
+    errdefer if (mtp) |x| freeAfterQueue(d, x.buf);
+    const total = r.snapBytes(at);
+    const bytes = total - (if (mtp) |x| x.bytes else 0); // the target's own buffer: the MTP part is its own
     if (q.kv_pool) {
         const gdn = gdnBytes(r);
         const buf = try d.alloc_(gdn);
@@ -67,7 +96,7 @@ fn saveSlotHere(r: *Runner, slot: u32, at: u32) !Snap {
         errdefer alloc.free(pages);
         @memcpy(pages, r.pt_host[slot][0..entries]);
         for (pages) |id| r.retainPage(id); // the state holds them until dropSnap
-        return .{ .at = at, .buf = buf, .bytes = bytes, .pages = pages };
+        return .{ .at = at, .buf = buf, .bytes = total, .pages = pages, .mtp = mtp };
     }
     const buf = try d.alloc_(bytes);
     errdefer freeAfterQueue(d, buf); // copies into it may be queued
@@ -89,7 +118,7 @@ fn saveSlotHere(r: *Runner, slot: u32, at: u32) !Snap {
         try copy(d, off(buf, o + REC_BYTES), l.conv[l.conv_cur].?, CONV_BYTES);
         o += REC_BYTES + CONV_BYTES;
     }
-    return .{ .at = at, .buf = buf, .bytes = bytes };
+    return .{ .at = at, .buf = buf, .bytes = total, .mtp = mtp };
 }
 
 /// A slot's GDN and convolution states into `snap` (a snapshot's copy): the current slot's, after `select`.
@@ -124,6 +153,7 @@ pub fn restoreSlot(r: *Runner, slot: u32, snap: Snap) !void {
         r.releaseSlot(slot); // the slot's own pages go back; the kept state's stay
         try r.mapPages(slot, 0, snap.pages);
         try copyGdnIn(d, r, snap.buf);
+        try restoreMtp(r, slot, snap.mtp);
         r.pos = at;
         r.block_rows = 0;
         r.tree_on = false;
@@ -148,6 +178,7 @@ pub fn restoreSlot(r: *Runner, slot: u32, snap: Snap) !void {
         try copy(d, l.conv[l.conv_cur].?, off(snap.buf, o + REC_BYTES), CONV_BYTES);
         o += REC_BYTES + CONV_BYTES;
     }
+    try restoreMtp(r, slot, snap.mtp);
     r.pos = at;
     r.block_rows = 0;
     r.tree_on = false;
@@ -160,6 +191,7 @@ pub fn dropSnap(r: *Runner, snap: Snap) void {
         for (snap.pages) |id| r.releasePage(id); // the pages go back to the pool at zero references
         if (snap.pages.len > 0) alloc.free(snap.pages);
     }
+    if (snap.mtp) |x| freeAfterQueue(&r.d, x.buf);
     freeAfterQueue(&r.d, snap.buf);
 }
 
