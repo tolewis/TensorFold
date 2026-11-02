@@ -17,8 +17,8 @@ fn hadamard128(v: *[128]f32) void {
             if (i & d != 0) continue;
             const a = v[i];
             const b = v[i + d];
-            v[i] = (a + b) * INV_SQRT128;
-            v[i + d] = (a - b) * INV_SQRT128;
+            v[i] = a + b;
+            v[i + d] = a - b;
         }
     }
 }
@@ -30,7 +30,7 @@ fn rotateIn(x: []const f32, k: usize, out: []f16) void {
         var v: [128]f32 = undefined;
         for (0..128) |i| v[i] = x[blk + i];
         hadamard128(&v);
-        for (0..128) |i| out[blk + i] = @floatCast(v[i]);
+        for (0..128) |i| out[blk + i] = @floatCast(v[i] * INV_SQRT128);
     }
 }
 
@@ -55,7 +55,7 @@ fn rotateOut(sums: []const f32, svh: []const f16, n: usize, out: []f32) void {
         var v: [128]f32 = undefined;
         for (0..128) |i| v[i] = sums[blk + i];
         hadamard128(&v);
-        for (0..128) |i| out[blk + i] = v[i] * @as(f32, svh[blk + i]);
+        for (0..128) |i| out[blk + i] = v[i] * INV_SQRT128 * @as(f32, svh[blk + i]);
     }
 }
 
