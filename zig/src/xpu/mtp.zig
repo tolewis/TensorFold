@@ -679,6 +679,9 @@ pub fn absorbKept(m: *Mtp, items: []const Kept) !void {
         // either writes past a card buffer and the next drain returns DEVICE_LOST instead of a named error
         if (it.pos + @as(u32, @intCast(it.block.len)) > cap) return error.MtpPosOverCap;
         for (it.block) |r| if (r >= q.maxRows()) return error.MtpRowOverMax;
+        // embed_dense reads E[id * D] with no bound of its own, and argmax writes 0x7fffffff for a row whose logits
+        // are all NaN or -infinity. A token at or past the vocabulary is a device read past the table: name it.
+        for (it.follow) |t| if (t >= q.VOCAB) return error.MtpBadToken;
         total += it.block.len;
     }
     if (total > @as(usize, q.windowRows())) return error.BadKept;
@@ -693,9 +696,6 @@ pub fn absorbKept(m: *Mtp, items: []const Kept) !void {
             m.mt_host[row * 8 + 0] = @intFromPtr(kv);
             m.mt_host[row * 8 + 1] = @intFromPtr(off(kv, m.kvHalf()));
             m.mt_host[row * 8 + 2] = 0; // no page table: the head's cache is its own allocation
-            m.mt_host[row * 8 + 3] = 0; // the GDN state pointers: the head has no GDN layer, but gdn_step reads them
-            m.mt_host[row * 8 + 4] = 0;
-            m.mt_host[row * 8 + 5] = 0;
             m.mt_host[row * 8 + 6] = 0;
             m.mt_host[row * 8 + 7] = 1;
             m.pos_host[row] = @intCast(it.pos + @as(u32, @intCast(j)));
@@ -705,6 +705,8 @@ pub fn absorbKept(m: *Mtp, items: []const Kept) !void {
     }
     try m.copyInIds(total);
     try m.copyInMt(total);
+    // drain the two host copies before the layer: a fault in a copy from host memory then names this step, not a kernel
+    try m.r.d.sync();
     try m.layer(0, @intCast(total), 0, false, true);
     for (ends[0..items.len]) |e| try copy(&m.r.d, off(m.last, @as(usize, e.slot) * D * 2), off(m.h, e.row * D * 2), D * 2);
     // each stream's newest kept row's position, and its chain reset for the next window
@@ -723,6 +725,7 @@ pub fn draft(m: *Mtp, asks: []const Ask) !void {
     const cap: u32 = @intCast(layout().cap);
     for (asks) |a| {
         if (m.kv[a.slot] == null) return error.NoSlot;
+        if (a.pending >= q.VOCAB) return error.MtpBadToken;
         const d = @min(@max(a.depth, 1), most);
         if (draftPos(m.pos[a.slot], d) >= cap) return error.MtpPosOverCap;
     }
@@ -753,13 +756,12 @@ pub fn draft(m: *Mtp, asks: []const Ask) !void {
                 try copy(&m.r.d, dst, off(m.last, @as(usize, a.slot) * D * 2), D * 2)
             else
                 try copy(&m.r.d, dst, off(m.h, @as(usize, prev[i]) * D * 2), D * 2);
-            m.ids_host[cnt] = @intCast(m.chain[a.slot][step - 1]);
+            const prev_tok = m.chain[a.slot][step - 1];
+            if (prev_tok >= q.VOCAB) return error.MtpBadToken;
+            m.ids_host[cnt] = @intCast(prev_tok);
             m.mt_host[cnt * 8 + 0] = @intFromPtr(m.kv[a.slot].?);
             m.mt_host[cnt * 8 + 1] = @intFromPtr(off(m.kv[a.slot].?, m.kvHalf()));
             m.mt_host[cnt * 8 + 2] = 0;
-            m.mt_host[cnt * 8 + 3] = 0;
-            m.mt_host[cnt * 8 + 4] = 0;
-            m.mt_host[cnt * 8 + 5] = 0;
             m.mt_host[cnt * 8 + 6] = 0;
             m.mt_host[cnt * 8 + 7] = 1;
             m.pos_host[cnt] = @intCast(draftPos(m.pos[a.slot], step));

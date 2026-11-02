@@ -208,6 +208,9 @@ KERNEL(256) void argmax(global const float *PV, global const int *PI, global int
     int idx = bi[0];
     for (int i = 1; i < 256; i++)
       if (bv[i] > best || (bv[i] == best && bi[i] < idx)) { best = bv[i]; idx = bi[i]; }
+    // a row whose logits are all NaN or -infinity keeps argmax_part's sentinel: token 0, not a token past the
+    // vocabulary (embed_dense reads E[id * D] with no bound and would fault on the device)
+    if (idx == 0x7fffffff) idx = 0;
     OUT[row] = idx;
   }
 }
