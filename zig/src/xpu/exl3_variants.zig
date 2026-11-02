@@ -99,14 +99,14 @@ pub const moe = struct {
 /// 0 is the safe one, 1 spends registers on rows (a lower decode cost a row block), 2 spends registers on column
 /// reuse instead (fewer A reads a work-group). The host picks a tile by the flag's value: 1, 2 or 3.
 pub const gemm2 = struct {
-    pub const bits = [_]u32{ 4, 6 };
+    pub const widths = [_]u32{ 4, 6 };
     pub const Tile = struct { m: u32, s: u32, kc: u32 };
     pub const tiles = [_]Tile{
         .{ .m = 24, .s = 8, .kc = 2 },
         .{ .m = 48, .s = 8, .kc = 2 },
         .{ .m = 24, .s = 16, .kc = 2 },
     };
-    pub const count = tiles.len * bits.len;
+    pub const count = tiles.len * widths.len;
 
     pub fn name(comptime v: usize, comptime b: u32) []const u8 {
         return std.fmt.comptimePrint("exl3_gemm2_t{d}_b{d}", .{ v, b });
@@ -126,7 +126,7 @@ pub const gemm2 = struct {
 
     /// The image index of a tile and a width, as kernels.exl3_gemm2 lists them.
     pub fn index(comptime v: usize, comptime b: usize) usize {
-        return v * bits.len + b;
+        return v * widths.len + b;
     }
 };
 

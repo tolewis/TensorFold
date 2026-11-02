@@ -44,7 +44,7 @@ pub const exl3_moe: [exl3_variants.moe.bits.len][]const u8 = blk: {
 pub const exl3_gemm2: [exl3_variants.gemm2.count][]const u8 = blk: {
     var out: [exl3_variants.gemm2.count][]const u8 = undefined;
     for (exl3_variants.gemm2.tiles, 0..) |_, v| {
-        for (exl3_variants.gemm2.bits, 0..) |b, i| {
+        for (exl3_variants.gemm2.widths, 0..) |b, i| {
             out[exl3_variants.gemm2.index(v, i)] = if (available) &Blob("spv_" ++ exl3_variants.gemm2.name(v, b)).bytes else &.{};
         }
     }

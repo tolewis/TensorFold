@@ -209,7 +209,7 @@ const kernels = [_]Kernel{
 fn exl3Gemm2() [exl3_variants.gemm2.count]Kernel {
     var out: [exl3_variants.gemm2.count]Kernel = undefined;
     inline for (exl3_variants.gemm2.tiles, 0..) |_, v| {
-        inline for (exl3_variants.gemm2.bits, 0..) |b, i| {
+        inline for (exl3_variants.gemm2.widths, 0..) |b, i| {
             out[exl3_variants.gemm2.index(v, i)] = .{ .name = exl3_variants.gemm2.name(v, b), .src = "exl3_gemm2", .options = exl3_variants.gemm2.options(v, b) };
         }
     }

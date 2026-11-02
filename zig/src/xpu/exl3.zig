@@ -551,7 +551,7 @@ pub fn promptGemm2() ?usize {
 pub fn gemm2Index(plan: *const Plan, comptime v: usize) ?usize {
     const t = variants.gemm2.tiles[v];
     if (variants.moe.gemm_lo != 0) return null;
-    const i = std.mem.indexOfScalar(u32, &variants.gemm2.bits, plan.bits) orelse return null;
+    const i = std.mem.indexOfScalar(u32, &variants.gemm2.widths, plan.bits) orelse return null;
     if (plan.strips.gcd % t.s != 0 or plan.k_tiles_gcd % t.kc != 0) return null;
     if (plan.n_max < 16 * t.s or plan.k_max % (16 * t.kc) != 0) return null;
     return variants.gemm2.index(v, i);
