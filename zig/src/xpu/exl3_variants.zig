@@ -52,11 +52,11 @@ pub const mv2 = struct {
     }
 
     pub fn name(comptime v: u32) []const u8 {
-        return std.fmt.comptimePrint("exl3_mv2_b{d}_ns{d}_ku{d}", .{ mbits[v / (mns.len * mku.len)], mns[(v / mku.len) % mns.len], mku[v % mku.len]);
+        return std.fmt.comptimePrint("exl3_mv2_b{d}_ns{d}_ku{d}", .{ mbits[v / (mns.len * mku.len)], mns[(v / mku.len) % mns.len], mku[v % mku.len] });
     }
 
     pub fn options(comptime v: u32) []const u8 {
-        return std.fmt.comptimePrint("-cl-std=CL3.0 -DEXL3_ABS -DBITS={d} -DNS={d} -DKU={d}", .{ mbits[v / (mns.len * mku.len)], mns[(v / mku.len) % mns.len], mku[v % mku.len]);
+        return std.fmt.comptimePrint("-cl-std=CL3.0 -DEXL3_ABS -DBITS={d} -DNS={d} -DKU={d}", .{ mbits[v / (mns.len * mku.len)], mns[(v / mku.len) % mns.len], mku[v % mku.len] });
     }
 };
 
