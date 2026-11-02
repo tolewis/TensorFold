@@ -135,6 +135,10 @@ pub const Proj = struct {
     x2: u64 = 0,
     y2: u64 = 0,
     chunk2: ?exl3.Plan = null,
+    /// The head only: the same plans over the second activation set, and the 1-row plan that copies a row there.
+    dec2: [WINDOW]exl3.Plan = undefined,
+    last2: [WINDOW]exl3.Plan = undefined,
+    row_plan2: ?exl3.Plan = null,
 
     pub fn groups(p: *const Proj, w: *const Weights, x: u64, y: u64, rows: u32, out: *[4]exl3.Group) []exl3.Group {
         for (p.parts[0..p.count], out[0..p.count], 0..) |pt, *g, j| g.* = .{
@@ -240,6 +244,15 @@ pub const Weights = struct {
             try w.bindOne2(l.gu.x3.?, h, pp, rows);
             try w.bindOne2(l.down.x3.?, h, r, rows);
         }
+        // the head reads the second set's rows and writes the second set's logits buffer, so it needs its own plans
+        const hp = w.head;
+        hp.x2 = h;
+        hp.y2 = @intFromPtr(a.logits);
+        const wr: usize = q.windowRows();
+        for (hp.dec2[0..wr], 0..) |*pl, t| pl.* = try hp.plan(w, h, hp.y2, @intCast(t + 1));
+        for (hp.last2[0..wr], 0..) |*pl, t| pl.* = try hp.plan(w, h + t * D * 2, hp.y2, 1);
+        hp.chunk2 = try hp.plan(w, h, hp.y2, rows);
+        hp.row_plan2 = try hp.plan(w, hp.row, hp.y2, 1);
         try d.sync();
     }
 
@@ -259,19 +272,103 @@ pub const Weights = struct {
     }
 };
 
+/// Which plan a head call runs, from its addresses and its row count. Pure, so a host test covers every case the
+/// open path needs: a verify window of T rows, one row t of an activation set, and the second activation set.
+pub const HeadPick = union(enum) {
+    dec: usize, // T rows of the main activation set
+    dec2: usize, // T rows of the second activation set
+    chunk: void, // more rows than the decode plans hold, main set
+    chunk2: void,
+    last: usize, // one row t of the main set
+    last2: usize, // one row t of the second set
+    row: void, // one row from elsewhere: copy it, run the 1-row plan
+    row2: void,
+};
+
+pub fn headPick(p: *const Proj, xa: u64, ya: u64, T: u32) ?HeadPick {
+    if (p.dec_n == 0 or T == 0) return null;
+    if (p.y2 != 0 and ya == p.y2) {
+        if (p.x2 == 0) return null;
+        if (xa == p.x2) {
+            if (T <= p.dec_n) return .{ .dec2 = T - 1 };
+            return .chunk2;
+        }
+        if (T != 1 or xa < p.x2 or (xa - p.x2) % (D * 2) != 0) return null;
+        const t = (xa - p.x2) / (D * 2);
+        if (t < p.dec_n) return .{ .last2 = t };
+        return .row2;
+    }
+    if (ya != p.y) return null;
+    if (xa == p.x) {
+        if (T <= p.dec_n) return .{ .dec = T - 1 };
+        return .chunk;
+    }
+    if (T != 1 or xa < p.x or (xa - p.x) % (D * 2) != 0) return null;
+    const t = (xa - p.x) / (D * 2);
+    if (t < p.dec_n) return .{ .last = t };
+    return .row;
+}
+
+test "the head's plan pick covers the window measure, the drafter and the second activation set" {
+    const P = struct {
+        fn f(x: u64, y: u64, x2: u64, y2: u64) Proj {
+            return .{ .base = 0, .width = 0, .k = 0, .x = x, .y = y, .x2 = x2, .y2 = y2, .dec_n = 16, .head = true };
+        }
+    }.f;
+    const X: u64 = 0x100000;
+    const Y: u64 = 0x200000;
+    const X2: u64 = 0x300000;
+    const Y2: u64 = 0x400000;
+    const p = P(X, Y, X2, Y2);
+    // the window measure's verify window: T rows of the main set (this is what failed at open)
+    try std.testing.expectEqual(HeadPick{ .dec = 15 }, headPick(&p, X, Y, 16).?);
+    try std.testing.expectEqual(HeadPick{ .dec = 7 }, headPick(&p, X, Y, 8).?);
+    try std.testing.expectEqual(HeadPick{ .dec = 0 }, headPick(&p, X, Y, 1).?);
+    // one row t of the main set (the forward's last row)
+    try std.testing.expectEqual(HeadPick{ .last = 3 }, headPick(&p, X + 3 * D * 2, Y, 1).?);
+    try std.testing.expectEqual(HeadPick{ .row }, headPick(&p, X + 600 * D * 2, Y, 1).?);
+    // the second activation set: its own plans, its own logits buffer
+    try std.testing.expectEqual(HeadPick{ .dec2 = 7 }, headPick(&p, X2, Y2, 8).?);
+    try std.testing.expectEqual(HeadPick{ .last2 = 3 }, headPick(&p, X2 + 3 * D * 2, Y2, 1).?);
+    try std.testing.expectEqual(HeadPick{ .row2 }, headPick(&p, X2 + 600 * D * 2, Y2, 1).?);
+    try std.testing.expectEqual(HeadPick{ .chunk2 }, headPick(&p, X2, Y2, 17).?);
+    // refusals: the wrong logits buffer, an unaligned row, a row above the plans with more than one row
+    try std.testing.expectEqual(@as(?HeadPick, null), headPick(&p, X, Y2, 16));
+    try std.testing.expectEqual(@as(?HeadPick, null), headPick(&p, X + 5, Y, 1));
+    try std.testing.expectEqual(@as(?HeadPick, null), headPick(&p, X + 600 * D * 2, Y, 2));
+    // a lone process without the second set: the same answers, and the second set refuses
+    const q1 = P(X, Y, 0, 0);
+    try std.testing.expectEqual(HeadPick{ .dec = 15 }, headPick(&q1, X, Y, 16).?);
+    try std.testing.expectEqual(@as(?HeadPick, null), headPick(&q1, X2, Y2, 8));
+}
+
 /// `x` [T, k] fp16 to `out` [T, width] fp16 through the plans `bind` built; `wide`: a prompt chunk (the XMX form).
 pub fn project(p: *const Proj, w: *const Weights, d: *Dev, x: *anyopaque, out: *anyopaque, T: u32, wide: bool) !void {
     const xa: u64 = @intFromPtr(x);
     const ya: u64 = @intFromPtr(out);
-    if (p.head) { // the head: one row t of h (the forward's last row), from either activation set
-        if (ya != p.y or T != 1) return error.Exl3Unbound;
-        if (xa >= p.x and (xa - p.x) % (D * 2) == 0) {
-            const t = (xa - p.x) / (D * 2);
-            if (t < p.dec_n) return exl3.encode(&w.p, w.stream(), &p.last[t]);
+    if (p.head) { // the head: T rows of an activation set (a verify window), or one row t of it
+        switch (headPick(p, xa, ya, T) orelse return error.Exl3Unbound) {
+            .dec => |i| return exl3.encode(&w.p, w.stream(), &p.dec[i]),
+            .dec2 => |i| return exl3.encode(&w.p, w.stream(), &p.dec2[i]),
+            .last => |i| return exl3.encode(&w.p, w.stream(), &p.last[i]),
+            .last2 => |i| return exl3.encode(&w.p, w.stream(), &p.last2[i]),
+            .chunk => {
+                const c = p.chunk orelse return error.Exl3Unbound;
+                return exl3.encodeRows(&w.p, w.stream(), &c, T);
+            },
+            .chunk2 => {
+                const c = p.chunk2 orelse return error.Exl3Unbound;
+                return exl3.encodeRows(&w.p, w.stream(), &c, T);
+            },
+            .row => {
+                try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, @ptrFromInt(p.row), x, D * 2, null, 0, null));
+                return exl3.encode(&w.p, w.stream(), &(p.row_plan orelse return error.Exl3Unbound));
+            },
+            .row2 => {
+                try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, @ptrFromInt(p.row), x, D * 2, null, 0, null));
+                return exl3.encode(&w.p, w.stream(), &(p.row_plan2 orelse return error.Exl3Unbound));
+            },
         }
-        // any other row (a prompt chunk's last row, or the second set's): copy it and run the 1-row plan
-        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, @ptrFromInt(p.row), x, D * 2, null, 0, null));
-        return exl3.encode(&w.p, w.stream(), &p.row_plan.?);
     }
     if (ya != p.y and (p.y2 == 0 or ya != p.y2)) return error.Exl3Unbound;
     if (xa == p.x) {
