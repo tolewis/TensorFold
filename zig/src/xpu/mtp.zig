@@ -41,13 +41,13 @@ pub var on = false;
 pub var most: u32 = 3;
 /// Prompt rows one absorb launch (a slice of a prompt chunk).
 pub const SLICE = 128;
-/// The rows a draft or keep absorb pass holds at most (the target's verify window).
-pub const ROWS = 16;
+/// The rows a draft or keep absorb pass holds at most (the target's verify window; XPU_VERIFY_ROWS=32: 32).
+pub const ROWS = q.MAX_ROWS;
 
 pub fn readEnv() void {
     if (std.c.getenv("XPU_MTP")) |v| on = v[0] != '0';
     if (std.c.getenv("XPU_MTP_K")) |v| most = std.fmt.parseInt(u32, std.mem.span(v), 10) catch most;
-    most = @min(@max(most, 1), ROWS - 1);
+    most = @min(@max(most, 1), q.windowRows() - 1);
 }
 
 /// One stream's kept rows of a verify: the slot, the position of its first kept row, the target's block rows of the
@@ -58,8 +58,8 @@ pub const Ask = struct { slot: u32, pending: u32, depth: u32 };
 /// One lone round's result: the accepted tokens (the drafts that landed, then the target's token).
 pub const Round = struct { tokens: []const u32, drafted: u32, accepted: u32 };
 
-/// One projection's plans: rows 1 to 16 (decode and draft), and the prompt slice (SLICE rows).
-const Plans = struct { dec: [ROWS]exl3.Plan = undefined, chunk: ?exl3.Plan = null };
+/// One projection's plans: rows 1 to q.windowRows() (decode and draft), and the prompt slice (SLICE rows).
+const Plans = struct { dec: [ROWS]exl3.Plan = undefined, dec_n: u32 = 0, chunk: ?exl3.Plan = null };
 
 const PlanSet = struct { qkv: Plans, o: Plans, gu: Plans, down: Plans };
 
@@ -212,11 +212,11 @@ pub const Mtp = struct {
         m.act = try d.alloc_(sl * FFR * 2);
         m.ahi = try d.alloc_(sl * (FFR / q.GS + 2) * 2);
         m.alo = try d.alloc_(sl * (FFR / q.GS + 2) * 2);
-        m.logits = try d.alloc_(ROWS * q.VOCAB * 2);
-        m.hb = try d.alloc_(ROWS * D * 2);
+        m.logits = try d.alloc_(q.windowRows() * q.VOCAB * 2);
+        m.hb = try d.alloc_(q.windowRows() * D * 2);
         m.ids = try d.alloc_(sl * 4);
-        m.mt = try d.alloc_(ROWS * 8 * 8);
-        m.mpos = try d.alloc_(ROWS * 4);
+        m.mt = try d.alloc_(q.windowRows() * 8 * 8);
+        m.mpos = try d.alloc_(q.windowRows() * 4);
         m.zero = try d.alloc_(sl * D * 4);
         try d.fill(m.zero, @as(f32, 0.0), sl * D * 4);
         m.last = try d.alloc_(q.MAX_SLOTS * D * 2);
@@ -225,7 +225,7 @@ pub const Mtp = struct {
         var need: [4]usize = .{ 0, 0, 0, 0 };
         inline for (.{ m.qkv, m.o, m.gu, m.down }) |pr| {
             for (pr.parts[0..pr.count], 0..) |pt, j| {
-                need[j] = @max(need[j], exl3.scratchBytes(pt.m.k, pt.m.n, ROWS));
+                need[j] = @max(need[j], exl3.scratchBytes(pt.m.k, pt.m.n, q.windowRows()));
                 need[j] = @max(need[j], exl3.promptScratchBytes(pt.m.k, pt.m.n, SLICE));
             }
         }
@@ -237,12 +237,16 @@ pub const Mtp = struct {
         // the head over the MTP's rows (the same lm_head matrix the target's head uses)
         m.head.x = @intFromPtr(m.hb);
         m.head.y = @intFromPtr(m.logits);
-        for (&m.head.dec, 0..) |*pl, t| pl.* = try m.head.plan(m.w, m.head.x, m.head.y, @intCast(t + 1));
+        const wr: usize = q.windowRows();
+        m.head.dec_n = @intCast(wr);
+        for (m.head.dec[0..wr], 0..) |*pl, t| pl.* = try m.head.plan(m.w, m.head.x, m.head.y, @intCast(t + 1));
         try d.sync();
     }
 
     fn mkPlans(m: *Mtp, out: *Plans, pr: *ex.Proj, x: *anyopaque, y: *anyopaque, ot: exl3.Output, it: exl3.Input) !void {
-        for (&out.dec, 0..) |*pl, t| pl.* = try m.mk(pr, x, y, @intCast(t + 1), ot, it);
+        const wr: usize = q.windowRows();
+        out.dec_n = @intCast(wr);
+        for (out.dec[0..wr], 0..) |*pl, t| pl.* = try m.mk(pr, x, y, @intCast(t + 1), ot, it);
         out.chunk = try m.mk(pr, x, y, SLICE, ot, it);
     }
 
@@ -414,6 +418,7 @@ fn layer(m: *Mtp, slot: u32, n: u32, p0: u32, wide: bool, mt: bool) !void {
 
 fn runPlans(m: *Mtp, ps: *Plans, n: u32, wide: bool) !void {
     if (wide) return exl3.encodeRows(&m.w.p, m.w.stream(), &ps.chunk.?, n);
+    if (n == 0 or n > ps.dec_n) return error.BadRows;
     return exl3.encode(&m.w.p, m.w.stream(), &ps.dec[n - 1]);
 }
 
@@ -470,7 +475,7 @@ pub fn absorbKept(m: *Mtp, items: []const Kept) !void {
         if (m.kv[it.slot] == null) return error.NoSlot;
         total += it.block.len;
     }
-    if (total > ROWS) return error.BadKept;
+    if (total > @as(usize, q.windowRows())) return error.BadKept;
     if (!m.quiet) if (tp.group) |*g| try g.record(.mtp_absorb, @intCast(items.len), 0, 0, m.keptWords(items));
     var row: usize = 0;
     var ends: [ROWS]struct { slot: u32, row: usize } = undefined;

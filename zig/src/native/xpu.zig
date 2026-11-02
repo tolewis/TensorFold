@@ -167,7 +167,11 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
     if (std.c.getenv("XPU_TREE")) |v| h.back.nodes = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 15;
     if (drafter != null or mtp != null) {
         try h.back.measure();
-        std.log.info("qwen27-xpu: window ms by rows: 1 {d:.1}, 2 {d:.1}, 4 {d:.1}, 8 {d:.1}, 16 {d:.1}", .{ h.back.costs[0].ms, h.back.costs[1].ms, h.back.costs[3].ms, h.back.costs[7].ms, h.back.costs[15].ms });
+        const wr = xq.windowRows();
+        if (wr > 16)
+            std.log.info("qwen27-xpu: window ms by rows: 1 {d:.1}, 2 {d:.1}, 4 {d:.1}, 8 {d:.1}, 16 {d:.1}, 24 {d:.1}, 32 {d:.1}", .{ h.back.costs[0].ms, h.back.costs[1].ms, h.back.costs[3].ms, h.back.costs[7].ms, h.back.costs[15].ms, h.back.costs[23].ms, h.back.costs[31].ms })
+        else
+            std.log.info("qwen27-xpu: window ms by rows: 1 {d:.1}, 2 {d:.1}, 4 {d:.1}, 8 {d:.1}, 16 {d:.1}", .{ h.back.costs[0].ms, h.back.costs[1].ms, h.back.costs[3].ms, h.back.costs[7].ms, h.back.costs[15].ms });
     }
     h.cfg = try lanes.Config.init(gpa, h.back.facts(), 16, 15);
     errdefer h.cfg.deinit(gpa);

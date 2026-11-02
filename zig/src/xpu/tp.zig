@@ -41,7 +41,7 @@ const off = dev.off;
 const D = q.D;
 
 const line = 64;
-const rows_max = 1024 + 128 + 16; // the widest forward (q.maxRows at XPU_CHUNK 1024) and a decode window
+const rows_max = 1024 + 128 + q.MAX_ROWS; // the widest forward (q.maxRows at XPU_CHUNK 1024) and a decode window
 const slot_bytes = rows_max * D * 2;
 const ring_len = 64;
 const peer_dead = 10.0; // seconds without an all-reduce: a silent rank is gone, the pair cannot run
@@ -164,6 +164,35 @@ pub const Group = struct {
     }
     pub fn setPool(g: *const Group, pages: u32) void {
         if (g.rank == 0) g.poolWord().store(pages, .seq_cst);
+    }
+
+    /// Lane p25-mtp32: each rank publishes its verify window's rows in its own counter line (offset 24), so the pair
+    /// can refuse to start when XPU_VERIFY_ROWS differs. The pool word of rank 0 is at offset 16, so this word sits
+    /// after it and never collides.
+    fn rowsWord(g: *const Group, r: u32) *std.atomic.Value(u64) {
+        return @ptrCast(@alignCast(g.map.ptr + @as(usize, r) * line + 24));
+    }
+    pub fn setRows(g: *const Group, rows: u32) void {
+        g.rowsWord(g.rank).store(rows, .seq_cst);
+    }
+    /// The rows the peer published; error.BadVerifyRows when they differ from `own`, null after `seconds`.
+    pub fn awaitRows(g: *const Group, own: u32, seconds: f64) !void {
+        const deadline = q.now() + seconds;
+        while (q.now() < deadline) {
+            for (0..g.tp) |r| if (r != g.rank) {
+                const n = g.rowsWord(@intCast(r)).load(.seq_cst);
+                if (n != 0) {
+                    if (n != own) {
+                        std.log.err("qwen27-xpu: XPU_VERIFY_ROWS differs across the pair: rank {d} has {d}, rank {d} has {d}", .{ g.rank, own, r, n });
+                        return error.BadVerifyRows;
+                    }
+                    return;
+                }
+            };
+            var ts: std.c.timespec = .{ .sec = 0, .nsec = 10_000_000 };
+            while (std.c.nanosleep(&ts, &ts) != 0) {}
+        }
+        return error.PeerLost;
     }
     /// The pages rank 0 published; null after `seconds` (rank 0 zeroes the pool before the first request).
     pub fn awaitPool(g: *const Group, seconds: f64) ?u32 {
@@ -626,6 +655,8 @@ test "the shared segment's header words do not collide" {
         @intFromPtr(g.aliveWord(1)) - base,
         @intFromPtr(g.poolWord()) - base,
         @intFromPtr(g.closed()) - base,
+        @intFromPtr(g.rowsWord(0)) - base,
+        @intFromPtr(g.rowsWord(1)) - base,
     };
     for (words, 0..) |a, i| {
         try std.testing.expect(a % 8 == 0);
@@ -638,6 +669,9 @@ test "the shared segment's header words do not collide" {
     try std.testing.expectEqual(@as(usize, 16), words[4]);
     try std.testing.expectEqual(@as(usize, line + 8), words[3]);
     try std.testing.expectEqual(@as(usize, 2 * line + 2 * 2 * slot_bytes + line - 8), words[5]);
+    // the verify-rows word of each rank sits at offset 24 of its line, after the liveness word
+    try std.testing.expectEqual(@as(usize, 24), words[6]);
+    try std.testing.expectEqual(@as(usize, line + 24), words[7]);
 }
 
 test "an fp16 sum rounds once from fp32" {

@@ -26,13 +26,13 @@ pub const Lanes = struct {
     nodes: u32 = 15,
     owners: [xq.MAX_SLOTS]?*lanes.Stream = @splat(null),
     first_logits: [xq.MAX_SLOTS]?[]f32 = @splat(null), // a sampled or structured stream's prompt-row logits, for `first`
-    mask_rows: [16]u32 = undefined, // a verify's greedy structured rows (argmaxMasked on the device)
+    mask_rows: [xq.MAX_ROWS]u32 = undefined, // a verify's greedy structured rows (argmaxMasked on the device)
     mask_bits: ?[]u32 = null, // and their grammar bits, gathered
     masked_vals: ?[]f64 = null, // a structured sampled row's allowed candidates
     masked_ids: ?[]u64 = null,
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
-    ids: [16]u32 = undefined, // the last verify's rows, window after window
+    ids: [xq.MAX_ROWS]u32 = undefined, // the last verify's rows, window after window
     widths: [16]u32 = undefined, // and each window's rows
     count: usize = 0,
     wslots: [16]u32 = undefined, // and each window's slot
@@ -42,7 +42,7 @@ pub const Lanes = struct {
     chain_par: [xq.MAX_SLOTS][16]i32 = undefined, // and each one's parent (−1: the pending token)
     chain_n: [xq.MAX_SLOTS]u32 = @splat(0),
     prompt_skip: u32 = 0, // a prefill's first rows the drafter never reads (further than WIN from the prompt's end)
-    costs: [16]lanes.config.Cost = undefined, // a window's ms by rows (verify and keep), timed by measure()
+    costs: [xq.MAX_ROWS]lanes.config.Cost = undefined, // a window's ms by rows (verify and keep), timed by measure()
     timed: usize = 0,
 
     fn self(ptr: *anyopaque) *Lanes {
@@ -55,9 +55,10 @@ pub const Lanes = struct {
 
     /// What the round loop reads: chains of up to 16 rows, all streams' windows in one shared forward, DFlash2 drafts
     pub fn facts(b: *const Lanes) lanes.Model {
-        if (b.mtp) |m| return .{ .exact_width = m.mostDrafts() + 1, .mtp = true, .speculate = true, .speculate_early = false, .drafts = m.mostDrafts(), .draft_prior = &.{ 0.78, 0.61, 0.47 }, .mtp_step_ms = m.stepMs(), .draft_streams = true, .hidden_rows = true, .streams_exact = true, .batch_rows = 16, .max_streams = b.slots, .lone_copies = false, .window_costs = b.costs[0..b.timed] };
+        const wr = xq.windowRows();
+        if (b.mtp) |m| return .{ .exact_width = m.mostDrafts() + 1, .mtp = true, .speculate = true, .speculate_early = false, .drafts = m.mostDrafts(), .draft_prior = &.{ 0.78, 0.61, 0.47 }, .mtp_step_ms = m.stepMs(), .draft_streams = true, .hidden_rows = true, .streams_exact = true, .batch_rows = wr, .max_streams = b.slots, .lone_copies = false, .window_costs = b.costs[0..b.timed] };
         const head = b.drafter != null;
-        return .{ .exact_width = 16, .mtp = head, .speculate = head, .speculate_early = false, .drafts = if (head) b.block - 1 else 0, .mtp_step_ms = if (head) 0.6 else 0, .draft_streams = head, .window_costs = b.costs[0..b.timed], .hidden_rows = true, .streams_exact = true, .batch_rows = 16, .max_streams = b.slots, .lone_copies = false };
+        return .{ .exact_width = 16, .mtp = head, .speculate = head, .speculate_early = false, .drafts = if (head) b.block - 1 else 0, .mtp_step_ms = if (head) 0.6 else 0, .draft_streams = head, .window_costs = b.costs[0..b.timed], .hidden_rows = true, .streams_exact = true, .batch_rows = wr, .max_streams = b.slots, .lone_copies = false };
     }
 
     /// Each window width's cost on a scratch context in the last slot, for the round loop's depth rule
@@ -79,13 +80,14 @@ pub const Lanes = struct {
                 return xq.now() - t0;
             }
         }.f;
-        for (0..3) |_| _ = try time(r, slot, ids[0..16], &one); // the widest first, while the clocks ramp up
-        for (&b.costs, 1..) |*c, w| {
+        const wr: usize = xq.windowRows();
+        for (0..3) |_| _ = try time(r, slot, ids[0..wr], &one); // the widest first, while the clocks ramp up
+        for (b.costs[0..wr], 1..) |*c, w| {
             var best: f64 = 1e9;
             for (0..3) |_| best = @min(best, try time(r, slot, ids[0..w], &one));
             c.* = .{ .width = @intCast(w), .ms = best * 1e3 };
         }
-        b.timed = b.costs.len;
+        b.timed = wr;
         try r.reset();
     }
 
@@ -110,8 +112,8 @@ pub const Lanes = struct {
         if (b.mtp) |m| {
             if (which.len == 0) return;
             var items: [16]xq.mtp.Kept = undefined;
-            var blocks: [16][16]u32 = undefined;
-            var follows: [16][16]u32 = undefined;
+            var blocks: [16][xq.MAX_ROWS]u32 = undefined;
+            var follows: [16][xq.MAX_ROWS]u32 = undefined;
             for (which, paths, 0..) |i, path, k| {
                 const slot = b.wslots[i];
                 for (path, 0..) |row, j| {
@@ -155,9 +157,10 @@ pub const Lanes = struct {
         if (b.count == 0) return;
         const n = b.count;
         b.count = 0;
-        const all = [16]u32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+        var all: [xq.MAX_ROWS]u32 = undefined;
+        for (&all, 0..) |*x, i| x.* = @intCast(i);
         var paths: [16][]const u32 = undefined;
-        for (paths[0..n], b.widths[0..n]) |*p, w| p.* = all[0..w];
+        for (paths[0..n], b.widths[0..n]) |*p, w| p.* = all[0..@as(usize, w)];
         try b.keepRows(paths[0..n]);
     }
 
@@ -382,7 +385,7 @@ pub const Lanes = struct {
         for (windows, 0..) |w, i| {
             if (w.held > 0) return error.HeldDrafts;
             const rows = w.rows();
-            if (total + rows > 16) return error.WindowTooWide;
+            if (total + rows > @as(usize, xq.windowRows())) return error.WindowTooWide;
             const ids = b.ids[total..][0..rows];
             ids[0] = w.pending;
             @memcpy(ids[1..], w.tokens);
@@ -404,7 +407,7 @@ pub const Lanes = struct {
             const words = w.masks.len / b.widths[i];
             if (mwords != 0 and words != mwords) return error.BadMasks;
             mwords = words;
-            const bits = b.mask_bits orelse try b.gpa.alloc(u32, 16 * xq.MASK_WORDS);
+            const bits = b.mask_bits orelse try b.gpa.alloc(u32, xq.MAX_ROWS * xq.MASK_WORDS);
             b.mask_bits = bits;
             if (words > xq.MASK_WORDS) return error.BadMasks;
             for (0..b.widths[i]) |j| {
@@ -413,7 +416,7 @@ pub const Lanes = struct {
                 nm += 1;
             }
         };
-        var mtok: [16]u32 = undefined;
+        var mtok: [xq.MAX_ROWS]u32 = undefined;
         if (nm > 0) try r.argmaxMasked(b.mask_rows[0..nm], b.mask_bits.?[0 .. nm * mwords], mwords, &mtok);
         var mi: usize = 0;
         var row: u32 = 0;
@@ -457,8 +460,8 @@ pub const Lanes = struct {
             // after each kept row), or the drafts would attend to the previous round's rows
             var which: [16]usize = undefined;
             var items: [16]xq.mtp.Kept = undefined;
-            var blocks: [16][16]u32 = undefined;
-            var follows: [16][16]u32 = undefined;
+            var blocks: [16][xq.MAX_ROWS]u32 = undefined;
+            var follows: [16][xq.MAX_ROWS]u32 = undefined;
             var nk: usize = 0;
             var asks: [16]xq.mtp.Ask = undefined;
             var na: usize = 0;
@@ -467,7 +470,7 @@ pub const Lanes = struct {
                 b.chain_n[slot] = 0;
                 if (q.rows) |rows| if (b.count > 0 and nk < items.len) {
                     const i = std.mem.indexOfScalar(u32, b.wslots[0..b.count], slot) orelse return error.UnknownStream;
-                    if (!b.absorbed[i] and rows.len == q.follow.len and rows.len <= 16) {
+                    if (!b.absorbed[i] and rows.len == q.follow.len and rows.len <= @as(usize, xq.windowRows())) {
                         for (rows, 0..) |r, j| {
                             blocks[nk][j] = b.wfirst[i] + r;
                             follows[nk][j] = q.follow[j];
@@ -647,7 +650,7 @@ pub const Lanes = struct {
         const m = b.mtp.?;
         const r = b.runner;
         var pending = pending0;
-        var out: [16]u32 = undefined;
+        var out: [xq.MAX_ROWS]u32 = undefined;
         while (!s.finished) {
             if (hooks.yield(hooks.ctx)) {
                 s.cache_len = r.pos;
