@@ -202,9 +202,11 @@ pub const Group = struct {
             .sum = @ptrCast(@alignCast(try d.g.hostAlloc(slot_bytes))),
         };
         g.counter(g.rank).store(0, .seq_cst);
-        // a fresh group: no close flag and every rank lives until its next all-reduce (its peers wait for them)
+        // a fresh group: no close flag, and no liveness stamp yet. Zero means "this rank has not reduced yet", so its
+        // peers wait for it up to the 180 s load deadline instead of calling it dead: the weights load for minutes
+        // between `open` and the first all-reduce (lane p2-int: a stamp at open would read as a silent rank there).
         g.closed().store(0, .seq_cst);
-        for (0..g.tp) |r| g.aliveWord(@intCast(r)).store(@intFromFloat(q.now()), .release);
+        for (0..g.tp) |r| g.aliveWord(@intCast(r)).store(0, .release);
         if (g.rank == 0) { // a fresh ring: the followers start at record 0
             g.consumed().store(0, .seq_cst);
             for (0..ring_len) |i| @atomicStore(u64, &g.rec(i).seq, 0, .seq_cst);
@@ -269,14 +271,20 @@ pub const Group = struct {
         for (0..g.tp) |r| if (r != g.rank) {
             const c = g.counter(@intCast(r));
             const alive = aliveWord(g, @intCast(r));
-            const deadline = q.now() + 180.0; // the peer may still be loading
+            const wait_start = q.now();
+            const deadline = wait_start + 180.0; // the peer may still be loading
             var spins: usize = 0;
             while (c.load(.seq_cst) < g.seq) : (spins += 1) {
                 if (spins % 4096 == 0) {
                     const now = q.now();
-                    // a closed segment or a silent peer: the peer is gone, not just late
+                    // a closed segment: the peer is gone, not just late
                     if (closed_word.load(.acquire) != 0 and c.load(.seq_cst) < g.seq) return error.PeerLost;
-                    if (now - @as(f64, @floatFromInt(alive.load(.acquire))) > peer_dead) return error.PeerLost;
+                    // a silent peer: its last all-reduce is older than peer_dead. Both conditions are needed. A peer
+                    // that was idle before this round stamps its liveness within a few ms of the round starting, and
+                    // a peer inside a long prompt chunk is alive, so only a wait that has lasted peer_dead with a
+                    // stale beat calls it dead. Beat 0: the peer has not reduced yet (its weights are loading).
+                    const beat = alive.load(.acquire);
+                    if (beat != 0 and now - wait_start > peer_dead and now - @as(f64, @floatFromInt(beat)) > peer_dead) return error.PeerLost;
                     if (now > deadline) {
                         std.debug.print("rank {d}: all-reduce {d} after record {d}: the peer is at {d}\n", .{ g.rank, g.seq, g.step, c.load(.seq_cst) });
                         return error.PeerLost;
@@ -600,6 +608,36 @@ fn recvFds(sock: linux.fd_t, data: []u8, fds: []i32) !void {
     const h: *const linux.cmsghdr = @ptrCast(&cbuf);
     if (h.level != linux.SOL.SOCKET or h.type != scm_rights or h.len != @sizeOf(linux.cmsghdr) + fds.len * 4) return error.FdRecv;
     @memcpy(std.mem.sliceAsBytes(fds), cbuf[@sizeOf(linux.cmsghdr) .. @sizeOf(linux.cmsghdr) + fds.len * 4]);
+}
+
+test "the shared segment's header words do not collide" {
+    // lane p2-int: lanes p21-pool and p28-ops both took offset 8 of rank 0's cache line for a header word. The pool
+    // word moved to 16, so rank 0's line is counter 0, liveness 8, pool 16, and every header word is its own u64.
+    const size = 2 * line + 2 * 2 * slot_bytes + line;
+    const map = try std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(std.heap.page_size_min), size);
+    defer std.testing.allocator.free(map);
+    @memset(map, 0);
+    const g: Group = .{ .map = map, .rank = 0, .tp = 2, .mine = undefined, .sum = undefined };
+    const base = @intFromPtr(map.ptr);
+    const words = [_]usize{
+        @intFromPtr(g.counter(0)) - base,
+        @intFromPtr(g.counter(1)) - base,
+        @intFromPtr(g.aliveWord(0)) - base,
+        @intFromPtr(g.aliveWord(1)) - base,
+        @intFromPtr(g.poolWord()) - base,
+        @intFromPtr(g.closed()) - base,
+    };
+    for (words, 0..) |a, i| {
+        try std.testing.expect(a % 8 == 0);
+        try std.testing.expect(a + 8 <= size);
+        for (words[i + 1 ..]) |b| try std.testing.expect(a != b);
+    }
+    // rank 0's line: the counter, then the liveness word, then the pool word
+    try std.testing.expectEqual(@as(usize, 0), words[0]);
+    try std.testing.expectEqual(@as(usize, 8), words[2]);
+    try std.testing.expectEqual(@as(usize, 16), words[4]);
+    try std.testing.expectEqual(@as(usize, line + 8), words[3]);
+    try std.testing.expectEqual(@as(usize, 2 * line + 2 * 2 * slot_bytes + line - 8), words[5]);
 }
 
 test "an fp16 sum rounds once from fp32" {
