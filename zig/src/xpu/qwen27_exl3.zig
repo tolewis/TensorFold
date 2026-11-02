@@ -221,9 +221,11 @@ pub const Weights = struct {
             const ev = std.mem.span(v);
             if (ev.len > 0 and ev[0] != '0') {
                 const first: ?exl3.Matrix = blk: {
-                    for (w.projs.items) |pj| for (pj.parts[0..pj.count]) |pt| {
-                        if (pt.m.halves == 8) break :blk pt.m;
-                    };
+                    for (w.projs.items) |pj| {
+                        for (pj.parts[0..pj.count]) |pt| {
+                            if (pt.m.halves == 8) break :blk pt.m.on(pj.base);
+                        }
+                    }
                     break :blk null;
                 };
                 if (first) |mm| {
