@@ -611,7 +611,8 @@ pub const Store = struct {
 
     /// The state at `at` of the `born`-token `prompt` supersedes the entry: a shorter state of the same conversation it extends.
     /// A rewind (a later turn's shorter state) and a reply's end (past `born`) supersede none.
-    pub fn subsumes(prompt: []const u32, born: u32, at: u32, e: *const Entry) bool {
+    pub fn subsumes(s: *const Store, prompt: []const u32, born: u32, at: u32, e: *const Entry) bool {
+        _ = s;
         return policy.subsumes(prompt, born, at, e);
     }
 
