@@ -59,7 +59,57 @@ Notes:
   a fake Level Zero (the `tp.test.an` failure is pre-existing on base).
 - At 10:32:01Z a ps check showed no leftover processes of mine; only the production serve.
 
-## Windowed GPU test (run in a gate window, TP 1, card 0)
+## Item 15 C1 (2026-11-02, lane B70.p22-k1tree, CL took over from the pi agent)
+
+Source review (CPU only). Launch argument counts against the kernel signatures, all match:
+`attn_k1_decode` 15 args (launch 15), `attn_k1_draft` 11 (launch 11), `attn_merge_span` 8 (launch 8).
+Every tree-path buffer is sized for its use: `pm`/`pl`/`po` are sized for `limits.splits(MAX_CTX)` slices,
+the tree table `a.tree` 16 x 17 ints, `grp` 16 x 2 ints, `kmt` 16 x 8 u64, `kpos`/`kposm` 16 ints. The tree
+table (`qwen27.zig` verifyTree) keeps depth in `row[0] & 255`, ancestors in `row[1 ..]`, and ORs the 256/512
+flags after the table is built.
+
+Defect found and fixed (commit `885e35d35`): the partials of a tree verify had stride `NS` per (row, head), but
+`attn_k1_draft` wrote its slice `NS` at `(row, head) * NS + NS`, which is slot 0 of the next head. The draft
+overwrote the next head's prefix slice 0, and the merge read it. Wrong output for every tree row, not a
+device fault. Fix: the prefix launch and `attn_merge_span` take `NS + 1` as the stride (`forward.zig`,
+`k1_bench.zig` tree branch); the draft keeps `NS` as its slice index and writes at stride `NS + 1` (`k1.cl`).
+The K1 tree branch also needs an int8 pool now (`q.kv_i8`), since the draft reads int8 only.
+
+Not established: the cause of `DEVICE_LOST` (0x70000001) in the TP 1 runs. I traced every read and write of the
+tree path in source and found no out-of-bounds index, so the stride fix may not remove it. The next split, if
+it returns: the test runs the K1 tree round first, so a run that skips it (scalar tree only) separates the
+K1 tree kernels from the rest of the verify.
+
+Build (inference1, `-Dtp=1`, from a clean export of `885e35d35`, not from the dirty worktree there):
+
+```
+~/b70/port/zig/zig build xpu-native -Dtp=1 -Doptimize=ReleaseFast -Dngen-include=$HOME/b70/stack/oneDNN/third_party/ngen -p ~/b70/qwen27/zig-out-p22-k1tree-885e35d-tp1
+```
+
+Result: exit 0, empty log. `~/b70/qwen27/zig-out-p22-k1tree-885e35d-tp1/xpu/bin/tensorfold-native`,
+sha256 `8adbd1cb7cb758e5181bf8c2ef178b15267752323eb3d88f383df9b91ec46aed`. The tree test is not in
+`xpu-native`: build it with `xpu-qwen27-tests` (it does not open a card) before the window run.
+
+Remote worktree: `~/b70/integrate/TensorFold/.worktrees/p22-k1tree` (inference1) has uncommitted edits from the
+pi agent at base `c5acd064` (`HANDOFF.md`, `tree_test.zig`, `zig/build/xpu.zig`, `dev.zig`, `k1.zig`,
+`qwen27.zig`, `k1_bench.zig`). `git push` to it is refused for that reason. The lane commit `885e35d35`
+contains all of it except the older variants of the same changes, so the lane branch is the source. Nobody
+has reset or stashed the remote worktree.
+
+Windowed GPU test for CL (TP 1, card 0). CL builds the test binary first, at `-Dtp=1`, from the export:
+
+```
+cd ~/b70/qwen27/src-p22-k1tree-885e35d
+~/b70/port/zig/zig build xpu-qwen27-tests -Dtp=1 -Doptimize=ReleaseFast -Dngen-include=$HOME/b70/stack/oneDNN/third_party/ngen -p ~/b70/qwen27/zig-out-p22-k1tree-885e35d-tp1
+TREE=$(find ~/b70/qwen27/zig-out-p22-k1tree-885e35d-tp1 -name tf-xpu-qwen27-tree-test -type f | head -1) && echo "$TREE"
+timeout 600 env TF_TP_SHM=/dev/shm/tf-tp-k1tree-22 XPU_KV_POOL=1 "$TREE" ~/models/qwen38-27b/Qwen3.8-27B-Uncensored-MLX-4bit
+```
+
+Expect `rows 16: K1 tree and scalar tree agree`, `rows 8: ...`, then `ok`. The test sets `TF_TP_SHM` itself
+(a lane-own name; the group does not open at TP 1). The `find` prints the binary path before the run: check it
+is under `zig-out-p22-k1tree-885e35d-tp1` and not the older `zig-out-p22-k1tree-tp1`.
+
+## Superseded: windowed GPU test of the 10:23Z build (stale, pre-fix)
 
 ```
 cd ~/b70/qwen27/zig-out-p22-k1tree-tp1
