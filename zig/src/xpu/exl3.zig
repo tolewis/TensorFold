@@ -171,9 +171,11 @@ pub const Pipelines = struct {
     matvec: [variants.all.len]mod.Kernel,
     moe_modules: [variants.moe.bits.len]mod.Module,
     moe: [variants.moe.bits.len]MoeKernels,
-    /// The prompt GEMM with the A tile in local memory (XPU_PROMPT_GEMM2=1), one a width.
+    /// The prompt GEMM with the A tile in local memory (XPU_PROMPT_GEMM2=1), one a width. gemm2_count is how many
+    /// of the images loaded: a build whose local memory the driver refuses keeps the live kernel and logs a warning.
     gemm2_modules: [variants.gemm2.bits.len]mod.Module,
     gemm2: [variants.gemm2.bits.len]mod.Kernel,
+    gemm2_count: usize,
 
     pub fn load(ctx: *const Context) Error!Pipelines {
         var p: Pipelines = undefined;
@@ -218,29 +220,32 @@ pub const Pipelines = struct {
             };
             moe_done += 1;
         }
-        var g2_done: usize = 0;
-        errdefer for (0..g2_done) |i| {
-            p.gemm2[i].deinit();
-            p.gemm2_modules[i].unload();
-        };
+        // The prompt GEMM2 images are optional: a driver that refuses their local memory only logs, and
+        // XPU_PROMPT_GEMM2 then falls back to exl3_gemm.
+        p.gemm2_count = 0;
         for (kernels.exl3_gemm2, 0..) |image, i| {
-            p.gemm2_modules[i] = try mod.Module.load(ctx, image);
+            p.gemm2_modules[i] = mod.Module.load(ctx, image) catch |e| {
+                std.log.warn("exl3_gemm2 {d} bits did not load, XPU_PROMPT_GEMM2 falls back to exl3_gemm: {t}", .{ variants.gemm2.bits[i], e });
+                break;
+            };
             p.gemm2[i] = p.gemm2_modules[i].kernel("exl3_gemm2", .{ 128, 1, 1 }) catch |e| {
+                std.log.warn("exl3_gemm2 {d} bits has no kernel, XPU_PROMPT_GEMM2 falls back to exl3_gemm: {t}", .{ variants.gemm2.bits[i], e });
                 p.gemm2_modules[i].unload();
-                return e;
+                break;
             };
             p.gemm2[i].indirect() catch |e| {
+                std.log.warn("exl3_gemm2 {d} bits indirect access failed, XPU_PROMPT_GEMM2 falls back to exl3_gemm: {t}", .{ variants.gemm2.bits[i], e });
                 p.gemm2[i].deinit();
                 p.gemm2_modules[i].unload();
-                return e;
+                break;
             };
-            g2_done += 1;
+            p.gemm2_count += 1;
         }
         return p;
     }
 
     pub fn deinit(p: *Pipelines) void {
-        for (&p.gemm2, &p.gemm2_modules) |*k, *m| {
+        for (p.gemm2[0..p.gemm2_count], p.gemm2_modules[0..p.gemm2_count]) |*k, *m| {
             k.deinit();
             m.unload();
         }
@@ -552,7 +557,10 @@ pub fn encodeRowsMode(p: *const Pipelines, s: Stream, plan: *const Plan, rows: u
     const m = variants.moe;
     const mi = std.mem.indexOfScalar(u32, &m.bits, plan.bits) orelse return error.Invalid;
     const k = p.moe[mi];
-    const g2 = if (gemm2) gemm2Index(plan) else null;
+    const g2 = if (gemm2) blk: {
+        const i = gemm2Index(plan) orelse break :blk null;
+        break :blk if (i < p.gemm2_count) i else null;
+    } else null;
     for ([_]mod.Kernel{ k.rotate_in_h, k.gemm, k.rotate_out_rows }) |kk| {
         try kk.setPtr(0, null); // base: unused with -DEXL3_ABS
         try kk.setPtr(1, plan.table.ptr);

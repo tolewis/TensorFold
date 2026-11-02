@@ -148,8 +148,8 @@ pub fn main(init: std.process.Init) !u8 {
         if (ab) {
             // prompt rows only: exl3_gemm (live) against exl3_gemm2, same case, both timed, outputs compared
             if (plan.rows <= exl3.variants.rows_max) return error.BadCase;
-            const fits = exl3.gemm2Index(&plan) != null;
-            std.debug.print("gemm2 path {s} (n {d}, k {d}, rows {d}, strips gcd {d}, k tiles gcd {d})\n", .{ if (fits) "applies" else "does not apply", plan.n_max, plan.k_max, plan.rows, plan.strips.gcd, plan.k_tiles_gcd });
+            const fits = exl3.gemm2Index(&plan) != null and p.gemm2_count == exl3.variants.gemm2.bits.len;
+            std.debug.print("gemm2 path {s} ({d} images loaded; n {d}, k {d}, rows {d}, strips gcd {d}, k tiles gcd {d})\n", .{ if (fits) "applies" else "does not apply", p.gemm2_count, plan.n_max, plan.k_max, plan.rows, plan.strips.gcd, plan.k_tiles_gcd });
             const y_bytes = y_rows * y_n * y_elem;
             const base_y = try gpa.alloc(u8, y_bytes);
             defer gpa.free(base_y);
