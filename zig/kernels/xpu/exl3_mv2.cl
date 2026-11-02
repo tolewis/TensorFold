@@ -1,6 +1,6 @@
 // exl3_matvec for the 1 row window, lane p29-exl3bw (XPU_EXL3_MV2). The trellis tile of a sub-group is staged in
 // local memory: each lane loads its WL words of the 128 to 192 byte tile once (16 8 byte loads a tile at 4 bits,
-// 128 bytes in flight with no overlapping loads between lanes, against 80 4 byte loads in exl3_matvec), one
+// 128 bytes in flight with no overlapping loads between lanes, against 96 4 byte loads in exl3_matvec), one
 // sub-group barrier publishes them, and every strip decodes its window from local memory. A KU step loads
 // KU x NS tiles before one barrier, so NS * KU * RINGW * 4 bytes are in flight per sub-group. The rotation of x
 // is fused (rows 1): each 128 block of x is rotated once per sub-group, the 64 bytes of rotated x it would re-read
@@ -123,8 +123,8 @@ __kernel void exl3_mv2(__global const uchar *base, __global const exl3_desc *des
                 const uint *t = AT(const uint, d.trellis) + tile + (tn0 + s) * RINGW;
                 #if BITS == 4
                 const uint2 v = *((__global const uint2 *)(t + 2 * c));
-                ld[ldp + (u * NS + s) * RINGW + c] = v.x;
-                ld[ldp + (u * NS + s) * RINGW + SG + c] = v.y;
+                ld[ldp + (u * NS + s) * RINGW + 2 * c] = v.x;
+                ld[ldp + (u * NS + s) * RINGW + 2 * c + 1] = v.y;
                 #else
                 #pragma unroll
                 for (uint j = 0; j < WL; j++) ld[ldp + (u * NS + s) * RINGW + WL * c + j] = t[WL * c + j];
