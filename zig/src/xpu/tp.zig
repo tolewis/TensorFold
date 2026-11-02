@@ -36,6 +36,7 @@ const linux = std.os.linux;
 const q = @import("qwen27.zig");
 const dev = @import("dev.zig");
 const ze = @import("ze");
+const overlap = @import("overlap.zig");
 const Dev = dev.Dev;
 const off = dev.off;
 const D = q.D;
@@ -93,6 +94,7 @@ pub var group: ?Group = null;
 var one_slot = false;
 var trace = false;
 var devflag = false; // TF_TP_DEVFLAG: the device-flag all-reduce (default off)
+var ov = false; // XPU_PREFILL_OVERLAP: the pushes on the copy queue group (default off)
 
 pub const Group = struct {
     map: []align(std.heap.page_size_min) u8,
@@ -120,6 +122,10 @@ pub const Group = struct {
     /// Host staging ring for a flag value (seq % fh_ring): the copy that carries it is queued on the in-order list.
     fh: [*]u64 = undefined,
     devflag: bool = false,
+    /// XPU_PREFILL_OVERLAP: the copy queue group's in-order list carries the partial pushes, and `ev` orders them
+    /// after this rank's consumes (the two-slot ring). `copy` null: the pushes stay on the compute list.
+    copy: ze.H = null,
+    ev: [8]ze.H = @splat(null),
 
     fn counter(g: *const Group, r: u32) *std.atomic.Value(u64) {
         return @ptrCast(@alignCast(g.map.ptr + r * line));
@@ -215,6 +221,7 @@ pub const Group = struct {
         one_slot = std.c.getenv("TF_TP_ONE_SLOT") != null;
         trace = std.c.getenv("TF_TP_TRACE") != null;
         devflag = std.c.getenv("TF_TP_DEVFLAG") != null;
+        ov = false; // set by agreeOverlap, which only runs with XPU_PREFILL_OVERLAP and the device-flag path
         const name: [*:0]const u8 = if (std.c.getenv("TF_TP_SHM")) |v| v else "/dev/shm/tf-tp-qwen27";
         const size = q.TP * line + 2 * q.TP * slot_bytes + line + ring_len * @sizeOf(Rec);
         // the file as the fabric's mailbox opens its own (fabric/tp/mailbox.zig): either rank may create it
@@ -240,11 +247,15 @@ pub const Group = struct {
             g.consumed().store(0, .seq_cst);
             for (0..ring_len) |i| @atomicStore(u64, &g.rec(i).seq, 0, .seq_cst);
         }
-        if (std.c.getenv("TF_TP_HOST") == null) g.openDirect(d) catch |err| {
-            std.log.warn("qwen27-xpu: TP all-reduce stays host-staged: {s}", .{@errorName(err)});
-            g.direct = false;
+        if (std.c.getenv("TF_TP_HOST") == null) g.openDirect(d) catch |err| switch (err) {
+            // XPU_PREFILL_OVERLAP refuses to start rather than run the two ranks on different plans
+            error.OverlapNoFlag, error.OverlapDisagree, error.OverlapNoCopyQueue => return err,
+            else => {
+                std.log.warn("qwen27-xpu: TP all-reduce stays host-staged: {s}", .{@errorName(err)});
+                g.direct = false;
+            },
         };
-        std.log.info("qwen27-xpu: TP {d} rank {d}: all-reduce {s}", .{ g.tp, g.rank, if (g.devflag) "device-flag (the peer's slot pushed over PCIe, the add polls a flag)" else if (g.direct) "device-direct (the peer's slots over PCIe)" else "host-staged" });
+        std.log.info("qwen27-xpu: TP {d} rank {d}: all-reduce {s}{s}", .{ g.tp, g.rank, if (g.devflag) "device-flag (the peer's slot pushed over PCIe, the add polls a flag)" else if (g.direct) "device-direct (the peer's slots over PCIe)" else "host-staged", if (ov) " with the pushes on the copy queue group" else "" });
         return g;
     }
 
@@ -339,18 +350,11 @@ pub const Group = struct {
         if (rows > rows_max) return error.TooManyRows;
         const n: usize = @as(usize, rows) * D;
         g.seq += 1;
+        const seq = g.seq;
         if (g.devflag) {
-            const par: usize = @intCast(g.seq % 2);
-            try g.push(d, partial, n, par);
-            try d.launch(d.k.tp_add_flag, .{ .x = @intCast((n + 255) / 256) }, .{
-                partial,                                   // out: this rank's partial, the sum lands here
-                off(g.blk.?, par * slot_bytes),            // the peer's push (read after the flag)
-                @as(i32, @intCast(n)),                     //
-                off(g.blk.?, blk_flag + par * 8),          // the flag the peer wrote
-                g.seq,                                     //
-                off(g.blk.?, blk_timeout),                 //
-            });
-            try g.consume(d, par);
+            const par: usize = @intCast(seq % 2);
+            if (ov) try g.pushCopy(d, partial, n, par, seq) else try g.push(d, partial, n, par, seq);
+            try g.addFlag(d, partial, n, par, seq);
             return;
         }
         if (g.direct) { // the partial into this rank's slot, the counter, then the add kernel reads the peer's slot
@@ -393,14 +397,15 @@ pub const Group = struct {
         if (rows > rows_max) return error.TooManyRows;
         const n: usize = @as(usize, rows) * D;
         g.seq += 1;
-        const par: usize = @intCast(g.seq % 2);
-        try g.push(d, partial, n, par);
+        const seq = g.seq;
+        const par: usize = @intCast(seq % 2);
+        if (ov) try g.pushCopy(d, partial, n, par, seq) else try g.push(d, partial, n, par, seq);
         try d.launch(d.k.tp_norm_tp, .{ .x = rows }, .{
             nrm.x,                                    // X fp32 residual
             partial,                                  // R fp16, keeps the sum
             off(g.blk.?, par * slot_bytes),           // the peer's push
             off(g.blk.?, blk_flag + par * 8),         //
-            g.seq,                                    //
+            seq,                                      //
             off(g.blk.?, blk_timeout),                //
             nrm.w,                                    // WN
             nrm.h,                                    //
@@ -415,26 +420,97 @@ pub const Group = struct {
             nrm.ms,                                   //
             nrm.rot,                                  //
         });
-        try g.consume(d, par);
+        try g.consume(d, par, seq);
+        if (ov) try g.signalConsumed(d, seq);
+    }
+
+    /// XPU_PREFILL_OVERLAP: this rank's partial into the peer's slot and then the flag, without the add. The add
+    /// follows later, so the copy engine's push runs while the other sub-chunk computes. Returns the exchange's
+    /// sequence number, which `addOnly` needs: the two ranks pair the pushes and the adds by it.
+    pub fn pushOnly(g: *Group, d: *Dev, partial: *anyopaque, rows: u32) !u64 {
+        if (!g.devflag) return error.NotDeviceFlag;
+        if (rows > rows_max) return error.TooManyRows;
+        const n: usize = @as(usize, rows) * D;
+        g.seq += 1;
+        const seq = g.seq;
+        const par: usize = @intCast(seq % 2);
+        if (ov) try g.pushCopy(d, partial, n, par, seq) else try g.push(d, partial, n, par, seq);
+        return seq;
+    }
+
+    /// The add of exchange `seq` whose push `pushOnly` queued: the kernel polls the peer's flag, so it runs as soon as
+    /// the push has landed. Then the ring's consumed counter, and the signal the next push waits for.
+    pub fn addOnly(g: *Group, d: *Dev, partial: *anyopaque, rows: u32, seq: u64) !void {
+        if (!g.devflag) return error.NotDeviceFlag;
+        if (rows > rows_max) return error.TooManyRows;
+        const n: usize = @as(usize, rows) * D;
+        const par: usize = @intCast(seq % 2);
+        try g.addFlag(d, partial, n, par, seq);
+    }
+
+    /// The add kernel of a device-flag exchange, the ring's consumed counter and (XPU_PREFILL_OVERLAP) the event the
+    /// next push waits for.
+    fn addFlag(g: *Group, d: *Dev, partial: *anyopaque, n: usize, par: usize, seq: u64) !void {
+        try d.launch(d.k.tp_add_flag, .{ .x = @intCast((n + 255) / 256) }, .{
+            partial,                                   // out: this rank's partial, the sum lands here
+            off(g.blk.?, par * slot_bytes),            // the peer's push (read after the flag)
+            @as(i32, @intCast(n)),                     //
+            off(g.blk.?, blk_flag + par * 8),          // the flag the peer wrote
+            seq,                                       //
+            off(g.blk.?, blk_timeout),                 //
+        });
+        try g.consume(d, par, seq);
+        if (ov) try g.signalConsumed(d, seq);
+    }
+
+    /// The push on the copy queue group (XPU_PREFILL_OVERLAP): the partial into the peer's slot and then the flag,
+    /// both on the copy engine's in-order list, so the peer's add kernel sees the partial complete before the flag.
+    /// The wait on `ev` starts the push only after this rank's consume of the exchange before it has finished, so the
+    /// peer has read the slot the two-slot ring reuses. Nothing is queued before the first exchange's push: the peer's
+    /// slots are empty then.
+    fn pushCopy(g: *Group, d: *Dev, partial: *anyopaque, n: usize, par: usize, seq: u64) !void {
+        const pb = g.peer_blk.?;
+        const cl = g.copy;
+        if (seq > 1) {
+            var e = [1]ze.H{g.ev[@intCast((seq - 1) % 8)]};
+            try ze.check(d.g.api.zeCommandListAppendWaitOnEvents(cl, 1, &e));
+        }
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(cl, off(pb, par * slot_bytes), partial, n * 2, null, 0, null));
+        // the flag must not land before the partial, so the peer's add cannot read a stale slot: a barrier between
+        // them, rather than trusting the copy engine to keep two copies' writes visible in order
+        try ze.check(d.g.api.zeCommandListAppendBarrier(cl, null, 0, null));
+        const hi: usize = @intCast(seq % fh_ring);
+        g.fh[hi] = seq;
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(cl, off(pb, blk_flag + par * 8), @ptrCast(&g.fh[hi]), 8, null, 0, null));
+    }
+
+    /// The event the copy engine's next push waits for: this rank's consume of exchange `seq` finished on the compute
+    /// list, so the peer has read the slot the next push writes again. The reset precedes the signal, and the event is
+    /// reused eight exchanges later, after the copy that waited on it has run (the add of the next exchange polls the
+    /// flag that copy writes, so the compute list cannot pass it).
+    fn signalConsumed(g: *Group, d: *Dev, seq: u64) !void {
+        const e = g.ev[@intCast(seq % 8)];
+        try ze.check(d.g.api.zeCommandListAppendEventReset(d.list, e));
+        try ze.check(d.g.api.zeCommandListAppendSignalEvent(d.list, e));
     }
 
     /// Pushes this rank's partial into the peer's slot and then the flag, both on the in-order list: the peer's
     /// kernel sees the partial complete before the flag.
-    fn push(g: *Group, d: *Dev, partial: *anyopaque, n: usize, par: usize) !void {
+    fn push(g: *Group, d: *Dev, partial: *anyopaque, n: usize, par: usize, seq: u64) !void {
         const pb = g.peer_blk.?;
         try dev.copy(d, off(pb, par * slot_bytes), partial, n * 2);
-        const hi: usize = @intCast(g.seq % fh_ring);
-        g.fh[hi] = g.seq;
+        const hi: usize = @intCast(seq % fh_ring);
+        g.fh[hi] = seq;
         try dev.copy(d, off(pb, blk_flag + par * 8), @ptrCast(&g.fh[hi]), 8);
     }
 
     /// Publishes this rank's consumed counter for the slot and waits until the peer consumed the slot the next
     /// exchange writes again (two slots). Runs after the add kernel, so the slot's data is read out first.
-    fn consume(g: *Group, d: *Dev, par: usize) !void {
-        const need: u64 = if (g.seq >= 2) g.seq - 1 else 0;
+    fn consume(g: *Group, d: *Dev, par: usize, seq: u64) !void {
+        const need: u64 = if (seq >= 2) seq - 1 else 0;
         try d.launch(d.k.tp_consume, .{ .x = 1 }, .{
             off(g.own_cons.?, par * 8),                 // this rank's consumed counter, pushed to the peer next
-            g.seq,                                      //
+            seq,                                        //
             off(g.blk.?, blk_pcons + (1 - par) * 8),    // the peer's consumption of the slot the next exchange reuses
             need,                                       //
             off(g.blk.?, blk_timeout),                  //
@@ -538,6 +614,7 @@ pub const Group = struct {
         var peer_mode: u8 = 0;
         try sendByte(conn, mode);
         try recvByte(conn, &peer_mode);
+        if (overlap.on) try g.agreeOverlap(d, conn, mode, peer_mode);
         if (mode == 1 and peer_mode == 1) {
             g.devflag = true;
             g.direct = true;
@@ -589,6 +666,37 @@ pub const Group = struct {
         if (!ok) std.log.warn("qwen27-xpu: TP rank {d}: the peer's block did not take the writes (flag 0x{x}, push 0x{x})", .{ g.rank, got_flag, got_push });
         return ok;
     }
+
+    /// XPU_PREFILL_OVERLAP: both ranks must run the same plan, because a push is paired with the add the other rank
+    /// queues for the same exchange. The settings cross over the socket beside the IPC handles, and a rank refuses
+    /// to start when they differ. It also needs the device-flag path: the add polls the peer's flag, so no host round
+    /// trip sits between the push and the add.
+    fn agreeOverlap(g: *Group, d: *Dev, conn: linux.fd_t, mode: u8, peer_mode: u8) !void {
+        if (mode != 1 or peer_mode != 1) {
+            std.log.err("qwen27-xpu: TP rank {d}: XPU_PREFILL_OVERLAP needs TF_TP_DEVFLAG=1 on both ranks (this rank {d}, the peer {d})", .{ g.rank, mode, peer_mode });
+            return error.OverlapNoFlag;
+        }
+        const words = [_]u32{ 1, overlap.rows, q.CHUNK };
+        try sendWords(conn, &words);
+        var theirs = [3]u32{ 0, 0, 0 };
+        try recvWords(conn, &theirs);
+        if (!std.mem.eql(u32, &words, &theirs)) {
+            std.log.err("qwen27-xpu: TP rank {d}: the overlap plans differ (this rank on {d} rows {d} chunk {d}, the peer on {d} rows {d} chunk {d})", .{ g.rank, words[0], words[1], words[2], theirs[0], theirs[1], theirs[2] });
+            return error.OverlapDisagree;
+        }
+        // the copy queue group (ordinal 1 on the B70): an in-order immediate list, and the events that order a push
+        // after this rank's consume of the exchange before it. No copy queue group: refuse to start, rather than run
+        // the overlap plan's pushes on the compute list (which would make the gate's flag-on run no faster).
+        g.copy = d.g.immediate(1, 0) catch |err| {
+            std.log.err("qwen27-xpu: TP rank {d}: XPU_PREFILL_OVERLAP needs the copy queue group (ordinal 1): {s}", .{ g.rank, @errorName(err) });
+            return error.OverlapNoCopyQueue;
+        };
+        g.ev = d.g.eventsDevice(8) catch |err| {
+            std.log.err("qwen27-xpu: TP rank {d}: XPU_PREFILL_OVERLAP needs its events: {s}", .{ g.rank, @errorName(err) });
+            return error.OverlapNoCopyQueue;
+        };
+        ov = true;
+    }
 };
 
 const cmsg_space = ((@sizeOf(linux.cmsghdr) + 2 * 4 + 7) / 8) * 8; // a control message with two fds
@@ -603,6 +711,26 @@ fn sendByte(sock: linux.fd_t, b: u8) !void {
     var v = [1]u8{b};
     const rc = linux.write(sock, &v, 1);
     if (failed(rc) or rc != 1) return error.ByteSend;
+}
+
+fn sendWords(sock: linux.fd_t, words: []const u32) !void {
+    const bytes = std.mem.sliceAsBytes(words);
+    var at: usize = 0;
+    while (at < bytes.len) {
+        const rc = linux.write(sock, bytes[at..].ptr, bytes.len - at);
+        if (failed(rc) or rc == 0) return error.WordSend;
+        at += rc;
+    }
+}
+
+fn recvWords(sock: linux.fd_t, words: []u32) !void {
+    const bytes = std.mem.sliceAsBytes(words);
+    var at: usize = 0;
+    while (at < bytes.len) {
+        const rc = linux.read(sock, bytes[at..].ptr, bytes.len - at);
+        if (failed(rc) or rc == 0) return error.WordRecv;
+        at += rc;
+    }
 }
 
 fn recvByte(sock: linux.fd_t, b: *u8) !void {
