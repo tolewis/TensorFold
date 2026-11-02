@@ -419,7 +419,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
                     const kern = if (rd.k16) d.k.attn_k1_16.? else d.k.attn_k1.?;
                     var posm_host: [16]i32 = undefined;
                     k1mod.mergePos(mm2.kkind, mm2.kpos, plan.ns, plan.span, &posm_host);
-                    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.kpos, mm2.kpos, 16 * 4, null, 0, null));
+                    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.kpos, @ptrCast(&mm2.kpos[0]), 16 * 4, null, 0, null));
                     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.kposm, &posm_host, 16 * 4, null, 0, null));
                     try k1mod.queueGroups(d, a.grp, grp_host[0 .. 2 * rd.n], rd.n);
                     // the partials' stride is ns + 1 (k1.cl attn_k1_draft_mt): the prefix launch and the merge take
