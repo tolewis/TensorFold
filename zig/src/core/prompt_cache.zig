@@ -497,30 +497,19 @@ pub const Store = struct {
                 if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held -| bytes); // spare that cannot take this state goes before any state
                 if (s.spare() < free_) continue;
             }
-            // the conversation's own older state it extends takes its storage first, then the least recently used one
+            // the conversation's own older state it extends gives its storage before the least recently used one
             const victim = s.victimBut(null, prompt, born) orelse return s.fail(at, error.CacheBorrowed);
-            const superseded = policy.subsumed(s, prompt, born, at);
             const vat = s.entries.items[victim].at;
             const vbytes = s.entries.items[victim].bytes;
             const vreason = policy.victimReason(s, victim, prompt, born);
-            if (superseded) |i| {
-                if (i != victim) {
-                    const sat = s.entries.items[i].at;
-                    const sbytes = s.entries.items[i].bytes;
-                    const a = @max(i, victim);
-                    const b = @min(i, victim); // the higher index first: orderedRemove shifts the lower one
-                    s.remove(a);
-                    s.remove(b); // the superseded one leaves for its conversation, the victim for the store
-                    evicted(sat, sbytes, "superseded by the state this pass keeps");
-                    evicted(vat, vbytes, vreason);
-                } else {
-                    s.remove(i);
-                    evicted(vat, vbytes, "superseded by the state this pass keeps");
-                }
-            } else {
-                s.remove(victim); // its storage may come back spare and take this state
-                evicted(vat, vbytes, vreason);
+            if (policy.subsumed(s, prompt, born, at)) |i| if (i != victim) {
+                evicted(s.entries.items[i].at, s.entries.items[i].bytes, "superseded by the state this pass keeps");
+                s.remove(i); // the loop rechecks the budget; the least recently used one leaves only if the room is still short
+                s.counts.evicted += 1;
+                continue;
             }
+            evicted(vat, vbytes, vreason); // the state may be superseded and the victim at once; the reason names it
+            s.remove(victim); // its storage may come back spare and take this state
             s.counts.evicted += 1;
         }
         if (s.entries.items.len == 0) if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| bytes);
@@ -612,8 +601,7 @@ pub const Store = struct {
     /// The state at `at` of the `born`-token `prompt` supersedes the entry: a shorter state of the same conversation it extends.
     /// A rewind (a later turn's shorter state) and a reply's end (past `born`) supersede none.
     pub fn subsumes(s: *const Store, prompt: []const u32, born: u32, at: u32, e: *const Entry) bool {
-        _ = s;
-        return policy.subsumes(prompt, born, at, e);
+        return policy.subsumes(s, prompt, born, at, e);
     }
 
     /// The first entry the state at `at` supersedes, or null.

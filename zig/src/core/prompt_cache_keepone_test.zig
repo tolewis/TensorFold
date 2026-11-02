@@ -1,7 +1,7 @@
 //! The prompt cache's keep-one rule: a later turn's state takes its own older one's storage, and the least
 //! recently used one never wins a kept state's page. A fake family's snapshots are host memory (a position and a
-//! running sum). A budget of 210 MiB holds two 104 MiB states; a third of 106 MiB fits beside one, so each new
-//! state forces exactly one eviction.
+//! running sum); a state's bytes are 100 + position. A budget of 300 holds two of them, so a third keep forces
+//! exactly one eviction.
 const std = @import("std");
 const pc = @import("prompt_cache.zig");
 const Store = pc.Store;
@@ -20,17 +20,17 @@ test "a later turn's state takes its own older one's storage, not the least rece
     defer arena.deinit();
     const a = arena.allocator();
     var f: Fake = .{ .gpa = gpa };
-    var s = Store.init(gpa, f.snapshots(), .{ .lookahead = 1, .min_prompt = 0 }, 210 << 20);
+    var s = Store.init(gpa, f.snapshots(), .{ .lookahead = 1, .min_prompt = 0 }, 300); // bytes: 100 + position
     defer s.deinit();
+    // An unrelated conversation keeps a state first: the least recently used state when the turn comes.
+    const pc_: []const u32 = &[_]u32{ 7, 8, 9, 1, 2 };
+    var p = try s.begin(a, pc_, 4, &.{}, &.{}, null, &.{});
+    _ = f.pass(&s, pc_, p);
     // Turn 1 of a conversation: history [1 2 3 4], its reply's first token 9 keys the state.
     const p1: []const u32 = &[_]u32{ 1, 2, 3, 4, 9 };
-    var p = try s.begin(a, p1, 4, &.{}, &.{}, null, &.{});
+    p = try s.begin(a, p1, 4, &.{}, &.{}, null, &.{});
     try std.testing.expectEqualSlices(u32, &.{ 4 }, p.marks);
     _ = f.pass(&s, p1, p);
-    // An unrelated conversation keeps a state of its own.
-    const pc_: []const u32 = &[_]u32{ 7, 8, 9, 1, 2 };
-    p = try s.begin(a, pc_, 4, &.{}, &.{}, null, &.{});
-    _ = f.pass(&s, pc_, p);
     // Turn 2 of the first conversation: history [1 2 3 4 5 6], and its reply's first token differs from the one
     // that keyed turn 1's state, so the prompt extends that state's tokens but not its key.
     const p2: []const u32 = &[_]u32{ 1, 2, 3, 4, 5, 6, 9 };
@@ -41,7 +41,7 @@ test "a later turn's state takes its own older one's storage, not the least rece
     try std.testing.expect(at(&s, &.{ 1, 2, 3, 4 }) == null); // the conversation's older state took its storage
     try std.testing.expectEqual(@as(u32, 6), s.find(p2, &.{}, &.{}).?.at); // its later turn's state stayed
     try std.testing.expectEqual(@as(u32, 4), s.find(pc_, &.{}, &.{}).?.at); // the unrelated state stayed
-    try std.testing.expectEqual(@as(u64, 1), s.counts.evicted); // one state left; the unrelated one never left
+    try std.testing.expectEqual(@as(u64, 1), s.counts.evicted); // exactly one state left; the unrelated one never left
     try std.testing.expect(s.subsumed(p2, 7, 6) == null); // nothing the later turn's state supersedes remains
 }
 
