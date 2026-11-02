@@ -17,8 +17,9 @@ const HV = q.GDN_V_HEADS;
 const alloc = q.alloc;
 const off = dev.off;
 
-/// Rows of a decode window (DFlash2 verify windows): a plan a row count, built once.
-pub const WINDOW = 16;
+/// Rows of a decode window (verify windows): a plan a row count, built once up to q.windowRows()
+/// (XPU_VERIFY_ROWS=32: 32 rows; 16 default). The arrays hold q.MAX_ROWS plans; `dec_n` is how many are built.
+pub const WINDOW = q.MAX_ROWS;
 
 /// The slice of a stored matrix a rank holds: rows [k0, k1) and columns [n0, n1), in multiples of 16 (the trellis
 /// tile) and of 128 (the rotate block) where the matvec rotates. All zero: the whole matrix (TP 1).
@@ -45,7 +46,7 @@ pub const Cut = struct {
 pub const Spec = struct { prefix: []const u8, cut: Cut = .{} };
 
 /// A stored matrix's place in its layer's device region.
-const Mat = struct {
+pub const Mat = struct {
     k: u32,
     n: u32,
     halves: u32,
@@ -108,7 +109,7 @@ const Pack = struct {
 };
 
 /// One part of a fused projection: the matrix and its first output column.
-const Part = struct { m: Mat, col: u32 };
+pub const Part = struct { m: Mat, col: u32 };
 
 /// An EXL3 projection of the runner: its parts in one region, the fused output width, and the plans over the
 /// runner's fixed buffers (bind). `loader.Proj.x3` points here.
@@ -123,14 +124,15 @@ pub const Proj = struct {
     x: u64 = 0,
     y: u64 = 0,
     dec: [WINDOW]exl3.Plan = undefined,
+    dec_n: u32 = 0, // the row counts `dec` holds plans for (1 .. q.windowRows())
     chunk: ?exl3.Plan = null,
-    /// The head only: rows 1 from row t of x (want = last, t < WINDOW), and from `row` (a prompt chunk's last row).
+    /// The head only: rows 1 from row t of x (want = last, t < dec_n), and from `row` (a prompt chunk's last row).
     last: [WINDOW]exl3.Plan = undefined,
     row: u64 = 0,
     row_plan: ?exl3.Plan = null,
     head: bool = false,
 
-    fn groups(p: *const Proj, w: *const Weights, x: u64, y: u64, rows: u32, out: *[4]exl3.Group) []exl3.Group {
+    pub fn groups(p: *const Proj, w: *const Weights, x: u64, y: u64, rows: u32, out: *[4]exl3.Group) []exl3.Group {
         for (p.parts[0..p.count], out[0..p.count], 0..) |pt, *g, j| g.* = .{
             .m = pt.m.on(p.base),
             .rows = rows,
@@ -145,7 +147,7 @@ pub const Proj = struct {
         return out[0..p.count];
     }
 
-    fn plan(p: *const Proj, w: *const Weights, x: u64, y: u64, rows: u32) !exl3.Plan {
+    pub fn plan(p: *const Proj, w: *const Weights, x: u64, y: u64, rows: u32) !exl3.Plan {
         var gs: [4]exl3.Group = undefined;
         return exl3.Plan.init(&w.ctx, w.stream(), alloc, p.groups(w, x, y, rows, &gs));
     }
@@ -160,13 +162,13 @@ pub const Weights = struct {
     head: *Proj = undefined,
     scratch: [4]u64 = .{ 0, 0, 0, 0 },
 
-    fn stream(w: *const Weights) xpu.Stream {
+    pub fn stream(w: *const Weights) xpu.Stream {
         return .{ .ctx = &w.ctx, .list = w.list };
     }
 
     /// Uploads one projection's parts (each a stored matrix, or the rank's slice of one) into one region, side by
     /// side at the output; `width` at least the parts' columns (the consumers' stride).
-    fn add(w: *Weights, d: *Dev, c: *const Checkpoint, specs: []const Spec, width: u32) !*Proj {
+    pub fn add(w: *Weights, d: *Dev, c: *const Checkpoint, specs: []const Spec, width: u32) !*Proj {
         var pk: Pack = .{};
         defer pk.host.deinit(alloc);
         if (specs.len > 4) return error.UnexpectedShape;
@@ -192,8 +194,9 @@ pub const Weights = struct {
         const rows = q.maxRows();
         if (rows > exl3.variants.moe.prompt_rows_max) return error.InvalidExl3Rows;
         var need: [4]usize = .{ 0, 0, 0, 0 };
+        const wr: usize = q.windowRows();
         for (w.projs.items) |p| for (p.parts[0..p.count], 0..) |pt, j| {
-            need[j] = @max(need[j], exl3.scratchBytes(pt.m.k, pt.m.n, WINDOW));
+            need[j] = @max(need[j], exl3.scratchBytes(pt.m.k, pt.m.n, wr));
             if (!p.head) need[j] = @max(need[j], exl3.promptScratchBytes(pt.m.k, pt.m.n, rows));
         };
         for (&w.scratch, need) |*sc, n| if (n > 0) {
@@ -211,8 +214,9 @@ pub const Weights = struct {
         const hp = w.head;
         hp.x = h;
         hp.y = @intFromPtr(a.logits);
-        for (&hp.dec, 0..) |*pl, t| pl.* = try hp.plan(w, h, hp.y, @intCast(t + 1));
-        for (&hp.last, 0..) |*pl, t| pl.* = try hp.plan(w, h + t * D * 2, hp.y, 1);
+        hp.dec_n = @intCast(wr);
+        for (hp.dec[0..wr], 0..) |*pl, t| pl.* = try hp.plan(w, h, hp.y, @intCast(t + 1));
+        for (hp.last[0..wr], 0..) |*pl, t| pl.* = try hp.plan(w, h + t * D * 2, hp.y, 1);
         hp.row = @intFromPtr(try d.alloc_(D * 2));
         hp.row_plan = try hp.plan(w, hp.row, hp.y, 1);
         try d.sync();
@@ -221,7 +225,9 @@ pub const Weights = struct {
     fn bindOne(w: *const Weights, p: *Proj, x: u64, y: u64, rows: u32) !void {
         p.x = x;
         p.y = y;
-        for (&p.dec, 0..) |*pl, t| pl.* = try p.plan(w, x, y, @intCast(t + 1));
+        p.dec_n = @intCast(q.windowRows());
+        const wr: usize = q.windowRows();
+        for (p.dec[0..wr], 0..) |*pl, t| pl.* = try p.plan(w, x, y, @intCast(t + 1));
         p.chunk = try p.plan(w, x, y, rows);
     }
 };
@@ -232,15 +238,15 @@ pub fn project(p: *const Proj, w: *const Weights, d: *Dev, x: *anyopaque, out: *
     const ya: u64 = @intFromPtr(out);
     if (ya != p.y) return error.Exl3Unbound;
     if (xa == p.x) {
-        if (!wide and T <= WINDOW) return exl3.encode(&w.p, w.stream(), &p.dec[T - 1]);
+        if (!wide and T <= p.dec_n) return exl3.encode(&w.p, w.stream(), &p.dec[T - 1]);
         if (p.chunk) |*c| return exl3.encodeRows(&w.p, w.stream(), c, T);
-        if (T <= WINDOW) return exl3.encode(&w.p, w.stream(), &p.dec[T - 1]);
+        if (T <= p.dec_n) return exl3.encode(&w.p, w.stream(), &p.dec[T - 1]);
         return error.Exl3Unbound;
     }
     // the head: one row t of h (the forward's last row)
     if (!p.head or T != 1 or xa < p.x or (xa - p.x) % (D * 2) != 0) return error.Exl3Unbound;
     const t = (xa - p.x) / (D * 2);
-    if (t < WINDOW) return exl3.encode(&w.p, w.stream(), &p.last[t]);
+    if (t < p.dec_n) return exl3.encode(&w.p, w.stream(), &p.last[t]);
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, @ptrFromInt(p.row), x, D * 2, null, 0, null));
     return exl3.encode(&w.p, w.stream(), &p.row_plan.?);
 }
@@ -267,7 +273,7 @@ fn rowsTensor(d: *Dev, c: *const Checkpoint, name: []const u8, row_bytes: usize,
 }
 
 /// A BF16 norm weight; `centred`: stored as gamma − 1 (the Hugging Face Qwen3.5 form) gets its 1 back.
-fn normTensor(d: *Dev, c: *const Checkpoint, name: []const u8, centred: bool) !*anyopaque {
+pub fn normTensor(d: *Dev, c: *const Checkpoint, name: []const u8, centred: bool) !*anyopaque {
     const t = try c.get(name);
     if (!std.mem.eql(u8, t.dtype, "BF16")) return error.UnexpectedDtype;
     if (!centred) return d.upload(t.bytes);

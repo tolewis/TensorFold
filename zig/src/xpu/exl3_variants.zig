@@ -7,8 +7,9 @@ pub const Variant = struct { bits: u32, rows: u32, ns: u32, hs: bool };
 
 /// Sage EXL3: 4 bits (language layers and MTP), 6 bits (vision and lm_head).
 pub const bits = [_]u32{ 4, 6 };
-/// Row buckets: a launch of r rows runs the smallest bucket >= r.
-pub const rows = [_]u32{ 1, 2, 4, 8, 16 };
+/// Row buckets: a launch of r rows runs the smallest bucket >= r. 32 is lane p25-mtp32's verify window
+/// (XPU_VERIFY_ROWS=32): the 24-row window runs the 32-row image (the next bucket up).
+pub const rows = [_]u32{ 1, 2, 4, 8, 16, 32 };
 pub const rows_max = rows[rows.len - 1];
 const strips_per_group = [_]u32{ 1, 2, 4 };
 
@@ -145,8 +146,8 @@ test "picks follow the measured rule" {
             return all[pick(b, r, .{ .min = smin, .gcd = sgcd, .total = smin * 320 }).?];
         }
     }.v;
-    try std.testing.expectEqual(Variant{ .bits = 6, .rows = 1, .ns = 4, .hs = false }, at(6, 1, 15520, 15520));
-    try std.testing.expectEqual(Variant{ .bits = 6, .rows = 4, .ns = 4, .hs = true }, at(6, 3, 15520, 15520));
+    try std.testing.expectEqual(Variant{ .bits = 6, .rows = 1, .ns = 1, .hs = false }, at(6, 1, 15520, 15520));
+    try std.testing.expectEqual(Variant{ .bits = 6, .rows = 4, .ns = 1, .hs = false }, at(6, 3, 15520, 15520));
     // wide groups: NS 1 to 4 rows, NS 4 at 8, NS 2 at 16 (the 27B, 2026-11-01)
     try std.testing.expectEqual(Variant{ .bits = 4, .rows = 1, .ns = 1, .hs = false }, at(4, 1, 128, 128));
     try std.testing.expectEqual(Variant{ .bits = 4, .rows = 4, .ns = 1, .hs = false }, at(4, 3, 128, 128));
@@ -155,7 +156,11 @@ test "picks follow the measured rule" {
     try std.testing.expectEqual(Variant{ .bits = 4, .rows = 2, .ns = 2, .hs = true }, at(4, 2, 32, 32));
     try std.testing.expectEqual(Variant{ .bits = 4, .rows = 1, .ns = 1, .hs = false }, at(4, 1, 33, 33));
     try std.testing.expectEqual(@as(?usize, null), pick(5, 1, .{ .min = 128, .gcd = 128, .total = 1024 }));
-    try std.testing.expectEqual(@as(?usize, null), pick(4, 17, .{ .min = 128, .gcd = 128, .total = 1024 }));
+    try std.testing.expectEqual(@as(?usize, null), pick(4, 33, .{ .min = 128, .gcd = 128, .total = 1024 }));
+    // the 32-row bucket: a 17-row or 24-row launch runs the 32-row image (lane p25-mtp32)
+    try std.testing.expectEqual(@as(u32, 32), all[pick(4, 17, .{ .min = 128, .gcd = 128, .total = 1024 }).?].rows);
+    try std.testing.expectEqual(@as(u32, 32), all[pick(4, 24, .{ .min = 128, .gcd = 128, .total = 1024 }).?].rows);
+    try std.testing.expectEqual(@as(u32, 32), all[pick(6, 32, .{ .min = 15520, .gcd = 15520, .total = 15520 * 320 }).?].rows);
     // one layer's top-8: NS 1, then K splits up to the target
     try std.testing.expectEqual(@as(u32, 1), all[pick(4, 1, .{ .min = 32, .gcd = 32, .total = 256 }).?].ns);
     try std.testing.expectEqual(@as(u32, 16), split(256, 128, false));
@@ -169,5 +174,6 @@ test "picks follow the measured rule" {
     try std.testing.expectEqual(@as(u32, 16), split(80, 1088, true));
     try std.testing.expectEqual(@as(u32, 8), split(160, 320, true));
     try std.testing.expectEqual(@as(u32, 1), split(3880, 320, true));
-    try std.testing.expectEqualStrings("exl3_b6_r4_n4_hs", name(all[all.len - 7]));
+    // the last image is the widest bucket (32 rows, lane p25-mtp32)
+    try std.testing.expectEqualStrings("exl3_b6_r32_n4", name(all[all.len - 1]));
 }

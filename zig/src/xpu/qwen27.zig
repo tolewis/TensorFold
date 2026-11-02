@@ -34,6 +34,7 @@ pub const profReport = dev.profReport;
 pub const Proj = loader.Proj;
 pub const Model = loader.Model;
 pub const Acts = fwd.Acts;
+pub const mtp = @import("mtp.zig");
 pub const embedRows = fwd.embedRows;
 pub const gemm = fwd.gemm;
 pub const Want = fwd.Want;
@@ -66,6 +67,16 @@ pub const MASK_WORDS = (VOCAB + 31) / 32; // a grammar row's bits (structured ou
 pub var GS: u32 = 64;
 pub const GDN_IN = (GDN_AB + 2 * GDN_V_HEADS + 255) / 256 * 256; // qkv 10240 | z 6144 | a 48 | b 48 = 16480, padded to the GEMM tile (256): 16640 at TP 1
 pub const ATT_IN = ATT_Q_HEADS * 512 + 2 * ATT_KV_HEADS * 256; // (q 256 | gate 256) × 24 | k 1024 | v 1024: 14336 at TP 1
+/// The most rows of one verify window (a shared round over several streams): the compile-time bound.
+/// XPU_VERIFY_ROWS=32 raises the live cap from 16 to 32 rows; 16 is the default, so the live path is unchanged.
+pub const MAX_ROWS = 32;
+/// The rows a verify window may hold now: XPU_VERIFY_ROWS (16 default, 32 allowed), set in Runner.init.
+pub var verify_rows: u32 = 16;
+
+pub fn windowRows() u32 {
+    return verify_rows;
+}
+
 pub var CHUNK: u32 = 1024; // prompt rows per forward (XPU_CHUNK, a multiple of 64)
 /// A forward's rows at most: a chunk, plus a rest under 128 rows joined to a prompt's last chunk.
 pub fn maxRows() u32 {
@@ -89,12 +100,12 @@ pub var pool_tokens: ?u32 = null;
 
 // Layout of a GDN layer's stash (bytes): q, k, v, g, β, then the qkv rows of P.
 pub const ST_Q = 0;
-pub const ST_K = ST_Q + 16 * GDN_K_HEADS * 128 * 2;
-pub const ST_V = ST_K + 16 * GDN_K_HEADS * 128 * 2;
-pub const ST_G = ST_V + 16 * GDN_V_HEADS * 128 * 2;
-pub const ST_B = ST_G + 16 * GDN_V_HEADS * 4;
-pub const ST_P = ST_B + 16 * GDN_V_HEADS * 4;
-pub const STASH = ST_P + 16 * GDN_IN * 2;
+pub const ST_K = ST_Q + MAX_ROWS * GDN_K_HEADS * 128 * 2;
+pub const ST_V = ST_K + MAX_ROWS * GDN_K_HEADS * 128 * 2;
+pub const ST_G = ST_V + MAX_ROWS * GDN_V_HEADS * 128 * 2;
+pub const ST_B = ST_G + MAX_ROWS * GDN_V_HEADS * 4;
+pub const ST_P = ST_B + MAX_ROWS * GDN_V_HEADS * 4;
+pub const STASH = ST_P + MAX_ROWS * GDN_IN * 2;
 /// Target layers whose hidden states feed the DFlash2 drafter (its config's target_layer_ids).
 pub const TAP_LAYERS = [5]usize{ 5, 19, 33, 47, 61 };
 
@@ -191,20 +202,20 @@ pub const Runner = struct {
     context: u32,
     ckpt: Checkpoint = .{},
     host_logits: []f32 = &.{},
-    block: [16]u32 = @splat(0), // the last verified block's greedy tokens
+    block: [MAX_ROWS]u32 = @splat(0), // the last verified block's greedy tokens
     block_rows: u32 = 0,
     tree_on: bool = false, // the last verified block was a tree (commitPath)
-    tree_host: [16 * 17]i32 = @splat(0),
+    tree_host: [MAX_ROWS * 17]i32 = @splat(0), // the tree table (17 wide: a tree window is 16 rows at most)
     path_host: [16]i32 = @splat(0),
     slot: u32 = 0, // the selected sequence (select)
-    mt_host: [LAYERS * 16 * 8]u64 = @splat(0), // verifyMulti's per-row state addresses, by layer
-    pos_host: [16]i32 = @splat(0),
+    mt_host: [LAYERS * MAX_ROWS * 8]u64 = @splat(0), // verifyMulti's per-row state addresses, by layer
+    pos_host: [MAX_ROWS]i32 = @splat(0),
     win_host: [32]i32 = @splat(0), // and each window's first row and width (keepMulti)
-    ids_host: [16]u32 = @splat(0),
+    ids_host: [MAX_ROWS]u32 = @splat(0),
     multi_slots: [16]u32 = @splat(0), // the last verifyMulti's slots, by window
     multi_count: u32 = 0,
     multi_tree: bool = false, // the last verifyMulti had tree windows: every window's states are replayed at the keep
-    mpath_host: [16 * 2 * 16]i32 = @splat(0),
+    mpath_host: [16 * 2 * MAX_ROWS]i32 = @splat(0),
     seqs: [MAX_SLOTS]struct { pos: u32 = 0, last: u32 = 0 } = @splat(.{}),
     // the shared K/V pool (allocPool): every attention layer's pages, each slot's page table and the pages it holds
     pool: u32 = 0, // pages in each attention layer's pool (0: per-slot caches)
@@ -216,6 +227,11 @@ pub const Runner = struct {
     /// Target hidden states for a drafter: when on, every forward fills acts.taps and calls `on_taps` with its rows.
     taps_on: bool = false,
     on_taps: ?struct { ctx: *anyopaque, f: *const fn (*anyopaque, *anyopaque, u32) anyerror!void } = null,
+    /// The MTP head's prompt absorb: when set, every prompt chunk keeps its rows' final normed state and calls
+    /// `on_prompt` with the chunk's tokens, its first position and the token after the chunk (the pending one).
+    on_prompt: ?struct { ctx: *anyopaque, f: *const fn (*anyopaque, []const u32, u32, u32) anyerror!void } = null,
+    /// The checkpoint's own MTP head, when XPU_MTP=1 (the follower rank runs it too: its all-reduces must meet).
+    mtp: ?*mtp.Mtp = null,
 
     /// Loads `dir` (MLX affine 4/64 or GPTQ 4/128) onto the first Arc Pro B70 (PCI id 0xe223), room for `context` rows.
     pub fn init(dir: []const u8, context: u32) !*Runner {
@@ -238,6 +254,12 @@ pub const Runner = struct {
         if (std.c.getenv("XPU_A8")) |v| a8_group = if (std.mem.eql(u8, std.mem.span(v), "token")) std.math.maxInt(u32) else try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_DUMP_H")) |v| dump_h = open(v, 0o2101, @as(c_uint, 0o644)); // append
         if (std.c.getenv("XPU_CHUNK")) |v| CHUNK = try limits.chunk(std.mem.span(v));
+        // the verify window's rows: 16 (the live path) or 32 (lane p25-mtp32). Both ranks must agree.
+        if (std.c.getenv("XPU_VERIFY_ROWS")) |v| {
+            const n = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+            if (n != 16 and n != MAX_ROWS) return error.BadVerifyRows;
+            verify_rows = n;
+        } else verify_rows = 16;
         if (std.c.getenv("TF_TP_RANK")) |v| RANK = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         k1mod.readEnv(); // XPU_K1, XPU_K1_WAVE
         if (RANK >= TP) return error.RankOutOfRange;
@@ -293,6 +315,11 @@ pub const Runner = struct {
         errdefer alloc.destroy(r);
         r.* = .{ .d = .{ .g = try ze.Gpu.open(0xe223), .list = undefined, .k = undefined }, .model = undefined, .acts = undefined, .context = context, .ckpt = ckpt };
         tp.group = try tp.Group.open(&r.d); // null at TP 1
+        // the pair publishes its verify rows and, when XPU_VERIFY_ROWS is set, refuses to start on a mismatch
+        if (tp.group) |*g| {
+            g.setRows(verify_rows);
+            if (std.c.getenv("XPU_VERIFY_ROWS") != null) try g.awaitRows(verify_rows, 180.0);
+        }
         const d = &r.d;
         errdefer d.g.close();
         d.list = try d.g.immediate(0, 0);
@@ -623,11 +650,15 @@ pub const Runner = struct {
         var at: usize = 0;
         while (at < ids.len) {
             const end = chunkEnd(at, ids.len);
-            const want = last and end == ids.len;
+            const want = (last and end == ids.len) or r.on_prompt != null;
             if (r.pos + (end - at) > r.context) return error.ContextFull;
             try r.ensurePages(r.slot, r.pos + @as(u32, @intCast(end - at)));
             if (try forward(&r.d, &r.model, &r.acts, @ptrCast(ids[at..end]), r.pos, .{ .prompt = true, .want = if (want) .last else .none, .taps = r.taps_on, .pt = r.pt[r.slot] })) |t| r.last = @intCast(t);
             if (r.taps_on) if (r.on_taps) |cb| try cb.f(cb.ctx, r.acts.taps, @intCast(end - at));
+            if (r.on_prompt) |cb| {
+                const after: u32 = if (end < ids.len) ids[end] else r.last;
+                try cb.f(cb.ctx, ids[at..end], r.pos, after);
+            }
             r.pos += @intCast(end - at);
             at = end;
         }
@@ -758,16 +789,16 @@ pub const Runner = struct {
     /// Structured output: each row's greedy token among those its grammar `bits` allow, computed on the device.
     pub fn argmaxMasked(r: *Runner, rows: []const u32, bits: []const u32, words: usize, out: []u32) !void {
         const n = rows.len;
-        if (n == 0 or n > 16 or words > MASK_WORDS or bits.len != n * words or out.len < n) return error.BadMasks;
+        if (n == 0 or n > verify_rows or words > MASK_WORDS or bits.len != n * words or out.len < n) return error.BadMasks;
         const d = &r.d;
-        var rh: [16]i32 = undefined;
+        var rh: [MAX_ROWS]i32 = undefined;
         for (rows, 0..) |x, j| rh[j] = @intCast(x);
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, r.acts.mrows, &rh, n * 4, null, 0, null));
         errdefer d.settle(); // rh and toks live in this frame and bits is the caller's: errors wait for the queue
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, r.acts.mbits, bits.ptr, bits.len * 4, null, 0, null));
         try d.launch(d.k.argmax_part_masked, .{ .x = 256, .y = @intCast(n) }, .{ r.acts.logits, @as(i32, VOCAB), r.acts.mbits, @as(i32, @intCast(words)), r.acts.mrows, r.acts.pv, r.acts.pi });
         try d.launch(d.k.argmax, .{ .x = @intCast(n) }, .{ r.acts.pv, r.acts.pi, r.acts.mtok });
-        var toks: [16]i32 = undefined;
+        var toks: [MAX_ROWS]i32 = undefined;
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &toks, r.acts.mtok, n * 4, null, 0, null));
         try d.sync();
         for (out[0..n], toks[0..n]) |*o, t| o.* = @intCast(t);

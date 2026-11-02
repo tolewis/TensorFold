@@ -62,24 +62,24 @@ pub const Acts = struct {
     pl: *anyopaque,
     po: *anyopaque,
     pscr: *anyopaque, // fp32 [maxRows, D] (slice totals of the narrow prompt GEMM)
-    logits: *anyopaque, // fp16 [16, VOCAB]
+    logits: *anyopaque, // fp16 [windowRows, VOCAB]
     taps: *anyopaque, // bf16 [maxRows, 5 D]: hidden states after TAP_LAYERS, when Mode.taps
     tok: *anyopaque, // i32
     pv: *anyopaque, // argmax partials: f32 [256], i32 [256]
     pi: *anyopaque,
-    mrows: *anyopaque, // i32 [16]: argmaxMasked's rows
-    mbits: *anyopaque, // u32 [16, MASK_WORDS]: and their grammar bits
-    mtok: *anyopaque, // i32 [16]: and their tokens
+    mrows: *anyopaque, // i32 [MAX_ROWS]: argmaxMasked's rows
+    mbits: *anyopaque, // u32 [MAX_ROWS, MASK_WORDS]: and their grammar bits
+    mtok: *anyopaque, // i32 [MAX_ROWS]: and their tokens
     ids: *anyopaque, // i32 [maxRows]
     zeros: *anyopaque, // padding rows of the GDN chunks: k = v = 0, β = 0 …
     ones: *anyopaque, // … and g = 1
     chain: *anyopaque, // i32 [16, 17]: the tree table of a chain (row t at depth t), for the decode attention
-    tree: *anyopaque, // i32 [16, 17]: the verified block's tree table (decode.cl, DEPTH and ANC)
+    tree: *anyopaque, // i32 [MAX_ROWS, 17]: the verified block's tree table (decode.cl, DEPTH and ANC)
     path: *anyopaque, // i32 [16]: the rows of the kept path
-    mpath: *anyopaque, // i32 [16, 2, 16]: keepPaths' per-window paths, rows of the block then rows of the window
+    mpath: *anyopaque, // i32 [16, 2, MAX_ROWS]: keepPaths' per-window paths, rows of the block then rows of the window
     sl: *anyopaque, // fp32 [16, 48, 128, 128]: GDN state after each row of a verified tree
-    mt: *anyopaque, // u64 [LAYERS, 16, 8]: stepMulti's per-row state addresses
-    mpos: *anyopaque, // i32 [16]: and positions
+    mt: *anyopaque, // u64 [LAYERS, MAX_ROWS, 8]: stepMulti's per-row state addresses
+    mpos: *anyopaque, // i32 [MAX_ROWS]: and positions
     a8: *anyopaque, // W4A8 prompt: activations int8 [maxRows, FF] (permuted by blocks of 8) …
     sa: *anyopaque, // … and their scales fp32 [FF / 128, maxRows + 32]
     grp: *anyopaque, // i32 [16, 2]: K1's row groups (first row, rows)
@@ -88,6 +88,7 @@ pub const Acts = struct {
         const rows = q.maxRows();
         const nc = limits.chunks(rows);
         const ns = limits.splits(q.MAX_CTX, SPLIT);
+        const wr: usize = q.windowRows();
         return .{
             .x = try d.alloc_(rows * D * 4),
             .h = try d.alloc_(rows * FF * 2),
@@ -106,32 +107,32 @@ pub const Acts = struct {
             .u0 = try d.alloc_(nc * HV * 64 * 128 * 4),
             .hs = try d.alloc_(3 * nc * HV * 128 * 128 * 2),
             .vn = try d.alloc_(3 * nc * HV * 128 * 64 * 2),
-            // decode attention partials: at most 16 rows (the prompt kernel needs none)
-            .pm = try d.alloc_(16 * HQ * ns * 4),
-            .pl = try d.alloc_(16 * HQ * ns * 4),
-            .po = try d.alloc_(16 * HQ * ns * 256 * 4),
+            // decode attention partials: up to windowRows() rows (XPU_VERIFY_ROWS=32: 32; the prompt kernel needs none)
+            .pm = try d.alloc_(wr * HQ * ns * 4),
+            .pl = try d.alloc_(wr * HQ * ns * 4),
+            .po = try d.alloc_(wr * HQ * ns * 256 * 4),
             .pscr = try d.alloc_(rows * D * 4),
-            .logits = try d.alloc_(16 * VOCAB * 2),
-            .tok = try d.alloc_(16 * 4),
-            .pv = try d.alloc_(16 * 1024),
-            .pi = try d.alloc_(16 * 1024),
-            .mrows = try d.alloc_(16 * 4),
-            .mbits = try d.alloc_(16 * MASK_WORDS * 4),
-            .mtok = try d.alloc_(16 * 4),
+            .logits = try d.alloc_(wr * VOCAB * 2),
+            .tok = try d.alloc_(wr * 4),
+            .pv = try d.alloc_(wr * 1024),
+            .pi = try d.alloc_(wr * 1024),
+            .mrows = try d.alloc_(q.MAX_ROWS * 4),
+            .mbits = try d.alloc_(q.MAX_ROWS * MASK_WORDS * 4),
+            .mtok = try d.alloc_(q.MAX_ROWS * 4),
             .taps = try d.alloc_(rows * 5 * D * 2),
             .ids = try d.alloc_(rows * 4),
             .zeros = try d.alloc_(rows * HV * 128 * 2),
             .ones = try d.alloc_(rows * HV * 4),
             .chain = try d.upload(std.mem.sliceAsBytes(&chainTable())),
-            .tree = try d.alloc_(16 * 17 * 4),
+            .tree = try d.alloc_(q.MAX_ROWS * 17 * 4),
             .path = try d.alloc_(16 * 4),
-            .mpath = try d.alloc_(16 * 2 * 16 * 4),
+            .mpath = try d.alloc_(16 * 2 * q.MAX_ROWS * 4),
             .sl = try d.alloc_(16 * HV * 128 * 128 * 4),
-            .mt = try d.alloc_(LAYERS * 16 * 8 * 8),
-            .mpos = try d.alloc_(16 * 4),
+            .mt = try d.alloc_(LAYERS * q.MAX_ROWS * 8 * 8),
+            .mpos = try d.alloc_(q.MAX_ROWS * 4),
             .a8 = try d.alloc_(rows * FF),
             .sa = try d.alloc_((FF / 128) * (rows + 32) * 4),
-            .grp = try d.alloc_(16 * 2 * 4),
+            .grp = try d.alloc_(q.MAX_ROWS * 2 * 4),
         };
     }
 };
@@ -317,14 +318,17 @@ pub var gdn_probe: ?*const fn (*Dev, *Acts, *anyopaque, u32, usize) anyerror!voi
 pub const Mode = struct { prompt: bool = false, want: Want = .last, stash: bool = false, taps: bool = false, tree: bool = false, pt: ?*anyopaque = null, multi: ?struct { mt: *anyopaque, pos: *anyopaque, max_pos: u32, win: []const i32 = &.{} } = null };
 
 /// K1: the row groups of the forward's attn_k1 launch; a copy of it is queued, so it lives as long as the process.
-var grp_host: [32]i32 = undefined;
+var grp_host: [q.MAX_ROWS * 2]i32 = undefined;
 
-/// One forward over `ids` (< q.maxRows() rows) at p0..; the last row's greedy token; ≤ 16 non-prompt rows: GDN serial.
+/// One forward over `ids` (< q.maxRows() rows) at p0..; the last row's greedy token; non-prompt rows up to
+/// q.windowRows(): GDN serial (a shared round's windows).
 pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) !?i32 {
     const want = mode.want != .none;
     if (ids.len > q.maxRows()) return error.TooManyRows; // the scratch holds maxRows, padded to 64
     const T: u32 = @intCast(ids.len);
-    const wide = T > 16 or mode.prompt; // the prompt kernels: a prompt chunk cuts the same bits at any length
+    // a shared round's windows stay on the decode path at up to q.windowRows() rows (XPU_VERIFY_ROWS=32):
+    // each row has its own slot state in MT, which the prompt kernels do not take
+    const wide = mode.prompt or (T > 16 and mode.multi == null);
     const t32: i32 = @intCast(T);
     const tp = (T + 63) / 64 * 64; // GDN chunk rows (padded)
     const nul: ?*anyopaque = null;
@@ -360,7 +364,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
         if (probe) try dumpBuf(d, "p0", a.p, T * GDN_IN, .f16);
         if (l.attn) {
             const ctx = if (mode.multi) |mm| mm.max_pos + 1 else p0 + T; // tree rows see fewer slices
-            const mt: ?*anyopaque = if (mode.multi) |mm| off(mm.mt, i * 16 * 8 * 8) else null;
+            const mt: ?*anyopaque = if (mode.multi) |mm| off(mm.mt, i * q.MAX_ROWS * 8 * 8) else null;
             const ns = (ctx + SPLIT - 1) / SPLIT;
             // the shared pool's page table of the current slot; a shared round carries each row's in MT
             const pt: ?*anyopaque = if (mode.multi != null) null else mode.pt;
@@ -389,7 +393,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
         } else {
             const cin = l.conv[l.conv_cur].?;
             const cout = l.conv[1 - l.conv_cur].?;
-            const gmt: ?*anyopaque = if (mode.multi) |mm| off(mm.mt, i * 16 * 8 * 8) else null;
+            const gmt: ?*anyopaque = if (mode.multi) |mm| off(mm.mt, i * q.MAX_ROWS * 8 * 8) else null;
             if (mode.multi == null) l.conv_cur = 1 - l.conv_cur; // multi: each slot's flips after the forward
             if (wide)
                 try d.launch(d.k.gdn_pre_rows, .{ .x = (T + 7) / 8, .y = (GDN_QKV / 128 + 15) / 16 }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32 })
@@ -483,7 +487,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
     if (m.head.x3) |e| try exl3.project(e, m.exl3.?, d, off(a.h, first * D * 2), a.logits, rows, false) else try gemm(d, a.pscr, off(a.h, first * D * 2), off(a.ahi, first * (D / m.head.gs) * 2), off(a.alo, first * (D / m.head.gs) * 2), m.head, a.logits, rows);
     try d.launch(d.k.argmax_part, .{ .x = 256, .y = rows }, .{ a.logits, @as(i32, VOCAB), a.pv, a.pi });
     try d.launch(d.k.argmax, .{ .x = rows }, .{ a.pv, a.pi, a.tok });
-    var toks: [16]i32 = undefined;
+    var toks: [q.MAX_ROWS]i32 = undefined;
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &toks, a.tok, rows * 4, null, 0, null));
     try d.sync();
     if (ranks.group) |*g| try g.check(d); // TF_TP_DEVFLAG: a timed-out exchange (the peer went away) is PeerLost

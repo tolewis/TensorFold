@@ -23,13 +23,17 @@ const off = dev.off;
 /// A window of a shared verify: `ids` (pending token, then drafts) from its position; `parents` for a tree, else chain.
 pub const Win = struct { slot: u32, ids: []const u32, parents: ?[]const i32 = null };
 
-/// Every window in one forward (16 rows at most): each row's greedy token in `block`; nothing moves until `keepMulti`.
+/// The most windows of one shared verify (one a stream; MAX_SLOTS 8 in practice).
+pub const MAX_WINDOWS = 16;
+
+/// Every window in one forward (q.windowRows() rows at most, XPU_VERIFY_ROWS=32: 32): each row's greedy token in
+/// `block`; nothing moves until `keepMulti`.
 pub fn verifyMulti(r: *Runner, wins: []const Win) !void {
     if (tp.group) |*g| { // a window: slot, rows, has parents, the ids, the parents
-        var words: [16 * 35]u32 = undefined;
+        var words: [MAX_WINDOWS * 3 + 2 * q.MAX_ROWS]u32 = undefined;
         var at: usize = 0;
-        for (wins[0..@min(wins.len, 16)]) |w| {
-            const n = @min(w.ids.len, 16);
+        for (wins[0..@min(wins.len, MAX_WINDOWS)]) |w| {
+            const n = @min(w.ids.len, @as(usize, q.windowRows()));
             words[at] = w.slot;
             words[at + 1] = @intCast(n);
             words[at + 2] = @intFromBool(w.parents != null);
@@ -40,15 +44,15 @@ pub fn verifyMulti(r: *Runner, wins: []const Win) !void {
                 at += n;
             }
         }
-        try g.record(.verify_multi, @intCast(@min(wins.len, 16)), 0, 0, words[0..at]);
+        try g.record(.verify_multi, @intCast(@min(wins.len, MAX_WINDOWS)), 0, 0, words[0..at]);
     }
-    if (wins.len == 0 or wins.len > 16) return error.BadBlock;
+    if (wins.len == 0 or wins.len > MAX_WINDOWS) return error.BadBlock;
     r.store();
     var T: usize = 0;
     var max_pos: u32 = 0;
     for (wins, 0..) |w, i| {
         for (wins[0..i]) |o| if (o.slot == w.slot) return error.SlotTwice;
-        if (w.ids.len == 0 or T + w.ids.len > 16) return error.BadBlock;
+        if (w.ids.len == 0 or T + w.ids.len > @as(usize, q.windowRows())) return error.BadBlock;
         const p = r.seqs[w.slot].pos;
         if (p + w.ids.len > r.context) return error.ContextFull;
         r.win_host[2 * i] = @intCast(T);
@@ -86,6 +90,7 @@ pub fn verifyMulti(r: *Runner, wins: []const Win) !void {
                     if (pj < 0 or pj >= j) return error.BadBlock;
                     const pr = r.tree_host[(first + @as(usize, @intCast(pj))) * 17 ..][0..17];
                     const dp: usize = @intCast(pr[0] & 255);
+                    if (dp + 2 > 17) return error.BadBlock; // the tree table row holds 16 ancestors: a tree window is 16 rows
                     row[0] = @intCast(dp + 1);
                     @memcpy(row[1 .. dp + 2], pr[1 .. dp + 2]);
                     row[dp + 2] = @intCast(t);
@@ -103,7 +108,7 @@ pub fn verifyMulti(r: *Runner, wins: []const Win) !void {
     for (&r.model.layers, 0..) |*l, i| for (wins, 0..) |w, wi| {
         const first: usize = @intCast(r.win_host[2 * wi]);
         for (0..w.ids.len) |j| {
-            const e = r.mt_host[(i * 16 + first + j) * 8 ..][0..8];
+            const e = r.mt_host[(i * q.MAX_ROWS + first + j) * 8 ..][0..8];
             e.* = @splat(0);
             e[6] = first;
             e[7] = w.ids.len;
@@ -121,10 +126,10 @@ pub fn verifyMulti(r: *Runner, wins: []const Win) !void {
         }
     };
     const d = &r.d;
-    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, r.acts.mt, &r.mt_host, LAYERS * 16 * 8 * 8, null, 0, null));
+    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, r.acts.mt, &r.mt_host, LAYERS * q.MAX_ROWS * 8 * 8, null, 0, null));
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, r.acts.mpos, &r.pos_host, T * 4, null, 0, null));
     _ = try forward(d, &r.model, &r.acts, @ptrCast(r.ids_host[0..T]), 0, .{ .want = .rows, .stash = true, .taps = r.taps_on, .tree = tree, .multi = .{ .mt = r.acts.mt, .pos = r.acts.mpos, .max_pos = max_pos, .win = r.win_host[0 .. 2 * wins.len] } });
-    var toks: [16]i32 = undefined;
+    var toks: [q.MAX_ROWS]i32 = undefined;
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &toks, r.acts.tok, T * 4, null, 0, null));
     try d.sync();
     for (r.block[0..T], toks[0..T]) |*o, t| o.* = @intCast(t);
@@ -136,26 +141,26 @@ pub fn verifyMulti(r: *Runner, wins: []const Win) !void {
 /// Keeps the first `keep[i]` rows of window i of the last verifyMulti: whole windows keep their state, others replay.
 pub fn keepMulti(r: *Runner, keep: []const u32) !void {
     if (tp.group) |*g| try g.record(.keep_multi, 0, 0, 0, keep);
-    var rows: [16]u32 = undefined;
+    var rows: [q.MAX_ROWS]u32 = undefined;
     for (&rows, 0..) |*x, i| x.* = @intCast(i);
-    var paths: [16][]const u32 = undefined;
-    if (keep.len > 16) return error.BadCommit;
-    for (keep, 0..) |k, i| paths[i] = rows[0..@min(k, 16)];
+    var paths: [MAX_WINDOWS][]const u32 = undefined;
+    if (keep.len > MAX_WINDOWS) return error.BadCommit;
+    for (keep, 0..) |k, i| paths[i] = rows[0..@min(@as(usize, k), @as(usize, q.windowRows()))];
     return r.keepPaths(paths[0..keep.len]);
 }
 
 /// Keeps window i's root path `paths[i]`: a whole chain window keeps its state, otherwise GDN states replay, K/V move.
 pub fn keepPaths(r: *Runner, paths: []const []const u32) !void {
     if (tp.group) |*g| { // a path: its length, then its rows
-        var words: [16 * 17]u32 = undefined;
+        var words: [MAX_WINDOWS * (1 + q.MAX_ROWS)]u32 = undefined;
         var at: usize = 0;
-        for (paths[0..@min(paths.len, 16)]) |p| {
-            const n = @min(p.len, 16);
+        for (paths[0..@min(paths.len, MAX_WINDOWS)]) |p| {
+            const n = @min(p.len, @as(usize, q.windowRows()));
             words[at] = @intCast(n);
             @memcpy(words[at + 1 .. at + 1 + n], p[0..n]);
             at += 1 + n;
         }
-        try g.record(.keep_paths, @intCast(@min(paths.len, 16)), 0, 0, words[0..at]);
+        try g.record(.keep_paths, @intCast(@min(paths.len, MAX_WINDOWS)), 0, 0, words[0..at]);
     }
     if (paths.len != r.multi_count) return error.BadCommit;
     const d = &r.d;
@@ -166,11 +171,11 @@ pub fn keepPaths(r: *Runner, paths: []const []const u32) !void {
         if (path.len == 0 or path.len > width or path[0] != 0) return error.BadCommit;
         for (path, 0..) |row, dd| {
             if (row >= width or (dd > 0 and row <= path[dd - 1])) return error.BadCommit;
-            r.mpath_host[(i * 2) * 16 + dd] = @intCast(first + row);
-            r.mpath_host[(i * 2 + 1) * 16 + dd] = @intCast(row);
+            r.mpath_host[(i * 2) * q.MAX_ROWS + dd] = @intCast(first + row);
+            r.mpath_host[(i * 2 + 1) * q.MAX_ROWS + dd] = @intCast(row);
         }
     }
-    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, r.acts.mpath, &r.mpath_host, paths.len * 2 * 16 * 4, null, 0, null));
+    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, r.acts.mpath, &r.mpath_host, paths.len * 2 * q.MAX_ROWS * 4, null, 0, null));
     for (paths, 0..) |path, i| {
         const sl = r.multi_slots[i];
         const first: u32 = @intCast(r.win_host[2 * i]);
@@ -178,8 +183,8 @@ pub fn keepPaths(r: *Runner, paths: []const []const u32) !void {
         const k: u32 = @intCast(path.len);
         var straight = true;
         for (path, 0..) |row, dd| straight = straight and row == dd;
-        const brows = off(r.acts.mpath, (i * 2) * 16 * 4); // the path in rows of the block
-        const wrows = off(r.acts.mpath, (i * 2 + 1) * 16 * 4); // and of the window
+        const brows = off(r.acts.mpath, (i * 2) * q.MAX_ROWS * 4); // the path in rows of the block
+        const wrows = off(r.acts.mpath, (i * 2 + 1) * q.MAX_ROWS * 4); // and of the window
         for (&r.model.layers) |*l| {
             if (l.attn) {
                 if (!straight) try d.launch(d.k.kv_move, .{ .x = q.ATT_KV_HEADS }, .{ l.slot_kc[sl].?, l.slot_vc[sl].?, @as(i32, @intCast(r.seqs[sl].pos)), wrows, @as(i32, @intCast(k)), kvCap(), r.pt[sl] });
@@ -216,17 +221,17 @@ pub fn keepPaths(r: *Runner, paths: []const []const u32) !void {
 
 /// One token for each of several slots: a verifyMulti of one-row windows, all kept.
 pub fn stepMulti(r: *Runner, slots: []const u32, tokens: []const u32) !void {
-    var wins: [16]Win = undefined;
+    var wins: [MAX_WINDOWS]Win = undefined;
     if (tp.group) |*g| { // the slots, then the tokens
-        var words: [32]u32 = undefined;
-        const n: usize = @min(slots.len, 16); // usize: see verifyTree
+        var words: [2 * MAX_WINDOWS]u32 = undefined;
+        const n: usize = @min(slots.len, MAX_WINDOWS); // usize: see verifyTree
         @memcpy(words[0..n], slots[0..n]);
         @memcpy(words[n .. 2 * n], tokens[0..@min(tokens.len, n)]);
         try g.record(.step_multi, @intCast(n), 0, 0, words[0 .. 2 * n]);
     }
-    if (slots.len > 16 or tokens.len != slots.len) return error.BadBlock;
+    if (slots.len > MAX_WINDOWS or tokens.len != slots.len) return error.BadBlock;
     for (slots, tokens, 0..) |sl, *t, i| wins[i] = .{ .slot = sl, .ids = t[0..1] };
     try r.verifyMulti(wins[0..slots.len]);
-    const ones: [16]u32 = @splat(1);
+    const ones: [MAX_WINDOWS]u32 = @splat(1);
     try r.keepMulti(ones[0..slots.len]);
 }
