@@ -659,14 +659,14 @@ pub fn forwardOverlap(d: *Dev, m: *Model, a: *Acts, a2: *Acts, ids: []const i32,
         if (pend[0]) |s| {
             try g.addOnly(d, a.r, T1, s);
             pend[0] = null;
-            if (gemm_probe) |f| try f(d, a, l.down, act[0], T1, i - 1, 3);
+            if (gemm_probe) |f| try f(d, a, m.layers[i - 1].down, act[0], T1, i - 1, 3);
             if (p0 == 0 and i - 1 < 4) try dump(d, a, T1, try std.fmt.allocPrint(alloc, "{d}", .{i - 1}), true);
             try tapLayer(&c1, i - 1);
         }
         if (pend[1]) |s| {
             try g.addOnly(d, a2.r, T2, s);
             pend[1] = null;
-            if (gemm_probe) |f| try f(d, a2, l.down, act[1], T2, i - 1, 3);
+            if (gemm_probe) |f| try f(d, a2, m.layers[i - 1].down, act[1], T2, i - 1, 3);
             try tapLayer(&c2, i - 1);
         }
         try layerFront(&c1, l, i);
@@ -683,7 +683,7 @@ pub fn forwardOverlap(d: *Dev, m: *Model, a: *Acts, a2: *Acts, ids: []const i32,
     if (pend[0]) |s| {
         try g.addOnly(d, a.r, T1, s);
         if (gemm_probe) |f| try f(d, a, m.layers[LAYERS - 1].down, act[0], T1, LAYERS - 1, 3);
-        if (p0 == 0) try dump(d, a, T1, try std.fmt.allocPrint(alloc, "{d}", .{LAYERS - 1}), true);
+        if (p0 == 0 and LAYERS - 1 < 4) try dump(d, a, T1, try std.fmt.allocPrint(alloc, "{d}", .{LAYERS - 1}), true);
         try tapLayer(&c1, LAYERS - 1);
     }
     if (pend[1]) |s| {
