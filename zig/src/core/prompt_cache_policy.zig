@@ -52,7 +52,7 @@ pub fn subsumed(s: *const pc.Store, prompt: []const u32, born: u32, at: u32) ?us
 
 /// The reason the victim victimBut chose left: the prompt or a kept state extends it, else least recently used.
 pub fn victimReason(s: *const pc.Store, i: usize, prompt: []const u32, born: u32) []const u8 {
-    const e = &s.entries.items[i];
+    const e = s.entries.items[i];
     var reason = "least recently used";
     if (born > e.born and prompt.len > e.at and std.mem.eql(u32, prompt[0..e.at], e.tokens[0..e.at])) reason = "superseded by the prompt";
     for (s.entries.items) |o| if (o.born > e.born and o.at > e.at and std.mem.eql(u32, o.tokens[0..e.at], e.tokens[0..e.at])) {
