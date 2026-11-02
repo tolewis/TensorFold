@@ -417,7 +417,9 @@ fn mergeError(delta: f64, slices: usize, per: usize, base: f64) f64 {
     var ref_num: [dim]f64 = @splat(0);
     var ref_den: f64 = 0;
     var mx: f64 = -1e300;
-    for (0..slices) |k| for (0..per) |j| mx = @max(mx, -@as(f64, @floatFromInt(k)) * delta - 0.5 * @as(f64, @floatFromInt(j)));
+    for (0..slices) |k| {
+        for (0..per) |j| mx = @max(mx, -@as(f64, @floatFromInt(k)) * delta - 0.5 * @as(f64, @floatFromInt(j)));
+    }
     for (0..slices) |k| {
         m[k] = -1e300;
         for (0..per) |j| m[k] = @max(m[k], -@as(f64, @floatFromInt(k)) * delta - 0.5 * @as(f64, @floatFromInt(j)));
