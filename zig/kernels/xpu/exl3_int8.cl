@@ -124,7 +124,7 @@ __kernel void exl3_int8_gemm(__global const uchar *base, __global const exl3_des
             __global const uint *tk = tiles + (ulong)(kc / 16 + 2 * t) * tile_k + s * RINGW;
             half kv[32];
             tile_halves(tk, c, kv);
-            tile_halves(tk + tile_k, kv + 16);
+            tile_halves(tk + tile_k, c, kv + 16);
             float m = 0.0f;
             for (uint i = 0; i < 32; i++) m = fmax(m, fabs((float)kv[i]));
             const float sc = m > 0.0f ? m / 127.0f : 1.0f, inv = 1.0f / sc;
