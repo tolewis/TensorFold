@@ -26,6 +26,7 @@ const linux = std.os.linux;
 const q = @import("qwen27.zig");
 const dev = @import("dev.zig");
 const ze = @import("ze");
+const pf = @import("prefill_profile.zig");
 const Dev = dev.Dev;
 const D = q.D;
 
@@ -187,14 +188,20 @@ pub const Group = struct {
         if (g.direct) { // the partial into this rank's slot, the counter, then the add kernel reads the peer's slot
             const par: usize = @intCast(g.seq % 2);
             try dev.copy(d, g.dslot[par], partial, n * 2);
+            const prof = pf.prefill_profile.on and pf.prefill_profile.active;
+            const t0 = if (prof) q.now() else 0; // the host settles and waits for the peers (all-reduce wait)
             d.settle();
             g.counter(g.rank).store(g.seq, .seq_cst);
             try g.waitPeers();
+            if (prof) pf.prefill_profile.gpu[@intFromEnum(pf.Class.all_reduce_wait)] += q.now() - t0;
             try dev.copy(d, g.pbuf[par], g.peer[par].?, n * 2); // over PCIe, on the in-order list
+            if (prof) pf.prefill_profile.mark(.all_reduce_add, 0, 0); // the add kernel and its two copies
             try d.launch(d.k.tp_add, .{ .x = @intCast((n + 255) / 256) }, .{ partial, g.dslot[par], g.pbuf[par], @as(i32, @intCast(n)) });
             return;
         }
         try dev.copy(d, @ptrCast(g.mine), partial, n * 2);
+        const prof = pf.prefill_profile.on and pf.prefill_profile.active;
+        const t0 = if (prof) q.now() else 0;
         d.settle();
         @memcpy(g.slot(g.rank, g.seq)[0..n], g.mine[0..n]);
         g.counter(g.rank).store(g.seq, .seq_cst);
@@ -205,6 +212,8 @@ pub const Group = struct {
             for (0..g.tp) |r| acc += @floatCast(@as(f16, @bitCast(g.slot(@intCast(r), g.seq)[i])));
             g.sum[i] = @bitCast(@as(f16, @floatCast(acc)));
         }
+        if (prof) pf.prefill_profile.gpu[@intFromEnum(pf.Class.all_reduce_wait)] += q.now() - t0;
+        if (prof) pf.prefill_profile.mark(.all_reduce_add, 0, 0); // the sum write-back is the add's cost here
         try dev.copy(d, partial, @ptrCast(g.sum), n * 2);
         d.settle();
     }

@@ -22,7 +22,18 @@ const MASK_WORDS = q.MASK_WORDS;
 const Model = loader.Model;
 const Proj = loader.Proj;
 const SPLIT = q.SPLIT;
+const pf = @import("prefill_profile.zig");
 const limits = @import("limits.zig");
+
+/// The prefill profile: charge the next launch to `cls` (the GEMM work in GFLOP, the KV reads in GB).
+fn pfmark(cls: pf.Class, gflop: f64, bytes: f64) void {
+    if (pf.prefill_profile.on) pf.prefill_profile.mark(cls, gflop, bytes);
+}
+
+/// The prefill attention's KV reads (GB), per rank: the visible context's key and value rows.
+fn kvRead(ctx: u32) f64 {
+    return @as(f64, ctx) * @as(f64, 2 * AKV * (256 + if (q.kv_i8) 4 else 256)) / 1e9;
+}
 const ST_B = q.ST_B;
 const ST_G = q.ST_G;
 const ST_K = q.ST_K;
@@ -145,6 +156,7 @@ pub fn chainTable() [16 * 17]i32 {
 
 /// gate|up and SwiGLU: the activation and its row sums; prompt rows via the GEMM epilogue, decode rows via `swiglu`.
 pub fn mlpIn(d: *Dev, m: *const Model, a: *Acts, w: Proj, T: u32, gs: i32, pre: bool, wide: bool) !*anyopaque {
+    pfmark(.exl3_gu, 2 * @as(f64, T) * @as(f64, w.k) * @as(f64, w.n) / 1e9, 0); // gate | up and its swiglu
     if (w.x3) |e| { // EXL3: [gate | up] (ilv 0), then swiglu; the W4A8 and nGEN epilogues are int4 only
         try exl3.project(e, m.exl3.?, d, a.h, a.p, T, wide);
         try d.launch(d.k.swiglu, .{ .x = T, .y = (FF + 1023) / 1024 }, .{ a.p, a.h, a.ahi, a.alo, gs, @as(i32, 0), q.rot_on, @as(i32, FF) });
@@ -332,9 +344,11 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
     const mpos: ?*anyopaque = if (mode.multi) |mm| mm.pos else null;
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.ids, ids.ptr, ids.len * 4, null, 0, null));
     errdefer d.settle(); // the queued copy reads the caller's ids: an error returns only once the queue is idle
+    pfmark(.embed, 0, 0);
     try embedRows(d, m, a.ids, a.x, T);
     if (p0 == 0) try dump(d, a, T, "embed", false);
     for (&m.layers, 0..) |*l, i| {
+        pfmark(.norms_glue, 0, 0);
         try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.in_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, if (i == 0) 0 else 1), gs, q8a, q8s, q8ms, q.rot_on });
         const probe = p0 == 0 and i == 0;
         if (probe) try dumpBuf(d, "h0", a.h, T * D, .f16);
@@ -342,33 +356,45 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
         const min_in = if (q.a8_group != 0 and wide and q.a8_sites & 1 != 0) a.r else a.h;
         if (min_in != a.h) try copy(d, a.r, a.h, T * D * 2);
         try a8(d, a, min_in, D, T, 1);
+        pfmark(.exl3_mixer_in, 2 * @as(f64, T) * @as(f64, l.mixer_in.k) * @as(f64, l.mixer_in.n) / 1e9, 0);
         try pgemm(d, m, a, min_in, l.mixer_in, a.p, T, q8on, 0, false, wide);
         if (gemm_probe) |f| try f(d, a, l.mixer_in, min_in, T, i, 0);
-        if (l.ab) |ab| try d.launch(d.k.dense_rows, .{ .x = (T + 15) / 16, .y = 2 * HV / 16 }, .{ a.h, ab, a.p, t32, @as(i32, GDN_IN), @as(i32, GDN_AB) });
+        if (l.ab) |ab| {
+            pfmark(.gdn_chunk, 2 * @as(f64, T) * @as(f64, D) * @as(f64, GDN_AB) / 1e9, 0);
+            try d.launch(d.k.dense_rows, .{ .x = (T + 15) / 16, .y = 2 * HV / 16 }, .{ a.h, ab, a.p, t32, @as(i32, GDN_IN), @as(i32, GDN_AB) });
+        }
         if (probe) try dumpBuf(d, "p0", a.p, T * GDN_IN, .f16);
         if (l.attn) {
             const ctx = if (mode.multi) |mm| mm.max_pos + 1 else p0 + T; // tree rows see fewer slices
             const mt: ?*anyopaque = if (mode.multi) |mm| off(mm.mt, i * 16 * 8 * 8) else null;
             const ns = (ctx + SPLIT - 1) / SPLIT;
+            pfmark(.attn_prefill, 0, 0);
             try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, @as(i32, @intCast(p0)), EPS, tree, mt, mpos, q.kv8, kvCap(), @as(?*anyopaque, null), @as(?*anyopaque, null) });
             if (wide and q.kv_i8) {
+                pfmark(.attn_prefill, 4 * @as(f64, HQ) * @as(f64, T) * @as(f64, ctx) * 256 / 1e9, kvRead(ctx));
                 try d.launch(d.k.attn_prompt8, .{ .x = (T + 7) / 8, .y = AKV }, .{ a.q, l.kc.?, l.vc.?, a.y, @as(i32, @intCast(p0)), t32, @as(f32, 1.0 / 16.0), kvCap(), @as(?*anyopaque, null) });
             } else if (wide) {
+                pfmark(.attn_prefill, 4 * @as(f64, HQ) * @as(f64, T) * @as(f64, ctx) * 256 / 1e9, kvRead(ctx));
                 try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = AKV }, .{ a.q, l.kc.?, l.vc.?, a.y, @as(i32, @intCast(p0)), t32, @as(f32, 1.0 / 16.0), @as(?*anyopaque, null) });
             } else {
                 try d.launch(d.k.attn_decode, .{ .x = ns, .y = AKV, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), @as(f32, 1.0 / 16.0), if (mode.multi != null) tree else table, mt, mpos, kvCap() });
                 try d.launch(d.k.attn_merge, .{ .x = HQ, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), table, mpos });
             }
-            if (q.kv8 & 1 != 0) try d.launch(d.k.rot_heads, .{ .x = T, .y = HQ }, .{a.y});
+            if (q.kv8 & 1 != 0) {
+                pfmark(.attn_prefill, 0, 0);
+                try d.launch(d.k.rot_heads, .{ .x = T, .y = HQ }, .{a.y});
+            }
+            pfmark(.attn_prefill, 0, 0);
             try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo, gs, q.rot_on, q8oa, q8os, q8ms });
         } else {
             const cin = l.conv[l.conv_cur].?;
             const cout = l.conv[1 - l.conv_cur].?;
             const gmt: ?*anyopaque = if (mode.multi) |mm| off(mm.mt, i * 16 * 8 * 8) else null;
             if (mode.multi == null) l.conv_cur = 1 - l.conv_cur; // multi: each slot's flips after the forward
-            if (wide)
+            if (wide) {
+                pfmark(.gdn_chunk, 0, 0);
                 try d.launch(d.k.gdn_pre_rows, .{ .x = (T + 7) / 8, .y = (GDN_QKV / 128 + 15) / 16 }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32 })
-            else
+            } else {
                 try d.launch(d.k.gdn_pre, .{ .x = T, .y = GDN_QKV / 256 }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32, tree, gmt });
             if (wide and tp > T) { // neutral padding rows: the state does not move
                 const pad = tp - T;
@@ -399,6 +425,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
                 const ncu: u32 = tp / 64;
                 const hk: i32 = HK;
                 const hv: i32 = HV;
+                pfmark(.gdn_chunk, 0, 0);
                 try d.launch(d.k.gdn_prep, .{ .x = ncu, .y = HV }, .{ a.k, a.v, a.g, a.beta, a.la, a.wb, a.u0, hk, hv, nc, @as(i32, 0) });
                 try d.launch(d.k.gdn_state, .{ .x = HV }, .{ a.k, a.wb, a.u0, a.la, l.rec.?, l.rec.?, a.hs, a.vn, hk, hv, nc });
                 try d.launch(d.k.gdn_out, .{ .x = ncu, .y = HV }, .{ a.q, a.k, a.la, a.hs, a.vn, a.y, hk, hv, nc });
@@ -412,31 +439,39 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
                 try dumpBuf(d, "beta0", a.beta, T * HV, .f32);
                 try dumpBuf(d, "y0", a.y, T * MIX_OUT, .bf16);
             }
+            pfmark(.norms_glue, 0, 0);
             try d.launch(d.k.gated_norm, .{ .x = T }, .{ a.y, a.p, l.gnorm.?, a.h, a.ahi, a.alo, EPS, gs, q.rot_on, q8oa, q8os, q8ms });
             if (probe) try dumpBuf(d, "o0", a.h, T * MIX_OUT, .f16);
         }
+        pfmark(.norms_glue, 0, 0);
         try a8(d, a, a.h, MIX_OUT, T, 2);
+        pfmark(.exl3_mixer_out, 2 * @as(f64, T) * @as(f64, l.mixer_out.k) * @as(f64, l.mixer_out.n) / 1e9, 0);
         try pgemm(d, m, a, a.h, l.mixer_out, a.r, T, q8out, 0, q.int4_sites & 2 != 0, wide);
         if (ranks.group) |*g| try g.allReduce(d, a.r, T); // TP: the ranks' partial out-projections summed
         if (gemm_probe) |f| try f(d, a, l.mixer_out, a.h, T, i, 1);
         if (probe) try dumpBuf(d, "r0", a.r, T * D, .f16);
+        pfmark(.norms_glue, 0, 0);
         try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs, q8a, q8s, q8ms, q.rot_on });
         try a8(d, a, a.h, D, T, 4);
         if (gemm_probe) |f| try f(d, a, l.gu, a.h, T, i, 2);
         const act = try mlpIn(d, m, a, l.gu, T, gs, q8on, wide);
         try a8(d, a, act, FF, T, 8);
+        pfmark(.exl3_down, 2 * @as(f64, T) * @as(f64, l.down.k) * @as(f64, l.down.n) / 1e9, 0);
         try pgemm(d, m, a, act, l.down, a.r, T, false, if (act == a.p) q.rot_on else 0, q.int4_sites & 8 != 0, wide);
         if (ranks.group) |*g| try g.allReduce(d, a.r, T); // TP: the ranks' partial down projections summed
         if (gemm_probe) |f| try f(d, a, l.down, act, T, i, 3);
         if (p0 == 0 and i < 4) try dump(d, a, T, try std.fmt.allocPrint(alloc, "{d}", .{i}), true);
-        if (mode.taps) for (TAP_LAYERS, 0..) |tl, slot| if (tl == i)
+        if (mode.taps) for (TAP_LAYERS, 0..) |tl, slot| if (tl == i) {
+            pfmark(.norms_glue, 0, 0);
             try d.launch(d.k.tap, .{ .x = D / 256, .y = T }, .{ a.x, a.r, a.taps, @as(i32, D), @as(i32, @intCast(slot)) });
+        }
     }
     if (!want and q.dump_h == null) { // x is per token: nothing carries to the next chunk
         try d.sync();
         return null;
     }
     const hgs: i32 = @intCast(m.head.gs);
+    pfmark(.norms_glue, 0, 0);
     try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, m.norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), hgs, no_q8, no_q8, @as(i32, 0), @as(i32, 0) });
     if (q.dump_h) |fd| { // XPU_DUMP_H: every row's final normed hidden state, appended
         const host = try alloc.alloc(u16, T * D);
@@ -449,7 +484,9 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
     if (gemm_probe) |f| try f(d, a, m.head, a.h, T, LAYERS, 4);
     const first = if (mode.want == .rows) 0 else T - 1;
     const rows = T - first;
+    pfmark(.exl3_head, 2 * @as(f64, rows) * @as(f64, m.head.k) * @as(f64, m.head.n) / 1e9, 0);
     if (m.head.x3) |e| try exl3.project(e, m.exl3.?, d, off(a.h, first * D * 2), a.logits, rows, false) else try gemm(d, a.pscr, off(a.h, first * D * 2), off(a.ahi, first * (D / m.head.gs) * 2), off(a.alo, first * (D / m.head.gs) * 2), m.head, a.logits, rows);
+    pfmark(.norms_glue, 0, 0);
     try d.launch(d.k.argmax_part, .{ .x = 256, .y = rows }, .{ a.logits, @as(i32, VOCAB), a.pv, a.pi });
     try d.launch(d.k.argmax, .{ .x = rows }, .{ a.pv, a.pi, a.tok });
     var toks: [16]i32 = undefined;

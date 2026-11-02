@@ -4,6 +4,7 @@ const ze = @import("ze");
 const safetensors = @import("safetensors.zig");
 const q = @import("qwen27.zig");
 const fwd = @import("forward.zig");
+const pf = @import("prefill_profile.zig");
 const a8 = fwd.a8;
 const alloc = q.alloc;
 
@@ -221,7 +222,10 @@ pub const Dev = struct {
     pub fn launch(d: *Dev, k: ze.H, groups: ze.GroupCount, args: anytype) !void {
         inline for (args, 0..) |a, i| try d.g.arg(k, i, a);
         var ev: ze.H = null;
-        if (q.prof.on) {
+        const pp = &pf.prefill_profile;
+        if (pp.on and pp.active) { // the prefill profile: one event a launch, classed by the caller's `mark`
+            ev = try pp.nextEvent(d);
+        } else if (q.prof.on) {
             if (q.prof.used == q.prof.events.len) try d.sync();
             ev = q.prof.events[q.prof.used];
             q.prof.kernel[q.prof.used] = k;
@@ -232,6 +236,7 @@ pub const Dev = struct {
 
     pub fn sync(d: *Dev) !void {
         d.settle();
+        if (pf.prefill_profile.on) try pf.prefill_profile.flush(d); // the prompt path's pending launches, read at every sync
         if (q.prof.on) {
             for (q.prof.events[0..q.prof.used], q.prof.kernel[0..q.prof.used]) |e, k| {
                 const t = try d.g.seconds(e);

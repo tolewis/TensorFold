@@ -5,6 +5,7 @@ const kb = @import("xpu_qwen27_kernels");
 const dev = @import("dev.zig");
 const fwd = @import("forward.zig");
 const tp = @import("tp.zig");
+const pf = @import("prefill_profile.zig");
 const loader = @import("load.zig");
 const multi = @import("runner_multi.zig");
 const slot_states = @import("slot_states.zig");
@@ -332,6 +333,7 @@ pub const Runner = struct {
         }
         const prof_on = prof.on;
         prof.on = false; // not during the load
+        if (std.c.getenv("XPU_PREFILL_PROFILE") != null) pf.prefill_profile.on = true; // the prompt pass class table
         r.model = try load(d, &ckpt);
         prof.on = prof_on;
         r.acts = try Acts.init(d);
@@ -433,6 +435,7 @@ pub const Runner = struct {
             if (r.pos + (end - at) > r.context) return error.ContextFull;
             if (try forward(&r.d, &r.model, &r.acts, @ptrCast(ids[at..end]), r.pos, .{ .prompt = true, .want = if (want) .last else .none, .taps = r.taps_on })) |t| r.last = @intCast(t);
             if (r.taps_on) if (r.on_taps) |cb| try cb.f(cb.ctx, r.acts.taps, @intCast(end - at));
+            if (pf.prefill_profile.active) try pf.prefill_profile.endChunk(&r.d, last, @intCast(end - at));
             r.pos += @intCast(end - at);
             at = end;
         }
