@@ -89,6 +89,13 @@ const LaneServed = struct {
     }
 };
 
+/// Drops the least recently used kept prompt state: a live stream needs its pages (XPU_KEEP_SHARED).
+fn evictOne(ptr: *anyopaque) bool {
+    const h: *LaneServed = @ptrCast(@alignCast(ptr));
+    const store = if (h.cache) |*s| s else return false;
+    return store.evictOne();
+}
+
 /// The prompt cache's states: a slot's copy at a mark of its prompt pass, restored by the pass itself.
 const Snaps = struct {
     fn of(ptr: *anyopaque) *LaneServed {
@@ -142,13 +149,21 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
         if (mtp) |m| try m.measure(); // its timed step: an all-reduce, so after both ranks' pools
         // kept prompt states hold the pool's pages past the streams' contexts; their GDN copies have a reserve of their own
         const e = (context + xq.PAGE - 1) / xq.PAGE;
-        const spare = pages -| slots * e;
+        var spare = pages -| slots * e;
+        if (xq.keep_shared) { // XPU_KEEP_SHARED: kept states hold any free page, and give way to a stream that needs one
+            // the streams' reserve: a page a slot for its next row, a chunk's pages a slot for a prompt pass
+            const chunk_pages = (xq.maxRows() + xq.PAGE - 1) / xq.PAGE;
+            const reserve = @min(slots * (chunk_pages + 1), pages -| 1);
+            runner.reserve = reserve;
+            spare = pages -| reserve;
+        }
         budget = if (cache_on) @as(u64, spare) * runner.kvBytesPerToken() * xq.PAGE else 0;
         if (o.prompt_cache_gib) |gib| {
             if (gib > 0) budget = @min(budget, std.math.lossyCast(u64, gib * (1 << 30)));
         }
         std.log.info("qwen27-xpu: a shared K/V pool of {d} pages ({d} tokens, {d:.2} GB a card, int8), {d} stream(s) of at most {d} tokens, kept prompt states in up to {d:.1} GiB of it", .{ pages, runner.poolTokens(), @as(f64, @floatFromInt(runner.poolBytes())) / 1e9, slots, context, @as(f64, @floatFromInt(budget)) / (1 << 30) });
         if (slots < want) std.log.warn("qwen27-xpu: the K/V pool holds {d} tokens, so {d} stream(s) are admitted of the {d} asked for (--kv-pool-tokens names a bigger pool)", .{ runner.poolTokens(), slots, want });
+        if (xq.keep_shared) std.log.info("qwen27-xpu: kept prompt states share the pool (XPU_KEEP_SHARED): {d} pages ({d} tokens) stay free for the streams, kept states in up to {d:.1} GiB of the pool, the least recently used one dropped when a stream needs a page", .{ runner.reserve, @as(u64, runner.reserve) * xq.PAGE, @as(f64, @floatFromInt(budget)) / (1 << 30) });
     } else {
         budget = cacheBudget(o);
         // a stream past the first: its GDN state and, with the MTP head, its own K/V cache
@@ -193,6 +208,7 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
         }
         h.host.cache = &h.cache.?;
         h.host.info_.prompt_cache = true;
+        if (xq.keep_shared) runner.evict = .{ .ctx = h, .f = evictOne }; // rank 0 decides; its drops are step records
         std.log.info("qwen27-xpu: prompt cache of {d:.1} GiB", .{@as(f64, @floatFromInt(budget)) / (1 << 30)});
     }
     errdefer if (h.cache) |*store| store.deinit();

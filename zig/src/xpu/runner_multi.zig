@@ -29,6 +29,11 @@ pub const MAX_WINDOWS = 16;
 /// Every window in one forward (q.windowRows() rows at most, XPU_VERIFY_ROWS=32: 32): each row's greedy token in
 /// `block`; nothing moves until `keepMulti`.
 pub fn verifyMulti(r: *Runner, wins: []const Win) !void {
+    // every window's pages first (rank 0: the kept states it drops are step records before this call)
+    for (wins) |w| if (w.ids.len > 0 and w.slot < q.MAX_SLOTS) {
+        const p = r.seqs[w.slot].pos;
+        if (@as(u64, p) + w.ids.len <= r.context) try r.makeRoom(w.slot, p + @as(u32, @intCast(w.ids.len)));
+    };
     if (tp.group) |*g| { // a window: slot, rows, has parents, the ids, the parents
         var words: [MAX_WINDOWS * 3 + 2 * q.MAX_ROWS]u32 = undefined;
         var at: usize = 0;
