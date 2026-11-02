@@ -455,7 +455,8 @@ fn exl3Probe(r: *q.Runner) !void {
     for ([_]q.Proj{ l0.gu, l0.down }) |w| {
         const K = w.k;
         const N = if (w.ilv) w.n else w.n;
-        for ([_]u32{ 1, 8 }) |T| {
+        // XPU_ROWS_MAX: 16, 32 and 64 rows show the many-row decode against the 1-row decode, with GB/s
+        for ([_]u32{ 1, 16, 32, 64 }) |T| {
             var best: f64 = 1e9;
             for (0..200) |it| {
                 const t0 = q.now();
@@ -464,7 +465,8 @@ fn exl3Probe(r: *q.Runner) !void {
                 if (it > 10) best = @min(best, q.now() - t0);
             }
             const bytes4 = @as(f64, @floatFromInt(K)) * @as(f64, @floatFromInt(N)) / 2.0;
-            std.debug.print("int4 (ours)  K {d:5} N {d:5} rows {d:2}: {d:6.3} ms, {d:5.0} GB/s\n", .{ K, N, T, best * 1e3, bytes4 / best / 1e9 });
+            const pl = @import("w4rows.zig").plan(T, N, q.rows_max);
+            std.debug.print("int4 (ours) {s} K {d:5} N {d:5} rows {d:2}: {d:6.3} ms, {d:5.0} GB/s\n", .{ @tagName(pl.kernel), K, N, T, best * 1e3, bytes4 / best / 1e9 });
             for ([_]u32{ 4, 3, 2 }) |bits| {
                 const bytes: usize = @as(usize, K / 16) * (N / 16) * 16 * bits * 2;
                 const tr = try d.alloc_(bytes);
