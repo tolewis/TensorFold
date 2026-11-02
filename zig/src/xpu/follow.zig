@@ -15,8 +15,10 @@ pub fn run(r: *q.Runner) !void {
     const g = if (tp.group) |*x| x else return error.NotARank;
     const trace = std.c.getenv("TF_TP_TRACE") != null; // every record to stderr
     if (g.rank == 0) return error.NotAFollower;
-    var snaps: std.AutoHashMapUnmanaged(u64, slot_states.Snap) = .empty;
+    var snaps: std.AutoHashMapUnmanaged(u64, slot_states.Snap) = .empty; // rank 0's save_slot ids: this rank's own saves
     defer snaps.deinit(alloc);
+    var spills: std.AutoHashMapUnmanaged(u64, *q.Spill) = .empty; // a spilled state's id: this rank's host pages
+    defer spills.deinit(alloc);
     var buf: std.ArrayList(u32) = .empty;
     defer buf.deinit(alloc);
     var rec: tp.Rec = undefined;
@@ -77,8 +79,20 @@ pub fn run(r: *q.Runner) !void {
                 const s = slot_states.saveSlot(r, rec.a, rec.b) catch |e| break :blk e;
                 break :blk snaps.put(alloc, id, s);
             },
-            .restore_slot => if (snaps.get(id)) |s| slot_states.restoreSlot(r, rec.a, s) else error.NoSuchSnap,
-            .drop_snap => if (snaps.fetchRemove(id)) |kv| slot_states.dropSnap(r, kv.value) else {},
+            .spill_slot => blk: { // rank 0 moved a kept state's K/V to host RAM: this rank moves its half too
+                const s = snaps.get(id) catch |e| break :blk e;
+                const spill = q.spillState(r, id, rec.a, s.at, s.pages) catch |e| break :blk e;
+                const p = try alloc.create(q.Spill);
+                errdefer alloc.free(p);
+                p.* = spill;
+                break :blk spills.put(alloc, id, p);
+            },
+            .restore_slot => if (spills.get(id)) |s| q.restoreSpill(r, rec.a, s.at, s) else if (snaps.get(id)) |s|
+                slot_states.restoreSlot(r, rec.a, s) else error.NoSuchSnap,
+            .drop_snap => {
+                if (spills.fetchRemove(id)) |s| q.dropSpill(r, s);  // a spilled state's host buffer
+                if (snaps.fetchRemove(id)) |kv| slot_states.dropSnap(r, kv.value);
+            },
             .ensure => slot_states.ensure(r, rec.a),
             .close => return,
             .more => error.BadRecord,

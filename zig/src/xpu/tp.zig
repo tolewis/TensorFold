@@ -37,7 +37,7 @@ pub const rec_words = 1024; // 4 KiB a record
 pub const rec_data = rec_words - 8;
 
 /// A state-changing Runner call. `more`: the rest of the previous record's data.
-pub const Op = enum(u32) { select = 1, store, reset, prompt, more, step, verify, commit, verify_tree, commit_path, verify_multi, keep_multi, keep_paths, step_multi, save_slot, restore_slot, drop_snap, ensure, close };
+pub const Op = enum(u32) { select = 1, store, reset, prompt, more, step, verify, commit, verify_tree, commit_path, verify_multi, keep_multi, keep_paths, step_multi, save_slot, spill_slot, restore_slot, drop_snap, ensure, close };
 
 /// One step record: `seq` is the record's number plus one once written (0: empty), `n` the data words of the
 /// whole call, `a` `b` `lo` `hi` the call's small arguments (lo and hi a 64-bit snapshot id).

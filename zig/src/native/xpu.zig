@@ -106,6 +106,9 @@ const Snaps = struct {
     fn drop(ptr: *anyopaque, saved: api.prompt_cache.Saved) void {
         of(ptr).back.keepDrop(@ptrCast(@alignCast(saved)));
     }
+    fn spill(ptr: *anyopaque) struct { u64, u64, u64 } {
+        return of(ptr).back.runner.spillStats();
+    }
 };
 
 /// The prompt cache's budget: --prompt-cache-gib, else 2 GiB (0: no cache); set aside before the streams.
@@ -178,7 +181,7 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
     }
     if (budget > 0) {
         // the prompt kernels compute in blocks of 64 rows from a call's start: kept and resumed at planned marks only
-        h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = h, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, .{ .planned = true, .grid = 64 }, budget);
+        h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = h, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop, .spilled = Snaps.spill } }, .{ .planned = true, .grid = 64 }, budget);
         if (xq.kv_pool) { // kept states' GDN and drafter-context copies stay inside the reserve the pool left for them
             const per = xq.gdnBytes(runner) + (if (drafter != null) Drafter.ctxBytes() else 0);
             h.cache.?.most = @intCast(@max(1, (1536 << 20) / @max(per, 1)));

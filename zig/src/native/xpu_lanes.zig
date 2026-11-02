@@ -11,8 +11,9 @@ const ring = 64;
 const TAP_ROW = 5 * xq.D * 2; // bf16 [5 D]
 const TREE_MIN = 5; // drafts from which a stream's window is a DFlash2 tree (below: its chain)
 
-/// A kept prompt state (prompt cache): the slot's states after `at` tokens and its DFlash2 context.
-pub const Kept = struct { snap: xq.Runner.Snap, ctx: ?*anyopaque = null, range: [2]u32 = .{ 0, 0 } };
+/// A kept prompt state (prompt cache): the slot's states after `at` tokens and its DFlash2 context. A spilled state's
+/// K/V pages live in the runner's host RAM until a restore copies them back into fresh pool pages.
+pub const Kept = struct { snap: xq.Runner.Snap, ctx: ?*anyopaque = null, range: [2]u32 = .{ 0, 0 }, spill: ?*xq.Spill = null };
 
 pub const Lanes = struct {
     gpa: Allocator,
@@ -213,7 +214,12 @@ pub const Lanes = struct {
             for (s.reuse.marks) |mark| if (mark > at and mark < end) {
                 end = mark;
             };
-            try r.prompt(ids[at..end], end == ids.len);
+            // the pool may run short while a kept state's pages are in it: the least recently used one moves to host RAM,
+            // so its page ids return to the pool and this chunk takes them from there.
+            try r.prompt(ids[at..end], end == ids.len) catch |err| {
+                if (err == error.ContextFull and r.spillLru()) continue;  // the pool ran short: a kept state's K/V moved to host RAM
+                return err;
+            };
             at = end;
             if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) if (s.reuse.hook) |k| k.at(k.ptr, s, @intCast(at));
         }
@@ -230,13 +236,18 @@ pub const Lanes = struct {
         return b.runner.snapBytes(at) + if (b.drafter != null) Drafter.ctxBytes() else 0;
     }
 
-    /// `s`'s slot standing at `at` prompt tokens, copied (its DFlash2 context too).
+    /// `s`'s slot standing at `at` prompt tokens, copied (its DFlash2 context too). A state whose K/V pages move to
+    /// host RAM keeps them alive in the runner's spill list until a restore or a drop frees their host buffer.
     pub fn keepSave(b: *Lanes, s: *const lanes.Stream, at: u32) !*Kept {
         const slot = b.slotOf(s) orelse return error.UnknownStream;
         const k = try b.gpa.create(Kept);
         errdefer b.gpa.destroy(k);
-        k.* = .{ .snap = try b.runner.saveSlot(slot, at) };
-        errdefer b.runner.dropSnap(k.snap);
+        k.* = .{ .snap = try b.runner.saveSlot(slot, at), .spill = null };
+        if (xq.kv_spill) {
+            b.runner.keepSlot(@intFromPtr(k.snap.buf), slot, at);  // a state the pool may spill when it runs short
+            defer b.runner.touchId(@intFromPtr(k.snap.buf));  // its LRU order in the runner's kept list
+        }
+        errdefer if (xq.kv_spill) b.runner.dropSlot(@intFromPtr(k.snap.buf));
         if (b.drafter) |d| {
             const buf = try b.runner.d.alloc_(Drafter.ctxBytes());
             errdefer xq.freeAfterQueue(&b.runner.d, buf); // saveCtx's copies may be queued
@@ -247,13 +258,21 @@ pub const Lanes = struct {
     }
 
     pub fn keepDrop(b: *Lanes, k: *Kept) void {
-        b.runner.dropSnap(k.snap);
+        if (k.spill != null) xq.dropSpill(&b.runner, k.spill.*);  // a spilled state's host buffer; its page ids are back in the pool
+        b.runner.dropSnap(k.snap);  // records .drop_snap so rank 1 drops its half of the same state too
+        if (xq.kv_spill) b.runner.dropSlot(@intFromPtr(k.snap.buf));  // the state is gone: it leaves `kept`
         if (k.ctx) |x| xq.freeAfterQueue(&b.runner.d, x);
         b.gpa.destroy(k);
     }
 
     fn restoreKept(b: *Lanes, slot: u32, k: *const Kept) !void {
-        try b.runner.restoreSlot(slot, k.snap);
+        if (k.spill != null) {  // its K/V pages were moved to host RAM; copy them back into fresh pool pages
+            try b.runner.restoreSpill(slot, k.snap.at, k.spill.*);
+            xq.dropSpill(&b.runner, k.spill.*);  // the copy is done: their host buffer is gone
+        } else {
+            try b.runner.restoreSlot(slot, k.snap);
+        }
+        if (xq.kv_spill) b.runner.touchId(@intFromPtr(k.snap.buf));  // a restored state moves to the end of `kept`
         if (b.drafter) |d| try d.restoreCtx(slot, k.ctx orelse return error.NoContext, k.range);
     }
 

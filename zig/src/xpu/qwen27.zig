@@ -85,6 +85,11 @@ pub const PAGE: u32 = 64;
 pub var kv_pool = false;
 /// --kv-pool-tokens: the pool's size in tokens; null: what the card leaves after the load and the reserve.
 pub var pool_tokens: ?u32 = null;
+/// XPU_KV_SPILL=1: when the pool runs short of page ids, a kept prompt state's K/V pages move to pinned host memory,
+/// so its page ids return to the pool for a new slot and the state survives its resume. Off by default.
+pub var kv_spill = false;
+/// XPU_KV_SPILL_GIB: a rank's spilled states may use that much pinned host memory (64 GiB by default).
+pub var spill_gib: u64 = 64;
 
 // Layout of a GDN layer's stash (bytes): q, k, v, g, β, then the qkv rows of P.
 pub const ST_Q = 0;
@@ -141,6 +146,8 @@ const Options = struct {
     chunk: u32,
     kv_pool: bool,
     pool_tokens: ?u32,
+    kv_spill: bool,
+    spill_gib: u64,
 };
 var defaults: ?Options = null;
 /// One runner at a time: the options, MAX_CTX and GS above belong to the process, not to a runner.
@@ -166,6 +173,8 @@ fn restore(o: Options) void {
     CHUNK = o.chunk;
     kv_pool = o.kv_pool;
     pool_tokens = o.pool_tokens;
+    kv_spill = o.kv_spill;
+    spill_gib = o.spill_gib;
 }
 
 extern "c" fn clock_gettime(clk: c_int, ts: *[2]i64) c_int;
@@ -176,6 +185,21 @@ pub fn now() f64 {
 }
 
 /// The whole model on the device and one sequence's state: what a serial host drives.
+/// A state the store keeps at a slot's page table: its snapshot buffer address (how both ranks name a state), its
+/// slot and where it stands; `kept[0]` is the least recently used (a restore or a keep ages it to the end).
+pub const Kept = struct { id: u64, slot: u32, at: u32, used: u64 };
+
+/// A state's K/V pages moved to pinned host memory (a kept prompt state the pool released): its page ids return to
+/// the pool for a new slot, so the state survives its resume, which copies them back into fresh pool pages.
+pub const Spill = struct {
+    id: u64, // the store's snapshot buffer address; how both ranks name the state
+    slot: u32,
+    at: u32,
+    ids: []u32, // its pages' page ids, in the table's order
+    buf: *anyopaque, // this rank's half of every layer's K/V, one piece per page id and half
+    bytes: usize, // what it holds of the spill budget
+};
+
 pub const Runner = struct {
     d: Dev,
     model: Model,
@@ -238,6 +262,8 @@ pub const Runner = struct {
         if (std.c.getenv("XPU_KV_POOL_TOKENS")) |v| pool_tokens = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (pool_tokens != null) kv_pool = true;
         if (kv_pool) kv_i8 = true;
+        if (std.c.getenv("XPU_KV_SPILL")) |v| kv_spill = v[0] != '0';
+        if (std.c.getenv("XPU_KV_SPILL_GIB")) |v| spill_gib = try std.fmt.parseInt(u64, std.mem.span(v), 10);
         MAX_CTX = try limits.context(context);
         {
             const marker = try std.fmt.allocPrintSentinel(alloc, "{s}/hadamard128", .{dir}, 0);
@@ -379,6 +405,9 @@ pub const Runner = struct {
         if (r.host_logits.len > 0) alloc.free(r.host_logits);
         for (r.pt_host) |t| if (t.len > 0) alloc.free(t);
         if (r.pages.count > 0) r.pages.deinit();
+        r.kept.deinit(alloc);
+        for (r.spilled.values()) |*s| dropSpill(r, s);
+        r.spilled.deinit(alloc);
         alloc.destroy(r);
     }
 
@@ -481,6 +510,7 @@ pub const Runner = struct {
         return @as(u64, r.pool) * PAGE;
     }
 
+
     /// The shared K/V pool: `pages` pages in each attention layer (K pages, then V pages, one allocation a layer,
     /// zeroed so the card holds them now), and each slot's page table, mapping nothing.
     pub fn allocPool(r: *Runner, pages: u32) !void {
@@ -556,7 +586,151 @@ pub const Runner = struct {
         if (full) return error.ContextFull;
     }
 
-    /// Drops `slot`'s hold on its pages: a fresh sequence, or a restore that maps a kept state's pages.
+    /// The store keeps a state's page ids at this slot; `id` is its snapshot buffer address, how both ranks name it.
+    /// It moves to the end of `kept` when used again (a restore or a keep): `kept[0]` stays the oldest.
+    pub fn keepSlot(r: *Runner, id: u64, slot: u32, at: u32) void {
+        for (&r.kept.items) |*k| if (k.id == id) return;
+        r.used_clock += 1;
+        r.kept.append(alloc, .{ .id = id, .slot = slot, .at = at, .used = r.used_clock }) catch {};
+    }
+
+    /// The store dropped a state: its page ids are back in the pool, so the spill's host buffer is what is left of it.
+    pub fn dropSlot(r: *Runner, id: u64) void {
+        for (r.kept.items, 0..) |*k, i| if (k.id == id) r.kept.orderedRemove(i);
+    }
+
+    /// Age a kept state at the end of `kept`: a restore or a keep moves it to the most recently used (the LRU stays first).
+    pub fn touchId(r: *Runner, id: u64) void {
+        for (&r.kept.items) |*k| {
+            if (k.id == id) {
+                r.used_clock += 1;
+                k.* = .{ .id = id, .slot = k.slot, .at = k.at, .used = r.used_clock };
+                return;
+            }
+        }
+    }
+
+    /// A state's K/V pages moved to pinned host memory: its page ids return to the pool so a new slot takes them; the
+    /// restore copies them back into fresh pool pages and fixes its page table. The state survives its resume.
+    pub fn spillState(r: *Runner, id: u64, slot: u32, at: u32, ids: []const u32) ?Spill {
+        if (r.pool == 0) return null;
+        const budget = @as(u64, spill_gib) << 30;  // the spill budget stays in GiB
+        const bytes = @as(usize, at) * r.kvBytesPerToken();  // a state's K/V on this rank
+        if (r.spilled_bytes + bytes > budget) return null;
+        if (ids.len == 0) return null;
+        const entries: usize = @intCast(ids.len);
+        var layers: usize = 0;
+        for (r.model.layers) |l| { if (l.attn) layers += 1; }
+        const buf: *anyopaque = try r.d.g.hostAlloc(entries * 2 * layers * r.page_bytes);
+        errdefer r.d.free(buf);  // the pages this holds are back in the pool now
+        const page_ids = try alloc.alloc(u32, entries);
+        errdefer alloc.free(page_ids);
+        @memcpy(page_ids, ids);
+        var o: usize = 0;
+        for (r.model.layers) |*l| {
+            if (!l.attn) continue;
+            for (page_ids) |pid| {
+                // one piece of each half of every layer's K and V page
+                try copy(&r.d, off(buf, o), off(l.kc.?, @as(usize, pid) * r.page_bytes), r.page_bytes);  o += r.page_bytes;
+                try copy(&r.d, off(buf, o), off(l.vc.?, @as(usize, pid) * r.page_bytes), r.page_bytes);  o += r.page_bytes;
+            }
+        }
+        try r.d.sync();
+        return .{ .id = id, .slot = slot, .at = at, .ids = page_ids, .buf = buf, .bytes = bytes };
+    }
+
+    /// The pool runs short of page ids (a slot needs pages the pool no longer gives): move the least recently used kept
+    /// state's K/V to pinned host memory, so its page ids return to the pool and this call takes them from there.
+    /// true when a state was spilled; false when no state is held or the budget is exceeded.
+    pub fn spillLru(r: *Runner) bool {
+        if (!kv_spill) return false;
+        return spillLru(&r.kept, &r.spilled_bytes, @as(u64, spill_gib) << 30, r.kvBytesPerToken()) != null;
+    }
+
+    /// The least recently used kept state whose K/V fits the spill budget (null when none is held or it does not fit):
+    /// a host-side copy of the runner's bookkeeping for the pool's pages.
+    fn spillLru(kept: *std.ArrayList(Kept), spilled_bytes: *u64, budget: u64, kv_bytes_per_token: usize) ?Kept {
+        if (kept.items.len == 0) return null;
+        var first: ?usize = null;
+        for (kept.items, 0..) |k, i| { if (first) |f| { if (k.used < kept.items[f].used) first = i; } else first = i; }
+        const k = kept.items[first.?];
+        const bytes = @as(u64, k.at) * kv_bytes_per_token;  // a state's K/V on this rank
+        if (spilled_bytes.* + bytes > budget) return null;
+        return k;
+    }
+
+    /// A kept state's page ids: its slot's table entries up to where it stands.
+    pub fn slotPages(r: *const Runner, slot: u32, at: u32) []const u32 {
+        const entries = (at + PAGE - 1) / PAGE;
+        return r.pt_host[slot][0..entries];
+    }
+
+    /// A spilled state's K/V pages back into fresh pool pages: the slot's own pages go back to the pool first, then the
+    /// pool's free list gives them (the spill released its ids) and this copy fixes the page table.
+    pub fn restoreSpill(r: *Runner, slot: u32, at: u32, s: *Spill) !void {
+        if (r.pool == 0) return;
+        r.releaseSlot(slot); // the slot's own pages go back to the pool; the kept state's stay
+        try r.ensurePages(slot, at);   // fresh pages from the free list (the spill released its ids)
+        const entries = @as(usize, @intCast(r.held[slot]));
+        var o: usize = 0;
+        for (r.model.layers) |*l| {
+            if (!l.attn) continue;
+            for (r.pt_host[slot][0..entries]) |id| {
+                try copy(&r.d, off(l.kc.?, @as(usize, id) * r.page_bytes), off(s.buf, o), r.page_bytes);  o += r.page_bytes;
+                try copy(&r.d, off(l.vc.?, @as(usize, id) * r.page_bytes), off(s.buf, o), r.page_bytes);  o += r.page_bytes;
+            }
+        }
+        // the fresh pages are in the table now: fix it on the device and wait for the copies to land.
+        try r.mapPages(slot, 0, r.pt_host[slot][0..entries]);
+        try r.d.sync();
+        r.restore_count += 1;
+    }
+
+    /// The spill statistics: states moved to host RAM, restored from it and their bytes (XPU_KV_SPILL_GIB holds them).
+    pub fn spillStats(r: *const Runner) struct { u64, u64, u64 } {
+        return .{ r.spill_count, r.restore_count, r.spill_bytes };
+    }
+
+    /// The spilled state's host buffer back to the pool; its page ids are there already.
+    pub fn dropSpill(r: *Runner, s: *Spill) void {
+        if (r.pool == 0) return;
+        r.spilled_bytes -= s.bytes;
+        r.spilled.remove(s.id);
+        alloc.free(s.ids);
+        freeAfterQueue(&r.d, s.buf);  // the host buffer is dropped when the queue drains
+    }
+
+
+
+    /// Pages for `slot`'s table entries up to `to`, mapped in its table; error.ContextFull when the pool has none left.
+    /// When the pool runs short of page ids, a kept state's K/V pages move to pinned host memory first, so its page
+    /// ids return to the pool and this call takes them from there.
+    pub fn ensurePagesFrom(r: *Runner, slot: u32, to: u32) !void {
+        if (r.pool == 0) return;
+        const from = r.held[slot];
+        if (to <= from) return;
+        var i = from;
+        var full = false;
+        while (i < to) : (i += 1) {
+            const id = r.pages.take() orelse { full = true; break; };
+            r.pt_host[slot][i] = id; // take gave the slot's reference
+        }
+        if (full) {
+            // the pool runs short of page ids: a kept state's K/V pages move to pinned host memory, so its page ids
+            // return to the pool and this call takes them from there.
+            if (!spillLru(r)) return error.ContextFull;  // no state is held or the budget is exceeded
+            full = false;
+            while (i < to) : (i += 1) {
+                const id = r.pages.take() orelse { full = true; break; };
+                r.pt_host[slot][i] = id; // take gave the slot's reference
+            }
+        }
+        if (full) return error.ContextFull;
+        r.held[slot] = i;
+        try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, off(r.pt[slot].?, @as(usize, from) * 4), r.pt_host[slot].ptr + from, (i - from) * 4, null, 0, null));
+    }
+
+    /// `slot`'s own pages back to the pool: a fresh sequence, or a restore that maps a kept state's pages.
     pub fn releaseSlot(r: *Runner, slot: u32) void {
         if (r.pool == 0 or slot >= MAX_SLOTS or r.pt[slot] == null) return;
         for (r.pt_host[slot][0..r.held[slot]]) |id| r.releasePage(id);

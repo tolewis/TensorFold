@@ -61,6 +61,9 @@ pub const Snapshots = struct {
         forget: ?*const fn (ptr: *anyopaque, dir: [:0]const u8, key: u64) void = null,
         /// --learn-conversations: the state's image as rows and parts, and copies out of and into kept states.
         rows: ?*const rows.Image = null,
+        /// A family whose kept states may move to host RAM: the states moved to it, the ones restored from it and
+        /// their bytes (XPU_KV_SPILL_GIB holds them; null: no spills are held).
+        spilled: ?*const fn (ptr: *anyopaque) struct { spill: u64, restore: u64, bytes: u64 } = null,
     };
 };
 
@@ -556,7 +559,8 @@ pub const Store = struct {
     /// One log line after a prompt pass: where it resumed, how many states it kept, and what the store holds.
     pub fn report(s: *const Store, prompt: usize, from: u32, kept: u64) void {
         if (@import("builtin").is_test) return;
-        std.log.info("prompt cache: {d} tokens, resumed at {d}, kept {d}; {d} states, {d} MiB and {d} MiB spare of {d} MiB (hits {d}, misses {d}, evicted {d}, refused {d}, failed {d})", .{ prompt, from, kept, s.entries.items.len, s.holding() >> 20, s.spare() >> 20, s.budget >> 20, s.counts.hits, s.counts.misses, s.counts.evicted, s.counts.refused, s.counts.failed });
+        const silled = if (s.family.vtable.spilled) |f| f(s.family.ptr) else .{ 0, 0, 0 };
+        std.log.info("prompt cache: {d} tokens, resumed at {d}, kept {d}; {d} states, {d} MiB and {d} MiB spare of {d} MiB (hits {d}, misses {d}, evicted {d}, refused {d}, failed {d}, spilled {d}, restored {d}, host {d:.2} GiB)", .{ prompt, from, kept, s.entries.items.len, s.holding() >> 20, s.spare() >> 20, s.budget >> 20, s.counts.hits, s.counts.misses, s.counts.evicted, s.counts.refused, s.counts.failed, silled.spill, silled.restore, @as(f64, @floatFromInt(silled.bytes)) / (1 << 30) });
     }
 
     fn fail(s: *Store, at: u32, err: anyerror) bool {
