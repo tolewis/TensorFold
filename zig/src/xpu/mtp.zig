@@ -44,6 +44,35 @@ pub const SLICE = 128;
 /// The rows a draft or keep absorb pass holds at most (the target's verify window; XPU_VERIFY_ROWS=32: 32).
 pub const ROWS = q.MAX_ROWS;
 
+/// The io of every MTP layer projection. The layer's activation rows are fp16: attn_gate, add_rmsnorm and swiglu all
+/// write `half`, so a plan that reads them as bf16 misreads every value (lane p29-mtpfix: the o_proj's plan said bf16
+/// and the attention half of every absorbed row was scaled by about 2^-7 before the o projection).
+pub const ProjIO = struct { out: exl3.Output = .f16, in: exl3.Input = .f16 };
+pub const layer_io: ProjIO = .{};
+
+/// The cache position of a chained draft row: the newest absorbed position plus its step. cuda_mtp.zig's hold runs row
+/// k at pos0 + k - 1 with pos0 = ctx.end, and ctx.end is the newest absorbed position plus one, so the first draft row
+/// is one past the newest absorbed row: its K/V does not overwrite that row's K/V and its rope is at its own position.
+/// Pure, so a host test covers it.
+pub fn draftPos(newest: u32, step: u32) u32 {
+    return newest + step;
+}
+
+test "a draft row's position is one past the newest absorbed row, and its step advances by one" {
+    // newest 100: the absorbed rows are at 0..100; draft rows go to 101, 102, 103, never back onto 100
+    try std.testing.expectEqual(@as(u32, 101), draftPos(100, 1));
+    try std.testing.expectEqual(@as(u32, 102), draftPos(100, 2));
+    try std.testing.expectEqual(@as(u32, 103), draftPos(100, 3));
+    try std.testing.expectEqual(@as(u32, 1), draftPos(0, 1)); // a fresh slot: the prompt's last row is at 0
+    var step: u32 = 1;
+    while (step < 4) : (step += 1) try std.testing.expect(draftPos(100, step) > 100);
+}
+
+test "every MTP projection reads the layer's fp16 activation rows" {
+    try std.testing.expectEqual(exl3.Input.f16, layer_io.in);
+    try std.testing.expectEqual(exl3.Output.f16, layer_io.out);
+}
+
 /// Reads the two flags at the runner's init, before anything asks whether the head is on. `Mtp.load` reads them again
 /// (it is also the path a test drives), so the flags are set from one place.
 pub fn readEnv() void {
@@ -338,10 +367,11 @@ pub const Mtp = struct {
             }
         }
         for (&m.scratch, need) |*sc, n| sc.* = try d.alloc_(@max(n, 64));
-        try m.mkPlans(&m.plans.qkv, m.qkv, m.h, m.p, .f16, .f16);
-        try m.mkPlans(&m.plans.o, m.o, m.h, m.pr, .f16, .bf16);
-        try m.mkPlans(&m.plans.gu, m.gu, m.h, m.guv, .f16, .f16);
-        try m.mkPlans(&m.plans.down, m.down, m.act, m.pr, .f16, .f16);
+        const io = layer_io;
+        try m.mkPlans(&m.plans.qkv, m.qkv, m.h, m.p, io.out, io.in);
+        try m.mkPlans(&m.plans.o, m.o, m.h, m.pr, io.out, io.in);
+        try m.mkPlans(&m.plans.gu, m.gu, m.h, m.guv, io.out, io.in);
+        try m.mkPlans(&m.plans.down, m.down, m.act, m.pr, io.out, io.in);
         // the head over the MTP's rows (the same lm_head matrix the target's head uses)
         m.head.x = @intFromPtr(m.hb);
         m.head.y = @intFromPtr(m.logits);
@@ -509,12 +539,14 @@ pub fn measure(m: *Mtp) !void {
     const asks = [_]Ask{.{ .slot = 0, .pending = 100, .depth = 2 }};
     var best: f64 = std.math.inf(f64);
     for (0..3) |_| {
-        const t0 = q.now();
+        const t0 = q.now(); // seconds (qwen27.now)
         m.draft(&asks) catch return;
         try m.r.d.sync();
         best = @min(best, q.now() - t0);
     }
-    m.step_ms = best / 1.0;
+    // one draft step in ms: the ask holds two drafts (one layer pass and two head calls), as cuda_mtp.zig's load prices
+    // a chain by its depth. q.now is seconds, so the price is 1e3 * seconds / drafts.
+    m.step_ms = best * 1e3 / 2.0;
     m.chain_n[0] = 0;
     m.pos[0] = 0;
     std.debug.print("MTP head: one draft step {d:.3} ms, {d} drafts a round at most, {d:.2} GB of K/V a card at {d} slots\n", .{ m.step_ms, most, @as(f64, @floatFromInt(m.slotBytes())) * @as(f64, q.MAX_SLOTS) / 1e9, q.MAX_SLOTS });
@@ -567,6 +599,9 @@ fn layer(m: *Mtp, slot: u32, n: u32, p0: u32, wide: bool, mt: bool) !void {
         try d.launch(d.k.attn_decode, .{ .x = ns, .y = AKV, .z = n }, .{ m.qb, nul, nul, m.r.acts.pm, m.r.acts.pl, m.r.acts.po, @as(i32, 0), @as(i32, @intCast(ns)), scale, nul, m.mt, m.mpos, cap, nul });
         try d.launch(d.k.attn_merge, .{ .x = HQ, .y = n }, .{ m.r.acts.pm, m.r.acts.pl, m.r.acts.po, m.y, @as(i32, 0), @as(i32, @intCast(ns)), nul, m.mpos });
     }
+    // XPU_KV8 & 1 rotates q, k, v by Hadamard in attn_prep, so the merged output is un-rotated before the gate, as the
+    // target's forward does. Off with XPU_KV8 unset (the live pair's setting), where the launch is skipped.
+    if (q.kv8 & 1 != 0) try d.launch(d.k.rot_heads, .{ .x = n, .y = HQ }, .{m.y});
     try d.launch(d.k.attn_gate, .{ .x = n }, .{ m.y, m.p, m.h, m.ahi, m.alo, gs, rot, nul, nul, ms });
     try m.runPlans(&m.plans.o, n, wide);
     if (tp.group) |*g| try g.allReduce(d, m.pr, n);
@@ -634,7 +669,8 @@ pub fn absorbKept(m: *Mtp, items: []const Kept) !void {
     var total: usize = 0;
     for (items) |it| {
         if (it.block.len != it.follow.len or it.block.len == 0) return error.BadKept;
-        if (m.kv[it.slot] == null) return error.NoSlot;
+        // a slot that has not run a prompt absorb has no cache yet: open it here (the pool sizing reserved its bytes)
+        if (m.kv[it.slot] == null) try m.open(it.slot);
         total += it.block.len;
     }
     if (total > @as(usize, q.windowRows())) return error.BadKept;
@@ -705,7 +741,7 @@ pub fn draft(m: *Mtp, asks: []const Ask) !void {
             m.mt_host[cnt * 8 + 2] = 0;
             m.mt_host[cnt * 8 + 6] = 0;
             m.mt_host[cnt * 8 + 7] = 1;
-            m.pos_host[cnt] = @intCast(m.pos[a.slot] + step - 1);
+            m.pos_host[cnt] = @intCast(draftPos(m.pos[a.slot], step));
             which[cnt] = i;
             prev[i] = @intCast(cnt);
             cnt += 1;
