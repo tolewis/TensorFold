@@ -47,8 +47,11 @@ static inline float bf2f(ushort h) { return as_float((uint)h << 16); }
 // Tree verify draft (lane p22-k1tree): a row's draft keys are the tree table's mask of its cache rows - its own
 // row and its ancestors', rows p0 + the ancestor rows, at most 16. The prefix keys are attn_k1_decode's slices
 // 0 .. NS - 1; this kernel writes slice NS, the partials in the same domain (m in log2, l in fp32, o unnormalized),
-// so attn_merge_span joins the two. One sub-group of 16 lanes per (K/V head, row): the 6 query heads x 16 dims a
-// lane. Grid (1, AKV, rows). The draft rows' K/V pages must cover p0 + rows - 1 (verifyTree's ensurePages).
+// so attn_merge_span joins the two. The partials of a tree verify have stride NS + 1 per (row, head): the prefix
+// launch and attn_merge_span get NS + 1 as their NS, and this kernel takes NS as the slice count (its slice index)
+// and writes at stride NS + 1, so slice NS sits after the prefix slices 0 .. NS - 1 and never aliases the next head.
+// One sub-group of 16 lanes per (K/V head, row): the 6 query heads x 16 dims a lane. Grid (1, AKV, rows). The draft
+// rows' K/V pages must cover p0 + rows - 1 (verifyTree's ensurePages).
 #define DEPTH(t) (TREE[(t) * 17] & 255)
 #define ANC(t, d) TREE[(t) * 17 + 1 + (d)]
 KERNEL(16) void attn_k1_draft(global const ushort *Q, global const char *KC, global const char *VC,
@@ -89,7 +92,7 @@ KERNEL(16) void attn_k1_draft(global const ushort *Q, global const char *KC, glo
     }
   }
   for (int a = 0; a < Q27_GQA; a++) {              // slice NS: the partials' layout as attn_k1_decode's
-    const long base = ((long)t * Q27_AQ + qh0 + a) * NS + NS;
+    const long base = ((long)t * Q27_AQ + qh0 + a) * (NS + 1) + NS;
     if (lane == 0) {
       PM[base] = m[a];
       PL[base] = l[a];
