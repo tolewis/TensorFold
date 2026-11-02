@@ -39,3 +39,9 @@ pub const exl3_moe: [exl3_variants.moe.bits.len][]const u8 = blk: {
     for (exl3_variants.moe.bits, &out) |b, *image| image.* = if (available) &Blob("spv_" ++ exl3_variants.moe.name(b)).bytes else &.{};
     break :blk out;
 };
+/// The prompt GEMM with the A tile in local memory, one image a width of exl3_variants.gemm2.bits (same order).
+pub const exl3_gemm2: [exl3_variants.gemm2.bits.len][]const u8 = blk: {
+    var out: [exl3_variants.gemm2.bits.len][]const u8 = undefined;
+    for (exl3_variants.gemm2.bits, &out) |b, *image| image.* = if (available) &Blob("spv_" ++ exl3_variants.gemm2.name(b)).bytes else &.{};
+    break :blk out;
+};

@@ -93,6 +93,30 @@ pub const moe = struct {
     }
 };
 
+/// The prompt GEMM with the A tile in local memory (exl3_gemm2.cl, lane p26-gemm). Prompt rows only, behind
+/// XPU_PROMPT_GEMM2=1, default off. One image a width. Measured on the B70 by tools/xpu/exl3_27b_gemm2_bench.py.
+/// m: rows a sub-group, s: 16-column strips a sub-group, kc: k tiles a local-memory step. The A tile of a step is
+/// 8 * m * 16 * kc fp16 bytes and the decoded B tiles are kc * s * 512 bytes (20,480 at 24 / 8 / 2).
+pub const gemm2 = struct {
+    pub const bits = [_]u32{ 4, 6 };
+    pub const m = 24;
+    pub const s = 8;
+    pub const kc = 2;
+
+    pub fn name(comptime b: u32) []const u8 {
+        return std.fmt.comptimePrint("exl3_gemm2_b{d}", .{b});
+    }
+
+    pub fn options(comptime b: u32) []const u8 {
+        return std.fmt.comptimePrint("-cl-std=CL3.0 -DEXL3_ABS -DBITS={d} -DGEMM2_M={d} -DGEMM2_S={d} -DGEMM2_KC={d}", .{ b, m, s, kc });
+    }
+
+    /// Local memory the kernel asks for: the A tile of a step, then the decoded B tiles.
+    pub fn localBytes() usize {
+        return 8 * m * 16 * kc * 2 + kc * s * 16 * 32;
+    }
+};
+
 /// Sub-groups a launch needs to fill the GPU; fewer strips a sub-group and K splits get it there (narrow groups:
 /// Sage experts, N 512 and 2048, measured 2026-10-24 and -25).
 pub const sub_group_target = 4096;
