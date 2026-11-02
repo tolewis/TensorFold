@@ -67,6 +67,7 @@ __kernel void exl3_matvec3(__global const uchar *base, __global const exl3_desc 
     // h 0 needs the window 16 bits later than h 1. Both fit in the 64-bit pair at index m, so one runtime shift
     // covers both and every window offset stays a constant.
     const uint sh = (OFF0 + 16) - SHB * h;
+#pragma unroll 2
     for (uint kb = k0; kb < k0 + kspan; kb += 16, tile += tile_k) {
         ulong p[4];
         for (uint j = 0; j < 4; j++) p[j] = *(__global const ulong *)(tile + ((wbase + 2 * j) % RINGW));
