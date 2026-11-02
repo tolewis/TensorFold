@@ -44,10 +44,44 @@ pub const SLICE = 128;
 /// The rows a draft or keep absorb pass holds at most (the target's verify window; XPU_VERIFY_ROWS=32: 32).
 pub const ROWS = q.MAX_ROWS;
 
+/// Reads the two flags at the runner's init, before anything asks whether the head is on. `Mtp.load` reads them again
+/// (it is also the path a test drives), so the flags are set from one place.
 pub fn readEnv() void {
-    if (std.c.getenv("XPU_MTP")) |v| on = v[0] != '0';
-    if (std.c.getenv("XPU_MTP_K")) |v| most = std.fmt.parseInt(u32, std.mem.span(v), 10) catch most;
-    most = @min(@max(most, 1), q.windowRows() - 1);
+    const on_env = std.c.getenv("XPU_MTP");
+    const k_env = std.c.getenv("XPU_MTP_K");
+    applyEnv(
+        if (on_env) |v| v[0] != '0' else null,
+        if (k_env) |v| std.fmt.parseInt(u32, std.mem.span(v), 10) catch null else null,
+    );
+}
+
+/// The flags from an open's environment: `mtp` null when XPU_MTP is unset, `k` null when XPU_MTP_K is unset. Unset
+/// turns the head off and restores K = 3, so a second open in one process does not inherit the first one's flags.
+pub fn applyEnv(mtp: ?bool, k: ?u32) void {
+    on = mtp orelse false;
+    most = @min(@max(k orelse 3, 1), q.windowRows() - 1);
+}
+
+test "the MTP flags come from the open's environment, and unset turns them off" {
+    const wr = q.windowRows();
+    defer q.verify_rows = wr;
+    applyEnv(true, 5);
+    try std.testing.expect(on);
+    try std.testing.expectEqual(@as(u32, 5), most);
+    applyEnv(null, null); // a second open without XPU_MTP
+    try std.testing.expect(!on);
+    try std.testing.expectEqual(@as(u32, 3), most);
+    applyEnv(false, 2); // XPU_MTP=0
+    try std.testing.expect(!on);
+    try std.testing.expectEqual(@as(u32, 2), most);
+    applyEnv(true, 0); // K below the floor
+    try std.testing.expectEqual(@as(u32, 1), most);
+    applyEnv(true, 99); // K above the window
+    try std.testing.expectEqual(wr - 1, most);
+    q.verify_rows = 32; // XPU_VERIFY_ROWS=32 raises the cap with the window
+    applyEnv(true, 99);
+    try std.testing.expectEqual(@as(u32, 31), most);
+    applyEnv(null, null);
 }
 
 /// The host record a kept state keeps with the MTP part: the cache's newest absorbed position and the drafts it held.

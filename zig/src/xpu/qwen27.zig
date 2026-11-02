@@ -284,6 +284,10 @@ pub const Runner = struct {
         overlap.read(); // XPU_PREFILL_OVERLAP, XPU_OVERLAP_ROWS
         if (std.c.getenv("TF_TP_RANK")) |v| RANK = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         k1mod.readEnv(); // XPU_K1, XPU_K1_WAVE
+        // XPU_MTP, XPU_MTP_K: read here, not only in Mtp.load, because the engine's open asks whether the head is on
+        // before it loads it. Both ranks read them: the follower runs the same head.
+        mtp.readEnv();
+        if (mtp.on) std.log.info("qwen27-xpu: MTP head drafts K={d}, verify rows {d}", .{ mtp.most, verify_rows });
         if (RANK >= TP) return error.RankOutOfRange;
         // the shared K/V pool: a page holds int8 rows and their scales, so pool mode is int8 K/V
         if (std.c.getenv("XPU_KV_POOL")) |v| kv_pool = v[0] != '0';
