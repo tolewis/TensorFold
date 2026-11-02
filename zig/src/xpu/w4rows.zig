@@ -56,14 +56,16 @@ pub fn refMatvec(a: []const f32, q: []const u8, s: []const f32, b: []const f32, 
     std.debug.assert(a.len == m * k and q.len == k * n and y.len == m * n);
     const groups = k / gsz;
     std.debug.assert(s.len == groups * n and b.len == groups * n);
-    for (0..m) |r| for (0..n) |c| {
-        var acc: f32 = 0;
-        for (0..k) |kk| {
-            const g = kk / gsz;
-            const w = @as(f32, @floatFromInt(q[kk * n + c])) * s[g * n + c] + b[g * n + c];
-            acc += a[r * k + kk] * w;
+    for (0..m) |r| {
+        for (0..n) |c| {
+            var acc: f32 = 0;
+            for (0..k) |kk| {
+                const g = kk / gsz;
+                const w = @as(f32, @floatFromInt(q[kk * n + c])) * s[g * n + c] + b[g * n + c];
+                acc += a[r * k + kk] * w;
+            }
+            y[r * n + c] = acc;
         }
-        y[r * n + c] = acc;
     }
 }
 
@@ -86,10 +88,12 @@ pub fn tiledMatvec(a: []const f32, q: []const u8, s: []const f32, b: []const f32
                 for (0..wcols) |ci| {
                     const c = n0 + ci;
                     var acc: f32 = 0;
-                    for (0..groups) |g| for (0..gsz) |u| {
-                        const kk = g * gsz + u;
-                        const w = @as(f32, @floatFromInt(q[kk * n + c])) * s[g * n + c] + b[g * n + c];
-                        acc += a[r * k + kk] * w;
+                    for (0..groups) |g| {
+                        for (0..gsz) |u| {
+                            const kk = g * gsz + u;
+                            const w = @as(f32, @floatFromInt(q[kk * n + c])) * s[g * n + c] + b[g * n + c];
+                            acc += a[r * k + kk] * w;
+                        }
                     }
                     y[r * n + c] = acc;
                     writes[r * n + c] += 1;
