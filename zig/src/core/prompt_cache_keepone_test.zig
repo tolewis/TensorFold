@@ -1,5 +1,6 @@
-//! The prompt cache's keep-one rule: a later turn's state takes its own older one's storage, and the least
-//! recently used one never wins a kept state's page. A fake family's snapshots are host memory (a position and a
+//! The prompt cache's keep-one rule, as the review set it: a reserve never supersedes (a pass may cancel
+//! before it keeps its mark), so the conversation's older state stays while the budget allows both, and the
+//! least recently used state leaves under pressure. A fake family's snapshots are host memory (a position and a
 //! running sum); a state's bytes are 100 + position. A budget of 300 holds two of them, so a third keep forces
 //! exactly one eviction.
 const std = @import("std");
@@ -14,7 +15,7 @@ fn at(s: *const Store, prefix: []const u32) ?usize {
     return null;
 }
 
-test "a later turn's state takes its own older one's storage, not the least recently used state's" {
+test "a later turn's state saves with the conversation's older state while the budget allows; the unrelated one leaves" {
     const gpa = std.testing.allocator;
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -38,11 +39,11 @@ test "a later turn's state takes its own older one's storage, not the least rece
     try std.testing.expectEqual(@as(u32, 0), p.from); // its own older state is not resumable: the next token differs
     _ = f.pass(&s, p2, p);
     try std.testing.expectEqual(@as(usize, 2), s.entries.items.len);
-    try std.testing.expect(at(&s, &.{ 1, 2, 3, 4 }) == null); // the conversation's older state took its storage
-    try std.testing.expectEqual(@as(u32, 6), s.find(p2, &.{}, &.{}).?.at); // its later turn's state stayed
-    try std.testing.expectEqual(@as(u32, 4), s.find(pc_, &.{}, &.{}).?.at); // the unrelated state stayed
-    try std.testing.expectEqual(@as(u64, 1), s.counts.evicted); // exactly one state left; the unrelated one never left
-    try std.testing.expect(s.subsumed(p2, 7, 6) == null); // nothing the later turn's state supersedes remains
+    try std.testing.expect(at(&s, &.{ 1, 2, 3, 4 }) != null); // the conversation's older state stays: a keep supersedes it only when the budget forces it
+    try std.testing.expectEqual(@as(u32, 6), s.find(p2, &.{}, &.{}).?.at); // its later turn's state is there
+    try std.testing.expect(s.find(pc_, &.{}, &.{}) == null); // the unrelated state gave its storage to the keep
+    try std.testing.expectEqual(@as(u64, 1), s.counts.evicted); // exactly one state left; the conversation's older one never left
+    try std.testing.expect(s.subsumed(p2, 7, 6) != null); // the older state is the one a keep that must make room would supersede
 }
 
 test "a cancelled turn keeps the conversation's older state: reserve evicts by the least recently used order only" {
@@ -99,8 +100,4 @@ test "a later turn's shorter prompt is a rewind, not a supersede: the longer sta
     const p3: []const u32 = &[_]u32{ 1, 2, 3, 4, 7 };
     try std.testing.expect(!s.subsumes(p3, 5, 4, s.entries.items[ai]));
     try std.testing.expect(s.subsumed(p3, 5, 4) == null);
-}
-
-test {
-    _ = @import("scratch_keepone_trace.zig");
 }
