@@ -181,8 +181,13 @@ pub const Pipelines = struct {
             p.matvec[i].deinit();
             p.matvec_modules[i].unload();
         };
+        // XPU_EXL3_GRF256=1 (default off): 256 GRF per thread for exl3_matvec at 2+ rows and for the MoE image that holds exl3_gemm.
+        const grf256 = if (std.c.getenv("XPU_EXL3_GRF256")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+        if (grf256) std.log.info("exl3: 256 GRF per thread is on (exl3_matvec rows >= 2, exl3_gemm MoE image)", .{});
+        const grf_flag: ?[*:0]const u8 = if (grf256) "-cl-intel-256-GRF-per-thread" else null;
         for (kernels.exl3_matvec, 0..) |image, i| {
-            p.matvec_modules[i] = try mod.Module.load(ctx, image);
+            const flag = if (variants.all[i].rows >= 2) grf_flag else null;
+            p.matvec_modules[i] = try mod.Module.loadWith(ctx, image, flag);
             p.matvec[i] = p.matvec_modules[i].kernel("exl3_matvec", local_matvec) catch |e| {
                 p.matvec_modules[i].unload();
                 return e;
@@ -200,7 +205,7 @@ pub const Pipelines = struct {
             p.moe_modules[i].unload();
         };
         for (kernels.exl3_moe, 0..) |image, i| {
-            p.moe_modules[i] = try mod.Module.load(ctx, image);
+            p.moe_modules[i] = try mod.Module.loadWith(ctx, image, grf_flag);
             p.moe[i] = MoeKernels.load(p.moe_modules[i]) catch |e| {
                 p.moe_modules[i].unload();
                 return e;

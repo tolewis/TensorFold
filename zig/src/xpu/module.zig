@@ -11,6 +11,11 @@ pub const Module = struct {
 
     /// Builds a SPIR-V image; a refused build logs the driver's text.
     pub fn load(ctx: *const Context, spirv: []const u8) Error!Module {
+        return loadWith(ctx, spirv, null);
+    }
+
+    /// As `load` with driver build flags (e.g. "-cl-intel-256-GRF-per-thread"); flags apply to every kernel in the image.
+    pub fn loadWith(ctx: *const Context, spirv: []const u8, flags: ?[*:0]const u8) Error!Module {
         if (spirv.len == 0) {
             std.log.err("empty GPU image: this binary was built without kernels (-Dxpu)", .{});
             return error.Invalid;
@@ -18,7 +23,7 @@ pub const Module = struct {
         const d = ctx.d;
         var m: ze.H = null;
         var log: ze.H = null;
-        const desc: ze.ModuleDesc = .{ .format = 0, .inputSize = spirv.len, .pInputModule = spirv.ptr }; // SPIR-V
+        const desc: ze.ModuleDesc = .{ .format = 0, .inputSize = spirv.len, .pInputModule = spirv.ptr, .pBuildFlags = flags }; // SPIR-V
         const res = d.api.zeModuleCreate(ctx.gpu.context, ctx.gpu.device, &desc, &m, &log);
         if (res != 0) {
             var sz: usize = 0;
