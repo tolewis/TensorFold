@@ -59,20 +59,32 @@ fn rotateOut(sums: []const f32, svh: []const f16, n: usize, out: []f32) void {
     }
 }
 
-const Stats = struct { max_abs: f32, rms_rel: f32, p50: f32, p90: f32, p99: f32, max_rel: f32 };
+/// The error figures: the absolute error against the reference's rms, the relative L2 norm, and the per-element
+/// relative error over the outputs whose magnitude is at least a tenth of the reference's rms (a near-zero output
+/// from cancellation has no useful relative figure).
+const Stats = struct { max_abs: f32, p99_abs: f32, rel_l2: f32, p50: f32, p90: f32, p99: f32, max_rel: f32 };
 
-fn stats(err: []const f32, rel: []const f32, gpa: std.mem.Allocator) !Stats {
+fn stats(err: []const f32, rel: []const f32, keep: []const bool, rms_y: f32, gpa: std.mem.Allocator) !Stats {
     const e = try gpa.dupe(f32, err);
     defer gpa.free(e);
-    const r = try gpa.dupe(f32, rel);
-    defer gpa.free(r);
     std.mem.sort(f32, e, {}, std.sort.asc(f32));
+    var kept: usize = 0;
+    var sq_err: f64 = 0;
+    for (err) |v| sq_err += @as(f64, v) * v;
+    for (keep) |k| kept += @intFromBool(k);
+    const r = try gpa.alloc(f32, kept);
+    defer gpa.free(r);
+    var at: usize = 0;
+    for (rel, keep) |v, k| {
+        if (!k) continue;
+        r[at] = v;
+        at += 1;
+    }
     std.mem.sort(f32, r, {}, std.sort.asc(f32));
-    var rms: f64 = 0;
-    for (rel) |v| rms += @as(f64, v) * v;
     return .{
         .max_abs = e[e.len - 1],
-        .rms_rel = @floatCast(@sqrt(rms / @as(f64, @floatFromInt(rel.len)))),
+        .p99_abs = e[e.len * 99 / 100] / rms_y,
+        .rel_l2 = @floatCast(@sqrt(sq_err / @as(f64, @floatFromInt(err.len))) / @as(f64, rms_y)),
         .p50 = r[r.len / 2],
         .p90 = r[r.len * 9 / 10],
         .p99 = r[r.len * 99 / 100],
@@ -163,14 +175,18 @@ test "the int8 prompt GEMM's error against the fp16 kernel's output (one 27B sha
     defer gpa.free(err);
     const rel = try gpa.alloc(f32, rows * n);
     defer gpa.free(rel);
-    var mag: f64 = 0;
-    for (y16, y8, err, rel) |a, b, *e, *rr| {
+    const keep = try gpa.alloc(bool, rows * n);
+    defer gpa.free(keep);
+    var sq_y: f64 = 0;
+    for (y16) |a| sq_y += @as(f64, a) * a;
+    const rms_y: f32 = @floatCast(@sqrt(sq_y / @as(f64, @floatFromInt(rows * n))));
+    for (y16, y8, err, rel, keep) |a, b, *e, *rr, *k| {
         e.* = @abs(b - a);
-        rr.* = e.* / @max(@abs(a), 1e-6);
-        mag += @as(f64, @abs(a));
+        rr.* = e.* / @abs(a);
+        k.* = @abs(a) >= 0.1 * rms_y;
     }
-    const st = try stats(err, rel, gpa);
-    std.debug.print("exl3 int8 prompt GEMM, {d} x {d} x {d} rows: |y_fp16| mean {d:.4}, max abs error {e:.3}, rms rel {e:.3}, rel p50 {e:.3} p90 {e:.3} p99 {e:.3} max {e:.3}\n", .{ rows, n, k, mag / @as(f64, @floatFromInt(rows * n)), st.max_abs, st.rms_rel, st.p50, st.p90, st.p99, st.max_rel });
-    try std.testing.expect(st.rms_rel < 0.02);
-    try std.testing.expect(st.max_rel < 0.2);
+    const st = try stats(err, rel, keep, rms_y, gpa);
+    std.debug.print("exl3 int8 prompt GEMM, {d} rows x {d} cols x {d} k: |y_fp16| rms {d:.3}, max abs error {e:.3} ({d:.2} % of the rms), abs p99 {d:.2} % of the rms, rel L2 {e:.3}, rel p50 {e:.3} p90 {e:.3} p99 {e:.3} max {e:.3}\n", .{ rows, n, k, rms_y, st.max_abs, 100.0 * st.max_abs / rms_y, 100.0 * st.p99_abs, st.rel_l2, st.p50, st.p90, st.p99, st.max_rel });
+    try std.testing.expect(st.rel_l2 < 0.02);
+    try std.testing.expect(st.max_abs < 0.1 * rms_y);
 }
