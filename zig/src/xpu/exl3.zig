@@ -699,7 +699,8 @@ pub fn mv3Check(ctx: *const Context, s: Stream, gpa: std.mem.Allocator, p: *cons
     }
     const k: usize = m.k;
     const n: usize = m.n;
-    const strips: variants.Strips = .{ .min = n / 16, .gcd = n / 16, .total = n / 16 };
+    const nstrips: u32 = @intCast(n / 16);
+    const strips: variants.Strips = .{ .min = nstrips, .gcd = nstrips, .total = nstrips };
     const vi = variants.pick(4, 1, strips) orelse {
         std.log.info("exl3 mv3 check: no rows 1 4-bit matvec image, skipped", .{});
         return;
@@ -744,16 +745,16 @@ pub fn mv3Check(ctx: *const Context, s: Stream, gpa: std.mem.Allocator, p: *cons
     const mv = p.matvec[vi];
     try p.rotate_in.setPtr(0, null);
     try p.rotate_in.setPtr(1, t1.ptr);
-    try launch(p.rotate_in, s, .{ m.k / 128, 1, 1 });
+    try launch(p.rotate_in, s, .{ @intCast(m.k / 128), 1, 1 });
     try mv.setPtr(0, null);
     try mv.setPtr(1, t1.ptr);
     try mv.setU32(2, 1);
     try mv.setU32(3, 0);
-    try launch(mv, s, .{ std.math.divCeil(u32, n / 16 / ns, local_matvec[0] / 16) catch unreachable, 1, 1 });
+    try launch(mv, s, .{ std.math.divCeil(u32, nstrips / ns, local_matvec[0] / 16) catch unreachable, 1, 1 });
     try mvc.setPtr(0, null);
     try mvc.setPtr(1, t2.ptr);
     try mvc.setU32(2, 1);
-    try launch(mvc, s, .{ std.math.divCeil(u32, n / 16, local_matvec[0] / 16) catch unreachable, 1, 1 });
+    try launch(mvc, s, .{ std.math.divCeil(u32, nstrips, local_matvec[0] / 16) catch unreachable, 1, 1 });
     const a = try gpa.alloc(f32, n);
     defer gpa.free(a);
     const b = try gpa.alloc(f32, n);
