@@ -320,7 +320,7 @@ pub var gdn_probe: ?*const fn (*Dev, *Acts, *anyopaque, u32, usize) anyerror!voi
 /// prompt: a prompt chunk, prompt kernels at any rows; tree: rows see their ancestors; multi: one row a slot.
 /// multi.win: the windows' (first row, rows) pairs, as verifyMulti's win_host holds them (K1's row groups).
 /// pt: the selected slot's page table (pool mode); with multi, each row's table is in MT.
-pub const Mode = struct { prompt: bool = false, want: Want = .last, stash: bool = false, taps: bool = false, tree: bool = false, pt: ?*anyopaque = null, multi: ?struct { mt: *anyopaque, pos: *anyopaque, max_pos: u32, win: []const i32 = &.{} } = null };
+pub const Mode = struct { prompt: bool = false, want: Want = .last, stash: bool = false, taps: bool = false, tree: bool = false, pt: ?*anyopaque = null, multi: ?struct { mt: *anyopaque, pos: *anyopaque, max_pos: u32, win: []const i32 = &.{}, kpos: []const i32 = &.{}, kkind: []const u8 = &.{} } = null };
 
 /// K1: the row groups of the forward's attn_k1 launch; a copy of it is queued, so it lives as long as the process.
 var grp_host: [32]i32 = undefined;
