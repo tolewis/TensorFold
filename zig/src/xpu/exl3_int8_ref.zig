@@ -170,7 +170,7 @@ test "the int8 prompt GEMM's error against the fp16 kernel's output (one 27B sha
         mag += @as(f64, @abs(a));
     }
     const st = try stats(err, rel, gpa);
-    std.debug.print("exl3 int8 prompt GEMM, {d} x {d} x {d} rows: |y_fp16| mean {d:.4}, max abs error {d:.3e}, rms rel {d:.3e}, rel p50 {d:.3e} p90 {d:.3e} p99 {d:.3e} max {d:.3e}\n", .{ rows, n, k, mag / @as(f64, @floatFromInt(rows * n)), st.max_abs, st.rms_rel, st.p50, st.p90, st.p99, st.max_rel });
+    std.debug.print("exl3 int8 prompt GEMM, {d} x {d} x {d} rows: |y_fp16| mean {d:.4}, max abs error {e:.3}, rms rel {e:.3}, rel p50 {e:.3} p90 {e:.3} p99 {e:.3} max {e:.3}\n", .{ rows, n, k, mag / @as(f64, @floatFromInt(rows * n)), st.max_abs, st.rms_rel, st.p50, st.p90, st.p99, st.max_rel });
     try std.testing.expect(st.rms_rel < 0.02);
     try std.testing.expect(st.max_rel < 0.2);
 }
