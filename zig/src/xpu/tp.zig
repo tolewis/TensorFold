@@ -102,9 +102,10 @@ var trace = false;
 var devflag = false; // TF_TP_DEVFLAG: the device-flag all-reduce (default off)
 
 /// A peer that dies in the handshake closes its end: without a timeout the surviving rank blocks in recvFds forever.
-/// 60 s is far longer than the fd exchange takes.
+/// 180 s matches every other deadline: the device-flag self test builds a kernel on the first open and the other rank
+/// waits in recvByte for it.
 fn setTimeouts(sock: linux.fd_t) void {
-    var tv: linux.timeval = .{ .sec = 60, .usec = 0 };
+    var tv: linux.timeval = .{ .sec = 180, .usec = 0 };
     _ = linux.setsockopt(sock, linux.SOL.SOCKET, linux.SO.RCVTIMEO, @ptrCast(&tv), @sizeOf(linux.timeval));
     _ = linux.setsockopt(sock, linux.SOL.SOCKET, linux.SO.SNDTIMEO, @ptrCast(&tv), @sizeOf(linux.timeval));
 }
@@ -167,7 +168,9 @@ fn genNow() u64 {
 /// A follower waits for rank 0's fresh segment: the path must still name the inode it opened, the magic must match, and
 /// the generation must be published (rank 0 writes it after it resets every shared word). The deadline exits 1, so
 /// systemd restarts the pair instead of this rank waiting forever for a segment that no rank will publish.
-fn awaitGen(name: [*:0]const u8, size: usize, want: u64, fd_out: *linux.fd_t, gen_out: *u64) ![]align(std.heap.page_size_min) u8 {
+const Segment = struct { map: []align(std.heap.page_size_min) u8, gen: u64 };
+
+fn awaitGen(name: [*:0]const u8, size: usize, want: u64) !Segment {
     const deadline = q.now() + 180.0;
     while (true) {
         const fd = std.c.open(name, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, @as(std.c.mode_t, 0));
@@ -180,9 +183,8 @@ fn awaitGen(name: [*:0]const u8, size: usize, want: u64, fd_out: *linux.fd_t, ge
                     // the generation and the magic together: rank 0 publishes the generation after it resets every
                     // shared word, so a segment read here is clean, and a file another build made fails the magic
                     if (genOf(fd) == gen and mg == magic) {
-                        fd_out.* = fd; // kept: the follower re-checks that the path still names this generation
-                        gen_out.* = gen;
-                        return map;
+                        _ = std.c.close(fd); // the map keeps the inode alive; the follower re-opens the path to check it
+                        return .{ .map = map, .gen = gen };
                     }
                     std.posix.munmap(map);
                 } else |_| {}
@@ -190,12 +192,45 @@ fn awaitGen(name: [*:0]const u8, size: usize, want: u64, fd_out: *linux.fd_t, ge
             _ = std.c.close(fd);
         }
         if (q.now() > deadline) {
-            std.log.err("rank {d}: no fresh TP segment at {s} after 180 s: the group is lost\n", .{ q.RANK, name });
+            std.log.err("rank {d}: no TP segment with generation {d} at {s} after 180 s: the group is lost\n", .{ q.RANK, want, name });
             std.process.exit(1);
         }
         var ts: std.c.timespec = .{ .sec = 0, .nsec = 20_000_000 };
         while (std.c.nanosleep(&ts, &ts) != 0) {}
     }
+}
+
+/// Rank 0's listener: bind, listen, wait for the follower, accept. The socket lives until the caller's open returns.
+fn bindAccept(sock_out: *linux.fd_t, base: []const u8, seconds: f64) !linux.fd_t {
+    const addr = try Group.sockAddr(base);
+    const alen: linux.socklen_t = @intCast(@offsetOf(linux.sockaddr.un, "path") + base.len + 6);
+    const sock_rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (failed(sock_rc)) return error.SocketFailed;
+    const sock: linux.fd_t = @intCast(sock_rc);
+    setTimeouts(sock);
+    _ = linux.unlink(@ptrCast(&addr.path));
+    if (failed(linux.bind(sock, @ptrCast(&addr), alen))) {
+        _ = linux.close(sock);
+        return error.BindFailed;
+    }
+    if (failed(linux.listen(sock, 1))) {
+        _ = linux.close(sock);
+        return error.ListenFailed;
+    }
+    var pfd = [1]linux.pollfd{.{ .fd = sock, .events = linux.POLL.IN, .revents = 0 }};
+    const ready = linux.poll(&pfd, 1, @intFromFloat(seconds * 1000.0));
+    if (failed(ready) or ready == 0) {
+        _ = linux.close(sock);
+        return error.PeerLost;
+    }
+    const acc = linux.accept4(sock, null, null, linux.SOCK.CLOEXEC);
+    if (failed(acc)) {
+        _ = linux.close(sock);
+        return error.AcceptFailed;
+    }
+    sock_out.* = sock;
+    setTimeouts(@intCast(acc));
+    return @intCast(acc);
 }
 
 pub const Group = struct {
@@ -224,11 +259,10 @@ pub const Group = struct {
     /// Host staging ring for a flag value (seq % fh_ring): the copy that carries it is queued on the in-order list.
     fh: [*]u64 = undefined,
     devflag: bool = false,
-    /// The segment's path, the generation this rank mapped, and on a follower the descriptor it opened: a follower
-    /// re-checks that the path still names this generation, because a rank 0 that restarted replaced it.
+    /// The segment's path and the generation this rank mapped: a follower re-checks that the path still names this
+    /// generation, because a rank 0 that restarted replaced it.
     name: [*:0]const u8 = undefined,
     gen: u64 = 0,
-    fd: linux.fd_t = -1,
 
     /// The generation rank 0 published after it reset every shared word. 0: no rank has published one yet.
     fn genWord(g: *const Group) *std.atomic.Value(u64) {
@@ -271,6 +305,23 @@ pub const Group = struct {
         closed(g).store(1, .release);
     }
 
+    /// A follower stamps its liveness word while it waits for a record, so rank 0 sees a follower that died while no
+    /// request was in flight. The all-reduce path stamps the same word; zero still means "has not reduced yet".
+    pub fn stampAlive(g: *Group) void {
+        g.aliveWord(g.rank).store(@intFromFloat(q.now()), .release);
+    }
+
+    /// Rank 0: a follower whose stamp is older than `peer_dead` is gone, even though no record is due. A follower
+    /// stamps at every all-reduce and about once a second while it waits, so a fresh stamp means it is alive.
+    fn checkFollower(g: *Group) void {
+        if (g.rank != 0 or g.tp < 2) return;
+        const beat = g.aliveWord(1).load(.acquire);
+        if (beat == 0) return; // it has not reduced yet: it is loading
+        const age = q.now() - @as(f64, @floatFromInt(beat));
+        if (age > peer_dead)
+            lostAt(g, "rank 0: the follower's liveness stamp is {d:.1} s old: the group is lost\n", .{age});
+    }
+
     /// Rank 0's K/V pool size in pages, in the unused tail of its counter line (the counters take one word a rank):
     /// a follower sizes the same pool, so both ranks map the same page ids.
     /// Lane p2-int: the liveness word of lane p28-ops took offset 8 of rank 0's line, so this word moved to offset 16
@@ -303,15 +354,29 @@ pub const Group = struct {
         trace = std.c.getenv("TF_TP_TRACE") != null;
         devflag = std.c.getenv("TF_TP_DEVFLAG") != null;
         record_wait = 180.0;
-        if (std.c.getenv("TF_TP_RECORD_WAIT")) |v| record_wait = std.fmt.parseFloat(f64, std.mem.span(v)) catch 180.0;
+        if (std.c.getenv("TF_TP_RECORD_WAIT")) |v| {
+            const want = std.fmt.parseFloat(f64, std.mem.span(v)) catch 180.0;
+            if (want >= 10.0) record_wait = want else std.log.warn("qwen27-xpu: TF_TP_RECORD_WAIT={d} is under 10 s, so 180 s is used", .{want});
+            std.log.info("qwen27-xpu: TP record wait {d:.0} s (TF_TP_RECORD_WAIT)", .{record_wait});
+        }
         const name: [*:0]const u8 = if (std.c.getenv("TF_TP_SHM")) |v| v else "/dev/shm/tf-tp-qwen27";
         const base = std.mem.span(name);
         const size = hdr + q.TP * line + 2 * q.TP * slot_bytes + line + ring_len * @sizeOf(Rec);
         const sa = try sockAddr(base);
-        var map: []align(std.heap.page_size_min) u8 = undefined;
-        var fd: linux.fd_t = -1;
-        var gen: u64 = 0;
-        var peer_conn: ?linux.fd_t = null;
+        var g: Group = undefined;
+        var conn: linux.fd_t = -1;
+        var sock: linux.fd_t = -1;
+        // The handshake socket lives to the end of this function. A defer inside the rank branch would close it before
+        // sendFds, which was the W2 defect.
+        defer {
+            if (conn >= 0) _ = linux.close(conn);
+        }
+        defer {
+            if (sock >= 0) {
+                _ = linux.close(sock);
+                _ = linux.unlink(@ptrCast(&sa.path));
+            }
+        }
         if (q.RANK == 0) {
             // A fresh generation: the old segment and its socket go first, so no rank reads a dead pair's words and no
             // follower connects to its socket. A plain systemd restart then recovers in any start order.
@@ -321,25 +386,16 @@ pub const Group = struct {
             if (f < 0) return error.ShmOpenFailed;
             defer _ = std.c.close(f);
             if (std.c.ftruncate(f, @intCast(size)) != 0) return error.ShmSizeFailed;
-            map = try std.posix.mmap(null, size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, f, 0);
-        } else {
-            // connect first: rank 0 names the generation of the segment it made, and this rank takes only that one
-            const conn = try connectPeer(base, 180.0);
-            gen = try recvGen(conn);
-            map = try awaitGen(name, size, gen, &fd, &gen);
-            peer_conn = conn;
-        }
-        var g: Group = .{
-            .map = map,
-            .rank = q.RANK,
-            .tp = q.TP,
-            .name = name,
-            .fd = fd,
-            .gen = gen,
-            .mine = @ptrCast(@alignCast(try d.g.hostAlloc(slot_bytes))),
-            .sum = @ptrCast(@alignCast(try d.g.hostAlloc(slot_bytes))),
-        };
-        if (g.rank == 0) {
+            const map = try std.posix.mmap(null, size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, f, 0);
+            g = .{
+                .map = map,
+                .rank = 0,
+                .tp = q.TP,
+                .name = name,
+                .gen = 0,
+                .mine = @ptrCast(@alignCast(try d.g.hostAlloc(slot_bytes))),
+                .sum = @ptrCast(@alignCast(try d.g.hostAlloc(slot_bytes))),
+            };
             // Every shared word is reset before the generation is published: a follower that reads the generation reads
             // a segment that is already clean. A follower resets nothing, so it cannot clear a word rank 0 is using.
             g.magicWord().store(magic, .seq_cst);
@@ -356,10 +412,29 @@ pub const Group = struct {
             for (0..ring_len) |i| @atomicStore(u64, &g.rec(i).seq, 0, .seq_cst);
             g.gen = genNow();
             g.genWord().store(g.gen, .release); // last: the segment is clean when a follower sees it
+            // The handshake runs in every mode, host-staged included: the generation crosses it, and a follower takes
+            // only the segment that carries it. A rank 0 that cannot listen fails the open, so systemd restarts the pair.
+            conn = try bindAccept(&sock, base, 180.0);
+            try sendGen(conn, g.gen);
+        } else {
+            // connect first: rank 0 names the generation of the segment it made, and this rank takes only that one
+            conn = try connectPeer(base, 180.0);
+            const want = try recvGen(conn);
+            const seg = try awaitGen(name, size, want);
+            g = .{
+                .map = seg.map,
+                .rank = q.RANK,
+                .tp = q.TP,
+                .name = name,
+                .gen = seg.gen,
+                .mine = @ptrCast(@alignCast(try d.g.hostAlloc(slot_bytes))),
+                .sum = @ptrCast(@alignCast(try d.g.hostAlloc(slot_bytes))),
+            };
         }
-        if (std.c.getenv("TF_TP_HOST") == null) g.openDirect(d, peer_conn) catch |err| switch (err) {
-            // the peer never came, or it went away in the handshake: exit so systemd restarts the pair
-            error.PeerLost, error.AcceptFailed, error.NoPeerSocket, error.FdSend, error.FdRecv, error.ByteSend, error.ByteRecv => lostAt(&g, "rank {d}: the open did not meet its peer ({s}): the group is lost\n", .{ g.rank, @errorName(err) }),
+        // The listener and the connect are in `open` itself (a peer that never comes fails the open, so systemd
+        // restarts the pair). Inside the fd handshake only a broken socket is fatal.
+        if (std.c.getenv("TF_TP_HOST") == null) g.openDirect(d, conn) catch |err| switch (err) {
+            error.FdSend, error.FdRecv, error.ByteSend, error.ByteRecv => lostAt(&g, "rank {d}: the open did not meet its peer ({s}): the group is lost\n", .{ g.rank, @errorName(err) }),
             else => {
                 std.log.warn("qwen27-xpu: TP all-reduce stays host-staged: {s}", .{@errorName(err)});
                 g.direct = false;
@@ -373,6 +448,9 @@ pub const Group = struct {
     /// words. Waits while the ring is full (a follower 64 records behind).
     pub fn record(g: *Group, op: Op, a: u32, b: u32, id: u64, data: []const u32) !void {
         if (g.rank != 0) return;
+        // a follower that died while rank 0 was idle leaves its stamp behind: exit here, before the ring wait (180 s)
+        // or the all-reduce wait (10 s) would spend the time on it
+        checkFollower(g);
         if (trace) std.debug.print("record {d}: {s} a {d} b {d} n {d} data[0] {d}\n", .{ g.step, @tagName(op), a, b, data.len, if (data.len > 0) data[0] else 0 });
         var at: usize = 0;
         var first = true;
@@ -407,6 +485,7 @@ pub const Group = struct {
         const r = g.rec(g.step);
         var spins: usize = 0;
         var checked = q.now();
+        stampAlive(g); // rank 0 knows this rank is alive while it waits
         while (@atomicLoad(u64, &r.seq, .acquire) != g.step + 1) : (spins += 1) {
             if (spins > 20_000) {
                 // the peer closed the segment (it exited): no record is coming, so this rank exits and systemd
@@ -414,8 +493,9 @@ pub const Group = struct {
                 if (spins % 100 == 0 and closed_word.load(.acquire) != 0) lostAt(g, "rank {d}: the group closed while it waited for record {d}\n", .{ g.rank, g.step });
                 // a rank 0 that restarted replaced the segment with a new generation: this map is the dead one, and
                 // the record this rank waits for will never come here. Exit and let systemd restart the pair.
-                if (spins % 5000 == 0 and q.now() - checked > 1.0) {
+                if (q.now() - checked > 1.0) {
                     checked = q.now();
+                    stampAlive(g); // about once a second while it waits
                     const fd = std.c.open(g.name, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(std.c.mode_t, 0));
                     var same = false;
                     if (fd >= 0) {
@@ -630,42 +710,13 @@ pub const Group = struct {
     /// handles cross over a unix socket beside the shm file (rank 0 listens, rank 1 connects, SCM_RIGHTS carries
     /// the dma-buf fds). A peer that never comes, or that goes away in the handshake, exits this rank: a wedged open
     /// is worse than a restart.
-    fn openDirect(g: *Group, d: *Dev, peer_conn: ?linux.fd_t) !void {
+    fn openDirect(g: *Group, d: *Dev, conn: linux.fd_t) !void {
         if (g.tp != 2) return error.DirectNeedsTwoRanks;
         const want_flag = devflag;
         const blk = try d.g.deviceAlloc(if (want_flag) blk_devflag_bytes else blk_legacy_bytes);
         var handle: ze.IpcHandle = undefined;
         try ze.check(d.g.api.zeMemGetIpcHandle(d.g.context, blk, &handle));
         var fds = [1]i32{std.mem.readInt(i32, handle.data[0..4], .little)};
-        const name: [*:0]const u8 = if (std.c.getenv("TF_TP_SHM")) |v| v else "/dev/shm/tf-tp-qwen27";
-        const base = std.mem.span(name);
-        const addr = try sockAddr(base);
-        const alen: linux.socklen_t = @intCast(@offsetOf(linux.sockaddr.un, "path") + base.len + 6);
-        var conn: linux.fd_t = undefined;
-        if (g.rank == 0) {
-            const sock_rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
-            if (failed(sock_rc)) return error.SocketFailed;
-            const sock: linux.fd_t = @intCast(sock_rc);
-            defer _ = linux.close(sock);
-            setTimeouts(sock);
-            _ = linux.unlink(@ptrCast(&addr.path));
-            if (failed(linux.bind(sock, @ptrCast(&addr), alen))) return error.BindFailed;
-            if (failed(linux.listen(sock, 1))) return error.ListenFailed;
-            var pfd = [1]linux.pollfd{.{ .fd = sock, .events = linux.POLL.IN, .revents = 0 }};
-            const ready = linux.poll(&pfd, 1, 180_000);
-            if (failed(ready) or ready == 0) return error.PeerLost;
-            const acc = linux.accept4(sock, null, null, linux.SOCK.CLOEXEC);
-            if (failed(acc)) return error.AcceptFailed;
-            conn = @intCast(acc);
-            setTimeouts(conn);
-            defer _ = linux.close(conn);
-            defer _ = linux.unlink(@ptrCast(&addr.path));
-            // the follower takes only the segment this process made: its generation crosses before the fds
-            try sendGen(conn, g.gen);
-        } else {
-            conn = peer_conn orelse return error.NoPeerSocket;
-            defer _ = linux.close(conn);
-        }
         try sendFds(conn, std.mem.asBytes(&handle), &fds);
         var theirs: ze.IpcHandle = undefined;
         var their_fds = [1]i32{0};
@@ -700,7 +751,7 @@ pub const Group = struct {
             return;
         }
         for (0..2) |i| {
-            g.dslot[i] = off(blk, i * slot_bytes);
+            g.dslot[i] = off(blk, i * 2 * slot_bytes);
             g.pbuf[i] = off(blk, (2 + i) * slot_bytes);
             g.peer[i] = off(p.?, i * slot_bytes);
         }
