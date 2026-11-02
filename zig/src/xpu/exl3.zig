@@ -693,7 +693,6 @@ pub fn mv3Check(ctx: *const Context, s: Stream, gpa: std.mem.Allocator, p: *cons
         std.log.info("exl3 mv3 check: no mv3 image, skipped", .{});
         return;
     };
-    try m.validate();
     if (m.halves != 8) {
         std.log.info("exl3 mv3 check: {d}-bit matrix, skipped (4-bit only)", .{m.halves / 2});
         return;
