@@ -76,6 +76,13 @@ fn rotBytes(k: usize, rows: usize) usize {
     return std.mem.alignForward(usize, k * rows * 4, 256);
 }
 
+/// A prompt group's rotated input: hi [rows][k] fp16, then lo [rows][k] when the image reads it (GEMM_LO 1). With
+/// GEMM_LO 0 (variants.moe.gemm_lo) exl3_gemm reads hi alone, so exl3_rotate_in_h stores hi alone.
+fn promptRotBytes(k: usize, rows: usize) usize {
+    const planes: usize = if (variants.moe.gemm_lo == 1) 2 else 1;
+    return std.mem.alignForward(usize, k * rows * 2 * planes, 256);
+}
+
 /// The most K splits a launch holding a group of width n can pick: a launch has at least that group's strips.
 fn splitBound(n: usize) usize {
     const strips = n / 16;
@@ -87,23 +94,24 @@ pub fn scratchBytes(k: usize, n: usize, rows: usize) usize {
     return rotBytes(k, rows) + splitBound(n) * n * rows * 4;
 }
 
-/// A prompt group (more than variants.rows_max rows): fp16 hi and lo planes of the rotated input (the size of rotBytes),
-/// then fp32 sums [rows][n], one split.
+/// A prompt group (more than variants.rows_max rows): the rotated input (promptRotBytes), then fp32 sums [rows][n], one
+/// split.
 pub fn promptScratchBytes(k: usize, n: usize, rows: usize) usize {
-    return rotBytes(k, rows) + n * rows * 4;
+    return promptRotBytes(k, rows) + n * rows * 4;
 }
 
 pub fn descriptor(g: Group) !Desc {
     try g.m.validate();
     if (g.rows == 0 or g.rows > variants.moe.prompt_rows_max) return error.InvalidExl3Rows;
     if (g.x_stride < g.m.k or g.y_stride < g.m.n) return error.InvalidExl3Stride;
+    const rot = if (g.rows > variants.rows_max) promptRotBytes(g.m.k, g.rows) else rotBytes(g.m.k, g.rows);
     return .{
         .trellis = g.m.trellis,
         .suh = g.m.suh,
         .svh = g.m.svh,
         .x = g.x,
         .rot = g.scratch,
-        .sums = g.scratch + rotBytes(g.m.k, g.rows),
+        .sums = g.scratch + rot,
         .out = g.y,
         .k = g.m.k,
         .n = g.m.n,
@@ -639,9 +647,11 @@ test "descriptor layout and scratch" {
     try std.testing.expectEqual(@as(u32, 1), d.out_type);
     try std.testing.expectEqual(@as(usize, 2048 * 3 * 4 + 16 * 512 * 3 * 4), scratchBytes(2048, 512, 3));
     try std.testing.expectEqual(@as(usize, 1), splitBound(248320));
-    try std.testing.expectError(error.InvalidExl3Rows, descriptor(.{ .m = m, .rows = 1025, .x = 0, .x_stride = 2048, .y = 0, .y_stride = 512, .scratch = 0 }));
-    // prompt rows: one split
-    try std.testing.expectEqual(@as(usize, 2048 * 512 * 4 + 512 * 512 * 4), promptScratchBytes(2048, 512, 512));
+    try std.testing.expectError(error.InvalidExl3Rows, descriptor(.{ .m = m, .rows = 1281, .x = 0, .x_stride = 2048, .y = 0, .y_stride = 512, .scratch = 0 }));
+    // prompt rows: one split, the rotated input as the image reads it (hi alone at GEMM_LO 0)
+    try std.testing.expectEqual(@as(usize, 2048 * 512 * 2 * @as(usize, variants.moe.gemm_lo + 1) + 512 * 512 * 4), promptScratchBytes(2048, 512, 512));
+    const dp = try descriptor(.{ .m = m, .rows = 512, .x = 0, .x_stride = 2048, .y = 0, .y_stride = 512, .scratch = 0x10000 });
+    try std.testing.expectEqual(@as(u64, 0x10000 + 2048 * 512 * 2 * @as(u64, variants.moe.gemm_lo + 1)), dp.sums);
     try std.testing.expectError(error.UnsupportedExl3Shape, (Matrix{ .trellis = 0, .suh = 0, .svh = 0, .k = 100, .n = 512, .halves = 8 }).validate());
     // Sage: hidden 2048, ff 512, 8 picks and the shared expert
     try std.testing.expectEqual(@as(usize, 9 * 4 * 2 * 512 * 4 + 9 * 512 * 4), moeScratchBytes(2048, 512, 9));

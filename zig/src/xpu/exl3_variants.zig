@@ -74,7 +74,10 @@ pub const moe = struct {
     pub const gemm_kc = 4;
     pub const tile_ns = 2;
     pub const tile_rows = 16;
-    pub const prompt_rows_max = 1024;
+    /// 1280 rows: q.maxRows() is XPU_CHUNK + 128, and 1152 (6 row blocks of 8 x GEMM_M 24, no partial block) is the
+    /// largest chunk the 27B prompt path takes (lane p26-prefill, 2026-11-01). Was 1024, which the default chunk of
+    /// 1024 rows already exceeded.
+    pub const prompt_rows_max = 1280;
 
     pub fn name(comptime b: u32) []const u8 {
         return std.fmt.comptimePrint("exl3_moe_b{d}", .{b});
