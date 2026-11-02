@@ -101,12 +101,13 @@ pub const Lanes = struct {
             }
         }.f;
         for (0..3) |_| _ = try time(r, slot, ids[0..16], &one); // the widest first, while the clocks ramp up
-        for (&b.costs, 1..) |*c, w| {
+        const n = xq.timedWidths(b.costs.len, xq.rows_max); // widths above XPU_ROWS_MAX are refused (BadBlock)
+        for (b.costs[0..n], 1..) |*c, w| {
             var best: f64 = 1e9;
             for (0..3) |_| best = @min(best, try time(r, slot, ids[0..w], &one));
             c.* = .{ .width = @intCast(w), .ms = best * 1e3 };
         }
-        b.timed = b.costs.len;
+        b.timed = n;
         try r.reset();
     }
 
