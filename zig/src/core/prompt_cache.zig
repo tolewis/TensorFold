@@ -133,6 +133,12 @@ pub const Plan = struct { from: u32 = 0, marks: []const u32 = &.{} };
 /// The borrowed entry a backend restores; the caller must report resumed or release it, even on cancellation.
 pub const Lookup = struct { entry: ?*Entry = null, marks: []const u32 = &.{} };
 
+/// One engine's store. A store is one conversation, never two: one lane per store, one turn in flight at a time.
+/// The conversation grows one reply at a time and its turns never share a prompt, so a request's states never
+/// supersede each other. The one that supersedes them is a later turn's state of the same conversation, and it
+/// takes its storage before the least recently used one leaves. A shorter prompt from a later turn (a rewind)
+/// supersedes none. A reply's end and its warm pass, kept at a position past the request's states, supersede
+/// none of them and never lose to them.
 pub const Store = struct {
     restore_log: ?RestoreLog = null,
     gpa: Allocator,
@@ -491,7 +497,21 @@ pub const Store = struct {
                 if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held -| bytes); // spare that cannot take this state goes before any state
                 if (s.spare() < free_) continue;
             }
-            s.remove(s.victimBut(null, prompt, born) orelse return s.fail(at, error.CacheBorrowed)); // its storage may come back spare and take this state
+            // the conversation's own older state it extends takes its storage first, then the least recently used one
+            const victim = s.victimBut(null, prompt, born) orelse return s.fail(at, error.CacheBorrowed);
+            const superseded = policy.subsumed(s, prompt, born, at);
+            if (superseded) |i| {
+                if (i != victim) {
+                    const a = @max(i, victim);
+                    const b = @min(i, victim); // the higher index first: orderedRemove shifts the lower one
+                    s.remove(a);
+                    s.remove(b); // the superseded one leaves for its conversation, the victim for the store
+                } else {
+                    s.remove(i);
+                }
+            } else {
+                s.remove(victim); // its storage may come back spare and take this state
+            }
             s.counts.evicted += 1;
         }
         if (s.entries.items.len == 0) if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| bytes);
@@ -579,6 +599,22 @@ pub const Store = struct {
     /// The entry to free first, never `skip`: a superseded one, no branch point, oldest; else the oldest, rewind last.
     pub const victimBut = policy.victimBut;
     const extended = policy.extended;
+
+    /// The state at `at` of the `born`-token `prompt` supersedes the entry: a shorter state of the same conversation it extends.
+    /// A rewind (a later turn's shorter state) and a reply's end (past `born`) supersede none.
+    pub fn subsumes(s: *const Store, prompt: []const u32, born: u32, at: u32, e: *const Entry) bool {
+        return policy.subsumes(s, prompt, born, at, e);
+    }
+
+    /// The first entry the state at `at` supersedes, or null.
+    pub fn subsumed(s: *const Store, prompt: []const u32, born: u32, at: u32) ?usize {
+        return policy.subsumed(s, prompt, born, at);
+    }
+
+    /// The reason the victim `victimBut` chose left: the prompt or a kept state extends it, else least recently used.
+    pub fn victimReason(s: *const Store, i: usize, prompt: []const u32, born: u32) []const u8 {
+        return policy.victimReason(s, i, prompt, born);
+    }
 };
 
 /// A line on the engine's log; tests stay quiet (the build runner fails a test that writes to stderr).
@@ -593,6 +629,7 @@ test {
     _ = @import("prompt_cache_rewind_test.zig");
     _ = @import("prompt_cache_interior_test.zig");
     _ = @import("prompt_cache_branch_test.zig");
+    _ = @import("prompt_cache_keepone_test.zig");
     _ = @import("prompt_cache_give_test.zig");
     _ = @import("prompt_cache_shared_test.zig");
     _ = @import("prompt_cache_lifetime_test.zig");

@@ -158,7 +158,7 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
         if (o.prompt_cache_gib) |gib| {
             if (gib > 0) budget = @min(budget, std.math.lossyCast(u64, gib * (1 << 30)));
         }
-        std.log.info("qwen27-xpu: a shared K/V pool of {d} pages ({d} tokens, {d:.2} GB a card, int8), {d} stream(s) of at most {d} tokens, kept prompt states in up to {d:.1} GiB of it", .{ pages, runner.poolTokens(), @as(f64, @floatFromInt(runner.poolBytes())) / 1e9, slots, context, @as(f64, @floatFromInt(budget)) / (1 << 30) });
+        std.log.info("qwen27-xpu: a shared K/V pool of {d} pages ({d} tokens, {d:.2} GB a card, int8), {d} stream(s) of at most {d} tokens, kept prompt states in up to {d:.1} GiB of it. The states are the one conversation's, a later turn's takes its own older one's storage, the least recently used one never wins a kept state's page", .{ pages, runner.poolTokens(), @as(f64, @floatFromInt(runner.poolBytes())) / 1e9, slots, context, @as(f64, @floatFromInt(budget)) / (1 << 30) });
         if (slots < want) std.log.warn("qwen27-xpu: the K/V pool holds {d} tokens, so {d} stream(s) are admitted of the {d} asked for (--kv-pool-tokens names a bigger pool)", .{ runner.poolTokens(), slots, want });
         if (xq.keep_shared) std.log.info("qwen27-xpu: kept prompt states share the pool (XPU_KEEP_SHARED): {d} pages ({d} tokens) stay free for the streams, kept states in up to {d:.1} GiB of the pool, the least recently used one dropped when a stream needs a page", .{ runner.reserve, @as(u64, runner.reserve) * xq.PAGE, @as(f64, @floatFromInt(budget)) / (1 << 30) });
     } else {
