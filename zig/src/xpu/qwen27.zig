@@ -912,16 +912,23 @@ pub fn modeWord() u64 {
 }
 
 test "mode word: each flag sits at the bit both ranks agree on" {
-    const saved = .{ kv_pool, keep_shared, kv_i8, embed_host, k1mod.on, k1mod.tree, k1mod.r16, k1mod.wave };
+    const saved_pool = kv_pool;
+    const saved_keep = keep_shared;
+    const saved_i8 = kv_i8;
+    const saved_embed = embed_host;
+    const saved_on = k1mod.on;
+    const saved_tree = k1mod.tree;
+    const saved_r16 = k1mod.r16;
+    const saved_wave = k1mod.wave;
     defer {
-        kv_pool = saved.0;
-        keep_shared = saved.1;
-        kv_i8 = saved.2;
-        embed_host = saved.3;
-        k1mod.on = saved.4;
-        k1mod.tree = saved.5;
-        k1mod.r16 = saved.6;
-        k1mod.wave = saved.7;
+        kv_pool = saved_pool;
+        keep_shared = saved_keep;
+        kv_i8 = saved_i8;
+        embed_host = saved_embed;
+        k1mod.on = saved_on;
+        k1mod.tree = saved_tree;
+        k1mod.r16 = saved_r16;
+        k1mod.wave = saved_wave;
     };
     kv_pool = false;
     keep_shared = false;
