@@ -71,11 +71,11 @@ pub fn attnPath(c: Cover) Path {
 }
 
 /// The open line: which rounds K1 serves with these flags (a pool and the K1 image assumed).
-pub fn coverageLine(buf: []u8, on: bool, tree_: bool, multi_tree_: bool) []const u8 {
-    const c: Cover = .{ .on = on, .tree = tree_, .multi_tree = multi_tree_, .i8 = true, .pool = true, .round_tree = false, .shared = false, .has_k1 = true, .has_draft = true, .has_draft_mt = true };
+pub fn coverageLine(buf: []u8, k1_on: bool, k1_tree: bool, k1_mt: bool) []const u8 {
+    const c: Cover = .{ .on = k1_on, .tree = k1_tree, .multi_tree = k1_mt, .i8 = true, .pool = true, .round_tree = false, .shared = false, .has_k1 = true, .has_draft = true, .has_draft_mt = true };
     const chain = attnPath(c);
-    const one = attnPath(.{ .on = on, .tree = tree_, .multi_tree = multi_tree_, .i8 = true, .pool = true, .round_tree = true, .shared = false, .has_k1 = true, .has_draft = true, .has_draft_mt = true });
-    const many = attnPath(.{ .on = on, .tree = tree_, .multi_tree = multi_tree_, .i8 = true, .pool = true, .round_tree = true, .shared = true, .has_k1 = true, .has_draft = true, .has_draft_mt = true });
+    const one = attnPath(.{ .on = k1_on, .tree = k1_tree, .multi_tree = k1_mt, .i8 = true, .pool = true, .round_tree = true, .shared = false, .has_k1 = true, .has_draft = true, .has_draft_mt = true });
+    const many = attnPath(.{ .on = k1_on, .tree = k1_tree, .multi_tree = k1_mt, .i8 = true, .pool = true, .round_tree = true, .shared = true, .has_k1 = true, .has_draft = true, .has_draft_mt = true });
     return std.fmt.bufPrint(buf, "K1 coverage: chain windows {s}, lone tree {s}, shared tree windows {s} (streams 1 to 6, up to 16 rows a round)", .{
         if (chain == .chain) "K1" else "scalar",
         if (one == .tree) "K1" else "scalar",
