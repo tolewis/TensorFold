@@ -29,9 +29,10 @@ pub var have16 = false;
 pub var tree = false;
 /// XPU_MULTI_TREE: a shared round with tree windows runs K1: the prefix keys through the decode kernels with
 /// per-row POS, the rows' draft keys (their ancestors and themselves) through attn_k1_draft_mt, one
-/// attn_merge_span join (lane p33-multitree, design/multitree-k1.md). Default off: the tree rows keep the
-/// scalar attn_decode + attn_merge. Production runs XPU_K1_TREE=1; this flag is separate, so the new binary
-/// changes no behavior until it is set.
+/// attn_merge_span join (lane p33-multitree, design/multitree-k1.md). Lane p39-k1cover: with XPU_K1_TREE=1 it is
+/// on unless XPU_MULTI_TREE=0, so a shared round with tree windows (2 to 5 streams) runs K1 like the lone tree
+/// and the chain rounds do. XPU_MULTI_TREE=1 turns it on without XPU_K1_TREE. Off, the tree rows keep the scalar
+/// attn_decode + attn_merge.
 pub var multi_tree = false;
 
 pub fn readEnv() void {
@@ -39,12 +40,54 @@ pub fn readEnv() void {
     if (std.c.getenv("XPU_K1_WAVE")) |v| wave = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 4;
     if (std.c.getenv("XPU_K1_R16")) |v| r16 = v[0] != '0';
     if (std.c.getenv("XPU_K1_TREE")) |v| tree = v[0] != '0';
+    multi_tree = tree; // the shared tree round follows the lone tree unless XPU_MULTI_TREE says
     if (std.c.getenv("XPU_MULTI_TREE")) |v| multi_tree = v[0] != '0';
+}
+
+/// What a forward's attention layer sees: the flags, the round and the kernels in the image.
+pub const Cover = struct {
+    on: bool,
+    tree: bool,
+    multi_tree: bool,
+    i8: bool, // int8 K/V (the pool)
+    pool: bool, // the layer has a page table
+    round_tree: bool, // Mode.tree: some window has a non-chain parents array
+    shared: bool, // Mode.multi: several streams' windows in one forward
+    has_k1: bool,
+    has_draft: bool,
+    has_draft_mt: bool,
+};
+
+pub const Path = enum { scalar, chain, tree, multi_tree };
+
+/// The attention path of a decode-width forward (at most 16 rows). forward.zig takes this branch and no other.
+/// chain: attn_k1 (a shared round of chain windows, or one stream); tree: a lone stream's tree verify (XPU_K1_TREE);
+/// multi_tree: tree windows of a shared round (XPU_MULTI_TREE); scalar: attn_decode + attn_merge.
+pub fn attnPath(c: Cover) Path {
+    if (c.tree and c.round_tree and !c.shared and c.i8 and c.pool and c.has_k1 and c.has_draft) return .tree;
+    if (c.multi_tree and c.shared and c.round_tree and c.i8 and c.pool and c.has_k1 and c.has_draft_mt) return .multi_tree;
+    if (c.on and !c.round_tree and c.pool and c.has_k1) return .chain;
+    return .scalar;
+}
+
+/// The open line: which rounds K1 serves with these flags (a pool and the K1 image assumed).
+pub fn coverageLine(buf: []u8, k1_on: bool, k1_tree: bool, k1_mt: bool) []const u8 {
+    const c: Cover = .{ .on = k1_on, .tree = k1_tree, .multi_tree = k1_mt, .i8 = true, .pool = true, .round_tree = false, .shared = false, .has_k1 = true, .has_draft = true, .has_draft_mt = true };
+    const chain = attnPath(c);
+    const one = attnPath(.{ .on = k1_on, .tree = k1_tree, .multi_tree = k1_mt, .i8 = true, .pool = true, .round_tree = true, .shared = false, .has_k1 = true, .has_draft = true, .has_draft_mt = true });
+    const many = attnPath(.{ .on = k1_on, .tree = k1_tree, .multi_tree = k1_mt, .i8 = true, .pool = true, .round_tree = true, .shared = true, .has_k1 = true, .has_draft = true, .has_draft_mt = true });
+    return std.fmt.bufPrint(buf, "K1 coverage: chain windows {s}, lone tree {s}, shared tree windows {s} (streams 1 to 6, up to 16 rows a round)", .{
+        if (chain == .chain) "K1" else "scalar",
+        if (one == .tree) "K1" else "scalar",
+        if (many == .multi_tree) "K1" else "scalar",
+    }) catch buf[0..0];
 }
 
 /// The tree verify's MT table and POS: the slot's own kc, vc and page table, every row's last prefix key p0 - 1.
 /// The host buffers must stay alive until the command list drains (the queued copies read them).
-pub var mt_host: [16 * 8]u64 = undefined;
+/// One table a layer: the layers' kc, vc and page table differ, and a queued copy reads its host buffer when the
+/// list runs, which at TP 1 (no per-layer host wait) is after the host has filled the later layers' tables.
+pub var mt_host: [64][16 * 8]u64 = undefined;
 pub var pos_host: [16]i32 = undefined;
 /// The merge's POS: p0 + span - 1, so the draft's slice NS joins (used = NS + 1).
 pub var posm_host: [16]i32 = undefined;

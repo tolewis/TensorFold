@@ -400,9 +400,10 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
             } else if (wide) {
                 try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = AKV }, .{ a.q, l.kc.?, l.vc.?, a.y, @as(i32, @intCast(p0)), t32, @as(f32, 1.0 / 16.0), pt });
             } else {
-                const k1on = k1mod.on and !mode.tree and l.pt != null and d.k.attn_k1 != null;
-                const k1t = k1mod.tree and mode.tree and mode.multi == null and q.kv_i8 and l.pt != null and d.k.attn_k1 != null and d.k.attn_k1_draft != null;
-                const k1mt = k1mod.multi_tree and mode.multi != null and mode.tree and q.kv_i8 and l.pt != null and d.k.attn_k1 != null and d.k.attn_k1_draft_mt != null;
+                const path = k1mod.attnPath(.{ .on = k1mod.on, .tree = k1mod.tree, .multi_tree = k1mod.multi_tree, .i8 = q.kv_i8, .pool = l.pt != null, .round_tree = mode.tree, .shared = mode.multi != null, .has_k1 = d.k.attn_k1 != null, .has_draft = d.k.attn_k1_draft != null, .has_draft_mt = d.k.attn_k1_draft_mt != null });
+                const k1on = path == .chain;
+                const k1t = path == .tree;
+                const k1mt = path == .multi_tree;
                 if (k1t) { // K1 tree (lane p22-k1tree): the prefix keys through the 8-row groups, the draft keys
                            // through attn_k1_draft into slice NS, merged as one row of partials a (row, head)
                     const wf: [1]u32 = .{0};
@@ -412,15 +413,15 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
                     const p0i: i32 = @intCast(p0);
                     const posm: i32 = @as(i32, @intCast(plan.ns)) * plan.span + plan.span - 1; // used = NS + 1
                     for (0..16) |r| {
-                        k1mod.mt_host[r * 8] = @intFromPtr(l.kc.?);
-                        k1mod.mt_host[r * 8 + 1] = @intFromPtr(l.vc.?);
-                        k1mod.mt_host[r * 8 + 2] = @intFromPtr(l.pt.?);
+                        k1mod.mt_host[i][r * 8] = @intFromPtr(l.kc.?);
+                        k1mod.mt_host[i][r * 8 + 1] = @intFromPtr(l.vc.?);
+                        k1mod.mt_host[i][r * 8 + 2] = @intFromPtr(l.pt.?);
                     }
                     for (0..16) |r| {
                         k1mod.pos_host[r] = p0i - 1;
                         k1mod.posm_host[r] = posm;
                     }
-                    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.kmt, &k1mod.mt_host, 16 * 8 * 8, null, 0, null));
+                    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.kmt, &k1mod.mt_host[i], 16 * 8 * 8, null, 0, null));
                     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.kpos, &k1mod.pos_host, 16 * 4, null, 0, null));
                     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.kposm, &k1mod.posm_host, 16 * 4, null, 0, null));
                     try k1mod.queueGroups(d, a.grp, grp_host[0 .. 2 * n], n);
@@ -441,10 +442,10 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
                     const tile = if (rd.k16) k1mod.TILE16 else k1mod.TILE;
                     const plan = k1mod.planTile(ctx, rd.n, AKV, k1mod.wave, tile);
                     const kern = if (rd.k16) d.k.attn_k1_16.? else d.k.attn_k1.?;
-                    var posm_host: [16]i32 = undefined;
-                    k1mod.mergePos(mm2.kkind, mm2.kpos, plan.ns, plan.span, &posm_host);
+                    // the queued copy reads this buffer when the list runs, after forward returns: a global, not the stack
+                    k1mod.mergePos(mm2.kkind, mm2.kpos, plan.ns, plan.span, &k1mod.posm_host);
                     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.kpos, @ptrCast(&mm2.kpos[0]), 16 * 4, null, 0, null));
-                    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.kposm, &posm_host, 16 * 4, null, 0, null));
+                    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.kposm, &k1mod.posm_host, 16 * 4, null, 0, null));
                     try k1mod.queueGroups(d, a.grp, grp_host[0 .. 2 * rd.n], rd.n);
                     // the partials' stride is ns + 1 (k1.cl attn_k1_draft_mt): the prefix launch and the merge take
                     // it as NS, the draft takes ns as its slice index

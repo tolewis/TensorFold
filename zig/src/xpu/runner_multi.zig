@@ -306,3 +306,103 @@ test "k1 mt: the merge per-row used reads all slices for a tree row and the chai
     try std.testing.expectEqual(@as(i32, 40960), out[3]); // exactly at a span edge: 40960 / 128 + 1 slices
     try std.testing.expectEqual(@as(i32, 0), out[4]);
 }
+
+/// One window split of a round for the cover test: the widths of up to 6 windows (16 rows at most) and which are trees.
+fn coverCheck(widths: []const u32, tree_mask: u32, flags_on: bool) !void {
+    var win: [32]i32 = undefined;
+    var host: [32]i32 = undefined;
+    var first: u32 = 0;
+    var any_tree = false;
+    for (widths, 0..) |w, i| {
+        win[2 * i] = @intCast(first);
+        win[2 * i + 1] = @intCast(w);
+        first += w;
+        any_tree = any_tree or (tree_mask >> @intCast(i)) & 1 != 0;
+    }
+    const t = first;
+    // the row groups: every row once, in order, none longer than the kernel's group, at most the 16 the launch holds
+    const rd = k1mod.roundGroups(win[0 .. 2 * widths.len], t, &host);
+    try std.testing.expect(rd.n >= widths.len and rd.n <= 16);
+    var rows: u32 = 0;
+    for (0..rd.n) |g| {
+        try std.testing.expectEqual(rows, @as(u32, @intCast(host[2 * g])));
+        try std.testing.expect(host[2 * g + 1] >= 1 and @as(u32, @intCast(host[2 * g + 1])) <= rd.rows);
+        rows += @intCast(host[2 * g + 1]);
+    }
+    try std.testing.expectEqual(t, rows);
+    // the path: a shared round (2 or more windows, or one window in the shared forward) and a lone stream
+    for ([_]bool{ true, false }) |shared| {
+        if (!shared and widths.len != 1) continue;
+        const c: k1mod.Cover = .{ .on = flags_on, .tree = flags_on, .multi_tree = flags_on, .i8 = true, .pool = true, .round_tree = any_tree, .shared = shared, .has_k1 = true, .has_draft = true, .has_draft_mt = true };
+        const want: k1mod.Path = if (!flags_on) .scalar else if (!any_tree) .chain else if (shared) .multi_tree else .tree;
+        try std.testing.expectEqual(want, k1mod.attnPath(c));
+    }
+}
+
+test "k1 cover: streams 1 to 6 and every window split of 16 rows take a K1 path" {
+    const saved16 = k1mod.have16;
+    const savedr = k1mod.r16;
+    defer {
+        k1mod.have16 = saved16;
+        k1mod.r16 = savedr;
+    }
+    var checked: u32 = 0;
+    for ([_]bool{ true, false }) |r16on| {
+        k1mod.have16 = true;
+        k1mod.r16 = r16on;
+        // the scheduler's even splits of 16 rows (remainder to the first streams), each window a tree or a chain
+        for (1..7) |n| {
+            var widths: [6]u32 = undefined;
+            for (widths[0..n], 0..) |*w, i| w.* = @intCast(16 / n + @intFromBool(i < 16 % n));
+            var mask: u32 = 0;
+            while (mask < (@as(u32, 1) << @intCast(n))) : (mask += 1) {
+                try coverCheck(widths[0..n], mask, true);
+                try coverCheck(widths[0..n], mask, false);
+                checked += 2;
+            }
+        }
+        // every split: 1 to 6 windows of 1 to 16 rows, 16 rows at most, any window a tree (3 rows or more) or a chain
+        var widths: [6]u32 = undefined;
+        for (1..7) |n| {
+            @memset(widths[0..n], 1);
+            while (true) {
+                var sum: u32 = 0;
+                for (widths[0..n]) |w| sum += w;
+                if (sum <= 16) {
+                    var mask: u32 = 0;
+                    for (widths[0..n], 0..) |w, i| if (w >= 3) {
+                        mask |= @as(u32, 1) << @intCast(i);
+                    };
+                    // all trees, all chains, and the first window alone
+                    try coverCheck(widths[0..n], mask, true);
+                    try coverCheck(widths[0..n], 0, true);
+                    try coverCheck(widths[0..n], mask & 1, true);
+                    checked += 3;
+                }
+                var k: usize = 0; // odometer over widths 1 to 16
+                while (k < n) : (k += 1) {
+                    widths[k] += 1;
+                    if (widths[k] <= 16) break;
+                    widths[k] = 1;
+                }
+                if (k == n) break;
+            }
+        }
+    }
+    try std.testing.expect(checked > 1000);
+    // XPU_MULTI_TREE=0 under XPU_K1_TREE=1: the shared tree windows go back to the scalar path, nothing else moves
+    const off_mt: k1mod.Cover = .{ .on = true, .tree = true, .multi_tree = false, .i8 = true, .pool = true, .round_tree = true, .shared = true, .has_k1 = true, .has_draft = true, .has_draft_mt = true };
+    try std.testing.expectEqual(k1mod.Path.scalar, k1mod.attnPath(off_mt));
+    // a layer without a page table, or a bf16 cache, keeps the scalar path in every shape
+    var nopool = off_mt;
+    nopool.multi_tree = true;
+    nopool.pool = false;
+    try std.testing.expectEqual(k1mod.Path.scalar, k1mod.attnPath(nopool));
+    nopool.pool = true;
+    nopool.i8 = false;
+    try std.testing.expectEqual(k1mod.Path.scalar, k1mod.attnPath(nopool));
+    // the open line names the coverage
+    var buf: [200]u8 = undefined;
+    try std.testing.expectEqualStrings("K1 coverage: chain windows K1, lone tree K1, shared tree windows K1 (streams 1 to 6, up to 16 rows a round)", k1mod.coverageLine(&buf, true, true, true));
+    try std.testing.expectEqualStrings("K1 coverage: chain windows K1, lone tree K1, shared tree windows scalar (streams 1 to 6, up to 16 rows a round)", k1mod.coverageLine(&buf, true, true, false));
+}
