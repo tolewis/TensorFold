@@ -4,6 +4,7 @@ const ze = @import("ze");
 const safetensors = @import("safetensors.zig");
 const q = @import("qwen27.zig");
 const fwd = @import("forward.zig");
+const winprof = @import("xpu").winprof;
 const a8 = fwd.a8;
 const alloc = q.alloc;
 
@@ -239,7 +240,7 @@ pub const Dev = struct {
             ev = q.prof.events[q.prof.used];
             q.prof.kernel[q.prof.used] = k;
             q.prof.used += 1;
-        }
+        } else ev = winprof.attach(k);
         try ze.check(d.g.api.zeCommandListAppendLaunchKernel(d.list, k, &groups, ev, 0, null));
     }
 

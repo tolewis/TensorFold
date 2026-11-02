@@ -5,6 +5,7 @@ const q = @import("qwen27.zig");
 const dev = @import("dev.zig");
 const loader = @import("load.zig");
 const exl3 = @import("qwen27_exl3.zig");
+const winprof = @import("xpu").winprof;
 const D = q.D;
 const Dev = dev.Dev;
 const EPS = q.EPS;
@@ -205,7 +206,9 @@ pub fn chainTable() [16 * 17]i32 {
 /// gate|up and SwiGLU: the activation and its row sums; prompt rows via the GEMM epilogue, decode rows via `swiglu`.
 pub fn mlpIn(d: *Dev, m: *const Model, a: *Acts, w: Proj, T: u32, gs: i32, pre: bool, wide: bool) !*anyopaque {
     if (w.x3) |e| { // EXL3: [gate | up] (ilv 0), then swiglu; the W4A8 and nGEN epilogues are int4 only
+        winprof.setTag(.exl3_gate_up);
         try exl3.project(e, m.exl3.?, d, a.h, a.p, T, wide);
+        winprof.setTag(.other);
         try d.launch(d.k.swiglu, .{ .x = T, .y = (FF + 1023) / 1024 }, .{ a.p, a.h, a.ahi, a.alo, gs, @as(i32, 0), q.rot_on, @as(i32, FF) });
         return a.h;
     }
@@ -414,7 +417,9 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
     if (gemm_probe) |f| try f(d, a, m.head, a.h, T, LAYERS, 4);
     const first = if (mode.want == .rows) 0 else T - 1;
     const rows = T - first;
+    if (m.head.x3 != null) winprof.setTag(.exl3_head);
     if (m.head.x3) |e| try exl3.project(e, m.exl3.?, d, off(a.h, first * D * 2), a.logits, rows, false) else try gemm(d, a.pscr, off(a.h, first * D * 2), off(a.ahi, first * (D / m.head.gs) * 2), off(a.alo, first * (D / m.head.gs) * 2), m.head, a.logits, rows);
+    winprof.setTag(.other);
     try d.launch(d.k.argmax_part, .{ .x = 256, .y = rows }, .{ a.logits, @as(i32, VOCAB), a.pv, a.pi });
     try d.launch(d.k.argmax, .{ .x = rows }, .{ a.pv, a.pi, a.tok });
     var toks: [q.MAX_ROWS]i32 = undefined;
@@ -506,7 +511,9 @@ pub fn layerFront(c: *const Ctx, l: *loader.Layer, i: usize) !void {
     const min_in = if (q.a8_group != 0 and wide and q.a8_sites & 1 != 0) a.r else a.h;
     if (min_in != a.h) try copy(d, a.r, a.h, T * D * 2);
     try a8(d, a, min_in, D, T, 1);
+    if (l.mixer_in.x3 != null) winprof.setTag(.exl3_in);
     try pgemm(d, m, a, min_in, l.mixer_in, a.p, T, c.q8on, 0, false, wide);
+    winprof.setTag(.other);
     if (gemm_probe) |f| try f(d, a, l.mixer_in, min_in, T, i, 0);
     if (l.ab) |ab| try d.launch(d.k.dense_rows, .{ .x = (T + 15) / 16, .y = 2 * HV / 16 }, .{ a.h, ab, a.p, t32, @as(i32, GDN_IN), @as(i32, GDN_AB) });
     if (probe) try dumpBuf(d, "p0", a.p, T * GDN_IN, .f16);
@@ -593,7 +600,9 @@ pub fn layerFront(c: *const Ctx, l: *loader.Layer, i: usize) !void {
         if (probe) try dumpBuf(d, "o0", a.h, T * MIX_OUT, .f16);
     }
     try a8(d, a, a.h, MIX_OUT, T, 2);
+    if (l.mixer_out.x3 != null) winprof.setTag(.exl3_out);
     try pgemm(d, m, a, a.h, l.mixer_out, a.r, T, c.q8out, 0, q.int4_sites & 2 != 0, wide);
+    winprof.setTag(.other);
 }
 
 /// The ranks' sum of the mixer's out projection. TF_TP_DEVFLAG on the decode path fuses it into the residual add and
@@ -621,7 +630,9 @@ pub fn layerBack(c: *const Ctx, l: *loader.Layer, i: usize, fused: bool) !*anyop
     if (gemm_probe) |f| try f(d, a, l.gu, a.h, T, i, 2);
     const act = try mlpIn(d, c.m, a, l.gu, T, c.gs, c.q8on, c.wide);
     try a8(d, a, act, FF, T, 8);
+    if (l.down.x3 != null) winprof.setTag(.exl3_down);
     try pgemm(d, c.m, a, act, l.down, a.r, T, false, if (act == a.p) q.rot_on else 0, q.int4_sites & 8 != 0, c.wide);
+    winprof.setTag(.other);
     return act;
 }
 

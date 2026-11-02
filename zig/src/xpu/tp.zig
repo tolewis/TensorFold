@@ -40,6 +40,7 @@ const overlap = @import("overlap.zig");
 const Dev = dev.Dev;
 const off = dev.off;
 const D = q.D;
+const winprof = @import("xpu").winprof;
 
 const line = 64;
 const rows_max = 1152 + 128 + q.MAX_ROWS; // the widest forward (q.maxRows at XPU_CHUNK 1152) and a decode window
@@ -360,6 +361,7 @@ pub const Group = struct {
         if (g.direct) { // the partial into this rank's slot, the counter, then the add kernel reads the peer's slot
             const par: usize = @intCast(g.seq % 2);
             try dev.copy(d, g.dslot[par], partial, n * 2);
+            const t0: f64 = if (winprof.on) q.now() else 0;
             d.settle();
             g.counter(g.rank).store(g.seq, .seq_cst); // the counter and the liveness word are the rank's heartbeat
             aliveWord(g, g.rank).store(@intFromFloat(q.now()), .release);
@@ -367,11 +369,13 @@ pub const Group = struct {
                 // the group is lost: this rank closes it and exits instead of waiting 180 s or serving broken rounds
                 waitGroupLost(g, e);
             }
+            if (winprof.on) winprof.hostWait(q.now() - t0);
             try dev.copy(d, g.pbuf[par], g.peer[par].?, n * 2); // over PCIe, on the in-order list
             try d.launch(d.k.tp_add, .{ .x = @intCast((n + 255) / 256) }, .{ partial, g.dslot[par], g.pbuf[par], @as(i32, @intCast(n)) });
             return;
         }
         try dev.copy(d, @ptrCast(g.mine), partial, n * 2);
+        const t0: f64 = if (winprof.on) q.now() else 0;
         d.settle();
         @memcpy(g.slot(g.rank, g.seq)[0..n], g.mine[0..n]);
         g.counter(g.rank).store(g.seq, .seq_cst); // the counter and the liveness word are the rank's heartbeat
@@ -380,6 +384,7 @@ pub const Group = struct {
             // the group is lost: this rank closes it and exits instead of waiting 180 s or serving broken rounds
             waitGroupLost(g, e);
         }
+        if (winprof.on) winprof.hostWait(q.now() - t0);
         // the sum in fp32, rounded once: the ranks add in the same order, so both hold the same bits
         for (0..n) |i| {
             var acc: f32 = 0;
