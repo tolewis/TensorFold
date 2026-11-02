@@ -188,8 +188,10 @@ test "mlx tp slice: every TP 2 split of Qwen3.8-27B lies on a group boundary" {
         .{ .n = 6144, .k = D, .c = .{ Cut.cols(0, 3072), Cut.cols(3072, 3072) } }, // in_proj_z
         .{ .n = 48, .k = D, .c = .{ Cut.cols(0, 24), Cut.cols(24, 24) } }, // in_proj_a, in_proj_b
     };
-    for (cases) |cs| for (cs.c) |c| {
-        const sp = try span(c, cs.n, cs.k);
-        try std.testing.expect(sp.k % GS == 0 and sp.k0 % GS == 0);
+    for (cases) |cs| {
+        for (cs.c) |c| {
+            const sp = try span(c, cs.n, cs.k);
+            try std.testing.expect(sp.k % GS == 0 and sp.k0 % GS == 0);
+        }
     }
 }
