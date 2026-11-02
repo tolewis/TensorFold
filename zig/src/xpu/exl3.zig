@@ -213,7 +213,7 @@ pub const Pipelines = struct {
                     };
                     if (p.mv3) |k| {
                         try k.indirect();
-                        std.log.info("exl3: XPU_EXL3_MV3 is on: rows 1 4-bit launches use exl3_matvec3 (exl3_mv3.cl); 6-bit and rows 2 to 16 stay on exl3_matvec", .{});
+                        std.log.info("exl3: XPU_EXL3_MV3 is on: rows 1 4-bit launches use exl3_matvec3 (exl3_mv3.cl), 6-bit and rows 2 to 16 stay on exl3_matvec", .{});
                     }
                 }
             }
