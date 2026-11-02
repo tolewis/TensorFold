@@ -47,7 +47,7 @@ pub fn run(r: *q.Runner) !void {
             .verify_tree => if (r.verifyTree(data[0..n], @ptrCast(data[n .. 2 * n]))) |_| {} else |e| e,
             .commit_path => r.commitPath(data),
             .verify_multi => blk: {
-                var wins: [16]multi.Win = undefined;
+                var wins: [q.ROWS_CAP]multi.Win = undefined;
                 var at: usize = 0;
                 for (wins[0..n]) |*w| {
                     const rows: usize = data[at + 1];
@@ -63,7 +63,7 @@ pub fn run(r: *q.Runner) !void {
             },
             .keep_multi => multi.keepMulti(r, data),
             .keep_paths => blk: {
-                var paths: [16][]const u32 = undefined;
+                var paths: [q.ROWS_CAP][]const u32 = undefined;
                 var at: usize = 0;
                 for (paths[0..n]) |*p| {
                     const rows: usize = data[at];

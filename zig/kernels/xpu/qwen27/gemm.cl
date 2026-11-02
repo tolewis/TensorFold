@@ -335,6 +335,75 @@ W4K_KERNEL(w4k_decode, 16, 32, 4, 16, READ16, 2)
 
 // dpb family (wide shapes: gdn.in, attn.qkv, gate|up, head), original quartets: decode and verification.
 W4K_KERNEL_SL(w4k1_decode, 16, 32, 4, 16, READ16, 2, 1)
+
+// --- Many-row decode (XPU_ROWS_MAX above 16): one weight read a sub-group serves RB row blocks of 16 rows, so a
+// work-group does 32 or 64 rows from the same weight bytes. Same scales, bias and bits as w4k1_decode at 16 rows;
+// MLX 4/64 and GPTQ 4/128. The rows are a row block of the same columns: grid x = ceil(M / (16 RB)).
+#define BIAS_TILE_M(tot, i, j, mb)                                                                                   \
+  for (int st = 0; st < (G + 15) / 16; st++) {                                                                       \
+    ushort8 ah, al;                                                                                                  \
+    uint8 bb;                                                                                                        \
+    intel_sub_group_2d_block_read_16b_8r16x1c((global void *)Ahi, G * 2, M, G * 2, (int2)(16 * st, (mb) + 8 * (i)), (private ushort *)&ah); \
+    intel_sub_group_2d_block_read_16b_8r16x1c((global void *)Alo, G * 2, M, G * 2, (int2)(16 * st, (mb) + 8 * (i)), (private ushort *)&al); \
+    intel_sub_group_2d_block_read_transform_16b_16r16x1c((global void *)Bg, N * 2, G, N * 2, (int2)(n0 + 16 * (j), 16 * st), (private uint *)&bb); \
+    tot = intel_sub_group_f16_f16_matrix_mad_k16(as_short8(ah), as_int8(bb), tot);                                  \
+    tot = intel_sub_group_f16_f16_matrix_mad_k16(as_short8(al), as_int8(bb), tot);                                  \
+  }
+
+#define W4MR_KERNEL(NAME, SG_N_, RB_)                                                                                \
+  KERNEL_HEAD_K(NAME, 64) {                                                                                          \
+    enum { SG_M = 16, SG_N = SG_N_, RB = RB_ };                                                                      \
+    const int sg = get_sub_group_id(), lane = get_sub_group_local_id();                                             \
+    const int m0 = get_group_id(0) * (SG_M * RB), n0 = (get_group_id(1) * 4 + sg) * SG_N;                            \
+    float8 total[RB][SG_M / 8][SG_N / 16];                                                                           \
+    for (int rb = 0; rb < RB; rb++)                                                                                  \
+      for (int i = 0; i < SG_M / 8; i++)                                                                             \
+        for (int j = 0; j < SG_N / 16; j++) total[rb][i][j] = 0.0f;                                                  \
+    for (int g = 0; g < G; g++) {                                                                                    \
+      uint w[SG_N / 16][8];                                                                                          \
+      float s[SG_N / 16];                                                                                            \
+      for (int j = 0; j < SG_N / 16; j++) {                                                                          \
+        intel_sub_group_2d_block_read_32b_8r16x1c((global void *)W, N * 4, K / 8, N * 4, (int2)(n0 + 16 * j, g * 8), w[j]); \
+        s[j] = (float)S[g * N + n0 + 16 * j + lane] * 16777216.0f;                                                   \
+      }                                                                                                              \
+      for (int rb = 0; rb < RB; rb++) {                                                                              \
+        float8 part[SG_M / 8][SG_N / 16];                                                                            \
+        for (int i = 0; i < SG_M / 8; i++)                                                                           \
+          for (int j = 0; j < SG_N / 16; j++) part[i][j] = 0.0f;                                                     \
+        for (int t2 = 0; t2 < 2; t2++) {                                                                             \
+          ushort ab[SG_M / 4][8];                                                                                    \
+          for (int r = 0; r < SG_M / 4; r++)                                                                         \
+            READ16((global void *)A, K * 2, M, K * 2, (int2)(g * 64 + t2 * 32, m0 + rb * SG_M + 4 * r), ab[r]);       \
+          for (int h = 0; h < 2; h++) {                                                                              \
+            const int t = 2 * t2 + h;                                                                                \
+            for (int j = 0; j < SG_N / 16; j++) {                                                                    \
+              const uint w0 = w[j][2 * t], w1 = w[j][2 * t + 1];                                                     \
+              int8 bb = as_int8((uint8)(w0, w0 >> 4, w0 >> 8, w0 >> 12, w1, w1 >> 4, w1 >> 8, w1 >> 12) & 0x000F000Fu); \
+              for (int i = 0; i < SG_M / 8; i++) {                                                                   \
+                const short8 a = as_short8(vload8(0, &ab[(8 * i) / 4][h * 4 + (8 * i) % 4]));                         \
+                part[i][j] = intel_sub_group_f16_f16_matrix_mad_k16(a, bb, part[i][j]);                              \
+              }                                                                                                      \
+            }                                                                                                        \
+          }                                                                                                          \
+        }                                                                                                            \
+        for (int i = 0; i < SG_M / 8; i++)                                                                           \
+          for (int j = 0; j < SG_N / 16; j++) total[rb][i][j] = fma(part[i][j], (float8)(s[j]), total[rb][i][j]);    \
+      }                                                                                                              \
+    }                                                                                                                \
+    for (int rb = 0; rb < RB; rb++)                                                                                  \
+      for (int i = 0; i < SG_M / 8; i++)                                                                             \
+        for (int j = 0; j < SG_N / 16; j++) {                                                                        \
+          const int mb = m0 + rb * SG_M + 8 * i;                                                                     \
+          if (mb >= M) continue;                                                                                     \
+          float8 tot = total[rb][i][j];                                                                              \
+          BIAS_TILE_M(tot, i, j, mb)                                                                                 \
+          half8 hh = convert_half8_rte(tot);                                                                         \
+          intel_sub_group_2d_block_write_16b_8r16x1c(C, N * 2, M, N * 2, (int2)(n0 + 16 * j, mb), (private ushort *)&hh); \
+        }                                                                                                            \
+  }
+
+W4MR_KERNEL(w4k1_mr32, 32, 2)
+W4MR_KERNEL(w4k1_mr64, 16, 4)
 W4K_KERNEL_SL(w4k1_d16, 16, 16, 4, 16, READ16, 2, 1)
 W4K_KERNEL_SL(w4k1_d64, 16, 64, 4, 16, READ16, 2, 1)
 W4K_KERNEL_SL(w4k1_w8, 16, 32, 8, 16, READ16, 2, 1)

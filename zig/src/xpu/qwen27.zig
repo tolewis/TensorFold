@@ -135,6 +135,12 @@ pub var a8_sites4: u32 = 15; // XPU_A8_SITES4: the sites in int4 when XPU_A8_BIT
 pub var embed_host: bool = false;
 /// The checkpoint is MLX 4/64 (not EXL3 or GPTQ): a bit of the mode word, so a pair of mixed models fails at start.
 pub var fmt_mlx: bool = false;
+/// XPU_ROWS_MAX: the most rows of one forward's shared verify round. 16 (the default) is the live path; 32 or 64
+/// let verifyMulti take a round of that many rows (lanes/qwen27 design/manyrow-exl3.md). The per-row buffers, the
+/// tree table and the MT table are sized for it, and nothing else changes: the kernels are the same.
+pub var rows_max: u32 = 16;
+/// The most rows the runner's host arrays hold, whatever XPU_ROWS_MAX is (a comptime bound).
+pub const ROWS_CAP: u32 = 64;
 pub var prof: Prof = .{};
 
 /// The XPU_* options as the process had them before its first open, put back at every open (Runner.init).
@@ -152,6 +158,7 @@ const Options = struct {
     a8_levels: i32,
     a8_sites4: u32,
     embed_host: bool,
+    rows_max: u32,
     chunk: u32,
     kv_pool: bool,
     pool_tokens: ?u32,
@@ -162,7 +169,7 @@ var defaults: ?Options = null;
 var live = false;
 
 fn options() Options {
-    return .{ .dump_dir = dump_dir, .dump_h = dump_h, .a8_group = a8_group, .kv8 = kv8, .kv_i8 = kv_i8, .prefill_int4 = prefill_int4, .int4_sites = int4_sites, .prefill_int8 = prefill_int8, .a8_sites = a8_sites, .a8_rot = a8_rot, .a8_levels = a8_levels, .a8_sites4 = a8_sites4, .embed_host = embed_host, .chunk = CHUNK, .kv_pool = kv_pool, .pool_tokens = pool_tokens, .keep_shared = keep_shared };
+    return .{ .dump_dir = dump_dir, .dump_h = dump_h, .a8_group = a8_group, .kv8 = kv8, .kv_i8 = kv_i8, .prefill_int4 = prefill_int4, .int4_sites = int4_sites, .prefill_int8 = prefill_int8, .a8_sites = a8_sites, .a8_rot = a8_rot, .a8_levels = a8_levels, .a8_sites4 = a8_sites4, .embed_host = embed_host, .rows_max = rows_max, .chunk = CHUNK, .kv_pool = kv_pool, .pool_tokens = pool_tokens, .keep_shared = keep_shared };
 }
 
 fn restore(o: Options) void {
@@ -179,6 +186,7 @@ fn restore(o: Options) void {
     a8_levels = o.a8_levels;
     a8_sites4 = o.a8_sites4;
     embed_host = o.embed_host;
+    rows_max = o.rows_max;
     CHUNK = o.chunk;
     kv_pool = o.kv_pool;
     pool_tokens = o.pool_tokens;
@@ -208,22 +216,22 @@ pub const Runner = struct {
     context: u32,
     ckpt: Checkpoint = .{},
     host_logits: []f32 = &.{},
-    block: [16]u32 = @splat(0), // the last verified block's greedy tokens
+    block: [ROWS_CAP]u32 = @splat(0), // the last verified block's greedy tokens
     block_rows: u32 = 0,
     tree_on: bool = false, // the last verified block was a tree (commitPath)
-    tree_host: [16 * 17]i32 = @splat(0),
-    path_host: [16]i32 = @splat(0),
+    tree_host: [ROWS_CAP * 17]i32 = @splat(0),
+    path_host: [ROWS_CAP]i32 = @splat(0),
     slot: u32 = 0, // the selected sequence (select)
-    mt_host: [LAYERS * 16 * 8]u64 = @splat(0), // verifyMulti's per-row state addresses, by layer
-    pos_host: [16]i32 = @splat(0),
-    kpos_host: [16]i32 = @splat(0), // XPU_MULTI_TREE: each row's last prefix key (chain: mpos, tree: the window base - 1)
-    kkind_host: [16]u8 = @splat(0), // and 1 for a tree row, 0 for a chain row
-    win_host: [32]i32 = @splat(0), // and each window's first row and width (keepMulti)
-    ids_host: [16]u32 = @splat(0),
-    multi_slots: [16]u32 = @splat(0), // the last verifyMulti's slots, by window
+    mt_host: [LAYERS * ROWS_CAP * 8]u64 = @splat(0), // verifyMulti's per-row state addresses, by layer
+    pos_host: [ROWS_CAP]i32 = @splat(0),
+    kpos_host: [ROWS_CAP]i32 = @splat(0), // XPU_MULTI_TREE: each row's last prefix key (chain: mpos, tree: the window base - 1)
+    kkind_host: [ROWS_CAP]u8 = @splat(0), // and 1 for a tree row, 0 for a chain row
+    win_host: [2 * ROWS_CAP]i32 = @splat(0), // and each window's first row and width (keepMulti)
+    ids_host: [ROWS_CAP]u32 = @splat(0),
+    multi_slots: [ROWS_CAP]u32 = @splat(0), // the last verifyMulti's slots, by window
     multi_count: u32 = 0,
     multi_tree: bool = false, // the last verifyMulti had tree windows: every window's states are replayed at the keep
-    mpath_host: [16 * 2 * 16]i32 = @splat(0),
+    mpath_host: [ROWS_CAP * 2 * 16]i32 = @splat(0),
     seqs: [MAX_SLOTS]struct { pos: u32 = 0, last: u32 = 0 } = @splat(.{}),
     // the shared K/V pool (allocPool): every attention layer's pages, each slot's page table and the pages it holds
     pool: u32 = 0, // pages in each attention layer's pool (0: per-slot caches)
@@ -265,6 +273,12 @@ pub const Runner = struct {
         if (std.c.getenv("XPU_CHUNK")) |v| CHUNK = try limits.chunk(std.mem.span(v));
         if (std.c.getenv("TF_TP_RANK")) |v| RANK = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         k1mod.readEnv(); // XPU_K1, XPU_K1_WAVE
+        if (std.c.getenv("XPU_ROWS_MAX")) |v| {
+            rows_max = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 16;
+            if (rows_max != 16 and rows_max != 32 and rows_max != 64) return error.BadRowsMax;
+        }
+        // the window probe: the row counts a shared verify round may take
+        if (rows_max > 16) std.debug.print("rows: XPU_ROWS_MAX={d}: a shared verify round may take {d} rows (buckets 16, 32 and 64), the head stays at 16-row buckets\n", .{ rows_max, rows_max });
         if (RANK >= TP) return error.RankOutOfRange;
         // the shared K/V pool: a page holds int8 rows and their scales, so pool mode is int8 K/V
         if (std.c.getenv("XPU_KV_POOL")) |v| kv_pool = v[0] != '0';
@@ -324,7 +338,7 @@ pub const Runner = struct {
         tp.group = try tp.Group.open(&r.d); // null at TP 1
         if (tp.group) |*g| {
             if (g.rank != 0 and g.readMode() != modeWord()) {
-                std.log.err("rank {d}: the mode word does not match rank 0's: this rank's XPU_KV_POOL, XPU_KEEP_SHARED, XPU_KV_INT8, XPU_EMBED_HOST, XPU_K1, XPU_K1_TREE, XPU_MULTI_TREE, XPU_K1_R16 or XPU_K1_WAVE diverges, or this rank loads a different weight format (EXL3 or MLX), and the pair sizes its cards differently\n", .{ RANK });
+                std.log.err("rank {d}: the mode word does not match rank 0's: this rank's XPU_KV_POOL, XPU_KEEP_SHARED, XPU_KV_INT8, XPU_EMBED_HOST, XPU_K1, XPU_K1_TREE, XPU_MULTI_TREE, XPU_K1_R16, XPU_K1_WAVE or XPU_ROWS_MAX diverges, or this rank loads a different weight format (EXL3 or MLX), and the pair sizes its cards differently\n", .{ RANK });
                 g.markClosed(); // rank 0 sees the closed segment at its first all-reduce and exits at once
                 return error.ModeMismatch;
             }
@@ -375,6 +389,8 @@ pub const Runner = struct {
             .quantize_mlx = try d.kernel(mg, "quantize_mlx", 16),
             .dec_wide_g128 = try d.kernel(mm128, "w4k1_decode", 64),
             .dec_wide64_g128 = try d.kernel(mm128, "w4k1_d64", 64),
+            .dec_mr32_g128 = try d.kernel(mm128, "w4k1_mr32", 64),
+            .dec_mr64_g128 = try d.kernel(mm128, "w4k1_mr64", 64),
             .dec_narrow_g128 = try d.kernel(mm128, "w4k_dsplit", 64),
             .ngen_wide_g128 = try d.kernel(mw128, "w4g_dpb", 256),
             .ngen_narrow_g128 = try d.kernel(mn128, "w4g_s4dpb", 256),
@@ -389,6 +405,8 @@ pub const Runner = struct {
             .a4 = try d.kernel(try d.g.module(&kb.ngen_a4), "w4a4", 256),
             .dec_wide = try d.kernel(mm, "w4k1_decode", 64),
             .dec_wide64 = try d.kernel(mm, "w4k1_d64", 64),
+            .dec_mr32 = try d.kernel(mm, "w4k1_mr32", 64),
+            .dec_mr64 = try d.kernel(mm, "w4k1_mr64", 64),
             .dec_narrow = try d.kernel(mm, "w4k_dsplit", 64),
             .gdn_prep = try d.kernel(mgd, "gdn_prep", 64),
             .gdn_state = try d.kernel(mgd, "gdn_state", 256),
@@ -917,6 +935,7 @@ pub fn modeWord() u64 {
     w |= (@as(u64, k1mod.wave) & 15) << 7;
     w |= @as(u64, @intFromBool(k1mod.multi_tree)) << 11;
     w |= @as(u64, @intFromBool(fmt_mlx)) << 12; // 0: EXL3, 1: MLX 4/64
+    w |= @as(u64, switch (rows_max) { 16 => 0, 32 => 1, else => 2 }) << 13; // XPU_ROWS_MAX: 0 at 16 rows, 1 at 32, 2 at 64
     return w;
 }
 
@@ -931,8 +950,10 @@ test "mode word: each flag sits at the bit both ranks agree on" {
     const saved_r16 = k1mod.r16;
     const saved_wave = k1mod.wave;
     const saved_fmt = fmt_mlx;
+    const saved_rows = rows_max;
     defer {
         fmt_mlx = saved_fmt;
+        rows_max = saved_rows;
         kv_pool = saved_pool;
         keep_shared = saved_keep;
         kv_i8 = saved_i8;
@@ -970,6 +991,21 @@ test "mode word: each flag sits at the bit both ranks agree on" {
     try std.testing.expectEqual(@as(u64, 0x7F) | (@as(u64, 5) << 7) | (@as(u64, 1) << 11), modeWord());
     k1mod.multi_tree = false;
     try std.testing.expectEqual(@as(u64, 0x7F) | (@as(u64, 5) << 7), modeWord());
+    // XPU_ROWS_MAX: bits 13 and 14, 0 at 16 rows, 1 at 32, 2 at 64; bit 12 stays the weight format
+    rows_max = 16;
+    try std.testing.expectEqual(@as(u64, 0x7F) | (@as(u64, 5) << 7), modeWord());
+    rows_max = 32;
+    try std.testing.expectEqual(@as(u64, 0x7F) | (@as(u64, 5) << 7) | (@as(u64, 1) << 13), modeWord());
+    rows_max = 64;
+    try std.testing.expectEqual(@as(u64, 0x7F) | (@as(u64, 5) << 7) | (@as(u64, 2) << 13), modeWord());
+    // both together: an MLX rank at 64 rows differs from an EXL3 rank at 64 rows and from an MLX rank at 16 rows
+    fmt_mlx = true;
+    try std.testing.expectEqual(@as(u64, 0x7F) | (@as(u64, 5) << 7) | (@as(u64, 1) << 12) | (@as(u64, 2) << 13), modeWord());
+    rows_max = 16;
+    try std.testing.expectEqual(@as(u64, 0x7F) | (@as(u64, 5) << 7) | (@as(u64, 1) << 12), modeWord());
+    fmt_mlx = false;
+    rows_max = 64;
+    try std.testing.expectEqual(@as(u64, 0x7F) | (@as(u64, 5) << 7) | (@as(u64, 2) << 13), modeWord());
 }
 
 /// The pool's pages for a TP 2 pair: rank 0 sizes it and publishes the count, a follower waits for it and takes the

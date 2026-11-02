@@ -126,6 +126,9 @@ pub const Proj = struct {
     chunk: ?exl3.Plan = null,
     /// The head only: rows 1 from row t of x (want = last, t < WINDOW), and from `row` (a prompt chunk's last row).
     last: [WINDOW]exl3.Plan = undefined,
+    /// The head only, with XPU_ROWS_MAX above 16: rows 16 from row 16k of x, so a shared round of up to 64 rows
+    /// runs the head in 16-row buckets (there is no 64-row 6-bit decode image).
+    h16: [4]?exl3.Plan = .{ null, null, null, null },
     row: u64 = 0,
     row_plan: ?exl3.Plan = null,
     head: bool = false,
@@ -215,6 +218,9 @@ pub const Weights = struct {
         for (&hp.last, 0..) |*pl, t| pl.* = try hp.plan(w, h + t * D * 2, hp.y, 1);
         hp.row = @intFromPtr(try d.alloc_(D * 2));
         hp.row_plan = try hp.plan(w, hp.row, hp.y, 1);
+        if (q.rows_max > WINDOW) { // the head's 16-row buckets, rows 16k of h
+            for (0..4) |k| hp.h16[k] = try hp.plan(w, hp.x + @as(u64, k) * WINDOW * D * 2, hp.y + @as(u64, k) * WINDOW * hp.width * 2, WINDOW);
+        }
         try d.sync();
     }
 
@@ -233,6 +239,12 @@ pub fn project(p: *const Proj, w: *const Weights, d: *Dev, x: *anyopaque, out: *
     if (ya != p.y) return error.Exl3Unbound;
     if (xa == p.x) {
         if (!wide and T <= WINDOW) return exl3.encode(&w.p, w.stream(), &p.dec[T - 1]);
+        // the head above one decode window: 16-row buckets, one launch a bucket (XPU_ROWS_MAX)
+        if (p.head and q.rows_max > WINDOW and T <= q.rows_max) {
+            var k: u32 = 0;
+            while (k < T) : (k += WINDOW) try exl3.encode(&w.p, w.stream(), &p.h16[k / WINDOW].?);
+            return;
+        }
         if (p.chunk) |*c| return exl3.encodeRows(&w.p, w.stream(), c, T);
         if (T <= WINDOW) return exl3.encode(&w.p, w.stream(), &p.dec[T - 1]);
         return error.Exl3Unbound;

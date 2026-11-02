@@ -5,6 +5,7 @@ const q = @import("qwen27.zig");
 const dev = @import("dev.zig");
 const loader = @import("load.zig");
 const exl3 = @import("qwen27_exl3.zig");
+const w4rows = @import("w4rows.zig");
 const D = q.D;
 const Dev = dev.Dev;
 const EPS = q.EPS;
@@ -89,6 +90,7 @@ pub const Acts = struct {
 
     pub fn init(d: *Dev) !Acts {
         const rows = q.maxRows();
+        const vr = q.rows_max; // the per-row buffers of a shared verify round
         const nc = limits.chunks(rows);
         const ns = limits.splits(q.MAX_CTX, SPLIT);
         return .{
@@ -109,35 +111,36 @@ pub const Acts = struct {
             .u0 = try d.alloc_(nc * HV * 64 * 128 * 4),
             .hs = try d.alloc_(3 * nc * HV * 128 * 128 * 2),
             .vn = try d.alloc_(3 * nc * HV * 128 * 64 * 2),
-            // decode attention partials: at most 16 rows (the prompt kernel needs none)
-            .pm = try d.alloc_(16 * HQ * ns * 4),
-            .pl = try d.alloc_(16 * HQ * ns * 4),
-            .po = try d.alloc_(16 * HQ * ns * 256 * 4),
+            // the shared round's per-row state: XPU_ROWS_MAX rows (16 on the live path; 32 or 64 on request)
+            .pm = try d.alloc_(vr * HQ * ns * 4),
+            .pl = try d.alloc_(vr * HQ * ns * 4),
+            .po = try d.alloc_(vr * HQ * ns * 256 * 4),
             .pscr = try d.alloc_(rows * D * 4),
-            .logits = try d.alloc_(16 * VOCAB * 2),
-            .tok = try d.alloc_(16 * 4),
-            .pv = try d.alloc_(16 * 1024),
-            .pi = try d.alloc_(16 * 1024),
-            .mrows = try d.alloc_(16 * 4),
-            .mbits = try d.alloc_(16 * MASK_WORDS * 4),
-            .mtok = try d.alloc_(16 * 4),
+            .logits = try d.alloc_(vr * VOCAB * 2),
+            .tok = try d.alloc_(vr * 4),
+            .pv = try d.alloc_(vr * 1024),
+            .pi = try d.alloc_(vr * 1024),
+            .mrows = try d.alloc_(vr * 4),
+            .mbits = try d.alloc_(vr * MASK_WORDS * 4),
+            .mtok = try d.alloc_(vr * 4),
             .taps = try d.alloc_(rows * 5 * D * 2),
             .ids = try d.alloc_(rows * 4),
             .zeros = try d.alloc_(rows * HV * 128 * 2),
             .ones = try d.alloc_(rows * HV * 4),
+            // a chain's table stays 16 rows: a chain runs on the decode attention only up to 16 rows
             .chain = try d.upload(std.mem.sliceAsBytes(&chainTable())),
-            .tree = try d.alloc_(16 * 17 * 4),
-            .path = try d.alloc_(16 * 4),
-            .mpath = try d.alloc_(16 * 2 * 16 * 4),
-            .sl = try d.alloc_(16 * HV * 128 * 128 * 4),
-            .mt = try d.alloc_(LAYERS * 16 * 8 * 8),
-            .mpos = try d.alloc_(16 * 4),
+            .tree = try d.alloc_(vr * 17 * 4),
+            .path = try d.alloc_(vr * 4),
+            .mpath = try d.alloc_(q.ROWS_CAP * 2 * q.ROWS_CAP * 4),
+            .sl = try d.alloc_(vr * HV * 128 * 128 * 4),
+            .mt = try d.alloc_(LAYERS * vr * 8 * 8),
+            .mpos = try d.alloc_(vr * 4),
             .a8 = try d.alloc_(rows * FF),
             .sa = try d.alloc_((FF / 128) * (rows + 32) * 4),
-            .grp = try d.alloc_(16 * 2 * 4),
-            .kmt = try d.alloc_(16 * 8 * 8),
-            .kpos = try d.alloc_(16 * 4),
-            .kposm = try d.alloc_(16 * 4),
+            .grp = try d.alloc_(vr * 2 * 4),
+            .kmt = try d.alloc_(vr * 8 * 8),
+            .kpos = try d.alloc_(vr * 4),
+            .kposm = try d.alloc_(vr * 4),
         };
     }
 };
@@ -206,6 +209,22 @@ pub fn gemmRows(d: *Dev, pscr: *anyopaque, h: *anyopaque, ahi: *anyopaque, alo: 
     const ngen_wide = if (g128) k.ngen_wide_g128 else k.ngen_wide;
     const ngen_narrow = if (g128) k.ngen_narrow_g128 else k.ngen_narrow;
     const mp: i32 = @intCast((m + 7) / 8 * 8);
+    // XPU_ROWS_MAX above 16: the int4 many-row decode serves 17 rows up to the cap, one weight read a work-group
+    // for 2 or 4 row blocks of 16 rows (zig/kernels/xpu/qwen27/gemm.cl w4k1_mr32/mr64). Up to 16 rows and above
+    // the cap the path is today's.
+    const many = m > w4rows.window and q.rows_max > w4rows.window and m <= q.rows_max and w.n % 64 == 0 and
+        (m > 32 or w.n % w4rows.columns32 == 0);
+    if (many) {
+        const pl = w4rows.plan(m, w.n, q.rows_max);
+        const kern = switch (pl.kernel) {
+            .mr32 => if (g128) k.dec_mr32_g128 else k.dec_mr32,
+            .mr64 => if (g128) k.dec_mr64_g128 else k.dec_mr64,
+            else => unreachable,
+        };
+        try d.launch(kern, .{ .x = pl.grid[0], .y = pl.grid[1], .z = 1 }, .{ h, w.w, w.s, w.bg, out, M, N, K, ahi, alo, mp, G });
+        if (gemm_hook) |f| try f(d, h, w, out, m);
+        return;
+    }
     if (!wide) {
         if (w.wide)
             // 64 columns per subgroup for the widest shapes (gate|up, head), 32 below (measured end to end)
@@ -323,14 +342,19 @@ pub var gdn_probe: ?*const fn (*Dev, *Acts, *anyopaque, u32, usize) anyerror!voi
 pub const Mode = struct { prompt: bool = false, want: Want = .last, stash: bool = false, taps: bool = false, tree: bool = false, pt: ?*anyopaque = null, multi: ?struct { mt: *anyopaque, pos: *anyopaque, max_pos: u32, win: []const i32 = &.{}, kpos: []const i32 = &.{}, kkind: []const u8 = &.{} } = null };
 
 /// K1: the row groups of the forward's attn_k1 launch; a copy of it is queued, so it lives as long as the process.
-var grp_host: [32]i32 = undefined;
+var grp_host: [2 * q.ROWS_CAP]i32 = undefined;
 
 /// One forward over `ids` (< q.maxRows() rows) at p0..; the last row's greedy token; ≤ 16 non-prompt rows: GDN serial.
 pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) !?i32 {
     const want = mode.want != .none;
     if (ids.len > q.maxRows()) return error.TooManyRows; // the scratch holds maxRows, padded to 64
     const T: u32 = @intCast(ids.len);
-    const wide = T > 16 or mode.prompt; // the prompt kernels: a prompt chunk cuts the same bits at any length
+    // `wide`: the prompt kernels (a prompt chunk cuts the same bits at any length). A shared round keeps the decode
+    // kernels at any row count: they carry each row's state and page table in MT, which the prompt GDN does not.
+    const wide = mode.prompt or (mode.multi == null and T > 16);
+    // `gwide`: the GEMM path. The int4 decode kernels hold 16 rows a sub-group, so a round above 16 rows takes the
+    // nGEN prompt GEMM (one 64-row tile), and EXL3 takes its prompt GEMM above variants.window rows.
+    const gwide = mode.prompt or T > 16;
     const t32: i32 = @intCast(T);
     const tp = (T + 63) / 64 * 64; // GDN chunk rows (padded)
     const nul: ?*anyopaque = null;
@@ -360,13 +384,13 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
         const min_in = if (q.a8_group != 0 and wide and q.a8_sites & 1 != 0) a.r else a.h;
         if (min_in != a.h) try copy(d, a.r, a.h, T * D * 2);
         try a8(d, a, min_in, D, T, 1);
-        try pgemm(d, m, a, min_in, l.mixer_in, a.p, T, q8on, 0, false, wide);
+        try pgemm(d, m, a, min_in, l.mixer_in, a.p, T, q8on, 0, false, gwide);
         if (gemm_probe) |f| try f(d, a, l.mixer_in, min_in, T, i, 0);
         if (l.ab) |ab| try d.launch(d.k.dense_rows, .{ .x = (T + 15) / 16, .y = 2 * HV / 16 }, .{ a.h, ab, a.p, t32, @as(i32, GDN_IN), @as(i32, GDN_AB) });
         if (probe) try dumpBuf(d, "p0", a.p, T * GDN_IN, .f16);
         if (l.attn) {
             const ctx = if (mode.multi) |mm| mm.max_pos + 1 else p0 + T; // tree rows see fewer slices
-            const mt: ?*anyopaque = if (mode.multi) |mm| off(mm.mt, i * 16 * 8 * 8) else null;
+            const mt: ?*anyopaque = if (mode.multi) |mm| off(mm.mt, i * @as(usize, q.rows_max) * 8 * 8) else null;
             const ns = (ctx + SPLIT - 1) / SPLIT;
             // the shared pool's page table of the current slot; a shared round carries each row's in MT
             const pt: ?*anyopaque = if (mode.multi != null) null else mode.pt;
@@ -383,7 +407,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
                            // through attn_k1_draft into slice NS, merged as one row of partials a (row, head)
                     const wf: [1]u32 = .{0};
                     const wn: [1]u32 = .{T};
-                    const n = k1mod.rowGroups(&wf, &wn, grp_host[0..32]);
+                    const n = k1mod.rowGroups(&wf, &wn, grp_host[0 .. 2 * q.ROWS_CAP]);
                     const plan = k1mod.planTile(p0, n, AKV, k1mod.wave, k1mod.TILE);
                     const p0i: i32 = @intCast(p0);
                     const posm: i32 = @as(i32, @intCast(plan.ns)) * plan.span + plan.span - 1; // used = NS + 1
@@ -446,7 +470,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
         } else {
             const cin = l.conv[l.conv_cur].?;
             const cout = l.conv[1 - l.conv_cur].?;
-            const gmt: ?*anyopaque = if (mode.multi) |mm| off(mm.mt, i * 16 * 8 * 8) else null;
+            const gmt: ?*anyopaque = if (mode.multi) |mm| off(mm.mt, i * @as(usize, q.rows_max) * 8 * 8) else null;
             if (mode.multi == null) l.conv_cur = 1 - l.conv_cur; // multi: each slot's flips after the forward
             if (wide)
                 try d.launch(d.k.gdn_pre_rows, .{ .x = (T + 7) / 8, .y = (GDN_QKV / 128 + 15) / 16 }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32 })
@@ -498,7 +522,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
             if (probe) try dumpBuf(d, "o0", a.h, T * MIX_OUT, .f16);
         }
         try a8(d, a, a.h, MIX_OUT, T, 2);
-        try pgemm(d, m, a, a.h, l.mixer_out, a.r, T, q8out, 0, q.int4_sites & 2 != 0, wide);
+        try pgemm(d, m, a, a.h, l.mixer_out, a.r, T, q8out, 0, q.int4_sites & 2 != 0, gwide);
         if (ranks.group) |*g| { // TP: the ranks' partial out-projections summed
             if (!wide and g.devflag) { // TF_TP_DEVFLAG: the add fused into the residual add and norm below
                 try g.allReduceNorm(d, a.r, T, .{ .x = a.x, .w = l.post_norm, .h = a.h, .ahi = a.ahi, .alo = a.alo, .a8 = q8a, .sa = q8s, .ms = q8ms, .eps = EPS, .has_r = 1, .gs = gs, .rot = q.rot_on });
@@ -512,7 +536,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
         if (gemm_probe) |f| try f(d, a, l.gu, a.h, T, i, 2);
         const act = try mlpIn(d, m, a, l.gu, T, gs, q8on, wide);
         try a8(d, a, act, FF, T, 8);
-        try pgemm(d, m, a, act, l.down, a.r, T, false, if (act == a.p) q.rot_on else 0, q.int4_sites & 8 != 0, wide);
+        try pgemm(d, m, a, act, l.down, a.r, T, false, if (act == a.p) q.rot_on else 0, q.int4_sites & 8 != 0, gwide);
         if (ranks.group) |*g| try g.allReduce(d, a.r, T); // TP: the ranks' partial down projections summed
         if (gemm_probe) |f| try f(d, a, l.down, act, T, i, 3);
         if (p0 == 0 and i < 4) try dump(d, a, T, try std.fmt.allocPrint(alloc, "{d}", .{i}), true);
@@ -540,7 +564,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
     if (m.head.x3) |e| try exl3.project(e, m.exl3.?, d, off(a.h, first * D * 2), a.logits, rows, false) else try gemm(d, a.pscr, off(a.h, first * D * 2), off(a.ahi, first * (D / m.head.gs) * 2), off(a.alo, first * (D / m.head.gs) * 2), m.head, a.logits, rows);
     try d.launch(d.k.argmax_part, .{ .x = 256, .y = rows }, .{ a.logits, @as(i32, VOCAB), a.pv, a.pi });
     try d.launch(d.k.argmax, .{ .x = rows }, .{ a.pv, a.pi, a.tok });
-    var toks: [16]i32 = undefined;
+    var toks: [q.ROWS_CAP]i32 = undefined;
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &toks, a.tok, rows * 4, null, 0, null));
     try d.sync();
     if (ranks.group) |*g| try g.check(d); // TF_TP_DEVFLAG: a timed-out exchange (the peer went away) is PeerLost
