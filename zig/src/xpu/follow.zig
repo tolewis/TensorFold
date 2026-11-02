@@ -80,6 +80,14 @@ pub fn run(r: *q.Runner) !void {
             .restore_slot => if (snaps.get(id)) |s| slot_states.restoreSlot(r, rec.a, s) else error.NoSuchSnap,
             .drop_snap => if (snaps.fetchRemove(id)) |kv| slot_states.dropSnap(r, kv.value) else {},
             .ensure => slot_states.ensure(r, rec.a),
+            .mtp_absorb => if (r.mtp) |m| blk: {
+                const b = q.mtp.KeptBuf.from(data);
+                break :blk m.absorbKept(b.list());
+            } else {},
+            .mtp_draft => if (r.mtp) |m| blk: {
+                const b = q.mtp.AskBuf.from(data);
+                break :blk m.draft(b.list());
+            } else {},
             .close => return,
             .more => error.BadRecord,
         };

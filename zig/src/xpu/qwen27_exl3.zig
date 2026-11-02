@@ -45,7 +45,7 @@ pub const Cut = struct {
 pub const Spec = struct { prefix: []const u8, cut: Cut = .{} };
 
 /// A stored matrix's place in its layer's device region.
-const Mat = struct {
+pub const Mat = struct {
     k: u32,
     n: u32,
     halves: u32,
@@ -108,7 +108,7 @@ const Pack = struct {
 };
 
 /// One part of a fused projection: the matrix and its first output column.
-const Part = struct { m: Mat, col: u32 };
+pub const Part = struct { m: Mat, col: u32 };
 
 /// An EXL3 projection of the runner: its parts in one region, the fused output width, and the plans over the
 /// runner's fixed buffers (bind). `loader.Proj.x3` points here.
@@ -130,7 +130,7 @@ pub const Proj = struct {
     row_plan: ?exl3.Plan = null,
     head: bool = false,
 
-    fn groups(p: *const Proj, w: *const Weights, x: u64, y: u64, rows: u32, out: *[4]exl3.Group) []exl3.Group {
+    pub fn groups(p: *const Proj, w: *const Weights, x: u64, y: u64, rows: u32, out: *[4]exl3.Group) []exl3.Group {
         for (p.parts[0..p.count], out[0..p.count], 0..) |pt, *g, j| g.* = .{
             .m = pt.m.on(p.base),
             .rows = rows,
@@ -145,7 +145,7 @@ pub const Proj = struct {
         return out[0..p.count];
     }
 
-    fn plan(p: *const Proj, w: *const Weights, x: u64, y: u64, rows: u32) !exl3.Plan {
+    pub fn plan(p: *const Proj, w: *const Weights, x: u64, y: u64, rows: u32) !exl3.Plan {
         var gs: [4]exl3.Group = undefined;
         return exl3.Plan.init(&w.ctx, w.stream(), alloc, p.groups(w, x, y, rows, &gs));
     }
@@ -160,13 +160,13 @@ pub const Weights = struct {
     head: *Proj = undefined,
     scratch: [4]u64 = .{ 0, 0, 0, 0 },
 
-    fn stream(w: *const Weights) xpu.Stream {
+    pub fn stream(w: *const Weights) xpu.Stream {
         return .{ .ctx = &w.ctx, .list = w.list };
     }
 
     /// Uploads one projection's parts (each a stored matrix, or the rank's slice of one) into one region, side by
     /// side at the output; `width` at least the parts' columns (the consumers' stride).
-    fn add(w: *Weights, d: *Dev, c: *const Checkpoint, specs: []const Spec, width: u32) !*Proj {
+    pub fn add(w: *Weights, d: *Dev, c: *const Checkpoint, specs: []const Spec, width: u32) !*Proj {
         var pk: Pack = .{};
         defer pk.host.deinit(alloc);
         if (specs.len > 4) return error.UnexpectedShape;
@@ -267,7 +267,7 @@ fn rowsTensor(d: *Dev, c: *const Checkpoint, name: []const u8, row_bytes: usize,
 }
 
 /// A BF16 norm weight; `centred`: stored as gamma − 1 (the Hugging Face Qwen3.5 form) gets its 1 back.
-fn normTensor(d: *Dev, c: *const Checkpoint, name: []const u8, centred: bool) !*anyopaque {
+pub fn normTensor(d: *Dev, c: *const Checkpoint, name: []const u8, centred: bool) !*anyopaque {
     const t = try c.get(name);
     if (!std.mem.eql(u8, t.dtype, "BF16")) return error.UnexpectedDtype;
     if (!centred) return d.upload(t.bytes);

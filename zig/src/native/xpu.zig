@@ -83,6 +83,7 @@ const LaneServed = struct {
         if (h.back.masked_ids) |x| h.gpa.free(x);
         h.gpa.destroy(@as(*Allocator, @ptrCast(@alignCast(h.back.pick_ctx))));
         if (h.back.drafter) |d| d.deinit();
+        if (h.back.mtp) |m| m.deinit();
         h.back.runner.deinit(); // the card's memory and context, after the engine has stopped
         h.gpa.destroy(h);
     }
@@ -115,14 +116,14 @@ fn cacheBudget(o: api.Open) u64 {
 }
 
 /// Streams the loaded card holds: each one past the first a GDN state and `context` tokens of K/V; 0 when none fits.
-fn slotsThatFit(runner: *xq.Runner, want: u32, reserve: u64) !u32 {
+fn slotsThatFit(runner: *xq.Runner, want: u32, reserve: u64, per_slot: u64) !u32 {
     const margin: u64 = 2 << 30; // activations of later chunks, the drafter's growth
     const mem = try runner.d.g.memory();
     const m: admit.Memory = .{ .free = mem.free, .size = mem.size, .allocated = runner.d.allocated };
-    return admit.streamsThatFit(m, margin, reserve, runner.slotBytes(), want, xq.MAX_SLOTS);
+    return admit.streamsThatFit(m, margin, reserve, per_slot, want, xq.MAX_SLOTS);
 }
 
-fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter, o: api.Open, context: u32) !api.Opened {
+fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter, mtp: ?*xq.mtp.Mtp, o: api.Open, context: u32) !api.Opened {
     const want = @min(@max(o.lanes, 1), xq.MAX_SLOTS);
     var budget: u64 = 0;
     var slots: u32 = 0;
@@ -130,13 +131,15 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
         // the shared K/V pool: what the card leaves after the load, the drafter, every stream's GDN states and the
         // reserve; the streams are the ones its pages cover at --context tokens each
         const cache_on = if (o.prompt_cache_gib) |gib| gib > 0 else true;
-        const drafter_ctx: u64 = if (drafter != null) @intCast(Drafter.ctxBytes()) else 0; // a stream's drafter context
+        // a stream's drafter context, and the MTP head's own K/V cache when it drafts
+        const drafter_ctx: u64 = (if (drafter != null) @as(u64, @intCast(Drafter.ctxBytes())) else 0) + (if (mtp) |m| m.slotBytes() else 0);
         const pages = try xq.poolPagesShared(runner, want, cache_on, drafter_ctx);
         if (pages == 0) return error.PoolDoesNotFit;
         const by_pool: u32 = @intCast(@min(@as(u64, want), (@as(u64, pages) * xq.PAGE) / context));
         if (by_pool == 0) return error.StreamDoesNotFit;
         slots = by_pool;
         try runner.allocPool(pages);
+        if (mtp) |m| try m.measure(); // its timed step: an all-reduce, so after both ranks' pools
         // kept prompt states hold the pool's pages past the streams' contexts; their GDN copies have a reserve of their own
         const e = (context + xq.PAGE - 1) / xq.PAGE;
         const spare = pages -| slots * e;
@@ -148,7 +151,8 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
         if (slots < want) std.log.warn("qwen27-xpu: the K/V pool holds {d} tokens, so {d} stream(s) are admitted of the {d} asked for (--kv-pool-tokens names a bigger pool)", .{ runner.poolTokens(), slots, want });
     } else {
         budget = cacheBudget(o);
-        slots = try slotsThatFit(runner, want, budget);
+        // a stream past the first: its GDN state and, with the MTP head, its own K/V cache
+        slots = try slotsThatFit(runner, want, budget, runner.slotBytes() + (if (mtp) |m| m.slotBytes() else 0));
         if (slots == 0) return error.StreamDoesNotFit;
     }
     const h = try gpa.create(LaneServed);
@@ -158,10 +162,10 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
     gpa_box.* = gpa;
     h.gpa = gpa;
     h.cache = null; // gpa.create leaves the defaults unset
-    h.back = .{ .gpa = gpa, .runner = runner, .drafter = drafter, .pick = pickCtx, .pick_ctx = gpa_box, .slots = slots };
+    h.back = .{ .gpa = gpa, .runner = runner, .drafter = drafter, .mtp = mtp, .pick = pickCtx, .pick_ctx = gpa_box, .slots = slots };
     if (std.c.getenv("XPU_BLOCK")) |v| h.back.block = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 8;
     if (std.c.getenv("XPU_TREE")) |v| h.back.nodes = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 15;
-    if (drafter != null) {
+    if (drafter != null or mtp != null) {
         try h.back.measure();
         std.log.info("qwen27-xpu: window ms by rows: 1 {d:.1}, 2 {d:.1}, 4 {d:.1}, 8 {d:.1}, 16 {d:.1}", .{ h.back.costs[0].ms, h.back.costs[1].ms, h.back.costs[3].ms, h.back.costs[7].ms, h.back.costs[15].ms });
     }
@@ -172,7 +176,7 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
     errdefer h.core.deinit();
     // the engine cuts its prompts on its own grid from position 0 (prefill_step 0): the same ids give the same bits
     h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "qwen27-xpu", .lanes = slots, .context_window = context, .prefill_step = 0, .structures = true });
-    if (drafter != null) {
+    if (drafter != null or mtp != null) {
         h.back.initDrafts();
         h.host.lone = .{ .ctx = &h.back, .run = XpuLanes.lone, .resumes = true, .sampled = true };
     }
@@ -189,7 +193,7 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
     }
     errdefer if (h.cache) |*store| store.deinit();
     try h.host.start();
-    std.log.info("qwen27-xpu: {d} streams of {d} tokens{s}", .{ slots, context, if (drafter != null) ", DFlash2 trees for a lone stream" else "" });
+    std.log.info("qwen27-xpu: {d} streams of {d} tokens{s}", .{ slots, context, if (mtp != null) ", the MTP head's drafts for a lone stream" else if (drafter != null) ", DFlash2 trees for a lone stream" else "" });
     return .{ .engine = h.host.engine(), .close = LaneServed.close, .ctx = h };
 }
 
@@ -221,8 +225,15 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
         problem.* = try std.fmt.allocPrint(a, "a follower needs TF_TP_RANK above 0 (1 to {d})", .{xq.TP - 1});
         return false;
     }
+    var mtp: ?*xq.mtp.Mtp = null;
+    if (xq.mtp.on) { // the follower runs the same MTP layer: its all-reduces must meet rank 0's
+        mtp = xq.mtp.Mtp.load(runner) catch |err| {
+            problem.* = try std.fmt.allocPrint(a, "rank {d} could not load the checkpoint's MTP head: {s}", .{ xq.RANK, @errorName(err) });
+            return false;
+        };
+    }
     if (xq.kv_pool) { // the pool rank 0 sized: both ranks map the same page ids
-        const pages = xq.poolPagesShared(runner, @min(@max(o.lanes, 1), xq.MAX_SLOTS), true, 0) catch |err| {
+        const pages = xq.poolPagesShared(runner, @min(@max(o.lanes, 1), xq.MAX_SLOTS), true, if (mtp) |m| m.slotBytes() else 0) catch |err| {
             problem.* = try std.fmt.allocPrint(a, "rank {d} could not size the K/V pool: {s}", .{ xq.RANK, @errorName(err) });
             return false;
         };
@@ -231,6 +242,10 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
             return false;
         };
     }
+    if (mtp) |m| m.measure() catch |err| {
+        problem.* = try std.fmt.allocPrint(a, "rank {d} could not time the MTP head: {s}", .{ xq.RANK, @errorName(err) });
+        return false;
+    };
     std.log.info("qwen27-xpu: rank {d} of {d} holds its half of {s} and follows rank 0", .{ xq.RANK, xq.TP, o.dir });
     xq.follow.run(runner) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "rank {d} stopped: {s}", .{ xq.RANK, @errorName(err) });
@@ -257,15 +272,23 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         return null;
     };
     var dr: ?*Drafter = null;
-    if (o.drafts) if (o.drafter) |dir| {
+    var mtp: ?*xq.mtp.Mtp = null;
+    if (o.drafts and xq.mtp.on) {
+        mtp = xq.mtp.Mtp.load(runner) catch |err| {
+            runner.deinit();
+            problem.* = try std.fmt.allocPrint(a, "the XPU engine could not load the checkpoint's MTP head (XPU_MTP=1): {s}", .{@errorName(err)});
+            return null;
+        };
+    } else if (o.drafts) if (o.drafter) |dir| {
         dr = Drafter.init(runner, dir) catch |err| {
             runner.deinit();
             problem.* = try std.fmt.allocPrint(a, "the XPU engine could not load the drafter {s}: {s}", .{ dir, @errorName(err) });
             return null;
         };
     };
-    return openLanes(gpa, io, runner, dr, o, context) catch |err| {
+    return openLanes(gpa, io, runner, dr, mtp, o, context) catch |err| {
         if (dr) |x| x.deinit();
+        if (mtp) |m| m.deinit();
         runner.deinit();
         problem.* = if (err == error.StreamDoesNotFit and xq.kv_pool)
             try std.fmt.allocPrint(a, "the XPU engine cannot hold the K/V pool and {d} stream(s) of {d} tokens beside {s} on this card: set a smaller --context, fewer --parallel slots, or a smaller --kv-pool-tokens", .{ @min(@max(o.lanes, 1), xq.MAX_SLOTS), context, o.dir })

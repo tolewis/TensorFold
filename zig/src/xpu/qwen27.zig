@@ -34,6 +34,7 @@ pub const profReport = dev.profReport;
 pub const Proj = loader.Proj;
 pub const Model = loader.Model;
 pub const Acts = fwd.Acts;
+pub const mtp = @import("mtp.zig");
 pub const embedRows = fwd.embedRows;
 pub const gemm = fwd.gemm;
 pub const Want = fwd.Want;
@@ -216,6 +217,11 @@ pub const Runner = struct {
     /// Target hidden states for a drafter: when on, every forward fills acts.taps and calls `on_taps` with its rows.
     taps_on: bool = false,
     on_taps: ?struct { ctx: *anyopaque, f: *const fn (*anyopaque, *anyopaque, u32) anyerror!void } = null,
+    /// The MTP head's prompt absorb: when set, every prompt chunk keeps its rows' final normed state and calls
+    /// `on_prompt` with the chunk's tokens, its first position and the token after the chunk (the pending one).
+    on_prompt: ?struct { ctx: *anyopaque, f: *const fn (*anyopaque, []const u32, u32, u32) anyerror!void } = null,
+    /// The checkpoint's own MTP head, when XPU_MTP=1 (the follower rank runs it too: its all-reduces must meet).
+    mtp: ?*mtp.Mtp = null,
 
     /// Loads `dir` (MLX affine 4/64 or GPTQ 4/128) onto the first Arc Pro B70 (PCI id 0xe223), room for `context` rows.
     pub fn init(dir: []const u8, context: u32) !*Runner {
@@ -623,11 +629,15 @@ pub const Runner = struct {
         var at: usize = 0;
         while (at < ids.len) {
             const end = chunkEnd(at, ids.len);
-            const want = last and end == ids.len;
+            const want = (last and end == ids.len) or r.on_prompt != null;
             if (r.pos + (end - at) > r.context) return error.ContextFull;
             try r.ensurePages(r.slot, r.pos + @as(u32, @intCast(end - at)));
             if (try forward(&r.d, &r.model, &r.acts, @ptrCast(ids[at..end]), r.pos, .{ .prompt = true, .want = if (want) .last else .none, .taps = r.taps_on, .pt = r.pt[r.slot] })) |t| r.last = @intCast(t);
             if (r.taps_on) if (r.on_taps) |cb| try cb.f(cb.ctx, r.acts.taps, @intCast(end - at));
+            if (r.on_prompt) |cb| {
+                const after: u32 = if (end < ids.len) ids[end] else r.last;
+                try cb.f(cb.ctx, ids[at..end], r.pos, after);
+            }
             r.pos += @intCast(end - at);
             at = end;
         }

@@ -16,7 +16,7 @@ const usage =
     \\  --force   teacher forcing: feed these ids after the prompt, one step per id (the end token never stops)
     \\  --prefill ROWS  the prompt in windows of ROWS tokens (16 and up)
     \\  --logits  print each step's five largest logits ("step N pos P top5: id:logit ...")
-    \\  Serial decode only: MTP drafts, sampling and the CUDA engine's graph and kernel options are not available here.
+    \\  Serial decode only: drafts (the server's DFlash2 or MTP head), sampling and the CUDA engine's graph and kernel options are not available here.
     \\
 ;
 
@@ -144,7 +144,7 @@ pub fn main(init: std.process.Init) !u8 {
     var ctx = try xpu.Context.init(&driver, o.device);
     defer ctx.deinit();
     std.debug.print("device {s}, max single allocation {d:.2} GB\n", .{ ctx.name(), @as(f64, @floatFromInt(ctx.maxAlloc())) / 1e9 });
-    if (!hasNoDrafts(args)) std.debug.print("MTP drafts are not available on the Intel GPU engine: decoding serially\n", .{});
+    if (!hasNoDrafts(args)) std.debug.print("drafts are not attached on this serial path (the server drafts): decoding serially\n", .{});
     switch (fam) {
         .nemotron => {
             const e = nemotron.Engine.init(gpa, init.io, &ctx, o.model, .{ .context = o.context, .progress = true, .window_rows = o.prefill }) catch |err| {
