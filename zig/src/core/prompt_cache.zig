@@ -500,17 +500,26 @@ pub const Store = struct {
             // the conversation's own older state it extends takes its storage first, then the least recently used one
             const victim = s.victimBut(null, prompt, born) orelse return s.fail(at, error.CacheBorrowed);
             const superseded = policy.subsumed(s, prompt, born, at);
+            const vat = s.entries.items[victim].at;
+            const vbytes = s.entries.items[victim].bytes;
+            const vreason = policy.victimReason(s, victim, prompt, born);
             if (superseded) |i| {
                 if (i != victim) {
+                    const sat = s.entries.items[i].at;
+                    const sbytes = s.entries.items[i].bytes;
                     const a = @max(i, victim);
                     const b = @min(i, victim); // the higher index first: orderedRemove shifts the lower one
                     s.remove(a);
                     s.remove(b); // the superseded one leaves for its conversation, the victim for the store
+                    evicted(sat, sbytes, "superseded by the state this pass keeps");
+                    evicted(vat, vbytes, vreason);
                 } else {
                     s.remove(i);
+                    evicted(vat, vbytes, "superseded by the state this pass keeps");
                 }
             } else {
                 s.remove(victim); // its storage may come back spare and take this state
+                evicted(vat, vbytes, vreason);
             }
             s.counts.evicted += 1;
         }
@@ -621,6 +630,12 @@ pub const Store = struct {
 pub fn note(comptime fmt: []const u8, args: anytype) void {
     if (@import("builtin").is_test) return;
     std.log.warn("prompt cache: " ++ fmt, args);
+}
+
+/// One log line for a state the store evicted: where it sat, what it held, why it left.
+pub fn evicted(at: u32, bytes: u64, reason: []const u8) void {
+    if (@import("builtin").is_test) return;
+    std.log.info("prompt cache: evicted a state at {d} tokens ({d} MiB): {s}", .{ at, bytes >> 20, reason });
 }
 
 test {
