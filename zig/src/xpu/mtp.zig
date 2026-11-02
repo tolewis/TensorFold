@@ -406,6 +406,9 @@ fn fcRows(d: *Dev, c: *const dev.Checkpoint) !struct { e: *anyopaque, h: *anyopa
     const tr = try c.get("mtp.fc.trellis");
     const suh_t = try c.get("mtp.fc.suh");
     const svh_t = try c.get("mtp.fc.svh");
+    // the fc is decoded with the mul1 codebook below; another codebook would decode every state wrong
+    const mul1_t = try c.get("mtp.fc.mul1");
+    if (mul1_t.bytes.len != 4 or std.mem.readInt(i32, mul1_t.bytes[0..4], .little) == 0) return error.UnsupportedExl3Codebook;
     if (!std.mem.eql(u8, tr.dtype, "I16") or tr.rank != 3 or !std.mem.eql(u8, suh_t.dtype, "F16") or !std.mem.eql(u8, svh_t.dtype, "F16")) return error.UnexpectedShape;
     const tiles_k: usize = @intCast(tr.shape[0]);
     const tiles_n: usize = @intCast(tr.shape[1]);
