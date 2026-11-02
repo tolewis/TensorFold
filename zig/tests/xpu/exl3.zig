@@ -146,33 +146,32 @@ pub fn main(init: std.process.Init) !u8 {
         var plan = try exl3.Plan.init(&ctx, s, gpa, groups);
         defer plan.deinit();
         if (ab) {
-            // prompt rows only: exl3_gemm (live) against exl3_gemm2, same case, both timed, outputs compared
+            // prompt rows only: exl3_gemm (live) against each exl3_gemm2 tile, same case, both timed, outputs compared
             if (plan.rows <= exl3.variants.rows_max) return error.BadCase;
-            const fits = exl3.gemm2Index(&plan) != null and p.gemm2_count == exl3.variants.gemm2.bits.len;
-            std.debug.print("gemm2 path {s} ({d} images loaded; n {d}, k {d}, rows {d}, strips gcd {d}, k tiles gcd {d})\n", .{ if (fits) "applies" else "does not apply", p.gemm2_count, plan.n_max, plan.k_max, plan.rows, plan.strips.gcd, plan.k_tiles_gcd });
             const y_bytes = y_rows * y_n * y_elem;
             const base_y = try gpa.alloc(u8, y_bytes);
             defer gpa.free(base_y);
             const g2_y = try gpa.alloc(u8, y_bytes);
             defer gpa.free(g2_y);
-            const us_base = try abTime(io, &p, s, &plan, false, reps);
+            const us_base = try abTime(io, &p, s, &plan, null, reps);
             try buf.download(s, y_off, base_y);
-            const us_g2 = try abTime(io, &p, s, &plan, true, reps);
-            try buf.download(s, y_off, g2_y);
-            // max abs and relative difference of the flag path against the live kernel, on the same inputs
-            var max_abs: f32 = 0;
-            var max_ref: f32 = 0;
-            var n_diff: usize = 0;
-            const a = std.mem.bytesAsSlice(f32, base_y);
-            const b = std.mem.bytesAsSlice(f32, g2_y);
-            for (a, b) |x, z| {
-                const dlt = @abs(x - z);
-                if (dlt > max_abs) max_abs = dlt;
-                if (@abs(x) > max_ref) max_ref = @abs(x);
-                if (dlt != 0) n_diff += 1;
+            std.debug.print("gemm2 base exl3_gemm: {d:.1} us (n {d}, k {d}, rows {d})\n", .{ us_base, plan.n_max, plan.k_max, plan.rows });
+            inline for (0..exl3.variants.gemm2.tiles.len) |v| {
+                const t = exl3.variants.gemm2.tiles[v];
+                const i = exl3.gemm2Index(&plan, v) orelse {
+                    std.debug.print("gemm2 tile {d} (m {d}, s {d}, kc {d}): does not apply\n", .{ v, t.m, t.s, t.kc });
+                    continue;
+                };
+                if (i >= p.gemm2_count) {
+                    std.debug.print("gemm2 tile {d} (m {d}, s {d}, kc {d}): image did not load\n", .{ v, t.m, t.s, t.kc });
+                    continue;
+                }
+                const us_g2 = try abTime(io, &p, s, &plan, v, reps);
+                try buf.download(s, y_off, g2_y);
+                const e = diff(base_y, g2_y);
+                std.debug.print("gemm2 tile {d} (m {d}, s {d}, kc {d}): {d:.1} us, speedup {d:.2}x, max abs {e:.3}, rel {e:.2}, {d} of {d} values differ\n", .{ v, t.m, t.s, t.kc, us_g2, if (us_g2 > 0) us_base / us_g2 else 0, e.max_abs, e.max_abs / (e.max_ref + 1e-30), e.n_diff, e.n });
             }
-            std.debug.print("gemm2 ab: base {d:.1} us, gemm2 {d:.1} us, speedup {d:.2}x, max abs {e:.3}, rel {e:.2}, {d} of {d} values differ\n", .{ us_base, us_g2, if (us_g2 > 0) us_base / us_g2 else 0, max_abs, max_abs / (max_ref + 1e-30), n_diff, a.len });
-            // the output of the flag path is what the Python side reads (the last run was the flag path)
+            // the output of the last flag run is what the Python side reads
         } else {
             try exl3.encode(&p, s, &plan);
             if (reps > 0) {
@@ -210,17 +209,33 @@ fn report(io: std.Io, t0: std.Io.Timestamp, reps: usize, weight_bytes: f64) void
     std.debug.print("call {d:.1} us, weights {d:.2} MB, {d:.1} GB/s\n", .{ dt * 1e6, weight_bytes / 1e6, weight_bytes / dt / 1e9 });
 }
 
-/// Us a call of encodeRowsMode, after a warm-up of the same length. 0 when reps is 0.
-fn abTime(io: std.Io, p: *const exl3.Pipelines, s: xpu.Stream, plan: *const exl3.Plan, gemm2: bool, reps: usize) !f64 {
+/// Us a call of encodeRowsMode (null: the live kernel), after a warm-up of the same length. 0 when reps is 0.
+fn abTime(io: std.Io, p: *const exl3.Pipelines, s: xpu.Stream, plan: *const exl3.Plan, variant: ?usize, reps: usize) !f64 {
     if (reps == 0) {
-        try exl3.encodeRowsMode(p, s, plan, plan.rows, gemm2);
+        try exl3.encodeRowsMode(p, s, plan, plan.rows, variant);
         return 0;
     }
-    for (0..reps) |_| try exl3.encodeRowsMode(p, s, plan, plan.rows, gemm2);
+    for (0..reps) |_| try exl3.encodeRowsMode(p, s, plan, plan.rows, variant);
     try s.synchronize();
     const t0 = std.Io.Clock.awake.now(io);
-    for (0..reps) |_| try exl3.encodeRowsMode(p, s, plan, plan.rows, gemm2);
+    for (0..reps) |_| try exl3.encodeRowsMode(p, s, plan, plan.rows, variant);
     try s.synchronize();
     const ns = std.Io.Clock.awake.now(io).toNanoseconds() - t0.toNanoseconds();
     return @as(f64, @floatFromInt(ns)) / 1e3 / @as(f64, @floatFromInt(reps));
+}
+
+/// How far a flag output is from the live kernel's: max abs, the reference's max abs, and how many values differ.
+const Diff = struct { max_abs: f32, max_ref: f32, n_diff: usize, n: usize };
+
+fn diff(ref_bytes: []const u8, got_bytes: []const u8) Diff {
+    const a = std.mem.bytesAsSlice(f32, ref_bytes);
+    const b = std.mem.bytesAsSlice(f32, got_bytes);
+    var d: Diff = .{ .max_abs = 0, .max_ref = 0, .n_diff = 0, .n = @min(a.len, b.len) };
+    for (a, b) |x, z| {
+        const e = @abs(x - z);
+        if (e > d.max_abs) d.max_abs = e;
+        if (@abs(x) > d.max_ref) d.max_ref = @abs(x);
+        if (e != 0) d.n_diff += 1;
+    }
+    return d;
 }

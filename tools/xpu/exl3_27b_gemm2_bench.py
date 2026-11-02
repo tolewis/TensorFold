@@ -1,9 +1,10 @@
 """The prompt GEMM of exl3_gemm2 (XPU_PROMPT_GEMM2=1) against exl3_gemm on the Qwen3.8-27B dense shapes at TP 2.
-Runs tf-xpu-exl3-test in mode 3 (prompt GEMM A/B): one case, both kernels timed, the max abs and relative
-difference of the flag output against the live kernel's, and the flag output written. Cases come from the
+Runs tf-xpu-exl3-test in mode 3 (prompt GEMM A/B): one case, the live kernel and every exl3_gemm2 tile timed,
+the max abs and relative difference of each tile's output against the live kernel's, and the last tile's output
+written. Cases come from the
 checkpoint (real trellis words). One GPU job at a time.
 Usage: exl3_27b_gemm2_bench.py <EXL3 checkpoint> <tf-xpu-exl3-test> <work dir> [reps]
-Env: ROWS (896,1152), CASES (comma list), TAG (name in the printed lines).
+Env: ROWS (896,1152), CASES (comma list).
 """
 import json, os, struct, subprocess, sys, time
 import numpy as np
@@ -48,17 +49,24 @@ def run(prog, case, out, reps):
 
 
 def parse(stderr):
-    """The two lines of mode 3: the path check and the A/B result."""
-    path, ab = None, None
+    """The lines of mode 3: the live kernel's time, then one line a gemm2 tile."""
+    base, tiles = None, []
     for line in stderr.splitlines():
-        if line.startswith("gemm2 path "):
-            path = line.strip()
-        if line.startswith("gemm2 ab:"):
+        if line.startswith("gemm2 base exl3_gemm:"):
             f = line.replace(",", " ").split()
-            # gemm2 ab: base <us> us gemm2 <us> us speedup <x>x max abs <e> rel <e> <d> of <d> values differ
-            ab = {"base_us": float(f[2]), "gemm2_us": float(f[5]), "speedup": float(f[7].rstrip("x")),
-                  "max_abs": float(f[10]), "rel": float(f[12]), "diff": int(f[13]), "values": int(f[16])}
-    return path, ab
+            base = float(f[3])  # gemm2 base exl3_gemm: <us> us (n .., k .., rows ..)
+        elif line.startswith("gemm2 tile "):
+            f = line.replace(",", " ").split()
+            tile = int(f[2])
+            if "us," not in line:
+                tiles.append({"tile": tile, "m": int(f[4]), "s": int(f[6]), "kc": int(f[8].rstrip("):")), "note": " ".join(f[9:]).strip()})
+                continue
+            # gemm2 tile <v> (m <m>, s <s>, kc <kc>): <us> us, speedup <x>x, max abs <e>, rel <e>, <d> of <d> values differ
+            tiles.append({"tile": tile, "m": int(f[4]), "s": int(f[6]), "kc": int(f[8].rstrip("):")),
+                          "us": float(f[9]), "speedup": float(f[12].rstrip("x")),
+                          "max_abs": float(f[15]), "rel": float(f[17]),
+                          "diff": int(f[18]), "values": int(f[20])})
+    return base, tiles
 
 
 def main():
@@ -83,7 +91,7 @@ def main():
     rng = np.random.default_rng(27)
     results = []
     print(f"# {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} reps {reps} prog {prog}", flush=True)
-    print(f"{'case':6} {'k':>6} {'n':>6} {'rows':>5} {'base us':>10} {'gemm2 us':>10} {'x':>5} {'max abs':>10} {'rel':>10} {'MHz':>5}  note", flush=True)
+    print(f"{'case':6} {'k':>6} {'n':>6} {'rows':>5} {'tile':>4} {'m':>3} {'s':>3} {'kc':>3} {'base us':>10} {'gemm2 us':>10} {'x':>5} {'max abs':>10} {'rel':>10} {'MHz':>5}  note", flush=True)
     for name, mats in cases.items():
         for rows in rows_list:
             k = mats[0][0].shape[0] * 16
@@ -95,17 +103,22 @@ def main():
             mhz = act_freq()
             if r.returncode != 0:
                 err = (r.stderr.strip().splitlines() or ["?"])[-1][:140]
-                print(f"{name:6} {k:6} {n:6} {rows:5} {'fail':>10} {'':>10} {'':>5} {'':>10} {'':>10} {mhz:5}  {err}", flush=True)
+                print(f"{name:6} {k:6} {n:6} {rows:5} {'-':>4} {'':>3} {'':>3} {'':>3} {'fail':>10} {'':>10} {'':>5} {'':>10} {'':>10} {mhz:5}  {err}", flush=True)
                 results.append({"case": name, "k": k, "n": n, "rows": rows, "error": err})
                 continue
-            path, ab = parse(r.stderr)
-            note = path or "?"
-            if ab is None:
-                print(f"{name:6} {k:6} {n:6} {rows:5} {'?':>10} {'':>10} {'':>5} {'':>10} {'':>10} {mhz:5}  {note}", flush=True)
-                results.append({"case": name, "k": k, "n": n, "rows": rows, "note": note})
+            base, tiles = parse(r.stderr)
+            if base is None:
+                print(f"{name:6} {k:6} {n:6} {rows:5} {'-':>4} {'':>3} {'':>3} {'':>3} {'?':>10} {'':>10} {'':>5} {'':>10} {'':>10} {mhz:5}  no base line", flush=True)
+                results.append({"case": name, "k": k, "n": n, "rows": rows, "error": "no base line"})
                 continue
-            print(f"{name:6} {k:6} {n:6} {rows:5} {ab['base_us']:10.1f} {ab['gemm2_us']:10.1f} {ab['speedup']:5.2f} {ab['max_abs']:10.3e} {ab['rel']:10.2e} {mhz:5}  {note}", flush=True)
-            results.append({"case": name, "k": k, "n": n, "rows": rows, "note": note, "mhz": mhz, **ab})
+            for t in tiles:
+                note = t.get("note", "ok")
+                if "us" not in t:
+                    print(f"{name:6} {k:6} {n:6} {rows:5} {t['tile']:4} {t['m']:3} {t['s']:3} {t['kc']:3} {base:10.1f} {'-':>10} {'-':>5} {'-':>10} {'-':>10} {mhz:5}  {note}", flush=True)
+                    results.append({"case": name, "k": k, "n": n, "rows": rows, "base_us": base, "mhz": mhz, "note": note, **t})
+                    continue
+                print(f"{name:6} {k:6} {n:6} {rows:5} {t['tile']:4} {t['m']:3} {t['s']:3} {t['kc']:3} {base:10.1f} {t['us']:10.1f} {t['speedup']:5.2f} {t['max_abs']:10.3e} {t['rel']:10.2e} {mhz:5}  {note}", flush=True)
+                results.append({"case": name, "k": k, "n": n, "rows": rows, "base_us": base, "mhz": mhz, "note": note, **t})
     json.dump(results, open(os.path.join(work, "gemm2-results.json"), "w"), indent=1)
 
 

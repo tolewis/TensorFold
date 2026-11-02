@@ -171,10 +171,11 @@ pub const Pipelines = struct {
     matvec: [variants.all.len]mod.Kernel,
     moe_modules: [variants.moe.bits.len]mod.Module,
     moe: [variants.moe.bits.len]MoeKernels,
-    /// The prompt GEMM with the A tile in local memory (XPU_PROMPT_GEMM2=1), one a width. gemm2_count is how many
-    /// of the images loaded: a build whose local memory the driver refuses keeps the live kernel and logs a warning.
-    gemm2_modules: [variants.gemm2.bits.len]mod.Module,
-    gemm2: [variants.gemm2.bits.len]mod.Kernel,
+    /// The prompt GEMM with the A tile in local memory (XPU_PROMPT_GEMM2), one a tile and a width. gemm2_count is
+    /// how many of the images loaded: a build whose local memory the driver refuses keeps the live kernel and logs
+    /// a warning.
+    gemm2_modules: [variants.gemm2.count]mod.Module,
+    gemm2: [variants.gemm2.count]mod.Kernel,
     gemm2_count: usize,
 
     pub fn load(ctx: *const Context) Error!Pipelines {
@@ -225,16 +226,16 @@ pub const Pipelines = struct {
         p.gemm2_count = 0;
         for (kernels.exl3_gemm2, 0..) |image, i| {
             p.gemm2_modules[i] = mod.Module.load(ctx, image) catch |e| {
-                std.log.warn("exl3_gemm2 {d} bits did not load, XPU_PROMPT_GEMM2 falls back to exl3_gemm: {t}", .{ variants.gemm2.bits[i], e });
-                break;
+                std.log.warn("exl3_gemm2 image {d} did not load, its tile falls back to exl3_gemm: {t}", .{ i, e });
+                break; // the images of a tile follow each other: stop at the first refusal
             };
             p.gemm2[i] = p.gemm2_modules[i].kernel("exl3_gemm2", .{ 128, 1, 1 }) catch |e| {
-                std.log.warn("exl3_gemm2 {d} bits has no kernel, XPU_PROMPT_GEMM2 falls back to exl3_gemm: {t}", .{ variants.gemm2.bits[i], e });
+                std.log.warn("exl3_gemm2 image {d} has no kernel, its tile falls back to exl3_gemm: {t}", .{ i, e });
                 p.gemm2_modules[i].unload();
                 break;
             };
             p.gemm2[i].indirect() catch |e| {
-                std.log.warn("exl3_gemm2 {d} bits indirect access failed, XPU_PROMPT_GEMM2 falls back to exl3_gemm: {t}", .{ variants.gemm2.bits[i], e });
+                std.log.warn("exl3_gemm2 image {d} indirect access failed, its tile falls back to exl3_gemm: {t}", .{ i, e });
                 p.gemm2[i].deinit();
                 p.gemm2_modules[i].unload();
                 break;
@@ -530,37 +531,49 @@ pub fn encodeRows(p: *const Pipelines, s: Stream, plan: *const Plan, rows: u32) 
     return encodeRowsMode(p, s, plan, rows, promptGemm2());
 }
 
-/// Whether the prompt GEMM of exl3_gemm2 is asked for: XPU_PROMPT_GEMM2=1. Off by default, so the live path is
-/// unchanged.
-pub fn promptGemm2() bool {
-    const v = std.c.getenv("XPU_PROMPT_GEMM2") orelse return false;
+/// The tile of exl3_gemm2 the flag asks for, or null for the live kernel: XPU_PROMPT_GEMM2=1, 2 or 3 picks
+/// variants.gemm2.tiles[0], [1] or [2]. Unset (or anything else) is exl3_gemm, so the live path is unchanged.
+pub fn promptGemm2() ?usize {
+    const v = std.c.getenv("XPU_PROMPT_GEMM2") orelse return null;
     const t = std.mem.span(v);
-    return t.len > 0 and t[0] == '1';
+    if (t.len == 0) return null;
+    return switch (t[0]) {
+        '1' => 0,
+        '2' => 1,
+        '3' => 2,
+        else => null,
+    };
 }
 
-/// The image index of exl3_gemm2 for the plan's width, or null when the plan does not fit that kernel: hi plane
-/// only (GEMM_LO 0, which is what exl3_rotate_in_h stores), whole 16 * gemm2.s column blocks and whole
-/// 16 * gemm2.kc K steps.
-pub fn gemm2Index(plan: *const Plan) ?usize {
-    const g = variants.gemm2;
+/// The image index of exl3_gemm2 tile `v` for the plan's width, or null when the plan does not fit that tile: hi
+/// plane only (GEMM_LO 0, which is what exl3_rotate_in_h stores), whole 16 * s column blocks and whole 16 * kc K
+/// steps.
+pub fn gemm2Index(plan: *const Plan, comptime v: usize) ?usize {
+    const t = variants.gemm2.tiles[v];
     if (variants.moe.gemm_lo != 0) return null;
-    const i = std.mem.indexOfScalar(u32, &g.bits, plan.bits) orelse return null;
-    if (plan.strips.gcd % g.s != 0 or plan.k_tiles_gcd % g.kc != 0) return null;
-    if (plan.n_max < 16 * g.s or plan.k_max % (16 * g.kc) != 0) return null;
-    return i;
+    const i = std.mem.indexOfScalar(u32, &variants.gemm2.bits, plan.bits) orelse return null;
+    if (plan.strips.gcd % t.s != 0 or plan.k_tiles_gcd % t.kc != 0) return null;
+    if (plan.n_max < 16 * t.s or plan.k_max % (16 * t.kc) != 0) return null;
+    return variants.gemm2.index(v, i);
 }
 
-/// encodeRows with the prompt GEMM chosen by the caller: false is exl3_gemm (the live kernel), true is exl3_gemm2
-/// when the plan fits it, else exl3_gemm.
-pub fn encodeRowsMode(p: *const Pipelines, s: Stream, plan: *const Plan, rows: u32, gemm2: bool) Error!void {
+/// encodeRows with the prompt GEMM chosen by the caller: null is exl3_gemm (the live kernel), a variant index is
+/// exl3_gemm2 when the plan fits it and the image loaded, else exl3_gemm.
+pub fn encodeRowsMode(p: *const Pipelines, s: Stream, plan: *const Plan, rows: u32, variant: ?usize) Error!void {
     if (rows == 0 or rows > plan.rows or plan.rows <= variants.rows_max) return error.Invalid;
     const m = variants.moe;
     const mi = std.mem.indexOfScalar(u32, &m.bits, plan.bits) orelse return error.Invalid;
     const k = p.moe[mi];
-    const g2 = if (gemm2) blk: {
-        const i = gemm2Index(plan) orelse break :blk null;
+    const g2 = if (variant) |v| blk: {
+        const i = switch (v) {
+            0 => gemm2Index(plan, 0),
+            1 => gemm2Index(plan, 1),
+            2 => gemm2Index(plan, 2),
+            else => null,
+        } orelse break :blk null;
         break :blk if (i < p.gemm2_count) i else null;
     } else null;
+    const g2t = if (g2 != null) variants.gemm2.tiles[variant.?] else variants.gemm2.tiles[0];
     for ([_]mod.Kernel{ k.rotate_in_h, k.gemm, k.rotate_out_rows }) |kk| {
         try kk.setPtr(0, null); // base: unused with -DEXL3_ABS
         try kk.setPtr(1, plan.table.ptr);
@@ -573,8 +586,7 @@ pub fn encodeRowsMode(p: *const Pipelines, s: Stream, plan: *const Plan, rows: u
     }
     try launch(k.rotate_in_h, s, .{ plan.k_max / 128, rows, plan.count });
     if (g2) |i| {
-        const g = variants.gemm2;
-        try launch(p.gemm2[i], s, .{ plan.n_max / 16 / g.s, std.math.divCeil(u32, rows, 8 * g.m) catch unreachable, plan.count });
+        try launch(p.gemm2[i], s, .{ plan.n_max / 16 / g2t.s, std.math.divCeil(u32, rows, 8 * g2t.m) catch unreachable, plan.count });
     } else {
         try launch(k.gemm, s, .{ plan.n_max / 16 / m.gemm_s, std.math.divCeil(u32, rows, 8 * m.gemm_m) catch unreachable, plan.count });
     }
@@ -731,17 +743,26 @@ test "descriptor layout and scratch" {
 test "the prompt GEMM2 path takes only plans with whole column blocks and K steps" {
     // a 27B shard at TP 2: gate|up N 8,704 (544 strips), K 5,120 (320 k tiles), 1,152 rows
     const shard: Plan = .{ .table = undefined, .count = 2, .bits = 4, .rows = 1152, .k_max = 5120, .n_max = 8704, .strips = .{ .min = 544, .gcd = 544, .total = 1088 }, .k_tiles_gcd = 320 };
+    // lm_head, 6 bits
+    const head: Plan = .{ .table = undefined, .count = 1, .bits = 6, .rows = 1152, .k_max = 5120, .n_max = 248320, .strips = .{ .min = 15520, .gcd = 15520, .total = 15520 }, .k_tiles_gcd = 320 };
     if (variants.moe.gemm_lo == 0) {
-        try std.testing.expectEqual(@as(?usize, 0), gemm2Index(&shard));
-        // 6 bits is the second image
-        try std.testing.expectEqual(@as(?usize, 1), gemm2Index(&(Plan{ .table = undefined, .count = 1, .bits = 6, .rows = 1152, .k_max = 5120, .n_max = 248320, .strips = .{ .min = 15520, .gcd = 15520, .total = 15520 }, .k_tiles_gcd = 320 })));
+        // every tile fits the 27B shard: 24 / 8 / 2, 48 / 8 / 2 and 24 / 16 / 2 all divide 544 strips and 320 k tiles
+        try std.testing.expectEqual(@as(?usize, variants.gemm2.index(0, 0)), gemm2Index(&shard, 0));
+        try std.testing.expectEqual(@as(?usize, variants.gemm2.index(1, 0)), gemm2Index(&shard, 1));
+        try std.testing.expectEqual(@as(?usize, variants.gemm2.index(2, 0)), gemm2Index(&shard, 2));
+        // the second width is the next image of a tile
+        try std.testing.expectEqual(@as(?usize, variants.gemm2.index(0, 1)), gemm2Index(&head, 0));
+        try std.testing.expectEqual(@as(?usize, variants.gemm2.index(2, 1)), gemm2Index(&head, 2));
         // a group of 4 strips (N 64) is not a whole block of 8
-        try std.testing.expectEqual(@as(?usize, null), gemm2Index(&(Plan{ .table = undefined, .count = 1, .bits = 4, .rows = 1152, .k_max = 5120, .n_max = 64, .strips = .{ .min = 4, .gcd = 4, .total = 4 }, .k_tiles_gcd = 320 })));
+        try std.testing.expectEqual(@as(?usize, null), gemm2Index(&(Plan{ .table = undefined, .count = 1, .bits = 4, .rows = 1152, .k_max = 5120, .n_max = 64, .strips = .{ .min = 4, .gcd = 4, .total = 4 }, .k_tiles_gcd = 320 }), 0));
         // 3 bits has no image
-        try std.testing.expectEqual(@as(?usize, null), gemm2Index(&(Plan{ .table = undefined, .count = 1, .bits = 3, .rows = 1152, .k_max = 5120, .n_max = 8704, .strips = .{ .min = 544, .gcd = 544, .total = 544 }, .k_tiles_gcd = 320 })));
+        try std.testing.expectEqual(@as(?usize, null), gemm2Index(&(Plan{ .table = undefined, .count = 1, .bits = 3, .rows = 1152, .k_max = 5120, .n_max = 8704, .strips = .{ .min = 544, .gcd = 544, .total = 544 }, .k_tiles_gcd = 320 }), 0));
     }
-    // the local memory the kernel asks for: the A tile of a step, then the decoded B tiles
-    try std.testing.expectEqual(@as(usize, 20480), variants.gemm2.localBytes());
+    // the local memory the kernels ask for: the A tile of a step, then the decoded B tiles
+    try std.testing.expectEqual(@as(usize, 20480), variants.gemm2.localBytes(0));
+    try std.testing.expectEqual(@as(usize, 32768), variants.gemm2.localBytes(1));
+    try std.testing.expectEqual(@as(usize, 28672), variants.gemm2.localBytes(2));
+    try std.testing.expectEqual(@as(usize, 6), variants.gemm2.count);
 }
 
 test {
