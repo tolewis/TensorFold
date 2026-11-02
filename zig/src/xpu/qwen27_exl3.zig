@@ -218,7 +218,8 @@ pub const Weights = struct {
         try d.sync();
         // XPU_EXL3_MV3_CHECK: the mv3 correctness run, once, at open. Not run unless the variable is set.
         if (std.c.getenv("XPU_EXL3_MV3_CHECK")) |v| {
-            if (v.len > 0 and v[0] != '0') {
+            const e = std.mem.span(v);
+            if (e.len > 0 and e[0] != '0') {
                 const first: ?exl3.Matrix = blk: {
                     for (w.projs.items) |pj| for (pj.parts[0..pj.count]) |pt| {
                         if (pt.m.halves == 8) break :blk pt.m;
