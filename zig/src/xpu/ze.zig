@@ -356,6 +356,9 @@ pub const Gpu = struct {
         var kp: KernelProperties = .{};
         try check(g.api.zeKernelGetProperties(k, &kp));
         if (kp.spillMemSize != 0) std.debug.print("warning: {s} spills {d} bytes of registers\n", .{ name, kp.spillMemSize });
+        // XPU_ROWS_MAX: the many-row decode's register cost, always shown: the gate reads it here, at program build
+        if (std.mem.startsWith(u8, std.mem.span(name), "w4k1_mr"))
+            std.debug.print("kernel {s}: IGC spill {d} bytes, private {d} bytes\n", .{ name, kp.spillMemSize, kp.privateMemSize });
         return k;
     }
 

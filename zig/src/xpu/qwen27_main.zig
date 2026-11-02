@@ -56,6 +56,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.c.getenv("XPU_OVERLAP_PROBE") != null) try overlapProbe(r);
     if (std.c.getenv("XPU_ROWS_PROBE") != null) try rowsProbe(r);
     if (std.c.getenv("XPU_EXL3_PROBE") != null) try exl3Probe(r);
+    if (std.c.getenv("XPU_W4R_CHECK") != null) if (!try w4rCheck(r)) std.process.exit(1);
     if (std.c.getenv("XPU_MULTI_TEST")) |v| try multiTest(r, ids.items, try std.fmt.parseInt(u32, std.mem.span(v), 10));
     if (std.c.getenv("XPU_GEMM_ZEBIN")) |path| try gemmLoop(r, std.mem.span(path));
     if (std.c.getenv("XPU_A8_ZEBIN")) |path| try a8Loop(r, std.mem.span(path));
@@ -448,6 +449,104 @@ fn multiTest(r: *q.Runner, prompt: []const u32, n: u32) !void {
 }
 
 /// EXL3 speed probe (no weights, random trellis bits): the mul1 decode GEMV at 4, 3 and 2 bits against our int4 GEMM.
+fn off(p: *anyopaque, bytes: usize) *anyopaque {
+    return @ptrFromInt(@intFromPtr(p) + bytes);
+}
+
+/// The int4 many-row decode against the 16-row decode it replaces: one layer's gate|up (wide) and one layer's down
+/// (narrow), on hash-filled A. Four 16-row launches and one 64-row launch, two 16-row launches and one 32-row
+/// launch, compared over every element. A bar of 1e-3, and a nonzero exit on FAIL.
+fn w4rCheck(r: *q.Runner) !bool {
+    const d = &r.d;
+    const projs = [_]struct { name: []const u8, w: q.Proj }{
+        .{ .name = "gate|up", .w = r.model.layers[0].gu },
+        .{ .name = "down", .w = r.model.layers[0].down },
+    };
+    var ok = true;
+    const rows: u32 = 64;
+    for (projs) |cs| {
+        const w = cs.w;
+        const K: u32 = w.k;
+        const N: u32 = w.n;
+        const G: u32 = K / w.gs;
+        const a = try alloc.alloc(f16, rows * K);
+        defer alloc.free(a);
+        var rnd = std.Random.DefaultPrng.init(0x5eed_0001 + K);
+        for (a) |*v| v.* = @floatCast(rnd.random().float(f32) * 2 - 1);
+        // the row sums the bias term reads: the rowsums formula, hi and lo halves of s * 256
+        const hi = try alloc.alloc(f16, rows * G);
+        defer alloc.free(hi);
+        const lo = try alloc.alloc(f16, rows * G);
+        defer alloc.free(lo);
+        for (0..rows) |row| {
+            for (0..G) |g| {
+                var sum: f32 = 0;
+                for (0..w.gs) |kk| sum += @floatCast(a[row * K + g * w.gs + kk]);
+                const s = sum / @as(f32, @floatFromInt(w.gs)) * 256.0;
+                const h: f16 = @floatCast(s);
+                hi[row * G + g] = h;
+                lo[row * G + g] = @floatCast(s - @as(f32, @floatCast(h)));
+            }
+        }
+        const dA = try d.alloc_(rows * K * 2);
+        const dHi = try d.alloc_(rows * G * 2);
+        const dLo = try d.alloc_(rows * G * 2);
+        const dC = try d.alloc_(rows * N * 2);
+        const dS = try d.alloc_(rows * N * 2);
+        const dT = try d.alloc_(rows * N * 2);
+        try d.copyIn(dA, std.mem.sliceAsBytes(a));
+        try d.copyIn(dHi, std.mem.sliceAsBytes(hi));
+        try d.copyIn(dLo, std.mem.sliceAsBytes(lo));
+        const g128 = w.gs == 128;
+        const dec = if (g128) d.k.dec_wide_g128 else d.k.dec_wide;
+        const mr32 = if (g128) d.k.dec_mr32_g128 else d.k.dec_mr32;
+        const mr64 = if (g128) d.k.dec_mr64_g128 else d.k.dec_mr64;
+        const K32: i32 = @intCast(K);
+        const N32: i32 = @intCast(N);
+        const G32: i32 = @intCast(G);
+        const hc = try alloc.alloc(f16, rows * N);
+        defer alloc.free(hc);
+        const hs = try alloc.alloc(f16, rows * N);
+        defer alloc.free(hs);
+        // 64 rows in one launch, then four 16-row launches into their own rows of a second buffer
+        try d.launch(mr64, .{ .x = 1, .y = N / 64 }, .{ dA, w.w, w.s, w.bg, dC, @as(i32, 64), N32, K32, dHi, dLo, @as(i32, 64), G32 });
+        for (0..4) |rb| {
+            const r0 = rb * 16;
+            try d.launch(dec, .{ .x = 1, .y = N / 128 }, .{ off(dA, r0 * K * 2), w.w, w.s, w.bg, off(dS, r0 * N * 2), @as(i32, 16), N32, K32, off(dHi, r0 * G * 2), off(dLo, r0 * G * 2), @as(i32, 16), G32 });
+        }
+        // 32 rows in one launch, then two 16-row launches
+        try d.launch(mr32, .{ .x = 1, .y = N / 128 }, .{ dA, w.w, w.s, w.bg, dT, @as(i32, 32), N32, K32, dHi, dLo, @as(i32, 32), G32 });
+        try d.sync();
+        try d.copy(hc.ptr, dC, rows * N * 2);
+        try d.copy(hs.ptr, dS, rows * N * 2);
+        try d.sync();
+        var worst64: f32 = 0;
+        for (hc, hs) |x, y| {
+            const xf: f32 = @floatCast(x);
+            const yf: f32 = @floatCast(y);
+            worst64 = @max(worst64, @abs(xf - yf) / @max(@abs(xf + yf), 1e-2));
+        }
+        const p64 = worst64 <= 1e-3;
+        ok = ok and p64;
+        std.debug.print("w4r check: {s} rows 64 max rel err {e:.3} {s}\n", .{ cs.name, worst64, if (p64) "PASS" else "FAIL" });
+        @memset(hs, 0);
+        try d.copy(hc.ptr, dT, rows * N * 2);
+        try d.copy(hs.ptr, dS, 32 * N * 2);
+        try d.sync();
+        var worst32: f32 = 0;
+        for (hc[0 .. 32 * N], hs[0 .. 32 * N]) |x, y| {
+            const xf: f32 = @floatCast(x);
+            const yf: f32 = @floatCast(y);
+            worst32 = @max(worst32, @abs(xf - yf) / @max(@abs(xf + yf), 1e-2));
+        }
+        const p32 = worst32 <= 1e-3;
+        ok = ok and p32;
+        std.debug.print("w4r check: {s} rows 32 max rel err {e:.3} {s}\n", .{ cs.name, worst32, if (p32) "PASS" else "FAIL" });
+    }
+    std.debug.print("w4r check: {s}\n", .{if (ok) "PASS" else "FAIL"});
+    return ok;
+}
+
 fn exl3Probe(r: *q.Runner) !void {
     const d = &r.d;
     const a = &r.acts;
