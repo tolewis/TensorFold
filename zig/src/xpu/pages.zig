@@ -101,14 +101,17 @@ test "kept states give way to a stream, and a stream's own pages are never freed
     const a1 = p.take().?;
     p.retain(a0);
     p.retain(a1);
-    // stream B takes two pages, and kept states of other slots hold the rest
+    // stream B takes two pages, and a kept state of a slot whose sequence ended holds two more
     const b0 = p.take().?;
     const b1 = p.take().?;
     try std.testing.expect(b0 != b1);
     const k0 = p.take().?;
     const k1 = p.take().?;
-    p.retain(k0);
+    p.retain(k0); // the kept state's reference
     p.retain(k1);
+    p.release(k0); // its slot's reference went when that sequence ended
+    p.release(k1);
+    try std.testing.expectEqual(@as(u32, 1), p.held(k0));
     try std.testing.expectEqual(@as(u32, 2), p.spare());
     // B grows past its pages and the pool has two spare: no kept state goes
     try std.testing.expect(p.roomFor(2, 0));
@@ -129,7 +132,7 @@ test "kept states give way to a stream, and a stream's own pages are never freed
     try std.testing.expectEqual(@as(u32, 1), p.held(a0));
     try std.testing.expectEqual(@as(u32, 1), p.held(a1));
     try std.testing.expectEqual(@as(u32, 1), p.spare()); // only the second freed page: one was taken
-    try std.testing.expectEqual(@as(u32, 0), p.held(b0));
+    try std.testing.expectEqual(@as(u32, 1), p.held(b0));
 }
 
 test "a page released twice is not handed out twice at once" {
