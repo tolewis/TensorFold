@@ -97,7 +97,7 @@ __kernel void exl3_int8_quant(__global const uchar *base, __global const exl3_de
 // sums[row][n] = A8[row] @ W_q for GEMM_S strips and GEMM_WM rows of a group (exl3_rotate_in_h and
 // exl3_int8_quant before, exl3_rotate_out_rows after). The work-group decodes each pair of trellis tiles once into
 // local memory as an int8 DPAS B operand with its column scale, and its 8 sub-groups (GEMM_M rows each) all use it.
-// Grid (n / 16 / GEMM_S * 128, rows / GEMM_WM, groups), work-group 128.
+// Grid (n / 16 / GEMM_S, rows / GEMM_WM, groups), work-group 128.
 __attribute__((intel_reqd_sub_group_size(SG))) __attribute__((reqd_work_group_size(128, 1, 1)))
 __kernel void exl3_int8_gemm(__global const uchar *base, __global const exl3_desc *desc, uint rows) {
     __local int8 bs[GEMM_KC / 2][GEMM_S][SG];    // 32 int8 a lane: 8 ints
