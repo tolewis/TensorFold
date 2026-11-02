@@ -327,9 +327,11 @@ pub const Pipelines = struct {
     }
 
     pub fn deinit(p: *Pipelines) void {
-        for (0..variants.mv2.count) |i| if (p.mv2_loaded[i]) {
-            p.mv2[i].deinit();
-            p.mv2_modules[i].unload();
+        for (0..variants.mv2.count) |i| {
+            if (p.mv2_loaded[i]) {
+                p.mv2[i].deinit();
+                p.mv2_modules[i].unload();
+            }
         }
         for (&p.int8, &p.int8_modules) |*k, *m| {
             k.deinit();

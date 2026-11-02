@@ -37,7 +37,10 @@ pub const exl3_matvec: [exl3_variants.all.len][]const u8 = blk: {
 /// exl3_variants.mv2 (same order).
 pub const exl3_mv2: [exl3_variants.mv2.count][]const u8 = blk: {
     var out: [exl3_variants.mv2.count][]const u8 = undefined;
-    for (0..exl3_variants.mv2.count) |v, *image| image.* = if (available) &Blob("spv_" ++ exl3_variants.mv2.name(v)).bytes else &.{};
+    for (exl3_variants.mv2.mbits) |b| for (exl3_variants.mv2.mns) |n| for (exl3_variants.mv2.mku) |k| {
+        const v = exl3_variants.mv2.index(b, n, k);
+        out[v] = if (available) &Blob("spv_" ++ exl3_variants.mv2.name(v)).bytes else &.{};
+    }
     break :blk out;
 };
 /// The fused routed MLP, one image a width of exl3_variants.moe.bits (same order).
