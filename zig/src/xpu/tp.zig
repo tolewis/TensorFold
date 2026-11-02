@@ -45,6 +45,9 @@ const rows_max = 1024 + 128 + 16; // the widest forward (q.maxRows at XPU_CHUNK 
 const slot_bytes = rows_max * D * 2;
 const ring_len = 64;
 const peer_dead = 10.0; // seconds without an all-reduce: a silent rank is gone, the pair cannot run
+/// Seconds rank 0 waits for the follower to consume a step record before it calls the pair lost. TF_TP_RECORD_WAIT
+/// raises it (a replayed step that is legitimately slow); 180 s is the load and ring deadline the ring already had.
+var record_wait: f64 = 180.0;
 // the exported block a rank: the peer's pushed partials (2 slots), the flag words the peer writes (2), the peer's
 // consumed counters (2), a timeout word
 const blk_slots = 2 * slot_bytes;
@@ -186,6 +189,8 @@ pub const Group = struct {
         one_slot = std.c.getenv("TF_TP_ONE_SLOT") != null;
         trace = std.c.getenv("TF_TP_TRACE") != null;
         devflag = std.c.getenv("TF_TP_DEVFLAG") != null;
+        record_wait = 180.0;
+        if (std.c.getenv("TF_TP_RECORD_WAIT")) |v| record_wait = std.fmt.parseFloat(f64, std.mem.span(v)) catch 180.0;
         const name: [*:0]const u8 = if (std.c.getenv("TF_TP_SHM")) |v| v else "/dev/shm/tf-tp-qwen27";
         const size = q.TP * line + 2 * q.TP * slot_bytes + line + ring_len * @sizeOf(Rec);
         // the file as the fabric's mailbox opens its own (fabric/tp/mailbox.zig): either rank may create it
@@ -228,9 +233,12 @@ pub const Group = struct {
         var first = true;
         while (first or at < data.len) {
             const n = @min(data.len - at, rec_data);
-            const deadline = q.now() + 180.0;
+            const deadline = q.now() + record_wait;
             while (g.step >= ring_len and g.consumed().load(.acquire) + ring_len <= g.step) {
-                if (q.now() > deadline) return error.PeerLost;
+                // The follower is a whole ring behind: one of its steps has not returned. Rank 0 cannot go on and the
+                // pair cannot run, so the group closes and rank 0 exits (systemd restarts both). A plain error here
+                // left the pair up but wedged: no rank closed the segment and every later request failed.
+                if (q.now() > deadline) lostAt(g, "rank 0: record {d} ({s}) waited {d:.0} s for the follower, which is at {d}: the group is lost\n", .{ g.step, @tagName(op), record_wait, g.consumed().load(.acquire) });
                 std.atomic.spinLoopHint();
             }
             const r = g.rec(g.step);
@@ -250,10 +258,14 @@ pub const Group = struct {
 
     /// A follower takes the next step record (waits for it: rank 0 may idle between requests, so the spin sleeps).
     pub fn next(g: *Group, out: *Rec) void {
+        const closed_word = closed(g);
         const r = g.rec(g.step);
         var spins: usize = 0;
         while (@atomicLoad(u64, &r.seq, .acquire) != g.step + 1) : (spins += 1) {
             if (spins > 20_000) {
+                // the peer closed the segment (it exited): no record is coming, so this rank exits and systemd
+                // restarts the pair instead of this rank spinning until an operator stops it
+                if (spins % 100 == 0 and closed_word.load(.acquire) != 0) lostAt(g, "rank {d}: the group closed while it waited for record {d}\n", .{ g.rank, g.step });
                 var ts: std.c.timespec = .{ .sec = 0, .nsec = 20_000 };
                 _ = std.c.nanosleep(&ts, null);
             } else std.atomic.spinLoopHint();
@@ -296,12 +308,15 @@ pub const Group = struct {
     }
 
     /// A rank that lost its group closes the shared segment (its peer sees it at once) and exits non-zero so systemd
-    /// restarts the pair instead of serving broken rounds until an operator restarts them. The pair can no longer run
-    /// when one of its ranks is gone, so every rank leaves a zero exit code.
-    fn waitGroupLost(g: *Group, e: anyerror) noreturn {
+    /// restarts the pair instead of serving broken rounds until an operator restarts them.
+    fn lostAt(g: *Group, comptime fmt: []const u8, args: anytype) noreturn {
         markClosed(g);
-        std.log.err("rank {d}: all-reduce {d}: the group is lost ({s})\n", .{ g.rank, g.seq, @errorName(e) });
+        std.log.err(fmt, args);
         std.process.exit(1);
+    }
+
+    fn waitGroupLost(g: *Group, e: anyerror) noreturn {
+        lostAt(g, "rank {d}: all-reduce {d}: the group is lost ({s})\n", .{ g.rank, g.seq, @errorName(e) });
     }
 
     /// `partial` on the device holds `rows` x D fp16: on return it holds the ranks' sum. Every rank calls this the
