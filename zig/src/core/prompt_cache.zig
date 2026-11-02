@@ -364,10 +364,18 @@ pub const Store = struct {
             const vat = s.entries.items[victim].at;
             const vbytes = s.entries.items[victim].bytes;
             const vreason = policy.victimReason(s, victim, prompt, born);
-            // a mark this pass keeps supersedes the conversation's own older state: it gives its storage first
-            const superseded = for (marks_) |at| {
-                if (policy.subsumed(s, prompt, born, at)) |j| break j;
-            } else null;
+            // a mark this pass keeps supersedes the conversation's own older state: it gives its storage first;
+            // the resumed state never does, a peer restores it before it drops
+            var superseded: ?usize = null;
+            for (marks_) |at| {
+                if (policy.subsumed(s, prompt, born, at)) |j| {
+                    superseded = j;
+                    break;
+                }
+            };
+            if (superseded) |j| {
+                if (from != null and s.entries.items[j] == *from) superseded = null; // the resumed state a peer restores before it drops
+            }
             if (superseded) |j| {
                 if (j != victim) {
                     evicted(s.entries.items[j].at, s.entries.items[j].bytes, "superseded by the state this pass keeps");
