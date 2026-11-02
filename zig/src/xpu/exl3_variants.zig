@@ -148,8 +148,9 @@ test "picks follow the measured rule" {
             return all[pick(b, r, .{ .min = smin, .gcd = sgcd, .total = smin * 320 }).?];
         }
     }.v;
-    try std.testing.expectEqual(Variant{ .bits = 6, .rows = 1, .ns = 4, .hs = false }, at(6, 1, 15520, 15520));
-    try std.testing.expectEqual(Variant{ .bits = 6, .rows = 4, .ns = 4, .hs = true }, at(6, 3, 15520, 15520));
+    // lm_head: 15,520 strips, a wide group, so NS 1 at 1 to 4 rows as every wide group (the 2026-11-01 rule)
+    try std.testing.expectEqual(Variant{ .bits = 6, .rows = 1, .ns = 1, .hs = false }, at(6, 1, 15520, 15520));
+    try std.testing.expectEqual(Variant{ .bits = 6, .rows = 4, .ns = 1, .hs = false }, at(6, 3, 15520, 15520));
     // wide groups: NS 1 to 4 rows, NS 4 at 8, NS 2 at 16 (the 27B, 2026-11-01)
     try std.testing.expectEqual(Variant{ .bits = 4, .rows = 1, .ns = 1, .hs = false }, at(4, 1, 128, 128));
     try std.testing.expectEqual(Variant{ .bits = 4, .rows = 4, .ns = 1, .hs = false }, at(4, 3, 128, 128));
