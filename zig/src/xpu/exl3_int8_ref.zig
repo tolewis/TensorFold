@@ -149,7 +149,7 @@ test "the int8 prompt GEMM's error against the fp16 kernel's output (one 27B sha
         }
         sums16[r * n + c] = acc16;
         sums8[r * n + c] = acc8;
-    }
+    };
 
     const y16 = try gpa.alloc(f32, rows * n);
     defer gpa.free(y16);
