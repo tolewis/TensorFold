@@ -199,8 +199,8 @@ pub const Pipelines = struct {
         }
         // XPU_EXL3_MV3: the second rows-1 4-bit decode form. A load failure falls back to exl3_matvec.
         if (std.c.getenv("XPU_EXL3_MV3")) |v| {
-            const e = std.mem.span(v);
-            const on = e.len > 0 and e[0] != '0';
+            const ev = std.mem.span(v);
+            const on = ev.len > 0 and ev[0] != '0';
             if (on) {
                 p.mv3_module = mod.Module.load(ctx, kernels.exl3_mv3) catch |e| blk: {
                     std.log.warn("exl3: the rows 1 4-bit mv3 image did not load ({s}); the matvec stays", .{@errorName(e)});
