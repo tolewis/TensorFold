@@ -63,13 +63,13 @@ inline half mul1_half(uint s) {
 
 inline uint lane_row(uint v) { return 2 * (v / 4) + (v & 1) + 8 * ((v >> 1) & 1); }
 
-// The stream windows of exl3.cl, the same macros with the same values for 4 and 6 bits.
-#define RINGW (128 * BITS / 32)
-#define OFF0 ((RINGW * BITS) / 16 / 2)
-#define SHB ((BITS == 8) ? 24 : (BITS == 6) ? 16 : 0)
-#define SHW ((BITS == 4) ? 0 : 1)
-#define USEW (BITS == 4 ? 1 : 2)
-#define LOADW (SHW + (BITS == 4 ? 5 : 6))
+// The stream windows of exl3.cl, the same macros with the same values for 4 and 6 bits (8 BITS words a tile).
+#define RINGW (8 * BITS)
+#define OFF0 (BITS + 16)
+#define SHW ((4 * BITS) / 32)
+#define SHB ((4 * BITS) % 32)
+#define USEW ((OFF0 + 27 * BITS + 16 + 31) / 32 + 1)
+#define LOADW (USEW + SHW + 1)
 // The words one lane stages of its tile: the ring divided over the 16 lanes, the last lane the odd remainder.
 #define WL ((RINGW + SG - 1) / SG)
 
