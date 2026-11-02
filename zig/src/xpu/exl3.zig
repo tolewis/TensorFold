@@ -419,10 +419,16 @@ fn shapeOf(plan: *const Plan, rows: u32, strips_total: u32) Error!Shape {
 /// 797 to 815 us at 1 row and 1339 to 1477 us at 4 rows. On one layer's experts it saves a launch (B70, 2026-10-25).
 /// 4096 (was 65536, 2026-11-01): on the 27B's wide groups (N 5120 to 17408) every sub-group repeating the rotation
 /// cost more than the rotate_in launch it saved (gu 4 rows: 715 us fused at NS 1 against 468 us at 8 rows unfused).
+/// XPU_EXL3_FUSE=1: the 1 to 4 row launches fuse at every width (lane p29-exl3bw's bench knob): each sub-group
+/// re-rotates the 128 blocks of x in registers and the rotate_in launch drops out of the stages.
 const fuse_n_max = 4096;
 
+fn fuseAll() bool {
+    return std.c.getenv("XPU_EXL3_FUSE") != null;
+}
+
 fn fused(rows: u32, n_max: u32, k_tiles_gcd: u32, ks: u32) bool {
-    return rows <= 4 and n_max < fuse_n_max and (k_tiles_gcd / ks) % 8 == 0;
+    return rows <= 4 and (n_max < fuse_n_max or (fuseAll() and rows <= 1)) and (k_tiles_gcd / ks) % 8 == 0;
 }
 
 /// Queues the stages over a table of `count` groups (no host wait): rotate_in (unless fused), matvec, rotate_out.
