@@ -118,6 +118,7 @@ pub const Entry = struct {
     last: []u32, // the last prompt that kept or resumed it
     shared: bool = false, // kept at a shared system block's cut: other conversations resume it, so its own never supersedes it
     branched: bool = false, // resumed again after a later prompt kept a longer state extending it: never superseded
+    cut: bool = false, // an interior cold cut: it leaves before any conversation's history mark does
     expired: bool = false, // hidden from lookups immediately, reclaimed only at safe host boundaries
     borrowers: u32 = 0, // outstanding lookups: released by resumed or release, never evicted while borrowed
 };
@@ -157,6 +158,7 @@ pub const Store = struct {
     imprint: ?*imprint.Imprint = null, // --learn: shared cuts' states on disk, read back by later sessions and servers
     disk: ?*rows.Rows = null, // --learn-conversations: every kept state written behind to disk, read back where it pays
     active_rewind_at: u32 = 0, // the last lookup's rewind state (0: none); hosts keep a pass's states before the next lookup
+    active_cut_at: u32 = 0, // the last lookup's interior cold cut (0: none); the mark's keep tags it so eviction ranks it before history marks
 
     const SHARED_KEYS = 64;
 
@@ -382,6 +384,7 @@ pub const Store = struct {
         s.imprint = null;
         s.disk = null;
         s.active_rewind_at = 0;
+        s.active_cut_at = 0;
     }
 
     /// Forget a failed peer state matching the token prefix and canonical spans through at.
@@ -541,7 +544,7 @@ pub const Store = struct {
             return s.fail(at, err);
         };
         const charged = if (s.family.vtable.charged) |f| f(s.family.ptr, saved) else bytes;
-        e.* = .{ .tokens = tokens, .decode_spans = decoded, .at = at, .saved = saved, .bytes = charged, .born = born, .used = s.clock, .last = last, .shared = shared };
+        e.* = .{ .tokens = tokens, .decode_spans = decoded, .at = at, .saved = saved, .bytes = charged, .born = born, .used = s.clock, .last = last, .shared = shared, .cut = s.active_cut_at == at and at < born };
         owns_decoded = false;
         s.entries.append(s.gpa, e) catch {
             s.free(e);
@@ -605,7 +608,9 @@ pub const Store = struct {
         return false;
     }
 
-    /// The entry to free first, never `skip`: a superseded one, no branch point, oldest; else the oldest, rewind last.
+    /// The entry to free first, never `skip`: a superseded one, then a pass's own older non-history states (interior and
+    /// rewind cuts), then history marks, least recently used within each class. The order and the W5-m2b order (item 20
+    /// part K): a miss evicts another conversation's cut before it evicts its history mark.
     pub const victimBut = policy.victimBut;
     const extended = policy.extended;
 
@@ -620,7 +625,8 @@ pub const Store = struct {
         return policy.subsumed(s, prompt, born, at);
     }
 
-    /// The reason the victim `victimBut` chose left: the prompt or a kept state extends it, else least recently used.
+    /// The reason the victim `victimBut` chose left: the prompt or a kept state extends it, a cut class, else least
+    /// recently used within its class.
     pub fn victimReason(s: *const Store, i: usize, prompt: []const u32, born: u32) []const u8 {
         return policy.victimReason(s, i, prompt, born);
     }
@@ -645,6 +651,7 @@ test {
     _ = @import("prompt_cache_interior_test.zig");
     _ = @import("prompt_cache_branch_test.zig");
     _ = @import("prompt_cache_keepone_test.zig");
+    _ = @import("prompt_cache_victimorder_test.zig");
     _ = @import("prompt_cache_give_test.zig");
     _ = @import("prompt_cache_shared_test.zig");
     _ = @import("prompt_cache_lifetime_test.zig");

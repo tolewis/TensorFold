@@ -183,6 +183,9 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     // K1's slice merge (lane p39-k1cover): the exp2 merge against the one-pass softmax, no card
     const merge_step = b.step("test-k1-merge", "K1 slice merge: exp2 joins log2-base partials exactly, exp does not (no card)");
     if (target.result.cpu.arch == host.cpu.arch and target.result.os.tag == host.os.tag) merge_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = qwen27, .filters = &.{"k1 merge:"} })).step);
+    // XPU_KEEP_STATES: the keep-state count and the GDN reserve it sizes (lane p37-keepstates), no card
+    const ks_step = b.step("test-keep-states", "The XPU_KEEP_STATES keep-state count and its GDN reserve (no card)");
+    if (target.result.cpu.arch == host.cpu.arch and target.result.os.tag == host.os.tag) ks_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = qwen27, .filters = &.{"keep state count"} })).step);
     if (target.result.cpu.arch == host.cpu.arch and target.result.os.tag == host.os.tag) tests_build.dependOn(&b.addTest(.{ .root_module = qwen27 }).step);
     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
     // core (the image processor, M-RoPE layouts) for the engines' --vision as for the server: one module, one copy
