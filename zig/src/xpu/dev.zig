@@ -290,7 +290,7 @@ pub const Prof = struct {
     kernel: [4096]ze.H = @splat(null),
     used: usize = 0,
     names: [96]struct { k: ze.H = null, name: []const u8 = "" } = @splat(.{}),
-    total: [80]f64 = @splat(0),
+    total: [96]f64 = @splat(0),
 };
 
 pub fn profReport(label: []const u8) void {
