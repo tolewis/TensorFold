@@ -670,7 +670,7 @@ pub fn absorbPrompt(m: *Mtp, slot: u32, ids: []const u32, p0: u32, last_token: u
 /// cache at the kept positions, the newest row's state kept for the next window's first draft.
 pub fn absorbKept(m: *Mtp, items: []const Kept) !void {
     var total: usize = 0;
-    const cap: u32 = layout().cap;
+    const cap: u32 = @intCast(layout().cap);
     for (items) |it| {
         if (it.block.len != it.follow.len or it.block.len == 0) return error.BadKept;
         // a slot that has not run a prompt absorb has no cache yet: open it here (the pool sizing reserved its bytes)
@@ -720,7 +720,7 @@ pub fn draft(m: *Mtp, asks: []const Ask) !void {
     // the head's row buffers (hb, logits, mt, mpos, ids, the decode partials) are sized for windowRows, not for ROWS:
     // a window holds windowRows rows in all, so more streams than that is a bad request, not a card fault
     if (asks.len == 0 or asks.len > @as(usize, q.windowRows())) return error.BadDrafts;
-    const cap: u32 = layout().cap;
+    const cap: u32 = @intCast(layout().cap);
     for (asks) |a| {
         if (m.kv[a.slot] == null) return error.NoSlot;
         const d = @min(@max(a.depth, 1), most);
