@@ -90,6 +90,9 @@ pub var pool_tokens: ?u32 = null;
 /// page and the pool has none free, the least recently used kept state goes first, and a reserve of pages stays free
 /// for the streams. Off by default: kept states get only the pages past the streams' contexts, as before.
 pub var keep_shared = false;
+/// XPU_KEEP_STATES=N: the cap on kept prompt states, in place of today's 1536 MiB over the per-state cost. 0: unset.
+/// The count sits in the mode word, so a pair that disagrees fails to open with a mode mismatch.
+pub var keep_states: u32 = 0;
 
 /// Drops the least recently used kept prompt state the prompt cache may evict; false when none is left.
 pub const Evict = struct { ctx: *anyopaque, f: *const fn (ctx: *anyopaque) bool };
@@ -270,6 +273,7 @@ pub const Runner = struct {
         if (pool_tokens != null) kv_pool = true;
         if (kv_pool) kv_i8 = true;
         if (std.c.getenv("XPU_KEEP_SHARED")) |v| keep_shared = v[0] != '0';
+        if (std.c.getenv("XPU_KEEP_STATES")) |v| keep_states = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0;
         // K1 tree (XPU_K1=1 with XPU_K1_TREE=1) needs the int8 pool; print once so a run shows which path it takes
         if (k1mod.on and k1mod.tree and kv_i8) std.debug.print("K1 tree verify is on\n", .{});
         MAX_CTX = try limits.context(context);
@@ -877,8 +881,18 @@ const pass_reserve: u64 = 650_000_000;
 /// Bytes the card holds beyond what Dev.allocated counts (the runtime's own buffers).
 const held_not_counted: u64 = 400_000_000;
 /// Card bytes kept for the GDN, convolution and drafter-context copies of kept prompt states (their K/V pages come
-/// from the pool).
+/// from the pool) when XPU_KEEP_STATES is unset.
 const cache_gdn: u64 = 1536 << 20;
+/// The cap on kept prompt states: XPU_KEEP_STATES when set, else today's rule, 1536 MiB over the per-state cost.
+pub fn keepStateCount(per: u64) u32 {
+    return if (keep_states > 0) keep_states else @intCast(@max(1, cache_gdn / @max(per, 1)));
+}
+
+/// Card bytes the GDN and drafter-context copies of the kept prompt states hold: the count's worth of the per-state
+/// cost, or the fixed 1536 MiB when XPU_KEEP_STATES is unset.
+pub fn cacheGdnReserve(per: u64) u64 {
+    return if (keep_states > 0) @as(u64, keep_states) * per else cache_gdn;
+}
 /// Pages a pool is rounded down to: both ranks of a TP 2 pair size the same pool, so they map the same page ids.
 const sync_pages: u32 = 256;
 
@@ -888,7 +902,7 @@ const sync_pages: u32 = 256;
 pub fn poolPages(r: *Runner, slots: u32, tokens: ?u32, cache: bool, extra: u64) !u32 {
     if (tokens) |t| return @max(1, (t + PAGE - 1) / PAGE);
     const mem = try r.d.g.memory();
-    const keep = pass_reserve + held_not_counted + (if (cache) cache_gdn else 0);
+    const keep = pass_reserve + held_not_counted + (if (cache) cacheGdnReserve(@as(u64, gdnBytes(r)) + extra) else 0);
     const gdn: u64 = @intCast(slot_states.slotBytes(r));
     const counted = @as(u64, r.d.allocated) + (gdn + extra) * @as(u64, if (slots > 1) slots - 1 else 0);
     const left = (mem.size -| keep) -| counted;
@@ -900,7 +914,8 @@ pub fn poolPages(r: *Runner, slots: u32, tokens: ?u32, cache: bool, extra: u64) 
 }
 
 /// The run flags a pair must agree on: one bit each for kv_pool, keep_shared, kv_i8, embed_host, k1, k1_tree and
-/// k1 r16, four bits for the k1 wave (XPU_K1_WAVE, a small count), then multi_tree (XPU_MULTI_TREE).
+/// k1 r16, four bits for the k1 wave (XPU_K1_WAVE, a small count), then multi_tree (XPU_MULTI_TREE), then the kept
+/// state count (XPU_KEEP_STATES, a small count) in its own twelve bits, 0 to 4095.
 pub fn modeWord() u64 {
     var w: u64 = 0;
     w |= @as(u64, @intFromBool(kv_pool));
@@ -912,6 +927,7 @@ pub fn modeWord() u64 {
     w |= @as(u64, @intFromBool(k1mod.r16)) << 6;
     w |= (@as(u64, k1mod.wave) & 15) << 7;
     w |= @as(u64, @intFromBool(k1mod.multi_tree)) << 11;
+    w |= (@as(u64, keep_states) & 0xFFF) << 12;
     return w;
 }
 
@@ -925,6 +941,7 @@ test "mode word: each flag sits at the bit both ranks agree on" {
     const saved_mt = k1mod.multi_tree;
     const saved_r16 = k1mod.r16;
     const saved_wave = k1mod.wave;
+    const saved_ks = keep_states;
     defer {
         kv_pool = saved_pool;
         keep_shared = saved_keep;
@@ -935,6 +952,7 @@ test "mode word: each flag sits at the bit both ranks agree on" {
         k1mod.multi_tree = saved_mt;
         k1mod.r16 = saved_r16;
         k1mod.wave = saved_wave;
+        keep_states = saved_ks;
     }
     kv_pool = false;
     keep_shared = false;
@@ -959,6 +977,24 @@ test "mode word: each flag sits at the bit both ranks agree on" {
     try std.testing.expectEqual(@as(u64, 0x7F) | (@as(u64, 5) << 7) | (@as(u64, 1) << 11), modeWord());
     k1mod.multi_tree = false;
     try std.testing.expectEqual(@as(u64, 0x7F) | (@as(u64, 5) << 7), modeWord());
+    keep_states = 12;
+    try std.testing.expectEqual(@as(u64, 0x7F) | (@as(u64, 5) << 7) | (@as(u64, 12) << 12), modeWord());
+    keep_states = 0;
+}
+
+test "keep state count and GDN reserve: XPU_KEEP_STATES sizes both, the default rule holds" {
+    const saved = keep_states;
+    defer keep_states = saved;
+    const per: u64 = 187 << 20;
+    keep_states = 0;
+    try std.testing.expectEqual(@as(u32, (cache_gdn / per)), keepStateCount(per));
+    try std.testing.expectEqual(cache_gdn, cacheGdnReserve(per));
+    keep_states = 12;
+    try std.testing.expectEqual(@as(u32, 12), keepStateCount(per));
+    try std.testing.expectEqual(12 * per, cacheGdnReserve(per));
+    keep_states = 1;
+    try std.testing.expectEqual(@as(u32, 1), keepStateCount(per));
+    try std.testing.expectEqual(per, cacheGdnReserve(per));
 }
 
 /// The pool's pages for a TP 2 pair: rank 0 sizes it and publishes the count, a follower waits for it and takes the

@@ -2,6 +2,12 @@
 const std = @import("std");
 const pc = @import("prompt_cache.zig");
 
+/// The entry to free first, never `skip`, in the W5-m2b order (item 20 part K):
+/// 1. superseded states, a later pass or kept state of the same conversation extends them (least recently used);
+/// 2. interior cold cuts (least recently used);
+/// 3. history marks (least recently used within the class).
+/// The order keeps a live conversation's history mark while another conversation's interior cut is still free, so a
+/// multi-conversation working set evicts its cuts before it evicts a history mark.
 pub fn victimBut(s: *const pc.Store, skip: ?*pc.Entry, prompt: []const u32, born: u32) ?usize {
     var best: ?usize = null;
     for (s.entries.items, 0..) |e, i| {
@@ -10,11 +16,16 @@ pub fn victimBut(s: *const pc.Store, skip: ?*pc.Entry, prompt: []const u32, born
         if ((now or extended(s, e)) and (best == null or e.used < s.entries.items[best.?].used)) best = i;
     }
     if (best) |i| return i;
-    var oldest: ?usize = null;
-    for (s.entries.items, 0..) |e, i| if (e.borrowers == 0 and e != skip and (oldest == null or before(s, e, s.entries.items[oldest.?], prompt))) {
-        oldest = i;
-    };
-    return oldest;
+    for (0..2) |tier| {
+        var oldest: ?usize = null;
+        for (s.entries.items, 0..) |e, i| {
+            if (e.borrowers > 0 or e == skip) continue;
+            if (e.cut != (tier == 0)) continue; // tier 0: interior cold cuts; tier 1: history marks
+            if (oldest == null or before(s, e, s.entries.items[oldest.?], prompt)) oldest = i;
+        }
+        if (oldest) |i| return i;
+    }
+    return null;
 }
 
 /// Only live continuations make a prefix a branch point or a superseded state.

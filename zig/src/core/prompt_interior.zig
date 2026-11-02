@@ -38,6 +38,7 @@ fn same(e: *const pc.Entry, prompt: []const u32, at: u32, lookahead: u32, spans:
 /// Takes ownership of marks only on success. Endpoint, rewind, other marks and outstanding borrows have priority.
 pub fn add(s: *pc.Store, a: std.mem.Allocator, prompt: []const u32, from: u32, end: u32, user: u32, starts: []const u32, spans: []const modes.Span, marks: []const u32, endpoint: u32, endpoint_bytes: u64, restored: ?*pc.Entry) ![]const u32 {
     const at = cut(s.rules, prompt.len, from, end, user, starts, spans, marks);
+    s.active_cut_at = at; // 0 when the pass keeps no cut: a reply's end or another mark is never tagged as one
     if (at == 0 or std.mem.indexOfScalar(u32, marks, at) != null) return marks;
     var required: std.ArrayList(u32) = .empty;
     defer required.deinit(a);
@@ -68,7 +69,10 @@ pub fn add(s: *pc.Store, a: std.mem.Allocator, prompt: []const u32, from: u32, e
     // A family without trim owns its spare storage until it reuses it; conservative admission leaves it charged.
     if (s.family.vtable.trim == null) used +|= s.spare();
     const bytes = s.family.vtable.bytes(s.family.ptr, at);
-    if (used > s.budget or bytes > s.budget - used or slots >= s.most) return marks;
+    if (used > s.budget or bytes > s.budget - used or slots >= s.most) {
+        s.active_cut_at = 0; // no room for the cut: the pass keeps it not
+        return marks;
+    }
     const out = try a.alloc(u32, marks.len + 1);
     @memcpy(out[0..marks.len], marks);
     out[marks.len] = at;

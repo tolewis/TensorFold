@@ -209,12 +209,13 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
         h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = h, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, .{ .planned = true, .grid = 64 }, budget);
         if (xq.kv_pool) { // kept states' GDN and drafter-context copies stay inside the reserve the pool left for them
             const per = xq.gdnBytes(runner) + (if (drafter != null) Drafter.ctxBytes() else 0);
-            h.cache.?.most = @intCast(@max(1, (1536 << 20) / @max(per, 1)));
+            h.cache.?.most = xq.keepStateCount(per); // XPU_KEEP_STATES names the count; unset: today's 1536 MiB rule
         }
         h.host.cache = &h.cache.?;
         h.host.info_.prompt_cache = true;
         if (xq.keep_shared) runner.evict = .{ .ctx = h, .f = evictOne }; // rank 0 decides; its drops are step records
         std.log.info("qwen27-xpu: prompt cache of {d:.1} GiB", .{@as(f64, @floatFromInt(budget)) / (1 << 30)});
+        if (xq.kv_pool) std.log.info("qwen27-xpu: {d} kept prompt states at most (XPU_KEEP_STATES; unset: 1536 MiB over the per-state cost)", .{h.cache.?.most});
     }
     errdefer if (h.cache) |*store| store.deinit();
     try h.host.start();
@@ -243,7 +244,7 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
     if (o.kv_pool_tokens != null) xq.kv_pool = true;
     const runner = xq.Runner.init(o.dir, context) catch |err| {
         if (err == error.ModeMismatch) {
-            problem.* = "the XPU engine mode diverges from rank 0's (ModeMismatch): this rank's XPU_KV_POOL, XPU_KEEP_SHARED, XPU_KV_INT8, XPU_EMBED_HOST, XPU_K1, XPU_K1_TREE, XPU_K1_R16 or XPU_K1_WAVE differs, so the pair cannot run";
+            problem.* = "the XPU engine mode diverges from rank 0's (ModeMismatch): this rank's XPU_KV_POOL, XPU_KEEP_SHARED, XPU_KEEP_STATES, XPU_KV_INT8, XPU_EMBED_HOST, XPU_K1, XPU_K1_TREE, XPU_K1_R16, XPU_K1_WAVE or XPU_MULTI_TREE differs, so the pair cannot run";
         } else {
             problem.* = try std.fmt.allocPrint(a, "the XPU engine could not load {s}: {s}", .{ o.dir, @errorName(err) });
         }
@@ -255,6 +256,10 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
         return false;
     }
     if (xq.kv_pool) { // the pool rank 0 sized: both ranks map the same page ids
+        // the GDN copies of the kept prompt states this rank holds on its card: rank 0's count, agreed in the mode
+        // word (the drafter contexts stay on rank 0, so this rank's per-state cost is its GDN bytes alone)
+        const per = @as(u64, xq.gdnBytes(runner));
+        std.log.info("qwen27-xpu: rank {d} holds the GDN copies of up to {d} kept prompt states ({d} MiB of card memory, the count from rank 0's mode word)", .{ xq.RANK, xq.keepStateCount(per), xq.cacheGdnReserve(per) >> 20 });
         const pages = xq.poolPagesShared(runner, @min(@max(o.lanes, 1), xq.MAX_SLOTS), true, 0) catch |err| {
             problem.* = try std.fmt.allocPrint(a, "rank {d} could not size the K/V pool: {s}", .{ xq.RANK, @errorName(err) });
             return false;

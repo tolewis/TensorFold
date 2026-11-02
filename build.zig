@@ -54,6 +54,14 @@ fn keepOneCheck(b: *std.Build, target: std.Build.ResolvedTarget, step: *std.Buil
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = keepone })).step);
 }
 
+/// The prompt cache's W5-m2b victim order: a multi-conversation working set evicts interior cuts before history
+/// marks, and a pass's own superseded states before both.
+fn victimOrderCheck(b: *std.Build, target: std.Build.ResolvedTarget, step: *std.Build.Step) void {
+    const lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = .Debug, .link_libc = true });
+    const victorder = b.createModule(.{ .root_source_file = b.path("zig/src/core/prompt_cache_victimorder_test.zig"), .target = target, .optimize = .Debug, .link_libc = true, .imports = &.{ .{ .name = "lanes", .module = lanes } } });
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = victorder })).step);
+}
+
 /// The page pool's own tests, and its checks under engine_api's paged store and lane host (kv_pool a module of its...
 fn poolChecks(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Build.Step) void {
     const pool = b.createModule(.{ .root_source_file = b.path("zig/src/core/kv_pool.zig"), .target = target, .optimize = .Debug });
@@ -122,6 +130,9 @@ pub fn build(b: *std.Build) void {
     // the prompt cache's keep-one rule, its own step: a later turn's state takes its own older one's storage
     const keepone_step = b.step("test-prompt-cache-keepone", "the prompt cache keep-one rule: a later turn's state takes its own older one's storage");
     keepOneCheck(b, target, keepone_step);
+    // the prompt cache's W5-m2b victim order, its own step: interior cuts leave before history marks
+    const victorder_step = b.step("test-prompt-cache-victorder", "the prompt cache victim order: a working set evicts interior cuts before history marks");
+    victimOrderCheck(b, target, victorder_step);
     const cost_cases = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("zig/cost_rule_cases.zig"),
         .target = target,
