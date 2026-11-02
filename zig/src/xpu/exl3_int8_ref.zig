@@ -180,10 +180,10 @@ test "the int8 prompt GEMM's error against the fp16 kernel's output (one 27B sha
     var sq_y: f64 = 0;
     for (y16) |a| sq_y += @as(f64, a) * a;
     const rms_y: f32 = @floatCast(@sqrt(sq_y / @as(f64, @floatFromInt(rows * n))));
-    for (y16, y8, err, rel, keep) |a, b, *e, *rr, *k| {
+    for (y16, y8, err, rel, keep) |a, b, *e, *rr, *ok| {
         e.* = @abs(b - a);
         rr.* = e.* / @abs(a);
-        k.* = @abs(a) >= 0.1 * rms_y;
+        ok.* = @abs(a) >= 0.1 * rms_y;
     }
     const st = try stats(err, rel, keep, rms_y, gpa);
     std.debug.print("exl3 int8 prompt GEMM, {d} rows x {d} cols x {d} k: |y_fp16| rms {d:.3}, max abs error {e:.3} ({d:.2} % of the rms), abs p99 {d:.2} % of the rms, rel L2 {e:.3}, rel p50 {e:.3} p90 {e:.3} p99 {e:.3} max {e:.3}\n", .{ rows, n, k, rms_y, st.max_abs, 100.0 * st.max_abs / rms_y, 100.0 * st.p99_abs, st.rel_l2, st.p50, st.p90, st.p99, st.max_rel });
