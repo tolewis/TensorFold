@@ -218,8 +218,9 @@ pub const Weights = struct {
         for (&hp.last, 0..) |*pl, t| pl.* = try hp.plan(w, h + t * D * 2, hp.y, 1);
         hp.row = @intFromPtr(try d.alloc_(D * 2));
         hp.row_plan = try hp.plan(w, hp.row, hp.y, 1);
-        if (q.rows_max > WINDOW) for (0..4) |k| // the head's 16-row buckets, rows 16k of h
-            hp.h16[k] = try hp.plan(w, hp.x + @as(u64, k) * WINDOW * D * 2, hp.y + @as(u64, k) * WINDOW * hp.width * 2, WINDOW);
+        if (q.rows_max > WINDOW) { // the head's 16-row buckets, rows 16k of h
+            for (0..4) |k| hp.h16[k] = try hp.plan(w, hp.x + @as(u64, k) * WINDOW * D * 2, hp.y + @as(u64, k) * WINDOW * hp.width * 2, WINDOW);
+        }
         try d.sync();
     }
 
