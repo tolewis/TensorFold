@@ -257,7 +257,7 @@ pub const Pipelines = struct {
         }
         // The mv2 images are optional (XPU_EXL3_MV2 bench knob): a driver that refuses one logs and the knob
         // falls back to exl3_matvec.
-        for (p.mv2_loaded) |*f| f.* = false;
+        for (&p.mv2_loaded) |*f| f.* = false;
         for (kernels.exl3_mv2, 0..) |image, i| {
             p.mv2_modules[i] = mod.Module.load(ctx, image) catch |e| {
                 std.log.warn("exl3_mv2 image {d} did not load, the XPU_EXL3_MV2 knob falls back to exl3_matvec: {t}", .{ i, e });
@@ -468,7 +468,7 @@ const Mv2Sel = struct { ns: u32, ku: u32 };
 
 fn mv2Sel() ?Mv2Sel {
     const v = std.c.getenv("XPU_EXL3_MV2") orelse return null;
-    const s = std.mem.sliceTo(u8, v, 0);
+    const s = std.mem.sliceTo(v, 0);
     if (std.mem.eql(u8, s, "1")) return .{ .ns = 4, .ku = 2 };
     const at = std.mem.lastIndexOfScalar(u8, s, '_') orelse return null;
     const ns = std.fmt.parseInt(u32, s[0..at], 10) catch return null;
