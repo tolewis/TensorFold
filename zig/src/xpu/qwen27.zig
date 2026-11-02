@@ -926,7 +926,7 @@ pub fn modeWord() u64 {
     w |= @as(u64, @intFromBool(k1mod.r16)) << 6;
     w |= (@as(u64, k1mod.wave) & 15) << 7;
     w |= @as(u64, @intFromBool(k1mod.multi_tree)) << 11;
-    w |= (@as(u64, rows_max / 16) - 1) << 12; // XPU_ROWS_MAX: 0 at 16 rows, 1 at 32, 2 at 64
+    w |= @as(u64, switch (rows_max) { 16 => 0, 32 => 1, else => 2 }) << 12; // XPU_ROWS_MAX: 0 at 16 rows, 1 at 32, 2 at 64
     return w;
 }
 
