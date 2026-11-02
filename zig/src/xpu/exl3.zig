@@ -461,12 +461,13 @@ fn fused(rows: u32, n_max: u32, k_tiles_gcd: u32, ks: u32) bool {
     return rows <= 4 and (n_max < fuse_n_max or (fuseAll() and rows <= 1)) and (k_tiles_gcd / ks) % 8 == 0;
 }
 
-/// XPU_EXL3_MV2: the exl3_mv2 image the bench forces, "NS_KU" (2_1, 8_4, ...).
+/// XPU_EXL3_MV2: the exl3_mv2 image the bench forces. "1" is ns 4 ku 2, "NS_KU" sets both (2_1, 8_4, ...).
 const Mv2Sel = struct { ns: u32, ku: u32 };
 
 fn mv2Sel() ?Mv2Sel {
     const v = std.c.getenv("XPU_EXL3_MV2") orelse return null;
     const s = std.mem.sliceTo(u8, v, 0);
+    if (std.mem.eql(u8, s, "1")) return .{ .ns = 4, .ku = 2 };
     const at = std.mem.lastIndexOfScalar(u8, s, '_') orelse return null;
     const ns = std.fmt.parseInt(u32, s[0..at], 10) catch return null;
     const ku = std.fmt.parseInt(u32, s[at + 1 ..], 10) catch return null;
