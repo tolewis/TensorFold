@@ -37,16 +37,17 @@ fn isActiveRewind(s: *const pc.Store, e: *const pc.Entry, prompt: []const u32) b
 /// The state at `at` of the `born`-token `prompt` supersedes the entry: a shorter state of the same conversation it
 /// extends. A turn's next token keys the entry, so it may differ here; the states the two share are the first
 /// `e.at` tokens. A later turn's shorter state (a rewind) and a reply's end (past `born`) supersede none.
-pub fn subsumes(prompt: []const u32, born: u32, at: u32, e: *const pc.Entry) bool {
+pub fn subsumes(s: *const pc.Store, prompt: []const u32, born: u32, at: u32, e: *const pc.Entry) bool {
     if (at > born) return false;
     if (e.expired or e.borrowers > 0 or e.shared or e.branched or e.at >= at or e.born > born) return false;
+    if (isActiveRewind(s, e, prompt)) return false; // the rewind state serves a later edit; its conversation's older state may not take it
     const n = e.at;
     return n <= prompt.len and std.mem.eql(u32, e.tokens[0..n], prompt[0..n]);
 }
 
 /// The first entry the state at `at` supersedes, or null.
 pub fn subsumed(s: *const pc.Store, prompt: []const u32, born: u32, at: u32) ?usize {
-    for (s.entries.items, 0..) |e, i| if (subsumes(prompt, born, at, e)) return i;
+    for (s.entries.items, 0..) |e, i| if (subsumes(s, prompt, born, at, e)) return i;
     return null;
 }
 
