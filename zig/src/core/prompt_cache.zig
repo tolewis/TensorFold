@@ -502,11 +502,14 @@ pub const Store = struct {
             const vat = s.entries.items[victim].at;
             const vbytes = s.entries.items[victim].bytes;
             const vreason = policy.victimReason(s, victim, prompt, born);
-            if (policy.subsumed(s, prompt, born, at)) |i| if (i != victim) {
-                evicted(s.entries.items[i].at, s.entries.items[i].bytes, "superseded by the state this pass keeps");
-                s.remove(i); // the loop rechecks the budget; the least recently used one leaves only if the room is still short
-                s.counts.evicted += 1;
-                continue;
+            const superseded = policy.subsumed(s, prompt, born, at);
+            if (superseded) |i| {
+                if (i != victim) {
+                    evicted(s.entries.items[i].at, s.entries.items[i].bytes, "superseded by the state this pass keeps");
+                    s.remove(i); // the loop rechecks the budget; the least recently used one leaves only if the room is still short
+                    s.counts.evicted += 1;
+                    continue;
+                }
             }
             evicted(vat, vbytes, vreason); // the state may be superseded and the victim at once; the reason names it
             s.remove(victim); // its storage may come back spare and take this state
