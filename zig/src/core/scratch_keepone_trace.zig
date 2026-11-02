@@ -30,3 +30,26 @@ test "trace keepone scenario" {
     dump("after turn 2 keep", &s);
     std.debug.print("evicted={d} refused={d} failed={d}\n", .{ s.counts.evicted, s.counts.refused, s.counts.failed });
 }
+
+test "trace 136 scenario" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f: Fake = .{ .gpa = gpa };
+    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 330);
+    defer s.deinit();
+    const other = [_]u32{ 5, 5, 5, 5 };
+    _ = f.pass(&s, &other, try s.begin(a, &other, 3, &.{}, &.{}, null, &.{}));
+    dump("136 after O", &s);
+    const t1 = [_]u32{ 1, 2, 3, 4, 5, 6 };
+    _ = f.pass(&s, &t1, try s.begin(a, &t1, 4, &.{}, &.{}, null, &.{}));
+    dump("136 after T1", &s);
+    const t2 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    _ = f.pass(&s, &t2, try s.begin(a, &t2, 6, &.{}, &.{}, null, &.{}));
+    dump("136 after T2", &s);
+    const t3 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    _ = f.pass(&s, &t3, try s.begin(a, &t3, 8, &.{}, &.{}, null, &.{}));
+    dump("136 after T3", &s);
+    std.debug.print("136 evicted={d} refused={d}\n", .{ s.counts.evicted, s.counts.refused });
+}
