@@ -4,7 +4,6 @@ const std = @import("std");
 const exlr8_build = @import("exlr8.zig");
 const sage_config = @import("../src/families/qwen3_5/sage_config.zig");
 const exl3_variants = @import("../src/xpu/exl3_variants.zig");
-comptime { @setEvalBranchQuota(1_000_000); }
 
 /// ze.zig as its own module: the Qwen27 runner and the Nemotron runtime share one Level Zero table.
 fn zeModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
@@ -186,8 +185,11 @@ const Kernel = struct { name: []const u8, src: ?[]const u8 = null, options: []co
 const cl3 = "-cl-std=CL3.0";
 
 /// An explicit list: other files in the folder never join the build. The SPIR-V is device independent.
-const kernels = [_]Kernel{
-    .{ .name = "attn", .options = cl3 },
+/// A function with the eval branch quota raised: the comptime prints of the variant names pass the 73000 default.
+fn allKernels() [_]Kernel {
+    @setEvalBranchQuota(1_000_000);
+    return [_]Kernel{
+        .{ .name = "attn", .options = cl3 },
     .{ .name = "basic", .options = cl3 },
     .{ .name = "moe", .options = cl3 },
     .{ .name = "mamba" },
@@ -203,7 +205,10 @@ const kernels = [_]Kernel{
     .{ .name = "nem_attn_dec", .options = cl3 },
     .{ .name = "sage_exl3", .options = cl3 },
     .{ .name = "exl3", .options = cl3 ++ " -DEXL3_ABS" },
-} ++ exl3Matvec() ++ exl3Mv2() ++ exl3Moe() ++ exl3Int8() ++ exl3Gemm2();
+    } ++ exl3Matvec() ++ exl3Mv2() ++ exl3Moe() ++ exl3Int8() ++ exl3Gemm2();
+}
+
+const kernels = allKernels();
 
 /// The prompt GEMM with the A tile in local memory (exl3_gemm2.cl): one image a tile and a width of
 /// exl3_variants.gemm2.
