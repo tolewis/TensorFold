@@ -358,14 +358,11 @@ pub const Group = struct {
     }
 
     /// The mode word (offset 24 of rank 0's cache line, next to the pool word at 16): rank 0's run flags
-    /// (kv_pool, keep_shared, kv_i8, embed_host, k1, k1_tree). Rank 0 stores it at open before the generation;
-    /// a follower reads it right after open and exits on a mismatch before it allocates (item 18 keep-one:
+    /// (kv_pool, keep_shared, kv_i8, embed_host, k1, k1_tree, r16, wave). Rank 0 stores it at open before the
+    /// generation; a follower reads it right after open and exits on a mismatch before it allocates (item 18 keep-one:
     /// a rank 1 with no pool kept every state whole on its card).
     fn modeWord(g: *const Group) *std.atomic.Value(u64) {
         return @ptrCast(@alignCast(g.map.ptr + hdr + 24));
-    }
-    pub fn setMode(g: *Group) void {
-        if (g.rank == 0) g.modeWord().store(q.modeWord(), .seq_cst);
     }
     pub fn readMode(g: *const Group) u64 {
         return g.modeWord().load(.seq_cst);

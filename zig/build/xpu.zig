@@ -160,6 +160,9 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     if (target.result.cpu.arch == host.cpu.arch and target.result.os.tag == host.os.tag) tests_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = qwen27 })).step);
     // the same tests compiled and not run: no card is opened, so a lane can check a test without a window
     const tests_build = b.step("xpu-qwen27-tests-build", "Compile the 27B XPU tests, do not run them (no card)");
+    // the rank mode word's bit layout: a pure host test, run by name only, so no runner opens and no card is touched
+    const mode_step = b.step("test-mode-word", "The TP 2 rank mode word's bit layout (no card)");
+    if (target.result.cpu.arch == host.cpu.arch and target.result.os.tag == host.os.tag) mode_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = qwen27, .filters = &.{"mode word:"} })).step);
     if (target.result.cpu.arch == host.cpu.arch and target.result.os.tag == host.os.tag) tests_build.dependOn(&b.addTest(.{ .root_module = qwen27 }).step);
     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
     // core (the image processor, M-RoPE layouts) for the engines' --vision as for the server: one module, one copy

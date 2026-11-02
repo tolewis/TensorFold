@@ -318,10 +318,9 @@ pub const Runner = struct {
         r.* = .{ .d = .{ .g = try ze.Gpu.open(0xe223), .list = undefined, .k = undefined }, .model = undefined, .acts = undefined, .context = context, .ckpt = ckpt, .keep_shared = keep_shared };
         tp.group = try tp.Group.open(&r.d); // null at TP 1
         if (tp.group) |*g| {
-            if (g.rank == 0) {
-                g.setMode(); // rank 0 publishes its flags: the follower compares them before it allocates
-            } else if (g.readMode() != modeWord()) {
-                std.log.err("rank {d}: the mode word does not match rank 0's: this rank's XPU_KV_POOL, XPU_KEEP_SHARED, XPU_KV_INT8, XPU_EMBED_HOST, XPU_K1 or XPU_K1_TREE diverges, and the pair sizes its cards differently\n", .{ RANK });
+            if (g.rank != 0 and g.readMode() != modeWord()) {
+                std.log.err("rank {d}: the mode word does not match rank 0's: this rank's XPU_KV_POOL, XPU_KEEP_SHARED, XPU_KV_INT8, XPU_EMBED_HOST, XPU_K1, XPU_K1_TREE, XPU_K1_R16 or XPU_K1_WAVE diverges, and the pair sizes its cards differently\n", .{ RANK });
+                g.markClosed(); // rank 0 sees the closed segment at its first all-reduce and exits at once
                 return error.ModeMismatch;
             }
         }
@@ -897,9 +896,8 @@ pub fn poolPages(r: *Runner, slots: u32, tokens: ?u32, cache: bool, extra: u64) 
     return @intCast(pages - pages % sync_pages);
 }
 
-/// The pool's pages for a TP 2 pair: rank 0 sizes it and publishes the count, a follower waits for it and takes the
-/// same, so both ranks map the same page ids.
-/// The run flags a pair must agree on, one bit each: kv_pool, keep_shared, kv_i8, embed_host, k1, k1_tree.
+/// The run flags a pair must agree on: one bit each for kv_pool, keep_shared, kv_i8, embed_host, k1, k1_tree and
+/// k1 r16, then four bits for the k1 wave (XPU_K1_WAVE, a small count).
 pub fn modeWord() u64 {
     var w: u64 = 0;
     w |= @as(u64, @intFromBool(kv_pool));
@@ -908,8 +906,45 @@ pub fn modeWord() u64 {
     w |= @as(u64, @intFromBool(embed_host)) << 3;
     w |= @as(u64, @intFromBool(k1mod.on)) << 4;
     w |= @as(u64, @intFromBool(k1mod.tree)) << 5;
+    w |= @as(u64, @intFromBool(k1mod.r16)) << 6;
+    w |= (@as(u64, k1mod.wave) & 15) << 7;
     return w;
 }
+
+test "mode word: each flag sits at the bit both ranks agree on" {
+    const saved = .{ kv_pool, keep_shared, kv_i8, embed_host, k1mod.on, k1mod.tree, k1mod.r16, k1mod.wave };
+    defer {
+        kv_pool = saved.0;
+        keep_shared = saved.1;
+        kv_i8 = saved.2;
+        embed_host = saved.3;
+        k1mod.on = saved.4;
+        k1mod.tree = saved.5;
+        k1mod.r16 = saved.6;
+        k1mod.wave = saved.7;
+    };
+    kv_pool = false;
+    keep_shared = false;
+    kv_i8 = false;
+    embed_host = false;
+    k1mod.on = false;
+    k1mod.tree = false;
+    k1mod.r16 = true;
+    k1mod.wave = 4;
+    try std.testing.expectEqual(@as(u64, 1) << 6 | @as(u64, 4) << 7, modeWord());
+    kv_pool = true;
+    keep_shared = true;
+    kv_i8 = true;
+    embed_host = true;
+    k1mod.on = true;
+    k1mod.tree = true;
+    try std.testing.expectEqual(@as(u64, 0x7F) | (@as(u64, 4) << 7), modeWord());
+    k1mod.wave = 5;
+    try std.testing.expectEqual(@as(u64, 0x7F) | (@as(u64, 5) << 7), modeWord());
+}
+
+/// The pool's pages for a TP 2 pair: rank 0 sizes it and publishes the count, a follower waits for it and takes the
+/// same, so both ranks map the same page ids.
 pub fn poolPagesShared(r: *Runner, slots: u32, cache: bool, extra: u64) !u32 {
     const g = if (tp.group) |*x| x else return poolPages(r, slots, pool_tokens, cache, extra);
     if (g.rank == 0) {
