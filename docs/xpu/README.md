@@ -10,7 +10,7 @@ Battlemage G31, 32 GB) directly through **Level Zero**, with no PyTorch, no SYCL
 |---|---|
 | Model | Qwen3.8-27B (`model_type` `qwen3_5`: 48 GDN layers + 16 attention layers) |
 | Formats | MLX affine 4-bit, group size 64 (`mlx-q4g64`); GPTQ symmetric 4-bit, group size 128 (`gptq-int4-g128`) |
-| Measured checkpoints | GPTQ: [`SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16`](https://huggingface.co/SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16) (revision `9d189a60`), with its tokenizer as published; full recipe: [RECIPE-qwen38-27b-b70.md](RECIPE-qwen38-27b-b70.md) |
+| Measured checkpoints | GPTQ: [`SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16`](https://huggingface.co/SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16) (revision `9d189a60`), with its tokenizer as published; full recipe: [RECIPE-qwen38-27b-b70.md](RECIPE-qwen38-27b-b70.md); one-card workstation (MLX 4/64, 2 streams, idle unload): [RECIPE-qwen38-27b-b70-workstation.md](RECIPE-qwen38-27b-b70-workstation.md) |
 | Drafts | DFlash2 (`--drafter`), best-first tree of 15 nodes, greedy and sampled |
 | Serving | several streams (`--parallel N`, 8 by default, the engine's "lanes" host): shared rounds, a lone stream runs as a DFlash2 tree (also with `--parallel 1`) |
 
