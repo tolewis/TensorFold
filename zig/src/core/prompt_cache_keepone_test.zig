@@ -10,7 +10,7 @@ const Fake = @import("prompt_cache_fake.zig").Fake;
 
 /// The index of the entry that `prefix` names, or null.
 fn at(s: *const Store, prefix: []const u32) ?usize {
-    for (s.entries.items, 0..) |e, i| if (e.tokens.len >= prefix.len and std.mem.eql(u32, e.tokens[0 .. prefix.len], prefix)) return i;
+    for (s.entries.items, 0..) |e, i| if (e.at == prefix.len and std.mem.eql(u32, e.tokens[0 .. prefix.len], prefix)) return i;
     return null;
 }
 
