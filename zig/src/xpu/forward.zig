@@ -212,8 +212,7 @@ pub fn gemmRows(d: *Dev, pscr: *anyopaque, h: *anyopaque, ahi: *anyopaque, alo: 
     // XPU_ROWS_MAX above 16: the int4 many-row decode serves 17 rows up to the cap, one weight read a work-group
     // for 2 or 4 row blocks of 16 rows (zig/kernels/xpu/qwen27/gemm.cl w4k1_mr32/mr64). Up to 16 rows and above
     // the cap the path is today's.
-    const many = m > w4rows.window and q.rows_max > w4rows.window and m <= q.rows_max and w.n % 64 == 0 and
-        (m > 32 or w.n % w4rows.columns32 == 0);
+    const many = w4rows.takes(m, w.n, q.rows_max);
     if (many) {
         const pl = w4rows.plan(m, w.n, q.rows_max);
         const kern = switch (pl.kernel) {

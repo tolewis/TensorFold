@@ -45,6 +45,12 @@ pub fn plan(m: u32, n: u32, rows_max: u32) Plan {
     return .{ .kernel = .prompt, .rb = 0, .sg_n = 0, .grid = .{ 0, 0, 0 } };
 }
 
+/// Whether `gemmRows` sends `m` rows of an `n`-column GEMM to the many-row decode (any caller: the target's verify
+/// and the drafter's batched pass alike, `wide` does not matter).
+pub fn takes(m: u32, n: u32, rows_max: u32) bool {
+    return m > window and rows_max > window and m <= rows_max and n % 64 == 0 and (m > 32 or n % columns32 == 0);
+}
+
 /// Rows a launch of the decode path covers: the row blocks x 16.
 pub fn coveredRows(p: Plan) u32 {
     return if (p.rb == 0) 0 else p.rb * window;
@@ -205,4 +211,17 @@ test "w4rows tiling: a missing row block or column tile is caught" {
     // the full walk writes every row
     tiledMatvec(a, q, s, b, y, writes, m, n, k, 64, 128, 2);
     for (writes) |w| try std.testing.expectEqual(@as(u32, 1), w);
+}
+
+test "w4rows: the drafter's 48-row batched GEMMs take the many-row route at XPU_ROWS_MAX 64, not at 16 or 32" {
+    // 6 streams x 8 rows; every drafter projection is padded to 256 columns (Drafter.pack): qkv, o, gate|up, down, fc,
+    // the selector (256) and the head (98 592 padded to 98 816)
+    const ns = [_]u32{ 256, 1280, 4096, 5120, 6144, 34816, 98816 };
+    for (ns) |n| {
+        try std.testing.expect(takes(48, n, 64));
+        try std.testing.expect(!takes(48, n, 16));
+        try std.testing.expect(!takes(48, n, 32));
+        try std.testing.expect(!takes(65, n, 64));
+        try std.testing.expect(!takes(16, n, 64)); // 16 rows keep today's decode
+    }
 }
