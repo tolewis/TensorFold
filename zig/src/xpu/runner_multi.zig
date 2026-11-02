@@ -25,6 +25,11 @@ pub const Win = struct { slot: u32, ids: []const u32, parents: ?[]const i32 = nu
 
 /// Every window in one forward (16 rows at most): each row's greedy token in `block`; nothing moves until `keepMulti`.
 pub fn verifyMulti(r: *Runner, wins: []const Win) !void {
+    // every window's pages first (rank 0: the kept states it drops are step records before this call)
+    for (wins) |w| if (w.ids.len > 0 and w.slot < q.MAX_SLOTS) {
+        const p = r.seqs[w.slot].pos;
+        if (@as(u64, p) + w.ids.len <= r.context) try r.makeRoom(w.slot, p + @as(u32, @intCast(w.ids.len)));
+    };
     if (tp.group) |*g| { // a window: slot, rows, has parents, the ids, the parents
         var words: [16 * 35]u32 = undefined;
         var at: usize = 0;

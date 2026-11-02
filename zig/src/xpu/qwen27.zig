@@ -86,6 +86,13 @@ pub const PAGE: u32 = 64;
 pub var kv_pool = false;
 /// --kv-pool-tokens: the pool's size in tokens; null: what the card leaves after the load and the reserve.
 pub var pool_tokens: ?u32 = null;
+/// XPU_KEEP_SHARED=1 (lane p29-poolkeep): kept prompt states may hold any free pool page. When a live stream needs a
+/// page and the pool has none free, the least recently used kept state goes first, and a reserve of pages stays free
+/// for the streams. Off by default: kept states get only the pages past the streams' contexts, as before.
+pub var keep_shared = false;
+
+/// Drops the least recently used kept prompt state the prompt cache may evict; false when none is left.
+pub const Evict = struct { ctx: *anyopaque, f: *const fn (ctx: *anyopaque) bool };
 
 // Layout of a GDN layer's stash (bytes): q, k, v, g, β, then the qkv rows of P.
 pub const ST_Q = 0;
@@ -146,13 +153,14 @@ const Options = struct {
     chunk: u32,
     kv_pool: bool,
     pool_tokens: ?u32,
+    keep_shared: bool,
 };
 var defaults: ?Options = null;
 /// One runner at a time: the options, MAX_CTX and GS above belong to the process, not to a runner.
 var live = false;
 
 fn options() Options {
-    return .{ .dump_dir = dump_dir, .dump_h = dump_h, .a8_group = a8_group, .kv8 = kv8, .kv_i8 = kv_i8, .prefill_int4 = prefill_int4, .int4_sites = int4_sites, .prefill_int8 = prefill_int8, .a8_sites = a8_sites, .a8_rot = a8_rot, .a8_levels = a8_levels, .a8_sites4 = a8_sites4, .embed_host = embed_host, .chunk = CHUNK, .kv_pool = kv_pool, .pool_tokens = pool_tokens };
+    return .{ .dump_dir = dump_dir, .dump_h = dump_h, .a8_group = a8_group, .kv8 = kv8, .kv_i8 = kv_i8, .prefill_int4 = prefill_int4, .int4_sites = int4_sites, .prefill_int8 = prefill_int8, .a8_sites = a8_sites, .a8_rot = a8_rot, .a8_levels = a8_levels, .a8_sites4 = a8_sites4, .embed_host = embed_host, .chunk = CHUNK, .kv_pool = kv_pool, .pool_tokens = pool_tokens, .keep_shared = keep_shared };
 }
 
 fn restore(o: Options) void {
@@ -172,6 +180,7 @@ fn restore(o: Options) void {
     CHUNK = o.chunk;
     kv_pool = o.kv_pool;
     pool_tokens = o.pool_tokens;
+    keep_shared = o.keep_shared;
 }
 
 extern "c" fn clock_gettime(clk: c_int, ts: *[2]i64) c_int;
@@ -213,6 +222,12 @@ pub const Runner = struct {
     pt_host: [MAX_SLOTS][]u32 = @splat(&.{}), // and on the host, where the runner maps and keeps it
     held: [MAX_SLOTS]u32 = @splat(0), // entries of each slot's table that map a page
     pages: pages_mod.Pages = .{ .gpa = alloc, .count = 0, .refs = &.{} }, // the pool's references and free pages
+    /// XPU_KEEP_SHARED: kept prompt states hold pool pages beside the live streams.
+    keep_shared: bool = false,
+    /// Pages the pool keeps free for the streams' next calls: a page a slot for its next row, a chunk's pages a slot.
+    reserve: u32 = 0,
+    /// The kept states' eviction when a stream needs pages the pool does not have free (null: a follower, or no cache).
+    evict: ?Evict = null,
     /// Target hidden states for a drafter: when on, every forward fills acts.taps and calls `on_taps` with its rows.
     taps_on: bool = false,
     on_taps: ?struct { ctx: *anyopaque, f: *const fn (*anyopaque, *anyopaque, u32) anyerror!void } = null,
@@ -246,6 +261,7 @@ pub const Runner = struct {
         if (std.c.getenv("XPU_KV_POOL_TOKENS")) |v| pool_tokens = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (pool_tokens != null) kv_pool = true;
         if (kv_pool) kv_i8 = true;
+        if (std.c.getenv("XPU_KEEP_SHARED")) |v| keep_shared = v[0] != '0';
         MAX_CTX = try limits.context(context);
         {
             const marker = try std.fmt.allocPrintSentinel(alloc, "{s}/hadamard128", .{dir}, 0);
@@ -291,7 +307,7 @@ pub const Runner = struct {
         }
         const r = try alloc.create(Runner);
         errdefer alloc.destroy(r);
-        r.* = .{ .d = .{ .g = try ze.Gpu.open(0xe223), .list = undefined, .k = undefined }, .model = undefined, .acts = undefined, .context = context, .ckpt = ckpt };
+        r.* = .{ .d = .{ .g = try ze.Gpu.open(0xe223), .list = undefined, .k = undefined }, .model = undefined, .acts = undefined, .context = context, .ckpt = ckpt, .keep_shared = keep_shared };
         tp.group = try tp.Group.open(&r.d); // null at TP 1
         const d = &r.d;
         errdefer d.g.close();
@@ -591,6 +607,22 @@ pub const Runner = struct {
         if (full) return error.ContextFull;
     }
 
+    /// Pages a call on `slot` takes up to `upTo` positions, made free before the call. With XPU_KEEP_SHARED the least
+    /// recently used kept states go until the pool has them and keeps `reserve` free for the streams. Rank 0 only: the
+    /// drops it makes are step records the follower replays before this call, so both ranks free the same pages.
+    pub fn makeRoom(r: *Runner, slot: u32, upTo: u32) !void {
+        if (r.pool == 0 or !r.keep_shared) return;
+        const e = r.evict orelse return; // a follower: its drops arrive as records, in order before the call
+        if (slot >= MAX_SLOTS or r.pt[slot] == null or upTo > r.context) return;
+        const need = (upTo + PAGE - 1) / PAGE;
+        const from = r.held[slot];
+        if (need <= from) return;
+        const want = need - from;
+        while (!pages_mod.roomFor(&r.pages, want, r.reserve)) {
+            if (!e.f(e.ctx)) break; // no kept state left: the pass takes what the pool has
+        }
+    }
+
     /// Drops `slot`'s hold on its pages: a fresh sequence, or a restore that maps a kept state's pages.
     pub fn releaseSlot(r: *Runner, slot: u32) void {
         if (r.pool == 0 or slot >= MAX_SLOTS or r.pt[slot] == null) return;
@@ -619,6 +651,10 @@ pub const Runner = struct {
 
     /// Feeds prompt tokens in chunks; `last`: the final chunk, whose last row's logits are kept.
     pub fn prompt(r: *Runner, ids: []const u32, last: bool) !void {
+        // a resumed pass needs the pages of the whole request before it starts: rank 0 makes room first, so the
+        // drops it makes are step records the follower replays before this call
+        const end: u64 = @as(u64, r.pos) + ids.len;
+        if (end <= r.context) try r.makeRoom(r.slot, @intCast(end));
         if (tp.group) |*g| try g.record(.prompt, @intFromBool(last), 0, 0, ids);
         var at: usize = 0;
         while (at < ids.len) {
@@ -635,6 +671,7 @@ pub const Runner = struct {
 
     /// One decoded token in; the next one's logits kept.
     pub fn step(r: *Runner, token: u32) !void {
+        try r.makeRoom(r.slot, r.pos + 1);
         if (tp.group) |*g| try g.record(.step, token, 0, 0, &.{});
         if (r.pos + 1 > r.context) return error.ContextFull;
         try r.ensurePages(r.slot, r.pos + 1);
@@ -646,6 +683,7 @@ pub const Runner = struct {
 
     /// Verifies a block: `ids` (≤ 16 rows) run from `pos`, each row's greedy token returned; state moves till `commit`.
     pub fn verify(r: *Runner, ids: []const u32) ![]const u32 {
+        if (ids.len > 0 and @as(u64, r.pos) + ids.len <= r.context) try r.makeRoom(r.slot, r.pos + @as(u32, @intCast(ids.len)));
         if (tp.group) |*g| try g.record(.verify, 0, 0, 0, ids);
         if (ids.len == 0 or ids.len > 16) return error.BadBlock;
         if (r.pos + ids.len > r.context) return error.ContextFull;
@@ -681,6 +719,8 @@ pub const Runner = struct {
 
     /// Verifies a tree: row 0 is the pending token, `parents[t]` the row below row t; returns each row's greedy token.
     pub fn verifyTree(r: *Runner, ids: []const u32, parents: []const i32) ![]const u32 {
+        // a tree's deepest row is at most ids.len - 1 below pos: ids.len pages cover it
+        if (ids.len > 0 and @as(u64, r.pos) + ids.len <= r.context) try r.makeRoom(r.slot, r.pos + @as(u32, @intCast(ids.len)));
         if (tp.group) |*g| { // ids then parents, each ids.len words
             var both: [32]u32 = undefined;
             const n: usize = @min(ids.len, 16); // usize: @min with 16 narrows to u5, and 2 * n would wrap to 0
