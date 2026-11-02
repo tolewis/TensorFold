@@ -929,7 +929,7 @@ test "mode word: each flag sits at the bit both ranks agree on" {
         k1mod.tree = saved_tree;
         k1mod.r16 = saved_r16;
         k1mod.wave = saved_wave;
-    };
+    }
     kv_pool = false;
     keep_shared = false;
     kv_i8 = false;
