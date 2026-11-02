@@ -366,7 +366,7 @@ pub const Group = struct {
     pub fn setMode(g: *Group) void {
         if (g.rank == 0) g.modeWord().store(q.modeWord(), .seq_cst);
     }
-    pub fn mode(g: *const Group) u64 {
+    pub fn readMode(g: *const Group) u64 {
         return g.modeWord().load(.seq_cst);
     }
     /// The pages rank 0 published; null after `seconds` (rank 0 zeroes the pool before the first request).

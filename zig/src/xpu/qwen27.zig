@@ -320,7 +320,7 @@ pub const Runner = struct {
         if (tp.group) |*g| {
             if (g.rank == 0) {
                 g.setMode(); // rank 0 publishes its flags: the follower compares them before it allocates
-            } else if (g.mode() != modeWord()) {
+            } else if (g.readMode() != modeWord()) {
                 std.log.err("rank {d}: the mode word does not match rank 0's: this rank's XPU_KV_POOL, XPU_KEEP_SHARED, XPU_KV_INT8, XPU_EMBED_HOST, XPU_K1 or XPU_K1_TREE diverges, and the pair sizes its cards differently\n", .{ RANK });
                 return error.ModeMismatch;
             }
