@@ -653,8 +653,8 @@ pub const Runner = struct {
     pub fn prompt(r: *Runner, ids: []const u32, last: bool) !void {
         // a resumed pass needs the pages of the whole request before it starts: rank 0 makes room first, so the
         // drops it makes are step records the follower replays before this call
-        const end: u64 = @as(u64, r.pos) + ids.len;
-        if (end <= r.context) try r.makeRoom(r.slot, @intCast(end));
+        const upto: u64 = @as(u64, r.pos) + ids.len;
+        if (upto <= r.context) try r.makeRoom(r.slot, @intCast(upto));
         if (tp.group) |*g| try g.record(.prompt, @intFromBool(last), 0, 0, ids);
         var at: usize = 0;
         while (at < ids.len) {
