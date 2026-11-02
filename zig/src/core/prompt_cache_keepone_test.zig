@@ -39,8 +39,8 @@ test "a later turn's state takes its own older one's storage, not the least rece
     _ = f.pass(&s, p2, p);
     try std.testing.expectEqual(@as(usize, 2), s.entries.items.len);
     try std.testing.expect(at(&s, &.{ 1, 2, 3, 4 }) == null); // the conversation's older state took its storage
-    try std.testing.expectEqual(@as(u32, 6), s.find(p2, &.{}, &.{})?.at); // its later turn's state stayed
-    try std.testing.expectEqual(@as(u32, 4), s.find(pc_, &.{}, &.{})?.at); // the unrelated state stayed
+    try std.testing.expectEqual(@as(u32, 6), s.find(p2, &.{}, &.{}).?.at); // its later turn's state stayed
+    try std.testing.expectEqual(@as(u32, 4), s.find(pc_, &.{}, &.{}).?.at); // the unrelated state stayed
     try std.testing.expectEqual(@as(u64, 1), s.counts.evicted); // one state left; the unrelated one never left
     try std.testing.expect(s.subsumed(p2, 7, 6) == null); // nothing the later turn's state supersedes remains
 }
