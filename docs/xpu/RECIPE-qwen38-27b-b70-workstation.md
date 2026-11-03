@@ -31,6 +31,16 @@ Correctness, greedy:
 
 Prefill is about the same as p36: 39k in 26.7 s, 120k in 115 to 121 s.
 
+### Agent harness settings
+
+pi always sends its model `maxTokens` (32,768) as `max_tokens`. The stock server refuses a request when prompt +
+`max_tokens` is more than the window. The jubiku build adds `TF_CLAMP_MAX_TOKENS=1` (branch
+`lane/p39-clamp-max-tokens` on inf1-integrate): the server cuts `max_tokens` to the room left and does not refuse.
+
+pi compaction rule: `reserveTokens` = one full reply (32,768), not a percentage of the window. pi compacts at
+217,088 − 32,768 = 184,320 tokens and keeps the last 32,768 tokens after a compaction. Fleet policy:
+agent-loadout `pi/compaction-policy.json`.
+
 ## Two-stream benchmark (2026-11-02, p36)
 
 | Item | Value |
