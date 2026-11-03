@@ -74,7 +74,7 @@ test "a cap of 32 binds: the least recently used state leaves first, every conve
         const p = turn(&buf, 2, 0);
         const plan = try s.begin(a, p, @intCast(p.len - 1), &.{}, &.{}, null, &.{}); // the same prompt again: a hit
         try std.testing.expectEqual(@as(u32, @intCast(p.len - 1)), plan.from); // resumed at its state, its use renewed
-        if (plan.entry) |e| s.release(e);
+        _ = f.pass(&s, p, plan);
     }
     try run(&s, &f, a, CONVS + 4, 0);
     try std.testing.expectEqual(@as(usize, 32), s.entries.items.len);
