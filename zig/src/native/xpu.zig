@@ -182,7 +182,10 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
     h.back = .{ .gpa = gpa, .runner = runner, .drafter = drafter, .pick = pickCtx, .pick_ctx = gpa_box, .slots = slots };
     if (std.c.getenv("XPU_BLOCK")) |v| h.back.block = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 8;
     if (std.c.getenv("XPU_TREE")) |v| h.back.nodes = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 15;
-    if (std.c.getenv("XPU_ROUND_STATS")) |v| { // rank 0 drafts and prints; a follower stays off
+    // XPU_PROMPT_SLICE: prompt passes a chunk (XPU_CHUNK) a call, decode rounds between (unset, empty or 0: whole)
+    const slice = promptSlice();
+    h.back.slice = slice != null;
+        if (std.c.getenv("XPU_ROUND_STATS")) |v| { // rank 0 drafts and prints; a follower stays off
         const every = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0;
         if (every > 0 and xq.RANK == 0) h.back.rs = .{ .on = true, .every = every };
     }
@@ -200,6 +203,13 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
     // /health runs the pair's idle check: a follower that died with the pair idle exits rank 0 there, so the health
     // route stops answering 200 instead of waiting for the next request to notice
     h.host.health = .{ .ctx = @ptrCast(h), .read = healthRead };
+    if (slice) |share| {
+        h.host.slice_long = true;
+        if (share < 1) h.host.share.p = share;
+        const p = h.host.share.p;
+        if (xq.RANK == 0) std.log.info("qwen27-xpu: prompt passes in slices of {d} rows (XPU_PROMPT_SLICE), each followed by {s}; a prompt of at most {d} new rows runs whole", .{ xq.CHUNK, if (p >= 1) "a decode round of the other streams" else "decode rounds for the slice's time x (1 - p) / p", h.host.share.short });
+        if (xq.RANK == 0 and p < 1) std.log.info("qwen27-xpu: prompt share p {d:.2}: decode rounds take {d:.2} of a slice's time", .{ p, (1 - p) / p });
+    }
     if (drafter != null) {
         h.back.initDrafts();
         // XPU_TREE=0: no DFlash2 trees, so no lone-tree loop: a lone stream runs the shared round's chain windows (K1 chain)
@@ -221,6 +231,28 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
     try h.host.start();
     std.log.info("qwen27-xpu: {d} streams of {d} tokens{s}", .{ slots, context, if (drafter != null) ", DFlash2 trees for a lone stream" else "" });
     return .{ .engine = h.host.engine(), .close = LaneServed.close, .ctx = h };
+}
+
+/// XPU_PROMPT_SLICE: null (off) when unset, empty or 0; else the prompt passes' share of wall time beside decoding
+/// streams, in [0.01, 1] (1, or anything else: one decode round after each slice; TENSORFOLD_PREFILL_SHARE stands).
+fn promptSlice() ?f64 {
+    const v = std.mem.span(std.c.getenv("XPU_PROMPT_SLICE") orelse return null);
+    return sliceShare(v);
+}
+
+fn sliceShare(v: []const u8) ?f64 {
+    if (v.len == 0 or std.mem.eql(u8, v, "0")) return null;
+    const p = std.fmt.parseFloat(f64, v) catch return 1;
+    return if (p >= 0.01 and p <= 1) p else 1;
+}
+
+test "XPU_PROMPT_SLICE: unset, empty and 0 are off; a share in [0.01, 1] stands; anything else is 1" {
+    try std.testing.expectEqual(@as(?f64, null), sliceShare(""));
+    try std.testing.expectEqual(@as(?f64, null), sliceShare("0"));
+    try std.testing.expectEqual(@as(?f64, 1), sliceShare("1"));
+    try std.testing.expectEqual(@as(?f64, 0.6), sliceShare("0.6"));
+    try std.testing.expectEqual(@as(?f64, 1), sliceShare("yes"));
+    try std.testing.expectEqual(@as(?f64, 1), sliceShare("2"));
 }
 
 /// A tensor-parallel rank above 0 (`--rank 1` with TF_TP_RANK=1 and ZE_AFFINITY_MASK on its card, a -Dtp=2 build):
