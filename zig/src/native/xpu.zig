@@ -208,9 +208,13 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
     if (budget > 0) {
         // the prompt kernels compute in blocks of 64 rows from a call's start: kept and resumed at planned marks only
         h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = h, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, .{ .planned = true, .grid = 64 }, budget);
-        if (xq.kv_pool) { // kept states' GDN and drafter-context copies stay inside the reserve the pool left for them
-            const per = xq.gdnBytes(runner) + (if (drafter != null) Drafter.ctxBytes() else 0);
-            h.cache.?.most = @intCast(@max(1, (1536 << 20) / @max(per, 1)));
+        if (xq.kv_pool) { // kept states' GDN and drafter-context copies: in the card reserve the pool left for them, or
+            // in host memory (XPU_KEPT_HOST=1, a host budget a rank); each state takes one copy, so they cap the count
+            const ctx: u64 = if (drafter != null) Drafter.ctxBytes() else 0;
+            const per: u64 = (if (xq.kept_host) xq.keptGdnBytes(runner) else xq.gdnBytes(runner)) + ctx;
+            const room: u64 = if (xq.kept_host) std.math.lossyCast(u64, xq.kept_host_gib * (1 << 30)) else xq.cache_gdn;
+            h.cache.?.most = @intCast(@max(1, room / @max(per, 1)));
+            std.log.info("qwen27-xpu: kept prompt states: at most {d} ({s}, {d} MiB each)", .{ h.cache.?.most, if (xq.kept_host) "host memory, XPU_KEPT_HOST" else "card reserve", per >> 20 });
         }
         h.host.cache = &h.cache.?;
         h.host.info_.prompt_cache = true;
@@ -244,7 +248,7 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
     if (o.kv_pool_tokens != null) xq.kv_pool = true;
     const runner = xq.Runner.init(o.dir, context) catch |err| {
         if (err == error.ModeMismatch) {
-            problem.* = "the XPU engine mode diverges from rank 0's (ModeMismatch): this rank's XPU_KV_POOL, XPU_KEEP_SHARED, XPU_KV_INT8, XPU_EMBED_HOST, XPU_K1, XPU_K1_TREE, XPU_K1_R16 or XPU_K1_WAVE differs, so the pair cannot run";
+            problem.* = "the XPU engine mode diverges from rank 0's (ModeMismatch): this rank's XPU_KV_POOL, XPU_KEEP_SHARED, XPU_KEPT_HOST, XPU_KV_INT8, XPU_EMBED_HOST, XPU_K1, XPU_K1_TREE, XPU_K1_R16 or XPU_K1_WAVE differs, so the pair cannot run";
         } else {
             problem.* = try std.fmt.allocPrint(a, "the XPU engine could not load {s}: {s}", .{ o.dir, @errorName(err) });
         }

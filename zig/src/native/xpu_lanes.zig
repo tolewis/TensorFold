@@ -251,7 +251,8 @@ pub const Lanes = struct {
 
     /// The bytes keepSave takes at `at` tokens.
     pub fn keepBytes(b: *const Lanes, at: u32) u64 {
-        return b.runner.snapBytes(at) + if (b.drafter != null) Drafter.ctxBytes() else 0;
+        // XPU_KEPT_HOST=1: the drafter context's copy is host memory, not charged to the card's budget
+        return b.runner.snapBytes(at) + if (b.drafter != null and !(xq.kv_pool and xq.kept_host)) Drafter.ctxBytes() else 0;
     }
 
     /// `s`'s slot standing at `at` prompt tokens, copied (its DFlash2 context too).
@@ -262,7 +263,7 @@ pub const Lanes = struct {
         k.* = .{ .snap = try b.runner.saveSlot(slot, at) };
         errdefer b.runner.dropSnap(k.snap);
         if (b.drafter) |d| {
-            const buf = try b.runner.d.alloc_(Drafter.ctxBytes());
+            const buf = if (xq.kv_pool and xq.kept_host) try b.runner.d.hostAlloc(Drafter.ctxBytes()) else try b.runner.d.alloc_(Drafter.ctxBytes());
             errdefer xq.freeAfterQueue(&b.runner.d, buf); // saveCtx's copies may be queued
             k.range = try d.saveCtx(slot, buf);
             k.ctx = buf;

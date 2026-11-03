@@ -25,6 +25,7 @@ extern "c" fn munmap(addr: *anyopaque, len: usize) c_int;
 pub const MAX_SLOTS = loader.MAX_SLOTS;
 pub const freeAfterQueue = slot_states.freeAfterQueue;
 pub const gdnBytes = slot_states.gdnBytes;
+pub const keptGdnBytes = slot_states.keptGdnBytes;
 pub const Tensor = dev.Tensor;
 pub const Checkpoint = dev.Checkpoint;
 pub const Dev = dev.Dev;
@@ -90,6 +91,12 @@ pub var pool_tokens: ?u32 = null;
 /// page and the pool has none free, the least recently used kept state goes first, and a reserve of pages stays free
 /// for the streams. Off by default: kept states get only the pages past the streams' contexts, as before.
 pub var keep_shared = false;
+/// XPU_KEPT_HOST=1 (lane p43-keptcap): a kept prompt state's GDN, convolution and drafter-context copies live in pinned
+/// host memory, not on the card. The card's 1536 MiB reserve for them goes back to the pool, and the number of kept
+/// states comes from a host budget (XPU_KEPT_HOST_GIB, default 16 GiB a rank). Off by default.
+pub var kept_host = false;
+/// XPU_KEPT_HOST_GIB: the host bytes a rank gives kept states' copies with XPU_KEPT_HOST=1.
+pub var kept_host_gib: f64 = 16;
 
 /// Drops the least recently used kept prompt state the prompt cache may evict; false when none is left.
 pub const Evict = struct { ctx: *anyopaque, f: *const fn (ctx: *anyopaque) bool };
@@ -156,13 +163,15 @@ const Options = struct {
     kv_pool: bool,
     pool_tokens: ?u32,
     keep_shared: bool,
+    kept_host: bool,
+    kept_host_gib: f64,
 };
 var defaults: ?Options = null;
 /// One runner at a time: the options, MAX_CTX and GS above belong to the process, not to a runner.
 var live = false;
 
 fn options() Options {
-    return .{ .dump_dir = dump_dir, .dump_h = dump_h, .a8_group = a8_group, .kv8 = kv8, .kv_i8 = kv_i8, .prefill_int4 = prefill_int4, .int4_sites = int4_sites, .prefill_int8 = prefill_int8, .a8_sites = a8_sites, .a8_rot = a8_rot, .a8_levels = a8_levels, .a8_sites4 = a8_sites4, .embed_host = embed_host, .chunk = CHUNK, .kv_pool = kv_pool, .pool_tokens = pool_tokens, .keep_shared = keep_shared };
+    return .{ .dump_dir = dump_dir, .dump_h = dump_h, .a8_group = a8_group, .kv8 = kv8, .kv_i8 = kv_i8, .prefill_int4 = prefill_int4, .int4_sites = int4_sites, .prefill_int8 = prefill_int8, .a8_sites = a8_sites, .a8_rot = a8_rot, .a8_levels = a8_levels, .a8_sites4 = a8_sites4, .embed_host = embed_host, .chunk = CHUNK, .kv_pool = kv_pool, .pool_tokens = pool_tokens, .keep_shared = keep_shared, .kept_host = kept_host, .kept_host_gib = kept_host_gib };
 }
 
 fn restore(o: Options) void {
@@ -183,6 +192,8 @@ fn restore(o: Options) void {
     kv_pool = o.kv_pool;
     pool_tokens = o.pool_tokens;
     keep_shared = o.keep_shared;
+    kept_host = o.kept_host;
+    kept_host_gib = o.kept_host_gib;
 }
 
 extern "c" fn clock_gettime(clk: c_int, ts: *[2]i64) c_int;
@@ -272,6 +283,8 @@ pub const Runner = struct {
         if (pool_tokens != null) kv_pool = true;
         if (kv_pool) kv_i8 = true;
         if (std.c.getenv("XPU_KEEP_SHARED")) |v| keep_shared = v[0] != '0';
+        if (std.c.getenv("XPU_KEPT_HOST")) |v| kept_host = v[0] != '0';
+        if (std.c.getenv("XPU_KEPT_HOST_GIB")) |v| kept_host_gib = try std.fmt.parseFloat(f64, std.mem.span(v));
         // K1 tree (XPU_K1=1 with XPU_K1_TREE=1) needs the int8 pool; print once so a run shows which path it takes
         if (k1mod.on and k1mod.tree and kv_i8) std.debug.print("K1 tree verify is on\n", .{});
         if (k1mod.on or k1mod.tree or k1mod.multi_tree) {
@@ -328,7 +341,7 @@ pub const Runner = struct {
         tp.group = try tp.Group.open(&r.d); // null at TP 1
         if (tp.group) |*g| {
             if (g.rank != 0 and g.readMode() != modeWord()) {
-                std.log.err("rank {d}: the mode word does not match rank 0's: this rank's XPU_KV_POOL, XPU_KEEP_SHARED, XPU_KV_INT8, XPU_EMBED_HOST, XPU_K1, XPU_K1_TREE, XPU_MULTI_TREE, XPU_K1_R16 or XPU_K1_WAVE diverges, or this rank loads a different weight format (EXL3 or MLX), and the pair sizes its cards differently\n", .{ RANK });
+                std.log.err("rank {d}: the mode word does not match rank 0's: this rank's XPU_KV_POOL, XPU_KEEP_SHARED, XPU_KEPT_HOST, XPU_KV_INT8, XPU_EMBED_HOST, XPU_K1, XPU_K1_TREE, XPU_MULTI_TREE, XPU_K1_R16 or XPU_K1_WAVE diverges, or this rank loads a different weight format (EXL3 or MLX), and the pair sizes its cards differently\n", .{ RANK });
                 g.markClosed(); // rank 0 sees the closed segment at its first all-reduce and exits at once
                 return error.ModeMismatch;
             }
@@ -884,8 +897,8 @@ const pass_reserve: u64 = 650_000_000;
 /// Bytes the card holds beyond what Dev.allocated counts (the runtime's own buffers).
 const held_not_counted: u64 = 400_000_000;
 /// Card bytes kept for the GDN, convolution and drafter-context copies of kept prompt states (their K/V pages come
-/// from the pool).
-const cache_gdn: u64 = 1536 << 20;
+/// from the pool). Not taken with XPU_KEPT_HOST=1: the copies live in host memory.
+pub const cache_gdn: u64 = 1536 << 20;
 /// Pages a pool is rounded down to: both ranks of a TP 2 pair size the same pool, so they map the same page ids.
 const sync_pages: u32 = 256;
 
@@ -895,7 +908,7 @@ const sync_pages: u32 = 256;
 pub fn poolPages(r: *Runner, slots: u32, tokens: ?u32, cache: bool, extra: u64) !u32 {
     if (tokens) |t| return @max(1, (t + PAGE - 1) / PAGE);
     const mem = try r.d.g.memory();
-    const keep = pass_reserve + held_not_counted + (if (cache) cache_gdn else 0);
+    const keep = pass_reserve + held_not_counted + (if (cache and !kept_host) cache_gdn else 0);
     const gdn: u64 = @intCast(slot_states.slotBytes(r));
     const counted = @as(u64, r.d.allocated) + (gdn + extra) * @as(u64, if (slots > 1) slots - 1 else 0);
     const left = (mem.size -| keep) -| counted;
@@ -908,7 +921,7 @@ pub fn poolPages(r: *Runner, slots: u32, tokens: ?u32, cache: bool, extra: u64) 
 
 /// The run flags a pair must agree on: one bit each for kv_pool, keep_shared, kv_i8, embed_host, k1, k1_tree and
 /// k1 r16, four bits for the k1 wave (XPU_K1_WAVE, a small count), then multi_tree (XPU_MULTI_TREE), then the weight
-/// format (bit 12: MLX).
+/// format (bit 12: MLX), then kept_host (bit 13: XPU_KEPT_HOST).
 pub fn modeWord() u64 {
     var w: u64 = 0;
     w |= @as(u64, @intFromBool(kv_pool));
@@ -921,6 +934,7 @@ pub fn modeWord() u64 {
     w |= (@as(u64, k1mod.wave) & 15) << 7;
     w |= @as(u64, @intFromBool(k1mod.multi_tree)) << 11;
     w |= @as(u64, @intFromBool(fmt_mlx)) << 12; // 0: EXL3, 1: MLX 4/64
+    w |= @as(u64, @intFromBool(kept_host)) << 13; // kept states' copies in host memory: both ranks hold theirs there
     return w;
 }
 
@@ -935,7 +949,9 @@ test "mode word: each flag sits at the bit both ranks agree on" {
     const saved_r16 = k1mod.r16;
     const saved_wave = k1mod.wave;
     const saved_fmt = fmt_mlx;
+    const saved_kh = kept_host;
     defer {
+        kept_host = saved_kh;
         fmt_mlx = saved_fmt;
         kv_pool = saved_pool;
         keep_shared = saved_keep;
@@ -957,7 +973,11 @@ test "mode word: each flag sits at the bit both ranks agree on" {
     k1mod.r16 = true;
     k1mod.wave = 4;
     fmt_mlx = false;
+    kept_host = false;
     try std.testing.expectEqual(@as(u64, 1) << 6 | @as(u64, 4) << 7, modeWord());
+    kept_host = true; // XPU_KEPT_HOST on one rank only: the words differ
+    try std.testing.expectEqual(@as(u64, 1) << 6 | @as(u64, 4) << 7 | @as(u64, 1) << 13, modeWord());
+    kept_host = false;
     fmt_mlx = true; // the format bit: a pair of an EXL3 rank and an MLX rank differs
     try std.testing.expectEqual(@as(u64, 1) << 6 | @as(u64, 4) << 7 | @as(u64, 1) << 12, modeWord());
     fmt_mlx = false;

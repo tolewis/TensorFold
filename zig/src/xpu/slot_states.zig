@@ -18,6 +18,14 @@ pub fn gdnBytes(r: *const Runner) usize {
     return layers * (2 * q.GDN_V_HEADS * 128 * 128 * 4 + 2 * 3 * q.GDN_QKV * 2);
 }
 
+/// Bytes a kept state's GDN and convolution copy takes: each GDN layer's recurrent state and current convolution (what
+/// copyGdnOut writes; gdnBytes counts a slot's double buffers). The host copy's size with XPU_KEPT_HOST=1.
+pub fn keptGdnBytes(r: *const Runner) usize {
+    var layers: usize = 0;
+    for (r.model.layers) |l| layers += @intFromBool(!l.attn);
+    return layers * (REC_BYTES + CONV_BYTES);
+}
+
 /// Bytes a slot's states take: GDN and convolution states, and the K/V cache of `context` positions (none with the pool).
 pub fn slotBytes(r: *const Runner) usize {
     return gdnBytes(r) + if (q.kv_pool) 0 else (q.LAYERS / 4) * 2 * kvBytes();
@@ -36,6 +44,8 @@ pub fn kv() q.limits.KvLayout {
 
 /// The bytes saveSlot takes at `at` tokens; with the pool, the pages the state holds are charged too.
 pub fn snapBytes(r: *const Runner, at: u32) usize {
+    // XPU_KEPT_HOST=1: the GDN copy is host memory, so a state charges the card only its pool pages
+    if (q.kv_pool and q.kept_host) return @as(usize, at) * r.kvBytesPerToken();
     if (q.kv_pool) return gdnBytes(r) + @as(usize, at) * r.kvBytesPerToken();
     var n: usize = 0;
     for (&r.model.layers) |*l| n += if (l.attn) 2 * kv().snapBytes(at) else REC_BYTES + CONV_BYTES;
@@ -58,8 +68,8 @@ fn saveSlotHere(r: *Runner, slot: u32, at: u32) !Snap {
     const bytes = r.snapBytes(at);
     if (q.kv_pool) {
         if (at % q.PAGE != 0) return error.SlotNotThere; // the last page is partial: a restore maps it, and two streams write into it
-        const gdn = gdnBytes(r);
-        const buf = try d.alloc_(gdn);
+        // XPU_KEPT_HOST=1: pinned host memory, the copy goes over PCIe and takes no card memory
+        const buf = if (q.kept_host) try d.hostAlloc(keptGdnBytes(r)) else try d.alloc_(gdnBytes(r));
         errdefer freeAfterQueue(d, buf); // copies into it may be queued
         try copyGdnOut(d, r, buf);
         const entries = (at + q.PAGE - 1) / q.PAGE;

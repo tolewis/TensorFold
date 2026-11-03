@@ -645,6 +645,7 @@ test {
     _ = @import("prompt_cache_interior_test.zig");
     _ = @import("prompt_cache_branch_test.zig");
     _ = @import("prompt_cache_keepone_test.zig");
+    _ = @import("prompt_cache_most_test.zig");
     _ = @import("prompt_cache_give_test.zig");
     _ = @import("prompt_cache_shared_test.zig");
     _ = @import("prompt_cache_lifetime_test.zig");
