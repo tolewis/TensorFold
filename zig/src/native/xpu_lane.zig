@@ -202,7 +202,7 @@ pub fn Xpu(comptime S: type) type {
                 f();
             }
             const ids = s.prompt();
-            if (ids.len == 0 or ids.len + s.max_new + 1 > e.max_len) return error.PromptTooLong;
+            s.max_new = @import("xpu_admit.zig").fitReply(ids.len, s.max_new, e.max_len, 1) orelse return error.PromptTooLong;
             if (comptime has_head) if (self.drafting()) {
                 // the stream's sequence (the engine's own while free), then the prompt in prompt windows
                 const gop = try self.lane_of.getOrPut(self.gpa, s);

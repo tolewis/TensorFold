@@ -191,7 +191,8 @@ pub const Lanes = struct {
     /// A stream's prompt into its slot (a free one, slot 0 last); its last row's logits are kept when it samples.
     fn prefillSlot(b: *Lanes, s: *lanes.Stream, slot: u32) !void {
         const ids = s.prompt();
-        if (ids.len == 0 or ids.len + s.max_new + 17 > b.runner.context) return error.PromptTooLong;
+        // the reply is fitted to the context less the drafter's 17 slots; only a prompt with no room is refused
+        s.max_new = @import("xpu_admit.zig").fitReply(ids.len, s.max_new, b.runner.context, 17) orelse return error.PromptTooLong;
         const r = b.runner;
         try r.select(slot);
         try r.reset();

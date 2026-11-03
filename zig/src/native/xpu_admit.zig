@@ -11,6 +11,24 @@ pub fn streamsThatFit(m: Memory, margin: u64, reserve: u64, slot_bytes: u64, wan
     return @min(want, 1 + more);
 }
 
+/// A reply that would run past the context is cut to what fits: `max_new` within `context - reserve - prompt`.
+/// Null (refuse) only when the prompt itself leaves no room, or is empty.
+pub fn fitReply(prompt: usize, max_new: u32, context: usize, reserve: usize) ?u32 {
+    if (prompt == 0 or prompt + reserve >= context) return null;
+    const room = context - reserve - prompt;
+    return @intCast(@min(@as(usize, max_new), room));
+}
+
+test "fitReply cuts a reply that fills the window and refuses a prompt with no room" {
+    try std.testing.expectEqual(@as(?u32, 100), fitReply(10, 100, 4096, 17));
+    try std.testing.expectEqual(@as(?u32, 101556 - 17), fitReply(29516, 131000, 131072, 17));
+    try std.testing.expectEqual(@as(?u32, 4096 - 17 - 10), fitReply(10, 4096, 4096, 17));
+    try std.testing.expectEqual(@as(?u32, 1), fitReply(4078, 50, 4096, 17));
+    try std.testing.expectEqual(@as(?u32, null), fitReply(4079, 50, 4096, 17));
+    try std.testing.expectEqual(@as(?u32, null), fitReply(0, 50, 4096, 17));
+    try std.testing.expectEqual(@as(?u32, 5), fitReply(10, 5, 4096, 1));
+}
+
 const gib: u64 = 1 << 30;
 
 test "a stream that does not fit is refused" {
