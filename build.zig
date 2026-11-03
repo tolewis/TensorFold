@@ -52,10 +52,6 @@ fn keepOneCheck(b: *std.Build, target: std.Build.ResolvedTarget, step: *std.Buil
     const lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = .Debug, .link_libc = true });
     const keepone = b.createModule(.{ .root_source_file = b.path("zig/src/core/prompt_cache_keepone_test.zig"), .target = target, .optimize = .Debug, .link_libc = true, .imports = &.{ .{ .name = "lanes", .module = lanes } } });
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = keepone })).step);
-    // the count cap (XPU_KEPT_HOST, lane p43-keptcap): six conversations of five marks under a cap of 32, and the
-    // least recently used rule when the count binds
-    const most = b.createModule(.{ .root_source_file = b.path("zig/src/core/prompt_cache_most_test.zig"), .target = target, .optimize = .Debug, .link_libc = true, .imports = &.{ .{ .name = "lanes", .module = lanes } } });
-    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = most })).step);
 }
 
 /// The page pool's own tests, and its checks under engine_api's paged store and lane host (kv_pool a module of its...

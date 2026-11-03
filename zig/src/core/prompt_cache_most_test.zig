@@ -69,11 +69,13 @@ test "a cap of 32 binds: the least recently used state leaves first, every conve
     try std.testing.expect(holds(&s, 2, 0)); // the next one stays
     for (0..CONVS + 4) |c| try std.testing.expect(holds(&s, @intCast(c), if (c < CONVS) TURNS - 1 else 0));
     // a resume makes a state recently used: conversation 2's first state is used again, so conversation 3's goes next
-    try std.testing.expect(s.find(blk: {
+    {
         var buf: [64]u32 = undefined;
-        break :blk turn(&buf, 2, 0);
-    }, &.{}, &.{}) != null);
-    try run(&s, &f, a, 2, 0); // the same prompt again: a hit on its own state, its use time renewed
+        const p = turn(&buf, 2, 0);
+        const plan = try s.begin(a, p, @intCast(p.len - 1), &.{}, &.{}, null, &.{}); // the same prompt again: a hit
+        try std.testing.expectEqual(@as(u32, @intCast(p.len - 1)), plan.from); // resumed at its state, its use renewed
+        if (plan.entry) |e| s.release(e);
+    }
     try run(&s, &f, a, CONVS + 4, 0);
     try std.testing.expectEqual(@as(usize, 32), s.entries.items.len);
     try std.testing.expect(holds(&s, 2, 0));
