@@ -185,7 +185,7 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
     // XPU_PROMPT_SLICE: prompt passes a chunk (XPU_CHUNK) a call, decode rounds between (unset, empty or 0: whole)
     const slice = promptSlice();
     h.back.slice = slice != null;
-        if (std.c.getenv("XPU_ROUND_STATS")) |v| { // rank 0 drafts and prints; a follower stays off
+    if (std.c.getenv("XPU_ROUND_STATS")) |v| { // rank 0 drafts and prints; a follower stays off
         const every = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0;
         if (every > 0 and xq.RANK == 0) h.back.rs = .{ .on = true, .every = every };
     }
