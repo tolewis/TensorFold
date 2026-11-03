@@ -2,12 +2,36 @@
 
 This recipe serves Qwen3.8-27B from one Intel Arc Pro B70 in a workstation. The same card drives the desktop
 display. The server loads the model on the first request, and it gives the VRAM back to the desktop after 300 s
-idle. Two streams of 114,688 tokens share one K/V pool.
+idle. Production since 2026-11-03: one stream of 217,088 tokens with K1 decode attention and DFlash2 chains.
 
-Measured on jubiku on 2026-11-02. For the two-card server recipe, see
+Measured on jubiku on 2026-11-02 and 2026-11-03. For the two-card server recipe, see
 [RECIPE-qwen38-27b-b70.md](RECIPE-qwen38-27b-b70.md).
 
-## Final benchmark (2026-11-02)
+## Production benchmark (2026-11-03, p39 K1)
+
+Build `lane/p39-k1cover`, commit `138de4f4b3c6b6adc240bc8a39b31bf3b692941e`, with `XPU_K1=1 XPU_TREE=0`. One stream of
+217,088 tokens in an int8 pool of 245,760 tokens (8.18 GB). VRAM 26.1 GiB loaded.
+
+| Context | K1 chain (production) | K1 tree (`XPU_K1_TREE=1`) | p36, scalar tree |
+|---|---|---|---|
+| 30 tokens, 300 out | 142 tok/s | 136 tok/s | 153 tok/s |
+| 33 tokens, 64 out (code) | 197 tok/s | 165 tok/s | 191 tok/s |
+| 39,464 | 122 tok/s | 109 to 123 tok/s | 44 tok/s |
+| 120,173 | 91.5 tok/s | 99 to 102 tok/s | 16 to 18 tok/s |
+
+Correctness, greedy:
+
+- K1 plain at 120k gives sha `55532ae52f6c`, the same as K1 off. On p36, K1 drifted (`b85485f84991`).
+- K1 chain + DFlash2 at 120k gives `55532ae52f6c`.
+- K1 tree at 120k gives `07fc38779555` on both runs. The text is sane, but it is not the reference sha. This is why
+  production uses chains.
+- K1 tree at 39k: `70278af8e8b3` on both runs, the same as the chain. Acceptance 257/720.
+- K1 off, tree, 30-token prompt: `d317b4792cff` on both runs. On p36 the repeats were not the same.
+- No `xe` hang, reset, or fault in the kernel log during the tests.
+
+Prefill is about the same as p36: 39k in 26.7 s, 120k in 115 to 121 s.
+
+## Two-stream benchmark (2026-11-02, p36)
 
 | Item | Value |
 |---|---|
@@ -129,9 +153,12 @@ tailnet. Nothing listens on the LAN.
   limit.
 - A DFlash2 tree at temperature 0 can give different text on repeat runs (`d317b4792cff`, `7b62cdadaf9b`).
 
-## Phase two
+## Phase two (done 2026-11-03)
 
-These items are tested in part or built, but not in production:
+The p39 tests passed, and p39 with `XPU_K1=1 XPU_TREE=0` is in production. See the production benchmark above.
+Open items: the K1 tree is not exact against the reference, and two streams of K1 at 99k are not measured.
+
+The plan as written on 2026-11-02:
 
 1. `XPU_K1=1` (K1 decode attention) doubles plain decode at 120k, from 12.2–12.7 to 23.4–24.4 tok/s. The
    text matches for the first 300 characters, then it drifts from the K1-off text (greedy drift). K1 does not run
