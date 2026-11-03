@@ -235,6 +235,10 @@ pub fn sendWith(engine: api.Engine, route: Route, body: []const u8, start: Seen)
 }
 
 fn sendWithBudget(engine: api.Engine, route: Route, body: []const u8, start: Seen, default_budget: i64) !Seen {
+    return sendWithFloor(engine, route, body, start, default_budget, 0);
+}
+
+fn sendWithFloor(engine: api.Engine, route: Route, body: []const u8, start: Seen, default_budget: i64, reply_floor: i64) !Seen {
     var text: TestText = .{};
     var srv = try server.Server.init(std.testing.allocator, std.testing.io, engine, text.text(), .{
         .served_name = "test-model",
@@ -242,6 +246,7 @@ fn sendWithBudget(engine: api.Engine, route: Route, body: []const u8, start: See
         .enable_thinking = false,
         .use_drafts = false,
         .thinking_budget = default_budget,
+        .reply_floor = reply_floor,
     }, null);
     defer srv.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -527,4 +532,74 @@ test "closed or busy admission is service unavailable across chat, messages and 
         };
     }
     try std.testing.expectEqual(@as(usize, 0), wrong);
+}
+
+/// HiEngine's window is 8 and every prompt is 6 tokens, so the room is 2.
+fn floored(route: Route, body: []const u8, floor: i64) !Seen {
+    var backend: HiEngine = .{};
+    return sendWithFloor(backend.engine(), route, body, .{}, 0, floor);
+}
+
+const over_chat = "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":100";
+
+test "reply floor on, room at the floor: a whole chat over the room is fitted and served" {
+    const seen = try floored(.chat, over_chat ++ "}", 2);
+    try std.testing.expectEqual(@as(?u16, 200), seen.status);
+    try std.testing.expect(!seen.context_code);
+    try std.testing.expect(seen.content().len <= 2);
+}
+
+test "reply floor on, room at the floor: a streamed chat over the room is fitted and served" {
+    const seen = try floored(.chat, over_chat ++ ",\"stream\":true}", 1);
+    try std.testing.expect(seen.opened);
+    try std.testing.expect(!seen.context_code);
+    try std.testing.expect(seen.content().len <= 2);
+    try std.testing.expectEqual(@as(i64, 0), seen.preparing);
+}
+
+test "reply floor on: a Messages and a Responses request over the room are fitted too" {
+    const m = try floored(.messages, "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":100}", 2);
+    try std.testing.expectEqual(@as(?u16, 200), m.status);
+    const r = try floored(.responses, "{\"model\":\"test-model\",\"input\":\"x\",\"max_output_tokens\":100}", 2);
+    try std.testing.expectEqual(@as(?u16, 200), r.status);
+}
+
+test "reply floor on, a floor larger than the room still refuses in both modes" {
+    const whole = try floored(.chat, over_chat ++ "}", 5);
+    try std.testing.expectEqual(@as(?u16, 400), whole.status);
+    try std.testing.expect(whole.context_code);
+    try expectContextInStream(try floored(.chat, over_chat ++ ",\"stream\":true}", 5), true);
+}
+
+test "reply floor on, a limit under the floor and over the room still refuses" {
+    const seen = try floored(.chat, "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":3}", 100);
+    try std.testing.expect(seen.context_code);
+}
+
+test "reply floor on, max_tokens within the room is unchanged" {
+    const seen = try floored(.chat, "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":2}", 2);
+    try std.testing.expectEqual(@as(?u16, 200), seen.status);
+    try std.testing.expectEqualStrings("hi", seen.content());
+}
+
+test "reply floor on, a fitted reply that fills the room ends with length" {
+    const Full = struct {
+        max: u32 = 0,
+        fn engine(e: *@This()) api.Engine {
+            return .{ .ctx = e, .vtable = &.{ .info = HiEngine.info, .submit = submit, .cancel = HiEngine.cancel, .status = HiEngine.status, .memory = HiEngine.memory } };
+        }
+        fn submit(ctx: *anyopaque, id: api.Id, req: *const api.Request, sink: api.Sink) api.SubmitError!void {
+            const e: *@This() = @ptrCast(@alignCast(ctx));
+            e.max = req.max_tokens;
+            sink.event(sink.ctx, id, &.{ .prefilled = 0 });
+            sink.event(sink.ctx, id, &.{ .tokens = &.{ 'h', 'i' } });
+            sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .length } });
+        }
+    };
+    var full: Full = .{};
+    const whole = try sendWithFloor(full.engine(), .chat, over_chat ++ "}", .{}, 0, 2);
+    try std.testing.expectEqual(@as(u32, 2), full.max);
+    try std.testing.expectEqual(.length, whole.finish.?);
+    const streamed = try sendWithFloor(full.engine(), .chat, over_chat ++ ",\"stream\":true}", .{}, 0, 2);
+    try std.testing.expectEqual(.length, streamed.finish.?);
 }

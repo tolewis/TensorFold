@@ -48,6 +48,8 @@ pub const Config = struct {
     /// The served name first, then aliases, without repeats.
     model_ids: []const []const u8,
     default_max_tokens: i64 = 4096,
+    /// With a window, a request whose max_tokens is above the room is fitted to the room when the room is at least min(max_tokens, this); 0: refuse it (TF_REPLY_FLOOR).
+    reply_floor: i64 = 0,
     enable_thinking: bool = true,
     reasoning_effort: ?[]const u8 = null,
     thinking_budget: i64 = 0,

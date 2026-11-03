@@ -151,6 +151,15 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         std.debug.print("tensorfold: TF_SSE_KEEPALIVE_S: seconds, a number >= 0\n", .{});
         return 1;
     };
+    const reply_floor: i64 = if (env(s, "TF_REPLY_FLOOR")) |t| blk: {
+        const v = std.fmt.parseInt(i64, std.mem.trim(u8, t, " \t"), 10) catch -1;
+        if (std.mem.trim(u8, t, " \t").len == 0) break :blk 0;
+        if (v < 0) {
+            std.debug.print("tensorfold: TF_REPLY_FLOOR={s}: reply tokens, an integer >= 0\n", .{t});
+            return 1;
+        }
+        break :blk v;
+    } else 0;
     const config: server_mod.Config = .{
         .browser = .{ .allowed_hosts = args.allowed_host, .allowed_origins = args.allowed_origin },
         .allowed_controls = args.allowed_controls,
@@ -161,6 +170,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .default_voice = args.default_voice,
         .model_ids = ids.items,
         .default_max_tokens = args.max_tokens,
+        .reply_floor = reply_floor,
         .enable_thinking = args.thinking,
         .reasoning_effort = args.reasoning_effort,
         .thinking_budget = args.thinking_budget,
