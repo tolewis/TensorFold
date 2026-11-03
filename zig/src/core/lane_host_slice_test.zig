@@ -15,7 +15,7 @@ const slices = 8;
 const Seen = struct {
     mutex: std.Io.Mutex = .init,
     decoded: usize = 0, // the decoding stream's tokens delivered so far
-    at_slice: [slices]usize = @splat(0), // and when each of the cold pass's slices began
+    at_slice: [slices]u64 = @splat(0), // the core's rounds when each of the cold pass's slices began
     slices_seen: usize = 0,
     prefilled: [3]Id = @splat(0),
     count: usize = 0,
@@ -45,9 +45,10 @@ const Seen = struct {
     }
 };
 
-/// The cold pass's slices: each notes the decoder's tokens, and the third sends the warm request.
+/// The cold pass's slices: each notes the rounds run so far, and the third sends the warm request.
 const Arrive = struct {
     engine: api.Engine,
+    core: *const lanes.Engine,
     warm: *const Request,
     seen: *Seen,
     sent: bool = false,
@@ -56,7 +57,7 @@ const Arrive = struct {
         const a: *Arrive = @ptrCast(@alignCast(ctx));
         if (s.prompt_len != cold_len) return;
         a.seen.mutex.lockUncancelable(std.testing.io);
-        if (chunk < slices) a.seen.at_slice[chunk] = a.seen.decoded;
+        if (chunk < slices) a.seen.at_slice[chunk] = a.core.steps; // the engine thread's own count
         a.seen.slices_seen = @max(a.seen.slices_seen, chunk + 1);
         a.seen.mutex.unlock(std.testing.io);
         if (chunk == 2 and !a.sent) {
@@ -89,7 +90,7 @@ fn scene(sliced: bool, seen: *Seen) !void {
     const cold: Request = .{ .prompt = &cold_ids, .max_tokens = 4 };
     const warm: Request = .{ .prompt = &.{ 3, 1, 4, 1, 5, 9, 2, 6 }, .max_tokens = 4 };
     const e = host.engine();
-    var arrive: Arrive = .{ .engine = e, .warm = &warm, .seen = seen };
+    var arrive: Arrive = .{ .engine = e, .core = &core, .warm = &warm, .seen = seen };
     target.prefill_hook = Arrive.call;
     target.prefill_hook_ctx = &arrive;
     try e.submit(1, &decoder, .{ .ctx = seen, .event = Seen.event });
