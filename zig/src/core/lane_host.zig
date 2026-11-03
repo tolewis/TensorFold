@@ -79,6 +79,10 @@ pub const LaneHost = struct {
     rounds: ?Rounds = null,
     pieces: std.ArrayList(Rounds.Piece) = .empty,
     share: fill.Share = .{}, // prompt work's share of wall time beside decoding streams (lane_host_fill.zig)
+    /// Set by a family whose prompt passes run in slices on request (XPU_PROMPT_SLICE): a long prompt fills by slices
+    /// even when the lone driver would take it (the driver gets the stream back after its first round), and a kept
+    /// prefix counts as filled, so a warm request with few new rows runs whole beside a long pass. Off: as before.
+    slice_long: bool = false,
     finals: std.ArrayList(usize) = .empty,
 
     pub const ThreadInit = struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque) anyerror!void };
@@ -342,7 +346,7 @@ pub const LaneHost = struct {
     pub fn launch(h: *LaneHost, job: *Job, began: i96) bool {
         const r = job.request;
         if (r.embedding == null and r.max_tokens == 0 and h.info_.warm_turns) return h.warmPass(job, began);
-        if (r.embedding == null and lone.fits(h, job)) return lone.run(h, job, began, false);
+        if (r.embedding == null and lone.fits(h, job) and !(h.slice_long and h.core.fills() and fill.long(h, job))) return lone.run(h, job, began, false);
         if (h.core.fills()) {
             h.filling.append(h.gpa, job) catch return h.drop(job, "out of memory");
             return true;

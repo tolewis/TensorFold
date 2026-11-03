@@ -36,6 +36,9 @@ pub const RoundStats = struct {
     sum_draft: f64 = 0,
 };
 
+/// A slot's prompt pass: the next prompt row, and the rows the drafter still skips.
+pub const Fill = struct { on: bool = false, at: usize = 0, skip: u32 = 0 };
+
 pub const Lanes = struct {
     gpa: Allocator,
     runner: *xq.Runner,
@@ -63,6 +66,8 @@ pub const Lanes = struct {
     chain_par: [xq.MAX_SLOTS][16]i32 = undefined, // and each one's parent (−1: the pending token)
     chain_n: [xq.MAX_SLOTS]u32 = @splat(0),
     prompt_skip: u32 = 0, // a prefill's first rows the drafter never reads (further than WIN from the prompt's end)
+    fill: [xq.MAX_SLOTS]Fill = @splat(.{}), // each slot's prompt pass in progress (a sliced pass stands between calls)
+    slice: bool = false, // XPU_PROMPT_SLICE: prompt passes a chunk a call (prefill_step), decode rounds between
     costs: [16]lanes.config.Cost = undefined, // a window's ms by rows (verify and keep), timed by measure()
     timed: usize = 0,
     rs: RoundStats = .{}, // XPU_ROUND_STATS, set by the opener
@@ -72,7 +77,14 @@ pub const Lanes = struct {
     }
 
     pub fn backend(b: *Lanes) be.Backend {
-        return .{ .ptr = b, .vtable = &.{ .prefill = prefillFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .tree = treeFn, .release = releaseFn } };
+        const whole: be.Backend.VTable = .{ .prefill = prefillFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .tree = treeFn, .release = releaseFn };
+        const sliced: be.Backend.VTable = blk: {
+            var v = whole;
+            v.prefill_step = prefillStepFn;
+            v.reports_fill = true;
+            break :blk v;
+        };
+        return .{ .ptr = b, .vtable = if (b.slice) &sliced else &whole };
     }
 
     /// What the round loop reads: chains of up to 16 rows, all streams' windows in one shared forward, DFlash2 drafts
@@ -190,6 +202,13 @@ pub const Lanes = struct {
 
     /// A stream's prompt into its slot (a free one, slot 0 last); its last row's logits are kept when it samples.
     fn prefillSlot(b: *Lanes, s: *lanes.Stream, slot: u32) !void {
+        try b.beginPass(s, slot);
+        defer b.fill[slot].on = false;
+        while (!try b.passChunk(s, slot)) {}
+    }
+
+    /// A prompt pass's start in `slot`: the reply fitted, the slot and its drafter context reset, a kept prefix restored.
+    fn beginPass(b: *Lanes, s: *lanes.Stream, slot: u32) !void {
         const ids = s.prompt();
         // the reply is fitted to the context less the drafter's 17 slots; only a prompt with no room is refused
         s.max_new = @import("xpu_admit.zig").fitReply(ids.len, s.max_new, b.runner.context, 17) orelse return error.PromptTooLong;
@@ -201,12 +220,8 @@ pub const Lanes = struct {
             try d.use(slot);
             d.reset();
             r.taps_on = true;
-            b.prompt_skip = @intCast(ids.len -| xq.drafter.WIN);
         }
-        defer {
-            r.taps_on = false;
-            b.prompt_skip = 0;
-        }
+        defer r.taps_on = false;
         s.cached = 0;
         var at: usize = 0;
         if (s.reuse.saved) |saved| { // a kept state of this prompt's prefix: the pass starts there
@@ -226,27 +241,46 @@ pub const Lanes = struct {
                 }
             } else s.reuse_failed = true;
         }
-        if (b.drafter != null) b.prompt_skip = @intCast((ids.len -| xq.drafter.WIN) -| at);
-        // chunks cut where the request's chunks and the cache's marks are, as a fresh pass cuts them
-        while (at < ids.len) {
-            if (s.isCancelled()) return error.Cancelled;
-            var end = xq.chunkEnd(at, ids.len);
-            for (s.chunks) |cut| if (cut > at and cut < end) {
-                end = cut;
-            };
-            for (s.reuse.marks) |mark| if (mark > at and mark < end) {
-                end = mark;
-            };
-            try r.prompt(ids[at..end], end == ids.len);
-            at = end;
-            if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) if (s.reuse.hook) |k| k.at(k.ptr, s, @intCast(at));
+        b.fill[slot] = .{ .on = true, .at = at, .skip = if (b.drafter != null) @intCast((ids.len -| xq.drafter.WIN) -| at) else 0 };
+        s.fill_at.store(@intCast(at), .monotonic);
+    }
+
+    /// The pass's next chunk in `slot` (cut where the request's chunks and the cache's marks are, as a fresh pass cuts
+    /// them); true once the prompt is in, its last row's logits kept when the stream samples.
+    fn passChunk(b: *Lanes, s: *lanes.Stream, slot: u32) !bool {
+        const ids = s.prompt();
+        const r = b.runner;
+        const f = &b.fill[slot];
+        if (f.at >= ids.len) return true;
+        if (s.isCancelled()) return error.Cancelled;
+        if (r.slot != slot) try r.select(slot); // a decode round between slices made another slot current
+        r.taps_on = b.drafter != null;
+        b.prompt_skip = f.skip;
+        defer {
+            r.taps_on = false;
+            f.skip = b.prompt_skip;
+            b.prompt_skip = 0;
         }
+        const at = f.at;
+        var end = xq.chunkEnd(at, ids.len);
+        for (s.chunks) |cut| if (cut > at and cut < end) {
+            end = cut;
+        };
+        for (s.reuse.marks) |mark| if (mark > at and mark < end) {
+            end = mark;
+        };
+        try r.prompt(ids[at..end], end == ids.len);
+        f.at = end;
+        s.fill_at.store(@intCast(end), .monotonic);
+        if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(end)) != null) if (s.reuse.hook) |k| k.at(k.ptr, s, @intCast(end));
+        if (end < ids.len) return false;
         if (s.sampling != null or s.grammar != null) {
             const row = try r.logits();
             const keep = b.first_logits[slot] orelse try b.gpa.alloc(f32, row.len);
             @memcpy(keep, row);
             b.first_logits[slot] = keep;
         }
+        return true;
     }
 
     /// The bytes keepSave takes at `at` tokens.
@@ -298,6 +332,29 @@ pub const Lanes = struct {
         b.owners[slot] = s;
         errdefer b.owners[slot] = null;
         try b.prefillSlot(s, slot);
+    }
+
+    /// XPU_PROMPT_SLICE: one chunk of the prompt pass a call, false while chunks remain; the lane host runs decode
+    /// rounds of the other streams between calls. The chunks are the whole pass's (chunkEnd from the pass's start,
+    /// the request's chunks and the cache's marks), so the prompt's bits are the same.
+    fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
+        const b = self(ptr);
+        try b.settle();
+        const held = b.slotOf(s);
+        const slot = if (held != null and b.fill[held.?].on) held.? else blk: {
+            const sl = held orelse (b.freeSlot() orelse return error.NoFreeSlot);
+            b.owners[sl] = s;
+            errdefer b.owners[sl] = null;
+            try b.beginPass(s, sl);
+            break :blk sl;
+        };
+        errdefer {
+            b.fill[slot].on = false;
+            b.owners[slot] = null;
+        }
+        if (!try b.passChunk(s, slot)) return false;
+        b.fill[slot].on = false;
+        return true;
     }
 
     fn draw(b: *Lanes, s: *const lanes.Stream, slot: u32, row: ?[]const f32, position: u64) !u32 {
@@ -597,6 +654,7 @@ pub const Lanes = struct {
         const slot = b.slotOf(s) orelse return;
         b.owners[slot] = null;
         b.chain_n[slot] = 0;
+        b.fill[slot].on = false;
     }
 
     /// A lone drafted stream in slot 0 on DFlash2 trees until it ends (false) or another stream arrives (true).

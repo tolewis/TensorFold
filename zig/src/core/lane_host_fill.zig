@@ -99,7 +99,18 @@ pub fn run(h: *LaneHost) void {
 
 /// A prompt whose whole pass is at most `h.share.short` rows (a long prompt's last rows are not).
 fn short(h: *const LaneHost, j: *const LaneHost.Job) bool {
-    return j.stream.prompt_len -| j.stream.cached <= h.share.short;
+    return j.stream.prompt_len -| known(h, j) <= h.share.short;
+}
+
+/// A set-up job whose pass is longer than `h.share.short` rows: with `slice_long` it fills by slices, not alone.
+pub fn long(h: *const LaneHost, j: *const LaneHost.Job) bool {
+    return !short(h, j);
+}
+
+/// The prompt rows a job's pass will not run: what it has cached, and with `slice_long` a kept prefix it resumes from.
+fn known(h: *const LaneHost, j: *const LaneHost.Job) u64 {
+    const kept: u64 = if (h.slice_long and !j.fill_began and j.stream.reuse.saved != null) j.stream.reuse.at else 0;
+    return @max(j.stream.cached, kept);
 }
 
 /// A long prompt's step runs now: none owed, or nothing decoding.
