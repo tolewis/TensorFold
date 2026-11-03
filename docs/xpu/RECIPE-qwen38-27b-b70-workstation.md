@@ -34,8 +34,11 @@ Prefill is about the same as p36: 39k in 26.7 s, 120k in 115 to 121 s.
 ### Agent harness settings
 
 pi always sends its model `maxTokens` (32,768) as `max_tokens`. The stock server refuses a request when prompt +
-`max_tokens` is more than the window. The jubiku build adds `TF_CLAMP_MAX_TOKENS=1` (branch
-`lane/p39-clamp-max-tokens` on inf1-integrate): the server cuts `max_tokens` to the room left and does not refuse.
+`max_tokens` is more than the window. Production runs `lane/p42-replyclamp` (commit `7d08c424b`, p39 K1 plus a
+reply fit) with `TF_REPLY_FLOOR=1`. The server cuts `max_tokens` to the room left, and the engine keeps 17 positions
+for the drafter, so a reply that fills the window is cut 17 tokens short and never fails. Tested on 2026-11-03:
+`max_tokens` 217,088, 217,060 and 300,000 with a 30-token prompt all return 200. The earlier p39 clamp
+(`TF_CLAMP_MAX_TOKENS=1`) gave a 500 `PromptTooLong` when `max_tokens` filled the window. Do not use it.
 
 pi compaction rule: `reserveTokens` = one full reply (32,768), not a percentage of the window. pi compacts at
 217,088 − 32,768 = 184,320 tokens and keeps the last 32,768 tokens after a compaction. Fleet policy:
