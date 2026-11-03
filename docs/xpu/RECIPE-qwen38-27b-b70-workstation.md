@@ -33,8 +33,10 @@ Prefill is about the same as p36: 39k in 26.7 s, 120k in 115 to 121 s.
 
 ### Agent harness settings
 
-pi always sends its model `maxTokens` (32,768) as `max_tokens`. The stock server refuses a request when prompt +
-`max_tokens` is more than the window. Production runs `lane/p42-replyclamp` (commit `7d08c424b`, p39 K1 plus a
+pi 1.5.0 sends `max_tokens` = min(model `maxTokens`, `contextWindow` − its context estimate − 4,096)
+(pi-ai `dist/api/simple-options.js`, `clampMaxTokensToContext`). The estimate is the last reported usage plus
+characters / 4 for newer messages. Token-dense tool output (binary, base64) makes that estimate low, so prompt +
+`max_tokens` can still be more than the window. The stock server refuses such a request. Production runs `lane/p42-replyclamp` (commit `7d08c424b`, p39 K1 plus a
 reply fit) with `TF_REPLY_FLOOR=1`. The server cuts `max_tokens` to the room left, and the engine keeps 17 positions
 for the drafter, so a reply that fills the window is cut 17 tokens short and never fails. Tested on 2026-11-03:
 `max_tokens` 217,088, 217,060 and 300,000 with a 30-token prompt all return 200. The earlier p39 clamp
