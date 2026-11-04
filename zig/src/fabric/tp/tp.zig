@@ -22,6 +22,8 @@ pub const planlink = @import("planlink.zig");
 pub const Verbs = @import("verbs").Verbs;
 
 pub const Collective = collective.Collective;
+pub const DevicePtr = collective.DevicePtr;
+pub const Stream = collective.Stream;
 pub const DType = collective.DType;
 pub const Op = collective.Op;
 pub const Config = config.Config;

@@ -80,7 +80,7 @@ pub const Ctx = struct {
     }
 
     /// Above two ranks, the actual NCCL result is the reference, with the same in-place geometry.
-    fn sumReference(c: *Ctx, n: usize, t: DType, offset: ?usize, input: cuda.abi.DevicePtr) !void {
+    fn sumReference(c: *Ctx, n: usize, t: DType, offset: ?usize, input: tp.DevicePtr) !void {
         if (c.world == 2 or t == .u8 or t == .i32 or t == .i64) return;
         const slow = c.baseline orelse return error.MissingNcclReference;
         const out = c.oracle.ptr + (offset orelse 0);

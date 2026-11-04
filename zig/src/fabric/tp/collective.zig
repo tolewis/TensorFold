@@ -1,9 +1,10 @@
 //! The tensor-parallel communicator every backend implements: stream-ordered, graph-capturable, rank-order sums.
 const std = @import("std");
-const cuda = @import("cuda");
 
-pub const DevicePtr = cuda.abi.DevicePtr;
-pub const Stream = cuda.abi.Stream;
+/// A device address: `u64`, the value every backend's API takes. A CUDA device pointer is one.
+pub const DevicePtr = u64;
+/// The stream a collective queues on, opaque to the collective: a backend passes its own handle. A CUDA stream is one.
+pub const Stream = ?*anyopaque;
 
 pub const Error = error{ Aborted, NcclReductionRequired, NcclExchangeRequired, Unsupported, Invalid, PeerFailed, Timeout, BackendFailed };
 
