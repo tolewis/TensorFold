@@ -77,15 +77,15 @@ pub const Lanes = struct {
     }
 
     pub fn backend(b: *Lanes) be.Backend {
-        const whole: be.Backend.VTable = .{ .prefill = prefillFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .tree = treeFn, .release = releaseFn };
-        const sliced: be.Backend.VTable = blk: {
-            var v = whole;
-            v.prefill_step = prefillStepFn;
-            v.reports_fill = true;
-            break :blk v;
-        };
-        return .{ .ptr = b, .vtable = if (b.slice) &sliced else &whole };
+        return .{ .ptr = b, .vtable = vtableOf(b.slice) };
     }
+
+    /// The backend's vtable: whole prompt passes, or (XPU_PROMPT_SLICE) a chunk a call; static (xpu_slice_vtable.zig).
+    pub fn vtableOf(slice: bool) *const be.Backend.VTable {
+        return Vt.of(slice);
+    }
+
+    const Vt = @import("xpu_slice_vtable.zig").Vtables(.{ .prefill = prefillFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .tree = treeFn, .release = releaseFn }, prefillStepFn);
 
     /// What the round loop reads: chains of up to 16 rows, all streams' windows in one shared forward, DFlash2 drafts
     pub fn facts(b: *const Lanes) lanes.Model {
