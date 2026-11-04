@@ -39,14 +39,14 @@ KERNEL(256) void tp_add(global ushort *out, global const ushort *a, global const
   out[i] = as_ushort((half)s);
 }
 
-// The peer's partial is already in `peer` (pushed over PCIe before the flag). Wait for the flag, then add.
-KERNEL(256) void tp_add_flag(global ushort *out, global const ushort *peer, int n,
+// The peer's partial is already in `peer` (pushed over PCIe before the flag). Wait for the flag, then add `a`.
+KERNEL(256) void tp_add_flag(global ushort *out, global const ushort *a, global const ushort *peer, int n,
                              global volatile ulong *flag, ulong seq, global volatile uint *timeout) {
   const int i = get_global_id(0), lid = get_local_id(0);
   if (lid == 0) tp_wait(flag, seq, timeout);
   barrier(CLK_LOCAL_MEM_FENCE);
   if (i >= n) return;
-  const float s = (float)as_half(out[i]) + (float)as_half(peer[i]);
+  const float s = (float)as_half(a[i]) + (float)as_half(peer[i]);
   out[i] = as_ushort((half)s);
 }
 

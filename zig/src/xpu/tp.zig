@@ -13,15 +13,16 @@
 //! copy brings the peer's slot over PCIe and a kernel adds it into this rank's buffer (ze_ipc.py: 10 KB in 10.9 us, 9.2 MB in 283 us). The
 //! host settle before the counter stays.
 //!
-//! The device-flag path (TF_TP_DEVFLAG=1, default off; it needs a build with the tp_add_flag, add_rmsnorm_dec_tp and
-//! tp_consume kernels): no host wait an exchange. Each rank pushes its partial into the peer's exported slot over
+//! The device-flag path (TF_TP_DEVFLAG=1, default off; it needs a build with the tp_add_flag and tp_consume
+//! kernels): no host wait an exchange. Each rank pushes its partial into the peer's exported slot over
 //! PCIe (a copy into the IPC-opened block), then writes the exchange's sequence number into the peer's flag word on
 //! the same in-order list. The peer's add kernel polls that flag in device memory, adds, and a small kernel publishes
 //! the consumed counter and waits until the peer consumed the slot the next exchange writes again (two slots, so a
 //! rank cannot overrun its peer by more than one exchange). A rank that times out sets a timeout word and the host
-//! reports PeerLost at the next settle. The mixer's exchange is fused into the residual add and norm that reads the
-//! reduced tensor once (add_rmsnorm_dec_tp). At open the path proves that the peer's memory takes this rank's writes
-//! and both ranks agree on the mode over the socket; any failure leaves the host path in place.
+//! reports PeerLost at the next settle. The exchange is separate from the residual add and norm that reads the
+//! reduced tensor: the caller adds the sum after it, which is the shape of an upstream Collective allReduce. At open
+//! the path proves that the peer's memory takes this rank's writes and both ranks agree on the mode over the socket;
+//! any failure leaves the host path in place.
 //!
 //! The file: TF_TP_SHM names it (default /dev/shm/tf-tp-qwen27). Rank 0 creates and sizes it, rank 1 opens it.
 //! Layout: a header of TP sequence counters (u64, cache-line apart), then two slots a rank of `rows_max` x D fp16
@@ -34,6 +35,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const q = @import("qwen27.zig");
+const sum = @import("tp_sum.zig");
 const dev = @import("dev.zig");
 const ze = @import("ze");
 const Dev = dev.Dev;
@@ -78,22 +80,6 @@ pub const Rec = extern struct { seq: u64, op: u32, a: u32, b: u32, n: u32, lo: u
 comptime {
     std.debug.assert(@sizeOf(Rec) == rec_words * 4);
 }
-
-/// The residual add and norm the device-flag exchange can be fused into (add_rmsnorm_dec_tp).
-pub const Norm = struct {
-    x: *anyopaque, // fp32 residual [rows, D]
-    w: *anyopaque, // the norm weight (bf16)
-    h: *anyopaque, // fp16 normed output [rows, D]
-    ahi: *anyopaque,
-    alo: *anyopaque,
-    a8: ?*anyopaque = null, // the W4A8 quantized copy, when the site asks for it
-    sa: ?*anyopaque = null,
-    ms: i32 = 0,
-    eps: f32,
-    has_r: i32,
-    gs: i32,
-    rot: i32,
-};
 
 /// The magic a rank writes into the peer's flag word at open (plus its rank), to prove the host-to-peer write
 /// lands. `tp_magic2` does the same for the device-to-peer write the partial push uses.
@@ -246,8 +232,10 @@ pub const Group = struct {
     /// Step records written (rank 0) or consumed (a follower).
     step: u64 = 0,
     /// Host-visible staging for this rank's partial and for the sum (Level Zero host memory, so the copies are DMA).
-    mine: [*]u16,
-    sum: [*]u16,
+    mine: [*]u8,
+    sum: [*]u8,
+    /// The fp32 accumulator of the rank-order sum, one f32 an element of `slot_bytes` worth of partial.
+    acc: [*]f32,
     /// The device-direct path: this rank's two device slots and the peer's two, opened here. `direct` false: host path.
     dslot: [2]*anyopaque = undefined,
     peer: [2]?*anyopaque = .{ null, null },
@@ -281,9 +269,10 @@ pub const Group = struct {
     }
     /// Rank r's slot for call `seq` (1-based: the value of g.seq after the bump). TF_TP_ONE_SLOT=1 (a debug switch)
     /// uses one slot a rank as the first form did.
-    fn slot(g: *const Group, r: u32, seq: u64) [*]u16 {
+    /// Rank r's slot for call `seq` (1-based: the value of g.seq after the bump), as bytes of the partial's type.
+    fn slot(g: *const Group, r: u32, seq: u64) [*]u8 {
         const parity: u32 = if (one_slot) 0 else @intCast(seq % 2);
-        return @ptrCast(@alignCast(g.map.ptr + hdr + g.tp * line + (2 * r + parity) * slot_bytes));
+        return g.map.ptr + hdr + g.tp * line + (2 * r + parity) * slot_bytes;
     }
     fn consumed(g: *const Group) *std.atomic.Value(u64) {
         return @ptrCast(@alignCast(g.map.ptr + hdr + g.tp * line + 2 * g.tp * slot_bytes));
@@ -435,6 +424,7 @@ pub const Group = struct {
                 .gen = 0,
                 .mine = @ptrCast(@alignCast(try d.g.hostAlloc(slot_bytes))),
                 .sum = @ptrCast(@alignCast(try d.g.hostAlloc(slot_bytes))),
+                .acc = @ptrCast(@alignCast(try d.g.hostAlloc(rows_max * D * 4))),
             };
             // Every shared word is reset before the generation is published: a follower that reads the generation reads
             // a segment that is already clean. A follower resets nothing, so it cannot clear a word rank 0 is using.
@@ -470,6 +460,7 @@ pub const Group = struct {
                 .gen = seg.gen,
                 .mine = @ptrCast(@alignCast(try d.g.hostAlloc(slot_bytes))),
                 .sum = @ptrCast(@alignCast(try d.g.hostAlloc(slot_bytes))),
+                .acc = @ptrCast(@alignCast(try d.g.hostAlloc(rows_max * D * 4))),
             };
         }
         // The listener and the connect are in `open` itself (a peer that never comes fails the open, so systemd
@@ -506,7 +497,7 @@ pub const Group = struct {
                 std.atomic.spinLoopHint();
             }
             const r = g.rec(g.step);
-            r.op = @intFromEnum(if (first) op else Op.more);
+            r.op = @backingInt(if (first) op else Op.more);
             r.a = a;
             r.b = b;
             r.n = @intCast(data.len);
@@ -598,29 +589,35 @@ pub const Group = struct {
         lostAt(g, "rank {d}: all-reduce {d}: the group is lost ({s})\n", .{ g.rank, g.seq, @errorName(e) });
     }
 
-    /// `partial` on the device holds `rows` x D fp16: on return it holds the ranks' sum. Every rank calls this the
-    /// same number of times in the same order.
-    pub fn allReduce(g: *Group, d: *Dev, partial: *anyopaque, rows: u32) !void {
+    /// `dst[count]` <- the sum of this rank's and the peer's `src[count]` partials of `dtype`: the ranks add in rank
+    /// order in fp32 and the sum is rounded once to the activation type (fp16). Every rank calls this the same number
+    /// of times in the same order, so both hold the same bits. `src` and `dst` may be the same buffer.
+    pub fn allReduce(g: *Group, d: *Dev, src: *anyopaque, dst: *anyopaque, count: usize, dtype: sum.DType, op: sum.Op) !void {
+        if (op != .sum) return error.UnsupportedOp; // the engine asks for a sum only
+        if (count == 0 or count % D != 0) return error.BadCount;
+        const rows = count / D;
         if (rows > rows_max) return error.TooManyRows;
-        const n: usize = @as(usize, rows) * D;
+        const n = count;
+        const es = dtype.size();
         g.seq += 1;
         if (g.devflag) {
             const par: usize = @intCast(g.seq % 2);
-            try g.push(d, partial, n, par);
+            try g.push(d, src, n, par, es);
             try d.launch(d.k.tp_add_flag, .{ .x = @intCast((n + 255) / 256) }, .{
-                partial,                                   // out: this rank's partial, the sum lands here
-                off(g.blk.?, par * slot_bytes),            // the peer's push (read after the flag)
-                @as(i32, @intCast(n)),                     //
-                off(g.blk.?, blk_flag + par * 8),          // the flag the peer wrote
-                g.seq,                                     //
-                off(g.blk.?, blk_timeout),                 //
+                dst, // out: the sum, at the activation type
+                src, // this rank's partial
+                off(g.blk.?, par * slot_bytes), // the peer's push (read after the flag)
+                @as(i32, @intCast(n)), //
+                off(g.blk.?, blk_flag + par * 8), // the flag the peer wrote
+                g.seq, //
+                off(g.blk.?, blk_timeout), //
             });
             try g.consume(d, par);
             return;
         }
         if (g.direct) { // the partial into this rank's slot, the counter, then the add kernel reads the peer's slot
             const par: usize = @intCast(g.seq % 2);
-            try dev.copy(d, g.dslot[par], partial, n * 2);
+            try dev.copy(d, g.dslot[par], src, n * es);
             d.settle();
             g.counter(g.rank).store(g.seq, .seq_cst); // the counter and the liveness word are the rank's heartbeat
             aliveWord(g, g.rank).store(@intFromFloat(q.now()), .release);
@@ -628,66 +625,32 @@ pub const Group = struct {
                 // the group is lost: this rank closes it and exits instead of waiting 180 s or serving broken rounds
                 waitGroupLost(g, e);
             }
-            try dev.copy(d, g.pbuf[par], g.peer[par].?, n * 2); // over PCIe, on the in-order list
-            try d.launch(d.k.tp_add, .{ .x = @intCast((n + 255) / 256) }, .{ partial, g.dslot[par], g.pbuf[par], @as(i32, @intCast(n)) });
+            try dev.copy(d, g.pbuf[par], g.peer[par].?, n * es); // over PCIe, on the in-order list
+            try d.launch(d.k.tp_add, .{ .x = @intCast((n + 255) / 256) }, .{ dst, g.dslot[par], g.pbuf[par], @as(i32, @intCast(n)) });
             return;
         }
-        try dev.copy(d, @ptrCast(g.mine), partial, n * 2);
+        try dev.copy(d, @ptrCast(g.mine), src, n * es);
         d.settle();
-        @memcpy(g.slot(g.rank, g.seq)[0..n], g.mine[0..n]);
+        @memcpy(g.slot(g.rank, g.seq)[0 .. n * es], std.mem.sliceAsBytes(g.mine[0 .. n * es]));
         g.counter(g.rank).store(g.seq, .seq_cst); // the counter and the liveness word are the rank's heartbeat
         aliveWord(g, g.rank).store(@intFromFloat(q.now()), .release);
         if (g.waitPeers()) |_| {} else |e| {
             // the group is lost: this rank closes it and exits instead of waiting 180 s or serving broken rounds
             waitGroupLost(g, e);
         }
-        // the sum in fp32, rounded once: the ranks add in the same order, so both hold the same bits
-        for (0..n) |i| {
-            var acc: f32 = 0;
-            for (0..g.tp) |r| acc += @floatCast(@as(f16, @bitCast(g.slot(@intCast(r), g.seq)[i])));
-            g.sum[i] = @bitCast(@as(f16, @floatCast(acc)));
-        }
-        try dev.copy(d, partial, @ptrCast(g.sum), n * 2);
+        // the sum in fp32, in rank order, rounded once to fp16: both ranks add the same bytes in the same order
+        var parts: [4][]const u8 = undefined;
+        for (0..g.tp) |r| parts[r] = std.mem.sliceAsBytes(g.slot(@intCast(r), g.seq)[0 .. n * es]);
+        try sum.reduce(parts[0..g.tp], dtype, .f16, n, g.acc[0..n], std.mem.sliceAsBytes(g.sum[0 .. n * 2]));
+        try dev.copy(d, dst, @ptrCast(g.sum), n * 2);
         d.settle();
-    }
-
-    /// The mixer's exchange fused into the residual add and norm that reads the reduced tensor once
-    /// (add_rmsnorm_dec_tp, TF_TP_DEVFLAG): the same bits as the separate add and norm. `partial` keeps the sum.
-    pub fn allReduceNorm(g: *Group, d: *Dev, partial: *anyopaque, rows: u32, nrm: Norm) !void {
-        if (!g.devflag) return error.NotDeviceFlag;
-        if (rows > rows_max) return error.TooManyRows;
-        const n: usize = @as(usize, rows) * D;
-        g.seq += 1;
-        const par: usize = @intCast(g.seq % 2);
-        try g.push(d, partial, n, par);
-        try d.launch(d.k.tp_norm_tp, .{ .x = rows }, .{
-            nrm.x,                                    // X fp32 residual
-            partial,                                  // R fp16, keeps the sum
-            off(g.blk.?, par * slot_bytes),           // the peer's push
-            off(g.blk.?, blk_flag + par * 8),         //
-            g.seq,                                    //
-            off(g.blk.?, blk_timeout),                //
-            nrm.w,                                    // WN
-            nrm.h,                                    //
-            nrm.ahi,                                  //
-            nrm.alo,                                  //
-            @as(i32, D),                              //
-            nrm.eps,                                  //
-            nrm.has_r,                                //
-            nrm.gs,                                   //
-            nrm.a8,                                   //
-            nrm.sa,                                   //
-            nrm.ms,                                   //
-            nrm.rot,                                  //
-        });
-        try g.consume(d, par);
     }
 
     /// Pushes this rank's partial into the peer's slot and then the flag, both on the in-order list: the peer's
     /// kernel sees the partial complete before the flag.
-    fn push(g: *Group, d: *Dev, partial: *anyopaque, n: usize, par: usize) !void {
+    fn push(g: *Group, d: *Dev, src: *anyopaque, n: usize, par: usize, es: usize) !void {
         const pb = g.peer_blk.?;
-        try dev.copy(d, off(pb, par * slot_bytes), partial, n * 2);
+        try dev.copy(d, off(pb, par * slot_bytes), src, n * es);
         const hi: usize = @intCast(g.seq % fh_ring);
         g.fh[hi] = g.seq;
         try dev.copy(d, off(pb, blk_flag + par * 8), @ptrCast(&g.fh[hi]), 8);
@@ -714,10 +677,10 @@ pub const Group = struct {
         const counts = [_]u32{ 1, 8, 16, 32 };
         var out: [4]f64 = @splat(0);
         for (counts, 0..) |rows, i| {
-            try g.allReduce(d, partial, rows); // warm
+            try g.allReduce(d, partial, partial, @as(usize, rows) * D, .f16, .sum); // warm
             d.settle();
             const t0 = q.now();
-            for (0..128) |_| try g.allReduce(d, partial, rows);
+            for (0..128) |_| try g.allReduce(d, partial, partial, @as(usize, rows) * D, .f16, .sum);
             d.settle();
             out[i] = (q.now() - t0) * 1e3;
         }
@@ -890,7 +853,7 @@ test "the shared segment's header words do not collide" {
     const map = try std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(std.heap.page_size_min), size);
     defer std.testing.allocator.free(map);
     @memset(map, 0);
-    const g: Group = .{ .map = map, .rank = 0, .tp = 2, .mine = undefined, .sum = undefined };
+    const g: Group = .{ .map = map, .rank = 0, .tp = 2, .mine = undefined, .sum = undefined, .acc = undefined };
     const base = @intFromPtr(map.ptr);
     const words = [_]usize{
         @intFromPtr(g.genWord()) - base,

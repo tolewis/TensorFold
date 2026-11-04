@@ -163,6 +163,10 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     // the rank mode word's bit layout: a pure host test, run by name only, so no runner opens and no card is touched
     const mode_step = b.step("test-mode-word", "The TP 2 rank mode word's bit layout (no card)");
     if (target.result.cpu.arch == host.cpu.arch and target.result.os.tag == host.os.tag) mode_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = qwen27, .filters = &.{"mode word:"} })).step);
+    // the TP exchange's arithmetic (lane tfu-coll): the rank-order fp32 sum, its rounding and NaN, no card
+    const sum_step = b.step("test-tp-sum", "The TP exchange's rank-order fp32 sum: same bits on both ranks, NaN kept (no card)");
+    const sum_mod = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/tp_sum.zig"), .target = target, .optimize = optimize });
+    if (target.result.cpu.arch == host.cpu.arch and target.result.os.tag == host.os.tag) sum_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = sum_mod })).step);
     // MLX 4/64 rank slices (lane p36-mlx-tp2): pure host slicing and a CPU reference matvec, no card
     const mlx_step = b.step("test-mlx-tp-slice", "MLX 4/64 TP rank slices: concat for column splits, sum for row splits (no card)");
     const mlx_mod = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/mlx_tp.zig"), .target = target, .optimize = optimize });
