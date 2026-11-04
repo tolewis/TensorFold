@@ -14,7 +14,7 @@ var tp_ranks: u32 = 1;
 
 /// The qwen27 kernels whose compiled widths follow the rank (shape.h): the layer kernels, not the drafter's.
 fn tpKernel(name: []const u8) bool {
-    for ([_][]const u8{ "glue", "decode", "gemm", "gemm128", "gdn", "k1" }) |n| if (std.mem.eql(u8, name, n)) return true;
+    for ([_][]const u8{ "glue", "decode", "gemm", "gemm128", "gemm_f32", "gemm128_f32", "gdn", "k1" }) |n| if (std.mem.eql(u8, name, n)) return true;
     return false;
 }
 
@@ -42,6 +42,9 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .{ "k1", "zig/kernels/xpu/qwen27/k1.cl", "" },
         .{ "gemm", "zig/kernels/xpu/qwen27/gemm.cl", " -DGSZ=64" },
         .{ "gemm128", "zig/kernels/xpu/qwen27/gemm.cl", " -DGSZ=128" },
+        // the same kernels with an fp32 C: the TP row-split projections' partials, before the exchange
+        .{ "gemm_f32", "zig/kernels/xpu/qwen27/gemm.cl", " -DGSZ=64 -DOUT_F32" },
+        .{ "gemm128_f32", "zig/kernels/xpu/qwen27/gemm.cl", " -DGSZ=128 -DOUT_F32" },
         .{ "gdn", "zig/kernels/xpu/qwen27/gdn_chunk.cl", "" },
         .{ "drafter", "zig/kernels/xpu/qwen27/drafter.cl", "" },
         // Sage-A1.5 (qwen3_5_moe): the same sources at its shape (shape.h); the GEMM and GDN chunk images are shared
@@ -72,6 +75,11 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .{ "ngen_swiglu", "64", &.{ "b3", "swiglu" } },
         .{ "ngen_swiglu128", "128", &.{ "b3", "swiglu" } },
         .{ "ngen_a8", "128", &.{"a8"} },
+        // the fp32 C of the same prompt GEMMs (the TP row-split projections' partials)
+        .{ "ngen_narrow_f32", "64", &.{ "s4", "asplit", "f32" } },
+        .{ "ngen_narrow128_f32", "128", &.{ "s4", "asplit", "f32" } },
+        .{ "ngen_a8_f32", "128", &.{ "a8", "f32" } },
+        .{ "ngen_a4_f32", "128", &.{ "a4", "f32" } },
         .{ "ngen_a8_swiglu", "128", &.{ "a8", "swiglu" } },
         .{ "ngen_a4", "128", &.{"a4"} },
     }) |z| {
@@ -99,6 +107,12 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         \\pub const ngen_a8 align(8) = @embedFile("ngen_a8.zebin").*;
         \\pub const ngen_a8_swiglu align(8) = @embedFile("ngen_a8_swiglu.zebin").*;
         \\pub const ngen_a4 align(8) = @embedFile("ngen_a4.zebin").*;
+        \\pub const gemm_f32 align(8) = @embedFile("gemm_f32.bin").*;
+        \\pub const gemm128_f32 align(8) = @embedFile("gemm128_f32.bin").*;
+        \\pub const ngen_narrow_f32 align(8) = @embedFile("ngen_narrow_f32.zebin").*;
+        \\pub const ngen_narrow128_f32 align(8) = @embedFile("ngen_narrow128_f32.zebin").*;
+        \\pub const ngen_a8_f32 align(8) = @embedFile("ngen_a8_f32.zebin").*;
+        \\pub const ngen_a4_f32 align(8) = @embedFile("ngen_a4_f32.zebin").*;
         \\pub const sage_glue align(8) = @embedFile("sage_glue.bin").*;
         \\pub const sage_decode align(8) = @embedFile("sage_decode.bin").*;
         \\pub const sage_moe align(8) = @embedFile("sage_moe.bin").*;

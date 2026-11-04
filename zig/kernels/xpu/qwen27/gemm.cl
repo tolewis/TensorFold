@@ -141,12 +141,39 @@ kernel void rowsum(global const half *A, global float *Asum, int M, int Mp, int 
     nt = (pid % (GM * nn)) / size;                                                                                   \
   }
 
-#define STORE_HALF(acc)                                                                                              \
+// OUT_F32 (a TP row-split projection): the fp32 accumulator itself, no rounding before the exchange.
+#ifdef OUT_F32
+#define W4_OUT_T float
+#define STORE_OUT(acc)                                                                                               \
+  for (int i = 0; i < SG_M / 8; i++)                                                                                 \
+    for (int j = 0; j < SG_N / 16; j++) {                                                                            \
+      float8 f = acc[i][j];                                                                                          \
+      intel_sub_group_2d_block_write_32b_8r16x1c(C, N * 4, M, N * 4, (int2)(n0 + 16 * j, m0 + 8 * i), (private uint *)&f); \
+    }
+#else
+#define W4_OUT_T half
+#define STORE_OUT(acc)                                                                                               \
   for (int i = 0; i < SG_M / 8; i++)                                                                                 \
     for (int j = 0; j < SG_N / 16; j++) {                                                                            \
       half8 h = convert_half8_rte(acc[i][j]);                                                                        \
       intel_sub_group_2d_block_write_16b_8r16x1c(C, N * 2, M, N * 2, (int2)(n0 + 16 * j, m0 + 8 * i), (private ushort *)&h); \
     }
+#endif
+
+// One tile at (i, j): the same store as STORE_OUT, for the kernels that write it from a loop of their own.
+#ifdef OUT_F32
+#define STORE_ONE(acc, i, j)                                                                                         \
+  {                                                                                                                  \
+    float8 f = acc;                                                                                                  \
+    intel_sub_group_2d_block_write_32b_8r16x1c(C, N * 4, M, N * 4, (int2)(n0 + 16 * (j), m0 + 8 * (i)), (private uint *)&f); \
+  }
+#else
+#define STORE_ONE(acc, i, j)                                                                                         \
+  {                                                                                                                  \
+    half8 h = convert_half8_rte(acc);                                                                                \
+    intel_sub_group_2d_block_write_16b_8r16x1c(C, N * 2, M, N * 2, (int2)(n0 + 16 * (j), m0 + 8 * (i)), (private ushort *)&h); \
+  }
+#endif
 
 #define KERNEL_HEAD(NAME, SG_M_, SG_N_, WG_M, WG_N, OUT_T)                                                           \
   __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(16 * WG_M * WG_N, 1, 1)))      \
@@ -155,7 +182,7 @@ kernel void rowsum(global const half *A, global float *Asum, int M, int Mp, int 
 
 // Without slices (wide shapes): groups in order, first to last.
 #define W4N_KERNEL(NAME, SG_M_, SG_N_, WG_M, WG_N, R, READ_A, PF, SWIZZLE)                                           \
-  KERNEL_HEAD(NAME, SG_M_, SG_N_, WG_M, WG_N, half) {                                                                \
+  KERNEL_HEAD(NAME, SG_M_, SG_N_, WG_M, WG_N, W4_OUT_T) {                                                                \
     enum { SG_M = SG_M_, SG_N = SG_N_ };                                                                             \
     TILE_ORDER(SWIZZLE)                                                                                              \
     const int sg = get_sub_group_id(), lane = get_sub_group_local_id();                                             \
@@ -165,13 +192,13 @@ kernel void rowsum(global const half *A, global float *Asum, int M, int Mp, int 
     for (int i = 0; i < SG_M / 8; i++)                                                                               \
       for (int j = 0; j < SG_N / 16; j++) acc[i][j] = 0.0f;                                                          \
     for (int g = 0; g < K / GSZ; g++) GROUP_STEP(SG_M, SG_N, R, READ_A, PF, g, acc)                                  \
-    STORE_HALF(acc)                                                                                                  \
+    STORE_OUT(acc)                                                                                                  \
   }
 
 // With slices (narrow shapes): K in fixed slices summed from 0, total = ((t0 + t1) + t2) + t3, same bits either way.
 #define SLICES 4
 #define W4S3_KERNEL(NAME, SG_M_, SG_N_, WG_M, WG_N, R, READ_A, PF, SWIZZLE)                                          \
-  KERNEL_HEAD(NAME, SG_M_, SG_N_, WG_M, WG_N, half) {                                                                \
+  KERNEL_HEAD(NAME, SG_M_, SG_N_, WG_M, WG_N, W4_OUT_T) {                                                                \
     enum { SG_M = SG_M_, SG_N = SG_N_ };                                                                             \
     TILE_ORDER(SWIZZLE)                                                                                              \
     const int sg = get_sub_group_id(), lane = get_sub_group_local_id();                                             \
@@ -189,7 +216,7 @@ kernel void rowsum(global const half *A, global float *Asum, int M, int Mp, int 
       for (int i = 0; i < SG_M / 8; i++)                                                                             \
         for (int j = 0; j < SG_N / 16; j++) total[i][j] += acc[i][j];                                                \
     }                                                                                                                \
-    STORE_HALF(total)                                                                                                \
+    STORE_OUT(total)                                                                                                \
   }
 
 // One slice (get_group_id(2)) per work-group, in fp32 in P[slice][Mp][N]; then w4s3_reduce.
@@ -266,7 +293,7 @@ kernel void rowsum_hl(global const half *A, global half *Ahi, global half *Alo, 
 #define KERNEL_HEAD_K(NAME, LOCAL)                                                                                   \
   __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(LOCAL, 1, 1)))                 \
   kernel void NAME(global const half *A, global const uint *W, global const half *S, global const ushort *Bg,       \
-                   global half *C, int M, int N, int K, global const ushort *Ahi, global const ushort *Alo, int Mp, \
+                   global W4_OUT_T *C, int M, int N, int K, global const ushort *Ahi, global const ushort *Alo, int Mp, \
                    int G)
 
 // Slices in registers, one after the other (wide shapes).
@@ -293,7 +320,7 @@ kernel void rowsum_hl(global const half *A, global half *Ahi, global half *Alo, 
     }                                                                                                                \
     for (int i = 0; i < SG_M / 8; i++)                                                                               \
       for (int j = 0; j < SG_N / 16; j++) BIAS_TILE(total[i][j], i, j)                                               \
-    STORE_HALF(total)                                                                                                \
+    STORE_OUT(total)                                                                                                \
   }
 
 // One slice per subgroup (4 subgroups on one tile), reduced in order in local memory; narrow shapes and verification.
@@ -319,8 +346,7 @@ kernel void rowsum_hl(global const half *A, global half *Ahi, global half *Alo, 
       float8 tot = 0.0f;                                                                                             \
       for (int s = 0; s < SLICES; s++) tot += buf[s][i][j][lane];                                                    \
       BIAS_TILE(tot, i, j)                                                                                           \
-      half8 h = convert_half8_rte(tot);                                                                              \
-      intel_sub_group_2d_block_write_16b_8r16x1c(C, N * 2, M, N * 2, (int2)(n0 + 16 * j, m0 + 8 * i), (private ushort *)&h); \
+      STORE_ONE(tot, i, j)                                                                                           \
     }                                                                                                                \
   }
 

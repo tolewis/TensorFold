@@ -1,6 +1,4 @@
-//! The TP exchange's arithmetic, apart from the transport: the ranks' partials added in rank order in fp32, rounded
-//! once to the activation type. Both ranks call `reduce` with the same partials in the same order, so both hold the
-//! same bits; a NaN in any rank's partial stays a NaN.
+//! The TP exchange's arithmetic: the ranks' partials summed in rank order in fp32, rounded once to the activation type.
 
 const std = @import("std");
 
@@ -102,8 +100,7 @@ test "tp sum: a NaN partial stays a NaN on both ranks" {
 }
 
 test "tp sum: an fp32 partial keeps a term an fp16 partial loses" {
-    // 1.0005859375 and 0.0005859375: as fp32 partials the sum rounds once to 1.0009765625; rounded to fp16 first
-    // (1.0009765625 and 0.00048828125) the sum is 1.00146484375, a tie that rounds to 1.001953125
+    // as fp32 partials the sum rounds once to 1.0009765625; rounded to fp16 first, the tie rounds to 1.001953125
     const a: f32 = 1.0005859375;
     const b: f32 = 0.0005859375;
     var pa: [4]u8 = undefined;

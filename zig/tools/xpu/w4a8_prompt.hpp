@@ -26,7 +26,8 @@ class W4A8Prompt : public ELFCodeGenerator<hw> {
 
 public:
     // a4: W4A4 with rotated int4 activations [M, K/2] bytes; per group one 128 K A tile, two u4 x s4 DPAS on raw words.
-    W4A8Prompt(Product product, bool swiglu, bool a4 = false) : ELFCodeGenerator<hw>(product) {
+    // f32out: the fp32 accumulator itself as C (a TP row-split projection), not rounded to fp16 first.
+    W4A8Prompt(Product product, bool swiglu, bool a4 = false, bool f32out = false) : ELFCodeGenerator<hw>(product) {
         newArgument("A", ExternalArgumentType::GlobalPtr);
         newArgument("W", ExternalArgumentType::GlobalPtr);
         newArgument("S", ExternalArgumentType::GlobalPtr);
@@ -266,6 +267,18 @@ public:
                 add(1, hC.ud(6), m0, 8 * i);
                 store(1, block_2d(DataSizeLSC::D16, 16, 8), A64, hC, GRF(H));
             }
+        } else if (f32out) {
+            // Output: the fp32 accumulators, written by 2D blocks of 8 rows × 16 columns (N·4 bytes a row).
+            shl(1, t.d(2), N, 2);
+            add(1, t.d(2), t.d(2), -1);
+            add(1, t.d(3), M, -1);
+            header(hC, C, t.d(2), t.d(3), 16, 8, 1);
+            for (int i = 0; i < 4; i++)
+                for (int j = 0; j < 2; j++) {
+                    add(1, hC.ud(6), m0, 8 * i);
+                    add(1, hC.ud(5), n0, 16 * j);
+                    store(1, block_2d(DataSizeLSC::D32, 16, 8), A64, hC, GRF(ACC + 8 * (i * 2 + j)));
+                }
         } else
             for (int i = 0; i < 4; i++)
                 for (int j = 0; j < 2; j++) {

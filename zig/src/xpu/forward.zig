@@ -80,6 +80,7 @@ pub const Acts = struct {
     sl: *anyopaque, // fp32 [16, 48, 128, 128]: GDN state after each row of a verified tree
     mt: *anyopaque, // u64 [LAYERS, 16, 8]: stepMulti's per-row state addresses
     mpos: *anyopaque, // i32 [16]: and positions
+    r32: ?*anyopaque, // TP 2: the row-split projections' fp32 partials [maxRows, D], the exchange's source
     a8: *anyopaque, // W4A8 prompt: activations int8 [maxRows, FF] (permuted by blocks of 8) …
     sa: *anyopaque, // … and their scales fp32 [FF / 128, maxRows + 32]
     grp: *anyopaque, // i32 [16, 2]: K1's row groups (first row, rows)
@@ -97,6 +98,7 @@ pub const Acts = struct {
             .ahi = try d.alloc_(rows * (FF / 64) * 2),
             .alo = try d.alloc_(rows * (FF / 64) * 2),
             .r = try d.alloc_(rows * D * 2),
+            .r32 = if (q.TP > 1) try d.alloc_(rows * D * 4) else null,
             .p = try d.alloc_(rows * 2 * FF * 2),
             .q = try d.alloc_(rows * HQ * 256 * 2),
             .k = try d.alloc_(rows * HK * 128 * 2),
@@ -172,7 +174,7 @@ pub fn mlpIn(d: *Dev, m: *const Model, a: *Acts, w: Proj, T: u32, gs: i32, pre: 
         try d.launch(d.k.rowsums_ff, .{ .x = T }, .{ a.p, a.ahi, a.alo, gs, q.rot_on });
         return a.p;
     }
-    try gemmRows(d, a.pscr, a.h, a.ahi, a.alo, w, a.p, T, wide);
+    try gemmRows(d, a.pscr, a.h, a.ahi, a.alo, w, a.p, T, wide, null);
     try d.launch(d.k.swiglu, .{ .x = T, .y = (FF + 1023) / 1024 }, .{ a.p, a.h, a.ahi, a.alo, gs, @as(i32, @intFromBool(w.ilv)), q.rot_on, @as(i32, FF) });
     return a.h;
 }
@@ -189,11 +191,11 @@ pub fn embedRows(d: *Dev, m: *const Model, ids: *anyopaque, x: *anyopaque, rows:
 
 /// out[M, N] fp16 = h[M, K] · Wᵀ : decode kernels up to 16 rows, the nGEN prompt GEMMs above.
 pub fn gemm(d: *Dev, pscr: *anyopaque, h: *anyopaque, ahi: *anyopaque, alo: *anyopaque, w: Proj, out: *anyopaque, m: u32) !void {
-    return gemmRows(d, pscr, h, ahi, alo, w, out, m, m > 16);
+    return gemmRows(d, pscr, h, ahi, alo, w, out, m, m > 16, null);
 }
 
-/// `gemm` with the path chosen by the caller: `wide`, the nGEN prompt GEMMs whatever the rows (a prompt's chunk).
-pub fn gemmRows(d: *Dev, pscr: *anyopaque, h: *anyopaque, ahi: *anyopaque, alo: *anyopaque, w: Proj, out: *anyopaque, m: u32, wide: bool) !void {
+/// `gemm` with the path chosen by the caller (`wide`: the nGEN prompt GEMMs); `out32`: a TP row-split fp32 partial.
+pub fn gemmRows(d: *Dev, pscr: *anyopaque, h: *anyopaque, ahi: *anyopaque, alo: *anyopaque, w: Proj, out: *anyopaque, m: u32, wide: bool, out32: ?*anyopaque) !void {
     const M: i32 = @intCast(m);
     const N: i32 = @intCast(w.n);
     const K: i32 = @intCast(w.k);
@@ -205,21 +207,30 @@ pub fn gemmRows(d: *Dev, pscr: *anyopaque, h: *anyopaque, ahi: *anyopaque, alo: 
     const dec_narrow = if (g128) k.dec_narrow_g128 else k.dec_narrow;
     const ngen_wide = if (g128) k.ngen_wide_g128 else k.ngen_wide;
     const ngen_narrow = if (g128) k.ngen_narrow_g128 else k.ngen_narrow;
+    const dec_narrow32 = if (g128) k.dec_narrow_g128_f32 else k.dec_narrow_f32;
+    const ngen_narrow32 = if (g128) k.ngen_narrow_g128_f32 else k.ngen_narrow_f32;
     const mp: i32 = @intCast((m + 7) / 8 * 8);
+    const o32: ?*anyopaque = if (gemm_hook != null) null else out32;
     if (!wide) {
-        if (w.wide)
+        if (w.wide) {
             // 64 columns per subgroup for the widest shapes (gate|up, head), 32 below (measured end to end)
             if (w.n >= 30000)
                 try d.launch(dec_wide64, .{ .x = 1, .y = w.n / 256 }, .{ h, w.w, w.s, w.bg, out, M, N, K, ahi, alo, mp, G })
             else
-                try d.launch(dec_wide, .{ .x = 1, .y = w.n / 128 }, .{ h, w.w, w.s, w.bg, out, M, N, K, ahi, alo, mp, G })
+                try d.launch(dec_wide, .{ .x = 1, .y = w.n / 128 }, .{ h, w.w, w.s, w.bg, out, M, N, K, ahi, alo, mp, G });
+            if (o32) |o| try widen(d, o, out, @as(usize, m) * w.n);
+        } else if (o32) |o|
+            try d.launch(dec_narrow32.?, .{ .x = 1, .y = w.n / 32 }, .{ h, w.w, w.s, w.bg, o, M, N, K, ahi, alo, mp, G })
         else
             try d.launch(dec_narrow, .{ .x = 1, .y = w.n / 32 }, .{ h, w.w, w.s, w.bg, out, M, N, K, ahi, alo, mp, G });
     } else {
         const tiles = (m + 63) / 64;
         const groups: ze.GroupCount = .{ .x = 8, .y = w.n / 256, .z = (tiles + 7) / 8 };
-        if (w.wide)
-            try d.launch(ngen_wide, groups, .{ h, w.w, w.s, w.bg, out, M, N, K, ahi, alo, mp, G })
+        if (w.wide) {
+            try d.launch(ngen_wide, groups, .{ h, w.w, w.s, w.bg, out, M, N, K, ahi, alo, mp, G });
+            if (o32) |o| try widen(d, o, out, @as(usize, m) * w.n);
+        } else if (o32) |o|
+            try d.launch(ngen_narrow32.?, groups, .{ h, w.w, w.s, w.bg, o, M, N, K, ahi, alo, mp, G, pscr })
         else
             try d.launch(ngen_narrow, groups, .{ h, w.w, w.s, w.bg, out, M, N, K, ahi, alo, mp, G, pscr });
     }
@@ -286,16 +297,27 @@ pub fn kvCap() i32 {
 /// add_rmsnorm without the fused W4A8 quantization (its A8 and SA arguments).
 pub const no_q8: ?*anyopaque = null;
 
-/// Prompt GEMM: W4A8 when on and the rows are prompt rows, else fp16; `pre`: x already in acts.a8; `qrot`: see quantA8.
-pub fn pgemm(d: *Dev, m: *const Model, a: *Acts, x: *anyopaque, w: Proj, out: *anyopaque, T: u32, pre: bool, qrot: i32, int4: bool, wide: bool) !void {
-    if (w.x3) |e| return exl3.project(e, m.exl3.?, d, x, out, T, wide); // EXL3: no W4A8 or W4A4 copies
-    if (!q.prefill_int8 or !wide or w.gs != 128) return gemmRows(d, a.pscr, x, a.ahi, a.alo, w, out, T, wide);
+/// Prompt GEMM: W4A8 on prompt rows when asked, else fp16; `pre`, `qrot`: see quantA8; `out32`: a TP fp32 partial.
+pub fn pgemm(d: *Dev, m: *const Model, a: *Acts, x: *anyopaque, w: Proj, out: *anyopaque, T: u32, pre: bool, qrot: i32, int4: bool, wide: bool, out32: ?*anyopaque) !void {
+    if (w.x3) |e| { // EXL3: no W4A8 or W4A4 copies, and no fp32 epilogue: its fp16 output is widened
+        try exl3.project(e, m.exl3.?, d, x, out, T, wide);
+        if (out32) |o| try widen(d, o, out, T * w.n);
+        return;
+    }
+    if (!q.prefill_int8 or !wide or w.gs != 128) return gemmRows(d, a.pscr, x, a.ahi, a.alo, w, out, T, wide, out32);
     if (int4 and q.prefill_int4) {
         try d.launch(d.k.quant_a4, .{ .x = T }, .{ x, a.a8, a.sa, a.ahi, a.alo, @as(i32, @intCast(w.k)), @as(i32, @intCast(q.maxRows() + 32)), qrot });
+        if (out32) |o| return d.launch(d.k.a4_f32.?, a8Groups(w, T), a8Args(a, w, o, T));
         return d.launch(d.k.a4, a8Groups(w, T), a8Args(a, w, out, T));
     }
     if (!pre) try quantA8(d, a, x, w.k, T, qrot);
+    if (out32) |o| return d.launch(d.k.a8_f32.?, a8Groups(w, T), a8Args(a, w, o, T));
     try d.launch(d.k.a8, a8Groups(w, T), a8Args(a, w, out, T));
+}
+
+/// Widens an fp16 partial into the fp32 slot the exchange carries (a projection with no fp32 epilogue).
+pub fn widen(d: *Dev, out32: *anyopaque, in: *anyopaque, n: usize) !void {
+    try d.launch(d.k.tp_widen.?, .{ .x = @intCast((n + 255) / 256) }, .{ out32, in, @as(i32, @intCast(n)) });
 }
 pub fn quantA8(d: *Dev, a: *Acts, x: *anyopaque, K: u32, T: u32, rot: i32) !void {
     try d.launch(d.k.quant_a8, .{ .x = T }, .{ x, a.a8, a.sa, a.ahi, a.alo, @as(i32, @intCast(K)), @as(i32, @intCast(q.maxRows() + 32)), rot });
@@ -359,7 +381,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
         const min_in = if (q.a8_group != 0 and wide and q.a8_sites & 1 != 0) a.r else a.h;
         if (min_in != a.h) try copy(d, a.r, a.h, T * D * 2);
         try a8(d, a, min_in, D, T, 1);
-        try pgemm(d, m, a, min_in, l.mixer_in, a.p, T, q8on, 0, false, wide);
+        try pgemm(d, m, a, min_in, l.mixer_in, a.p, T, q8on, 0, false, wide, null);
         if (gemm_probe) |f| try f(d, a, l.mixer_in, min_in, T, i, 0);
         if (l.ab) |ab| try d.launch(d.k.dense_rows, .{ .x = (T + 15) / 16, .y = 2 * HV / 16 }, .{ a.h, ab, a.p, t32, @as(i32, GDN_IN), @as(i32, GDN_AB) });
         if (probe) try dumpBuf(d, "p0", a.p, T * GDN_IN, .f16);
@@ -498,9 +520,9 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
             if (probe) try dumpBuf(d, "o0", a.h, T * MIX_OUT, .f16);
         }
         try a8(d, a, a.h, MIX_OUT, T, 2);
-        try pgemm(d, m, a, a.h, l.mixer_out, a.r, T, q8out, 0, q.int4_sites & 2 != 0, wide);
-        if (ranks.group) |*g| // TP: the ranks' partial out-projections summed
-            try g.allReduce(d, a.r, a.r, @as(usize, T) * D, .f16, .sum);
+        try pgemm(d, m, a, a.h, l.mixer_out, a.r, T, q8out, 0, q.int4_sites & 2 != 0, wide, a.r32);
+        if (ranks.group) |*g| // TP: the ranks' partial out-projections (o_proj, the GDN out_proj), fp32, summed
+            try g.allReduce(d, a.r32.?, a.r, @as(usize, T) * D, .f32, .sum);
         if (gemm_probe) |f| try f(d, a, l.mixer_out, a.h, T, i, 1);
         if (probe) try dumpBuf(d, "r0", a.r, T * D, .f16);
         try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs, q8a, q8s, q8ms, q.rot_on });
@@ -508,8 +530,9 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
         if (gemm_probe) |f| try f(d, a, l.gu, a.h, T, i, 2);
         const act = try mlpIn(d, m, a, l.gu, T, gs, q8on, wide);
         try a8(d, a, act, FF, T, 8);
-        try pgemm(d, m, a, act, l.down, a.r, T, false, if (act == a.p) q.rot_on else 0, q.int4_sites & 8 != 0, wide);
-        if (ranks.group) |*g| try g.allReduce(d, a.r, a.r, @as(usize, T) * D, .f16, .sum); // TP: the ranks' partial down projections summed
+        try pgemm(d, m, a, act, l.down, a.r, T, false, if (act == a.p) q.rot_on else 0, q.int4_sites & 8 != 0, wide, a.r32);
+        if (ranks.group) |*g| // TP: the ranks' partial down projections, fp32, summed
+            try g.allReduce(d, a.r32.?, a.r, @as(usize, T) * D, .f32, .sum);
         if (gemm_probe) |f| try f(d, a, l.down, act, T, i, 3);
         if (p0 == 0 and i < 4) try dump(d, a, T, try std.fmt.allocPrint(alloc, "{d}", .{i}), true);
         if (mode.taps) for (TAP_LAYERS, 0..) |tl, slot| if (tl == i)

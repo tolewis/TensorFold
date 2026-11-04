@@ -25,7 +25,7 @@
 //! any failure leaves the host path in place.
 //!
 //! The file: TF_TP_SHM names it (default /dev/shm/tf-tp-qwen27). Rank 0 creates and sizes it, rank 1 opens it.
-//! Layout: a header of TP sequence counters (u64, cache-line apart), then two slots a rank of `rows_max` x D fp16
+//! Layout: a header of TP sequence counters (u64, cache-line apart), then two slots a rank of `rows_max` x D fp32
 //! (call `seq` uses slot seq % 2: a rank one call ahead writes the other slot, so a slow reader's data stays), then
 //! the follower's consumed counter and a ring of `ring_len` step records.
 //!
@@ -44,7 +44,7 @@ const D = q.D;
 
 const line = 64;
 const rows_max = 1024 + 128 + 16; // the widest forward (q.maxRows at XPU_CHUNK 1024) and a decode window
-const slot_bytes = rows_max * D * 2;
+const slot_bytes = rows_max * D * 4;
 const ring_len = 64;
 /// The segment header: the generation (0), the magic (8), then the rank lines. A segment is only taken by a follower
 /// that reads a non-zero generation with the right magic, so a file a dead pair left is never used.
@@ -269,7 +269,7 @@ pub const Group = struct {
     }
     /// Rank r's slot for call `seq` (1-based: the value of g.seq after the bump). TF_TP_ONE_SLOT=1 (a debug switch)
     /// uses one slot a rank as the first form did.
-    /// Rank r's slot for call `seq` (1-based: the value of g.seq after the bump), as bytes of the partial's type.
+    /// Rank r's slot for call `seq` (1-based: g.seq after the bump), as bytes of an fp32 partial.
     fn slot(g: *const Group, r: u32, seq: u64) [*]u8 {
         const parity: u32 = if (one_slot) 0 else @intCast(seq % 2);
         return g.map.ptr + hdr + g.tp * line + (2 * r + parity) * slot_bytes;
@@ -589,20 +589,18 @@ pub const Group = struct {
         lostAt(g, "rank {d}: all-reduce {d}: the group is lost ({s})\n", .{ g.rank, g.seq, @errorName(e) });
     }
 
-    /// `dst[count]` <- the sum of this rank's and the peer's `src[count]` partials of `dtype`: the ranks add in rank
-    /// order in fp32 and the sum is rounded once to the activation type (fp16). Every rank calls this the same number
-    /// of times in the same order, so both hold the same bits. `src` and `dst` may be the same buffer.
+    /// `dst[count]` <- the peer's and this rank's fp32 partials, summed in rank order and rounded once to fp16; `src` and `dst` may be the same buffer.
     pub fn allReduce(g: *Group, d: *Dev, src: *anyopaque, dst: *anyopaque, count: usize, dtype: sum.DType, op: sum.Op) !void {
         if (op != .sum) return error.UnsupportedOp; // the engine asks for a sum only
+        if (dtype != .f32) return error.UnsupportedDType; // the projections write fp32 partials
         if (count == 0 or count % D != 0) return error.BadCount;
         const rows = count / D;
         if (rows > rows_max) return error.TooManyRows;
         const n = count;
-        const es = dtype.size();
         g.seq += 1;
         if (g.devflag) {
             const par: usize = @intCast(g.seq % 2);
-            try g.push(d, src, n, par, es);
+            try g.push(d, src, n, par);
             try d.launch(d.k.tp_add_flag, .{ .x = @intCast((n + 255) / 256) }, .{
                 dst, // out: the sum, at the activation type
                 src, // this rank's partial
@@ -617,7 +615,7 @@ pub const Group = struct {
         }
         if (g.direct) { // the partial into this rank's slot, the counter, then the add kernel reads the peer's slot
             const par: usize = @intCast(g.seq % 2);
-            try dev.copy(d, g.dslot[par], src, n * es);
+            try dev.copy(d, g.dslot[par], src, n * 4);
             d.settle();
             g.counter(g.rank).store(g.seq, .seq_cst); // the counter and the liveness word are the rank's heartbeat
             aliveWord(g, g.rank).store(@intFromFloat(q.now()), .release);
@@ -625,13 +623,13 @@ pub const Group = struct {
                 // the group is lost: this rank closes it and exits instead of waiting 180 s or serving broken rounds
                 waitGroupLost(g, e);
             }
-            try dev.copy(d, g.pbuf[par], g.peer[par].?, n * es); // over PCIe, on the in-order list
+            try dev.copy(d, g.pbuf[par], g.peer[par].?, n * 4); // over PCIe, on the in-order list
             try d.launch(d.k.tp_add, .{ .x = @intCast((n + 255) / 256) }, .{ dst, g.dslot[par], g.pbuf[par], @as(i32, @intCast(n)) });
             return;
         }
-        try dev.copy(d, @ptrCast(g.mine), src, n * es);
+        try dev.copy(d, @ptrCast(g.mine), src, n * 4);
         d.settle();
-        @memcpy(g.slot(g.rank, g.seq)[0 .. n * es], std.mem.sliceAsBytes(g.mine[0 .. n * es]));
+        @memcpy(g.slot(g.rank, g.seq)[0 .. n * 4], g.mine[0 .. n * 4]);
         g.counter(g.rank).store(g.seq, .seq_cst); // the counter and the liveness word are the rank's heartbeat
         aliveWord(g, g.rank).store(@intFromFloat(q.now()), .release);
         if (g.waitPeers()) |_| {} else |e| {
@@ -640,7 +638,7 @@ pub const Group = struct {
         }
         // the sum in fp32, in rank order, rounded once to fp16: both ranks add the same bytes in the same order
         var parts: [4][]const u8 = undefined;
-        for (0..g.tp) |r| parts[r] = std.mem.sliceAsBytes(g.slot(@intCast(r), g.seq)[0 .. n * es]);
+        for (0..g.tp) |r| parts[r] = g.slot(@intCast(r), g.seq)[0 .. n * 4];
         try sum.reduce(parts[0..g.tp], dtype, .f16, n, g.acc[0..n], std.mem.sliceAsBytes(g.sum[0 .. n * 2]));
         try dev.copy(d, dst, @ptrCast(g.sum), n * 2);
         d.settle();
@@ -648,9 +646,9 @@ pub const Group = struct {
 
     /// Pushes this rank's partial into the peer's slot and then the flag, both on the in-order list: the peer's
     /// kernel sees the partial complete before the flag.
-    fn push(g: *Group, d: *Dev, src: *anyopaque, n: usize, par: usize, es: usize) !void {
+    fn push(g: *Group, d: *Dev, src: *anyopaque, n: usize, par: usize) !void {
         const pb = g.peer_blk.?;
-        try dev.copy(d, off(pb, par * slot_bytes), src, n * es);
+        try dev.copy(d, off(pb, par * slot_bytes), src, n * 4);
         const hi: usize = @intCast(g.seq % fh_ring);
         g.fh[hi] = g.seq;
         try dev.copy(d, off(pb, blk_flag + par * 8), @ptrCast(&g.fh[hi]), 8);
@@ -677,10 +675,10 @@ pub const Group = struct {
         const counts = [_]u32{ 1, 8, 16, 32 };
         var out: [4]f64 = @splat(0);
         for (counts, 0..) |rows, i| {
-            try g.allReduce(d, partial, partial, @as(usize, rows) * D, .f16, .sum); // warm
+            try g.allReduce(d, partial, partial, @as(usize, rows) * D, .f32, .sum); // warm
             d.settle();
             const t0 = q.now();
-            for (0..128) |_| try g.allReduce(d, partial, partial, @as(usize, rows) * D, .f16, .sum);
+            for (0..128) |_| try g.allReduce(d, partial, partial, @as(usize, rows) * D, .f32, .sum);
             d.settle();
             out[i] = (q.now() - t0) * 1e3;
         }
@@ -926,8 +924,8 @@ test "a fresh generation is never zero" {
 }
 
 test "an fp16 sum rounds once from fp32" {
-    const a: f16 = 1.0009765625; // 1 + 2^-10, the fp16 step above 1
-    const b: f16 = 0.00048828125; // 2^-11, below the step
+    const a: f16 = 1.0;
+    const b: f16 = 0.0009765625; // 2^-10, the fp16 step above 1
     const s: f32 = @as(f32, a) + @as(f32, b);
     try std.testing.expectEqual(@as(f16, 1.0009765625), @as(f16, @floatCast(s)));
     try std.testing.expect(@as(f16, @floatCast(s + b)) > a);

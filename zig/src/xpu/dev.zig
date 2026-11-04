@@ -154,6 +154,7 @@ pub const Dev = struct {
         tp_add: ze.H = null, // the TP 2 all-reduce add (the 27B loads it, Sage has none)
         tp_add_flag: ze.H = null, // the TP 2 device-flag add (TF_TP_DEVFLAG, the 27B only)
         tp_consume: ze.H = null, // the consumed counter and the ring's backpressure (TF_TP_DEVFLAG)
+        tp_widen: ze.H = null, // fp16 partial into the fp32 slot, for a projection with no fp32 epilogue
         attn_prompt: ze.H,
         attn_prompt8: ze.H,
         embed_dense: ze.H,
@@ -163,6 +164,12 @@ pub const Dev = struct {
         dec_wide_g128: ze.H,
         dec_wide64_g128: ze.H,
         dec_narrow_g128: ze.H,
+        dec_narrow_f32: ze.H = null, // the same kernel with an fp32 C: the TP row-split partials
+        dec_narrow_g128_f32: ze.H = null,
+        ngen_narrow_f32: ze.H = null,
+        ngen_narrow_g128_f32: ze.H = null,
+        a8_f32: ze.H = null,
+        a4_f32: ze.H = null,
         ngen_wide_g128: ze.H,
         ngen_narrow_g128: ze.H,
         ngen_swiglu: ze.H,

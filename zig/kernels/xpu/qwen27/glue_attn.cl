@@ -30,24 +30,28 @@ static void quant8_head(float v[16], float levels) {
 }
 
 // Attention output brought back from the rotated basis (KV8 & 1): O bf16 [T, 24, 256], grid (T, 24).
-// TP 2 all-reduce on the device: out = a + b over n fp16 values (the sum in fp32, rounded once). `b` is the peer
-// rank's slot, opened through an IPC handle and read over PCIe.
-KERNEL(256) void tp_add(global ushort *out, global const ushort *a, global const ushort *b, int n) {
+// TP 2 all-reduce on the device: out = f16(f32(a) + f32(b)) over n fp32 partials, one rounding, NaN kept.
+KERNEL(256) void tp_add(global ushort *out, global const float *a, global const float *b, int n) {
   const int i = get_global_id(0);
   if (i >= n) return;
-  const float s = (float)as_half(a[i]) + (float)as_half(b[i]);
-  out[i] = as_ushort((half)s);
+  out[i] = as_ushort(convert_half_rte(a[i] + b[i]));
 }
 
-// The peer's partial is already in `peer` (pushed over PCIe before the flag). Wait for the flag, then add `a`.
-KERNEL(256) void tp_add_flag(global ushort *out, global const ushort *a, global const ushort *peer, int n,
+// Widens an fp16 partial into the fp32 slot the exchange carries (a projection with no fp32 epilogue). NaN kept.
+KERNEL(256) void tp_widen(global float *out, global const ushort *in, int n) {
+  const int i = get_global_id(0);
+  if (i >= n) return;
+  out[i] = (float)as_half(in[i]);
+}
+
+// The peer's fp32 partial is already in `peer` (pushed over PCIe before the flag). Wait for the flag, then add `a`.
+KERNEL(256) void tp_add_flag(global ushort *out, global const float *a, global const float *peer, int n,
                              global volatile ulong *flag, ulong seq, global volatile uint *timeout) {
   const int i = get_global_id(0), lid = get_local_id(0);
   if (lid == 0) tp_wait(flag, seq, timeout);
   barrier(CLK_LOCAL_MEM_FENCE);
   if (i >= n) return;
-  const float s = (float)as_half(a[i]) + (float)as_half(peer[i]);
-  out[i] = as_ushort((half)s);
+  out[i] = as_ushort(convert_half_rte(a[i] + peer[i]));
 }
 
 // This rank has read the peer's slot: publish its consumed counter, then wait until the peer consumed the slot the

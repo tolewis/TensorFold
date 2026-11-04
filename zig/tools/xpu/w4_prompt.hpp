@@ -35,7 +35,9 @@ class W4Prompt : public ELFCodeGenerator<hw> {
 
 public:
     // 32x32 subgroup tiles, 64x256 work-groups; the group fold, bias and options as NAVIGATION.md section 8 says.
-    W4Prompt(Product product, int gsz, bool s4, bool asplit, bool b3, bool swiglu) : ELFCodeGenerator<hw>(product) {
+    // f32out: the fp32 accumulator itself as C (a TP row-split projection), not rounded to fp16 first.
+    W4Prompt(Product product, int gsz, bool s4, bool asplit, bool b3, bool swiglu, bool f32out = false)
+        : ELFCodeGenerator<hw>(product) {
         const int subs = gsz / 64, tn = 2;
         newArgument("A", ExternalArgumentType::GlobalPtr);
         newArgument("W", ExternalArgumentType::GlobalPtr);
@@ -379,6 +381,17 @@ public:
                 add(1, hC.ud(6), m0, 8 * i);
                 store(1, block_2d(DataSizeLSC::D16, 16, 8), A64, hC, GRF(H));
             }
+        } else if (f32out) {
+            // Output: the fp32 accumulators, written by 2D blocks of 8 rows × 16 columns (N·4 bytes a row).
+            shl(1, t.d(6), N, 2);
+            add(1, t.d(6), t.d(6), -1);
+            header(hC, C, t.d(6), t.d(3), 16, 8, 1);
+            for (int i = 0; i < 4; i++)
+                for (int j = 0; j < tn; j++) {
+                    add(1, hC.ud(6), m0, 8 * i);
+                    add(1, hC.ud(5), n0, 16 * j);
+                    store(1, block_2d(DataSizeLSC::D32, 16, 8), A64, hC, GRF(ACC + 8 * (i * tn + j)));
+                }
         } else {
             // Output: fp16 rounded to nearest even, written by 2D blocks of 8 rows × 16 columns.
             for (int i = 0; i < 4; i++)
