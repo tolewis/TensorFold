@@ -234,7 +234,10 @@ pub fn gemmRows(d: *Dev, pscr: *anyopaque, h: *anyopaque, ahi: *anyopaque, alo: 
         else
             try d.launch(ngen_narrow, groups, .{ h, w.w, w.s, w.bg, out, M, N, K, ahi, alo, mp, G, pscr });
     }
-    if (gemm_hook) |f| try f(d, h, w, out, m);
+    if (gemm_hook) |f| {
+        try f(d, h, w, out, m);
+        if (out32) |o| try widen(d, o, out, @as(usize, m) * w.n); // the exchange still reads the fp32 partial
+    }
 }
 
 /// XPU_FIDELITY: called after every GEMM (its input rows, weights and output); null in production.
