@@ -58,6 +58,13 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     const tp_step = b.step("test-tp", "TP bootstrap, failure, settings and in-process transport tests");
     tp_step.dependOn(&tests.step);
     tp_step.dependOn(cli_step);
+    // the XPU collective over host memory: no CUDA module and no device, so it runs wherever the host tests do
+    const xpu_host = b.createModule(.{ .root_source_file = b.path("zig/src/fabric/tp/xpu_host_test.zig"), .target = host, .optimize = .debug, .link_libc = true });
+    const xpu_run = b.addRunArtifact(b.addTest(.{ .root_module = xpu_host }));
+    const xpu_step = b.step("test-xpu-host", "The XPU collective over host memory: every call against the reference, NaN, desync, killed peer, timeout, planted faults");
+    xpu_step.dependOn(&xpu_run.step);
+    tp_step.dependOn(&xpu_run.step);
+    if (host.result.os.tag != .windows) test_step.dependOn(&xpu_run.step);
     const multi_root = module(b, host, .debug, runtime(b, host, .debug));
     multi_root.root_source_file = b.path("zig/src/fabric/tp/roce_multi_host.zig");
     const multi = b.addRunArtifact(b.addTest(.{ .root_module = multi_root }));

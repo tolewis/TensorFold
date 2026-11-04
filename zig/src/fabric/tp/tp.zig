@@ -243,6 +243,7 @@ test {
     _ = @import("roce_post_test.zig");
     _ = @import("roce_inflight_test.zig");
     _ = @import("host_test.zig");
+    _ = @import("xpu_host_test.zig");
     _ = @import("fate_test.zig");
     _ = @import("fate_lifetime_test.zig");
 }
