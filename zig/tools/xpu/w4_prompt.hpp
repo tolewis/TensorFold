@@ -385,6 +385,7 @@ public:
             // Output: the fp32 accumulators, written by 2D blocks of 8 rows × 16 columns (N·4 bytes a row).
             shl(1, t.d(6), N, 2);
             add(1, t.d(6), t.d(6), -1);
+            add(1, t.d(3), M, -1); // the bias block left G − 1 here: the store's height is the rows this tile covers
             header(hC, C, t.d(6), t.d(3), 16, 8, 1);
             for (int i = 0; i < 4; i++)
                 for (int j = 0; j < tn; j++) {
