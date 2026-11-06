@@ -1,17 +1,25 @@
 //! Backend-neutral engine parts: checkpoint files, the CUDA draft-depth rule, the copy index, the tokenizer.
 
+pub const benchmark_group = @import("benchmark_group.zig");
+pub const weight_only = @import("weight_only.zig");
+pub const profile = @import("profile");
 pub const safetensors = @import("safetensors.zig");
+pub const gguf = @import("gguf.zig");
 pub const npy = @import("npy.zig");
 pub const exl3_format = @import("exl3_format.zig");
 pub const exlr8 = @import("exlr8.zig");
 pub const eaq_container = @import("eaq_container.zig");
 pub const digest_cache = @import("digest_cache.zig");
 pub const checkpoint_identity = @import("checkpoint_identity.zig");
+pub const checkpoint_read_ahead = @import("checkpoint_read_ahead.zig");
 pub const checkpoint = @import("checkpoint.zig");
+pub const checkpoint_fixture = @import("checkpoint_fixture.zig");
 pub const exl3_load = @import("exl3_load.zig");
 pub const direct_io = @import("direct_io.zig");
+pub const direct_gather = @import("direct_gather.zig");
 pub const Checkpoint = checkpoint.Checkpoint;
 pub const draft_depth = @import("draft_depth.zig");
+pub const prompt_tail = @import("prompt_tail.zig");
 pub const CopyIndex = @import("copy_index.zig").CopyIndex;
 pub const recurrent_workspace = @import("recurrent_workspace.zig");
 pub const tokenizer = @import("tokenizer"); // a module of its own, so the native server shares it
@@ -30,8 +38,13 @@ pub const nvfp4_slice = @import("nvfp4_slice.zig");
 pub const registry = @import("registry.zig");
 pub const tuning = @import("tuning.zig");
 pub const norms_ref = @import("norms_ref.zig");
+pub const l2_ref = @import("l2_ref.zig");
 pub const act_ref = @import("act_ref.zig");
-pub const bf16_round = @import("bf16_round.zig");
+pub const bf16_round = @import("bf16_round");
+pub const joint_schema = @import("joint_schema/joint_schema.zig");
+pub const rope_yarn = @import("rope_yarn.zig");
+/// transformers' default and proportional RoPE inverse frequencies in fp32, word for word.
+pub const rope_freq = @import("rope_freq.zig");
 pub const embed_ref = @import("embed_ref.zig");
 /// The kernel contract every GPU kernel's test registers with (zig/tests/contract, tf-cuda-test kernel-contract).
 pub const contract = @import("contract.zig");
@@ -54,11 +67,17 @@ pub const dense_ref = @import("dense_ref.zig");
 
 pub const checkpoint_weights = @import("checkpoint_weights.zig");
 pub const kv_pool = @import("kv_pool.zig");
+pub const kv_prompts = @import("kv_prompts.zig");
 
 test {
+    _ = benchmark_group;
+    _ = profile;
     _ = checkpoint_weights;
     _ = safetensors;
+    _ = gguf;
     _ = affine4_host;
+    _ = rope_yarn;
+    _ = rope_freq;
     _ = affine4_fold;
     _ = shard_edit;
     _ = lora_merge;
@@ -70,8 +89,10 @@ test {
     _ = registry;
     _ = tuning;
     _ = norms_ref;
+    _ = l2_ref;
     _ = act_ref;
     _ = bf16_round;
+    _ = joint_schema;
     _ = embed_ref;
     _ = contract;
     _ = tree_round;
@@ -88,10 +109,13 @@ test {
     _ = exl3_load;
     _ = @import("exl3_rect_test.zig");
     _ = checkpoint;
+    _ = @import("checkpoint_prefetch.zig");
     _ = checkpoint_identity;
     _ = direct_io;
+    _ = direct_gather;
     _ = frame_rounds;
     _ = draft_depth;
+    _ = prompt_tail;
     _ = @import("copy_index.zig");
     _ = ids_json;
     _ = proposal_vocab;
@@ -104,6 +128,7 @@ test {
     _ = @import("nvfp4_fixture_test.zig");
     _ = @import("drafter_release_test.zig");
     _ = kv_pool;
+    _ = kv_prompts;
 }
 
 pub const frame_rounds = @import("frame_rounds.zig");
@@ -112,3 +137,15 @@ pub const tree_slots = @import("tree_slots.zig");
 pub const exl3_layout = @import("exl3_layout.zig");
 
 pub const exl3_prepare = @import("exl3_prepare.zig");
+
+pub const weight_only_contract = @import("contract/weight_only.zig");
+pub const weight_only_cuda_adapter = @import("weight_only_cuda_impl.zig").Adapter;
+pub const weight_only_metal_adapter = @import("weight_only_metal_impl.zig").Adapter;
+pub const hc_activation = @import("hc_activation.zig");
+pub const hc_activation_contract = @import("contract/hc_activation.zig");
+pub const hc_activation_cuda_adapter = @import("hc_activation_cuda_impl.zig").Adapter;
+pub const hc_activation_metal_adapter = @import("hc_activation_metal_impl.zig").Adapter;
+pub const hc_pointwise = @import("hc_pointwise.zig");
+pub const hc_pointwise_cuda_adapter = @import("hc_pointwise_cuda_impl.zig").Adapter;
+pub const hc_pointwise_metal_adapter = @import("hc_pointwise_metal_impl.zig").Adapter;
+pub const hc_pointwise_contract = @import("contract/hc_pointwise.zig");

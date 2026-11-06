@@ -31,6 +31,7 @@ The `apple_m1` CPU target keeps the macOS binary compatible with M1 through M5.
 Run the full suite on an isolated machine when the local GPU is serving a model.
 `test-golden` compares the frozen server corpus and records known differences separately.
 These results do not substitute for an actual checkpoint/model gate.
+On macOS, `zig build dev-tools` compiles and links every `tf-*` developer tool without running one; run it after changing an API they call.
 
 For the CUDA host-test subset without the macOS Metal family tests:
 
@@ -100,6 +101,10 @@ Disable supported prefix retention with `--prompt-cache-gib 0` and use fresh KV 
 Record 64k, 128k and the native window separately where the model/platform admits them.
 Compare against the previous release and the applicable standard server, such as `mlx_lm` or `vLLM`.
 When a difference is only a few percent, alternate before/after runs to separate it from temperature and load changes.
+
+Before asking us for a run on our machines, please post main-against-your-branch numbers if your change can reach inference (model and kernel code, the server's prompt and sampling code, build flags): same machine, checkpoint and settings, with token hashes equal on the default path. An opt-in that changes tokens says so and shows its proof.
+Once your numbers are in and there are no requested changes left, we repeat what your files can reach, where we have the hardware and checkpoint to do it. If your numbers show a loss, please fix it or show it's noise first.
+No machine to run on? Say so in the description: we review every PR either way, and we'll work out what we can do. If you have a chip we don't, your numbers are the evidence, so please post them.
 
 Memory receipts include peak physical process footprint and device/pinned allocations where the backend reports them.
 State the hardware RAM class and context; a budget on a larger host is not a measurement on a smaller machine.

@@ -83,6 +83,8 @@ pub const Backend = struct {
         errdefer topk.deinit();
         var head = try @import("runtime_head.zig").Head.init(a, target.device, target.weights.head);
         errdefer head.deinit();
+        // the trimmed head's shape is the drafter's own: compile its pipeline here, not in the first draft round
+        try target.kernels.prepareDecode(head.linear);
         const caches = try newCaches(a, target.device, c, c.layers);
         return .{ .allocator = a, .target = target, .checkpoint = checkpoint, .config = c, .primitives = primitives, .attention = attention, .topk = topk, .head = head, .frame = .{ .allocator = a, .device = target.device, .queue = target.queue }, .caches = caches };
     }
@@ -175,6 +177,10 @@ pub const Backend = struct {
         b.frame.ops += 1;
         if (b.frame.ops == first_part_ops or b.frame.ops % part_ops == 0) try b.frame.part();
         return b.frame.encoder;
+    }
+    /// TF_Q27_PROFILE: the frame's passes join `trace`'s `drafter` class, and its spans keep an open frame's encoder.
+    pub fn profile(b: *Backend, trace: ?*core.gpu_profile.Trace) void {
+        b.frame.profiler = trace;
     }
     pub fn copy(b: *Backend, e: mtl.ComputeEncoder, x: Ref, y: Ref, rows: u32, width: u32) !void {
         try b.target.glue.unstack(e, .{ .buffer = x.buf, .offset = x.off }, .{ .buffer = y.buf, .offset = y.off }, .{ .rows = rows, .width = width, .stride = width, .offset = 0 });

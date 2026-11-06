@@ -24,7 +24,9 @@ The Python packed Qwen decoder's tied-head limitation is separate from this nati
 Normal generation stops on both the model's end IDs and the tokenizer's chat-ending token; `ignore_eos: true` disables those stops for fixed-length throughput checks.
 
 The loader requires the 2B geometry and MLX affine 4-bit weights in groups of 64 with bf16 scales and
-biases. The head is the packed input embedding when the checkpoint ties it, or the checkpoint's own
+biases. In `capabilities --json`, `families.qwen3_5` is a union across the 2B and 27B engines,
+not a promise that every listed format loads at every geometry. For this 2B geometry, only `mlx-q4g64`
+is admitted; the other listed widths belong to the family's other engines. The head is the packed input embedding when the checkpoint ties it, or the checkpoint's own
 `language_model.lm_head` projection when it ships one; `config.json`'s `tie_word_embeddings` must
 agree with the tensors either way, and the head matmul reuses the embedding-shape pipeline either way.
 The vision tower is not loaded. Images, video, other model sizes and other quantization formats are outside
@@ -42,8 +44,13 @@ one-row rounds still go through the shared lane engine. GPU execution failures s
 The qualified path has up to 16 rows per stream and 32 rows per shared forward. Prompt chunks have up to
 128 rows and follow the server's planned boundaries. `--no-drafts` supplies the plain reference.
 
-There is no cross-request prompt reuse in the native preview. Follow-up turns process the rendered
-conversation afresh. A repeated reply is a fresh-execution check, not validation of a restored prefix cache.
+Cross-request prompt reuse is opt-in with `--prompt-cache-gib N`; omitting it or passing zero keeps fresh execution.
+The core prompt-cache store keeps committed recurrence, convolution tails, attention K/V and logits in host memory.
+It reuses only compatible prompt cuts on the 128-token grid or the request's explicit chunk boundaries, within the
+memory budget. The optional paged K/V path restores the same image into newly allocated pages. This is RAM retention;
+restart persistence and learned-state files are not enabled for the 2B. With the 4-bit checkpoint on an M5 Ultra and an
+M3 Ultra, every resumed chat reply equalled a fresh one. On the M3 Ultra, two prompts resuming from one 896-token kept
+state, at 1, 2 and 4 streams and temperatures 0 and 1.0, gave each request the same tokens as alone (28 Oct 2026).
 The checkpoint's config allows 262,144 positions, but that is not a memory or throughput qualification for
 that length. `--context` controls request admission; KV buffers are sized for each request's prompt and reply.
 

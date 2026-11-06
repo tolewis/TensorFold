@@ -42,6 +42,7 @@ fn run(comptime Cuda: type, comptime open: anytype, comptime drop: anytype, draf
     engine.chunk = 16;
     engine.eos = 7;
     engine.round_graph = .{};
+    engine.heads = .full;
     var ids = [_]u32{1};
     var head: mtp.Head = undefined;
     head.ids = &ids;
@@ -50,6 +51,8 @@ fn run(comptime Cuda: type, comptime open: anytype, comptime drop: anytype, draf
     v.limits = .{};
     v.prep = f;
     v.pool = f;
+    v.prep_paged = f;
+    v.pool_paged = f;
     v.encoder = .{ .ctx = &v, .driver = &driver, .stream = stream, .splice = f, .encode = Fake.encode, .config = .{ .hidden = 1024, .heads = 16, .depth = 24, .intermediate = 4096, .out_hidden = 2560, .image_token = 50, .video_token = 51, .vision_start = 52, .vision_end = 53 } };
     var self: Cuda = undefined;
     self.gpa = a;
@@ -60,6 +63,7 @@ fn run(comptime Cuda: type, comptime open: anytype, comptime drop: anytype, draf
     self.head = if (drafting) &head else null;
     self.vision = &v;
     self.lanes = .empty;
+    self.parts = .{};
     defer {
         var it = self.lanes.valueIterator();
         while (it.next()) |l| drop(&self, l);
@@ -138,6 +142,7 @@ fn release(comptime Cuda: type, comptime open: anytype) !void {
     engine.chunk = 16;
     engine.eos = 7;
     engine.round_graph = .{};
+    engine.heads = .full;
     var self: Cuda = undefined;
     self.gpa = a;
     self.context = 64;
@@ -147,6 +152,7 @@ fn release(comptime Cuda: type, comptime open: anytype) !void {
     self.head = null;
     self.vision = null;
     self.lanes = .empty;
+    self.parts = .{};
     defer self.lanes.deinit(a);
     var s = try lanes.Stream.init(a, .{ .id = "release", .prompt = &.{ 1, 2, 3 }, .max_new = 1 });
     defer s.deinit(a);

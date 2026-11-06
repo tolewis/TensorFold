@@ -1,4 +1,4 @@
-// A lone greedy stream's round on the GPU: the verify's arguments, the accept, the head's arguments and its confidence stop.
+// A lone greedy stream's GPU round: the verify's arguments, the accept, the head's arguments and its confidence stop.
 #include <metal_stdlib>
 using namespace metal;
 
@@ -186,7 +186,7 @@ inline bool tf_first(float a, uint ia, float b, uint ib) {
   return a > b || (a == b && ia < ib);
 }
 
-// Level j's draft and chance (tf_topk_probs's first id), then the stop: the running top-1 product to `power` vs its bar.
+// Level j's draft and chance (tf_topk_probs's first id), the stop: the running top-1 product to `power` vs its bar.
 kernel void tf_round_top1(const device bfloat* x [[buffer(0)]],
                           const device uint* map [[buffer(1)]],
                           device uint* ids [[buffer(2)]],

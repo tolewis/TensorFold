@@ -22,6 +22,7 @@ pub const image = @import("image.zig");
 pub const video = @import("video.zig");
 
 test {
+    _ = backend;
     _ = config;
     _ = state;
     _ = ep;
@@ -44,6 +45,7 @@ test {
     _ = @import("quant.zig");
     _ = @import("affine.zig");
     _ = @import("names.zig");
+    _ = @import("vision_names.zig");
     _ = @import("weights_test.zig");
     _ = @import("wide.zig");
     _ = vision;

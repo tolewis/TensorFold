@@ -7,12 +7,19 @@ const options = @import("contract_options");
 const check = @import("check.zig");
 const rows_k = @import("contract_rows.zig");
 const tail_k = @import("contract_norms_tail.zig");
+const tiles_k = @import("contract_rms_tiles.zig");
+const dory_k = @import("contract_dory.zig");
 const router_k = @import("contract_router.zig");
 const mm_k = @import("contract_mm.zig");
+const prefill_many_k = @import("contract_qmm_prefill_many.zig");
+const prefill_tile22_k = @import("contract_qmm_prefill_tile22.zig");
 const mx_k = @import("contract_mxfp8.zig");
+const half_k = @import("contract_lane_half.zig");
 const wide_k = @import("contract_projection_f32.zig");
 const rank_k = @import("contract_rank.zig");
 const writeback_k = @import("contract_flashnext_writeback.zig");
+const hcnorm_k = @import("contract_hc_normalize.zig");
+const hcmix_k = @import("contract_hc_mix.zig");
 const utility_k = @import("contract_utility.zig");
 const best_k = @import("contract_row_best.zig");
 const qsa_k = @import("contract_qsa_select.zig");
@@ -21,49 +28,49 @@ const h3_prep = @import("contract_h3_prep.zig");
 const h3_topk_k = @import("contract_h3_topk.zig");
 const drama3_k = @import("contract_drama3.zig");
 const ck_k = @import("contract_ck.zig");
+const q35_bf16_k = @import("contract_qwen_bf16.zig");
+const e3_k = @import("contract_experts3.zig");
 const scan_k = @import("contract_scan.zig");
 const lane8_k = @import("contract_ck_lane.zig");
 const latent_k = @import("contract_latent.zig");
 const vit_k = @import("contract_vit_glue.zig");
 const act_round_k = @import("contract_act_round.zig");
-
+const ple_k = @import("contract_ple.zig");
+const f32w_k = @import("contract_glm_f32w.zig");
 const w4a8_k = @import("contract_w4a8.zig");
-
 const round_k = @import("contract_tree_round.zig");
-
 const act_k = @import("contract_act.zig");
 const vit_g4_group = @import("contract_gemma_group.zig");
 const gdn_k = @import("contract_gdn.zig");
 const qk_k = @import("contract_qk.zig");
 const wrows_k = @import("contract_window_rows.zig");
-const embed_k = @import("contract_embed.zig");
-
+const glm_pages_k = @import("contract_glm_pages.zig");
+const glm_index_k = @import("contract_glm_index.zig");
+const glm_attn_k = @import("contract_glm_attn.zig");
+const glm = @import("glm_cuda");
+const elementwise_k = @import("contract_elementwise.zig");
 const tree_k = @import("contract_tree_attn.zig");
 const block_k = @import("contract_block_attn.zig");
 const q35_k = @import("contract_q35_attn.zig");
-
 const window_k = @import("contract_window.zig");
 const moe_k = @import("contract_moe.zig");
 const qkr_k = @import("contract_qk_round.zig");
 const fact_k = @import("contract_flashnext_fact.zig");
 const route_k = @import("contract_route_rows.zig");
 const fexp_k = @import("contract_flashnext_fexp.zig");
-const glue_k = @import("contract_flashnext_glue.zig");
-
+const fn_groups_k = @import("contract_flashnext_groups.zig");
+const q35_contiguous = @import("contract_q35_contiguous.zig");
 const contract = core.contract;
 const g = contract.gates;
 const kk = cuda.kernels;
 
-const controls = struct {
-    pub const bytes align(16) = @embedFile("fatbin_contract_controls").*;
+const images = struct {
+    pub const controls align(16) = @embedFile("fatbin_contract_controls").*;
+    pub const h3 align(16) = @embedFile("fatbin_h3").*;
 };
 
-const h3_image = struct {
-    pub const bytes align(16) = @embedFile("fatbin_h3").*;
-};
-
-/// Gates 1-4 on every registered CUDA kernel and each control at its own gate, then gate 5 on this GPU.
-pub fn run(gpu: check.Gpu) !void {
+/// Gates 1-4 on every registered CUDA kernel and each control at its own gate, then gate 5; `only`: contract_after.zig.
+pub fn run(gpu: check.Gpu, only: []const []const u8) !void {
     const a = gpu.gpa;
     if (!kk.available) return error.BuiltWithoutKernels;
     if (!options.controls) {
@@ -77,7 +84,7 @@ pub fn run(gpu: check.Gpu) !void {
     var mods: [8]cuda.Module = undefined;
     var loaded: usize = 0;
     defer for (mods[0..loaded]) |*m| m.unload();
-    for ([_][]const u8{ kk.nemotron_route, kk.qmm_group, kk.qmm_prefill, kk.lane_gemv, kk.affine4_pack, &controls.bytes, kk.experts, kk.nemotron_mamba }, 0..) |img, i| {
+    for ([_][]const u8{ kk.nemotron_route, kk.qmm_group, kk.qmm_prefill, kk.lane_gemv, kk.affine4_pack, &images.controls, kk.experts, kk.nemotron_mamba }, 0..) |img, i| {
         mods[i] = try cuda.Module.load(gpu.d, img);
         loaded += 1;
     }
@@ -116,16 +123,24 @@ pub fn run(gpu: check.Gpu) !void {
     defer w4a8_mod.unload();
     const w4a8_fns = try cuda.w4a8.Kernels.resolve(w4a8_mod);
     const w4a8_configs = [_]struct { kind: w4a8_k.Kind, fault: w4a8_k.Fault }{
-        .{ .kind = .quantize, .fault = .none },       .{ .kind = .prefill, .fault = .none },
-        .{ .kind = .quantize, .fault = .guard },      .{ .kind = .prefill, .fault = .guard },
-        .{ .kind = .quantize, .fault = .wrong_code }, .{ .kind = .quantize, .fault = .wrong_scale },
-        .{ .kind = .quantize, .fault = .wrong_sum },  .{ .kind = .quantize, .fault = .narrow_sum },
-        .{ .kind = .prefill, .fault = .wrong_code },  .{ .kind = .prefill, .fault = .narrow_epilogue },
+        .{ .kind = .quantize, .fault = .missed_flag }, .{ .kind = .prefill, .fault = .missed_flag },
+        .{ .kind = .quantize, .fault = .none },        .{ .kind = .prefill, .fault = .none },
+        .{ .kind = .quantize, .fault = .guard },       .{ .kind = .prefill, .fault = .guard },
+        .{ .kind = .quantize, .fault = .wrong_code },  .{ .kind = .quantize, .fault = .wrong_scale },
+        .{ .kind = .quantize, .fault = .wrong_sum },   .{ .kind = .quantize, .fault = .narrow_sum },
+        .{ .kind = .prefill, .fault = .wrong_code },   .{ .kind = .prefill, .fault = .narrow_epilogue },
     };
     var w4a8_cases: [w4a8_configs.len]w4a8_k.Case = undefined;
     for (&w4a8_cases, w4a8_configs) |*case, cfg| case.* = .{ .rig = .{ .gpu = gpu, .s = s }, .kind = cfg.kind, .fault = cfg.fault, .kernels = w4a8_fns, .arena = .init(a) };
     defer for (&w4a8_cases) |*case| case.deinit();
     for (&w4a8_cases) |*case| try kernels.append(a, case.kernel());
+    var q35_bf16 = try cuda.qwen35_bf16_rows.Kernels.load(gpu.d);
+    defer q35_bf16.unload();
+    const Q35Bf16Case = q35_bf16_k.Case(@TypeOf(q35_bf16));
+    var q35_cases: [q35_bf16_k.entries.len]Q35Bf16Case = undefined;
+    for (&q35_cases, q35_bf16_k.entries) |*item, entry| item.* = .{ .rig = .{ .gpu = gpu, .s = s }, .kernels = &q35_bf16, .entry = entry, .ctl = if (entry.fault == .half) try mods[5].function("tf_ctl_q35_dense_half") else null };
+    defer for (&q35_cases) |*item| item.deinit();
+    for (&q35_cases) |*item| try kernels.append(a, item.kernel());
     var row_list: [7]rows_k.Row = undefined;
     var nrows: usize = 0;
     defer for (row_list[0..nrows]) |*r| r.deinit();
@@ -139,19 +154,22 @@ pub fn run(gpu: check.Gpu) !void {
     for (tail_which, &tails) |w, *t| t.* = .{ .rig = .{ .gpu = gpu, .s = s }, .which = w, .norms = &norms, .ctl = if (tail_k.control(w) != null) try mods[5].function(tail_k.symbol(w)) else null };
     defer for (&tails) |*t| t.deinit();
     for (&tails) |*t| try kernels.append(a, t.kernel());
+    var tiles = [_]tiles_k.Tiles{ tiles_k.init(gpu, s, &norms, .y), tiles_k.init(gpu, s, &norms, .xs) };
+    defer for (&tiles) |*t| t.deinit();
+    for (&tiles) |*t| try kernels.append(a, t.kernel());
+    var dory: dory_k.Dory = .{};
+    defer dory.deinit();
+    try dory.add(gpu, s, &norms, mods[5], &kernels);
     var logits = router_k.Logits{ .rig = .{ .gpu = gpu, .s = s }, .f = try mods[0].function("tf_nemo_router") };
     defer logits.deinit();
     var logits_tiles = router_k.Logits{ .rig = .{ .gpu = gpu, .s = s }, .f = logits.f, .tiles = try mods[0].function("tf_nemo_router_tiles") };
     defer logits_tiles.deinit();
-    var topk = router_k.TopK{ .rig = .{ .gpu = gpu, .s = s }, .f = try mods[0].function("tf_nemo_topk") };
-    defer topk.deinit();
     var latent = try nemotron.latent.Fns.load(gpu.d);
     defer latent.unload();
     var latent_topk = router_k.LatentTopK{ .rig = .{ .gpu = gpu, .s = s }, .fns = &latent };
     defer latent_topk.deinit();
     try kernels.append(a, logits.kernel());
     try kernels.append(a, logits_tiles.kernel());
-    try kernels.append(a, topk.kernel());
     try kernels.append(a, latent_topk.kernel());
     var scan = scan_k.Scan{ .rig = .{ .gpu = gpu, .s = s }, .f = try mods[7].function("tf_nemo_scan"), .host = .init(a) };
     defer scan.deinit();
@@ -186,12 +204,25 @@ pub fn run(gpu: check.Gpu) !void {
     }
     defer for (&verify_controls) |*m| m.deinit();
     for (&verify_controls) |*m| if (m.kernel()) |k| try kernels.append(a, k);
+    var prefill_many = prefill_many_k.Registrations.init(gpu, s, &affine4);
+    defer prefill_many.deinit();
+    try prefill_many.append(cap, a, &kernels);
+    var prefill_tile22 = prefill_tile22_k.Registrations.init(gpu, s, &affine4);
+    defer prefill_tile22.deinit();
+    try prefill_tile22.append(cap, a, &kernels);
     var mx = [_]mx_k.Product{
         .{ .rig = .{ .gpu = gpu, .s = s }, .lane = &lane, .clusters = true },
         .{ .rig = .{ .gpu = gpu, .s = s }, .lane = &lane_reduce, .clusters = false },
     };
     defer for (&mx) |*m| m.deinit();
     for (&mx) |*m| try kernels.append(a, m.kernel());
+    var half_lane = lane;
+    var halves: [6]half_k.Half = undefined;
+    for (std.enums.values(half_k.Kind), 0..) |kind, i| for ([_]cuda.qmmf.Out{ .bf16, .f32 }, 0..) |format, j| {
+        halves[i * 2 + j] = .{ .rig = .{ .gpu = gpu, .s = s }, .lane = &half_lane, .kind = kind, .format = format };
+    };
+    defer for (&halves) |*h| h.deinit();
+    for (&halves) |*h| try kernels.append(a, h.kernel());
     var wide: [wide_k.modes.len * 2]wide_k.Product = undefined;
     for (wide_k.modes, 0..) |mode, i| {
         wide[i * 2] = .{ .rig = .{ .gpu = gpu, .s = s }, .lane = &lane, .mode = mode, .clusters = true };
@@ -199,12 +230,12 @@ pub fn run(gpu: check.Gpu) !void {
     }
     defer for (&wide) |*m| m.deinit();
     for (&wide) |*m| try kernels.append(a, m.kernel());
-    var narrow: [wide_k.bf16_modes.len * 2 + 1]wide_k.Product = undefined; // bf16 out (the 27B's ModelOpt layers)
+    var narrow: [wide_k.bf16_modes.len * 2 + 3]wide_k.Product = undefined; // bf16 out (the 27B's ModelOpt layers)
     for (wide_k.bf16_modes, 0..) |mode, i| {
         narrow[i * 2] = .{ .rig = .{ .gpu = gpu, .s = s }, .lane = &lane, .mode = mode, .clusters = true, .out_kind = .bf16 };
         narrow[i * 2 + 1] = .{ .rig = .{ .gpu = gpu, .s = s }, .lane = &lane_reduce, .mode = mode, .clusters = false, .out_kind = .bf16 };
     }
-    narrow[narrow.len - 1] = .{ .rig = .{ .gpu = gpu, .s = s }, .lane = &lane, .mode = .fp8, .clusters = true, .out_kind = .bf16, .prompt = &prompt };
+    for ([_]cuda.qmmf.Mode{ .fp8, .bf16, .bf16 }, [_]cuda.qmmf.Out{ .bf16, .bf16, .f32 }, narrow[narrow.len - 3 ..]) |mode, out, *m| m.* = .{ .rig = .{ .gpu = gpu, .s = s }, .lane = &lane, .mode = mode, .clusters = true, .out_kind = out, .prompt = &prompt };
     defer for (&narrow) |*m| m.deinit();
     for (&narrow) |*m| try kernels.append(a, m.kernel());
     var rank = rank_k.Rank{ .rig = .{ .gpu = gpu, .s = s }, .sum = &rank_sum };
@@ -223,6 +254,14 @@ pub fn run(gpu: check.Gpu) !void {
     }
     defer for (&writebacks) |*w| w.deinit();
     for (&writebacks) |*w| try kernels.append(a, w.kernel());
+    var hcnorms: [2]hcnorm_k.Normalize = undefined;
+    for (std.enums.values(hcnorm_k.Kind), &hcnorms) |kind, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .kind = kind, .cols_fn = try hc.function("fn_hc_normalize_cols"), .old_fn = try hc.function("fn_hc_normalize") };
+    defer for (&hcnorms) |*x| x.deinit();
+    for (&hcnorms) |*x| try kernels.append(a, x.kernel());
+    var hcmixes: [4]hcmix_k.Mix = undefined;
+    for (std.enums.values(hcmix_k.Kind), &hcmixes) |kind, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .kind = kind, .new_fn = try hc.function("fn_hc_dense_mix8"), .old_fn = try hc.function("fn_hc_dense_mix"), .ctl_fn = if (kind == .sums_control) try mods[5].function("tf_ctl_hc_mix8_bf16") else null };
+    defer for (&hcmixes) |*x| x.deinit();
+    for (&hcmixes) |*x| try kernels.append(a, x.kernel());
     var batch = try cuda.Module.load(gpu.d, kk.flashnext_batch);
     defer batch.unload();
     var sums: [2]utility_k.Sum = undefined;
@@ -245,7 +284,7 @@ pub fn run(gpu: check.Gpu) !void {
         selection.* = .{ .rig = .{ .gpu = gpu, .s = s }, .f = try batch.function("fn_qsa_select"), .padded = padded };
     defer for (&selections) |*selection| selection.deinit();
     for (&selections) |*selection| try kernels.append(a, selection.kernel());
-    var h3_mod = try cuda.Module.load(gpu.d, &h3_image.bytes);
+    var h3_mod = try cuda.Module.load(gpu.d, &images.h3);
     defer h3_mod.unload();
     const h3_which = comptime std.enums.values(h3_k.Which);
     var h3_list: [h3_which.len]h3_k.H3 = undefined;
@@ -293,6 +332,18 @@ pub fn run(gpu: check.Gpu) !void {
             nlane += 1;
         }
     }
+    var e3_mods = try e3_k.Loaded.init(gpu);
+    defer e3_mods.deinit();
+    var e3_splits: [std.enums.values(e3_k.Fault).len]e3_k.Split = undefined;
+    for (std.enums.values(e3_k.Fault), &e3_splits) |f, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .k = &e3_mods.k, .fault = f };
+    defer for (&e3_splits) |*x| x.deinit();
+    for (&e3_splits) |*x| try kernels.append(a, x.kernel());
+    const exl3_finish = try @import("contract_exl3_finish.zig").Group.create(a, gpu, s, mods[5], &kernels);
+    defer exl3_finish.destroy();
+    const exl3_grouped = try @import("contract_exl3_grouped.zig").Group.create(a, gpu, s, mods[5], &kernels);
+    defer exl3_grouped.destroy();
+    const nvfp4_facts = try @import("contract_nvfp4_tile.zig").Group.create(a, gpu, s, sms, try cuda.grouped.Router.resolve(mods[6]), &kernels);
+    defer nvfp4_facts.destroy();
     var round_mod = try cuda.Module.load(gpu.d, kk.tree_round);
     defer round_mod.unload();
     const round_fns = try cuda.tree_round.Kernels.resolve(round_mod);
@@ -310,6 +361,10 @@ pub fn run(gpu: check.Gpu) !void {
     for (act_round_k.entries, &act_rounds) |e, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .entry = e, .act = &act_rows, .ctl = if (e.keep != null) try mods[5].function("tf_ctl_act_round") else null };
     defer for (&act_rounds) |*x| x.deinit();
     for (&act_rounds) |*x| try kernels.append(a, x.kernel());
+    const ples = try ple_k.Group.create(a, gpu, s, mods[5], &kernels);
+    defer ples.destroy();
+    const spark_acts = try @import("contract_spark_act.zig").Group.create(a, gpu, s, &act_rows, mods[5], &kernels);
+    defer spark_acts.destroy();
     var gemma_ops: @import("contract_gemma_ops.zig").Group = .{};
     defer gemma_ops.deinit();
     try gemma_ops.init(gpu, s, &act_rows, &vit, &round_fns, mods[5]);
@@ -355,10 +410,10 @@ pub fn run(gpu: check.Gpu) !void {
     var q35_kv8 = try cuda.Module.load(gpu.d, kk.qwen35_kv8);
     defer q35_kv8.unload();
     var q35s: [q35_k.forms.len]q35_k.Q35 = undefined;
-    for (q35_k.forms, &q35s) |f, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .form = f, .partial = try if (f.cache == .fp8) q35_kv8.function("tf_q35_attn_partial8") else q35_mod.function("tf_q35_attn_partial"), .merge = try q35_mod.function("tf_q35_attn_merge") };
+    for (q35_k.forms, &q35s) |f, *x| x.* = try q35_k.Q35.init(.{ .gpu = gpu, .s = s }, f, q35_mod, q35_kv8);
     defer for (&q35s) |*x| x.deinit();
     for (&q35s) |*x| try kernels.append(a, x.kernel());
-    var window_fns = try cuda.window_attention.WindowAttention.load(gpu.d);
+    var window_fns = try window_k.load(gpu.d);
     defer window_fns.unload();
     var windows: [window_k.cfgs.len]window_k.Window = undefined;
     for (window_k.cfgs, &windows) |f, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .f = f, .g = &window_fns };
@@ -380,12 +435,9 @@ pub fn run(gpu: check.Gpu) !void {
     for (&denses, 0..) |*x, i| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .tile = i, .g = &dense_fns };
     defer for (&denses) |*x| x.deinit();
     for (&denses) |*x| try kernels.append(a, x.kernel());
-    var embed_rows = try cuda.embed_rows.EmbedRows.load(gpu.d);
-    defer embed_rows.unload();
-    var embeds: [embed_k.entries.len]embed_k.Embed = undefined;
-    for (embed_k.entries, &embeds) |e, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .entry = e, .e = &embed_rows, .ctl = if (e.keep != null) try mods[5].function("tf_ctl_embed_affine") else null };
-    defer for (&embeds) |*x| x.deinit();
-    for (&embeds) |*x| try kernels.append(a, x.kernel());
+    var elementwise: elementwise_k.Set = .{};
+    defer elementwise.deinit();
+    try elementwise.add(gpu, s, mods[5], &kernels);
     var qkrs: [qkr_k.forms.len]qkr_k.Qk = undefined;
     for (&qkrs, qkr_k.forms) |*x, f| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .form = f, .k = &qk_rows, .ctl = if (f.keep != null) try mods[5].function("tf_ctl_qk_round") else null, .arena = .init(a) };
     defer for (&qkrs) |*x| x.deinit();
@@ -435,49 +487,92 @@ pub fn run(gpu: check.Gpu) !void {
     defer attn.unload();
     var hcf_mod = try cuda.Module.load(gpu.d, kk.flashnext_hcf);
     defer hcf_mod.unload();
-    var fglue = try @import("flashnext").Glue.load(gpu.d);
-    defer fglue.deinit();
-    const glue_fns: glue_k.Fns = .{
-        .tpr = try batch.function("fn_gdn_chain_tpr"),
-        .rows_to = try batch.function("fn_gdn_rows_to"),
-        .tile = try attn.function("_ZN8qsa_tile6scoresILi8ELi4EEEvPK13__nv_bfloat16S3_PKiPfiiii"),
-        .scores = try attn.function("fn_qsa_scores"),
-        .hcf_down = try hcf_mod.function(ftk.cubin_hcf_down),
-        .hcf_up = try hcf_mod.function(ftk.cubin_hcf_up),
-        .front = try batch.function("fn_gdn_front"),
-        .norm = try batch.function("fn_gdn_norm"),
-        .fused = try batch.function("fn_gdn_fused"),
-    };
-    try glue_fns.fused.allowDynamicShared(fparts.gdn_fused_smem);
-    try glue_fns.tpr.allowDynamicShared(fparts.chain_tpr_smem);
-    try glue_fns.hcf_down.allowDynamicShared(ftk.hcf_down_smem);
-    try glue_fns.hcf_up.allowDynamicShared(ftk.hcf_up_smem);
-    var glues: [4]glue_k.Glue = undefined;
-    for (std.enums.values(glue_k.Kind), &glues) |kind, *m| m.* = .{ .rig = .{ .gpu = gpu, .s = s }, .kind = kind, .f = &glue_fns, .glue = &fglue };
-    defer for (&glues) |*m| m.deinit();
-    for (&glues) |*m| try kernels.append(a, m.kernel());
+    var fn_groups: fn_groups_k.Set = .{};
+    defer fn_groups.deinit();
+    try fn_groups.add(gpu, s, batch, attn, hcf_mod, &kernels);
     var wrows: [wrows_k.cfgs.len]wrows_k.Rows = undefined;
     for (&wrows, wrows_k.cfgs) |*x, f| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .f = f, .g = &window_fns, .ctl = mods[5], .arena = .init(a) };
     defer for (&wrows) |*x| x.deinit();
     for (&wrows) |*x| try kernels.append(a, x.kernel());
+    var glm_glue = try cuda.Module.load(gpu.d, kk.glm_glue);
+    defer glm_glue.unload();
+    var f32ws: [6]f32w_k.F32w = undefined;
+    for (std.enums.values(f32w_k.Which), &f32ws) |w, *x| x.* = .init(.{ .gpu = gpu, .s = s }, w, try glm_glue.function(switch (w) {
+        .norm_y, .norm_sums => "tf_glm_rmsnorm_4096_f32w",
+        else => "tf_glm_hc_finish_f32w",
+    }));
+    defer for (&f32ws) |*x| x.deinit();
+    for (&f32ws) |*x| try kernels.append(a, x.kernel());
+    var bf16s: [f32w_k.bf16_entries.len]f32w_k.F32w = undefined;
+    for (f32w_k.bf16_entries, &bf16s) |e, *x| {
+        x.* = .init(.{ .gpu = gpu, .s = s }, e.which, try glm_glue.function(e.symbol));
+        x.width = e.width;
+        x.baseline = try mods[5].function(e.old);
+    }
+    defer for (&bf16s) |*x| x.deinit();
+    for (&bf16s) |*x| try kernels.append(a, x.kernel());
+    var f32w_control: f32w_k.F32w = .init(.{ .gpu = gpu, .s = s }, .norm_y, try glm_glue.function("tf_glm_rmsnorm_4096_f32w"));
+    f32w_control.bf16_gamma = true;
+    defer f32w_control.deinit();
+    try kernels.append(a, f32w_control.kernel());
+    const glm_fns = try glm.glue.Kernels.load(glm_glue);
+    var glm_lat = glm_pages_k.LatWrite{ .rig = .{ .gpu = gpu, .s = s }, .f = glm_fns.lat_write };
+    defer glm_lat.deinit();
+    try kernels.append(a, glm_lat.kernel());
+    var glm_pool = glm_pages_k.PoolKeys{ .rig = .{ .gpu = gpu, .s = s }, .f = glm_fns.pool_keys };
+    defer glm_pool.deinit();
+    try kernels.append(a, glm_pool.kernel());
+    var glm_index = glm_index_k.Index.init(gpu, s, glm_fns);
+    defer glm_index.deinit();
+    try glm_index.append(a, &kernels);
+    const glm_fast = try @import("contract_glm_pools.zig").Fast.create(a, gpu, s, glm_fns, &kernels);
+    defer glm_fast.destroy(a);
+    const glm_top1 = try @import("contract_glm_top1.zig").Top1.create(a, gpu, s, glm_fns, &kernels);
+    defer glm_top1.destroy(a);
+    var glm_ops = try cuda.Module.load(gpu.d, kk.glm_ops);
+    defer glm_ops.unload();
+    var glm_tokens = glm_index_k.Tokens{ .rig = .{ .gpu = gpu, .s = s }, .f = try glm_ops.function("tf_glm_dsa_tokens") };
+    defer glm_tokens.deinit();
+    try kernels.append(a, glm_tokens.kernel());
+    var glm_chunks: [4]glm_attn_k.Chunks = undefined;
+    for (&glm_chunks, [_]u32{ 16, 16, 32, 32 }, [_]bool{ false, true, false, true }) |*x, hb, sparse|
+        x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .f = if (hb == 16) glm_fns.chunks_16 else glm_fns.chunks_32, .merge = glm_fns.merge, .form = .{ .hb = hb, .sparse = sparse } };
+    defer for (&glm_chunks) |*x| x.deinit();
+    for (&glm_chunks) |*x| try kernels.append(a, x.kernel());
+    var glm_controls = @import("contract_glm_controls.zig").Controls.init(gpu, s, glm_fns, glm_tokens.f, glm_ops);
+    defer glm_controls.deinit();
+    try glm_controls.append(a, &kernels);
+    var q35_flat_mod = try cuda.Module.load(gpu.d, kk.qwen35);
+    defer q35_flat_mod.unload();
+    var q35_fp8 = try cuda.Module.load(gpu.d, kk.qwen35_kv8);
+    defer q35_fp8.unload();
+    var contiguous: [q35_contiguous.forms.len]q35_contiguous.Q35 = undefined;
+    for (q35_contiguous.forms, &contiguous) |f, *x| x.* = .{
+        .rig = .{ .gpu = gpu, .s = s },
+        .form = f,
+        .partial = try if (f.cache == .fp8) q35_fp8.function("tf_q35_attn_partial8_contiguous") else q35_flat_mod.function("tf_q35_attn_partial_contiguous"),
+        .baseline = try if (f.cache == .fp8) q35_fp8.function("tf_q35_attn_partial8_legacy") else q35_flat_mod.function("tf_q35_attn_partial_legacy"),
+        .merge = try q35_flat_mod.function("tf_q35_attn_merge"),
+    };
+    defer for (&contiguous) |*x| x.deinit();
+    for (&contiguous) |*x| try kernels.append(a, x.kernel());
+    const mtp_rows = try @import("contract_qwen_mtp_rows.zig").Group.create(a, gpu, s, &kernels);
+    defer mtp_rows.destroy();
+    const weight_only = try @import("contract_weight_only_suite.zig").Suite.create(a, gpu, s, &kernels);
+    defer weight_only.destroy(a);
+    const families = try @import("contract_family_sets.zig").Sets.init(gpu, s, a, &kernels, &affine4, cap);
+    defer families.deinit();
     var t: g.Tally = .{};
     try @import("contract_dump.zig").run(a, kernels.items);
     const t0 = check.now(gpu.io);
+    @import("contract_after.zig").keep(&kernels, only);
     try g.runAll(a, kernels.items, 0x6b63, &t);
-    try @import("gdn_back_tests.zig").run(gpu);
-    try @import("q4_back_tests.zig").run(gpu);
-    try @import("moe_back_tests.zig").run(gpu);
-    try @import("attn_back_tests.zig").run(gpu);
-    try @import("fn_hc_back_tests.zig").run(gpu);
-    try @import("fn_moe_back_tests.zig").run(gpu);
-    try @import("fn_pocket_tests.zig").run(gpu, 0);
-    std.debug.print("PASS gradient component suites (FP64 and finite-difference checks); resource receipts still required\n", .{});
+    if (only.len == 0) try @import("contract_back_suites.zig").run(gpu);
     const t1 = check.now(gpu.io);
-    try @import("contract_qwen_served.zig").run(gpu);
-    try @import("contract_qwen_learning.zig").numerical(gpu);
-    const lim = try live(gpu);
+    if (only.len == 0) try @import("contract_after.zig").suites(gpu);
+    const lim = try live(gpu, only);
     const t2 = check.now(gpu.io);
-    std.debug.print("SUMMARY {d} kernels: {d} pass gates 1-4, {d} fail, {d} known findings; {d} controls: {d} red as planted, {d} missed; {d} limit problems; gates {d} ms, limits {d} ms\n", .{ t.kernels, t.passed, t.failed, t.known, t.controls, t.caught, t.missed, lim, @divTrunc(t1 - t0, std.time.ns_per_ms), @divTrunc(t2 - t1, std.time.ns_per_ms) });
+    std.debug.print("{s}SUMMARY {d} kernels: {d} pass gates 1-4, {d} fail, {d} known findings; {d} controls: {d} red as planted, {d} missed; {d} limit problems; gates {d} ms, limits {d} ms\n", .{ if (only.len > 0) "(filtered) " else "", t.kernels, t.passed, t.failed, t.known, t.controls, t.caught, t.missed, lim, @divTrunc(t1 - t0, std.time.ns_per_ms), @divTrunc(t2 - t1, std.time.ns_per_ms) });
     try check.expect(t.problems() + lim == 0, "kernel-contract: {d} gate failures, {d} controls missed, {d} limit problems", .{ t.failed, t.missed, lim });
 }
 

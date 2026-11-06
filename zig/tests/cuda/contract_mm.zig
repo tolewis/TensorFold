@@ -12,7 +12,7 @@ const Dense = contract.dense.Dense;
 const qlinear = cuda.qlinear;
 const nvfp4 = cuda.nvfp4;
 
-pub const Kind = enum { qmm_group, lane_gemv, lane_gemv_split, lane_gemv_seg, prompt16, prompt16_f32, lane_f32, lane_f32_reduce, verify32_bits, verify32_fp64, verify64_bits, verify64_fp64, verify128_bits, verify128_fp64 };
+pub const Kind = enum { mlp128_bits, mlp128_fp64, qmm_group, lane_gemv, lane_gemv_split, lane_gemv_seg, prompt16, prompt16_f32, prompt16_lean, prompt16_lean_f32, lane_f32, lane_f32_reduce, verify32_bits, verify32_fp64, verify64_bits, verify64_fp64, verify128_bits, verify128_fp64 };
 
 /// Rows a verify kind's launch holds, 0 for the others.
 pub fn verifyTile(kind: Kind) usize {
@@ -51,6 +51,15 @@ const fp4_lane = [_]c.Shape{
 };
 const fp4_tiles = [3]c.Tile{ .{ .size = 16 }, .{ .size = 64, .step = 64, .min = 64 }, .{ .size = 512, .step = 64, .min = 64 } };
 const prompt_tiles = [3]c.Tile{ .{ .size = 128 }, .{ .size = 128, .step = 64, .min = 64 }, .{ .size = 128, .step = 64, .min = 64 } };
+/// prompt_lean: 128-row tiles, 256 columns, three 64-input stages in its ring.
+const lean_tiles = [3]c.Tile{ .{ .size = 128 }, .{ .size = 256, .step = 64, .min = 64 }, .{ .size = 192, .step = 64, .min = 64 } };
+/// Partial row and column tiles, odd group counts, and more tiles (3 x 20) than a GB10 has multiprocessors.
+const lean_served = &[_]c.Shape{ .{ .rows = 300, .n = 512, .k = 2560 }, .{ .rows = 64, .n = 2560, .k = 512 }, .{ .rows = 300, .n = 5120, .k = 576 }, .{ .rows = 17, .n = 640, .k = 1088 } };
+
+/// The lean tile's kinds, each bit-equal to prompt16's 128 x 128 tile.
+pub fn lean(kind: Kind) bool {
+    return kind == .prompt16_lean or kind == .prompt16_lean_f32;
+}
 
 /// GB10 verify tiles' affine-4 projections (N, K): the 27B's, the 35B's, their drafters', then both vocabulary heads.
 pub const projections = [_][2]usize{
@@ -92,12 +101,16 @@ pub fn spec(kind: Kind) c.Spec {
         .verify64_fp64 => .{ .name = "cuda affine4 verify64 FP64", .accum = .f32, .depth = groupDepth, .out = .bf16, .tiles = wide64_tiles, .served = wide64 },
         .verify128_bits => .{ .name = "cuda affine4 verify128 one-row bits", .accum = .f32, .depth = groupDepth, .out = .bf16, .replaces = "the original one-row affine4 decode", .tiles = wide128_tiles, .served = wide128_bits },
         .verify128_fp64 => .{ .name = "cuda affine4 verify128 FP64", .accum = .f32, .depth = groupDepth, .out = .bf16, .tiles = wide128_tiles, .served = wide128 },
+        .mlp128_bits => .{ .name = "cuda affine4 MLP128 replacement bits", .accum = .f32, .depth = groupDepth, .out = .bf16, .replaces = "qmm_group 64-column tile", .tiles = .{ .{ .size = 16 }, .{}, .{} }, .served = &.{ .{ .rows = 1, .n = 17408, .k = 5120 }, .{ .rows = 3, .n = 17408, .k = 5120 }, .{ .rows = 16, .n = 17408, .k = 5120 } } },
+        .mlp128_fp64 => .{ .name = "cuda affine4 MLP128 FP64", .accum = .f32, .depth = groupDepth, .out = .bf16, .tiles = .{ .{ .size = 16 }, .{}, .{} }, .served = &.{ .{ .rows = 1, .n = 17408, .k = 5120 }, .{ .rows = 16, .n = 17408, .k = 5120 } } },
         .qmm_group => .{ .name = "cuda qmm_group (cluster tile)", .accum = .f32, .depth = groupDepth, .out = .bf16, .tiles = tiles, .served = decode },
         .lane_gemv => .{ .name = "cuda lane_gemv", .accum = .f32, .depth = groupDepth, .out = .bf16, .replaces = "qmm_group's cluster tile", .tiles = tiles, .served = decode },
         .lane_gemv_split => .{ .name = "cuda lane_gemv split-K", .accum = .f32, .depth = groupDepth, .out = .bf16, .replaces = "qmm_group's cluster tile", .tiles = tiles, .served = decode },
         .lane_gemv_seg => .{ .name = "cuda lane_gemv segmented split-K", .accum = .f32, .depth = groupDepth, .out = .bf16, .replaces = "affine-4 decode()", .tiles = tiles, .served = segmented },
         .prompt16 => .{ .name = "cuda prompt16 FP4 tile 4", .accum = .f32, .depth = mmaChain, .ops = 2, .out = .bf16, .tiles = prompt_tiles, .served = &.{ .{ .rows = 300, .n = 512, .k = 2560 }, .{ .rows = 64, .n = 2560, .k = 512 } } },
         .prompt16_f32 => .{ .name = "cuda prompt16 FP4 tile 4, fp32 out", .accum = .f32, .depth = mmaChain, .ops = 2, .out = .f32, .tiles = prompt_tiles, .served = &.{ .{ .rows = 300, .n = 512, .k = 2560 }, .{ .rows = 64, .n = 2560, .k = 512 }, .{ .rows = 64, .n = 4096, .k = 3072 } } },
+        .prompt16_lean => .{ .name = "cuda prompt16 FP4 lean tile", .accum = .f32, .depth = mmaChain, .ops = 2, .out = .bf16, .replaces = "prompt16 FP4 tile 4", .tiles = lean_tiles, .served = lean_served },
+        .prompt16_lean_f32 => .{ .name = "cuda prompt16 FP4 lean tile, fp32 out", .accum = .f32, .depth = mmaChain, .ops = 2, .out = .f32, .replaces = "prompt16 FP4 tile 4, fp32 out", .tiles = lean_tiles, .served = lean_served },
         .lane_f32 => .{ .name = "cuda qmmf FP4 fp32 out (slices in a cluster)", .accum = .f32, .depth = laneFp4Depth, .ops = 2, .out = .f32, .tiles = fp4_tiles, .served = &fp4_lane },
         .lane_f32_reduce => .{ .name = "cuda qmmf FP4 fp32 out (slices by reduce_kernel<true>)", .accum = .f32, .depth = laneFp4Depth, .ops = 2, .out = .f32, .tiles = fp4_tiles, .served = &fp4_lane },
     };
@@ -129,6 +142,7 @@ pub const Mm = struct {
     }
 
     pub fn kernel(self: *Mm) ?g.Kernel {
+        if ((self.kind == .mlp128_bits or self.kind == .mlp128_fp64) and self.sm != 120) return null;
         if (self.sm < 90 and (self.kind == .qmm_group or verifyTile(self.kind) > 0)) return null;
         var declared = spec(self.kind);
         if (self.truncate_verify) declared.name = switch (self.kind) {
@@ -140,7 +154,7 @@ pub const Mm = struct {
             else => "control: verify32 truncated FP64",
         };
         if (self.sm < 90) {
-            if (self.kind != .lane_gemv_seg) declared.replaces = null; // decode() runs on every GPU
+            if (self.kind != .lane_gemv_seg and !lean(self.kind)) declared.replaces = null; // these run on every GPU
             if (self.kind == .lane_f32) declared.name = "cuda qmmf FP4 fp32 out (slices by reduce_kernel<true>, architecture fallback)";
         }
         return .{ .spec = declared, .ctx = self, .vt = &vt, .control = if (self.truncate_verify) .shapes else null };
@@ -161,13 +175,14 @@ pub const Mm = struct {
         self.drop();
         if (shape.rows == 0 or shape.n == 0 or shape.k == 0 or shape.k % 64 != 0) return false;
         return switch (self.kind) {
-            .qmm_group, .lane_gemv, .lane_gemv_split, .lane_gemv_seg, .verify32_bits, .verify32_fp64, .verify64_bits, .verify64_fp64, .verify128_bits, .verify128_fp64 => self.prepareAffine(shape, fill, seed),
-            .prompt16, .prompt16_f32, .lane_f32, .lane_f32_reduce => self.preparePrompt(shape, fill, seed),
+            .mlp128_bits, .mlp128_fp64, .qmm_group, .lane_gemv, .lane_gemv_split, .lane_gemv_seg, .verify32_bits, .verify32_fp64, .verify64_bits, .verify64_fp64, .verify128_bits, .verify128_fp64 => self.prepareAffine(shape, fill, seed),
+            .prompt16, .prompt16_f32, .prompt16_lean, .prompt16_lean_f32, .lane_f32, .lane_f32_reduce => self.preparePrompt(shape, fill, seed),
         };
     }
 
     fn prepareAffine(self: *Mm, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
         const wide = verifyTile(self.kind) > 0;
+        if ((self.kind == .mlp128_bits or self.kind == .mlp128_fp64) and !(shape.rows > 0 and shape.rows <= 16 and shape.n == 17408 and shape.k == 5120)) return false;
         if (shape.rows > (if (wide) verifyTile(self.kind) else 16) or (!wide and shape.n % 64 != 0)) return false;
         if (self.kind == .lane_gemv_split and qlinear.splitK(shape.n, shape.k) == 1) return false; // served only with K slices
         const a = self.rig.gpu.gpa;
@@ -201,7 +216,7 @@ pub const Mm = struct {
         try self.affine4.?.pack(self.rig.s, src_w, src_s, src_b, self.q);
         try self.rig.s.synchronize();
         const out_bytes = shape.rows * shape.n * 2;
-        if (self.kind == .lane_gemv or self.kind == .lane_gemv_split or self.kind == .lane_gemv_seg or oneRowBits(self.kind)) self.base = try self.rig.scratch(out_bytes);
+        if (self.kind == .lane_gemv or self.kind == .lane_gemv_split or self.kind == .lane_gemv_seg or oneRowBits(self.kind) or self.kind == .mlp128_bits) self.base = try self.rig.scratch(out_bytes);
         self.out = try self.rig.output(out_bytes);
         return true;
     }
@@ -246,6 +261,7 @@ pub const Mm = struct {
         if (self.lane) |l| if (l.partBytes(shape.rows, self.w4) > 0) {
             self.part = try self.rig.scratch(l.partBytes(shape.rows, self.w4));
         };
+        if (lean(self.kind)) self.base = try self.rig.scratch(shape.rows * n * c.size(spec(self.kind).out));
         self.out = try self.rig.output(shape.rows * n * c.size(spec(self.kind).out));
         return true;
     }
@@ -266,6 +282,12 @@ pub const Mm = struct {
                 const f = self.f.?;
                 try self.affine4.?.clusterRows(verifyTile(kind), s, self.x, self.xs, self.q, out, if (self.truncate_verify) @min(f.shape.rows, 16) else f.shape.rows);
             },
+            .mlp128_bits, .mlp128_fp64 => {
+                const f = self.f.?;
+                var selected = self.affine4.?.*;
+                selected.mlp128 = true;
+                try selected.cluster(s, self.x, self.xs, self.q, out, f.shape.rows, 1);
+            },
             .qmm_group => {
                 const f = self.f.?;
                 try self.affine4.?.cluster(s, self.x, self.xs, self.q, out, f.shape.rows, qlinear.splitK(f.shape.n, f.shape.k));
@@ -284,8 +306,10 @@ pub const Mm = struct {
                 const segs = [_]qlinear.Affine4Kernels.Out{ .{ .q = self.q, .out = self.base }, .{ .q = self.q, .out = out } };
                 try self.affine4.?.gemvSeg(s, self.x, self.xs, &segs, f.shape.rows, self.split.?.*);
             },
-            .prompt16 => try self.prompt.?.matmul(s, self.x, self.d.?.shape.k, self.d.?.shape.rows, self.w4, out),
-            .prompt16_f32 => try self.prompt.?.matmulOut(s, self.x, self.d.?.shape.k, self.d.?.shape.rows, self.w4, out, .f32),
+            .prompt16 => try self.prompt.?.matmulTile(s, self.x, self.d.?.shape.k, self.d.?.shape.rows, self.w4, out, .bf16, .classic),
+            .prompt16_f32 => try self.prompt.?.matmulTile(s, self.x, self.d.?.shape.k, self.d.?.shape.rows, self.w4, out, .f32, .classic),
+            .prompt16_lean => try self.prompt.?.matmulTile(s, self.x, self.d.?.shape.k, self.d.?.shape.rows, self.w4, out, .bf16, .lean),
+            .prompt16_lean_f32 => try self.prompt.?.matmulTile(s, self.x, self.d.?.shape.k, self.d.?.shape.rows, self.w4, out, .f32, .lean),
             .lane_f32, .lane_f32_reduce => {
                 const d = self.d.?;
                 try self.lane.?.matmulOut(s, self.x, d.shape.k, d.shape.rows, self.w4, out, .f32, self.part);
@@ -293,8 +317,20 @@ pub const Mm = struct {
         }
     }
 
-    /// qmm_group's cluster tile on the same inputs: the bits lane_gemv must equal.
+    /// The replaced kernel on the same inputs: qmm_group's cluster tile (lane_gemv), prompt16's tile (prompt_lean).
     pub fn replaced(self: *Mm) ![]const u8 {
+        if (self.kind == .mlp128_bits) {
+            const f = self.f.?;
+            var baseline = self.affine4.?.*;
+            baseline.mlp128 = false;
+            try baseline.cluster(self.rig.s, self.x, self.xs, self.q, self.base, f.shape.rows, 1);
+            return self.rig.bytes(self.base, self.count() * 2);
+        }
+        if (lean(self.kind)) {
+            try self.launch(if (self.kind == .prompt16_lean) .prompt16 else .prompt16_f32, self.base);
+            try self.rig.s.synchronize();
+            return self.rig.bytes(self.base, self.count() * c.size(spec(self.kind).out));
+        }
         if (oneRowBits(self.kind)) {
             const f = self.f.?;
             for (0..f.shape.rows) |row| try self.affine4.?.decode(self.rig.s, self.x + row * f.shape.k * 2, self.xs + row * (f.shape.k / 64) * 4, self.q, self.base + row * f.shape.n * 2, 1);

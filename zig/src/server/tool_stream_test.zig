@@ -120,8 +120,6 @@ test "a one-call reply retains an unoffered call and still hides an unclosed one
     // a stream that sent the prose before the block ends with the block
     try std.testing.expectEqualStrings(text["Launching. ".len..], single.kept(text, "\nLaunching. ").?);
     try std.testing.expect(single.kept("Launching.", "Launching. ") == null);
-    const parallel: Policy = .{};
-    try std.testing.expect(parallel.kept(text, "Launching. ") == null);
 }
 
 const tool_parse = @import("tool_parse.zig");
@@ -143,12 +141,17 @@ fn sentArguments(a: Allocator, deltas: []const Value) Allocator.Error![]const u8
     return out.items;
 }
 
+/// (prefix, suffix) of a DSML call around its ``q`` value: ``tool_calls``, and V4.1's spaced ``calls``.
+const dsml = [_][2][]const u8{
+    .{ "<｜DSML｜tool_calls><｜DSML｜invoke name=\"lookup\"><｜DSML｜parameter name=\"q\" string=\"true\">", "</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>" },
+    .{ "<｜DSML｜ calls><｜DSML｜ invoke name=\"lookup\"><｜DSML｜ parameter name=\"q\" string=\"true\">", "</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>" },
+};
+
 test "DSML containment survives every byte boundary and preserves adjacent call order" {
-    const prefix = "<｜DSML｜tool_calls><｜DSML｜invoke name=\"lookup\">" ++
-        "<｜DSML｜parameter name=\"q\" string=\"true\">";
-    const suffix = "</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>";
     const legacy = "<tool_call><function=lookup></function></tool_call>";
-    for ([_][]const u8{ legacy, "<tool_call><function=lookup></function>" }) |literal| {
+    for (dsml) |sp| for ([_][]const u8{ legacy, "<tool_call><function=lookup></function>" }) |literal| {
+        const prefix = sp[0];
+        const suffix = sp[1];
         var outer_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
         defer outer_arena.deinit();
         const outer_a = outer_arena.allocator();
@@ -174,59 +177,77 @@ test "DSML containment survives every byte boundary and preserves adjacent call 
             try std.testing.expectEqual(@as(i64, 3), calls);
             try std.testing.expectEqualStrings(expected, try sentArguments(a, out.items));
         }
-    }
+    };
 }
 
-test "unfinished DSML retains containment through byte feeds and final closeCall" {
-    const prefix = "<｜DSML｜tool_calls><｜DSML｜invoke name=\"lookup\">" ++
-        "<｜DSML｜parameter name=\"q\" string=\"true\">";
-    const literals = [_][]const u8{
-        "<tool_call><function=lookup></function></tool_call>",
-        "<tool_call><function=lookup></function>",
-        "<tool_call>{\"name\":\"lookup\",\"arguments\":{}",
+test "an unfinished DSML block streams the call it began, its nested XML as argument text" {
+    // the nested XML literal, and the arguments its block's value streams up to the reply's end
+    const literals = [_][2][]const u8{
+        .{ "<tool_call><function=lookup></function></tool_call>", "{\"q\":\"<tool_call><function=lookup></function></tool_call>" },
+        .{ "<tool_call><function=lookup></function>", "{\"q\":\"<tool_call><function=lookup></function>" },
+        .{ "<tool_call>{\"name\":\"lookup\",\"arguments\":{}", "{\"q\":\"<tool_call>{\\\"name\\\":\\\"lookup\\\",\\\"arguments\\\":{}" },
     };
-    for (literals) |literal| {
+    for (dsml) |sp| for (literals) |literal| {
         var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
         defer arena.deinit();
         const a = arena.allocator();
         const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]")).ok.array;
-        const text = try std.mem.concat(a, u8, &.{ prefix, literal });
+        const text = try std.mem.concat(a, u8, &.{ sp[0], literal[0] });
+        const name_end = std.mem.indexOf(u8, text, "\">").? + 2; // the byte the invoke's name ends on
         var s = try Streamer.init(a, tools);
         var out: std.ArrayList(Value) = .empty;
+        var last: usize = 0;
         for (0..text.len + 1) |n| {
             try s.feed(text[0..n], &out);
-            try std.testing.expectEqual(@as(usize, 0), out.items.len);
+            // nothing before the name's ``>``, the header at it, then only its arguments' pieces
+            if (n <= name_end) try std.testing.expectEqual(@as(usize, @intFromBool(n == name_end)), out.items.len);
+            try std.testing.expect(out.items.len >= last); // a longer prefix only ever adds
+            last = out.items.len;
         }
         const tail = try tool_parse.closeCall(a, text, tools);
         try std.testing.expectEqualStrings("", tail);
         try s.feed(try std.mem.concat(a, u8, &.{ text, tail }), &out);
-        try std.testing.expectEqual(@as(usize, 0), out.items.len);
-        try std.testing.expect(!s.streamed);
-    }
+        try std.testing.expectEqual(last, out.items.len); // the empty closeCall sends no delta of its own
+        // the invoke's header and its value stream; the nested XML is that value's text, never a call of its own
+        var headers: usize = 0;
+        for (out.items) |delta| for (delta.get("tool_calls").?.array) |call| {
+            if (call.get("id") == null) continue;
+            try std.testing.expectEqual(@as(i64, @intCast(headers)), call.get("index").?.int64().?);
+            try std.testing.expectEqualStrings("lookup", call.get("function").?.strField("name").?);
+            headers += 1;
+        };
+        try std.testing.expectEqual(@as(usize, 1), headers);
+        try std.testing.expectEqualStrings(literal[1], try sentArguments(a, out.items));
+        try std.testing.expect(s.streamed);
+    };
 }
 
-test "malformed closed DSML masks its nested XML and resumes the next legitimate call" {
-    const malformed = "<｜DSML｜tool_calls><｜DSML｜invoke name=\"lookup\">" ++
-        "<｜DSML｜parameter name=\"q\" string=\"true\">" ++
-        "<tool_call><function=lookup></function></tool_call>" ++
-        "</｜DSML｜parameter></｜DSML｜tool_calls>";
+test "a malformed DSML block's header stands: its nested XML is argument text and the next call arrives" {
     const legacy = "<tool_call><function=lookup></function></tool_call>";
-    const text = malformed ++ legacy;
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]")).ok.array;
-    var s = try Streamer.init(a, tools);
-    var out: std.ArrayList(Value) = .empty;
-    for (0..malformed.len + 1) |n| {
-        try s.feed(text[0..n], &out);
-        try std.testing.expectEqual(@as(usize, 0), out.items.len);
+    inline for (.{ .{ dsml[0][0], "</｜DSML｜parameter></｜DSML｜tool_calls>" }, .{ dsml[1][0], "</｜DSML｜ parameter></｜DSML｜ calls>" } }) |sp| {
+        const malformed = sp[0] ++ legacy ++ sp[1];
+        const text = malformed ++ legacy;
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]")).ok.array;
+        var s = try Streamer.init(a, tools);
+        var out: std.ArrayList(Value) = .empty;
+        const name_end = std.mem.indexOf(u8, text, "\">").? + 2; // the byte the invoke's name ends on
+        var last: usize = 0;
+        for (0..text.len + 1) |n| {
+            try s.feed(text[0..n], &out);
+            // nothing before the name's ``>``, the header at it, then only pieces
+            if (n <= name_end) try std.testing.expectEqual(@as(usize, @intFromBool(n == name_end)), out.items.len);
+            try std.testing.expect(out.items.len >= last);
+            last = out.items.len;
+        }
+        var calls: usize = 0;
+        for (out.items) |delta| for (delta.get("tool_calls").?.array) |call| {
+            calls += @intFromBool(call.get("id") != null);
+        };
+        // the call the block began, then the next one: the nested XML stays the block's argument text
+        try std.testing.expectEqual(@as(usize, 2), calls);
+        try std.testing.expectEqualStrings("{\"q\":\"<tool_call><function=lookup></function></tool_call>\"{}", try sentArguments(a, out.items));
     }
-    for (malformed.len + 1..text.len + 1) |n| try s.feed(text[0..n], &out);
-    var calls: usize = 0;
-    for (out.items) |delta| for (delta.get("tool_calls").?.array) |call| {
-        if (call.get("id") != null) calls += 1;
-    };
-    try std.testing.expectEqual(@as(usize, 1), calls);
-    try std.testing.expectEqualStrings("{}", try sentArguments(a, out.items));
 }

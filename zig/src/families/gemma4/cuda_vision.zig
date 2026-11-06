@@ -3,10 +3,12 @@ const std = @import("std");
 const cuda = @import("cuda");
 const wts = @import("cuda_weights.zig");
 const kern = @import("cuda_kernels.zig");
-const image = @import("cuda_image.zig");
+const image = @import("image.zig");
+const steps = image.For(@import("core").picture);
 const tw = @import("cuda_tower.zig");
 
 const vit = cuda.vit;
+const toBf16 = @import("core").bf16_round.bits;
 
 /// nn.LayerNorm's default and Gemma4RMSNorm's.
 const ln_eps: f32 = 1e-5;
@@ -26,7 +28,7 @@ pub const Vision = struct {
     e: union(enum) { embedder: Embedder, tower: tw.Tower },
 
     pub fn prepare(v: *const Vision, a: std.mem.Allocator, bytes: []const u8, max_tokens: u32) !image.Prepared {
-        return image.prepare(v.io, a, bytes, @min(max_tokens, v.limits.image_tokens), if (v.e == .tower) .patches else .merged);
+        return steps.prepare(v.io, a, bytes, @min(max_tokens, v.limits.image_tokens), if (v.e == .tower) .patches else .merged);
     }
 
     /// An image's prepared rows to `out` [tokens, hidden] bf16, queued on `s`.
@@ -42,7 +44,7 @@ pub const Vision = struct {
         }
     }
 
-    pub const explain = image.decoderProblem;
+    pub const explain = steps.decoderProblem;
     /// Gemma 4's templates write an image for parts of type "image" (as the Metal family offers them).
     pub const part_type = "image";
 };
@@ -66,6 +68,7 @@ pub const Embedder = struct {
         errdefer e.vit.unload();
         e.gemms = try vit.Gemms.init(gpa, d);
         errdefer e.gemms.deinit();
+        errdefer e.buffers.deinit(gpa);
         errdefer for (e.buffers.items) |*b| b.free();
         const t = image.max_budget;
         for (&e.x) |*p| p.* = try e.alloc(d, t * wts.merged_width * 2);
@@ -73,6 +76,12 @@ pub const Embedder = struct {
         e.acc = try e.alloc(d, t * wts.vision_width * 4);
         e.ids = try e.alloc(d, 2 * t * 4);
         return e;
+    }
+
+    /// The device bytes init allocates for its scratch.
+    pub fn workspaceBytes() u64 {
+        const t: u64 = image.max_budget;
+        return 2 * t * wts.merged_width * 2 + 6 * t * wts.vision_width * 2 + t * wts.vision_width * 4 + 2 * t * 4;
     }
 
     fn alloc(e: *Embedder, d: *const cuda.Driver, bytes: usize) !u64 {
@@ -103,7 +112,7 @@ pub const Embedder = struct {
         const vw = wts.vision_width;
         const host = try e.gpa.alloc(u16, t * mw + 2 * t * 2);
         defer e.gpa.free(host);
-        for (pixels, host[0 .. t * mw]) |p, *h| h.* = vit.bf16(p);
+        for (pixels, host[0 .. t * mw]) |p, *h| h.* = toBf16(p);
         // each row's x and y position rows of the [1120, 2, width] table, as rows of a [2240, width] one
         const ids = std.mem.bytesAsSlice(i32, std.mem.sliceAsBytes(host[t * mw ..]));
         for (0..t) |r| {

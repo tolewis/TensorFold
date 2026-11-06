@@ -423,10 +423,9 @@ extern "C" __global__ void __launch_bounds__(64) tf_q35_head_norm(const __nv_bfl
 struct StoreBf16 {
     int layer, kvh;
     __device__ __forceinline__ void operator()(const Seg& sg, int h, int slot, int d, __nv_bfloat16 k, __nv_bfloat16 v) const {
-        __nv_bfloat16* keys = reinterpret_cast<__nv_bfloat16*>(sg.kv) + (size_t)layer * 2 * kvh * sg.cap * HD;
-        const size_t dst = ((size_t)h * sg.cap + slot) * HD + d;
-        keys[dst] = k;
-        keys[(size_t)kvh * sg.cap * HD + dst] = v;
+        __nv_bfloat16* kv = reinterpret_cast<__nv_bfloat16*>(sg.kv);
+        kv[kv_row(sg, kvh, layer, 0, h, slot) + d] = k;
+        kv[kv_row(sg, kvh, layer, 1, h, slot) + d] = v;
     }
 };
 
@@ -434,26 +433,12 @@ struct StoreBf16 {
 extern "C" __global__ void __launch_bounds__(256) tf_q35_rope(Geo geo, __nv_bfloat16* __restrict__ Qn, const __nv_bfloat16* __restrict__ Kn,
                                                                 const __nv_bfloat16* __restrict__ Vr, const Seg* __restrict__ segs,
                                                                 const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
-                                                                const int* __restrict__ P, const int* __restrict__ M) {
-    rope_rows(geo, Qn, Kn, Vr, segs, rowseg, rowanc, P, M, StoreBf16{layer, geo.kvh});
+                                                                const int* __restrict__ P, const int* __restrict__ M, const float* __restrict__ Y) {
+    rope_rows(geo, Qn, Kn, Vr, segs, rowseg, rowanc, P, M, Y, StoreBf16{layer, geo.kvh});
 }
 
-// Decode attention over bf16 rows on tensor cores (qwen35_attn_tc.cuh), tiles in two dynamic shared buffers.
-extern "C" __global__ void __launch_bounds__(128) tf_q35_attn_partial(Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
-                                                                        const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
-                                                                        const int* __restrict__ P, float scale,
-                                                                        float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
-    extern __shared__ __align__(16) uint4 attn_tiles[];
-    tf_q35_tc::attn_one<tf_q35_tc::Bf16Tiles<128>>({attn_tiles, nullptr, nullptr, nullptr}, geo, Q, segs, rowseg, rowanc, layer, P, scale, PM, PL, PO);
-}
-
-extern "C" __global__ void __launch_bounds__(256) tf_q35_attn_rows(Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
-                                                                     const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
-                                                                     const int* __restrict__ P, float scale, int total,
-                                                                     float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
-    extern __shared__ __align__(16) uint4 attn_tiles[];
-    tf_q35_tc::attn_rows<4, tf_q35_tc::Bf16Tiles<256>>({attn_tiles, nullptr, nullptr, nullptr}, geo, Q, segs, rowseg, rowanc, layer, P, scale, total, PM, PL, PO);
-}
+// Causal attention in chunks of chunk_keys(the row's keys), a warp a query head; partials by (row, head, chunk).
+#include "qwen35_attn.cuh"
 
 // A row's chunks' partials into each (row, query head)'s output, rows qh * HD wide. Grid (qh, rows), a warp each.
 extern "C" __global__ void __launch_bounds__(32) tf_q35_attn_merge(Geo geo, const float* __restrict__ PM, const float* __restrict__ PL,
@@ -513,3 +498,36 @@ extern "C" __global__ void tf_q35_attn_gate(Geo geo, const __nv_bfloat16* __rest
 #include "qwen35_rows.cuh"
 #include "qwen35_slots.cuh"
 #include "qwen35_argmax.cuh"
+
+
+extern "C" __global__ void __launch_bounds__(128) tf_q35_attn_partial(Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
+                                                                        const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
+                                                                        const int* __restrict__ P, float scale,
+                                                                        float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
+    extern __shared__ __align__(16) uint4 attn_tiles[];
+    tf_q35_tc::attn_one<tf_q35_tc::Bf16Tiles<128>>({attn_tiles, nullptr, nullptr, nullptr}, geo, Q, segs, rowseg, rowanc, layer, P, scale, PM, PL, PO);
+}
+
+extern "C" __global__ void __launch_bounds__(256) tf_q35_attn_rows(Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
+                                                                     const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
+                                                                     const int* __restrict__ P, float scale, int total,
+                                                                     float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
+    extern __shared__ __align__(16) uint4 attn_tiles[];
+    tf_q35_tc::attn_rows<4, tf_q35_tc::Bf16Tiles<256>>({attn_tiles, nullptr, nullptr, nullptr}, geo, Q, segs, rowseg, rowanc, layer, P, scale, total, PM, PL, PO);
+}
+
+extern "C" __global__ void __launch_bounds__(128) tf_q35_attn_partial_whole(Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
+                                                                        const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
+                                                                        const int* __restrict__ P, float scale,
+                                                                        float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
+    extern __shared__ __align__(16) uint4 attn_tiles[];
+    tf_q35_tc::attn_one<tf_q35_tc::WholeBf16Tiles<128>>({attn_tiles, nullptr, nullptr, nullptr}, geo, Q, segs, rowseg, rowanc, layer, P, scale, PM, PL, PO);
+}
+
+extern "C" __global__ void __launch_bounds__(256) tf_q35_attn_rows_whole(Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
+                                                                     const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
+                                                                     const int* __restrict__ P, float scale, int total,
+                                                                     float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
+    extern __shared__ __align__(16) uint4 attn_tiles[];
+    tf_q35_tc::attn_rows<4, tf_q35_tc::WholeBf16Tiles<256>>({attn_tiles, nullptr, nullptr, nullptr}, geo, Q, segs, rowseg, rowanc, layer, P, scale, total, PM, PL, PO);
+}

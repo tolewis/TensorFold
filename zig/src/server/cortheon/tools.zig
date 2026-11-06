@@ -127,13 +127,17 @@ pub fn why(e: anyerror) []const u8 {
 
 /// A GitHub file page rewritten to its raw text, so a read gets the code instead of the page around it.
 pub fn rawGithub(a: Allocator, url: []const u8) Allocator.Error![]const u8 {
-    const prefix = "https://github.com/";
-    if (!std.mem.startsWith(u8, url, prefix)) return url;
-    var parts = std.mem.splitScalar(u8, url[prefix.len..], '/');
+    const https = "https://";
+    if (url.len < https.len or !std.ascii.startsWithIgnoreCase(url, https)) return url;
+    var after = url[https.len..];
+    if (std.ascii.startsWithIgnoreCase(after, "www.")) after = after["www.".len..]; // www.github.com is the same host
+    const host = "github.com/";
+    if (after.len < host.len or !std.ascii.startsWithIgnoreCase(after, host)) return url; // GitHub.com is the same host
+    var parts = std.mem.splitScalar(u8, after[host.len..], '/');
     const owner = parts.next() orelse return url;
     const repo = parts.next() orelse return url;
     const kind = parts.next() orelse return url;
-    if (!std.mem.eql(u8, kind, "blob")) return url;
+    if (!std.ascii.eqlIgnoreCase(kind, "blob")) return url; // Blob is the same path segment
     const rest = parts.rest();
     if (rest.len == 0) return url;
     return std.fmt.allocPrint(a, "https://raw.githubusercontent.com/{s}/{s}/{s}", .{ owner, repo, rest });
@@ -152,6 +156,28 @@ test "specs parse, calls are recognised and arguments read from either form" {
     try std.testing.expect(!isServer("bash"));
     try std.testing.expectEqualStrings("https://raw.githubusercontent.com/o/r/main/src/a.zig", try rawGithub(a, "https://github.com/o/r/blob/main/src/a.zig"));
     try std.testing.expectEqualStrings("https://github.com/o/r", try rawGithub(a, "https://github.com/o/r"));
+}
+
+test "a GitHub file page is read as raw text when the host's letters differ" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("https://raw.githubusercontent.com/o/r/main/src/a.zig", try rawGithub(a, "https://GitHub.com/o/r/blob/main/src/a.zig"));
+}
+
+test "a GitHub file page on the www host is read as raw text" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("https://raw.githubusercontent.com/o/r/main/src/a.zig", try rawGithub(a, "https://www.GitHub.com/o/r/blob/main/src/a.zig"));
+    try std.testing.expectEqualStrings("https://www.github.com/o/r", try rawGithub(a, "https://www.github.com/o/r"));
+}
+
+test "a GitHub file page is read as raw text when blob's letters differ" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("https://raw.githubusercontent.com/o/r/main/src/a.zig", try rawGithub(a, "https://github.com/o/r/Blob/main/src/a.zig"));
 }
 
 const Fake = struct {

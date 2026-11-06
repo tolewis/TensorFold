@@ -6,7 +6,9 @@
 #include <math.h>
 #include <stdint.h>
 
-#include "qmm_frag.cuh"
+#include "common/kv_pages.cuh"
+#include "common/qmm_frag.cuh"
+#include "common/cp_async.cuh"
 #include "window_fallback.h"
 
 namespace tf_wrows {
@@ -28,9 +30,12 @@ enum Fault : int {
     TRUNC = 4,   // the merge's output rounded toward zero
 };
 
+using tf_common::Pg; // common/kv_pages.cuh
+
 using qmm_frag::commit;
 using qmm_frag::cp16z;
 using qmm_frag::ldmatrix4;
+using qmm_frag::ldmatrix4t;
 using qmm_frag::mma;
 using qmm_frag::mma0;
 
@@ -101,11 +106,12 @@ __device__ __noinline__ void slow_head(const __nv_bfloat16* qh, KV kv, int lo, i
 }
 
 // Decode partials, a block a (row, key head, chunk): the chunk's max, weights and o; empty chunks write m = -inf.
-template <int D, int FAULT>
+template <int D, int FAULT, bool PG = false>
 __device__ __forceinline__ void part(const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ kc,
                                      const __nv_bfloat16* __restrict__ vc, const int* __restrict__ pos,
                                      const int* __restrict__ slot, float* __restrict__ po, float* __restrict__ pm,
-                                     float* __restrict__ pl, int h, int hk, int win, long long ring, float scale) {
+                                     float* __restrict__ pl, int h, int hk, int win, long long ring, float scale,
+                                     Pg pg = Pg{}) {
     constexpr int DPL = D / 32;  // a lane's dims of q and k, and its columns of v
     constexpr int HW = 32 / DPL; // query heads a warp takes: 32 q values, then 32 accumulators, a lane
     constexpr int U = 4;         // keys a warp loads at once
@@ -126,12 +132,19 @@ __device__ __forceinline__ void part(const __nv_bfloat16* __restrict__ q, const 
     }
     const int nk = k1 - k0 + 1;
     const int64_t r0 = k0 % ring;
+    // a paged chunk lies in one page (no window: chunks start at multiples of CK, pages hold whole chunks)
+    int64_t pb = 0;
+    if constexpr (PG) {
+        const int ts = (slot != nullptr ? slot[r] : 0) * pg.stride;
+        pb = static_cast<int64_t>(pg.tab[ts + k0 / pg.tok]) * pg.page + static_cast<int64_t>(k0 % pg.tok) * hk * D;
+    }
     // warp (hg, kg): heads hg HW.., keys [j0, j1), the kg-th of WG runs in key order
     const int HG = (G + HW - 1) / HW, WG = max(1, NW / HG);
     const int hg = warp % HG, kg = warp / HG, run = (nk + WG - 1) / WG;
     const bool busy = warp < HG * WG;
     const int j0 = min(kg * run, nk), j1 = min(j0 + run, nk);
     const auto rowp = [&](const __nv_bfloat16* cache, int jj) {
+        if constexpr (PG) return cache + pb + (static_cast<int64_t>(jj) * hk + kh) * D + lane * DPL;
         int64_t row = r0 + jj;
         if (row >= ring) row -= ring;
         return cache + ((base + row) * hk + kh) * D + lane * DPL;
@@ -239,14 +252,16 @@ __device__ __forceinline__ void part(const __nv_bfloat16* __restrict__ q, const 
     if (threadIdx.x < G) pm[part * G + threadIdx.x] = mx[threadIdx.x], pl[part * G + threadIdx.x] = ls[threadIdx.x];
 }
 
+// merge's float64 replay of a head over pages (window_pages.cu), off the fast path: its frame and divisions with it.
+template <int D> __device__ __noinline__ void merge_pg_odd(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, const int*, const int*, int, int, int, float, Pg, __nv_bfloat16*, int64_t, int, int);
 // out = sum_c a_c o_c / sum_c a_c l_c, a_c = expf(m_c - M), chunks in order; NaN or inf: the head again in float64.
-template <int D, int FAULT>
+template <int D, int FAULT, bool PG = false>
 __device__ __forceinline__ void merge(const float* __restrict__ po, const float* __restrict__ pm,
                                       const float* __restrict__ pl, __nv_bfloat16* __restrict__ out, int h, int hk,
                                       int chunks, const __nv_bfloat16* __restrict__ q,
                                       const __nv_bfloat16* __restrict__ kc, const __nv_bfloat16* __restrict__ vc,
                                       const int* __restrict__ pos, const int* __restrict__ slot, int win,
-                                      long long ring, float scale) {
+                                      long long ring, float scale, Pg pg = Pg{}) {
     const int64_t r = blockIdx.x;
     const int kh = blockIdx.y, G = h / hk;
     const int o = blockIdx.z * NT + threadIdx.x; // NT divides D: the block's outputs are one head's
@@ -265,11 +280,14 @@ __device__ __forceinline__ void merge(const float* __restrict__ po, const float*
     const float x = __fdiv_rn(acc, l);
     __nv_bfloat16* oh = out + (r * h + kh * G + hd) * D;
     oh[e] = FAULT == TRUNC ? __float2bfloat16_rz(x) : __float2bfloat16_rn(x);
-    if (__syncthreads_or(!isfinite(x))) {
+    if constexpr (PG) {
+        if (__syncthreads_or(!isfinite(x))) merge_pg_odd<D>(q, kc, vc, pos, slot, h, hk, win, scale, pg, oh, r, kh, hd);
+    } else if (__syncthreads_or(!isfinite(x))) {
         const int p = pos[r];
         const int64_t base = (slot != nullptr ? static_cast<int64_t>(slot[r]) : 0) * ring;
         const auto kv = [&](int key, int which) {
-            return (which == 0 ? kc : vc) + ((base + key % ring) * hk + kh) * D;
+            const __nv_bfloat16* c = which == 0 ? kc : vc;
+            return c + ((base + key % ring) * hk + kh) * D;
         };
         const int c0 = blockIdx.z * NT % D;
         slow_head<D>(q + (r * h + kh * G + hd) * D, kv, win > 0 ? max(p - win + 1, 0) : 0, p, (double)scale, oh, c0,
@@ -279,14 +297,7 @@ __device__ __forceinline__ void merge(const float* __restrict__ po, const float*
 
 namespace prompt {
 
-__device__ __forceinline__ void ldmatrix4t(uint32_t (&r)[4], const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                 : "r"(qmm_frag::smem(p)));
-}
-
-template <int N>
-__device__ __forceinline__ void wait_group() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+using tf_common::cp_wait;
 
 __device__ __forceinline__ uint32_t pack(float lo, float hi) {
     __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
@@ -313,11 +324,11 @@ struct Cfg {
 };
 
 // Prompt rows p0..: row i sees keys [p0 + i - win + 1, hi[i]]; CS warps a 16-row band, slices summed; P32: P halves.
-template <int D, bool P32, int FAULT>
+template <int D, bool P32, int FAULT, bool PG = false>
 __device__ __forceinline__ bool rows(const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ kc,
                                      const __nv_bfloat16* __restrict__ vc, __nv_bfloat16* __restrict__ out,
                                      const int* __restrict__ hi, int p0, int W, int H, int HK, int G, float scale,
-                                     int win, int ring) {
+                                     int win, int ring, Pg pg = Pg{}) {
     using K = Cfg<D>;
     constexpr int CS = K::CS, NG = K::NG, C = K::C, NS = K::NS, SL = K::SL, K16 = K::K16, NB = K::NB;
     extern __shared__ uint4 wsmem[];
@@ -341,15 +352,37 @@ __device__ __forceinline__ bool rows(const __nv_bfloat16* __restrict__ q, const 
     __syncthreads();
     const int kfirst = first(p0 + row0), klast = kmax, limit = p0 + W;
     const int t0 = kfirst / BN, tiles = klast / BN + 1 - t0, items = 2 * tiles;
-    auto stage = [&](int item) { // item 2t: tile t's keys, 2t + 1: its values
+    int pk = 0, nxt = 0; // PG: the staged tile's first key's row in its page, the next page's id (a page early)
+    int64_t pb = 0;      // PG: the staged tile's base, stepped a tile at a time (pages hold whole tiles)
+    const int* tp = pg.tab + (PG ? t0 * BN / pg.tok : 0);
+    if constexpr (PG) {
+        pk = t0 * BN % pg.tok;
+        pb = static_cast<int64_t>(*tp) * pg.page + static_cast<int64_t>(pk) * HK * D;
+        if (t0 * BN - pk + pg.tok <= klast) nxt = tp[1];
+    }
+    auto stage = [&](int item) { // item 2t: tile t's keys, 2t + 1: its values (items staged in order)
         const __nv_bfloat16* src = item % 2 == 0 ? kc : vc;
         const int key0 = (t0 + item / 2) * BN;
         uint4* dst = slots + (item % NS) * K::SLOT;
+        if (PG && item % 2 == 0 && item > 0) { // the next tile: a tile on, or at a page end the id loaded a page ago
+            pb += BN * HK * D;
+            if ((pk += BN) == pg.tok) {
+                pk = 0;
+                pb = static_cast<int64_t>(nxt) * pg.page;
+                ++tp;
+                if (key0 + pg.tok <= klast) nxt = tp[1];
+            }
+        }
         for (int i = threadIdx.x; i < BN * C; i += NT) {
             const int key = key0 + i / C;
             const bool in = key >= kfirst && key <= klast && key < limit; // outside every row's keys: zeros
-            const int row = in ? (ring > 0 ? key % ring : key) : 0;
-            cp16z(dst + sw<D>(i / C, i % C), src + ((int64_t)row * HK + hk) * D + (i % C) * 8, in);
+            if constexpr (PG) { // the linear form below with the tile's row at pb
+                const int row = in ? i / C : 0;
+                cp16z(dst + sw<D>(i / C, i % C), src + (pb + ((int64_t)row * HK + hk) * D + (i % C) * 8), in);
+            } else {
+                const int row = in ? (ring > 0 ? key % ring : key) : 0;
+                cp16z(dst + sw<D>(i / C, i % C), src + ((int64_t)row * HK + hk) * D + (i % C) * 8, in);
+            }
         }
     };
     uint32_t qa[K16][4]; // this warp's SL dims of rows r0, r1
@@ -370,7 +403,7 @@ __device__ __forceinline__ bool rows(const __nv_bfloat16* __restrict__ q, const 
         commit();
     }
     auto take = [&](int it) -> const uint4* { // item it's slot, once every thread's copy has landed
-        wait_group<NS - 1>();
+        cp_wait<NS - 1>();
         __syncthreads();
         return slots + (it % NS) * K::SLOT;
     };
@@ -508,7 +541,7 @@ __device__ __forceinline__ bool rows(const __nv_bfloat16* __restrict__ q, const 
             done(2 * t + 1);
         }
     }
-    wait_group<0>();
+    cp_wait<0>();
     bool odd = false;
 #pragma unroll
     for (int i = 0; i < NB; ++i) {
@@ -528,16 +561,18 @@ __device__ __forceinline__ bool rows(const __nv_bfloat16* __restrict__ q, const 
 }
 
 // A block with a NaN or infinite output: recompute only affected heads, leaving every finite head's bits alone.
-template <int D>
+template <int D, bool PG = false>
 __device__ __noinline__ void odd(const __nv_bfloat16* q, const __nv_bfloat16* kc, const __nv_bfloat16* vc,
                                  __nv_bfloat16* out, const int* hi, int p0, int W, int H, int HK, int G, float scale,
-                                 int win, int ring) {
+                                 int win, int ring, Pg pg = Pg{}) {
     using K = Cfg<D>;
     const int HB = G % K::NG == 0 ? K::NG : 1, RB = K::NG / HB;
     const int hk = blockIdx.y / (G / HB), hg = blockIdx.y % (G / HB);
     const int row0 = blockIdx.x * 16 * RB;
     const auto kv = [&](int key, int which) {
-        return (which == 0 ? kc : vc) + ((int64_t)(ring > 0 ? key % ring : key) * HK + hk) * D;
+        const __nv_bfloat16* c = which == 0 ? kc : vc;
+        if constexpr (PG) return c + (int64_t)pg.tab[key / pg.tok] * pg.page + ((int64_t)(key % pg.tok) * HK + hk) * D;
+        return c + ((int64_t)(ring > 0 ? key % ring : key) * HK + hk) * D;
     };
     for (int i = 0; i < 16 * RB * HB; ++i) {
         const int r = row0 + i % (16 * RB), head = hk * G + hg * HB + i / (16 * RB);
@@ -552,12 +587,12 @@ __device__ __noinline__ void odd(const __nv_bfloat16* q, const __nv_bfloat16* kc
     }
 }
 
-template <int D, bool P32, int FAULT>
+template <int D, bool P32, int FAULT, bool PG = false>
 __device__ __forceinline__ void kernel(const __nv_bfloat16* q, const __nv_bfloat16* kc, const __nv_bfloat16* vc,
                                        __nv_bfloat16* out, const int* hi, int p0, int W, int H, int HK, int G,
-                                       float scale, int win, int ring) {
-    if (rows<D, P32, FAULT>(q, kc, vc, out, hi, p0, W, H, HK, G, scale, win, ring))
-        odd<D>(q, kc, vc, out, hi, p0, W, H, HK, G, scale, win, ring);
+                                       float scale, int win, int ring, Pg pg = Pg{}) {
+    if (rows<D, P32, FAULT, PG>(q, kc, vc, out, hi, p0, W, H, HK, G, scale, win, ring, pg))
+        odd<D, PG>(q, kc, vc, out, hi, p0, W, H, HK, G, scale, win, ring, pg);
 }
 
 } // namespace prompt

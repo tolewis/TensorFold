@@ -1,8 +1,11 @@
 //! TensorFold's tokenizer for Hugging Face tokenizer.json files: encode equals tokenizers' encode(text, add_special_tokens=False).
 const std = @import("std");
+pub const kimi_tiktoken = @import("tiktoken.zig");
 pub const unicode = @import("unicode.zig");
 const steps = @import("steps.zig");
+const regex = @import("regex.zig");
 const models = @import("model.zig");
+const qwen2_slow = @import("qwen2_slow.zig");
 const Allocator = std.mem.Allocator;
 pub const Memo = @import("memo.zig").Memo;
 pub const eos = @import("eos.zig");
@@ -149,6 +152,19 @@ pub const Tokenizer = struct {
             t.allocator.destroy(arena);
         }
         t.* = undefined;
+    }
+
+    /// New Split regex, empty memo; call before the tokenizer is shared: an encode in flight keeps the old memo.
+    pub fn overrideSplit(t: *Tokenizer, pattern: []const u8) !void {
+        const pre = if (t.pre_tokenizer) |*p| p else return error.NoSplitRegex;
+        const split = firstSplit(pre) orelse return error.NoSplitRegex;
+        split.pattern = .{ .regex = try regex.Regex.compile(t.arena.?.allocator(), pattern) };
+        if (t.memo) |m| {
+            const gpa = m.gpa;
+            const cap = m.cap;
+            m.destroy();
+            t.memo = Memo.create(gpa, cap) catch null; // without a memo every encode tokenizes, which is only slower
+        }
     }
 
     /// Id of a token written out whole, such as a chat template's special token.
@@ -419,11 +435,16 @@ pub const Tokenizer = struct {
     }
 };
 
-/// Loads `path/tokenizer.json`, or `path` itself when it names a .json file.
+/// Loads `path/tokenizer.json`, or `path` itself when it names a .json file; a Qwen2 slow export is converted.
 pub fn loadTokenizer(io: std.Io, a: Allocator, path: []const u8) !Tokenizer {
     const file = if (std.mem.endsWith(u8, path, ".json")) try a.dupe(u8, path) else try std.fmt.allocPrint(a, "{s}/tokenizer.json", .{path});
     defer a.free(file);
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, file, a, .limited(1 << 30));
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, file, a, .limited(1 << 30)) catch |e| {
+        if (e != error.FileNotFound or std.mem.endsWith(u8, path, ".json")) return e;
+        const converted = qwen2_slow.converted(io, a, path) catch |f| return if (f == error.FileNotFound) e else f;
+        defer a.free(converted);
+        return parse(a, converted);
+    };
     defer a.free(bytes);
     return parse(a, bytes);
 }
@@ -524,8 +545,8 @@ fn addTokens(t: *Tokenizer, keep: Allocator, scratch: Allocator, list: std.json.
         }
         var zero: usize = 0;
         const text = if (token.normalized and t.normalizer != null) try keep.dupe(u8, try t.normalizer.?.apply(&ctx, token.content, &zero)) else token.content;
-        // tokenizers matches and decodes a normalized added token by its normalized content.
-        try t.id_to_token.put(token.id, text);
+        // Normalization changes the matching key; the decoder retains the added token's original spelling.
+        try t.id_to_token.put(token.id, token.content);
         try (if (token.normalized) &t.normalized else &t.raw).insert(keep, text, @intCast(index));
     }
     if (tokens.items.len > 0) {
@@ -540,4 +561,15 @@ fn addTokens(t: *Tokenizer, keep: Allocator, scratch: Allocator, list: std.json.
 test {
     _ = @import("tokenizer_test.zig");
     _ = @import("masked_test.zig");
+    _ = @import("unicode_nfkc_test.zig");
+}
+
+/// The first Split whose pattern is a regex, in a pre-tokenizer or its sequence.
+fn firstSplit(p: *steps.PreTokenizer) ?*@FieldType(steps.PreTokenizer, "split") {
+    switch (p.*) {
+        .split => |*s| return if (s.pattern == .regex) s else null,
+        .sequence => |list| for (@constCast(list)) |*q| if (firstSplit(q)) |s| return s,
+        else => {},
+    }
+    return null;
 }

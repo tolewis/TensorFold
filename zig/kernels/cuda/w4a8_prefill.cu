@@ -2,42 +2,12 @@
 #include <cuda_bf16.h>
 #include <stdint.h>
 
-#include "qmm_frag.cuh"
-#include "w4a8_normalize.h"
+#include "common/qmm_frag.cuh"
+#include "w4a8_quantize.cuh"
+#include "w4a8_store.cuh"
 
 namespace tf_w4a8 {
 using namespace qmm_frag;
-
-// Within each 32-input step the int8 mma's slot s holds input P(s), the order the packed 4-bit words give each lane.
-__host__ __device__ __forceinline__ int slot_input(int s) {
-    const int q = (s & 15) >> 2, i = s & 3;
-    return (s & 16) + 2 * q + (i & 1) + 8 * (i >> 1);
-}
-
-// Rows of x as int8 in slot order, a scale (amax / 127) and fp32 sum a 64-input group: a warp a group.
-__device__ __forceinline__ void quantize_rows_body(const __nv_bfloat16* __restrict__ x, uint8_t* __restrict__ xq,
-                                                     float* __restrict__ xa, float* __restrict__ xs, int K, int ldx) {
-    const int row = blockIdx.x, lane = threadIdx.x & 31, g = blockIdx.y * 4 + (threadIdx.x >> 5);
-    if (g * 64 >= K) return;
-    const __nv_bfloat16* src = x + (size_t)row * ldx + g * 64;
-    // lane holds slots 2 lane and 2 lane + 1 of the group (step lane / 16)
-    const int s0 = (2 * lane) & 31, step = lane >> 4;
-    const float v0 = __bfloat162float(src[step * 32 + slot_input(s0)]), v1 = __bfloat162float(src[step * 32 + slot_input(s0 + 1)]);
-    float amax = fmaxf(fabsf(v0), fabsf(v1)), sum = v0 + v1;
-#pragma unroll
-    for (int o = 16; o; o >>= 1) {
-        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-        sum += __shfl_xor_sync(0xffffffffu, sum, o);
-    }
-    const float a = amax > 0.0f ? amax / 127.0f : 1.0f, inv = amax > 0.0f ? 127.0f / amax : 1.0f;
-    const int q0 = __float2int_rn(tf_w4a8_normalized(v0, amax, inv)), q1 = __float2int_rn(tf_w4a8_normalized(v1, amax, inv));
-    const uint16_t q = (uint16_t)((q0 & 0xFF) | ((q1 & 0xFF) << 8));
-    reinterpret_cast<uint16_t*>(xq + (size_t)row * K + g * 64)[lane] = q;
-    if (lane == 0) {
-        xa[(size_t)row * (K / 64) + g] = a;
-        xs[(size_t)row * (K / 64) + g] = sum;
-    }
-}
 
 template <int BM, int BN, int WM, int WN, int STAGES>
 struct Tile8 {
@@ -188,18 +158,12 @@ __device__ __forceinline__ void prefill8_body(const uint8_t* __restrict__ xq, co
                 const int row = m0 + wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8;
                 if (row >= M || col >= N) continue;
                 __nv_bfloat16* dst = out + (size_t)row * N + col;
-                if (col + 1 < N) *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(acc[i][j][2 * h], acc[i][j][2 * h + 1]);
-                else dst[0] = __float2bfloat16_rn(acc[i][j][2 * h]);
+                tf_w4a8_store(dst, N - col, acc[i][j][2 * h], acc[i][j][2 * h + 1]);
             }
         }
 }
 
 }  // namespace tf_w4a8
-
-extern "C" __global__ void __launch_bounds__(128) tf_w4a8_quantize(const __nv_bfloat16* __restrict__ x, uint8_t* __restrict__ xq,
-                                                                  float* __restrict__ xa, float* __restrict__ xs, int K, int ldx) {
-    tf_w4a8::quantize_rows_body(x, xq, xa, xs, K, ldx);
-}
 
 extern "C" __global__ void __launch_bounds__(256) tf_w4a8_prefill(const uint8_t* __restrict__ xq, const float* __restrict__ xa,
         const float* __restrict__ xs, const uint32_t* __restrict__ w, const __nv_bfloat16* __restrict__ scales,

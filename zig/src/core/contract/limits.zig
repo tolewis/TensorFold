@@ -26,6 +26,8 @@ pub const MetalLaunch = struct {
     adapts: bool = false,
     /// False for Metal 4 tensor-op kernels: Xcode's translator cannot build them for M1/M2 ahead of time.
     offline: bool = true,
+    /// air-tt refuses this pipeline for M1/M2 (Nemotron's attention partials): unmeasured there, not shown to fit.
+    unbuildable: bool = false,
 };
 
 /// An NVIDIA target we build for: its per-block and per-SM limits (CUDA's compute capability tables).
@@ -73,13 +75,67 @@ pub fn metal(l: MetalLaunch, f: Apple, out: *std.ArrayList(u8), a: std.mem.Alloc
     if (l.threads > f.threads) n += try note(out, a, "{s} on {s}: {d} threads a group, the family's most is {d}", .{ l.name, f.name, l.threads, f.threads });
     const tg = l.tg_memory + l.dynamic;
     if (tg > f.tg_memory) n += try note(out, a, "{s} on {s}: {d} threadgroup bytes, the family's most is {d}", .{ l.name, f.name, tg, f.tg_memory });
-    if (f.by_registers and l.reserved < l.threads and !l.adapts) {
+    if (f.by_registers and l.reserved < l.threads and !l.adapts and !l.unbuildable) {
         const lim = if (f.gen == 13) l.m1 else l.m2;
         if (!l.offline and l.threads > 256) n += try note(out, a, "{s} on {s}: {d} threads past 256 and no M1/M2 compile to show they fit (reserve them)", .{ l.name, f.name, l.threads });
         if (l.offline and lim == 0) n += try note(out, a, "{s} on {s}: no compiled thread limit recorded", .{ l.name, f.name });
         if (lim != 0 and lim < l.threads) n += try note(out, a, "{s} on {s}: {d} threads, the pipeline compiles for {d} (reserve the threads)", .{ l.name, f.name, l.threads, lim });
     }
     return n;
+}
+
+/// The most threads (a multiple of 32, 1024 down) whose build `probe.plainAt` finds equal to the plain build; 0: none.
+pub fn plainLimit(probe: anytype) !u32 {
+    var threads: u32 = 1024;
+    while (threads > 0) : (threads -= 32) if (try probe.plainAt(threads)) return threads;
+    return 0;
+}
+
+/// Builds that equal the plain one exactly at the listed thread counts, counting how many the search asks for.
+const FakeBuilds = struct {
+    equal: []const u32,
+    asked: *u32,
+
+    pub fn plainAt(f: FakeBuilds, threads: u32) !bool {
+        f.asked.* += 1;
+        return std.mem.indexOfScalar(u32, f.equal, threads) != null;
+    }
+
+    fn upTo(comptime limit: u32) [limit / 32]u32 {
+        var out: [limit / 32]u32 = undefined;
+        for (&out, 1..) |*t, i| t.* = @intCast(32 * i);
+        return out;
+    }
+};
+
+test "the offline search: the largest count equal to plain when every count up to it is" {
+    var asked: u32 = 0;
+    inline for (.{ 1024, 640, 448, 256, 32 }) |limit| {
+        const below = FakeBuilds.upTo(limit);
+        try std.testing.expectEqual(@as(u32, limit), try plainLimit(FakeBuilds{ .equal = &below, .asked = &asked }));
+    }
+    try std.testing.expectEqual(@as(u32, 0), try plainLimit(FakeBuilds{ .equal = &.{}, .asked = &asked }));
+}
+
+test "the offline search: the largest count equal to plain past counts that differ" {
+    var asked: u32 = 0;
+    // Nemotron's expert rows on M1/M2: plain at 224 and 320-448, not at 32-192, 256, 288 or 480 and up.
+    const gaps = [_]u32{ 224, 320, 352, 384, 416, 448 };
+    try std.testing.expectEqual(@as(u32, 448), try plainLimit(FakeBuilds{ .equal = &gaps, .asked = &asked }));
+    const lone = [_]u32{ 64, 512 };
+    try std.testing.expectEqual(@as(u32, 512), try plainLimit(FakeBuilds{ .equal = &lone, .asked = &asked }));
+    const odd = [_]u32{ 32, 96, 160 };
+    try std.testing.expectEqual(@as(u32, 160), try plainLimit(FakeBuilds{ .equal = &odd, .asked = &asked }));
+}
+
+test "the offline search: one build when 1024 equals plain, every count when none does" {
+    var asked: u32 = 0;
+    const all = FakeBuilds.upTo(1024);
+    try std.testing.expectEqual(@as(u32, 1024), try plainLimit(FakeBuilds{ .equal = &all, .asked = &asked }));
+    try std.testing.expectEqual(@as(u32, 1), asked);
+    asked = 0;
+    try std.testing.expectEqual(@as(u32, 0), try plainLimit(FakeBuilds{ .equal = &.{}, .asked = &asked }));
+    try std.testing.expectEqual(@as(u32, 32), asked);
 }
 
 /// Registers a block takes on one SM: each warp's registers rounded up to 256, times its warps.
@@ -144,6 +200,8 @@ pub const HipLaunch = struct {
 /// What hipcc made of one kernel for one chip, from the code object's metadata (vgprs 0: none recorded).
 pub const HipUsage = struct {
     vgprs: u32,
+    /// False: the kernel is not launched on this chip (its image keeps a trap body there); no usage is checked.
+    served: bool = true,
     sgprs: u32 = 0,
     lds: u32 = 0,
     private: u32 = 0,
@@ -206,6 +264,11 @@ test "a launch inside every family passes; each planted excess is named" {
     var wide_op = tensor_op;
     wide_op.threads = 512;
     try std.testing.expectEqual(@as(usize, 1), try metal(wide_op, apple[0], &out, a));
+    var wide_unmeasured = wide_op;
+    wide_unmeasured.unbuildable = true; // air-tt refuses it: unmeasured on M1/M2, not shown to fit
+    for (apple[0..2]) |f| try std.testing.expectEqual(@as(usize, 0), try metal(wide_unmeasured, f, &out, a));
+    wide_unmeasured.threads = 2048; // still held to the family's absolute limit
+    try std.testing.expectEqual(@as(usize, 1), try metal(wide_unmeasured, apple[0], &out, a));
 }
 
 /// The table's row for `sm` (a target the records cover).
@@ -260,4 +323,37 @@ test "HIP: bounds, wave size, VGPRs a SIMD and LDS per chip" {
     big.dynamic = 32 * 1024;
     try std.testing.expectEqual(@as(usize, 1), try hip(big, .{ .vgprs = 32, .lds = 40 * 1024 }, rdna[0], &out, a));
     try std.testing.expectEqual(@as(usize, 0), try hip(big, .{ .vgprs = 32, .lds = 32 * 1024 }, rdna[0], &out, a));
+}
+/// A Vulkan entry point as dispatched, with its workgroup geometry and shared-memory use.
+pub const VulkanLaunch = struct {
+    name: []const u8,
+    local_size: [3]u32,
+    shared_bytes: u32 = 0,
+};
+
+/// Measured per-chip physical-device limits. Null means the fleet has not measured this value.
+pub const VulkanDeviceLimits = struct {
+    chip: []const u8,
+    max_compute_work_group_invocations: ?u32 = null,
+    max_compute_work_group_size: ?[3]u32 = null,
+    max_compute_shared_memory_size: ?u32 = null,
+    max_storage_buffer_range: ?u32 = null,
+    min_storage_buffer_offset_alignment: ?u32 = null,
+    subgroup_size: ?u32 = null,
+};
+
+/// Refuses incomplete measurements instead of treating missing values as permissive defaults.
+pub fn vulkanFits(launch: VulkanLaunch, device: VulkanDeviceLimits) error{Unmeasured}!bool {
+    const invocations = device.max_compute_work_group_invocations orelse return error.Unmeasured;
+    const sizes = device.max_compute_work_group_size orelse return error.Unmeasured;
+    const shared = device.max_compute_shared_memory_size orelse return error.Unmeasured;
+    _ = device.max_storage_buffer_range orelse return error.Unmeasured;
+    _ = device.min_storage_buffer_offset_alignment orelse return error.Unmeasured;
+    _ = device.subgroup_size orelse return error.Unmeasured;
+    var total: u64 = 1;
+    for (launch.local_size, sizes) |asked, most| {
+        if (asked == 0 or asked > most) return false;
+        total *= asked;
+    }
+    return total <= invocations and launch.shared_bytes <= shared;
 }

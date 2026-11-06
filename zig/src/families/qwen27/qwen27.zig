@@ -1,5 +1,6 @@
 //! Dense Qwen text configuration and checkpoint contracts. GPU forward pieces follow separately.
 pub const dflash = @import("dflash/root.zig");
+pub const gguf = @import("gguf.zig");
 pub const config = @import("config.zig");
 pub const affine = @import("affine.zig");
 pub const widths = @import("widths.zig");
@@ -24,7 +25,11 @@ pub const image_rows = @import("image_rows.zig");
 pub const gpu_weights = @import("gpu_weights.zig");
 pub const gpu_frame = @import("gpu_frame.zig");
 pub const model = @import("model.zig");
+/// The routed block's kernels (the kernel contract builds its row kernel's source as the engine does).
+pub const moe_gpu = @import("moe_gpu.zig");
 pub const projection = @import("projection.zig");
+pub const prompt_memory = @import("prompt_memory.zig");
+pub const prompt_rows = @import("prompt_rows.zig");
 pub const prompt_glue = @import("prompt_glue.zig");
 pub const prompt_gpu = @import("prompt_gpu.zig");
 pub const prompt_state = @import("prompt_state.zig");
@@ -38,6 +43,7 @@ pub const session = @import("session.zig");
 pub const snapshot = @import("snapshot.zig");
 pub const disk = @import("disk.zig");
 pub const taps = @import("taps.zig");
+pub const tap_gather = @import("tap_gather.zig");
 pub const tap_ring = @import("tap_ring.zig");
 /// The 27B's Metal sources by name (the kernel contract compiles them as the engine does).
 pub const runtime_sources = @import("qwen_runtime_sources");
@@ -51,9 +57,12 @@ test {
     _ = glue;
     _ = image_rows;
     _ = @import("rope_test.zig");
+    _ = @import("attention_pick_test.zig");
     _ = state;
     _ = projection;
     _ = model;
+    _ = quant_gpu;
+    _ = @import("quant_rows_test.zig");
     _ = round_plan;
     _ = attention;
     _ = prompt_glue;
@@ -65,6 +74,7 @@ test {
     _ = checkpoint;
     _ = weights;
     _ = @import("weights_test.zig");
+    _ = @import("geometry_test.zig");
 }
 
 pub const residency = @import("residency.zig");

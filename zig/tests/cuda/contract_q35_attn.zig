@@ -1,4 +1,4 @@
-//! qwen35's decode attention under the contract: tf_q35_attn_partial (or _partial8), then tf_q35_attn_merge.
+//! Qwen35 decode attention: short and long TC entries for bf16 or fp8 caches, then the shared merge.
 const std = @import("std");
 const cuda = @import("cuda");
 const core = @import("core");
@@ -16,6 +16,7 @@ const maxch = 64;
 const qh = 24;
 const kvh = 4;
 const group = qh / kvh;
+const attn_tiles = 4 * 32 * hd * 2;
 const scale: f32 = 1.0 / 16.0;
 /// A stream's drafted window here (DFlash2's verify rows); past 64 rows the call is one prompt chunk's chain.
 const width = 16;
@@ -23,14 +24,14 @@ const most_window = 64;
 
 /// cuda_engine.zig's Geo, cuda_cache.zig's Seg and cuda_round.zig's Ancestor, as the kernels read them.
 const Geo = extern struct { hid: c_int = 5120, nk: c_int = 16, nv: c_int = 48, qh: c_int = qh, kvh: c_int = kvh, nl: c_int = 1 };
-const Seg = extern struct { rec: u64 = 0, conv: u64 = 0, kv: u64, tap: u64 = 0, log: u64 = 0, before: u64 = 0, cap: c_int, len: c_int, row0: c_int, rows: c_int, tap_rows: c_int = 0, taps: c_int = 0, delta: c_int = 0 };
+const Seg = extern struct { rec: u64 = 0, conv: u64 = 0, kv: u64, tap: u64 = 0, log: u64 = 0, before: u64 = 0, cap: c_int, len: c_int, row0: c_int, rows: c_int, tap_rows: c_int = 0, taps: c_int = 0, delta: c_int = 0, pt: u64 = 0, ps: u64 = 0, ptok: c_int = 0, pn: c_int = 0, plog: u64 = 0 };
 const Ancestor = extern struct { bits: u64, depth: u32, chain: u32 };
 
 pub const Cache = enum { bf16, fp8 };
 
 /// A registered form: its cache, and for the control a launch that drops each row's last chunk.
-pub const Form = struct { cache: Cache, control: bool = false };
-pub const forms = [_]Form{ .{ .cache = .bf16 }, .{ .cache = .fp8 }, .{ .cache = .bf16, .control = true } };
+pub const Form = struct { cache: Cache, control: bool = false, mt2: bool = false, whole: bool = false };
+pub const forms = [_]Form{ .{ .cache = .bf16 }, .{ .cache = .fp8 }, .{ .cache = .bf16, .control = true }, .{ .cache = .fp8, .mt2 = true }, .{ .cache = .fp8, .mt2 = true, .whole = true } };
 
 /// A row's merged output sums every key it sees, then the chunks' partials (at most 64).
 fn keyChain(s: c.Shape) usize {
@@ -44,19 +45,21 @@ const stress_keys = 2048;
 const nan_key = "a NaN key in one of a row's several chunks leaves the row finite: tf_q35_attn_merge skips that chunk";
 
 pub fn spec(f: Form) c.Spec {
-    const name = switch (f.cache) {
+    const name = if (f.mt2) (if (f.whole) "cuda qwen35 MT2 fp8 whole attention" else "cuda qwen35 MT2 fp8 paged attention") else switch (f.cache) {
         .bf16 => if (f.control) "control qwen35 attention dropping each row's last chunk" else "cuda qwen35 decode attention, bf16 cache (tf_q35_attn_partial, tf_q35_attn_merge)",
         .fp8 => "cuda qwen35 decode attention, fp8 cache (tf_q35_attn_partial8, tf_q35_attn_merge)",
     };
     // a DFlash2 window past 2,048 keys, four streams' windows, a 128-row prompt chunk, 256-key chunks past 8,192
-    const served: []const c.Shape = &.{ .{ .rows = 16, .n = qh, .k = 2100 }, .{ .rows = 64, .n = qh, .k = 700 }, .{ .rows = 128, .n = qh, .k = 300 }, .{ .rows = 16, .n = qh, .k = 9000 } };
-    return .{ .name = name, .accum = .f32, .depth = keyChain, .ops = 3, .out = .bf16, .replaces = "the chunk-major grid (each row alone)", .tiles = .{ .{ .size = width }, .{}, .{ .size = 128 } }, .served = served, .sums = .{ .why = attn.why }, .known = .{ .gate = .nonfinite, .finding = nan_key } };
+    const served: []const c.Shape = if (f.mt2) &.{ .{ .rows = 1, .n = qh, .k = 512 }, .{ .rows = 1, .n = qh, .k = 8191 }, .{ .rows = 1, .n = qh, .k = 8192 }, .{ .rows = 3, .n = qh, .k = 32768 }, .{ .rows = 5, .n = qh, .k = 9000 }, .{ .rows = 6, .n = qh, .k = 9000 }, .{ .rows = 16, .n = qh, .k = 65535 }, .{ .rows = 1, .n = qh, .k = 122779 } } else &.{ .{ .rows = 16, .n = qh, .k = 2100 }, .{ .rows = 64, .n = qh, .k = 700 }, .{ .rows = 128, .n = qh, .k = 300 }, .{ .rows = 16, .n = qh, .k = 9000 }, .{ .rows = 64, .n = qh, .k = 9000 } };
+    return .{ .name = name, .accum = .f32, .depth = keyChain, .ops = 3, .out = .bf16, .replaces = if (f.mt2) "the four-MMA FP8 row tile" else "the chunk-major grid (each row alone)", .tiles = .{ .{ .size = if (f.mt2) 32 / group else width }, .{}, .{ .size = 128 } }, .served = served, .sums = .{ .why = attn.why }, .known = .{ .gate = .nonfinite, .finding = nan_key } };
 }
 
 pub const Q35 = struct {
     rig: rig_.Rig,
     form: Form,
     partial: cuda.Function,
+    long_rows: cuda.Function,
+    original_rows: cuda.Function,
     merge: cuda.Function,
     r: ?attn.Ref = null,
     shape: c.Shape = .{ .rows = 0, .n = 0, .k = 0 },
@@ -72,6 +75,16 @@ pub const Q35 = struct {
     base: [4]u64 = @splat(0),
     out: u64 = 0,
     chunks: usize = 0,
+
+    pub fn init(rig: rig_.Rig, form: Form, bf16: cuda.Module, fp8: cuda.Module) !Q35 {
+        const partial = try if (form.cache == .fp8) fp8.function("tf_q35_attn_partial8") else bf16.function("tf_q35_attn_partial");
+        const long_rows = try if (form.mt2) fp8.function(if (form.whole) "tf_q35_attn_rows8_mt2_whole" else "tf_q35_attn_rows8_mt2") else if (form.cache == .fp8) fp8.function("tf_q35_attn_rows8") else bf16.function("tf_q35_attn_rows");
+        if (form.cache == .bf16) {
+            try partial.allowDynamicShared(attn_tiles);
+            try long_rows.allowDynamicShared(attn_tiles);
+        }
+        return .{ .rig = rig, .form = form, .partial = partial, .long_rows = long_rows, .original_rows = try if (form.cache == .fp8) fp8.function("tf_q35_attn_rows8") else bf16.function("tf_q35_attn_rows"), .merge = try bf16.function("tf_q35_attn_merge") };
+    }
 
     pub fn deinit(self: *Q35) void {
         const a = self.rig.gpu.gpa;
@@ -283,9 +296,8 @@ pub const Q35 = struct {
         try self.rig.s.synchronize();
     }
 
-    /// Rows [m0, m0 + n) through the partial kernel, rows fastest, into partials `p` (row m0's slots at m0).
+    /// Both engine TC paths over rows [m0, m0 + n), into row m0's slots. Device lengths select the path.
     fn launchPartial(self: *Q35, n: usize, m0: usize, z: usize, p: [3]u64) !void {
-        const fn_ = self.partial;
         var args: cuda.Args = .{};
         args.add(Geo{});
         args.add(self.dev[0] + m0 * qh * hd * 2);
@@ -295,11 +307,19 @@ pub const Q35 = struct {
         args.add(@as(c_int, 0));
         args.add(@as(u64, 0));
         args.add(scale);
+        var rows_args = args;
+        rows_args.add(@as(c_int, @intCast(n)));
         const slots = m0 * qh * maxch;
-        args.add(p[0] + slots * 4);
-        args.add(p[1] + slots * 4);
-        args.add(p[2] + slots * hd * 4);
-        try cuda.launch.launch(fn_, .{ .grid = .{ .x = @intCast(n), .y = kvh, .z = @intCast(z) }, .block = .{ .x = 32 * group } }, self.rig.s, &args);
+        const dst = [3]u64{ p[0] + slots * 4, p[1] + slots * 4, p[2] + slots * hd * 4 };
+        for (dst) |ptr| {
+            args.add(ptr);
+            rows_args.add(ptr);
+        }
+        const shared: u32 = if (self.form.cache == .bf16) attn_tiles else 0;
+        try cuda.launch.launch(self.partial, .{ .grid = .{ .x = @intCast(n), .y = @intCast(z), .z = kvh }, .block = .{ .x = 128 }, .shared = shared }, self.rig.s, &args);
+        const tile: usize = if (self.form.mt2) 32 / group else 64 / group;
+        const groups = (n + tile - 1) / tile;
+        try cuda.launch.launch(self.long_rows, .{ .grid = .{ .x = @intCast(groups), .y = @intCast(z), .z = kvh }, .block = .{ .x = if (self.form.mt2) @as(u32, 128) else 256 }, .shared = shared }, self.rig.s, &rows_args);
     }
 
     fn launchMerge(self: *Q35, p: [3]u64, out: u64) !void {
@@ -317,6 +337,14 @@ pub const Q35 = struct {
     /// The chunk-major grid's bits: every row in a launch of its own, where both grids run the same blocks.
     pub fn replaced(self: *Q35) ![]const u8 {
         const p = self.base[0..3].*;
+        const original = self.long_rows;
+        const mt2 = self.form.mt2;
+        defer {
+            self.long_rows = original;
+            self.form.mt2 = mt2;
+        }
+        self.long_rows = self.original_rows;
+        self.form.mt2 = false;
         for (0..self.shape.rows) |m| try self.launchPartial(1, m, maxch, p);
         try self.launchMerge(p, self.base[3]);
         return self.rig.bytes(self.base[3], self.count() * 2);

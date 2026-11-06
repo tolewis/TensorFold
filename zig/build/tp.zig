@@ -4,8 +4,7 @@ const std = @import("std");
 
 /// The CUDA runtime without the engine's kernels (tp only needs the driver, memory, streams and NCCL).
 fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
-    const options = b.addOptions();
-    options.addOption(bool, "with_kernels", false);
+    const options = @import("cuda_runtime.zig").kernelOptions(b, false, null);
     const cuda = b.createModule(.{ .root_source_file = b.path("zig/src/cuda/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
     cuda.addImport("gpu_memory", @import("gpu_memory.zig").module(b, target));
     cuda.addOptions("kernel_options", options);
@@ -26,6 +25,7 @@ fn mailboxFatbin(b: *std.Build, nvcc: []const u8) std.Build.LazyPath {
     const run = b.addSystemCommand(&.{ nvcc, "-fatbin", "-O3", "-std=c++17", "-gencode=arch=compute_120,code=sm_120", "-gencode=arch=compute_121,code=sm_121", "-gencode=arch=compute_90,code=compute_90", "-o" });
     const out = run.addOutputFileArg("tp_mailbox.fatbin");
     run.addFileArg(b.path("zig/src/fabric/tp/mailbox.cu"));
+    _ = run.addFileInput(b.path("zig/src/fabric/tp/roce_device.cuh"));
     return out;
 }
 
@@ -42,6 +42,10 @@ fn kernelModule(b: *std.Build, image: ?std.Build.LazyPath) *std.Build.Module {
 
 pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, test_step: *std.Build.Step, opts: @import("options.zig").Tp) void {
     const host = b.graph.host;
+    if (host.result.os.tag != .windows) {
+        const fate_host = b.createModule(.{ .root_source_file = b.path("zig/src/fabric/tp/fate_lifetime_test.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{.{ .name = "cuda", .module = runtime(b, host, .debug) }} });
+        b.step("test-tp-fate-host", "Failure hooks and their owners survive concurrent shutdown without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = fate_host })).step);
+    }
     const cli_tests = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/fabric/tp/gpu_cli.zig"), .target = host, .optimize = optimize }) }));
     const cli_step = b.step("test-tp-cli", "TP runner command validation (no GPU)");
     cli_step.dependOn(&cli_tests.step);
@@ -54,6 +58,13 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     const tp_step = b.step("test-tp", "TP bootstrap, failure, settings and in-process transport tests");
     tp_step.dependOn(&tests.step);
     tp_step.dependOn(cli_step);
+    const multi_root = module(b, host, .debug, runtime(b, host, .debug));
+    multi_root.root_source_file = b.path("zig/src/fabric/tp/roce_multi_host.zig");
+    const multi = b.addRunArtifact(b.addTest(.{ .root_module = multi_root }));
+    multi.has_side_effects = true;
+    b.step("test-roce-multi-host", "Frozen two-rank posts and multirank fake-verbs byte and completion contracts").dependOn(&multi.step);
+    tp_step.dependOn(&multi.step);
+    if (host.result.os.tag != .windows) test_step.dependOn(&multi.step);
     // the bootstrap and failure tests run over POSIX sockets: Windows checks only the Linux compile below
     if (host.result.os.tag != .windows) test_step.dependOn(&tests.step);
     const linux = b.resolveTargetQuery(.{ .cpu_arch = host.result.cpu.arch, .os_tag = .linux, .abi = .gnu });
@@ -98,5 +109,5 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
         }
     }
     b.installArtifact(exe);
-    b.step("tf-tp-test", "TP=2 on two GPUs: bootstrap, every collective bit-exact, graph capture, fail-fast, latency").dependOn(&b.addInstallArtifact(exe, .{}).step);
+    b.step("tf-tp-test", "TP on 2 to 16 GPUs: bootstrap, every collective bit-exact, graph capture, fail-fast, latency").dependOn(&b.addInstallArtifact(exe, .{}).step);
 }
