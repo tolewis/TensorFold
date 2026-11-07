@@ -190,13 +190,14 @@ fn park(m: *Manager) void {
 /// A request's reload: the parked request drives the reopen; every fallible step runs before the engine publishes.
 pub fn reload(m: *Manager, srv: *server_mod.Server, reply: Allocator, problem_out: *[]const u8) error{ OutOfMemory, ReloadFailed, EngineOpenFailed }!void {
     m.mutex.lockUncancelable(m.io);
-    while (m.state == .loading) {
-        m.cond.waitUncancelable(m.io, &m.mutex); // one reload at a time: the others wait for publish or failure
+    // A request that arrives mid-unload waits for the close to end, then reloads: no 503 for a race with the timer.
+    // `park` broadcasts after it sets `unloaded`; a concurrent reload broadcasts at publish or failure.
+    while (m.state == .loading or (m.state == .unloading and m.parked)) {
+        m.cond.waitUncancelable(m.io, &m.mutex); // one transition at a time: wait for publish, failure or the close
         if (m.state == .resident) return m.mutex.unlock(m.io); // a concurrent reload won: serve with its engine
-        if (m.state == .unloaded) break; // the winner failed: this request retries the reload
     }
     if (m.state == .resident) return m.mutex.unlock(m.io);
-    if (m.state != .unloaded) {
+    if (m.state != .unloaded) { // stopped (or unloading before the stub swap, which `begin` already turned resident)
         problem_out.* = "the engine is still unloading; send the request again";
         m.mutex.unlock(m.io);
         return error.ReloadFailed; // the route returns the retry reason with Retry-After
