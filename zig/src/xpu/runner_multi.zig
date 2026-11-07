@@ -51,7 +51,9 @@ pub fn k1mtFill(win_host: []const i32, pos_host: []const i32, tree_host: []i32, 
 pub fn verifyMulti(r: *Runner, wins: []const Win) !void {
     // every window's pages first (rank 0: the kept states it drops are step records before this call)
     for (wins) |w| if (w.ids.len > 0 and w.slot < q.MAX_SLOTS) {
-        const p = r.seqs[w.slot].pos;
+        // the selected slot's position is r.pos: its seqs entry still holds the slot's last stream until r.store()
+        // below, and room for that stream's length drops kept states a short new stream never needs
+        const p = if (w.slot == r.slot) r.pos else r.seqs[w.slot].pos;
         if (@as(u64, p) + w.ids.len <= r.context) try r.makeRoom(w.slot, p + @as(u32, @intCast(w.ids.len)));
     };
     if (tp.group) |*g| { // a window: slot, rows, has parents, the ids, the parents

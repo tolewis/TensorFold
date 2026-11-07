@@ -131,6 +131,9 @@ pub fn build(b: *std.Build) void {
     // the prompt cache's keep-one rule, its own step: a later turn's state takes its own older one's storage
     const keepone_step = b.step("test-prompt-cache-keepone", "the prompt cache keep-one rule: a later turn's state takes its own older one's storage");
     keepOneCheck(b, target, keepone_step);
+    // jubiku 2026-11-07: a long conversation keeps its state between short calls (XPU store numbers)
+    const longturn_step = b.step("test-prompt-cache-longturn", "the prompt cache keeps a long conversation's state between short calls, on the XPU store's numbers");
+    longturn_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/core/prompt_cache_longturn_test.zig"), .target = target, .optimize = .Debug, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = .Debug, .link_libc = true }) }} }) })).step);
     const cost_cases = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("zig/cost_rule_cases.zig"),
         .target = target,
