@@ -1024,7 +1024,7 @@ pub fn modeWord() u64 {
     w |= @as(u64, @intFromBool(k1mod.multi_tree)) << 11;
     w |= @as(u64, @intFromBool(fmt_mlx)) << 12; // 0: EXL3, 1: MLX 4/64
     w |= @as(u64, @intFromBool(kept_host)) << 13; // kept states' copies in host memory: both ranks hold theirs there
-    w |= @as(u64, @intFromBool(park_on)) << 23; // idle kept states park in host memory: both ranks, or neither
+    w |= @as(u64, @intFromBool(park_on)) << 23; // idle kept states park in host memory: all ranks, or neither
     return w;
 }
 

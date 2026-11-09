@@ -305,6 +305,8 @@ fn copySpan(d: *dev.Dev, dst: *anyopaque, src: *anyopaque, n: usize, pinned: boo
         return;
     }
     if (d.staging.len == 0) d.staging = @as([*]u8, @ptrCast(try d.g.hostAlloc(256 << 20)))[0 .. 256 << 20];
+    // A queued copy may still read staging. Drain it once before the first host write.
+    if (!src_is_card) try d.sync();
     var done: usize = 0;
     while (done < n) {
         const c = @min(d.staging.len, n - done);
