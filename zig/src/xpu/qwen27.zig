@@ -290,7 +290,7 @@ pub const Runner = struct {
         if (std.c.getenv("XPU_KEEP_SHARED")) |v| keep_shared = v[0] != '0';
         if (std.c.getenv("XPU_KEEP_PAGES")) |v| keep_pages = v[0] != '0';
         if (keep_pages and !(kv_pool and keep_shared)) {
-            if (RANK == 0) std.log.warn("qwen27-xpu: XPU_KEEP_PAGES needs XPU_KV_POOL=1 and XPU_KEEP_SHARED=1; left off", .{});
+            if (RANK == 0) std.log.warn("qwen27-xpu: rank {d}: XPU_KEEP_PAGES needs XPU_KV_POOL=1 and XPU_KEEP_SHARED=1; left off", .{RANK});
             keep_pages = false;
         }
         if (std.c.getenv("XPU_KEPT_HOST")) |v| kept_host = v[0] != '0';

@@ -149,7 +149,8 @@ const Snaps = struct {
         .pages = pageNote,
     };
     fn vtable() *const api.prompt_cache.Snapshots.VTable {
-        return if (xq.keep_pages) &counted else &plain;
+        // Rank 0 decides. A follower replays save_slot, restore_slot and drop_snap and does not call these hooks.
+        return if (xq.keep_pages and xq.RANK == 0) &counted else &plain;
     }
 };
 
@@ -199,7 +200,7 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
         std.log.info("qwen27-xpu: a shared K/V pool of {d} pages ({d} tokens, {d:.2} GB a card, int8), {d} stream(s) of at most {d} tokens, kept prompt states in up to {d:.1} GiB of it. The states are the one conversation's, a later turn's takes its own older one's storage, the least recently used one never wins a kept state's page", .{ pages, runner.poolTokens(), @as(f64, @floatFromInt(runner.poolBytes())) / 1e9, slots, context, @as(f64, @floatFromInt(budget)) / (1 << 30) });
         if (slots < want) std.log.warn("qwen27-xpu: the K/V pool holds {d} tokens, so {d} stream(s) are admitted of the {d} asked for (--kv-pool-tokens names a bigger pool)", .{ runner.poolTokens(), slots, want });
         if (xq.keep_shared) std.log.info("qwen27-xpu: kept prompt states share the pool (XPU_KEEP_SHARED): {d} pages ({d} tokens) stay free for the streams, kept states in up to {d:.1} GiB of the pool, the least recently used one dropped when a stream needs a page", .{ runner.reserve, @as(u64, runner.reserve) * xq.PAGE, @as(f64, @floatFromInt(budget)) / (1 << 30) });
-        if (xq.keep_pages and xq.RANK == 0) std.log.info("qwen27-xpu: kept prompt states count each page once (XPU_KEEP_PAGES)", .{});
+        if (xq.keep_pages and xq.RANK == 0) std.log.info("qwen27-xpu: rank {d}: kept prompt states count each page once (XPU_KEEP_PAGES)", .{xq.RANK});
     } else {
         budget = cacheBudget(o);
         slots = try slotsThatFit(runner, want, budget);
