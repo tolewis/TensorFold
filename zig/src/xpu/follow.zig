@@ -79,7 +79,7 @@ pub fn run(r: *q.Runner) !void {
                 break :blk snaps.put(alloc, id, s);
             },
             .park_snap => blk: {
-                const e = snaps.getEntry(id) orelse break :blk error.NoSuchSnap;
+                const e = snaps.getEntry(id) orelse break :blk error.NoSuchSnap; // an unknown id is a lost or reordered park: exit before the pools drift
                 break :blk slot_states.parkSnap(r, e.value_ptr); // this rank's half; the id is rank 0's buffer, as drop_snap
             },
             .restore_slot => if (snaps.get(id)) |s| slot_states.restoreSlot(r, rec.a, s) else error.NoSuchSnap,
@@ -88,11 +88,15 @@ pub fn run(r: *q.Runner) !void {
             .close => return,
             .more => error.BadRecord,
         };
-        done catch |err| switch (err) {
-            error.BadBlock, error.BadCommit, error.ContextFull, error.NoSuchSlot, error.SlotNotThere => {
-                std.debug.print("follow: rank 0's {s} returned {s} here too\n", .{ @tagName(op), @errorName(err) });
-            },
-            else => return err,
+        done catch |err| {
+            // a park that fails on this rank while rank 0 parked leaves the two pools different
+            if (op == .park_snap) return err;
+            switch (err) {
+                error.BadBlock, error.BadCommit, error.ContextFull, error.NoSuchSlot, error.SlotNotThere => {
+                    std.debug.print("follow: rank 0's {s} returned {s} here too\n", .{ @tagName(op), @errorName(err) });
+                },
+                else => return err,
+            }
         };
     }
 }
