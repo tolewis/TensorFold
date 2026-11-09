@@ -648,6 +648,16 @@ pub const Runner = struct {
         r.pages.retain(id);
     }
 
+    /// `retainPage` and one kept-state reference. The kept count runs with the page-count flag on or off.
+    pub fn keep(r: *Runner, id: u32) void {
+        r.pages.keep(id);
+    }
+
+    /// `releasePage` and one kept-state reference less.
+    pub fn unkeep(r: *Runner, id: u32) void {
+        r.pages.unkeep(id);
+    }
+
     /// Page ids `ids` into `slot`'s table from entry `from`; the slot maps from + ids.len on. The caller holds them.
     pub fn mapPages(r: *Runner, slot: u32, from: u32, ids: []const u32) !void {
         if (r.pool == 0) return;

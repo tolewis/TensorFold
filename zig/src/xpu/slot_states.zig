@@ -95,7 +95,7 @@ fn saveSlotHere(r: *Runner, slot: u32, at: u32) !Snap {
         const pages = try alloc.alloc(u32, @as(usize, entries));
         errdefer alloc.free(pages);
         @memcpy(pages, r.pt_host[slot][0..entries]);
-        for (pages) |id| r.retainPage(id); // the state holds them until dropSnap
+        for (pages) |id| r.keep(id); // the state holds them until dropSnap; the kept count runs with the flag on or off
         return .{ .at = at, .buf = buf, .bytes = bytes, .pages = pages };
     }
     const buf = try d.alloc_(bytes);
@@ -240,7 +240,7 @@ pub fn restoreSlot(r: *Runner, slot: u32, snap: Snap) !void {
 pub fn dropSnap(r: *Runner, snap: Snap) void {
     if (tp.group) |*g| g.record(.drop_snap, 0, 0, @intFromPtr(snap.buf), &.{}) catch {};
     if (q.kv_pool) {
-        for (snap.pages) |id| r.releasePage(id); // the pages go back to the pool at zero references
+        for (snap.pages) |id| r.unkeep(id); // the pages go back to the pool at zero references
         if (snap.pages.len > 0) alloc.free(snap.pages);
     }
     freeAfterQueue(&r.d, snap.buf);
