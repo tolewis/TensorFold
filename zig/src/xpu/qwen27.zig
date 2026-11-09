@@ -97,8 +97,9 @@ pub var keep_shared = false;
 pub var kept_host = false;
 /// XPU_KEPT_HOST_GIB: the host bytes a rank gives kept states' copies with XPU_KEPT_HOST=1.
 pub var kept_host_gib: f64 = 16;
-/// XPU_PARK_GIB: host bytes for idle kept prompt states, over all ranks. Unset or 0: off.
-/// Each rank holds park_gib / TP. It needs XPU_KEEP_PAGES=1 and XPU_KEPT_HOST=1.
+/// XPU_PARK_GIB: host bytes for idle kept prompt states, the total over all ranks. Unset or 0: off.
+/// Rank 0 checks parked bytes summed over the ranks. A follower never refuses a park for this budget.
+/// It needs XPU_KEEP_PAGES=1 and XPU_KEPT_HOST=1.
 pub var park_gib: f64 = 0;
 /// The host tier is on (mode word bit 23). False when the flag is off or a required flag is missing.
 pub var park_on = false;
@@ -382,7 +383,7 @@ pub const Runner = struct {
                 return error.ModeMismatch;
             }
         }
-        if (park_on and RANK == 0) std.log.info("qwen27-xpu: idle kept prompt states park in host memory (XPU_PARK_GIB): {d} GiB a rank", .{park_gib / @as(f64, @floatFromInt(TP))});
+        if (park_on and RANK == 0) std.log.info("qwen27-xpu: rank {d}: idle kept prompt states park in host memory (XPU_PARK_GIB): {d} GiB a rank", .{ RANK, park_gib / @as(f64, @floatFromInt(TP)) });
         const d = &r.d;
         errdefer d.g.close();
         d.list = try d.g.immediate(0, 0);
@@ -729,8 +730,8 @@ pub const Runner = struct {
     }
 
     /// Pages a parked restore takes, made free before rank 0 records `restore_slot`. The slot's pages with one
-    /// reference come back when the restore releases the slot, so they count. Rank 1 has no evict hook: it never
-    /// decides, and it replays the records this call writes before it sees `restore_slot`.
+    /// reference come back when the restore releases the slot, so they count. A follower has no evict hook: it
+    /// never decides. Every follower replays the records this call writes before it sees `restore_slot`.
     pub fn makeRoomParked(r: *Runner, slot: u32, at: u32) void {
         if (r.pool == 0 or !r.keep_shared) return;
         const e = r.evict orelse return;
@@ -744,7 +745,7 @@ pub const Runner = struct {
     fn parkedRoom(r: *const Runner, slot: u32, need: u32) bool {
         var back: u32 = 0;
         for (r.pt_host[slot][0..r.held[slot]]) |id| {
-            if (r.pages.held(id) == 1) back += 1;
+            if (r.pages.sole(id)) back += 1;
         }
         return @as(u64, r.pages.spare()) + back >= @as(u64, need) + r.reserve;
     }

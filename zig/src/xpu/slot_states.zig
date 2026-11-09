@@ -8,7 +8,6 @@ const q = @import("qwen27.zig");
 const tp = @import("tp.zig");
 const dev = @import("dev.zig");
 const fwd = @import("forward.zig");
-const pages_mod = @import("pages.zig");
 const park_runs = @import("park_runs.zig");
 const Runner = q.Runner;
 const copy = dev.copy;
@@ -144,17 +143,15 @@ fn copyGdnIn(d: *dev.Dev, r: *Runner, snap: *anyopaque) !void {
 }
 
 /// Copies `snap`'s K and V pages to one host buffer and drops its pool pages. The GDN copy stays in `snap.buf`.
-/// On any error the snap is unchanged. Rank 0 records `park_snap` only after the copy has landed, so rank 1
-/// parks its own half of a snap that rank 0 did park. The id is `snap.buf`, as `drop_snap`.
+/// On any error the snap is unchanged. Rank 0 records `park_snap` only after the copy has landed. Every follower
+/// then parks its own share. The id is `snap.buf`, as `drop_snap`. A follower does not refuse for the tier budget.
 pub fn parkSnap(r: *Runner, snap: *Snap) !void {
     if (snap.park != null) return;
     if (!q.kv_pool or r.page_bytes == 0 or snap.at % q.PAGE != 0) return error.NotParkable;
     const entries: usize = snap.pages.len;
     const expect: usize = (snap.at + q.PAGE - 1) / q.PAGE;
     if (entries == 0 or entries != expect) return error.NotParkable;
-    var layers: usize = 0;
-    for (r.model.layers) |l| layers += @intFromBool(l.attn);
-    const bytes = layers * 2 * entries * r.page_bytes;
+    const bytes = @as(usize, snap.at) * r.kvBytesPerToken();
     const d = &r.d;
     const host = try parkAlloc(d, bytes);
     var own = true;
@@ -171,12 +168,12 @@ pub fn parkSnap(r: *Runner, snap: *Snap) !void {
     snap.park_bytes = bytes;
     snap.park_pinned = host.pinned;
     own = false;
-    for (snap.pages) |id| unkeepPage(r, id);
+    for (snap.pages) |id| r.unkeep(id);
     alloc.free(snap.pages);
     snap.pages = &.{};
     r.park_moved = bytes;
     r.park_ms = ms;
-    if (q.park_log) std.log.info("qwen27-xpu: park copy {d} tokens, {d:.1} MiB, {d:.1} ms", .{ snap.at, @as(f64, @floatFromInt(bytes)) / (1 << 20), ms });
+    if (q.park_log) std.log.info("qwen27-xpu: rank {d}: park copy {d} tokens, {d:.1} MiB, {d:.1} ms", .{ q.RANK, snap.at, @as(f64, @floatFromInt(bytes)) / (1 << 20), ms });
 }
 
 /// Makes `slot` stand where `snap` was taken (its prompt pass goes on from snap.at).
@@ -202,7 +199,7 @@ pub fn restoreSlot(r: *Runner, slot: u32, snap: Snap) !void {
             const ms = (q.now() - t0) * 1e3;
             r.park_moved = snap.park_bytes;
             r.park_ms = ms;
-            if (q.park_log) std.log.info("qwen27-xpu: restore copy {d} tokens, {d:.1} MiB, {d:.1} ms", .{ at, @as(f64, @floatFromInt(snap.park_bytes)) / (1 << 20), ms });
+            if (q.park_log) std.log.info("qwen27-xpu: rank {d}: restore copy {d} tokens, {d:.1} MiB, {d:.1} ms", .{ q.RANK, at, @as(f64, @floatFromInt(snap.park_bytes)) / (1 << 20), ms });
             return;
         }
         try r.mapPages(slot, 0, snap.pages);
@@ -264,13 +261,6 @@ fn parkFree(d: *dev.Dev, ptr: *anyopaque, pinned: bool) void {
     if (pinned) d.g.free(ptr) else free(ptr);
 }
 
-/// `unkeep` once p56 lands. Until then a release is the same reference.
-fn unkeepPage(r: *Runner, id: u32) void {
-    if (comptime @hasDecl(pages_mod.Pages, "unkeep")) {
-        r.pages.unkeep(id);
-    } else r.pages.release(id);
-}
-
 fn copyKv(r: *Runner, host: *anyopaque, ids: []const u32, pinned: bool, way: Way) !void {
     const d = &r.d;
     const pb = r.page_bytes;
@@ -279,18 +269,24 @@ fn copyKv(r: *Runner, host: *anyopaque, ids: []const u32, pinned: bool, way: Way
     const runs = try alloc.alloc(park_runs.Run, entries);
     defer alloc.free(runs);
     const nruns = park_runs.pageRuns(ids, runs);
-    var layer: usize = 0;
+    const span = entries * pb; // one of K or V for this layer
+    var base: usize = 0;
     for (&r.model.layers) |*l| {
         if (!l.attn) continue;
         const kc = l.kc orelse return error.NotParkable;
         const vc = l.vc orelse return error.NotParkable;
+        const k_base = base;
+        base += span;
+        const v_base = base;
+        base += span;
         for (runs[0..nruns]) |run| {
             const nbytes = @as(usize, run.len) * pb;
+            const atb = @as(usize, run.at) * pb;
             const id0 = ids[@as(usize, run.at)];
             const dev_k = off(kc, @as(usize, id0) * pb);
             const dev_v = off(vc, @as(usize, id0) * pb);
-            const host_k = off(host, (layer * 2) * entries * pb + @as(usize, run.at) * pb);
-            const host_v = off(host, (layer * 2 + 1) * entries * pb + @as(usize, run.at) * pb);
+            const host_k = off(host, k_base + atb);
+            const host_v = off(host, v_base + atb);
             if (way == .to_host) {
                 try copySpan(d, host_k, dev_k, nbytes, pinned, true);
                 try copySpan(d, host_v, dev_v, nbytes, pinned, true);
@@ -299,7 +295,6 @@ fn copyKv(r: *Runner, host: *anyopaque, ids: []const u32, pinned: bool, way: Way
                 try copySpan(d, dev_v, host_v, nbytes, pinned, false);
             }
         }
-        layer += 1;
     }
 }
 

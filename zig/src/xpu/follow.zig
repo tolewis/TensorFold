@@ -80,7 +80,7 @@ pub fn run(r: *q.Runner) !void {
             },
             .park_snap => blk: {
                 const e = snaps.getEntry(id) orelse break :blk error.NoSuchSnap; // an unknown id is a lost or reordered park: exit before the pools drift
-                break :blk slot_states.parkSnap(r, e.value_ptr); // this rank's half; the id is rank 0's buffer, as drop_snap
+                break :blk slot_states.parkSnap(r, e.value_ptr); // this rank's share; the id is rank 0's buffer, as drop_snap
             },
             .restore_slot => if (snaps.get(id)) |s| slot_states.restoreSlot(r, rec.a, s) else error.NoSuchSnap,
             .drop_snap => if (snaps.fetchRemove(id)) |kv| slot_states.dropSnap(r, kv.value) else error.NoSuchSnap, // an unknown id is a lost or reordered drop: exit before the pools drift
@@ -89,7 +89,7 @@ pub fn run(r: *q.Runner) !void {
             .more => error.BadRecord,
         };
         done catch |err| {
-            // a park that fails on this rank while rank 0 parked leaves the two pools different
+            // a park that fails on this rank while rank 0 parked leaves the pools different
             if (op == .park_snap) return err;
             switch (err) {
                 error.BadBlock, error.BadCommit, error.ContextFull, error.NoSuchSlot, error.SlotNotThere => {
