@@ -91,6 +91,9 @@ pub var pool_tokens: ?u32 = null;
 /// page and the pool has none free, the least recently used kept state goes first, and a reserve of pages stays free
 /// for the streams. Off by default: kept states get only the pages past the streams' contexts, as before.
 pub var keep_shared = false;
+/// XPU_KEEP_PAGES=1: the prompt-cache budget counts each pool page once, however many kept states hold it.
+/// Needs XPU_KV_POOL=1 and XPU_KEEP_SHARED=1. Without them it logs one warning and stays off.
+pub var keep_pages = false;
 /// XPU_KEPT_HOST=1 (lane p43-keptcap): a kept prompt state's GDN, convolution and drafter-context copies live in pinned
 /// host memory, not on the card. The card's 1536 MiB reserve for them goes back to the pool, and the number of kept
 /// states comes from a host budget (XPU_KEPT_HOST_GIB, default 16 GiB a rank). Off by default.
@@ -163,6 +166,7 @@ const Options = struct {
     kv_pool: bool,
     pool_tokens: ?u32,
     keep_shared: bool,
+    keep_pages: bool,
     kept_host: bool,
     kept_host_gib: f64,
 };
@@ -171,7 +175,7 @@ var defaults: ?Options = null;
 var live = false;
 
 fn options() Options {
-    return .{ .dump_dir = dump_dir, .dump_h = dump_h, .a8_group = a8_group, .kv8 = kv8, .kv_i8 = kv_i8, .prefill_int4 = prefill_int4, .int4_sites = int4_sites, .prefill_int8 = prefill_int8, .a8_sites = a8_sites, .a8_rot = a8_rot, .a8_levels = a8_levels, .a8_sites4 = a8_sites4, .embed_host = embed_host, .chunk = CHUNK, .kv_pool = kv_pool, .pool_tokens = pool_tokens, .keep_shared = keep_shared, .kept_host = kept_host, .kept_host_gib = kept_host_gib };
+    return .{ .dump_dir = dump_dir, .dump_h = dump_h, .a8_group = a8_group, .kv8 = kv8, .kv_i8 = kv_i8, .prefill_int4 = prefill_int4, .int4_sites = int4_sites, .prefill_int8 = prefill_int8, .a8_sites = a8_sites, .a8_rot = a8_rot, .a8_levels = a8_levels, .a8_sites4 = a8_sites4, .embed_host = embed_host, .chunk = CHUNK, .kv_pool = kv_pool, .pool_tokens = pool_tokens, .keep_shared = keep_shared, .keep_pages = keep_pages, .kept_host = kept_host, .kept_host_gib = kept_host_gib };
 }
 
 fn restore(o: Options) void {
@@ -192,6 +196,7 @@ fn restore(o: Options) void {
     kv_pool = o.kv_pool;
     pool_tokens = o.pool_tokens;
     keep_shared = o.keep_shared;
+    keep_pages = o.keep_pages;
     kept_host = o.kept_host;
     kept_host_gib = o.kept_host_gib;
 }
@@ -283,6 +288,11 @@ pub const Runner = struct {
         if (pool_tokens != null) kv_pool = true;
         if (kv_pool) kv_i8 = true;
         if (std.c.getenv("XPU_KEEP_SHARED")) |v| keep_shared = v[0] != '0';
+        if (std.c.getenv("XPU_KEEP_PAGES")) |v| keep_pages = v[0] != '0';
+        if (keep_pages and !(kv_pool and keep_shared)) {
+            if (RANK == 0) std.log.warn("qwen27-xpu: XPU_KEEP_PAGES needs XPU_KV_POOL=1 and XPU_KEEP_SHARED=1; left off", .{});
+            keep_pages = false;
+        }
         if (std.c.getenv("XPU_KEPT_HOST")) |v| kept_host = v[0] != '0';
         if (std.c.getenv("XPU_KEPT_HOST_GIB")) |v| kept_host_gib = try std.fmt.parseFloat(f64, std.mem.span(v));
         // K1 tree (XPU_K1=1 with XPU_K1_TREE=1) needs the int8 pool; print once so a run shows which path it takes
@@ -611,12 +621,13 @@ pub fn deinit(r: *Runner) void {
     }
 
     /// `retainPage` and one kept-state reference. The kept count runs with the page-count flag on or off.
-    pub fn keep(r: *Runner, id: u32) void {
+    /// Named keepPage: other Runner methods already bind a parameter named keep.
+    pub fn keepPage(r: *Runner, id: u32) void {
         r.pages.keep(id);
     }
 
     /// `releasePage` and one kept-state reference less.
-    pub fn unkeep(r: *Runner, id: u32) void {
+    pub fn unkeepPage(r: *Runner, id: u32) void {
         r.pages.unkeep(id);
     }
 

@@ -311,6 +311,56 @@ pub const Lanes = struct {
         b.gpa.destroy(k);
     }
 
+    /// Bytes of one pool page on this card: K and V of `PAGE` tokens in every attention layer.
+    pub fn keepPageBytes(b: *const Lanes) u64 {
+        return @as(u64, @intCast(b.runner.kvBytesPerToken())) * xq.PAGE;
+    }
+
+    /// Bytes the kept states hold together: each page with a kept-state reference, once.
+    pub fn keepHeld(b: *const Lanes) u64 {
+        return @as(u64, b.runner.pages.kept_pages) * b.keepPageBytes();
+    }
+
+    /// Pages of `owner`'s slot table from entry 0 to ceil(at / PAGE) that no kept state holds yet, plus `keepBytes(0)`.
+    pub fn keepAdds(b: *const Lanes, owner: ?*anyopaque, at: u32) u64 {
+        const stream: *const lanes.Stream = @ptrCast(@alignCast(owner orelse return b.keepBytes(at)));
+        const slot = b.slotOf(stream) orelse return b.keepBytes(at);
+        const r = b.runner;
+        if (r.pool == 0) return b.keepBytes(at);
+        const entries: u32 = (at + xq.PAGE - 1) / xq.PAGE;
+        const have = r.held[slot];
+        const up: u32 = @min(entries, have);
+        const table = r.pt_host[slot];
+        const end: usize = @min(@as(usize, up), table.len);
+        var n: u64 = 0;
+        for (table[0..end]) |id| n += @intFromBool(r.pages.keptRefs(id) == 0);
+        n += @as(u64, up) - @as(u64, end);
+        if (entries > up) n += @as(u64, entries - up);
+        return n * b.keepPageBytes() + b.keepBytes(0);
+    }
+
+    /// Bytes `held` falls by when this state is dropped: its pages with one kept-state reference.
+    pub fn keepFrees(b: *const Lanes, saved: *anyopaque) u64 {
+        const k: *const Kept = @ptrCast(@alignCast(saved));
+        var n: u64 = 0;
+        for (k.snap.pages) |id| n += @intFromBool(b.runner.pages.keptRefs(id) == 1);
+        return n * b.keepPageBytes();
+    }
+
+    /// Bytes a drop gives back to the streams: the state's pages with one holder in all.
+    pub fn keepReturns(b: *const Lanes, saved: *anyopaque) u64 {
+        const k: *const Kept = @ptrCast(@alignCast(saved));
+        var n: u64 = 0;
+        for (k.snap.pages) |id| n += @intFromBool(b.runner.pages.sole(id));
+        return n * b.keepPageBytes();
+    }
+
+    /// Pages for the status line: kept states' pages, the pool, and pages free.
+    pub fn keepPageNote(b: *const Lanes) api.prompt_cache.PageNote {
+        const p = &b.runner.pages;
+        return .{ .held = p.kept_pages, .pool = p.count, .free = p.spare() };
+    }
+
     fn restoreKept(b: *Lanes, slot: u32, k: *const Kept) !void {
         try b.runner.restoreSlot(slot, k.snap);
         if (b.drafter) |d| try d.restoreCtx(slot, k.ctx orelse return error.NoContext, k.range);

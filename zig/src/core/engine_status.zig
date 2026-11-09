@@ -32,7 +32,17 @@ pub const Status = struct {
     /// A shared K/V pool's pages (null: the engine has none), read from the backend's atomic counts.
     kv_pool: ?KvPool = null,
 
-    pub const PromptCache = struct { states: u64 = 0, bytes: u64 = 0 };
+    pub const PromptCache = struct {
+        states: u64 = 0,
+        bytes: u64 = 0,
+        /// Set when the family counts each pool page once. Null: those gauges stay off.
+        pages_held: ?u64 = null,
+        pages_free: ?u64 = null,
+        evict_budget: ?u64 = null,
+        evict_count: ?u64 = null,
+        evict_stream: ?u64 = null,
+        evict_superseded: ?u64 = null,
+    };
     /// Pages in the pool, tokens a page holds, pages streams hold, pages promised and not yet held, and the rest.
     pub const KvPool = struct { pages: u64 = 0, page_tokens: u32 = 0, used: u64 = 0, promised: u64 = 0, free: u64 = 0 };
 };

@@ -119,6 +119,38 @@ const Snaps = struct {
     fn drop(ptr: *anyopaque, saved: api.prompt_cache.Saved) void {
         of(ptr).back.keepDrop(@ptrCast(@alignCast(saved)));
     }
+    fn held(ptr: *anyopaque) u64 {
+        return of(ptr).back.keepHeld();
+    }
+    fn adds(ptr: *anyopaque, owner: ?*anyopaque, at: u32) u64 {
+        return of(ptr).back.keepAdds(owner, at);
+    }
+    fn frees(ptr: *anyopaque, saved: api.prompt_cache.Saved) u64 {
+        return of(ptr).back.keepFrees(saved);
+    }
+    fn returnsFn(ptr: *anyopaque, saved: api.prompt_cache.Saved) u64 {
+        return of(ptr).back.keepReturns(saved);
+    }
+    fn pageNote(ptr: *anyopaque) api.prompt_cache.PageNote {
+        return of(ptr).back.keepPageNote();
+    }
+
+    /// Two static vtables. A vtable built in a `var` and returned by pointer dangles (p44).
+    const plain: api.prompt_cache.Snapshots.VTable = .{ .bytes = bytes, .save = save, .restore = restore, .drop = drop };
+    const counted: api.prompt_cache.Snapshots.VTable = .{
+        .bytes = bytes,
+        .save = save,
+        .restore = restore,
+        .drop = drop,
+        .held = held,
+        .adds = adds,
+        .frees = frees,
+        .returns = returnsFn,
+        .pages = pageNote,
+    };
+    fn vtable() *const api.prompt_cache.Snapshots.VTable {
+        return if (xq.keep_pages) &counted else &plain;
+    }
 };
 
 /// The prompt cache's budget: --prompt-cache-gib, else 2 GiB (0: no cache); set aside before the streams.
@@ -167,6 +199,7 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
         std.log.info("qwen27-xpu: a shared K/V pool of {d} pages ({d} tokens, {d:.2} GB a card, int8), {d} stream(s) of at most {d} tokens, kept prompt states in up to {d:.1} GiB of it. The states are the one conversation's, a later turn's takes its own older one's storage, the least recently used one never wins a kept state's page", .{ pages, runner.poolTokens(), @as(f64, @floatFromInt(runner.poolBytes())) / 1e9, slots, context, @as(f64, @floatFromInt(budget)) / (1 << 30) });
         if (slots < want) std.log.warn("qwen27-xpu: the K/V pool holds {d} tokens, so {d} stream(s) are admitted of the {d} asked for (--kv-pool-tokens names a bigger pool)", .{ runner.poolTokens(), slots, want });
         if (xq.keep_shared) std.log.info("qwen27-xpu: kept prompt states share the pool (XPU_KEEP_SHARED): {d} pages ({d} tokens) stay free for the streams, kept states in up to {d:.1} GiB of the pool, the least recently used one dropped when a stream needs a page", .{ runner.reserve, @as(u64, runner.reserve) * xq.PAGE, @as(f64, @floatFromInt(budget)) / (1 << 30) });
+        if (xq.keep_pages and xq.RANK == 0) std.log.info("qwen27-xpu: kept prompt states count each page once (XPU_KEEP_PAGES)", .{});
     } else {
         budget = cacheBudget(o);
         slots = try slotsThatFit(runner, want, budget);
@@ -217,7 +250,7 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
     }
     if (budget > 0) {
         // the prompt kernels compute in blocks of 64 rows from a call's start: kept and resumed at planned marks only
-        h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = h, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, .{ .planned = true, .grid = 64 }, budget);
+        h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = h, .vtable = Snaps.vtable() }, .{ .planned = true, .grid = 64 }, budget);
         if (xq.kv_pool) { // kept states' GDN and drafter-context copies: in the card reserve the pool left for them, or
             // in host memory (XPU_KEPT_HOST=1, a host budget a rank); each state takes one copy, so they cap the count
             const ctx: u64 = if (drafter != null) Drafter.ctxBytes() else 0;

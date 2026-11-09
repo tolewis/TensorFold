@@ -119,7 +119,12 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/safetensors.zig"), .target = target }) })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/limits.zig"), .target = target }) })).step);
     // the K/V pool's page references: which pages a slot or a kept prompt state holds
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/pages.zig"), .target = target }) })).step);
+    const pages_run = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/pages.zig"), .target = target }) }));
+    test_step.dependOn(&pages_run.step);
+    b.step("test-xpu-pages", "K/V pool page reference counts, including kept-state pages").dependOn(&pages_run.step);
+    const prompt_lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = .Debug, .link_libc = true });
+    const prompt_cache = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/core/prompt_cache.zig"), .target = target, .optimize = .Debug, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = prompt_lanes }} }) }));
+    b.step("test-prompt-cache", "Prompt cache unit tests on the CPU, including shared-page states").dependOn(&prompt_cache.step);
     // the prompt cache's keep-one rule, its own step: a later turn's state takes its own older one's storage
     const keepone_step = b.step("test-prompt-cache-keepone", "the prompt cache keep-one rule: a later turn's state takes its own older one's storage");
     keepOneCheck(b, target, keepone_step);

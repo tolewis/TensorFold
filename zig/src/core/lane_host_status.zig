@@ -83,7 +83,19 @@ pub fn noteLive(h: *LaneHost) void {
     defer h.mutex.unlock(h.io);
     h.live_tokens.clearRetainingCapacity();
     h.live_generated = 0;
-    h.cache_status = if (h.cache) |s| .{ .states = s.entries.items.len, .bytes = s.held + s.spare() } else null;
+    h.cache_status = if (h.cache) |s| blk: {
+        var row: api.Status.PromptCache = .{ .states = s.entries.items.len, .bytes = s.held + s.spare() };
+        if (s.family.vtable.pages) |note| {
+            const n = note(s.family.ptr);
+            row.pages_held = n.held;
+            row.pages_free = n.free;
+            row.evict_budget = s.counts.evict_budget;
+            row.evict_count = s.counts.evict_count;
+            row.evict_stream = s.counts.evict_stream;
+            row.evict_superseded = s.counts.evict_superseded;
+        }
+        break :blk row;
+    } else null;
     for (h.admitted.items) |job| if (job.started) {
         h.live_tokens.append(h.gpa, @intCast(job.stream.context.items.len)) catch {};
         h.live_generated += @intCast(job.stream.emitted().len);

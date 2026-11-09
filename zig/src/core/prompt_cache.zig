@@ -16,6 +16,9 @@ pub const Saved = *anyopaque;
 pub const singleReclaim = imprint.singleReclaim; // the learned-state file helpers, beside the Imprint that owns them
 pub const singleForgetChecked = imprint.singleForgetChecked;
 
+/// Pages a sharing family prints after the status line: pages kept states hold, the pool, and pages free.
+pub const PageNote = struct { held: u32 = 0, pool: u32 = 0, free: u32 = 0 };
+
 /// What a family gives the cache: copies of its state while the prompt pass stands at a chunk end.
 pub const Snapshots = struct {
     ptr: *anyopaque,
@@ -42,6 +45,12 @@ pub const Snapshots = struct {
         held: ?*const fn (ptr: *anyopaque) u64 = null,
         /// The storage a save at `at` for `owner` adds to what the kept states hold now (with `held`; null: `bytes`).
         adds: ?*const fn (ptr: *anyopaque, owner: ?*anyopaque, at: u32) u64 = null,
+        /// Bytes `held` falls by when this state is dropped. Null: the state's charge. A state that frees nothing stays when bytes are short.
+        frees: ?*const fn (ptr: *anyopaque, saved: Saved) u64 = null,
+        /// Bytes a drop gives back to the streams. Null: the state's charge. `evictOne` skips a state that returns nothing.
+        returns: ?*const fn (ptr: *anyopaque, saved: Saved) u64 = null,
+        /// Pages for the status line (null: the line is unchanged).
+        pages: ?*const fn (ptr: *anyopaque) PageNote = null,
         /// Write `saved` as learned state `key`, in files of the family's own under `dir` (null: nothing kept on disk).
         write: ?*const fn (ptr: *anyopaque, saved: Saved, dir: [:0]const u8, key: u64) anyerror!void = null,
         /// Learned state `key` of `at` tokens, read back from its files under `dir` into new storage.
@@ -122,7 +131,26 @@ pub const Entry = struct {
     borrowers: u32 = 0, // outstanding lookups: released by resumed or release, never evicted while borrowed
 };
 
-pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0 };
+pub const Counts = struct {
+    hits: u64 = 0,
+    misses: u64 = 0,
+    kept: u64 = 0,
+    evicted: u64 = 0,
+    refused: u64 = 0,
+    failed: u64 = 0,
+    /// Evictions by why: the byte budget, the state count, a stream that needed a page, a superseded state.
+    evict_budget: u64 = 0,
+    evict_count: u64 = 0,
+    evict_stream: u64 = 0,
+    evict_superseded: u64 = 0,
+};
+
+const EvictWhy = enum { budget, count, stream, superseded };
+
+fn whyOf(reason: []const u8, bytes_short: bool) EvictWhy {
+    if (std.mem.indexOf(u8, reason, "superseded") != null) return .superseded;
+    return if (bytes_short) .budget else .count;
+}
 
 pub const RestoreDetails = @import("prompt_cache_restore.zig").Details;
 pub const RestoreLog = @import("prompt_cache_restore.zig").Log;
@@ -181,11 +209,16 @@ pub const Store = struct {
     }
 
     /// Drops the least recently used kept state a stream's page need makes room with (never a borrowed one, and the
-    /// rewind state last); false when no state is left to drop. The family's drop returns the state's pages.
+    /// rewind state last); false when no state is left to drop. With `returns`, a state that gives no page back stays,
+    /// and false means none of them does. The family's drop returns the state's pages.
     pub fn evictOne(s: *Store) bool {
-        const i = s.victimBut(null, &.{}, 0) orelse return false;
-        s.remove(i);
-        s.counts.evicted += 1;
+        const i = if (s.family.vtable.held != null and s.family.vtable.returns != null)
+            policy.victimButIf(s, null, &.{}, 0, .returns)
+        else
+            s.victimBut(null, &.{}, 0);
+        const at_ = i orelse return false;
+        s.remove(at_);
+        s.noteEvict(.stream);
         s.forced += 1;
         return true;
     }
@@ -228,6 +261,32 @@ pub const Store = struct {
         return if (s.family.vtable.held) |f| f(s.family.ptr) else s.held;
     }
 
+    fn noteEvict(s: *Store, why: EvictWhy) void {
+        s.counts.evicted += 1;
+        switch (why) {
+            .budget => s.counts.evict_budget += 1,
+            .count => s.counts.evict_count += 1,
+            .stream => s.counts.evict_stream += 1,
+            .superseded => s.counts.evict_superseded += 1,
+        }
+    }
+
+    /// Bytes the log names for a drop: what `held` falls by when the family counts shared pages, else the state's charge.
+    fn freedOf(s: *const Store, e: *const Entry) u64 {
+        if (s.family.vtable.held != null) if (s.family.vtable.frees) |f| return f(s.family.ptr, e.saved);
+        return e.bytes;
+    }
+
+    fn sharingBytes(s: *const Store) bool {
+        return s.family.vtable.held != null and s.family.vtable.frees != null;
+    }
+
+    /// Today's victim. When shared pages make the bytes short, the first in that order whose `frees` is above 0.
+    fn victimFor(s: *const Store, skip: ?*Entry, prompt: []const u32, born: u32, bytes_short: bool) ?usize {
+        if (bytes_short and s.sharingBytes()) return policy.victimButIf(s, skip, prompt, born, .frees);
+        return policy.victimBut(s, skip, prompt, born);
+    }
+
     /// What the budget leaves past the kept states and the spare storage: a family readies storage only inside it.
     pub fn room(s: *const Store) u64 {
         return s.budget -| s.holding() -| s.spare();
@@ -240,8 +299,11 @@ pub const Store = struct {
             const skip = for (s.entries.items) |e| {
                 if (restoring != null and e.saved == restoring.?) break e;
             } else null;
-            s.remove(s.victimBut(skip, prompt, @intCast(prompt.len)) orelse return false);
-            s.counts.evicted += 1;
+            const born: u32 = @intCast(prompt.len);
+            const i = s.victimBut(skip, prompt, born) orelse return false;
+            const reason = policy.victimReason(s, i, prompt, born);
+            s.remove(i);
+            s.noteEvict(if (std.mem.indexOf(u8, reason, "superseded") != null) .superseded else .budget);
         }
         return true;
     }
@@ -364,13 +426,14 @@ pub const Store = struct {
         while (s.holding() + need > s.budget or s.entries.items.len + @min(new, s.most) > s.most) {
             // the least recently used one leaves. A mark supersedes the conversation's older state only when the
             // state is kept (keepBorn): a supersede is irreversible, and this pass may cancel before it keeps it.
-            const victim = s.victimBut(from, prompt, born) orelse return;
-            const vat = s.entries.items[victim].at;
-            const vbytes = s.entries.items[victim].bytes;
-            const vreason = policy.victimReason(s, victim, prompt, born);
-            evicted(vat, vbytes, vreason);
+            // When shared pages make the bytes short, a state that frees nothing stays. The count alone keeps today's victim.
+            const bytes_short = s.holding() + need > s.budget;
+            const victim = s.victimFor(from, prompt, born, bytes_short) orelse return;
+            const e = s.entries.items[victim];
+            const reason = policy.victimReason(s, victim, prompt, born);
+            evicted(e.at, s.freedOf(e), reason);
             s.remove(victim); // its storage may come back spare and take this state
-            s.counts.evicted += 1;
+            s.noteEvict(whyOf(reason, bytes_short));
         }
     }
 
@@ -500,28 +563,34 @@ pub const Store = struct {
             if (s.family.vtable.reuses) |f| if (s.entries.items.len < s.most and f(s.family.ptr, at)) break;
             const free_ = s.spare();
             const adds = if (s.family.vtable.adds) |f| f(s.family.ptr, owner, at) else bytes;
-            if (s.holding() + free_ + adds <= s.budget and s.entries.items.len < s.most) break;
+            const bytes_short = s.holding() + free_ + adds > s.budget;
+            const count_short = s.entries.items.len >= s.most;
+            if (!bytes_short and !count_short) break;
             if (free_ > 0) {
                 if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held -| bytes); // spare that cannot take this state goes before any state
                 if (s.spare() < free_) continue;
             }
-            // the conversation's own older state it extends gives its storage before the least recently used one
-            const victim = s.victimBut(null, prompt, born) orelse return s.fail(at, error.CacheBorrowed);
-            const vat = s.entries.items[victim].at;
-            const vbytes = s.entries.items[victim].bytes;
-            const vreason = policy.victimReason(s, victim, prompt, born);
+            // the conversation's own older state it extends gives its storage before the least recently used one.
+            // When shared pages make the bytes short, a state that frees nothing stays. The count alone keeps today's victim.
+            const victim = s.victimFor(null, prompt, born, bytes_short) orelse return s.fail(at, error.CacheBorrowed);
             const superseded = policy.subsumed(s, prompt, born, at);
             if (superseded) |i| {
                 if (i != victim) {
-                    evicted(s.entries.items[i].at, s.entries.items[i].bytes, "superseded by the state this pass keeps");
-                    s.remove(i); // the loop rechecks the budget; the least recently used one leaves only if the room is still short
-                    s.counts.evicted += 1;
-                    continue;
+                    const other = s.entries.items[i];
+                    const stays = bytes_short and s.sharingBytes() and s.family.vtable.frees.?(s.family.ptr, other.saved) == 0;
+                    if (!stays) {
+                        evicted(other.at, s.freedOf(other), "superseded by the state this pass keeps");
+                        s.remove(i); // the loop rechecks the budget; the least recently used one leaves only if the room is still short
+                        s.noteEvict(.superseded);
+                        continue;
+                    }
                 }
             }
-            evicted(vat, vbytes, vreason); // the state may be superseded and the victim at once; the reason names it
+            const e = s.entries.items[victim];
+            const reason = policy.victimReason(s, victim, prompt, born);
+            evicted(e.at, s.freedOf(e), reason); // the state may be superseded and the victim at once; the reason names it
             s.remove(victim); // its storage may come back spare and take this state
-            s.counts.evicted += 1;
+            s.noteEvict(whyOf(reason, bytes_short));
         }
         if (s.entries.items.len == 0) if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| bytes);
         const e = s.gpa.create(Entry) catch return s.fail(at, error.OutOfMemory);
@@ -563,8 +632,11 @@ pub const Store = struct {
         if (!modes.equal(&.{}, spans, m.at)) return have; // the request decodes rows the learned prompt pass prefilled
         const bytes = s.family.vtable.bytes(s.family.ptr, m.at);
         while (bytes <= s.budget and (s.holding() + s.spare() + bytes > s.budget or s.entries.items.len >= s.most)) {
-            s.remove(s.victimBut(have, prompt, born) orelse return have);
-            s.counts.evicted += 1;
+            const bytes_short = s.holding() + s.spare() + bytes > s.budget;
+            const victim = s.victimFor(have, prompt, born, bytes_short) orelse return have;
+            const reason = policy.victimReason(s, victim, prompt, born);
+            s.remove(victim);
+            s.noteEvict(whyOf(reason, bytes_short));
         }
         if (bytes > s.budget) return have;
         const e = s.gpa.create(Entry) catch return have;
@@ -596,7 +668,11 @@ pub const Store = struct {
     /// One log line after a prompt pass: where it resumed, how many states it kept, and what the store holds.
     pub fn report(s: *const Store, prompt: usize, from: u32, kept: u64) void {
         if (@import("builtin").is_test) return;
-        std.log.info("prompt cache: {d} tokens, resumed at {d}, kept {d}; {d} states, {d} MiB and {d} MiB spare of {d} MiB (hits {d}, misses {d}, evicted {d}, {d} for streams, refused {d}, failed {d})", .{ prompt, from, kept, s.entries.items.len, s.holding() >> 20, s.spare() >> 20, s.budget >> 20, s.counts.hits, s.counts.misses, s.counts.evicted, s.forced, s.counts.refused, s.counts.failed });
+        const line = "prompt cache: {d} tokens, resumed at {d}, kept {d}; {d} states, {d} MiB and {d} MiB spare of {d} MiB (hits {d}, misses {d}, evicted {d}, {d} for streams, refused {d}, failed {d})";
+        if (s.family.vtable.pages) |f| {
+            const n = f(s.family.ptr);
+            std.log.info(line ++ ", pages held {d} of {d}, free {d}", .{ prompt, from, kept, s.entries.items.len, s.holding() >> 20, s.spare() >> 20, s.budget >> 20, s.counts.hits, s.counts.misses, s.counts.evicted, s.forced, s.counts.refused, s.counts.failed, n.held, n.pool, n.free });
+        } else std.log.info(line, .{ prompt, from, kept, s.entries.items.len, s.holding() >> 20, s.spare() >> 20, s.budget >> 20, s.counts.hits, s.counts.misses, s.counts.evicted, s.forced, s.counts.refused, s.counts.failed });
     }
 
     fn fail(s: *Store, at: u32, err: anyerror) bool {
@@ -649,6 +725,7 @@ test {
     _ = @import("prompt_cache_give_test.zig");
     _ = @import("prompt_cache_shared_test.zig");
     _ = @import("prompt_cache_lifetime_test.zig");
+    _ = @import("prompt_cache_pages_test.zig");
     _ = @import("learned_fault_test.zig");
     _ = modes;
     _ = rows;

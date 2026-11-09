@@ -207,3 +207,143 @@ pub const Fake = struct {
         return f.sum;
     }
 };
+
+/// States that share pages, one page every `page` tokens. `bytes(0)` is 0. `held` is the distinct pages.
+/// `frees` is pages with one kept state. `returns` is pages with one holder in all.
+pub const Shared = struct {
+    gpa: Allocator,
+    page: u32 = 64,
+    token: u64 = 1,
+    refs: std.ArrayList(u16) = .empty,
+    kept: std.ArrayList(u16) = .empty,
+    kept_pages: u32 = 0,
+    live: std.ArrayList(u32) = .empty, // the stream's page table
+    at: u32 = 0,
+
+    const State = struct { ids: []u32 };
+    const counted: Snapshots.VTable = .{
+        .bytes = bytesFn,
+        .save = saveFn,
+        .restore = restoreFn,
+        .drop = dropFn,
+        .held = heldFn,
+        .adds = addsFn,
+        .frees = freesFn,
+        .returns = returnsFn,
+    };
+
+    pub fn deinit(f: *Shared) void {
+        f.refs.deinit(f.gpa);
+        f.kept.deinit(f.gpa);
+        f.live.deinit(f.gpa);
+    }
+
+    pub fn snapshots(f: *Shared) Snapshots {
+        return .{ .ptr = f, .vtable = &counted };
+    }
+
+    /// The stream's table covers `at` tokens, taking a fresh page where it has none yet.
+    pub fn grow(f: *Shared, at: u32) !void {
+        const need: usize = (@as(usize, at) + f.page - 1) / f.page;
+        while (f.live.items.len < need) {
+            const id: u32 = @intCast(f.refs.items.len);
+            try f.refs.append(f.gpa, 0);
+            try f.kept.append(f.gpa, 0);
+            try f.live.append(f.gpa, id);
+        }
+        f.at = at;
+    }
+
+    /// Drop the stream's table. Page ids already handed out stay, so the next conversation takes new pages.
+    pub fn resetLive(f: *Shared) void {
+        f.live.clearRetainingCapacity();
+        f.at = 0;
+    }
+
+    /// The running stream holds `id` as well as any kept state, so a drop of that state may free no page.
+    pub fn hold(f: *Shared, id: u32) void {
+        f.refs.items[id] += 1;
+    }
+
+    pub fn pageBytes(f: *const Shared) u64 {
+        return @as(u64, f.page) * f.token;
+    }
+
+    fn of(ptr: *anyopaque) *Shared {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn bytesFn(ptr: *anyopaque, at: u32) u64 {
+        return @as(u64, at) * of(ptr).token;
+    }
+
+    fn heldFn(ptr: *anyopaque) u64 {
+        const f = of(ptr);
+        return @as(u64, f.kept_pages) * f.pageBytes();
+    }
+
+    fn addsFn(ptr: *anyopaque, _: ?*anyopaque, at: u32) u64 {
+        const f = of(ptr);
+        const n: usize = (@as(usize, at) + f.page - 1) / f.page;
+        const up = @min(n, f.live.items.len);
+        var fresh: u64 = 0;
+        for (f.live.items[0..up]) |id| fresh += @intFromBool(f.kept.items[id] == 0);
+        fresh += @as(u64, @intCast(n - up));
+        return fresh * f.pageBytes() + bytesFn(ptr, 0);
+    }
+
+    fn saveFn(ptr: *anyopaque, _: ?*anyopaque, at: u32) anyerror!Saved {
+        const f = of(ptr);
+        if (at != f.at) return error.NotAtMark;
+        const n: usize = (@as(usize, at) + f.page - 1) / f.page;
+        if (n > f.live.items.len) return error.NotAtMark;
+        const st = try f.gpa.create(State);
+        errdefer f.gpa.destroy(st);
+        st.ids = try f.gpa.alloc(u32, n);
+        @memcpy(st.ids, f.live.items[0..n]);
+        for (st.ids) |id| {
+            f.refs.items[id] += 1;
+            if (f.kept.items[id] == 0) f.kept_pages += 1;
+            f.kept.items[id] += 1;
+        }
+        return st;
+    }
+
+    fn restoreFn(ptr: *anyopaque, _: ?*anyopaque, saved: Saved) anyerror!void {
+        const f = of(ptr);
+        const st: *State = @ptrCast(@alignCast(saved));
+        f.live.clearRetainingCapacity();
+        try f.live.appendSlice(f.gpa, st.ids);
+        f.at = @intCast(st.ids.len * @as(usize, f.page));
+    }
+
+    fn dropFn(ptr: *anyopaque, saved: Saved) void {
+        const f = of(ptr);
+        const st: *State = @ptrCast(@alignCast(saved));
+        for (st.ids) |id| {
+            if (f.kept.items[id] > 0) {
+                f.kept.items[id] -= 1;
+                if (f.kept.items[id] == 0) f.kept_pages -= 1;
+            }
+            if (f.refs.items[id] > 0) f.refs.items[id] -= 1;
+        }
+        f.gpa.free(st.ids);
+        f.gpa.destroy(st);
+    }
+
+    fn freesFn(ptr: *anyopaque, saved: Saved) u64 {
+        const f = of(ptr);
+        const st: *State = @ptrCast(@alignCast(saved));
+        var n: u64 = 0;
+        for (st.ids) |id| n += @intFromBool(f.kept.items[id] == 1);
+        return n * f.pageBytes();
+    }
+
+    fn returnsFn(ptr: *anyopaque, saved: Saved) u64 {
+        const f = of(ptr);
+        const st: *State = @ptrCast(@alignCast(saved));
+        var n: u64 = 0;
+        for (st.ids) |id| n += @intFromBool(f.refs.items[id] == 1);
+        return n * f.pageBytes();
+    }
+};
