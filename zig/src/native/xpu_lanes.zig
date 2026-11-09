@@ -311,6 +311,11 @@ pub const Lanes = struct {
         b.gpa.destroy(k);
     }
 
+    /// Parks the kept state's K and V. The drafter context copy stays.
+    pub fn keepPark(b: *Lanes, k: *Kept) !void {
+        try b.runner.parkSnap(&k.snap);
+    }
+
     fn restoreKept(b: *Lanes, slot: u32, k: *const Kept) !void {
         try b.runner.restoreSlot(slot, k.snap);
         if (b.drafter) |d| try d.restoreCtx(slot, k.ctx orelse return error.NoContext, k.range);

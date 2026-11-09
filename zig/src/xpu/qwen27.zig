@@ -97,6 +97,17 @@ pub var keep_shared = false;
 pub var kept_host = false;
 /// XPU_KEPT_HOST_GIB: the host bytes a rank gives kept states' copies with XPU_KEPT_HOST=1.
 pub var kept_host_gib: f64 = 16;
+/// XPU_PARK_GIB: host bytes for idle kept prompt states, over all ranks. Unset or 0: off.
+/// Each rank holds park_gib / TP. It needs XPU_KEEP_PAGES=1 and XPU_KEPT_HOST=1.
+pub var park_gib: f64 = 0;
+/// The host tier is on (mode word bit 23). False when the flag is off or a required flag is missing.
+pub var park_on = false;
+/// XPU_PARK_PINNED=1: pinned host memory for the tier. Off: plain page-aligned host memory.
+pub var park_pinned = false;
+/// XPU_PARK_LOG=1: print the bytes and the time of each park copy and each restore copy.
+pub var park_log = false;
+/// XPU_PARK_MIN: a shorter state is dropped, not parked. Tokens. Default 16384.
+pub var park_min: u32 = 16384;
 
 /// Drops the least recently used kept prompt state the prompt cache may evict; false when none is left.
 pub const Evict = struct { ctx: *anyopaque, f: *const fn (ctx: *anyopaque) bool };
@@ -165,13 +176,18 @@ const Options = struct {
     keep_shared: bool,
     kept_host: bool,
     kept_host_gib: f64,
+    park_gib: f64,
+    park_on: bool,
+    park_pinned: bool,
+    park_log: bool,
+    park_min: u32,
 };
 var defaults: ?Options = null;
 /// One runner at a time: the options, MAX_CTX and GS above belong to the process, not to a runner.
 var live = false;
 
 fn options() Options {
-    return .{ .dump_dir = dump_dir, .dump_h = dump_h, .a8_group = a8_group, .kv8 = kv8, .kv_i8 = kv_i8, .prefill_int4 = prefill_int4, .int4_sites = int4_sites, .prefill_int8 = prefill_int8, .a8_sites = a8_sites, .a8_rot = a8_rot, .a8_levels = a8_levels, .a8_sites4 = a8_sites4, .embed_host = embed_host, .chunk = CHUNK, .kv_pool = kv_pool, .pool_tokens = pool_tokens, .keep_shared = keep_shared, .kept_host = kept_host, .kept_host_gib = kept_host_gib };
+    return .{ .dump_dir = dump_dir, .dump_h = dump_h, .a8_group = a8_group, .kv8 = kv8, .kv_i8 = kv_i8, .prefill_int4 = prefill_int4, .int4_sites = int4_sites, .prefill_int8 = prefill_int8, .a8_sites = a8_sites, .a8_rot = a8_rot, .a8_levels = a8_levels, .a8_sites4 = a8_sites4, .embed_host = embed_host, .chunk = CHUNK, .kv_pool = kv_pool, .pool_tokens = pool_tokens, .keep_shared = keep_shared, .kept_host = kept_host, .kept_host_gib = kept_host_gib, .park_gib = park_gib, .park_on = park_on, .park_pinned = park_pinned, .park_log = park_log, .park_min = park_min };
 }
 
 fn restore(o: Options) void {
@@ -194,6 +210,11 @@ fn restore(o: Options) void {
     keep_shared = o.keep_shared;
     kept_host = o.kept_host;
     kept_host_gib = o.kept_host_gib;
+    park_gib = o.park_gib;
+    park_on = o.park_on;
+    park_pinned = o.park_pinned;
+    park_log = o.park_log;
+    park_min = o.park_min;
 }
 
 extern "c" fn clock_gettime(clk: c_int, ts: *[2]i64) c_int;
@@ -249,6 +270,9 @@ pub const Runner = struct {
     reserve: u32 = 0,
     /// The kept states' eviction when a stream needs pages the pool does not have free (null: a follower, or no cache).
     evict: ?Evict = null,
+    /// Last park or restore K/V copy: bytes and milliseconds.
+    park_moved: u64 = 0,
+    park_ms: f64 = 0,
     /// Target hidden states for a drafter: when on, every forward fills acts.taps and calls `on_taps` with its rows.
     taps_on: bool = false,
     on_taps: ?struct { ctx: *anyopaque, f: *const fn (*anyopaque, *anyopaque, u32) anyerror!void } = null,
@@ -285,6 +309,18 @@ pub const Runner = struct {
         if (std.c.getenv("XPU_KEEP_SHARED")) |v| keep_shared = v[0] != '0';
         if (std.c.getenv("XPU_KEPT_HOST")) |v| kept_host = v[0] != '0';
         if (std.c.getenv("XPU_KEPT_HOST_GIB")) |v| kept_host_gib = try std.fmt.parseFloat(f64, std.mem.span(v));
+        if (std.c.getenv("XPU_PARK_GIB")) |v| park_gib = try std.fmt.parseFloat(f64, std.mem.span(v));
+        if (std.c.getenv("XPU_PARK_PINNED")) |v| park_pinned = v[0] != '0';
+        if (std.c.getenv("XPU_PARK_LOG")) |v| park_log = v[0] != '0';
+        if (std.c.getenv("XPU_PARK_MIN")) |v| park_min = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+        if (park_gib > 0) {
+            const keep_pages = if (std.c.getenv("XPU_KEEP_PAGES")) |v| v[0] != '0' else false;
+            if (!keep_pages or !kept_host) {
+                std.log.warn("qwen27-xpu: XPU_PARK_GIB needs XPU_KEEP_PAGES=1 and XPU_KEPT_HOST=1; the host tier stays off", .{});
+                park_gib = 0;
+                park_on = false;
+            } else park_on = true;
+        }
         // K1 tree (XPU_K1=1 with XPU_K1_TREE=1) needs the int8 pool; print once so a run shows which path it takes
         if (k1mod.on and k1mod.tree and kv_i8) std.debug.print("K1 tree verify is on\n", .{});
         if (k1mod.on or k1mod.tree or k1mod.multi_tree) {
@@ -341,11 +377,12 @@ pub const Runner = struct {
         tp.group = try tp.Group.open(&r.d); // null at TP 1
         if (tp.group) |*g| {
             if (g.rank != 0 and g.readMode() != modeWord()) {
-                std.log.err("rank {d}: the mode word does not match rank 0's: this rank's XPU_KV_POOL, XPU_KEEP_SHARED, XPU_KEPT_HOST, XPU_KV_INT8, XPU_EMBED_HOST, XPU_K1, XPU_K1_TREE, XPU_MULTI_TREE, XPU_K1_R16 or XPU_K1_WAVE diverges, or this rank loads a different weight format (EXL3 or MLX), and the pair sizes its cards differently\n", .{ RANK });
+                std.log.err("rank {d}: the mode word does not match rank 0's: this rank's XPU_KV_POOL, XPU_KEEP_SHARED, XPU_KEPT_HOST, XPU_PARK_GIB, XPU_KV_INT8, XPU_EMBED_HOST, XPU_K1, XPU_K1_TREE, XPU_MULTI_TREE, XPU_K1_R16 or XPU_K1_WAVE diverges, or this rank loads a different weight format (EXL3 or MLX), and the pair sizes its cards differently\n", .{RANK});
                 g.markClosed(); // rank 0 sees the closed segment at its first all-reduce and exits at once
                 return error.ModeMismatch;
             }
         }
+        if (park_on and RANK == 0) std.log.info("qwen27-xpu: idle kept prompt states park in host memory (XPU_PARK_GIB): {d} GiB a rank", .{park_gib / @as(f64, @floatFromInt(TP))});
         const d = &r.d;
         errdefer d.g.close();
         d.list = try d.g.immediate(0, 0);
@@ -448,7 +485,7 @@ pub const Runner = struct {
     }
 
     /// Gives back the card's memory, the shards' mappings and the host buffers; `r` is gone after it.
-pub fn deinit(r: *Runner) void {
+    pub fn deinit(r: *Runner) void {
         if (tp.group) |*g| {
             g.record(.close, 0, 0, 0, &.{}) catch {};
             g.markClosed(); // a rank that stops closes the group: its peer sees it at once, not after the wait
@@ -520,6 +557,7 @@ pub fn deinit(r: *Runner) void {
     pub const saveSlot = slot_states.saveSlot;
     pub const restoreSlot = slot_states.restoreSlot;
     pub const dropSnap = slot_states.dropSnap;
+    pub const parkSnap = slot_states.parkSnap;
     pub const unallocatedSlots = slot_states.unallocatedSlots;
     pub const ensure = slot_states.ensure;
 
@@ -646,6 +684,24 @@ pub fn deinit(r: *Runner) void {
         if (full) return error.ContextFull;
     }
 
+    /// `n` new pages for `slot`, from a held of 0. `take` already holds each page, so this does not retain again.
+    /// Writes `pt_host`, `held`, and the device table, as `ensurePages` does.
+    pub fn mapNewPages(r: *Runner, slot: u32, n: u32) !void {
+        if (r.pool == 0 or slot >= MAX_SLOTS or r.pt[slot] == null or r.held[slot] != 0) return error.BadSlot;
+        if (@as(usize, n) > r.pt_host[slot].len) return error.ContextFull;
+        var i: u32 = 0;
+        errdefer {
+            for (r.pt_host[slot][0..i]) |id| r.releasePage(id);
+            r.held[slot] = 0;
+        }
+        while (i < n) : (i += 1) {
+            r.pt_host[slot][i] = r.pages.take() orelse return error.ContextFull;
+        }
+        r.held[slot] = n;
+        if (n == 0) return;
+        try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, r.pt[slot].?, r.pt_host[slot].ptr, @as(usize, n) * 4, null, 0, null));
+    }
+
     /// Pages a call on `slot` takes up to `upTo` positions, made free before the call. With XPU_KEEP_SHARED the least
     /// recently used kept states go until the pool has them and keeps `reserve` free for the streams. Rank 0 only: the
     /// drops it makes are step records the follower replays before this call, so both ranks free the same pages.
@@ -660,6 +716,27 @@ pub fn deinit(r: *Runner) void {
         while (!r.pages.roomFor(want, r.reserve)) {
             if (!e.f(e.ctx)) break; // no kept state left: the pass takes what the pool has
         }
+    }
+
+    /// Pages a parked restore takes, made free before rank 0 records `restore_slot`. The slot's pages with one
+    /// reference come back when the restore releases the slot, so they count. Rank 1 has no evict hook: it never
+    /// decides, and it replays the records this call writes before it sees `restore_slot`.
+    pub fn makeRoomParked(r: *Runner, slot: u32, at: u32) void {
+        if (r.pool == 0 or !r.keep_shared) return;
+        const e = r.evict orelse return;
+        if (slot >= MAX_SLOTS or r.pt[slot] == null or at > r.context) return;
+        const need = (at + PAGE - 1) / PAGE;
+        while (!r.parkedRoom(slot, need)) {
+            if (!e.f(e.ctx)) break;
+        }
+    }
+
+    fn parkedRoom(r: *const Runner, slot: u32, need: u32) bool {
+        var back: u32 = 0;
+        for (r.pt_host[slot][0..r.held[slot]]) |id| {
+            if (r.pages.held(id) == 1) back += 1;
+        }
+        return @as(u64, r.pages.spare()) + back >= @as(u64, need) + r.reserve;
     }
 
     /// Drops `slot`'s hold on its pages: a fresh sequence, or a restore that maps a kept state's pages.
@@ -881,7 +958,8 @@ pub fn deinit(r: *Runner) void {
 };
 
 /// Zeroes `bytes` of device memory `p` in chunks: the pool's pages are held by the card now, not at a request.
-fn zeroed(d: *Dev, p: *anyopaque, bytes: usize) !void {    const first = @min(bytes, 64 << 20);
+fn zeroed(d: *Dev, p: *anyopaque, bytes: usize) !void {
+    const first = @min(bytes, 64 << 20);
     try d.fill(p, @as(u32, 0), first);
     var at: usize = first;
     while (at < bytes) {
@@ -921,7 +999,7 @@ pub fn poolPages(r: *Runner, slots: u32, tokens: ?u32, cache: bool, extra: u64) 
 
 /// The run flags a pair must agree on: one bit each for kv_pool, keep_shared, kv_i8, embed_host, k1, k1_tree and
 /// k1 r16, four bits for the k1 wave (XPU_K1_WAVE, a small count), then multi_tree (XPU_MULTI_TREE), then the weight
-/// format (bit 12: MLX), then kept_host (bit 13: XPU_KEPT_HOST).
+/// format (bit 12: MLX), then kept_host (bit 13: XPU_KEPT_HOST), then the host tier (bit 23: XPU_PARK_GIB).
 pub fn modeWord() u64 {
     var w: u64 = 0;
     w |= @as(u64, @intFromBool(kv_pool));
@@ -935,6 +1013,7 @@ pub fn modeWord() u64 {
     w |= @as(u64, @intFromBool(k1mod.multi_tree)) << 11;
     w |= @as(u64, @intFromBool(fmt_mlx)) << 12; // 0: EXL3, 1: MLX 4/64
     w |= @as(u64, @intFromBool(kept_host)) << 13; // kept states' copies in host memory: both ranks hold theirs there
+    w |= @as(u64, @intFromBool(park_on)) << 23; // idle kept states park in host memory: both ranks, or neither
     return w;
 }
 
@@ -950,7 +1029,9 @@ test "mode word: each flag sits at the bit both ranks agree on" {
     const saved_wave = k1mod.wave;
     const saved_fmt = fmt_mlx;
     const saved_kh = kept_host;
+    const saved_park = park_on;
     defer {
+        park_on = saved_park;
         kept_host = saved_kh;
         fmt_mlx = saved_fmt;
         kv_pool = saved_pool;
@@ -974,9 +1055,14 @@ test "mode word: each flag sits at the bit both ranks agree on" {
     k1mod.wave = 4;
     fmt_mlx = false;
     kept_host = false;
+    park_on = false;
     try std.testing.expectEqual(@as(u64, 1) << 6 | @as(u64, 4) << 7, modeWord());
     kept_host = true; // XPU_KEPT_HOST on one rank only: the words differ
     try std.testing.expectEqual(@as(u64, 1) << 6 | @as(u64, 4) << 7 | @as(u64, 1) << 13, modeWord());
+    kept_host = false;
+    park_on = true; // XPU_PARK_GIB on one rank only: the words differ
+    try std.testing.expectEqual(@as(u64, 1) << 6 | @as(u64, 4) << 7 | @as(u64, 1) << 23, modeWord());
+    park_on = false;
     kept_host = false;
     fmt_mlx = true; // the format bit: a pair of an EXL3 rank and an MLX rank differs
     try std.testing.expectEqual(@as(u64, 1) << 6 | @as(u64, 4) << 7 | @as(u64, 1) << 12, modeWord());

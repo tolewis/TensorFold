@@ -1,15 +1,23 @@
 //! A slot's states: allocation on first use, and the prompt cache's snapshots (save, restore, drop).
 //! With the shared K/V pool (XPU_KV_POOL) a snapshot keeps the slot's pages (their ids, one reference each) and copies
 //! only the GDN and convolution states; a restore maps the pages back, so a resume costs a page-table copy.
+//! A parked snapshot (XPU_PARK_GIB) holds no pool page. It holds one host buffer of the K and V pages of positions
+//! 0 to `at`, and the same GDN copy.
+const std = @import("std");
 const q = @import("qwen27.zig");
 const tp = @import("tp.zig");
 const dev = @import("dev.zig");
 const fwd = @import("forward.zig");
+const pages_mod = @import("pages.zig");
+const park_runs = @import("park_runs.zig");
 const Runner = q.Runner;
 const copy = dev.copy;
 const kvBytes = fwd.kvBytes;
 const off = dev.off;
 const alloc = q.alloc;
+
+extern "c" fn aligned_alloc(alignment: usize, size: usize) ?*anyopaque;
+extern "c" fn free(p: ?*anyopaque) void;
 
 /// Bytes of the GDN and convolution states a slot takes whatever its context: each GDN layer's states and convolution.
 pub fn gdnBytes(r: *const Runner) usize {
@@ -33,7 +41,17 @@ pub fn slotBytes(r: *const Runner) usize {
 
 /// A slot's state after `at` prompt tokens (prompt cache): GDN and convolution states, K/V rows 0 .. at, one buffer.
 /// With the pool: the GDN and convolution states only, and `pages`, the slot's page ids from entry 0 to ceil(at / PAGE).
-pub const Snap = struct { at: u32, buf: *anyopaque, bytes: usize, pages: []u32 = &.{} };
+/// Parked: `pages` is empty. `park` holds the K and V of positions 0 .. at, in position order, one host buffer.
+/// The GDN copy stays in `buf`.
+pub const Snap = struct {
+    at: u32,
+    buf: *anyopaque,
+    bytes: usize,
+    pages: []u32 = &.{},
+    park: ?*anyopaque = null,
+    park_bytes: usize = 0,
+    park_pinned: bool = false,
+};
 
 pub const REC_BYTES = q.GDN_V_HEADS * 128 * 128 * 4;
 pub const CONV_BYTES = 3 * q.GDN_QKV * 2;
@@ -125,14 +143,68 @@ fn copyGdnIn(d: *dev.Dev, r: *Runner, snap: *anyopaque) !void {
     }
 }
 
+/// Copies `snap`'s K and V pages to one host buffer and drops its pool pages. The GDN copy stays in `snap.buf`.
+/// On any error the snap is unchanged. Rank 0 records `park_snap` only after the copy has landed, so rank 1
+/// parks its own half of a snap that rank 0 did park. The id is `snap.buf`, as `drop_snap`.
+pub fn parkSnap(r: *Runner, snap: *Snap) !void {
+    if (snap.park != null) return;
+    if (!q.kv_pool or r.page_bytes == 0 or snap.at % q.PAGE != 0) return error.NotParkable;
+    const entries: usize = snap.pages.len;
+    const expect: usize = (snap.at + q.PAGE - 1) / q.PAGE;
+    if (entries == 0 or entries != expect) return error.NotParkable;
+    var layers: usize = 0;
+    for (r.model.layers) |l| layers += @intFromBool(l.attn);
+    const bytes = layers * 2 * entries * r.page_bytes;
+    const d = &r.d;
+    const host = try parkAlloc(d, bytes);
+    var own = true;
+    errdefer if (own) {
+        d.sync() catch {};
+        parkFree(d, host.ptr, host.pinned);
+    };
+    const t0 = q.now();
+    try copyKv(r, host.ptr, snap.pages, host.pinned, .to_host);
+    try d.sync(); // a page may be reused only after this
+    const ms = (q.now() - t0) * 1e3;
+    if (tp.group) |*g| try g.record(.park_snap, 0, 0, @intFromPtr(snap.buf), &.{});
+    snap.park = host.ptr;
+    snap.park_bytes = bytes;
+    snap.park_pinned = host.pinned;
+    own = false;
+    for (snap.pages) |id| unkeepPage(r, id);
+    alloc.free(snap.pages);
+    snap.pages = &.{};
+    r.park_moved = bytes;
+    r.park_ms = ms;
+    if (q.park_log) std.log.info("qwen27-xpu: park copy {d} tokens, {d:.1} MiB, {d:.1} ms", .{ snap.at, @as(f64, @floatFromInt(bytes)) / (1 << 20), ms });
+}
+
 /// Makes `slot` stand where `snap` was taken (its prompt pass goes on from snap.at).
+/// A parked snap stays parked. Rank 0 makes room for the new pages before it records `restore_slot`.
 pub fn restoreSlot(r: *Runner, slot: u32, snap: Snap) !void {
+    if (snap.park != null) r.makeRoomParked(slot, snap.at);
     if (tp.group) |*g| try g.record(.restore_slot, slot, 0, @intFromPtr(snap.buf), &.{});
     try r.select(slot);
     const d = &r.d;
     const at = snap.at;
     if (q.kv_pool) {
         r.releaseSlot(slot); // the slot's own pages go back; the kept state's stay
+        if (snap.park) |host| {
+            const entries: u32 = (at + q.PAGE - 1) / q.PAGE;
+            try r.mapNewPages(slot, entries);
+            const t0 = q.now();
+            try copyKv(r, host, r.pt_host[slot][0..entries], snap.park_pinned, .to_card);
+            try copyGdnIn(d, r, snap.buf);
+            r.pos = at;
+            r.block_rows = 0;
+            r.tree_on = false;
+            try d.sync();
+            const ms = (q.now() - t0) * 1e3;
+            r.park_moved = snap.park_bytes;
+            r.park_ms = ms;
+            if (q.park_log) std.log.info("qwen27-xpu: restore copy {d} tokens, {d:.1} MiB, {d:.1} ms", .{ at, @as(f64, @floatFromInt(snap.park_bytes)) / (1 << 20), ms });
+            return;
+        }
         try r.mapPages(slot, 0, snap.pages);
         try copyGdnIn(d, r, snap.buf);
         r.pos = at;
@@ -172,6 +244,89 @@ pub fn dropSnap(r: *Runner, snap: Snap) void {
         if (snap.pages.len > 0) alloc.free(snap.pages);
     }
     freeAfterQueue(&r.d, snap.buf);
+    if (snap.park) |p| {
+        r.d.sync() catch {};
+        parkFree(&r.d, p, snap.park_pinned);
+    }
+}
+
+const Way = enum { to_host, to_card };
+const park_align: usize = 4096;
+
+fn parkAlloc(d: *dev.Dev, bytes: usize) !struct { ptr: *anyopaque, pinned: bool } {
+    if (q.park_pinned) return .{ .ptr = try d.hostAlloc(bytes), .pinned = true };
+    const n = (bytes + park_align - 1) & ~(park_align - 1);
+    const p = aligned_alloc(park_align, n) orelse return error.OutOfMemory;
+    return .{ .ptr = p, .pinned = false };
+}
+
+fn parkFree(d: *dev.Dev, ptr: *anyopaque, pinned: bool) void {
+    if (pinned) d.g.free(ptr) else free(ptr);
+}
+
+/// `unkeep` once p56 lands. Until then a release is the same reference.
+fn unkeepPage(r: *Runner, id: u32) void {
+    if (comptime @hasDecl(pages_mod.Pages, "unkeep")) {
+        r.pages.unkeep(id);
+    } else r.pages.release(id);
+}
+
+fn copyKv(r: *Runner, host: *anyopaque, ids: []const u32, pinned: bool, way: Way) !void {
+    const d = &r.d;
+    const pb = r.page_bytes;
+    const entries = ids.len;
+    if (entries == 0 or pb == 0) return;
+    const runs = try alloc.alloc(park_runs.Run, entries);
+    defer alloc.free(runs);
+    const nruns = park_runs.pageRuns(ids, runs);
+    var layer: usize = 0;
+    for (&r.model.layers) |*l| {
+        if (!l.attn) continue;
+        const kc = l.kc orelse return error.NotParkable;
+        const vc = l.vc orelse return error.NotParkable;
+        for (runs[0..nruns]) |run| {
+            const nbytes = @as(usize, run.len) * pb;
+            const id0 = ids[@as(usize, run.at)];
+            const dev_k = off(kc, @as(usize, id0) * pb);
+            const dev_v = off(vc, @as(usize, id0) * pb);
+            const host_k = off(host, (layer * 2) * entries * pb + @as(usize, run.at) * pb);
+            const host_v = off(host, (layer * 2 + 1) * entries * pb + @as(usize, run.at) * pb);
+            if (way == .to_host) {
+                try copySpan(d, host_k, dev_k, nbytes, pinned, true);
+                try copySpan(d, host_v, dev_v, nbytes, pinned, true);
+            } else {
+                try copySpan(d, dev_k, host_k, nbytes, pinned, false);
+                try copySpan(d, dev_v, host_v, nbytes, pinned, false);
+            }
+        }
+        layer += 1;
+    }
+}
+
+fn copySpan(d: *dev.Dev, dst: *anyopaque, src: *anyopaque, n: usize, pinned: bool, src_is_card: bool) !void {
+    if (n == 0) return;
+    if (pinned) {
+        try copy(d, dst, src, n);
+        return;
+    }
+    if (d.staging.len == 0) d.staging = @as([*]u8, @ptrCast(try d.g.hostAlloc(256 << 20)))[0 .. 256 << 20];
+    var done: usize = 0;
+    while (done < n) {
+        const c = @min(d.staging.len, n - done);
+        const stage: *anyopaque = @ptrCast(d.staging.ptr);
+        if (src_is_card) {
+            try copy(d, stage, off(src, done), c);
+            try d.sync();
+            const dst_bytes: [*]u8 = @ptrCast(off(dst, done));
+            @memcpy(dst_bytes[0..c], d.staging[0..c]);
+        } else {
+            const src_bytes: [*]const u8 = @ptrCast(off(src, done));
+            @memcpy(d.staging[0..c], src_bytes[0..c]);
+            try copy(d, off(dst, done), stage, c);
+            try d.sync();
+        }
+        done += c;
+    }
 }
 
 /// Frees `p` once the queue has drained; kept (until the device closes) when the queue cannot be waited for.

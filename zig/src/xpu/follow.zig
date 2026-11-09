@@ -78,6 +78,10 @@ pub fn run(r: *q.Runner) !void {
                 if (snaps.getEntry(id)) |_| break :blk error.DuplicateSnap; // the buffer address is reused only after a drop; a save before it is a divergence
                 break :blk snaps.put(alloc, id, s);
             },
+            .park_snap => blk: {
+                const e = snaps.getEntry(id) orelse break :blk error.NoSuchSnap;
+                break :blk slot_states.parkSnap(r, e.value_ptr); // this rank's half; the id is rank 0's buffer, as drop_snap
+            },
             .restore_slot => if (snaps.get(id)) |s| slot_states.restoreSlot(r, rec.a, s) else error.NoSuchSnap,
             .drop_snap => if (snaps.fetchRemove(id)) |kv| slot_states.dropSnap(r, kv.value) else error.NoSuchSnap, // an unknown id is a lost or reordered drop: exit before the pools drift
             .ensure => slot_states.ensure(r, rec.a),

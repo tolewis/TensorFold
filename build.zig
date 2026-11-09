@@ -120,6 +120,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/limits.zig"), .target = target }) })).step);
     // the K/V pool's page references: which pages a slot or a kept prompt state holds
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/pages.zig"), .target = target }) })).step);
+    // consecutive K/V page ids join into one host copy (park tier)
+    const park_runs_run = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/park_runs.zig"), .target = target }) }));
+    test_step.dependOn(&park_runs_run.step);
+    b.step("test-park-runs", "consecutive K/V page ids join into one copy").dependOn(&park_runs_run.step);
     // the prompt cache's keep-one rule, its own step: a later turn's state takes its own older one's storage
     const keepone_step = b.step("test-prompt-cache-keepone", "the prompt cache keep-one rule: a later turn's state takes its own older one's storage");
     keepOneCheck(b, target, keepone_step);
