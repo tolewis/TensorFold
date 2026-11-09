@@ -825,22 +825,22 @@ pub const Runner = struct {
     }
 
     /// Keeps the first `keep` rows of the last verified block: GDN and convolution states replay those rows from entry.
-    pub fn commit(r: *Runner, keep: u32) !void {
-        if (tp.group) |*g| try g.record(.commit, keep, 0, 0, &.{});
-        if (keep == 0 or keep > r.block_rows or r.tree_on) return error.BadCommit;
+    pub fn commit(r: *Runner, rows: u32) !void {
+        if (tp.group) |*g| try g.record(.commit, rows, 0, 0, &.{});
+        if (rows == 0 or rows > r.block_rows or r.tree_on) return error.BadCommit;
         const nul: ?*anyopaque = null;
         for (&r.model.layers) |*l| if (!l.attn) {
-            if (keep == r.block_rows) { // every row kept: the block's final state is the state
+            if (rows == r.block_rows) { // every row kept: the block's final state is the state
                 std.mem.swap(?*anyopaque, &l.rec, &l.rec_save);
                 continue;
             }
             const st = l.stash.?;
-            try r.d.launch(r.d.k.gdn_step, .{ .x = 16, .y = GDN_V_HEADS }, .{ off(st, ST_Q), off(st, ST_K), off(st, ST_V), off(st, ST_G), off(st, ST_B), l.rec.?, l.rec.?, r.acts.y, @as(i32, @intCast(keep)), nul, nul, nul, nul });
+            try r.d.launch(r.d.k.gdn_step, .{ .x = 16, .y = GDN_V_HEADS }, .{ off(st, ST_Q), off(st, ST_K), off(st, ST_V), off(st, ST_G), off(st, ST_B), l.rec.?, l.rec.?, r.acts.y, @as(i32, @intCast(rows)), nul, nul, nul, nul });
             // the block's forward flipped conv_cur: conv[cur] is the state after all rows, conv[1 - cur] the entry
-            try r.d.launch(r.d.k.conv_commit, .{ .x = GDN_QKV / 256 }, .{ l.conv[1 - l.conv_cur].?, off(st, ST_P), l.conv[l.conv_cur].?, @as(i32, @intCast(keep)), nul });
+            try r.d.launch(r.d.k.conv_commit, .{ .x = GDN_QKV / 256 }, .{ l.conv[1 - l.conv_cur].?, off(st, ST_P), l.conv[l.conv_cur].?, @as(i32, @intCast(rows)), nul });
         };
-        r.pos += keep;
-        r.last = r.block[keep - 1];
+        r.pos += rows;
+        r.last = r.block[rows - 1];
         r.block_rows = 0; // no wait: the next commands queue behind these on the in-order list
     }
 
@@ -903,17 +903,17 @@ pub const Runner = struct {
             r.path_host[dd] = @intCast(row);
             straight = straight and row == dd;
         }
-        const keep: i32 = @intCast(path.len);
+        const rows: i32 = @intCast(path.len);
         try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, r.acts.path, &r.path_host, path.len * 4, null, 0, null));
         const nul: ?*anyopaque = null;
         for (&r.model.layers) |*l| {
             if (l.attn) {
-                if (!straight) try r.d.launch(r.d.k.kv_move, .{ .x = ATT_KV_HEADS }, .{ l.kc.?, l.vc.?, @as(i32, @intCast(r.pos)), r.acts.path, keep, kvCap(), r.pt[r.slot] });
+                if (!straight) try r.d.launch(r.d.k.kv_move, .{ .x = ATT_KV_HEADS }, .{ l.kc.?, l.vc.?, @as(i32, @intCast(r.pos)), r.acts.path, rows, kvCap(), r.pt[r.slot] });
                 continue;
             }
             const st = l.stash.?;
-            try r.d.launch(r.d.k.gdn_step, .{ .x = 16, .y = GDN_V_HEADS }, .{ off(st, ST_Q), off(st, ST_K), off(st, ST_V), off(st, ST_G), off(st, ST_B), l.rec.?, l.rec.?, r.acts.y, keep, r.acts.path, nul, nul, nul });
-            try r.d.launch(r.d.k.conv_commit, .{ .x = GDN_QKV / 256 }, .{ l.conv[1 - l.conv_cur].?, off(st, ST_P), l.conv[l.conv_cur].?, keep, r.acts.path });
+            try r.d.launch(r.d.k.gdn_step, .{ .x = 16, .y = GDN_V_HEADS }, .{ off(st, ST_Q), off(st, ST_K), off(st, ST_V), off(st, ST_G), off(st, ST_B), l.rec.?, l.rec.?, r.acts.y, rows, r.acts.path, nul, nul, nul });
+            try r.d.launch(r.d.k.conv_commit, .{ .x = GDN_QKV / 256 }, .{ l.conv[1 - l.conv_cur].?, off(st, ST_P), l.conv[l.conv_cur].?, rows, r.acts.path });
         }
         if (r.taps_on and !straight) for (path, 0..) |row, dd| if (row != dd)
             try copy(&r.d, off(r.acts.taps, dd * 5 * D * 2), off(r.acts.taps, row * 5 * D * 2), 5 * D * 2);
