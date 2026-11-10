@@ -515,5 +515,155 @@ KERNEL(256) void gated_norm(global const ushort *Y, global const half *P, global
   out_rows(hl, Q27_VD, H, t, rot, gs, A8, SA, MS, AHI, ALO);
 }
 
+// ---- Lane p4-k-norm (XPU_NORM_SHADOW, default off): timing probes of add_rmsnorm_dec. They never feed the model.
+// Each probe has one more argument than add_rmsnorm_dec: XO, the buffer that takes the X write. A shadow launch
+// gives scratch buffers for XO, H, AHI and ALO, so it reads what the real launch reads and changes nothing.
+//
+// NORM_OLD: the body of add_rmsnorm_dec. Bits of PROBE: 1 the launch alone, 2 stop after the first barrier (the
+// loads, the add, the X write and the sum), 4 no row sums (stop before the second barrier).
+#define NORM_OLD(name, PROBE)                                                                                \
+  KERNEL(512) void name(global const float *X, global const half *R, global const ushort *WN, global half *H, \
+                        global half *AHI, global half *ALO, int D, float eps, int has_r, int gs,             \
+                        global char *A8, global float *SA, int MS, int rot, global float *XO) {              \
+    local float red[32];                                                                                     \
+    local half hl[Q27_D];                                                                                    \
+    const int t = get_group_id(0), lid = get_local_id(0);                                                    \
+    if ((PROBE) & 1) {                                                                                       \
+      if (lid == 0) AHI[t] = (half)0.0f;                                                                     \
+      return;                                                                                                \
+    }                                                                                                        \
+    float xv[Q27_D512], ss = 0.0f;                                                                           \
+    for (int i = 0; i < Q27_D512; i++) {                                                                     \
+      const int e = lid + i * 512;                                                                           \
+      float x = e < D ? X[(long)t * D + e] : 0.0f;                                                           \
+      if (has_r && e < D) {                                                                                  \
+        x = rbf(x + (float)R[(long)t * D + e]);                                                              \
+        XO[(long)t * D + e] = x;                                                                             \
+      }                                                                                                      \
+      xv[i] = x;                                                                                             \
+      ss += x * x;                                                                                           \
+    }                                                                                                        \
+    const float s = sub_group_reduce_add(ss);                                                                \
+    if (get_sub_group_local_id() == 0) red[get_sub_group_id()] = s;                                          \
+    barrier(CLK_LOCAL_MEM_FENCE);                                                                            \
+    float tot = 0.0f;                                                                                        \
+    for (int i = 0; i < 32; i++) tot += red[i];                                                              \
+    if ((PROBE) & 2) {                                                                                       \
+      if (lid == 0) AHI[t] = convert_half_rte(tot);                                                          \
+      return;                                                                                                \
+    }                                                                                                        \
+    const float inv = rsqrt(tot / D + eps);                                                                  \
+    for (int i = 0; i < Q27_D512; i++) {                                                                     \
+      const int e = lid + i * 512;                                                                           \
+      if (e >= D) continue;                                                                                  \
+      const half v = convert_half_rte(rbf(xv[i] * inv * bf2f(WN[e])));                                       \
+      if (!rot) H[(long)t * D + e] = v;                                                                      \
+      hl[e] = v;                                                                                             \
+    }                                                                                                        \
+    if ((PROBE) & 4) return;                                                                                 \
+    barrier(CLK_LOCAL_MEM_FENCE);                                                                            \
+    out_rows(hl, D, H, t, rot, gs, A8, SA, MS, AHI, ALO);                                                    \
+  }
+NORM_OLD(norm_ref, 0)
+NORM_OLD(norm_n0, 1)
+NORM_OLD(norm_nb, 2)
+NORM_OLD(norm_nt, 4)
+
+// Block loads of VW columns (a column is 16 consecutive elements, one a lane) into an array of VW values a lane.
+#define NORM_RD_F_8(a, p) do { const float8 v_ = as_float8(intel_sub_group_block_read8((global const uint *)(p))); for (int j_ = 0; j_ < 8; j_++) (a)[j_] = v_[j_]; } while (0)
+#define NORM_RD_F_4(a, p) do { const float4 v_ = as_float4(intel_sub_group_block_read4((global const uint *)(p))); for (int j_ = 0; j_ < 4; j_++) (a)[j_] = v_[j_]; } while (0)
+#define NORM_RD_F_2(a, p) do { const float2 v_ = as_float2(intel_sub_group_block_read2((global const uint *)(p))); for (int j_ = 0; j_ < 2; j_++) (a)[j_] = v_[j_]; } while (0)
+#define NORM_RD_F_1(a, p) do { (a)[0] = as_float(intel_sub_group_block_read((global const uint *)(p))); } while (0)
+#define NORM_RD_U_8(a, p) do { const ushort8 v_ = intel_sub_group_block_read_us8((global const ushort *)(p)); for (int j_ = 0; j_ < 8; j_++) (a)[j_] = v_[j_]; } while (0)
+#define NORM_RD_U_4(a, p) do { const ushort4 v_ = intel_sub_group_block_read_us4((global const ushort *)(p)); for (int j_ = 0; j_ < 4; j_++) (a)[j_] = v_[j_]; } while (0)
+#define NORM_RD_U_2(a, p) do { const ushort2 v_ = intel_sub_group_block_read_us2((global const ushort *)(p)); for (int j_ = 0; j_ < 2; j_++) (a)[j_] = v_[j_]; } while (0)
+#define NORM_RD_U_1(a, p) do { (a)[0] = intel_sub_group_block_read_us((global const ushort *)(p)); } while (0)
+#define NORM_WR_F_8(p, a) intel_sub_group_block_write8((global uint *)(p), as_uint8((float8)((a)[0], (a)[1], (a)[2], (a)[3], (a)[4], (a)[5], (a)[6], (a)[7])))
+#define NORM_WR_F_4(p, a) intel_sub_group_block_write4((global uint *)(p), as_uint4((float4)((a)[0], (a)[1], (a)[2], (a)[3])))
+#define NORM_WR_F_2(p, a) intel_sub_group_block_write2((global uint *)(p), as_uint2((float2)((a)[0], (a)[1])))
+#define NORM_WR_F_1(p, a) intel_sub_group_block_write((global uint *)(p), as_uint((a)[0]))
+#define NORM_WR_U_8(p, a) intel_sub_group_block_write_us8((global ushort *)(p), (ushort8)((a)[0], (a)[1], (a)[2], (a)[3], (a)[4], (a)[5], (a)[6], (a)[7]))
+#define NORM_WR_U_4(p, a) intel_sub_group_block_write_us4((global ushort *)(p), (ushort4)((a)[0], (a)[1], (a)[2], (a)[3]))
+#define NORM_WR_U_2(p, a) intel_sub_group_block_write_us2((global ushort *)(p), (ushort2)((a)[0], (a)[1]))
+#define NORM_WR_U_1(p, a) intel_sub_group_block_write_us((global ushort *)(p), (a)[0])
+
+// NORM_NEW: add_rmsnorm_dec with block loads and S sub-groups a row (S x VW = 32). Sub-group sg holds the columns
+// sg VW to sg VW + VW - 1 of each chunk of 512. Its value j of lane l is the value of work-item (sg VW + j) 16 + l
+// of add_rmsnorm_dec, and each sum runs in the same order: the sum of squares a column over the chunks, the
+// reduction over the 16 lanes of a column, the 32 column sums in order. The tail is the same code.
+// REREAD 1: the second loop reads X again in place of VW registers a chunk (for S 4: 80 registers).
+// PROBE bit 1: the launch alone.
+#define NORM_NEW(name, S, VW, REREAD, PROBE)                                                                 \
+  KERNEL((S) * 16) void name(global const float *X, global const half *R, global const ushort *WN,          \
+                             global half *H, global half *AHI, global half *ALO, int D, float eps, int has_r, \
+                             int gs, global char *A8, global float *SA, int MS, int rot, global float *XO) { \
+    local float red[32];                                                                                     \
+    local half hl[Q27_D];                                                                                    \
+    const int t = get_group_id(0), sg = get_sub_group_id(), lane = get_sub_group_local_id();                 \
+    if ((PROBE) & 1) {                                                                                       \
+      if (get_local_id(0) == 0) AHI[t] = (half)0.0f;                                                         \
+      return;                                                                                                \
+    }                                                                                                        \
+    const int c0 = sg * (VW) * 16;                                                                           \
+    float xv[(REREAD) ? 1 : Q27_D512][VW], ss[VW];                                                           \
+    for (int j = 0; j < (VW); j++) ss[j] = 0.0f;                                                             \
+    for (int i = 0; i < Q27_D512; i++) {                                                                     \
+      const long e = (long)t * D + i * 512 + c0;                                                             \
+      float x[VW];                                                                                           \
+      if (i * 512 < D) {                                                                                     \
+        NORM_RD_F_##VW(x, X + e);                                                                            \
+        if (has_r) {                                                                                         \
+          ushort r[VW];                                                                                      \
+          NORM_RD_U_##VW(r, R + e);                                                                          \
+          for (int j = 0; j < (VW); j++) x[j] = rbf(x[j] + (float)as_half(r[j]));                            \
+          NORM_WR_F_##VW(XO + e, x);                                                                         \
+        }                                                                                                    \
+      } else {                                                                                               \
+        for (int j = 0; j < (VW); j++) x[j] = 0.0f;                                                          \
+      }                                                                                                      \
+      for (int j = 0; j < (VW); j++) {                                                                       \
+        if (!(REREAD)) xv[i][j] = x[j];                                                                      \
+        ss[j] += x[j] * x[j];                                                                                \
+      }                                                                                                      \
+    }                                                                                                        \
+    for (int j = 0; j < (VW); j++) {                                                                         \
+      const float s = sub_group_reduce_add(ss[j]);                                                           \
+      if (lane == 0) red[sg * (VW) + j] = s;                                                                 \
+    }                                                                                                        \
+    barrier(CLK_LOCAL_MEM_FENCE);                                                                            \
+    float tot = 0.0f;                                                                                        \
+    for (int i = 0; i < 32; i++) tot += red[i];                                                              \
+    const float inv = rsqrt(tot / D + eps);                                                                  \
+    for (int i = 0; i < Q27_D512; i++) {                                                                     \
+      if (i * 512 >= D) continue;                                                                            \
+      const int e = i * 512 + c0;                                                                            \
+      float x[VW];                                                                                           \
+      if (REREAD) {                                                                                          \
+        if (has_r) NORM_RD_F_##VW(x, XO + (long)t * D + e);                                                  \
+        else NORM_RD_F_##VW(x, X + (long)t * D + e);                                                         \
+      } else {                                                                                               \
+        for (int j = 0; j < (VW); j++) x[j] = xv[i][j];                                                      \
+      }                                                                                                      \
+      ushort w[VW], v[VW];                                                                                   \
+      NORM_RD_U_##VW(w, WN + e);                                                                             \
+      for (int j = 0; j < (VW); j++) {                                                                       \
+        const half h = convert_half_rte(rbf(x[j] * inv * bf2f(w[j])));                                       \
+        hl[e + j * 16 + lane] = h;                                                                           \
+        v[j] = as_ushort(h);                                                                                 \
+      }                                                                                                      \
+      if (!rot) NORM_WR_U_##VW(H + (long)t * D + e, v);                                                      \
+    }                                                                                                        \
+    barrier(CLK_LOCAL_MEM_FENCE);                                                                            \
+    out_rows(hl, D, H, t, rot, gs, A8, SA, MS, AHI, ALO);                                                    \
+  }
+NORM_NEW(norm_b32, 32, 1, 0, 0)
+NORM_NEW(norm_b16, 16, 2, 0, 0)
+NORM_NEW(norm_b8, 8, 4, 0, 0)
+NORM_NEW(norm_b4, 4, 8, 0, 0)
+NORM_NEW(norm_b4r, 4, 8, 1, 0)
+NORM_NEW(norm_b8r, 8, 4, 1, 0)
+NORM_NEW(norm_z4, 4, 8, 0, 1)
+
+
 #include "glue_attn.cl"
 #include "glue_quant.cl"

@@ -64,6 +64,10 @@ pub const Acts = struct {
     spm: ?*anyopaque = null, // XPU_K1_SHADOW: the scratch partials of the shadow launches
     spl: ?*anyopaque = null,
     spo: ?*anyopaque = null,
+    nsx: ?*anyopaque = null, // XPU_NORM_SHADOW: the scratch X, H and row sums of the shadow launches
+    nsh: ?*anyopaque = null,
+    nsa: ?*anyopaque = null,
+    nsl: ?*anyopaque = null,
     pscr: *anyopaque, // fp32 [maxRows, D] (slice totals of the narrow prompt GEMM)
     logits: *anyopaque, // fp16 [16, VOCAB]
     taps: *anyopaque, // bf16 [maxRows, 5 D]: hidden states after TAP_LAYERS, when Mode.taps
@@ -119,6 +123,10 @@ pub const Acts = struct {
             .spm = if (q.k1_shadow[0] != null) try d.alloc_(16 * HQ * ns * 4) else null,
             .spl = if (q.k1_shadow[0] != null) try d.alloc_(16 * HQ * ns * 4) else null,
             .spo = if (q.k1_shadow[0] != null) try d.alloc_(16 * HQ * ns * 256 * 4) else null,
+            .nsx = if (q.norm_shadow[0] != null) try d.alloc_(16 * D * 4) else null,
+            .nsh = if (q.norm_shadow[0] != null) try d.alloc_(16 * D * 2) else null,
+            .nsa = if (q.norm_shadow[0] != null) try d.alloc_(16 * D * 2) else null,
+            .nsl = if (q.norm_shadow[0] != null) try d.alloc_(16 * D * 2) else null,
             .pscr = try d.alloc_(rows * D * 4),
             .logits = try d.alloc_(16 * VOCAB * 2),
             .tok = try d.alloc_(16 * 4),
@@ -373,6 +381,14 @@ pub const Mode = struct { prompt: bool = false, want: Want = .last, stash: bool 
 var grp_host: [32]i32 = undefined;
 
 /// One forward over `ids` (< q.maxRows() rows) at p0..; the last row's greedy token; ≤ 16 non-prompt rows: GDN serial.
+/// XPU_NORM_SHADOW (lane p4-k-norm): the norm probes before an add_rmsnorm_dec launch of T rows (16 or less). A
+/// probe reads the X, R and weight of the launch and writes the scratch buffers of Acts.
+fn normShadows(d: *Dev, a: *Acts, T: u32, wn: *anyopaque, has_r: i32, gs: i32, ms: i32) !void {
+    const xo = a.nsx orelse return;
+    const nul: ?*anyopaque = null;
+    for (q.norm_shadow) |sh| try d.launch(sh orelse break, .{ .x = T }, .{ a.x, a.r, wn, a.nsh.?, a.nsa.?, a.nsl.?, @as(i32, D), EPS, has_r, gs, nul, nul, ms, @as(i32, 0), xo });
+}
+
 pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) !?i32 {
     const want = mode.want != .none;
     if (ids.len > q.maxRows()) return error.TooManyRows; // the scratch holds maxRows, padded to 64
@@ -401,6 +417,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
     if (p0 == 0) try dump(d, a, T, "embed", false);
     for (&m.layers, 0..) |*l, i| {
         q.prof.site = .norm_in; // XPU_PROFILE=2: the call site of the launches up to the next assignment
+        if (!wide) try normShadows(d, a, T, l.in_norm, if (i == 0) 0 else 1, gs, q8ms);
         try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.in_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, if (i == 0) 0 else 1), gs, q8a, q8s, q8ms, q.rot_on });
         q.prof.site = .none;
         const probe = p0 == 0 and i == 0;
@@ -577,6 +594,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
         if (gemm_probe) |f| try f(d, a, l.mixer_out, a.h, T, i, 1);
         if (probe) try dumpBuf(d, "r0", a.r, T * D, .f16);
         q.prof.site = .norm_post;
+        if (!fused and !wide) try normShadows(d, a, T, l.post_norm, 1, gs, q8ms);
         if (!fused) try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs, q8a, q8s, q8ms, q.rot_on });
         q.prof.site = .none;
         try a8(d, a, a.h, D, T, 4);
@@ -598,6 +616,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
         return null;
     }
     const hgs: i32 = @intCast(m.head.gs);
+    if (!wide) try normShadows(d, a, T, m.norm, 1, hgs, 0);
     try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, m.norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), hgs, no_q8, no_q8, @as(i32, 0), @as(i32, 0) });
     if (q.dump_h) |fd| { // XPU_DUMP_H: every row's final normed hidden state, appended
         const host = try alloc.alloc(u16, T * D);
