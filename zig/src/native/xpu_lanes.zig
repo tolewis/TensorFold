@@ -329,10 +329,9 @@ pub const Lanes = struct {
         const k: *const Kept = @ptrCast(@alignCast(saved));
         if (k.snap.park != null) return 0;
         if (k.snap.at < xq.park_min or k.snap.at % xq.PAGE != 0) return 0;
-        const kv: u64 = @as(u64, k.snap.at) * @as(u64, b.runner.kvBytesPerToken());
         const gdn: u64 = @intCast(xq.keptGdnBytes(b.runner));
         const ctx: u64 = if (k.ctx != null) Drafter.ctxBytes() else 0;
-        return park_tier.parkTierCharge(kv, gdn, ctx, xq.TP);
+        return park_tier.parkTierCharge(@as(u64, k.snap.at), @intCast(b.runner.kvBytesPerToken()), gdn, ctx, xq.TP);
     }
 
     /// Bytes the kept states hold together: each page with a kept-state reference, once.
