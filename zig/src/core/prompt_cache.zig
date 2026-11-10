@@ -16,6 +16,9 @@ pub const Saved = *anyopaque;
 pub const singleReclaim = imprint.singleReclaim; // the learned-state file helpers, beside the Imprint that owns them
 pub const singleForgetChecked = imprint.singleForgetChecked;
 
+/// Pages a sharing family prints after the status line: pages kept states hold, the pool, and pages free.
+pub const PageNote = struct { held: u32 = 0, pool: u32 = 0, free: u32 = 0 };
+
 /// What a family gives the cache: copies of its state while the prompt pass stands at a chunk end.
 pub const Snapshots = struct {
     ptr: *anyopaque,
@@ -42,6 +45,18 @@ pub const Snapshots = struct {
         held: ?*const fn (ptr: *anyopaque) u64 = null,
         /// The storage a save at `at` for `owner` adds to what the kept states hold now (with `held`; null: `bytes`).
         adds: ?*const fn (ptr: *anyopaque, owner: ?*anyopaque, at: u32) u64 = null,
+        /// Bytes `held` falls by when this state is dropped. Null: the state's charge. A state that frees nothing stays when bytes are short.
+        frees: ?*const fn (ptr: *anyopaque, saved: Saved) u64 = null,
+        /// Bytes a drop gives back to the streams. Null: the state's charge. `evictOne` skips a state that returns nothing.
+        returns: ?*const fn (ptr: *anyopaque, saved: Saved) u64 = null,
+        /// Host bytes a park of `saved` takes, summed over the ranks. Null: no tier. Zero: this state cannot park.
+        park_bytes: ?*const fn (ptr: *anyopaque, saved: Saved) u64 = null,
+        /// Move `saved` into the host tier. Returns the copy's milliseconds. Null: no tier.
+        park: ?*const fn (ptr: *anyopaque, saved: Saved) anyerror!f64 = null,
+        /// Milliseconds of the last park copy or parked restore. Null: the resume line prints 0.
+        copy_ms: ?*const fn (ptr: *anyopaque) f64 = null,
+        /// Pages for the status line (null: the line is unchanged).
+        pages: ?*const fn (ptr: *anyopaque) PageNote = null,
         /// Write `saved` as learned state `key`, in files of the family's own under `dir` (null: nothing kept on disk).
         write: ?*const fn (ptr: *anyopaque, saved: Saved, dir: [:0]const u8, key: u64) anyerror!void = null,
         /// Learned state `key` of `at` tokens, read back from its files under `dir` into new storage.
@@ -120,9 +135,33 @@ pub const Entry = struct {
     branched: bool = false, // resumed again after a later prompt kept a longer state extending it: never superseded
     expired: bool = false, // hidden from lookups immediately, reclaimed only at safe host boundaries
     borrowers: u32 = 0, // outstanding lookups: released by resumed or release, never evicted while borrowed
+    parked: bool = false, // K and V are in the host tier: no pool page, and it does not count against most
+    tier_bytes: u64 = 0, // host bytes this parked state holds, summed over the ranks
 };
 
-pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0 };
+pub const Counts = struct {
+    hits: u64 = 0,
+    misses: u64 = 0,
+    kept: u64 = 0,
+    evicted: u64 = 0,
+    refused: u64 = 0,
+    failed: u64 = 0,
+    /// Evictions by why: the byte budget, the state count, a stream that needed a page, a superseded state.
+    evict_budget: u64 = 0,
+    evict_count: u64 = 0,
+    evict_stream: u64 = 0,
+    evict_superseded: u64 = 0,
+    parks: u64 = 0,
+    park_resumes: u64 = 0,
+    park_drops: u64 = 0,
+};
+
+const EvictWhy = enum { budget, count, stream, superseded };
+
+fn whyOf(reason: []const u8, bytes_short: bool) EvictWhy {
+    if (std.mem.indexOf(u8, reason, "superseded") != null) return .superseded;
+    return if (bytes_short) .budget else .count;
+}
 
 pub const RestoreDetails = @import("prompt_cache_restore.zig").Details;
 pub const RestoreLog = @import("prompt_cache_restore.zig").Log;
@@ -147,7 +186,11 @@ pub const Store = struct {
     family: Snapshots,
     rules: Rules,
     budget: u64,
-    most: usize = std.math.maxInt(usize), // states kept at most: a family's snapshot slots, one a state
+    most: usize = std.math.maxInt(usize), // states kept at most: a family's snapshot slots, one a state. A parked state does not count.
+    tier: u64 = 0, // host bytes for parked states, the total over the ranks (0: the tier is off)
+    tier_used: u64 = 0,
+    park_min: u32 = 0, // a shorter state is dropped, not parked
+    rank: u32 = 0, // the rank the park log lines name
     held: u64 = 0,
     forced: u64 = 0, // states a live stream's page need took (XPU_KEEP_SHARED), beside the budget's own evictions
     clock: u64 = 0,
@@ -181,11 +224,25 @@ pub const Store = struct {
     }
 
     /// Drops the least recently used kept state a stream's page need makes room with (never a borrowed one, and the
-    /// rewind state last); false when no state is left to drop. The family's drop returns the state's pages.
+    /// rewind state last); false when no state is left to drop. With `returns`, a state that gives no page back stays,
+    /// and false means none of them does. The family's drop returns the state's pages.
     pub fn evictOne(s: *Store) bool {
-        const i = s.victimBut(null, &.{}, 0) orelse return false;
-        s.remove(i);
-        s.counts.evicted += 1;
+        const i = if (s.family.vtable.held != null and s.family.vtable.returns != null)
+            policy.victimButIf(s, null, &.{}, 0, .returns)
+        else
+            s.victimBut(null, &.{}, 0);
+        const at_ = i orelse return false;
+        if (!policy.extended(s, s.entries.items[at_]) and s.tryPark(at_, "least recently used")) {
+            s.forced += 1;
+            return true;
+        }
+        const leaving = s.entries.items[at_];
+        if (leaving.parked) {
+            s.counts.park_drops += 1;
+            s.logParkDrop(leaving.at, leaving.tier_bytes, "superseded by a kept state");
+        }
+        s.remove(at_);
+        s.noteEvict(.stream);
         s.forced += 1;
         return true;
     }
@@ -193,6 +250,7 @@ pub const Store = struct {
     pub fn remove(s: *Store, i: usize) void {
         std.debug.assert(s.entries.items[i].borrowers == 0);
         const e = s.entries.orderedRemove(i);
+        if (e.parked) s.tier_used -= e.tier_bytes;
         s.held -= e.bytes;
         s.free(e);
     }
@@ -228,6 +286,117 @@ pub const Store = struct {
         return if (s.family.vtable.held) |f| f(s.family.ptr) else s.held;
     }
 
+    fn noteEvict(s: *Store, why: EvictWhy) void {
+        s.counts.evicted += 1;
+        switch (why) {
+            .budget => s.counts.evict_budget += 1,
+            .count => s.counts.evict_count += 1,
+            .stream => s.counts.evict_stream += 1,
+            .superseded => s.counts.evict_superseded += 1,
+        }
+    }
+
+    /// Bytes the log names for a drop: what `held` falls by when the family counts shared pages, else the state's charge.
+    fn freedOf(s: *const Store, e: *const Entry) u64 {
+        if (s.family.vtable.held != null) if (s.family.vtable.frees) |f| return f(s.family.ptr, e.saved);
+        return e.bytes;
+    }
+
+    fn sharingBytes(s: *const Store) bool {
+        return s.family.vtable.held != null and s.family.vtable.frees != null;
+    }
+
+    /// Today's victim. When shared pages make the bytes short, the first in that order whose `frees` is above 0.
+    fn victimFor(s: *const Store, skip: ?*Entry, prompt: []const u32, born: u32, bytes_short: bool) ?usize {
+        if (bytes_short and s.sharingBytes()) return policy.victimButIf(s, skip, prompt, born, .frees);
+        return policy.victimBut(s, skip, prompt, born);
+    }
+
+    fn tierOn(s: *const Store) bool {
+        return s.tier > 0 and s.family.vtable.park != null and s.family.vtable.park_bytes != null;
+    }
+
+    /// States that count against `most`. A parked state does not. With the tier off this is the list length.
+    pub fn occupancy(s: *const Store) usize {
+        if (!s.tierOn()) return s.entries.items.len;
+        var n: usize = 0;
+        for (s.entries.items) |e| n += @intFromBool(!e.parked);
+        return n;
+    }
+
+    pub fn parkedStates(s: *const Store) usize {
+        var n: usize = 0;
+        for (s.entries.items) |e| n += @intFromBool(e.parked and !e.expired);
+        return n;
+    }
+
+    fn lruParked(s: *const Store) ?usize {
+        var best: ?usize = null;
+        for (s.entries.items, 0..) |e, i| {
+            if (!e.parked or e.expired or e.borrowers != 0) continue;
+            if (best == null or e.used < s.entries.items[best.?].used) best = i;
+        }
+        return best;
+    }
+
+    fn logPark(s: *const Store, at: u32, bytes: u64, ms: f64, reason: []const u8) void {
+        if (@import("builtin").is_test) return;
+        std.log.info("prompt cache: rank {d}: parked a state at {d} tokens ({d} MiB to host, {d:.1} ms): {s}", .{ s.rank, at, bytes >> 20, ms, reason });
+    }
+
+    fn logParkDrop(s: *const Store, at: u32, bytes: u64, reason: []const u8) void {
+        if (@import("builtin").is_test) return;
+        std.log.info("prompt cache: rank {d}: dropped a parked state at {d} tokens ({d} MiB): {s}", .{ s.rank, at, bytes >> 20, reason });
+    }
+
+    fn logParkResume(s: *const Store, at: u32, bytes: u64, ms: f64) void {
+        if (@import("builtin").is_test) return;
+        std.log.info("prompt cache: rank {d}: resumed a parked state at {d} tokens ({d} MiB from host, {d:.1} ms)", .{ s.rank, at, bytes >> 20, ms });
+    }
+
+    /// Drops least recently used parked states until `need` fits. A borrowed parked state stays.
+    fn makeTierRoom(s: *Store, need: u64) bool {
+        while (s.tier_used + need > s.tier) {
+            const i = s.lruParked() orelse return false;
+            const at = s.entries.items[i].at;
+            const bytes = s.entries.items[i].tier_bytes;
+            s.counts.park_drops += 1;
+            s.logParkDrop(at, bytes, "host tier full");
+            s.remove(i);
+        }
+        return true;
+    }
+
+    /// Parks the victim when the tier can take it. The entry stays, and it holds no pool page.
+    fn tryPark(s: *Store, i: usize, reason: []const u8) bool {
+        if (!s.tierOn()) return false;
+        const e = s.entries.items[i];
+        if (e.parked or e.borrowers != 0 or e.at < s.park_min or policy.extended(s, e)) return false;
+        const cost = s.family.vtable.park_bytes.?(s.family.ptr, e.saved);
+        if (cost == 0 or cost > s.tier) return false;
+        if (!s.makeTierRoom(cost)) return false;
+        const ms = s.family.vtable.park.?(s.family.ptr, e.saved) catch return false;
+        e.parked = true;
+        e.tier_bytes = cost;
+        s.tier_used += cost;
+        s.counts.parks += 1;
+        s.logPark(e.at, cost, ms, reason);
+        return true;
+    }
+
+    /// The victim leaves the pool. The tier parks it when it can. A superseded state is dropped.
+    fn depart(s: *Store, i: usize, prompt: []const u32, born: u32, bytes_short: bool) void {
+        const reason = policy.victimReason(s, i, prompt, born);
+        if (std.mem.indexOf(u8, reason, "superseded") == null and s.tryPark(i, reason)) return;
+        const e = s.entries.items[i];
+        if (e.parked) {
+            s.counts.park_drops += 1;
+            s.logParkDrop(e.at, e.tier_bytes, reason);
+        } else evicted(e.at, s.freedOf(e), reason);
+        s.remove(i);
+        s.noteEvict(whyOf(reason, bytes_short));
+    }
+
     /// What the budget leaves past the kept states and the spare storage: a family readies storage only inside it.
     pub fn room(s: *const Store) u64 {
         return s.budget -| s.holding() -| s.spare();
@@ -240,8 +409,9 @@ pub const Store = struct {
             const skip = for (s.entries.items) |e| {
                 if (restoring != null and e.saved == restoring.?) break e;
             } else null;
-            s.remove(s.victimBut(skip, prompt, @intCast(prompt.len)) orelse return false);
-            s.counts.evicted += 1;
+            const born: u32 = @intCast(prompt.len);
+            const i = s.victimBut(skip, prompt, born) orelse return false;
+            s.depart(i, prompt, born, true);
         }
         return true;
     }
@@ -361,16 +531,14 @@ pub const Store = struct {
             new += @intFromBool(!exists);
             prev = @max(prev, at);
         }
-        while (s.holding() + need > s.budget or s.entries.items.len + @min(new, s.most) > s.most) {
+        while (s.holding() + need > s.budget or s.occupancy() + @min(new, s.most) > s.most) {
             // the least recently used one leaves. A mark supersedes the conversation's older state only when the
             // state is kept (keepBorn): a supersede is irreversible, and this pass may cancel before it keeps it.
-            const victim = s.victimBut(from, prompt, born) orelse return;
-            const vat = s.entries.items[victim].at;
-            const vbytes = s.entries.items[victim].bytes;
-            const vreason = policy.victimReason(s, victim, prompt, born);
-            evicted(vat, vbytes, vreason);
-            s.remove(victim); // its storage may come back spare and take this state
-            s.counts.evicted += 1;
+            // When shared pages make the bytes short, a state that frees nothing stays. The count alone keeps today's victim.
+            // With the host tier on, a state that can park does, and a parked state does not count against most.
+            const bytes_short = s.holding() + need > s.budget;
+            const victim = s.victimFor(from, prompt, born, bytes_short) orelse return;
+            s.depart(victim, prompt, born, bytes_short);
         }
     }
 
@@ -425,6 +593,11 @@ pub const Store = struct {
         e.used = s.clock;
         e.branched = e.branched or s.extended(e); // a turn several continuations share (a re-sent, edited or forked one)
         s.counts.hits += 1;
+        if (e.parked) {
+            s.counts.park_resumes += 1;
+            const ms = if (s.family.vtable.copy_ms) |f| f(s.family.ptr) else 0;
+            s.logParkResume(e.at, e.tier_bytes, ms);
+        }
         const last = s.gpa.dupe(u32, prompt) catch return;
         s.gpa.free(e.last);
         e.last = last;
@@ -497,31 +670,36 @@ pub const Store = struct {
             return false;
         }
         while (s.entries.items.len > 0) { // room: spare storage this save can take, else new storage inside the budget
-            if (s.family.vtable.reuses) |f| if (s.entries.items.len < s.most and f(s.family.ptr, at)) break;
+            if (s.family.vtable.reuses) |f| if (s.occupancy() < s.most and f(s.family.ptr, at)) break;
             const free_ = s.spare();
             const adds = if (s.family.vtable.adds) |f| f(s.family.ptr, owner, at) else bytes;
-            if (s.holding() + free_ + adds <= s.budget and s.entries.items.len < s.most) break;
+            const bytes_short = s.holding() + free_ + adds > s.budget;
+            const count_short = s.occupancy() >= s.most;
+            if (!bytes_short and !count_short) break;
             if (free_ > 0) {
                 if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held -| bytes); // spare that cannot take this state goes before any state
                 if (s.spare() < free_) continue;
             }
-            // the conversation's own older state it extends gives its storage before the least recently used one
-            const victim = s.victimBut(null, prompt, born) orelse return s.fail(at, error.CacheBorrowed);
-            const vat = s.entries.items[victim].at;
-            const vbytes = s.entries.items[victim].bytes;
-            const vreason = policy.victimReason(s, victim, prompt, born);
+            // the conversation's own older state it extends gives its storage before the least recently used one.
+            // When shared pages make the bytes short, a state that frees nothing stays. The count alone keeps today's victim.
+            const victim = s.victimFor(null, prompt, born, bytes_short) orelse return s.fail(at, error.CacheBorrowed);
             const superseded = policy.subsumed(s, prompt, born, at);
             if (superseded) |i| {
                 if (i != victim) {
-                    evicted(s.entries.items[i].at, s.entries.items[i].bytes, "superseded by the state this pass keeps");
-                    s.remove(i); // the loop rechecks the budget; the least recently used one leaves only if the room is still short
-                    s.counts.evicted += 1;
-                    continue;
+                    const other = s.entries.items[i];
+                    const stays = !other.parked and bytes_short and s.sharingBytes() and s.family.vtable.frees.?(s.family.ptr, other.saved) == 0;
+                    if (!stays) {
+                        if (other.parked) {
+                            s.counts.park_drops += 1;
+                            s.logParkDrop(other.at, other.tier_bytes, "superseded by the state this pass keeps");
+                        } else evicted(other.at, s.freedOf(other), "superseded by the state this pass keeps");
+                        s.remove(i); // the loop rechecks the budget; the least recently used one leaves only if the room is still short
+                        s.noteEvict(.superseded);
+                        continue;
+                    }
                 }
             }
-            evicted(vat, vbytes, vreason); // the state may be superseded and the victim at once; the reason names it
-            s.remove(victim); // its storage may come back spare and take this state
-            s.counts.evicted += 1;
+            s.depart(victim, prompt, born, bytes_short); // a superseded victim is dropped; another may park
         }
         if (s.entries.items.len == 0) if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| bytes);
         const e = s.gpa.create(Entry) catch return s.fail(at, error.OutOfMemory);
@@ -562,9 +740,10 @@ pub const Store = struct {
         const m = im.best(prompt, starts, s.rules.planned, if (have) |x| x.at else 0) orelse return have;
         if (!modes.equal(&.{}, spans, m.at)) return have; // the request decodes rows the learned prompt pass prefilled
         const bytes = s.family.vtable.bytes(s.family.ptr, m.at);
-        while (bytes <= s.budget and (s.holding() + s.spare() + bytes > s.budget or s.entries.items.len >= s.most)) {
-            s.remove(s.victimBut(have, prompt, born) orelse return have);
-            s.counts.evicted += 1;
+        while (bytes <= s.budget and (s.holding() + s.spare() + bytes > s.budget or s.occupancy() >= s.most)) {
+            const bytes_short = s.holding() + s.spare() + bytes > s.budget;
+            const victim = s.victimFor(have, prompt, born, bytes_short) orelse return have;
+            s.depart(victim, prompt, born, bytes_short);
         }
         if (bytes > s.budget) return have;
         const e = s.gpa.create(Entry) catch return have;
@@ -596,7 +775,16 @@ pub const Store = struct {
     /// One log line after a prompt pass: where it resumed, how many states it kept, and what the store holds.
     pub fn report(s: *const Store, prompt: usize, from: u32, kept: u64) void {
         if (@import("builtin").is_test) return;
-        std.log.info("prompt cache: {d} tokens, resumed at {d}, kept {d}; {d} states, {d} MiB and {d} MiB spare of {d} MiB (hits {d}, misses {d}, evicted {d}, {d} for streams, refused {d}, failed {d})", .{ prompt, from, kept, s.entries.items.len, s.holding() >> 20, s.spare() >> 20, s.budget >> 20, s.counts.hits, s.counts.misses, s.counts.evicted, s.forced, s.counts.refused, s.counts.failed });
+        const line = "prompt cache: {d} tokens, resumed at {d}, kept {d}; {d} states, {d} MiB and {d} MiB spare of {d} MiB (hits {d}, misses {d}, evicted {d}, {d} for streams, refused {d}, failed {d})";
+        const tail = ", parked {d} states, {d} MiB of {d} MiB";
+        if (s.family.vtable.pages) |f| {
+            const n = f(s.family.ptr);
+            if (s.tier > 0) {
+                std.log.info(line ++ ", pages held {d} of {d}, free {d}" ++ tail, .{ prompt, from, kept, s.entries.items.len, s.holding() >> 20, s.spare() >> 20, s.budget >> 20, s.counts.hits, s.counts.misses, s.counts.evicted, s.forced, s.counts.refused, s.counts.failed, n.held, n.pool, n.free, s.parkedStates(), s.tier_used >> 20, s.tier >> 20 });
+            } else std.log.info(line ++ ", pages held {d} of {d}, free {d}", .{ prompt, from, kept, s.entries.items.len, s.holding() >> 20, s.spare() >> 20, s.budget >> 20, s.counts.hits, s.counts.misses, s.counts.evicted, s.forced, s.counts.refused, s.counts.failed, n.held, n.pool, n.free });
+        } else if (s.tier > 0) {
+            std.log.info(line ++ tail, .{ prompt, from, kept, s.entries.items.len, s.holding() >> 20, s.spare() >> 20, s.budget >> 20, s.counts.hits, s.counts.misses, s.counts.evicted, s.forced, s.counts.refused, s.counts.failed, s.parkedStates(), s.tier_used >> 20, s.tier >> 20 });
+        } else std.log.info(line, .{ prompt, from, kept, s.entries.items.len, s.holding() >> 20, s.spare() >> 20, s.budget >> 20, s.counts.hits, s.counts.misses, s.counts.evicted, s.forced, s.counts.refused, s.counts.failed });
     }
 
     fn fail(s: *Store, at: u32, err: anyerror) bool {
@@ -649,6 +837,8 @@ test {
     _ = @import("prompt_cache_give_test.zig");
     _ = @import("prompt_cache_shared_test.zig");
     _ = @import("prompt_cache_lifetime_test.zig");
+    _ = @import("prompt_cache_pages_test.zig");
+    _ = @import("prompt_cache_park_test.zig");
     _ = @import("learned_fault_test.zig");
     _ = modes;
     _ = rows;

@@ -2,19 +2,38 @@
 const std = @import("std");
 const pc = @import("prompt_cache.zig");
 
+/// Which states `victimButIf` may choose. `.any` is today's order. `.frees` and `.returns` skip a state the hook says frees nothing.
+pub const Gate = enum { any, frees, returns };
+
 pub fn victimBut(s: *const pc.Store, skip: ?*pc.Entry, prompt: []const u32, born: u32) ?usize {
+    return victimButIf(s, skip, prompt, born, .any);
+}
+
+/// `victimBut` in the same order, keeping only a state `gate` accepts. The first superseded one that accepts wins, else the oldest that accepts.
+pub fn victimButIf(s: *const pc.Store, skip: ?*pc.Entry, prompt: []const u32, born: u32, gate: Gate) ?usize {
     var best: ?usize = null;
     for (s.entries.items, 0..) |e, i| {
         if (e.borrowers > 0 or e.shared or e.branched or e == skip or isActiveRewind(s, e, prompt)) continue;
+        if (!admits(s, e, gate)) continue;
         const now = born > e.born and prompt.len > e.tokens.len and std.mem.eql(u32, prompt[0..e.tokens.len], e.tokens); // a longer request's tokens extend it
+        if (e.parked and !(now or extended(s, e))) continue; // a parked state is not a victim for room unless a later state extends it
         if ((now or extended(s, e)) and (best == null or e.used < s.entries.items[best.?].used)) best = i;
     }
     if (best) |i| return i;
     var oldest: ?usize = null;
-    for (s.entries.items, 0..) |e, i| if (e.borrowers == 0 and e != skip and (oldest == null or before(s, e, s.entries.items[oldest.?], prompt))) {
-        oldest = i;
-    };
+    for (s.entries.items, 0..) |e, i| {
+        if (e.borrowers > 0 or e.parked or e == skip or !admits(s, e, gate)) continue;
+        if (oldest == null or before(s, e, s.entries.items[oldest.?], prompt)) oldest = i;
+    }
     return oldest;
+}
+
+fn admits(s: *const pc.Store, e: *const pc.Entry, gate: Gate) bool {
+    return switch (gate) {
+        .any => true,
+        .frees => (s.family.vtable.frees orelse return true)(s.family.ptr, e.saved) > 0,
+        .returns => (s.family.vtable.returns orelse return true)(s.family.ptr, e.saved) > 0,
+    };
 }
 
 /// Only live continuations make a prefix a branch point or a superseded state.

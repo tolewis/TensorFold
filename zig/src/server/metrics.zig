@@ -176,6 +176,19 @@ pub const Metrics = struct {
             try gauge(w, "kv_pool_pages_promised", "gauge", "K/V pool pages admitted requests reserved and do not hold yet.", p.promised);
             try gauge(w, "kv_pool_pages_free", "gauge", "K/V pool pages neither held nor reserved: what a new request can get.", p.free);
         }
+        if (status.prompt_cache) |c| {
+            if (c.pages_held) |n| try gauge(w, "prompt_cache_pages_held", "gauge", "K/V pool pages kept prompt states hold, each page once.", n);
+            if (c.pages_free) |n| if (status.kv_pool == null) try gauge(w, "kv_pool_pages_free", "gauge", "K/V pool pages neither held nor reserved: what a new request can get.", n);
+            if (c.evict_budget) |n| try gauge(w, "prompt_cache_evictions_budget_total", "counter", "Kept prompt states evicted because the byte budget was short.", n);
+            if (c.evict_count) |n| try gauge(w, "prompt_cache_evictions_count_total", "counter", "Kept prompt states evicted because the state count was short.", n);
+            if (c.evict_stream) |n| try gauge(w, "prompt_cache_evictions_stream_total", "counter", "Kept prompt states evicted because a stream needed a page.", n);
+            if (c.evict_superseded) |n| try gauge(w, "prompt_cache_evictions_superseded_total", "counter", "Kept prompt states evicted because a later state of the same conversation replaced them.", n);
+            if (c.parked_states) |n| try gauge(w, "prompt_cache_parked_states", "gauge", "Kept prompt states whose K and V sit in host memory.", n);
+            if (c.parked_bytes) |n| try gauge(w, "prompt_cache_parked_bytes", "gauge", "Host bytes the parked states hold, summed over the ranks.", n);
+            if (c.parks) |n| try gauge(w, "prompt_cache_parks_total", "counter", "Kept prompt states parked into host memory.", n);
+            if (c.park_resumes) |n| try gauge(w, "prompt_cache_park_resumes_total", "counter", "Resumes of a parked prompt state.", n);
+            if (c.park_drops) |n| try gauge(w, "prompt_cache_park_drops_total", "counter", "Parked prompt states dropped.", n);
+        }
         try gauge(w, "mtp_drafted_total", "counter", "Draft tokens verified on finished requests.", snap.drafted);
         try gauge(w, "mtp_accepted_total", "counter", "Draft tokens kept on finished requests.", snap.accepted);
         try histogram(w, "request_latency_seconds", "Seconds from arrival to the reply leaving.", snap.latency);
@@ -416,6 +429,59 @@ test "metrics expose cache budget, minimum and inability to retain a state" {
     const info: api.Info = .{ .prompt_cache = true, .prompt_cache_capacity = .{ .budget_bytes = 322122547, .minimum_state_bytes = 384 << 20 } };
     try m.render(std.testing.io, &out.writer, .{}, &.{}, info, null, 262144);
     for ([_][]const u8{ "tensorfold:prompt_cache_budget_bytes 322122547\n", "tensorfold:prompt_cache_minimum_state_bytes 402653184\n", "tensorfold:prompt_cache_can_keep_state 0\n" }) |line| try std.testing.expect(std.mem.indexOf(u8, out.written(), line) != null);
+}
+
+test "keep pages: metrics name the pages held, the free pages and evictions by reason" {
+    var m: Metrics = .{ .gpa = std.testing.allocator };
+    defer m.deinit();
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    const status: api.Status = .{ .prompt_cache = .{
+        .states = 2,
+        .bytes = 10,
+        .pages_held = 14,
+        .pages_free = 3,
+        .evict_budget = 1,
+        .evict_count = 2,
+        .evict_stream = 3,
+        .evict_superseded = 4,
+    } };
+    try m.render(std.testing.io, &out.writer, status, &.{}, .{}, null, 4096);
+    const body = out.written();
+    for ([_][]const u8{
+        "tensorfold:prompt_cache_pages_held 14\n",
+        "tensorfold:kv_pool_pages_free 3\n",
+        "tensorfold:prompt_cache_evictions_budget_total 1\n",
+        "tensorfold:prompt_cache_evictions_count_total 2\n",
+        "tensorfold:prompt_cache_evictions_stream_total 3\n",
+        "tensorfold:prompt_cache_evictions_superseded_total 4\n",
+    }) |line| try std.testing.expect(std.mem.indexOf(u8, body, line) != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "kv_pool_pages_used") == null);
+}
+
+test "park: metrics name the parked states, their bytes, and the park counters" {
+    var m: Metrics = .{ .gpa = std.testing.allocator };
+    defer m.deinit();
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    const status: api.Status = .{ .prompt_cache = .{
+        .states = 2,
+        .bytes = 10,
+        .parked_states = 3,
+        .parked_bytes = 4096,
+        .parks = 5,
+        .park_resumes = 2,
+        .park_drops = 1,
+    } };
+    try m.render(std.testing.io, &out.writer, status, &.{}, .{}, null, 4096);
+    const body = out.written();
+    for ([_][]const u8{
+        "tensorfold:prompt_cache_parked_states 3\n",
+        "tensorfold:prompt_cache_parked_bytes 4096\n",
+        "tensorfold:prompt_cache_parks_total 5\n",
+        "tensorfold:prompt_cache_park_resumes_total 2\n",
+        "tensorfold:prompt_cache_park_drops_total 1\n",
+    }) |line| try std.testing.expect(std.mem.indexOf(u8, body, line) != null);
 }
 
 test "metrics count interior states in retained occupancy as well as restored tokens" {
