@@ -2,17 +2,19 @@
 
 This recipe serves Qwen3.8-27B from one Intel Arc Pro B70 in a workstation. The same card drives the desktop
 display. The server loads the model on the first request, and it gives the VRAM back to the desktop after 300 s
-idle. Production since 2026-11-03: one stream of 217,088 tokens with K1 decode attention and DFlash2 chains.
-Since 2026-11-10 (phase 1) it also runs two driver keys for the shared card and a drafter window of 512 rows.
+idle. Production since 2026-11-03: one stream of 217,088 tokens with K1 decode attention.
+Since 2026-11-10 (phase 1) it drafts DFlash2 trees on K1, with two driver keys for the shared card and a prompt
+chunk of 1024 rows.
 
 Measured on jubiku on 2026-11-02, 2026-11-03 and 2026-11-10. For the two-card server recipe, see
 [RECIPE-qwen38-27b-b70.md](RECIPE-qwen38-27b-b70.md).
 
 ## Phase 1 (2026-11-10): the production config
 
-Build `lane/fleet-serve`, commit `690e93f6`, `-Dtp=1 -Dcpu=skylake_avx512`. Production since 2026-11-10 08:14Z.
-The spec and the receipts are in `tolewis/Intel-B70-Recipe`: `docs/JUBIKU-PHASE-1.md`,
-`lanes/qwen27/receipts/p1-jubiku-window-1.md` and `p1-jubiku-window-2.md`.
+Build `lane/fleet-serve`, commit `690e93f6`, `-Dtp=1 -Dcpu=skylake_avx512`. The binary is in production since
+2026-11-10 08:14Z, and the tree config below since 14:22Z. The spec and the receipts are in
+`tolewis/Intel-B70-Recipe`: `docs/JUBIKU-PHASE-1.md`, `lanes/qwen27/receipts/p1-jubiku-window-1.md`,
+`p1-jubiku-window-2.md` and `p1-jubiku-window-3.md`.
 
 `qwen27.env`:
 
@@ -30,21 +32,24 @@ XPU_MTP=0
 XPU_KV_POOL=1
 XPU_EMBED_HOST=1
 XPU_KEEP_SHARED=1
-XPU_CHUNK=896
+XPU_CHUNK=1024
 XPU_K1=1
-XPU_TREE=0
-XPU_DRAFT_WIN=512
+XPU_K1_TREE=1
 NEOReadDebugKeys=1
 EnableRecoverablePageFaults=0
 ```
+
+The file has no `XPU_TREE` line and no `XPU_DRAFT_WIN` line. The server prints
+`K1 coverage: chain windows K1, lone tree K1, shared tree windows K1` and `DFlash2 trees for a lone stream`.
 
 What phase 1 changed:
 
 | Change | Effect | Evidence |
 |---|---|---|
-| `NEOReadDebugKeys=1`, `EnableRecoverablePageFaults=0` | No GPU engine reset from the desktop's render jobs. No speed change. | Five test starts ended with the fault. With the keys, three gate runs (3 h 49 min of load) had no kernel `xe` line. |
-| `XPU_DRAFT_WIN=512` on the `690e93f6` binary | +4.7% tok/s on the mean of 7 thinking runs (40k, 100k, 150k) | Window 2: 61.7 against 58.9 tok/s |
-| The `690e93f6` binary with no new flag | The same speed. 1 GiB less card memory (26.45 against 27.43 GiB). | Window 2, set N0 |
+| `NEOReadDebugKeys=1`, `EnableRecoverablePageFaults=0` | No GPU engine reset from the desktop's render jobs. No speed change. | Five test starts ended with the fault. With the keys, three gate runs (3 h 49 min of load) and 9 production starts had no kernel `xe` line. |
+| `XPU_K1_TREE=1` and no `XPU_TREE=0` (DFlash2 trees on K1) | +9.3% tok/s on the mean of 7 thinking runs (40k, 100k, 150k) | Window 3: 64.0, 64.9 and 64.2 in three starts, against 58.9 |
+| `XPU_CHUNK=1024` (was 896) | A cold prompt is 3.4 to 4.5% shorter | Window 3: 133.8 s against 140.2 s at 151k. A prompt of 196,043 tokens passes. |
+| The `690e93f6` binary | The same speed with no new flag. It has `XPU_DRAFT_WIN`. | Window 2, set N0 |
 
 Why the driver keys are needed. The Level Zero driver makes the server's memory map in page-fault mode by default.
 The `xe` driver then suspends the server's compute queue for each render job of the desktop (Hyprland, quickshell).
@@ -53,39 +58,75 @@ The GuC resets the engine when the server's context does not leave it in 640 ms.
 `XPU: a command list did not drain (Level Zero 0x70000001)`. `EnableRecoverablePageFaults=0` turns page-fault mode
 off. `NEOReadDebugKeys=1` makes a release driver read the key. A server on a card with no desktop does not need them.
 
-Speed, thinking on, effort low, temperature 1.0, 3,000 tokens a reply (the fleet's request shape):
+Speed, thinking on, effort low, temperature 1.0, 3,000 tokens a reply (the fleet's request shape), on an idle host:
 
-| Prompt tokens | Before phase 1 | Phase 1 | Change |
-|---|---|---|---|
-| 48,357 | 62.2 tok/s | 65.5 tok/s | +5.5% |
-| 99,611 | 60.3 tok/s | 62.5 tok/s | +3.7% |
-| 151,460 | 53.7 tok/s | 56.7 tok/s | +5.6% |
+| Prompt tokens | Before phase 1 | Chains, 512 window | Phase 1: trees | Change |
+|---|---|---|---|---|
+| 48,357 | 62.2 tok/s | 65.5 tok/s | 67.7 tok/s | +8.8% |
+| 99,611 | 60.3 tok/s | 62.5 tok/s | 65.0 tok/s | +7.7% |
+| 151,460 | 53.7 tok/s | 56.7 tok/s | 60.2 tok/s | +12.0% |
+| mean of 7 runs | 58.9 tok/s | 61.7 tok/s | 64.4 tok/s | +9.3% |
 
-These rates are lower than the greedy code rates of 2026-11-03 below. A sampled thinking reply lands fewer drafts
-(about 3.2 tokens a round).
+The tree lands 3.62 to 3.70 tokens a round against 3.29 for chains, in a round of 56.5 to 57.1 ms against 56.0 ms.
+These rates are lower than the greedy code rates of 2026-11-03 below. A sampled thinking reply lands fewer drafts.
 
-The drafter's context starts new at each request and grows with the reply. Its cost goes from 4.0 ms a round to
-10.9 ms at its cap of 2,047 rows. `XPU_DRAFT_WIN=512` holds it at 5.5 ms and loses 0.11 accepted drafts a round.
-A reply under about 600 tokens gets no gain. A reply over 2,200 tokens saves 5.4 ms a round on its later part.
-A window of 256 rows gave +2.7% on this host, less than 512.
+The drafter window and the tree. The drafter's context starts new at each request and grows with the reply. Its
+cost goes from 4.0 ms a round to 10.9 ms at its cap of 2,047 rows. `XPU_DRAFT_WIN=512` holds it at 5.5 ms.
+
+- Chains take the window: `XPU_TREE=0 XPU_DRAFT_WIN=512` gave 61.7 tok/s (+4.7%), and 256 rows gave +2.7%. A reply
+  under about 600 tokens gets no gain.
+- The tree does not. Under a 512 or 1024 window a round is 3 to 5 ms shorter, and the tree lands 3.25 to 3.40
+  tokens a round. The result is 62.2 to 64.1 tok/s. So the tree config sets no window.
+- `XPU_K1_WAVE=2` (the two-card value) does not change the time of a round on one card.
 
 Other numbers of the phase 1 config:
 
-- Cold prefill: 1,498 tok/s at 48k, 1,254 at 100k, 1,076 at 151k. First token on a cold 48k prompt: 32.3 s.
-  A warm turn starts in 0.2 s. No phase 1 flag changes prefill.
+- Cold prefill at chunk 1024: 1,555 tok/s at 48k, 1,311 at 100k, 1,132 at 151k. First token on a cold 48k
+  prompt: 31.1 s. A warm turn starts in 0.2 s.
 - The card sits at its stock 275 W cap in a prefill (p95 277 W). There is no higher cap to set.
-- Greedy decode, thinking off, 2,000 tokens: 76 tok/s at 48k, 77 at 100k, 70 at 151k.
-- Gate: needles at 151k found at depths 10, 50 and 90 percent, greedy eval 40 of 41 (the base also 40),
-  12 of 12 valid tool calls in a 12-turn agent run to 184k tokens, with a cache hit on every turn after the first.
+- Greedy decode, thinking off, 2,000 tokens (build `e059af9d`): the tree gives 84 tok/s at 48k, 76 at 100k and
+  61 to 67 at 151k. Chains give 76, 77 and 70. The tree is slower above 130k on this request shape.
+- Gate: needles at 151k found at depths 10, 50 and 90 percent with thinking on, and at depth 50 with thinking off.
+  Ten code prompts at effort low pass with 338 thinking tokens at most. A 12-turn agent run to 184k tokens gives
+  12 of 12 valid tool calls, with a cache hit on every turn after the first.
+- Other jobs on the host cost speed. With a desktop app and a headless render job running (load average 5.9), the
+  same 7 runs gave 61.0 tok/s. The tokens a round were equal, and a round was 4 to 14% longer.
+
+Known fault of the tree at TP 1: a greedy reply changes from start to start.
+
+- The greedy eval (41 rows, thinking on, no effort field, cap 16,384 tokens) gives 38 to 40 in six tree starts.
+  Chains give 40 in every start.
+- Each failed row is one of three code prompts with no spec. The model weighs the possible meanings for thousands
+  of thinking tokens, and a reply that reaches the cap has no answer. The text is correct English, not garbage.
+- With the server's sampling (temperature 1.0) both configs fail the same rows at the same rate: 39, 38 and 39 for
+  the tree, 38, 38 and 40 for chains. The tree does not answer worse than chains.
+- Cause: a chain round runs `attn_k1`, and a tree round runs the K1 prefix, `attn_k1_draft` and a merge
+  (`zig/src/xpu/k1.zig`, `attnPath`). A round is a tree only when the depth rule asks for 5 drafts or more
+  (`TREE_MIN`, `zig/src/native/xpu_lanes.zig`), and the depth rule reads the live clock
+  (`zig/src/core/lanes/depth.zig`). The logits are f16, so a greedy pick between two near-equal tokens changes
+  with the mix of round shapes. The two-card path repeats all 41 greedy replies.
+- Fix concepts: one kernel path for every round of a tree set, a logit test at TP 1 in the dev binary
+  (`zig/src/xpu/qwen27_main.zig`), a fixed draft count and window table for a replay, and a thinking budget
+  (`--thinking-budget`, not set here).
+
+Engine leads for more speed (not built):
+
+1. The tree under a drafter window. The tree's 3.64 tokens a round in the 52.4 ms round of the 512 window is
+   about 69 tok/s. Find why the tree's branch scores need the far context rows.
+2. A depth rule for trees. The rule prices a tree as a chain (`depth.zig`), asks for 4.8 to 6.6 drafts of 15, and
+   under 5 the round is a chain.
+3. `onTaps` calls `d.skip(k)` on every prompt pass, and `skip(0)` moves the drafter context start to its end
+   (`zig/src/xpu/drafter.zig`). A reply starts with the rows of the last prompt chunk only.
 
 Checked and not shipped:
 
-- `XPU_K1_TREE=1` without `XPU_TREE=0` (a lone DFlash2 tree on K1). It is 7 to 12% faster on the mean. It fails the
-  eval bar (39 of 41 against 40), and its reply text changes from start to start for the same seed.
-  The next step is a log probability test of the tree's logits.
 - `XPU_K1_WAVE` 1, 2 and 3. No value passed the speed rule.
+- `XPU_DRAFT_WIN` with the tree (see above).
 
-One run moves by up to 17% for the same reply on this host. Judge a change on the mean of several runs.
+Rollback to chains: `XPU_TREE=0`, `XPU_DRAFT_WIN=512`, no `XPU_K1_TREE` line (61.7 tok/s, greedy replies repeat).
+
+One run moves by up to 17% for the same reply on this host. A tree set also changes its reply text at each start.
+Judge a change on the mean of several runs and several starts.
 
 ## Production benchmark (2026-11-03, p39 K1)
 
@@ -249,7 +290,8 @@ tailnet. Nothing listens on the LAN.
 - A DFlash2 tree at temperature 0 can give different text on repeat runs (`d317b4792cff`, `7b62cdadaf9b`).
 - A server on the card that drives the desktop needs the two driver keys of the Phase 1 section. Without them the
   GuC can reset the engine under desktop render load.
-- A lone DFlash2 tree on K1 (`XPU_K1_TREE=1`) fails the eval bar at TP 1. Production keeps `XPU_TREE=0`.
+- A DFlash2 tree on K1 (`XPU_K1_TREE=1`) at TP 1 does not repeat a greedy reply from start to start. Its greedy
+  eval is 38 to 40 of 41 against 40 for chains. Production runs it for its speed (see Phase 1).
 
 ## Phase two (done 2026-11-03)
 
