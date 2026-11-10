@@ -191,6 +191,8 @@ pub const Stat = struct {
     launches: u64 = 0,
     copies: u64 = 0,
     syncs: u64 = 0,
+    hcopies: u64 = 0, // host-pointer copies of the tree verify and its commit (dev.hostCopy)
+    hcopy_s: f64 = 0, // host time inside those calls
 };
 pub var stat: Stat = .{};
 
@@ -954,7 +956,7 @@ pub const Runner = struct {
         // The draft K/V rows sit at pos + the row index, which reaches ids.len - 1: the tree table's rows past
         // depth_max - 1 (a comb's row 15) need the same pages as the draft (lane p22-k1tree, issue 3).
         try r.ensurePages(r.slot, r.pos + @as(u32, @intCast(ids.len)));
-        try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, r.acts.tree, &r.tree_host, ids.len * 17 * 4, null, 0, null));
+        try dev.hostCopy(&r.d, r.acts.tree, &r.tree_host, ids.len * 17 * 4);
         _ = try forward(&r.d, &r.model, &r.acts, @ptrCast(ids), r.pos, .{ .want = .rows, .stash = true, .taps = r.taps_on, .tree = true, .pt = r.pt[r.slot] });
         var toks: [16]i32 = undefined;
         try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, &toks, r.acts.tok, ids.len * 4, null, 0, null));
@@ -975,7 +977,7 @@ pub const Runner = struct {
             straight = straight and row == dd;
         }
         const rows: i32 = @intCast(path.len);
-        try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, r.acts.path, &r.path_host, path.len * 4, null, 0, null));
+        try dev.hostCopy(&r.d, r.acts.path, &r.path_host, path.len * 4);
         const nul: ?*anyopaque = null;
         for (&r.model.layers) |*l| {
             if (l.attn) {

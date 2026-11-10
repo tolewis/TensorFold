@@ -411,9 +411,9 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
                         k1mod.pos_host[r] = p0i - 1;
                         k1mod.posm_host[r] = posm;
                     }
-                    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.kmt, &k1mod.mt_host[i], 16 * 8 * 8, null, 0, null));
-                    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.kpos, &k1mod.pos_host, 16 * 4, null, 0, null));
-                    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.kposm, &k1mod.posm_host, 16 * 4, null, 0, null));
+                    try dev.hostCopy(d, a.kmt, &k1mod.mt_host[i], 16 * 8 * 8);
+                    try dev.hostCopy(d, a.kpos, &k1mod.pos_host, 16 * 4);
+                    try dev.hostCopy(d, a.kposm, &k1mod.posm_host, 16 * 4);
                     try k1mod.queueGroups(d, a.grp, grp_host[0 .. 2 * n], n);
                     // the partials' stride is ns + 1 (k1.cl attn_k1_draft): the prefix launch and the merge take it as NS,
                     // the draft takes ns as its slice index

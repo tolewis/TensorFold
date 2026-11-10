@@ -298,6 +298,17 @@ pub fn copy(d: *Dev, dst: *anyopaque, src: *anyopaque, n: usize) !void {
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, dst, src, n, ev, 0, null));
 }
 
+/// A queued copy with plain host memory on one side (a table to the card, a result to the host). XPU_ROUND_STATS
+/// counts the calls and the host time inside them (lane p4-k-gdn): a call that waits for the card shows there.
+pub fn hostCopy(d: *Dev, dst: ?*anyopaque, src: ?*const anyopaque, n: usize) !void {
+    const t0: f64 = if (q.stat.on) q.now() else 0;
+    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, dst, src, n, null, 0, null));
+    if (q.stat.on) {
+        q.stat.hcopies += 1;
+        q.stat.hcopy_s += q.now() - t0;
+    }
+}
+
 pub fn off(p: *anyopaque, bytes: usize) *anyopaque {
     return @ptrFromInt(@intFromPtr(p) + bytes);
 }

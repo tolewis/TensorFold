@@ -208,7 +208,7 @@ pub fn mergePos(kkind: []const u8, kpos: []const i32, ns: u32, span: i32, out: [
 
 /// Queues the groups of `wf`/`wn` into `grp`: the host buffer must stay alive until the list drains.
 pub fn queueGroups(d: *dev.Dev, grp: *anyopaque, host: []i32, n: u32) !void {
-    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, grp, host.ptr, @as(usize, 2 * n) * 4, null, 0, null));
+    try @import("dev.zig").hostCopy(d, grp, host.ptr, @as(usize, 2 * n) * 4);
 }
 
 /// Device bytes a round reads through K1: the K and V pages of `keys` keys for every stream, K/V head and row
