@@ -855,7 +855,7 @@ pub const Group = struct {
         const out = try d.g.deviceAlloc(64); // the probe's result (four words)
         const hout = try d.g.hostAlloc(64); // the host side of it
         const hw = try d.g.hostAlloc(8); // the writer's word
-        const w64 = @as(*u64, @ptrCast(hw));
+        const w64 = @as(*u64, @ptrCast(@alignCast(hw)));
         const zero = try d.g.hostAlloc(64);
         @memset(@as([*]u8, @ptrCast(zero))[0..64], 0);
         var b: u8 = 0;
@@ -955,7 +955,7 @@ pub const Group = struct {
                 try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, rb, off(g.blk.?, blk_timeout), 4, null, 0, null));
                 try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, off(rb, 4), off(g.blk.?, blk_flag), 32, null, 0, null));
                 d.settle();
-                const r4 = @as(*const [10]u32, @ptrCast(rb));
+                const r4 = @as(*const [10]u32, @ptrCast(@alignCast(rb)));
                 std.debug.print(P ++ "E4 exchange {d} call+settle {d:.2} ms timeout 0x{x} flag0 0x{x} flag1 0x{x} pcons0 0x{x} pcons1 0x{x}\n", .{ rank, i, (t1 - t0) * 1e3, r4[0], r4[1], r4[2], r4[3], r4[4] });
                 try labCopy(d, off(g.blk.?, blk_timeout), zero, 4); // the timeout word to 0
             }
@@ -991,7 +991,7 @@ fn labCopy(d: *Dev, dst: *anyopaque, src: *anyopaque, n: usize) !void {
 fn labOut(d: *Dev, out: *anyopaque, hout: *anyopaque) !*[4]u64 {
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, hout, out, 32, null, 0, null));
     d.settle();
-    return @ptrCast(hout);
+    return @ptrCast(@alignCast(hout));
 }
 
 /// The flag lab: the spin probe (one group of 16, only global id 0 works). Five arguments: the pointer, the two

@@ -87,7 +87,7 @@ KERNEL(16) void tp_probe(global volatile ulong *p, ulong want, ulong max_spins, 
         gave = 1;
         break;
       }
-      if (form == 1 and spins % 64 == 0)
+      if (form == 1 && spins % 64 == 0)
         atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_acquire, memory_scope_device);
     }
   }
