@@ -147,6 +147,24 @@ pub var kv8: i32 = 0;
 /// 2: gdn_step2, gdn_step with block loads (the same bits). 4: at the load, gdn_step2 against gdn_step on the card
 /// (gdn_check.zig), and the open fails when a value differs. Default 0.
 pub var gdn_bits: u32 = 0;
+/// XPU_MV (lane p4-k-mv): the decode matvec kernel of a call site, `site:variant` pairs separated by commas
+/// (XPU_MV=mixer_in_gdn:d16,mixer_in_attn:d16). A site is a `Site` name. A variant is a kernel of gemm.cl:
+/// wide sites (the family with no K slices): d16, d64, w8, p0, p4, the same bits as the default. `slice` puts a wide
+/// site on the K-slice kernel: its bits change, so it is a timing probe only. Narrow sites (K slices): s16, seq, the
+/// same bits as the default. Default: no pick.
+pub const MvPick = struct { k: ze.H, div: u32, wide: bool };
+pub var mv_pick: [16]?MvPick = @splat(null);
+const MvVariant = struct { name: []const u8, row: []const u8, kernel: [*:0]const u8, local: u32, div: u32, wide: bool, bits: bool = false };
+const mv_variants = [_]MvVariant{
+    .{ .name = "d16", .row = "mv_d16", .kernel = "w4k1_d16", .local = 64, .div = 64, .wide = true }, // 16 columns a subgroup: two times the threads
+    .{ .name = "d64", .row = "mv_d64", .kernel = "w4k1_d64", .local = 64, .div = 256, .wide = true }, // 64 columns: half the threads
+    .{ .name = "w8", .row = "mv_w8", .kernel = "w4k1_w8", .local = 128, .div = 256, .wide = true }, // 32 columns, 8 subgroups a work-group
+    .{ .name = "p0", .row = "mv_p0", .kernel = "w4k1_p0", .local = 64, .div = 128, .wide = true }, // no prefetch
+    .{ .name = "p4", .row = "mv_p4", .kernel = "w4k1_p4", .local = 64, .div = 128, .wide = true }, // prefetch 4 blocks ahead
+    .{ .name = "slice", .row = "mv_slice", .kernel = "w4k_dsplit", .local = 64, .div = 32, .wide = true, .bits = true }, // 4 K slices a tile: four times the threads, other bits
+    .{ .name = "s16", .row = "mv_s16", .kernel = "w4k_s16x16", .local = 64, .div = 16, .wide = false }, // 16 columns a tile, 4 K slices
+    .{ .name = "seq", .row = "mv_seq", .kernel = "w4k_decode", .local = 64, .div = 128, .wide = false }, // the K slices one after the other in one subgroup
+};
 /// Int8 K/V cache (XPU_KV_INT8=1): 256 int8 per position and head, then float scales after MAX_CTX positions.
 pub var kv_i8 = false;
 /// Rotated weights (`hadamard128` in the checkpoint): every GEMM input is rotated by blocks of 128 where it is made.
@@ -510,6 +528,23 @@ pub const Runner = struct {
             prof.sites_on = pv[0] == '2'; // a row a call site and an event a device copy (lane p4-k-gdn)
             prof.events = try d.g.events(4096);
             inline for (@typeInfo(@TypeOf(d.k)).@"struct".field_names, 0..) |name, i| prof.names[i] = .{ .k = @field(d.k, name), .name = name };
+        }
+        if (std.c.getenv("XPU_MV")) |mv| { // lane p4-k-mv: one line a rank, the check of the flag
+            var it = std.mem.tokenizeScalar(u8, std.mem.span(mv), ',');
+            while (it.next()) |pair| {
+                const colon = std.mem.indexOfScalar(u8, pair, ':') orelse return error.BadMvPick;
+                const site = std.meta.stringToEnum(Site, pair[0..colon]) orelse return error.BadMvSite;
+                const v = for (mv_variants) |v| {
+                    if (std.mem.eql(u8, v.name, pair[colon + 1 ..])) break v;
+                } else return error.BadMvVariant;
+                const k = try d.kernel(mm, v.kernel, v.local);
+                mv_pick[@intFromEnum(site)] = .{ .k = k, .div = v.div, .wide = v.wide };
+                if (prof.on) for (&prof.names) |*slot| if (slot.name.len == 0) { // a row of its own in the kernel table
+                    slot.* = .{ .k = k, .name = v.row };
+                    break;
+                };
+                std.debug.print("mv: XPU_MV {s} on {s} ({s}){s}\n", .{ @tagName(site), v.name, std.mem.span(v.kernel), if (v.bits) ", the bits change: a timing probe" else "" });
+            }
         }
         const prof_on = prof.on;
         prof.on = false; // not during the load

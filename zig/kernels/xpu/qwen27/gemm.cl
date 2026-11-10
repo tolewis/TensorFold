@@ -339,3 +339,6 @@ W4K_KERNEL_SL(w4k1_d16, 16, 16, 4, 16, READ16, 2, 1)
 W4K_KERNEL_SL(w4k1_d64, 16, 64, 4, 16, READ16, 2, 1)
 W4K_KERNEL_SL(w4k1_w8, 16, 32, 8, 16, READ16, 2, 1)
 W4K_KERNEL_SL(w4k1_v32, 32, 32, 4, 32, READ32, 2, 1)
+// Prefetch probes of the wide decode kernel (lane p4-k-mv, XPU_MV p0 and p4): the same tile and the same bits.
+W4K_KERNEL_SL(w4k1_p0, 16, 32, 4, 16, READ16, 0, 1)
+W4K_KERNEL_SL(w4k1_p4, 16, 32, 4, 16, READ16, 4, 1)
