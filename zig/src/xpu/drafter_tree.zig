@@ -1,6 +1,7 @@
 //! DFlash2 draft trees: the best-first policy over the drafter's lattice, and one verified tree round.
 const std = @import("std");
 const dmod = @import("drafter.zig");
+const q = @import("qwen27.zig");
 const Drafter = dmod.Drafter;
 const MAXL = dmod.MAXL;
 const TOPK = dmod.TOPK;
@@ -125,12 +126,21 @@ pub const Draw = struct {
     temperature: f64,
 };
 
-pub const Round = struct { tokens: []const u32, terminal: u32, drafted: u32, accepted: u32 };
+pub const Round = struct {
+    tokens: []const u32,
+    terminal: u32,
+    drafted: u32,
+    accepted: u32,
+    t_draft: f64 = 0, // XPU_ROUND_STATS: the drafter pass of this round
+    t_verify: f64 = 0, // XPU_ROUND_STATS: the verify of the tree
+    rows: u32 = 0, // the tree's verified rows, drafts and pending
+};
 
 /// One tree round from `pending`: drafts a tree of ≤ `nodes`, verifies it, keeps the path; returns the accepted drafts.
 pub fn treeRound(dr: *Drafter, pending: u32, depths: u32, nodes: u32, draw: ?Draw, out: *[MAXL]u32) !Round {
     const r = dr.r;
     const p0: u64 = r.pos;
+    const t0 = q.stat.on and q.now() or 0.0; // XPU_ROUND_STATS: the drafter pass of this round
     try dr.lattice(pending, depths);
     var noise: [MAXL][TOPK]f64 = undefined;
     if (draw) |dw| for (0..depths) |dd| for (0..TOPK) |j| {
@@ -143,7 +153,9 @@ pub fn treeRound(dr: *Drafter, pending: u32, depths: u32, nodes: u32, draw: ?Dra
     var rows: [MAXL]i32 = undefined; // the tree in verified rows: row 0 the pending token
     rows[0] = 0;
     for (1..n + 1) |i| rows[i] = if (par[i] < 0) 0 else par[i] + 1;
+    const v0 = q.stat.on and q.now() or 0.0; // XPU_ROUND_STATS: the verify of the tree
     const greedy = try r.verifyTree(ids[0 .. n + 1], rows[0 .. n + 1]);
+    const tv = q.stat.on and q.now() or 0.0;
     var path: [MAXL]u32 = undefined;
     path[0] = 0;
     var len: u32 = 1;
@@ -160,5 +172,5 @@ pub fn treeRound(dr: *Drafter, pending: u32, depths: u32, nodes: u32, draw: ?Dra
     try r.commitPath(path[0..len]);
     try dr.addTaps(r.acts.taps, len);
     for (0..len) |i| out[i] = ids[path[i]];
-    return .{ .tokens = out[0..len], .terminal = terminal, .drafted = n, .accepted = len - 1 };
+    return .{ .tokens = out[0..len], .terminal = terminal, .drafted = n, .accepted = len - 1, .t_draft = v0 - t0, .t_verify = tv - v0, .rows = n + 1 };
 }

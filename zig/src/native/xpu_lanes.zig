@@ -798,6 +798,7 @@ pub const Lanes = struct {
             defer r.taps_on = false;
             var sampled: Sampled = .{ .b = b, .s = s.sampling orelse .{ .seed = 0 } };
             const drawer: ?xq.drafter.Draw = if (s.sampling) |sp| .{ .ctx = &sampled, .row = Sampled.row, .gumbel = Sampled.gumbel, .temperature = sp.temperature } else null;
+            const t0 = if (b.rs.on) xq.now() else 0; // XPU_ROUND_STATS: the round from its treeRound entry
             const round = try xq.drafter.treeRound(d, pending, b.block - 1, b.nodes, drawer, &out);
             s.rounds += 1;
             s.drafted += round.drafted;
@@ -807,6 +808,18 @@ pub const Lanes = struct {
             @memcpy(landed[0..n], round.tokens[1..]);
             landed[n] = round.terminal;
             _ = try s.commit(b.gpa, landed[0 .. n + 1], &.{});
+            if (b.rs.on) {
+                const rs = &b.rs;
+                rs.open = true;
+                rs.t_start = t0;
+                rs.t_last = xq.now();
+                rs.t_draft = round.t_draft;
+                rs.t_verify = round.t_verify;
+                rs.streams = 1;
+                rs.rows = round.rows;
+                rs.win_acc[0] = @intCast(round.accepted);
+                try b.rsClose();
+            }
             pending = round.terminal;
             hooks.committed(hooks.ctx);
         }
