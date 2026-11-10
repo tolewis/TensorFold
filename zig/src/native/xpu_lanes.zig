@@ -704,23 +704,42 @@ pub const Lanes = struct {
             try d.use(b.slotOf(q.stream).?);
             if (d.end() + 1 != q.position) return error.BadDraftPosition;
         };
-        if (xq.drafter.ragged and ni > 1) try d.latticeRagged(items[0..ni], counts[0..ni]) else try d.latticeMulti(items[0..ni], depth);
-        // each stream's best-first tree of its asked drafts over its lattice, with the target's keyed noise if sampled
-        for (items[0..ni], asked[0..ni], reqs[0..ni], 0..) |it, n, q, i| {
-            d.take(i);
-            var noise: [16][xq.drafter.TOPK]f64 = undefined;
-            const sp = q.stream.sampling;
-            const nd = if (xq.drafter.ragged) counts[i] else depth;
-            if (sp) |x| for (0..nd) |dd| for (0..xq.drafter.TOPK) |j| {
-                noise[dd][j] = -@log(-@log(lanes.sampling.uniform(x.seed, q.position + dd, d.cand[dd][j])));
-            };
-            if (n < TREE_MIN or b.nodes == 0) { // few drafts (or XPU_TREE=0): a chain goes deeper than a tree of siblings
-                d.chain(it.pending, n, b.chain[it.slot][0..n]);
-                for (b.chain_par[it.slot][0..n], 0..) |*x, j| x.* = @as(i32, @intCast(j)) - 1;
-                b.chain_n[it.slot] = n;
-                continue;
+        // XPU_DRAFT_RAGGED: a batch is split into passes of at most 16 rows, the decode GEMM's limit (`gemm` takes
+        // the prompt GEMM above 16 rows, ~6 ms a pass against ~1 ms). Six streams at depth 2 are 18 rows in one pass
+        // and pay it; two passes of three streams stay on the decode kernels. A block is at most 8 rows, so a pass
+        // always takes at least one block. Off: one pass, every block the longest (latticeMulti).
+        const rag_max: u32 = 16;
+        var g: usize = 0;
+        while (g < ni) {
+            var e = ni;
+            if (xq.drafter.ragged and ni > 1) {
+                e = g;
+                var rs: u32 = 0;
+                while (e < ni and rs + counts[e] + 1 <= rag_max) {
+                    rs += counts[e] + 1;
+                    e += 1;
+                }
+                if (e == g) e = g + 1; // a block alone: 8 rows at most
             }
-            b.chain_n[it.slot] = d.tree(it.pending, n, if (sp != null) &noise else null, if (sp) |x| x.temperature else 1.0, b.chain[it.slot][0..n], b.chain_par[it.slot][0..n]);
+            if (xq.drafter.ragged and ni > 1) try d.latticeRagged(items[g..e], counts[g..e]) else try d.latticeMulti(items[0..ni], depth);
+            // each stream's best-first tree of its asked drafts over its lattice, with the target's keyed noise if sampled
+            for (items[g..e], asked[g..e], reqs[g..e], 0..) |it, n, q, i| {
+                d.take(i);
+                var noise: [16][xq.drafter.TOPK]f64 = undefined;
+                const sp = q.stream.sampling;
+                const nd = if (xq.drafter.ragged) counts[g + i] else depth;
+                if (sp) |x| for (0..nd) |dd| for (0..xq.drafter.TOPK) |j| {
+                    noise[dd][j] = -@log(-@log(lanes.sampling.uniform(x.seed, q.position + dd, d.cand[dd][j])));
+                };
+                if (n < TREE_MIN or b.nodes == 0) { // few drafts (or XPU_TREE=0): a chain goes deeper than a tree of siblings
+                    d.chain(it.pending, n, b.chain[it.slot][0..n]);
+                    for (b.chain_par[it.slot][0..n], 0..) |*x, j| x.* = @as(i32, @intCast(j)) - 1;
+                    b.chain_n[it.slot] = n;
+                    continue;
+                }
+                b.chain_n[it.slot] = d.tree(it.pending, n, if (sp != null) &noise else null, if (sp) |x| x.temperature else 1.0, b.chain[it.slot][0..n], b.chain_par[it.slot][0..n]);
+            }
+            g = e;
         }
     }
 
