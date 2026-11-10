@@ -1017,20 +1017,20 @@ pub const Group = struct {
                         const tw = q.now();
                         const wrc = d.g.api.zeCommandListHostSynchronize(d.list, 5_000_000_000);
                         const t2 = q.now();
-                        const o = try labOut(d, out, hout);
-                        if (pre) {
-                            std.debug.print(P ++ "E5a v{d} wait rc 0x{x} out1 {d} launch+wait {d:.2} ms t2-t1 {d:.2} ms\n", .{ rank, variant, wrc, o[1], (tw - t0) * 1e3, (t2 - tw) * 1e3 });
-                        } else {
-                            std.debug.print(P ++ "E5b v{d} wait rc 0x{x} out1 {d} t1-t0 {d:.2} ms t2-t1 {d:.2} ms\n", .{ rank, variant, wrc, o[1], (t1 - t0) * 1e3, (t2 - t1) * 1e3 });
-                        }
                         const stuck = wrc != 0;
-                        if (stuck) std.debug.print(P ++ "E5 v{d} not complete in 5 s\n", .{ rank, variant });
+                        if (stuck) std.debug.print(P ++ "E5 v{d} not complete in 5 s t2-t1 {d:.2} ms\n", .{ rank, variant, (t2 - tw) * 1e3 });
                         try sendByte(conn, if (stuck) @as(u8, 2) else 1); // ok or stuck
-                        try recvByte(conn, &s); // the writer's answer
-                        if (stuck) { // the writer wrote the word again: the wait can end
+                        try recvByte(conn, &s); // the writer's answer: the word again when stuck
+                        if (stuck) { // the wait may now end: no settle before the writer's write, or it would block here
                             const wrc2 = d.g.api.zeCommandListHostSynchronize(d.list, std.math.maxInt(u64));
                             const o2 = try labOut(d, out, hout);
                             std.debug.print(P ++ "E5 v{d} second wait rc 0x{x} out1 {d}\n", .{ rank, variant, wrc2, o2[1] });
+                        } else if (pre) {
+                            const o = try labOut(d, out, hout);
+                            std.debug.print(P ++ "E5a v{d} wait rc 0x{x} out1 {d} launch+wait {d:.2} ms t2-t1 {d:.2} ms\n", .{ rank, variant, wrc, o[1], (tw - t0) * 1e3, (t2 - tw) * 1e3 });
+                        } else {
+                            const o = try labOut(d, out, hout);
+                            std.debug.print(P ++ "E5b v{d} wait rc 0x{x} out1 {d} t1-t0 {d:.2} ms t2-t1 {d:.2} ms\n", .{ rank, variant, wrc, o[1], (t1 - t0) * 1e3, (t2 - t1) * 1e3 });
                         }
                         _ = d.g.api.zeEventDestroy(ev.?);
                     } else {
