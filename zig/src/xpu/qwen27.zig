@@ -152,7 +152,7 @@ pub var gdn_bits: u32 = 0;
 /// wide sites (the family with no K slices): d16, d64, w8, p0, p4, the same bits as the default. `slice` puts a wide
 /// site on the K-slice kernel: its bits change, so it is a timing probe only. Narrow sites (K slices): s16, seq, the
 /// same bits as the default. Default: no pick.
-/// A variant after a `+` (gate_up:+d64) is a shadow: the kernel runs before the site's own kernel and writes a scratch
+/// A variant after an `@` (gate_up:@d64) is a shadow: the kernel runs before the site's own kernel and writes a scratch
 /// buffer. The model keeps its bits, and the row `mv_<variant>_<site>` holds the time of the variant on this shape.
 /// Up to 8 shadows a site, any variant on any site. `ref` and `nref` are the default wide and narrow kernels.
 /// w0, a0, wa0, h8 and wseq are probes with wrong results (gemm.cl), so they run as shadows only.
@@ -550,7 +550,7 @@ pub const Runner = struct {
             while (it.next()) |pair| {
                 const colon = std.mem.indexOfScalar(u8, pair, ':') orelse return error.BadMvPick;
                 const site = std.meta.stringToEnum(Site, pair[0..colon]) orelse return error.BadMvSite;
-                const shadow = pair.len > colon + 1 and pair[colon + 1] == '+';
+                const shadow = pair.len > colon + 1 and pair[colon + 1] == '@';
                 const vname = pair[colon + 1 + @intFromBool(shadow) ..];
                 const v = for (mv_variants) |v| {
                     if (std.mem.eql(u8, v.name, vname)) break v;
