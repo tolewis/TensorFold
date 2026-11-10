@@ -348,12 +348,19 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
     const table = if (mode.tree) a.tree else a.chain;
     const mpos: ?*anyopaque = if (mode.multi) |mm| mm.pos else null;
     var fused = false; // the device-flag exchange ran the residual add and norm itself (TF_TP_DEVFLAG)
+    // XPU_FUSE bit 1 (WP2 step 3): the device-direct exchange joins the norm that follows. Decode only, the direct
+    // path only, and never when a probe reads the exchange's output ahead of that norm.
+    const fuse1 = q.fuse & 1 != 0 and !wide and gemm_probe == null;
+    var pend: ?*anyopaque = null; // the peer's partial an exchange left in pbuf, for the fused add of the next norm
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.ids, ids.ptr, ids.len * 4, null, 0, null));
     errdefer d.settle(); // the queued copy reads the caller's ids: an error returns only once the queue is idle
     try embedRows(d, m, a.ids, a.x, T);
     if (p0 == 0) try dump(d, a, T, "embed", false);
     for (&m.layers, 0..) |*l, i| {
-        try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.in_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, if (i == 0) 0 else 1), gs, q8a, q8s, q8ms, q.rot_on });
+        if (pend) |peer| { // XPU_FUSE bit 1: the previous layer's exchange joined into this layer's input norm
+            try d.launch(d.k.tp_norm_peer, .{ .x = T }, .{ a.x, a.r, peer, l.in_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs, q8a, q8s, q8ms, q.rot_on });
+            pend = null;
+        } else try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.in_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, if (i == 0) 0 else 1), gs, q8a, q8s, q8ms, q.rot_on });
         const probe = p0 == 0 and i == 0;
         if (probe) try dumpBuf(d, "h0", a.h, T * D, .f16);
         // W4A8 study: the GEMM reads a quantized copy (in r, free until mixer_out); the dense a/b gates read h as is
@@ -504,6 +511,10 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
             if (!wide and g.devflag) { // TF_TP_DEVFLAG: the add fused into the residual add and norm below
                 try g.allReduceNorm(d, a.r, T, .{ .x = a.x, .w = l.post_norm, .h = a.h, .ahi = a.ahi, .alo = a.alo, .a8 = q8a, .sa = q8s, .ms = q8ms, .eps = EPS, .has_r = 1, .gs = gs, .rot = q.rot_on });
                 fused = true;
+            } else if (fuse1 and g.direct) { // XPU_FUSE bit 1: the same add and norm on the device-direct path
+                const peer = try g.allReducePeer(d, a.r, T);
+                try d.launch(d.k.tp_norm_peer, .{ .x = T }, .{ a.x, a.r, peer, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs, q8a, q8s, q8ms, q.rot_on });
+                fused = true;
             } else try g.allReduce(d, a.r, T);
         }
         if (gemm_probe) |f| try f(d, a, l.mixer_out, a.h, T, i, 1);
@@ -514,7 +525,18 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
         const act = try mlpIn(d, m, a, l.gu, T, gs, q8on, wide);
         try a8(d, a, act, FF, T, 8);
         try pgemm(d, m, a, act, l.down, a.r, T, false, if (act == a.p) q.rot_on else 0, q.int4_sites & 8 != 0, wide);
-        if (ranks.group) |*g| try g.allReduce(d, a.r, T); // TP: the ranks' partial down projections summed
+        if (ranks.group) |*g| { // TP: the ranks' partial down projections summed, joined into the next norm when bit 1 is set
+            var tap_here = false;
+            for (TAP_LAYERS) |tl| {
+                if (tl == i) tap_here = true;
+            }
+            // tap and dump read r before that norm, so their layers keep the separate add
+            const keep_r = (mode.taps and tap_here) or (q.dump_dir != null and p0 == 0 and i < 4);
+            const has_norm = i + 1 < LAYERS or want or q.dump_h != null; // a norm follows this exchange
+            if (fuse1 and g.direct and !g.devflag and !keep_r and has_norm) {
+                pend = try g.allReducePeer(d, a.r, T);
+            } else try g.allReduce(d, a.r, T);
+        }
         if (gemm_probe) |f| try f(d, a, l.down, act, T, i, 3);
         if (p0 == 0 and i < 4) try dump(d, a, T, try std.fmt.allocPrint(alloc, "{d}", .{i}), true);
         if (mode.taps) for (TAP_LAYERS, 0..) |tl, slot| if (tl == i)
@@ -526,7 +548,10 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
         return null;
     }
     const hgs: i32 = @intCast(m.head.gs);
-    try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, m.norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), hgs, no_q8, no_q8, @as(i32, 0), @as(i32, 0) });
+    if (pend) |peer| { // XPU_FUSE bit 1: the last layer's exchange joined into the final norm
+        try d.launch(d.k.tp_norm_peer, .{ .x = T }, .{ a.x, a.r, peer, m.norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), hgs, no_q8, no_q8, @as(i32, 0), @as(i32, 0) });
+        pend = null;
+    } else try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, m.norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), hgs, no_q8, no_q8, @as(i32, 0), @as(i32, 0) });
     if (q.dump_h) |fd| { // XPU_DUMP_H: every row's final normed hidden state, appended
         const host = try alloc.alloc(u16, T * D);
         defer alloc.free(host);

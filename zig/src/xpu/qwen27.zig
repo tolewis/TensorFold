@@ -131,6 +131,9 @@ pub fn isAttention(i: usize) bool {
     return (i + 1) % 4 == 0;
 }
 
+/// XPU_FUSE=1 bit 0: the device-direct exchange's tp_add joins the norm that follows it (mixer and MLP exchanges).
+/// A bit mask; with it unset or 0 the engine takes today's path. Bit 0 is the exchange-into-norm step (WP2 step 3).
+pub var fuse: u32 = 0;
 /// XPU_DUMP=DIR: the first forward writes x (fp32 [T, D]) after each of the first four layers, for comparison.
 pub var dump_dir: ?[]const u8 = null;
 pub var verbose = false;
@@ -314,11 +317,13 @@ pub const Runner = struct {
         if (std.c.getenv("XPU_A8_BITS")) |v| a8_levels = if (std.mem.eql(u8, std.mem.span(v), "4")) 7 else 127;
         if (std.c.getenv("XPU_A8_SITES")) |v| a8_sites = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_A8")) |v| a8_group = if (std.mem.eql(u8, std.mem.span(v), "token")) std.math.maxInt(u32) else try std.fmt.parseInt(u32, std.mem.span(v), 10);
+        if (std.c.getenv("XPU_FUSE")) |v| fuse = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_DUMP_H")) |v| dump_h = open(v, 0o2101, @as(c_uint, 0o644)); // append
         if (std.c.getenv("XPU_CHUNK")) |v| CHUNK = try limits.chunk(std.mem.span(v));
         if (std.c.getenv("TF_TP_RANK")) |v| RANK = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         k1mod.readEnv(); // XPU_K1, XPU_K1_WAVE
         if (RANK >= TP) return error.RankOutOfRange;
+        if (fuse != 0) std.debug.print("fuse: rank {d}: XPU_FUSE={d} bit 1: the exchange joined into the norm that follows (mixer and MLP)\n", .{ RANK, fuse });
         // the shared K/V pool: a page holds int8 rows and their scales, so pool mode is int8 K/V
         if (std.c.getenv("XPU_KV_POOL")) |v| kv_pool = v[0] != '0';
         if (std.c.getenv("XPU_KV_POOL_TOKENS")) |v| pool_tokens = try std.fmt.parseInt(u32, std.mem.span(v), 10);
@@ -442,6 +447,7 @@ pub const Runner = struct {
             .tp_add = try d.kernel(mg, "tp_add", 256),
             .tp_add_flag = try d.kernel(mg, "tp_add_flag", 256),
             .tp_norm_tp = try d.kernel(mg, "add_rmsnorm_dec_tp", 512),
+            .tp_norm_peer = try d.kernel(mg, "add_rmsnorm_dec_peer", 512),
             .tp_consume = try d.kernel(mg, "tp_consume", 16),
             .attn_prompt = try d.kernel(md, "attn_prompt", 128),
             .attn_prompt8 = try d.kernel(md, "attn_prompt8", 128),
@@ -1047,6 +1053,7 @@ pub fn modeWord() u64 {
     w |= @as(u64, @intFromBool(fmt_mlx)) << 12; // 0: EXL3, 1: MLX 4/64
     w |= @as(u64, @intFromBool(kept_host)) << 13; // kept states' copies in host memory: both ranks hold theirs there
     w |= @as(u64, @intFromBool(park_on)) << 23; // idle kept states park in host memory: all ranks, or neither
+    w |= @as(u64, @intFromBool(fuse & 1 != 0)) << 14; // XPU_FUSE bit 1: both ranks fuse the exchange into the norm
     return w;
 }
 

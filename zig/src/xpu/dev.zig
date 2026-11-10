@@ -154,6 +154,7 @@ pub const Dev = struct {
         tp_add: ze.H = null, // the TP 2 all-reduce add (the 27B loads it, Sage has none)
         tp_add_flag: ze.H = null, // the TP 2 device-flag add (TF_TP_DEVFLAG, the 27B only)
         tp_norm_tp: ze.H = null, // the exchange fused into the residual add and norm (TF_TP_DEVFLAG)
+        tp_norm_peer: ze.H = null, // the device-direct exchange joined into the norm that follows (XPU_FUSE bit 1)
         tp_consume: ze.H = null, // the consumed counter and the ring's backpressure (TF_TP_DEVFLAG)
         attn_prompt: ze.H,
         attn_prompt8: ze.H,

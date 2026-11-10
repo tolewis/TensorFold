@@ -655,6 +655,30 @@ pub const Group = struct {
         d.settle();
     }
 
+    /// The device-direct exchange without the `tp_add` launch (XPU_FUSE bit 1): every step of allReduce's direct
+    /// branch, and the peer's partial stays in `pbuf[par]`. The caller launches the add and norm that follows with
+    /// that buffer as PEER, so the sum has the same bits as tp_add and the norm after it.
+    /// TP 3 and TP 4: the same steps and one pbuf a peer; the caller's kernel takes the N-1 peer partials.
+    pub fn allReducePeer(g: *Group, d: *Dev, partial: *anyopaque, rows: u32) !*anyopaque {
+        if (!g.direct) return error.NotDirect;
+        if (rows > rows_max) return error.TooManyRows;
+        const n: usize = @as(usize, rows) * D;
+        g.seq += 1;
+        const par: usize = @intCast(g.seq % 2);
+        try dev.copy(d, g.dslot[par], partial, n * 2);
+        d.settle();
+        g.counter(g.rank).store(g.seq, .seq_cst); // the counter and the liveness word are the rank's heartbeat
+        aliveWord(g, g.rank).store(@intFromFloat(q.now()), .release);
+        const w0: f64 = if (q.stat.on) q.now() else 0; // XPU_ROUND_STATS: the peer wait time
+        if (g.waitPeers()) |_| {} else |e| {
+            // the group is lost: this rank closes it and exits instead of waiting 180 s or serving broken rounds
+            waitGroupLost(g, e);
+        }
+        if (q.stat.on) q.stat.peer_s += q.now() - w0;
+        try dev.copy(d, g.pbuf[par], g.peer[par].?, n * 2); // over PCIe, on the in-order list
+        return g.pbuf[par];
+    }
+
     /// The mixer's exchange fused into the residual add and norm that reads the reduced tensor once
     /// (add_rmsnorm_dec_tp, TF_TP_DEVFLAG): the same bits as the separate add and norm. `partial` keeps the sum.
     pub fn allReduceNorm(g: *Group, d: *Dev, partial: *anyopaque, rows: u32, nrm: Norm) !void {
