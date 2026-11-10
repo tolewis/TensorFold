@@ -251,9 +251,10 @@ pub const Dev = struct {
             for (q.prof.events[0..q.prof.used], q.prof.kernel[0..q.prof.used]) |e, k| {
                 const t = try d.g.seconds(e);
                 try ze.check(d.g.api.zeEventHostReset(e));
-                for (&q.prof.names, &q.prof.total) |n, *tot| {
+                for (&q.prof.names, &q.prof.total, &q.prof.count) |n, *tot, *cnt| {
                     if (n.k == k) {
                         tot.* += t;
+                        cnt.* += 1; // one launch of this kernel in the synced window
                         break;
                     }
                 }
@@ -287,6 +288,7 @@ pub const Prof = struct {
     used: usize = 0,
     names: [96]struct { k: ze.H = null, name: []const u8 = "" } = @splat(.{}),
     total: [96]f64 = @splat(0),
+    count: [96]u64 = @splat(0), // launches a kernel, reset at each report
 };
 
 pub fn profReport(label: []const u8) void {
@@ -294,8 +296,9 @@ pub fn profReport(label: []const u8) void {
     var sum: f64 = 0;
     for (q.prof.total) |t| sum += t;
     std.debug.print("GPU time, {s}: {d:.1} ms\n", .{ label, sum * 1e3 });
-    for (q.prof.names, &q.prof.total) |n, *t| {
-        if (t.* > 0) std.debug.print("  {s:<14} {d:8.2} ms {d:5.1} %\n", .{ n.name, t.* * 1e3, t.* / sum * 100 });
+    for (q.prof.names, &q.prof.total, &q.prof.count) |n, *t, *c| {
+        if (t.* > 0) std.debug.print("  {s:<14} {d:8.2} ms {d:5.1} % {d:>8} launches\n", .{ n.name, t.* * 1e3, t.* / sum * 100, c.* });
         t.* = 0;
+        c.* = 0;
     }
 }
