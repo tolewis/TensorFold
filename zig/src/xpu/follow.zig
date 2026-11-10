@@ -17,9 +17,11 @@ pub fn run(r: *q.Runner) !void {
     // XPU_PROFILE: the follower's kernels a round, one table every N decode passes (XPU_ROUND_STATS a, 256)
     var prof_every: u32 = 256;
     var prof_passes: u32 = 0;
-    if (q.prof.on) if (std.c.getenv("XPU_ROUND_STATS")) |v| {
-        const every = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0;
-        if (every > 0) prof_every = every;
+    if (q.prof.on) {
+        if (std.c.getenv("XPU_ROUND_STATS")) |v| {
+            const every = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0;
+            if (every > 0) prof_every = every;
+        }
     }
     if (g.rank == 0) return error.NotAFollower;
     var snaps: std.AutoHashMapUnmanaged(u64, slot_states.Snap) = .empty;
