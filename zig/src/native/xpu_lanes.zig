@@ -675,6 +675,7 @@ pub const Lanes = struct {
         var na: usize = 0;
         var items: [16]xq.drafter.Block = undefined;
         var asked: [16]u32 = undefined;
+        var counts: [16]u32 = undefined;
         var reqs: [16]*const be.DraftRequest = undefined;
         var ni: usize = 0;
         var depth: u32 = 0;
@@ -692,8 +693,9 @@ pub const Lanes = struct {
             if (q.depth == 0 or ni == items.len) continue;
             items[ni] = .{ .slot = slot, .pending = if (q.rows != null) q.follow[q.follow.len - 1] else try b.value(q.first orelse return error.NoFirstToken) };
             asked[ni] = if (b.nodes == 0) q.depth else @min(q.depth, b.nodes); // XPU_TREE=0: chains of the asked depth
+            counts[ni] = @min(asked[ni], b.block - 1);
             reqs[ni] = &q;
-            depth = @max(depth, @min(asked[ni], b.block - 1));
+            depth = @max(depth, counts[ni]);
             ni += 1;
         }
         try b.absorb(which[0..na], ps[0..na]);
@@ -702,13 +704,14 @@ pub const Lanes = struct {
             try d.use(b.slotOf(q.stream).?);
             if (d.end() + 1 != q.position) return error.BadDraftPosition;
         };
-        try d.latticeMulti(items[0..ni], depth);
+        if (xq.drafter.ragged and ni > 1) try d.latticeRagged(items[0..ni], counts[0..ni]) else try d.latticeMulti(items[0..ni], depth);
         // each stream's best-first tree of its asked drafts over its lattice, with the target's keyed noise if sampled
         for (items[0..ni], asked[0..ni], reqs[0..ni], 0..) |it, n, q, i| {
             d.take(i);
             var noise: [16][xq.drafter.TOPK]f64 = undefined;
             const sp = q.stream.sampling;
-            if (sp) |x| for (0..depth) |dd| for (0..xq.drafter.TOPK) |j| {
+            const nd = if (xq.drafter.ragged) counts[i] else depth;
+            if (sp) |x| for (0..nd) |dd| for (0..xq.drafter.TOPK) |j| {
                 noise[dd][j] = -@log(-@log(lanes.sampling.uniform(x.seed, q.position + dd, d.cand[dd][j])));
             };
             if (n < TREE_MIN or b.nodes == 0) { // few drafts (or XPU_TREE=0): a chain goes deeper than a tree of siblings
