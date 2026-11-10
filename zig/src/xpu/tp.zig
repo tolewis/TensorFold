@@ -105,6 +105,7 @@ pub var group: ?Group = null;
 var one_slot = false;
 var trace = false;
 var devflag = false; // TF_TP_DEVFLAG: the device-flag all-reduce (default off)
+var evmode = false; // TF_TP_DEVFLAG=2: the flag wait is a counter based driver event, not a kernel poll
 
 /// A peer that dies in the handshake closes its end: without a timeout the surviving rank blocks in recvFds forever.
 /// 180 s matches every other deadline: the device-flag self test builds a kernel on the first open and the other rank
@@ -268,6 +269,13 @@ pub const Group = struct {
     /// generation, because a rank 0 that restarted replaced it.
     name: [*:0]const u8 = undefined,
     gen: u64 = 0,
+    /// The TF_TP_FLAGLAB socket (the handshake's conn, kept open by open): the lab steps on it at load.
+    lab_conn: linux.fd_t = -1,
+    /// TF_TP_DEVFLAG=2: the counter based events this rank's exchanges wait on (created an exchange, destroyed at
+    /// check after a settle has passed them), the driver's maximum completion value, and the event mode itself.
+    ev: bool = false,
+    evs: std.ArrayListUnmanaged(ze.H) = .empty,
+    ev_max: u64 = 0,
 
     /// The generation rank 0 published after it reset every shared word. 0: no rank has published one yet.
     fn genWord(g: *const Group) *std.atomic.Value(u64) {
@@ -387,7 +395,15 @@ pub const Group = struct {
         if (q.TP == 1) return null;
         one_slot = std.c.getenv("TF_TP_ONE_SLOT") != null;
         trace = std.c.getenv("TF_TP_TRACE") != null;
-        devflag = std.c.getenv("TF_TP_DEVFLAG") != null;
+        devflag = false;
+        evmode = false;
+        // TF_TP_DEVFLAG: 0 off, 1 the kernel poll, 2 the counter based event; unset is off. The value is parsed, so
+        // the WP1 rollback (TF_TP_DEVFLAG=0 in both env files) really turns the path off.
+        if (std.c.getenv("TF_TP_DEVFLAG")) |v| {
+            const s = std.mem.span(v);
+            if (s.len == 0 or s[0] != '0') devflag = true;
+            evmode = s.len > 0 and s[0] == '2';
+        }
         record_wait = 180.0;
         if (std.c.getenv("TF_TP_RECORD_WAIT")) |v| {
             const want = std.fmt.parseFloat(f64, std.mem.span(v)) catch 180.0;
@@ -404,12 +420,13 @@ pub const Group = struct {
         const size = hdr + q.TP * line + 2 * q.TP * slot_bytes + line + ring_len * @sizeOf(Rec);
         const sa = try sockAddr(base);
         var g: Group = undefined;
+        g.lab_conn = -1; // the rank branches re-initialize it from the field default; the early error paths must not read it
         var conn: linux.fd_t = -1;
         var sock: linux.fd_t = -1;
         // The handshake socket lives to the end of this function. A defer inside the rank branch would close it before
-        // sendFds, which was the W2 defect.
+        // sendFds, which was the W2 defect. TF_TP_FLAGLAB keeps it for the lab (lab_conn).
         defer {
-            if (conn >= 0) _ = linux.close(conn);
+            if (conn >= 0 and g.lab_conn != conn) _ = linux.close(conn);
         }
         defer {
             if (sock >= 0) {
@@ -481,6 +498,7 @@ pub const Group = struct {
                 g.direct = false;
             },
         };
+        if (std.c.getenv("TF_TP_FLAGLAB") != null or evmode) g.lab_conn = conn; // the lab steps on the socket at load; the event mode resets its words on it
         std.log.info("qwen27-xpu: TP {d} rank {d}: all-reduce {s}", .{ g.tp, g.rank, if (g.devflag) "device-flag (the peer's slot pushed over PCIe, the add polls a flag)" else if (g.direct) "device-direct (the peer's slots over PCIe)" else "host-staged" });
         return g;
     }
@@ -598,6 +616,14 @@ pub const Group = struct {
         lostAt(g, "rank {d}: all-reduce {d}: the group is lost ({s})\n", .{ g.rank, g.seq, @errorName(e) });
     }
 
+    /// TF_TP_DEVFLAG=2: a settle that a lost peer holds past the limit ends the process, as every other lost-group
+    /// path does, so the pair is restarted instead of holding the card.
+    fn lostSettle(rc: u32) void {
+        if (group) |*g| markClosed(g);
+        std.log.err("qwen27-xpu: a settle did not drain (Level Zero 0x{x}): the device-flag event's peer is lost, the process ends", .{rc});
+        std.process.exit(1);
+    }
+
     /// `partial` on the device holds `rows` x D fp16: on return it holds the ranks' sum. Every rank calls this the
     /// same number of times in the same order.
     pub fn allReduce(g: *Group, d: *Dev, partial: *anyopaque, rows: u32) !void {
@@ -605,6 +631,23 @@ pub const Group = struct {
         const n: usize = @as(usize, rows) * D;
         g.seq += 1;
         if (g.devflag) {
+            if (g.ev) { // TF_TP_DEVFLAG=2: the wait is a counter based event (spec WP1, "Second design")
+                if (g.seq > g.ev_max) try g.resetWords(d); // the completion value stays under the driver's maximum
+                const par: usize = @intCast(g.seq % 2);
+                g.stampAlive(); // the pair's liveness rule, as the host and device-direct paths stamp it
+                try g.pushEv(d, partial, n, par);
+                const fev = try g.newEvent(d, off(g.blk.?, blk_flag + par * 8), g.seq);
+                try d.launchEv(d.k.tp_add_flag, .{ .x = @intCast((n + 255) / 256) }, .{
+                    partial,                                   // out: this rank's partial, the sum lands here
+                    off(g.blk.?, par * slot_bytes),            // the peer's push, read after the event completes
+                    @as(i32, @intCast(n)),                     //
+                    off(g.blk.?, blk_flag + par * 8),          // the flag the peer wrote (tp_wait returns at once)
+                    g.seq,                                     //
+                    off(g.blk.?, blk_timeout),                 //
+                }, fev);
+                try g.consumeEv(d, par);
+                return;
+            }
             const par: usize = @intCast(g.seq % 2);
             try g.push(d, partial, n, par);
             try d.launch(d.k.tp_add_flag, .{ .x = @intCast((n + 255) / 256) }, .{
@@ -686,9 +729,15 @@ pub const Group = struct {
         if (rows > rows_max) return error.TooManyRows;
         const n: usize = @as(usize, rows) * D;
         g.seq += 1;
+        if (g.ev and g.seq > g.ev_max) try g.resetWords(d);
         const par: usize = @intCast(g.seq % 2);
-        try g.push(d, partial, n, par);
-        try d.launch(d.k.tp_norm_tp, .{ .x = rows }, .{
+        const fev: ze.H = if (g.ev) try g.newEvent(d, off(g.blk.?, blk_flag + par * 8), g.seq) else null;
+        if (g.ev) {
+            g.stampAlive();
+            try g.pushEv(d, partial, n, par);
+        } else try g.push(d, partial, n, par);
+        const groups: ze.GroupCount = .{ .x = rows };
+        const args = .{
             nrm.x,                                    // X fp32 residual
             partial,                                  // R fp16, keeps the sum
             off(g.blk.?, par * slot_bytes),           // the peer's push
@@ -707,8 +756,9 @@ pub const Group = struct {
             nrm.sa,                                   //
             nrm.ms,                                   //
             nrm.rot,                                  //
-        });
-        try g.consume(d, par);
+        };
+        if (g.ev) try d.launchEv(d.k.tp_norm_tp, groups, args, fev.?) else try d.launch(d.k.tp_norm_tp, groups, args);
+        if (g.ev) try g.consumeEv(d, par) else try g.consume(d, par);
     }
 
     /// Pushes this rank's partial into the peer's slot and then the flag, both on the in-order list: the peer's
@@ -735,6 +785,75 @@ pub const Group = struct {
         try dev.copy(d, off(g.peer_blk.?, blk_pcons + par * 8), off(g.own_cons.?, par * 8), 8);
     }
 
+    /// TF_TP_DEVFLAG=2: the push with the peer's consumption of this slot as a wait event on the first copy: the slot
+    /// is not overwritten until the peer read it (two slots, so a rank is at most one exchange ahead). The flag copy
+    /// follows on the in-order list, as in `push`.
+    fn pushEv(g: *Group, d: *Dev, partial: *anyopaque, n: usize, par: usize) !void {
+        const pb = g.peer_blk.?;
+        const need: u64 = if (g.seq >= 3) g.seq - 2 else 0; // the peer's consumed counter for this slot
+        if (q.stat.on) q.stat.copies += 1;
+        if (need > 0) {
+            const pev = try g.newEvent(d, off(g.blk.?, blk_pcons + par * 8), need);
+            var wa = [1]ze.H{pev};
+            try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, off(pb, par * slot_bytes), partial, n * 2, null, 1, &wa));
+        } else {
+            try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, off(pb, par * slot_bytes), partial, n * 2, null, 0, null));
+        }
+        const hi: usize = @intCast(g.seq % fh_ring);
+        g.fh[hi] = g.seq;
+        try dev.copy(d, off(pb, blk_flag + par * 8), @ptrCast(&g.fh[hi]), 8);
+    }
+
+    /// TF_TP_DEVFLAG=2: publish the consumed counter with the kernel's poll turned off (need 0 makes `tp_wait`
+    /// return at once), then push it into the peer's block. The next exchange's push waits for it with an event.
+    fn consumeEv(g: *Group, d: *Dev, par: usize) !void {
+        try d.launch(d.k.tp_consume, .{ .x = 1 }, .{
+            off(g.own_cons.?, par * 8),                 // this rank's consumed counter, pushed to the peer next
+            g.seq,                                      //
+            off(g.blk.?, blk_pcons + (1 - par) * 8),    // the peer's consumption of the slot the next exchange reuses
+            @as(u64, 0),                                // no wait in the kernel: the event does it
+            off(g.blk.?, blk_timeout),                  //
+        });
+        try dev.copy(d, off(g.peer_blk.?, blk_pcons + par * 8), off(g.own_cons.?, par * 8), 8);
+    }
+
+    /// TF_TP_DEVFLAG=2: a counter based event on `word` (this rank's device memory) that completes at `cv`. The
+    /// handle goes into `evs` and is destroyed at the next check, after a settle has passed it.
+    /// TP 3 and TP 4: the design is one event a peer, so N − 1 events a rank (3 at TP 4), each on that peer's flag
+    /// word with the sequence number as the completion value, and the adds of the peers' slots behind their events.
+    /// At 4 ranks the two-step sum (pairs (0,1) and (2,3), then (0,2) and (1,3)) needs 2 events a rank an exchange,
+    /// 2 copies and 2 waits, as spec WP1 states; at 3 ranks a rank reads N − 1 slots. This build's exchange is the
+    /// two-rank one (`openDirect` asks TP 2), so TP 3 and TP 4 keep the host path until WP7.
+    fn newEvent(g: *Group, d: *Dev, word: *anyopaque, cv: u64) !ze.H {
+        const cb = d.g.cbapi orelse return error.NoCounterBasedEvent;
+        const waddr: *u64 = @ptrCast(@alignCast(word));
+        var sync: ze.CbExternalSync = .{ .deviceAddress = waddr, .completionValue = cv };
+        var desc: ze.CbEventDesc = .{ .flags = 1, .signal = 2, .wait = 2 }; // immediate list; device scope on both sides
+        desc.pNext = &sync;
+        var ev: ze.H = null;
+        try ze.check(cb.zeEventCounterBasedCreate(d.g.context, d.g.device, &desc, &ev));
+        try g.evs.append(q.alloc, ev);
+        return ev;
+    }
+
+    /// TF_TP_DEVFLAG=2: both ranks reach this at the same exchange (the count is symmetric). The order: each rank
+    /// resets its own block's flag and peer-consumed words and its own consumed counters (a copy and a settle), then
+    /// one byte each way on the handshake socket, then the exchange pushes with sequence 1, so its event waits for
+    /// the peer's write of 1 (a completion value of 0 would be complete at once and the add would read a slot two
+    /// exchanges old). This runs before a completion value would pass the driver's maximum (2^32 − 1: about 12 days
+    /// of decode with no pause).
+    fn resetWords(g: *Group, d: *Dev) !void {
+        const zero = try d.g.hostAlloc(64);
+        @memset(@as([*]u8, @ptrCast(zero))[0..64], 0);
+        try labCopy(d, off(g.blk.?, blk_flag), zero, 32); // this rank's block: the flags and the peer-consumed words
+        try labCopy(d, g.own_cons.?, zero, 16);
+        try labCopy(d, off(g.peer_blk.?, blk_flag), zero, 32); // the flags and consumed counters this rank wrote there
+        var b: u8 = 1;
+        try sendByte(g.lab_conn, b);
+        try recvByte(g.lab_conn, &b); // the barrier: neither rank pushes before the other has reset
+        g.seq = 1; // this exchange's sequence, so its event waits for the peer's write of 1
+    }
+
     /// TF_TP_EXBENCH=1: at load, the cost of 128 exchanges (a round) at 1, 8, 16 and 32 rows in the group's
     /// mode. Both ranks run it, so the pair times as it does in a forward. The host waits a mode has are inside
     /// the figure, which is what the gate asks for.
@@ -757,6 +876,11 @@ pub const Group = struct {
     /// (the kernel spin cannot see the peer's host liveness word, so its timeout word is the only detector here).
     pub fn check(g: *Group, d: *Dev) !void {
         if (!g.devflag) return;
+        if (g.ev) { // the events of the exchanges a settle has passed are complete: give them back
+            for (g.evs.items) |e| _ = d.g.api.zeEventDestroy(e);
+            g.evs.clearRetainingCapacity();
+            return;
+        }
         var t: u32 = 0;
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &t, off(g.blk.?, blk_timeout), 4, null, 0, null));
         try d.sync();
@@ -802,14 +926,31 @@ pub const Group = struct {
             g.fh = @ptrCast(@alignCast(try d.g.hostAlloc(fh_ring * 8)));
             g.own_cons = try d.g.deviceAlloc(64);
             const list = try d.g.immediate(0, 0);
-            mode = if (try g.selfTest(d, list, conn)) 1 else 2;
+            // 1: the kernel poll (TF_TP_DEVFLAG=1); 3: the counter based event (TF_TP_DEVFLAG=2, needs the loader's
+            // event symbols); 2: the self test failed and both ranks take the host path.
+            mode = if (try g.selfTest(d, list, conn)) (if (evmode and d.g.cbapi != null) 3 else 1) else 2;
         }
         var peer_mode: u8 = 0;
         try sendByte(conn, mode);
         try recvByte(conn, &peer_mode);
-        if (mode == 1 and peer_mode == 1) {
+        if ((mode == 1 or mode == 3) and peer_mode == mode) {
             g.devflag = true;
             g.direct = true;
+            if (mode == 3) {
+                const cb = d.g.cbapi.?;
+                var maxv: u64 = 0;
+                if (cb.zeDeviceGetCounterBasedEventMaxValue(d.g.device, &maxv) != 0) maxv = std.math.maxInt(u32);
+                g.ev_max = maxv;
+                g.ev = true;
+                // the block stays resident, so the peer's writes into it are read by the event's counter
+                const rrc = cb.zeContextMakeMemoryResident(d.g.context, d.g.device, blk, blk_devflag_bytes);
+                if (rrc != 0) std.log.warn("qwen27-xpu: TP rank {d}: the block is not made resident (Level Zero 0x{x})", .{ g.rank, rrc });
+                // bounded time when the peer stops: a settle that a lost peer holds ends the process (the group's
+                // own deadline is 180 s; a round's settle is milliseconds and a prompt slice's is seconds)
+                dev.settle_ns = 60_000_000_000;
+                dev.lost = lostSettle;
+                std.log.info("qwen27-xpu: TP rank {d}: the device-flag wait is a counter based event (max value {d})", .{ g.rank, maxv });
+            }
             return;
         }
         if (mode != 0 or peer_mode != 0) {
@@ -860,6 +1001,272 @@ pub const Group = struct {
         if (!ok) std.log.warn("qwen27-xpu: TP rank {d}: the peer's block did not take the writes (flag 0x{x}, push 0x{x})", .{ g.rank, got_flag, got_push });
         return ok;
     }
+
+    /// TF_TP_FLAGLAB: the lab that shows which of the flag's writes a running kernel sees (H6, window p4w0: the
+    /// device-flag open and self test pass, the first flag wait never ends). Both ranks run it at load, in step
+    /// on the socket open kept for it (lab_conn): one rank is the waiter, the other the writer, and each
+    /// experiment runs twice, once a rank the waiter. The word under test is the flag word 0 (blk_flag) of the
+    /// waiter's block; E3 writes its own card's buffer instead. It prints one line a experiment and ends the
+    /// process. noE4 skips E4 (a give-up there takes about 20 s a kernel).
+    pub fn flagLab(g: *Group, d: *Dev, partial: *anyopaque) !void {
+        const P = "flaglab rank {d}: ";
+        const rank = g.rank;
+        const conn = g.lab_conn;
+        const forms = [_]i32{ 0, 1, 2 };
+        const out = try d.g.deviceAlloc(64); // the probe's result (four words)
+        const hout = try d.g.hostAlloc(64); // the host side of it
+        const hw = try d.g.hostAlloc(8); // the writer's word
+        const w64 = @as(*u64, @ptrCast(@alignCast(hw)));
+        const zero = try d.g.hostAlloc(64);
+        @memset(@as([*]u8, @ptrCast(zero))[0..64], 0);
+        var b: u8 = 0;
+
+        // E1: the write lands before the kernel starts. Expected: spins 0 (a kernel reads the peer's write at all).
+        // Zig 0.17 needs a block body for a nested loop (lane p4-cbwait: the base wrote `for (a) |x| for (b) |y| {`).
+        for (forms) |form| {
+            for (0..2) |i| {
+                const w: u32 = @intCast(i); // the waiter
+                if (rank == w) {
+                    try labCopy(d, off(g.blk.?, blk_flag), zero, 8); // the flag word to 0
+                    try sendByte(conn, 1);
+                } else {
+                    try recvByte(conn, &b);
+                    w64.* = 1;
+                    try labCopy(d, off(g.peer_blk.?, blk_flag), hw, 8);
+                    try sendByte(conn, 2);
+                }
+                if (rank == w) {
+                    try recvByte(conn, &b);
+                    const t0 = q.now();
+                    try labProbe(d, off(g.blk.?, blk_flag), 1, 1 << 24, form, out);
+                    d.settle();
+                    const o = try labOut(d, out, hout);
+                    std.debug.print(P ++ "E1 form {d} spins {d} last 0x{x} post 0x{x} gave {d} launch+settle {d:.2} ms\n", .{ rank, form, o[0], o[1], o[2], o[3], (q.now() - t0) * 1e3 });
+                }
+            }
+        }
+
+        // E2: the write lands while the kernel spins. The main experiment.
+        for (forms) |form| {
+            for (0..2) |i| {
+                const w: u32 = @intCast(i);
+                if (rank == w) {
+                    try labCopy(d, off(g.blk.?, blk_flag), zero, 8); // the flag word to 0
+                    try sendByte(conn, 1); // the reset is down
+                } else {
+                    try recvByte(conn, &b);
+                }
+                var t0: f64 = 0; // the probe's launch time (E2: the waiter's block ends before the print)
+                if (rank == w) {
+                    try labProbe(d, off(g.blk.?, blk_flag), 2, 1 << 28, form, out);
+                    t0 = q.now();
+                    try sendByte(conn, 2); // the probe runs
+                } else {
+                    try recvByte(conn, &b);
+                    var ts: std.c.timespec = .{ .sec = 0, .nsec = 200_000_000 };
+                    while (std.c.nanosleep(&ts, &ts) != 0) {} // the kernel runs
+                    w64.* = 2;
+                    try labCopy(d, off(g.peer_blk.?, blk_flag), hw, 8);
+                    try sendByte(conn, 3); // the write is down
+                }
+                if (rank == w) {
+                    try recvByte(conn, &b);
+                    const t1 = q.now();
+                    d.settle();
+                    const t2 = q.now();
+                    const o = try labOut(d, out, hout);
+                    std.debug.print(P ++ "E2 form {d} spins {d} last 0x{x} post 0x{x} gave {d} t1-t0 {d:.2} ms t2-t1 {d:.2} ms\n", .{ rank, form, o[0], o[1], o[2], o[3], (t1 - t0) * 1e3, (t2 - t1) * 1e3 });
+                    // E2b: a new kernel right after E2, no new write. Does it see what the spinning kernel did not?
+                    try labProbe(d, off(g.blk.?, blk_flag), 2, 1 << 16, form, out);
+                    d.settle();
+                    const o2 = try labOut(d, out, hout);
+                    std.debug.print(P ++ "E2b form {d} spins {d} last 0x{x} post 0x{x} gave {d}\n", .{ rank, form, o2[0], o2[1], o2[2], o2[3] });
+                }
+            }
+        }
+
+        // E3: the same on one card: a kernel spinning on a word its own card's copy engine writes. Both ranks run
+        // it at the same time, each alone (no socket).
+        const wbuf = try d.g.deviceAlloc(64); // the word (not exported)
+        const list2 = try d.g.immediate(1, 0); // the copy queue group, in order
+        for (forms) |form| {
+            try labCopy(d, wbuf, zero, 8); // the word to 0
+            try labProbe(d, wbuf, 3, 1 << 28, form, out);
+            var ts: std.c.timespec = .{ .sec = 0, .nsec = 200_000_000 };
+            while (std.c.nanosleep(&ts, &ts) != 0) {} // the kernel runs
+            w64.* = 3;
+            try ze.check(d.g.api.zeCommandListAppendMemoryCopy(list2, wbuf, hw, 8, null, 0, null));
+            const s0 = q.now();
+            try ze.check(d.g.api.zeCommandListHostSynchronize(list2, std.math.maxInt(u64)));
+            const s1 = q.now();
+            d.settle();
+            const o = try labOut(d, out, hout);
+            std.debug.print(P ++ "E3 form {d} spins {d} last 0x{x} post 0x{x} gave {d} copywait {d:.2} ms\n", .{ rank, form, o[0], o[1], o[2], o[3], (s1 - s0) * 1e3 });
+        }
+
+        // E5: the wait as a counter based driver event on the waiter's flag word (spec WP1, "Second design"). The
+        // event's counter is a word the application manages: the event is complete when the word is at or above the
+        // completion value, and a launch that waits for it starts only then. Variants: v2 the device word and a host
+        // word that never changes, v1 the device word only, v0 the device word with no wait scope. Each variant runs
+        // with rank 0 and then rank 1 as the waiter: E5a the word is written before the launch, E5b while the launch
+        // waits. E5c times one create plus destroy. A create that fails prints its rc and skips that exchange.
+        if (d.g.cbapi == null) {
+            std.debug.print(P ++ "E5 skipped: no counter based event symbols\n", .{rank});
+        } else {
+            const cb = d.g.cbapi.?;
+            var maxv: u64 = 0;
+            const mrc = cb.zeDeviceGetCounterBasedEventMaxValue(d.g.device, &maxv);
+            std.debug.print(P ++ "E5 max value rc 0x{x} value {d}\n", .{ rank, mrc, maxv });
+            const rrc = cb.zeContextMakeMemoryResident(d.g.context, d.g.device, g.blk.?, blk_devflag_bytes);
+            std.debug.print(P ++ "E5 make resident rc 0x{x} bytes {d}\n", .{ rank, rrc, blk_devflag_bytes });
+            const hhost = try d.g.hostAlloc(64); // v2's host word: set to 0 and never changed
+            @memset(@as([*]u8, @ptrCast(hhost))[0..64], 0);
+            const word = off(g.blk.?, blk_flag);
+            const peer_word = off(g.peer_blk.?, blk_flag);
+            for ([_]u32{ 2, 1, 0 }) |variant| for (0..2) |i| {
+                const w: u32 = @intCast(i); // the waiter
+                for ([_]bool{ true, false }) |pre| { // E5a (the write first) and E5b (the write while the launch waits)
+                    const want: u64 = if (pre) 5 else 6;
+                    var ev: ze.H = null;
+                    var skip = false;
+                    var t0: f64 = 0;
+                    var t1: f64 = 0;
+                    var s: u8 = 0;
+                    if (rank == w) {
+                        try labCopy(d, word, zero, 8); // the word to 0
+                        if (pre) {
+                            try sendByte(conn, 10); // the reset is down
+                            try recvByte(conn, &s); // the write is down
+                            ev = labE5Create(d, cb, variant, want, word, hhost, rank);
+                            skip = ev == null;
+                            try sendByte(conn, if (skip) @as(u8, 2) else 1); // go or skip
+                            if (!skip) {
+                                t0 = q.now();
+                                std.debug.print(P ++ "E5a v{d} launch\n", .{ rank, variant });
+                                try labE5Launch(d, ev.?, word, out);
+                            }
+                        } else {
+                            ev = labE5Create(d, cb, variant, want, word, hhost, rank);
+                            skip = ev == null;
+                            try sendByte(conn, if (skip) @as(u8, 2) else 1); // go or skip
+                            if (!skip) {
+                                std.debug.print(P ++ "E5b v{d} launch\n", .{ rank, variant });
+                                try labE5Launch(d, ev.?, word, out);
+                                t0 = q.now();
+                                try sendByte(conn, 3); // the launch is up
+                            }
+                        }
+                    } else {
+                        if (pre) {
+                            try recvByte(conn, &s); // the reset is down
+                            w64.* = want;
+                            try labCopy(d, peer_word, hw, 8);
+                            try sendByte(conn, 11); // the write is down
+                            try recvByte(conn, &s); // go or skip
+                            skip = s == 2;
+                        } else {
+                            try recvByte(conn, &s); // go or skip
+                            skip = s == 2;
+                            if (!skip) {
+                                try recvByte(conn, &s); // the launch is up
+                                var ts: std.c.timespec = .{ .sec = 0, .nsec = 200_000_000 };
+                                while (std.c.nanosleep(&ts, &ts) != 0) {} // the launch waits
+                                w64.* = want;
+                                try labCopy(d, peer_word, hw, 8);
+                                try sendByte(conn, 12); // the write is down
+                            }
+                        }
+                    }
+                    if (skip) continue;
+                    if (rank == w) {
+                        if (!pre) {
+                            try recvByte(conn, &s); // the write is down
+                            t1 = q.now();
+                        }
+                        const tw = q.now();
+                        const wrc = d.g.api.zeCommandListHostSynchronize(d.list, 5_000_000_000);
+                        const t2 = q.now();
+                        const stuck = wrc != 0;
+                        if (stuck) std.debug.print(P ++ "E5 v{d} not complete in 5 s t2-t1 {d:.2} ms\n", .{ rank, variant, (t2 - tw) * 1e3 });
+                        try sendByte(conn, if (stuck) @as(u8, 2) else 1); // ok or stuck
+                        try recvByte(conn, &s); // the writer's answer: the word again when stuck
+                        if (stuck) { // the wait may now end: no settle before the writer's write, or it would block here
+                            const wrc2 = d.g.api.zeCommandListHostSynchronize(d.list, std.math.maxInt(u64));
+                            const o2 = try labOut(d, out, hout);
+                            std.debug.print(P ++ "E5 v{d} second wait rc 0x{x} out1 {d}\n", .{ rank, variant, wrc2, o2[1] });
+                        } else if (pre) {
+                            const o = try labOut(d, out, hout);
+                            std.debug.print(P ++ "E5a v{d} wait rc 0x{x} out1 {d} launch+wait {d:.2} ms t2-t1 {d:.2} ms\n", .{ rank, variant, wrc, o[1], (tw - t0) * 1e3, (t2 - tw) * 1e3 });
+                        } else {
+                            const o = try labOut(d, out, hout);
+                            std.debug.print(P ++ "E5b v{d} wait rc 0x{x} out1 {d} t1-t0 {d:.2} ms t2-t1 {d:.2} ms\n", .{ rank, variant, wrc, o[1], (t1 - t0) * 1e3, (t2 - t1) * 1e3 });
+                            if (o[1] == 0) std.debug.print(P ++ "E5b v{d} out1 0: the driver did not hold the launch\n", .{ rank, variant });
+                        }
+                        _ = d.g.api.zeEventDestroy(ev.?);
+                    } else {
+                        try recvByte(conn, &s); // ok or stuck
+                        if (s == 2) {
+                            w64.* = want + 1;
+                            try labCopy(d, peer_word, hw, 8);
+                        }
+                        try sendByte(conn, 13); // the writer's answer
+                    }
+                }
+            };
+            // E5c: the cost of one create and destroy, each rank alone, v2 (1,000 events; the first rc that is not 0).
+            var total: f64 = 0;
+            var okc: u32 = 0;
+            var bad: u32 = 0;
+            var first_rc: u32 = 0;
+            for (0..1000) |_| {
+                const tc = q.now();
+                var evc: ze.H = null;
+                const waddr: *u64 = @ptrCast(@alignCast(word));
+                const haddr: *u64 = @ptrCast(@alignCast(hhost));
+                var sync: ze.CbExternalSync = .{ .deviceAddress = waddr, .hostAddress = haddr, .completionValue = 1 };
+                var desc: ze.CbEventDesc = .{ .flags = 1, .signal = 2, .wait = 2, .pNext = &sync };
+                const rc = cb.zeEventCounterBasedCreate(d.g.context, d.g.device, &desc, &evc);
+                if (rc != 0) {
+                    if (bad == 0) first_rc = rc;
+                    bad += 1;
+                    continue;
+                }
+                _ = d.g.api.zeEventDestroy(evc);
+                total += q.now() - tc;
+                okc += 1;
+            }
+            std.debug.print(P ++ "E5c v2 create+destroy {d} of 1000 ok, mean {d:.2} us, first bad rc 0x{x}\n", .{ rank, okc, if (okc > 0) total / @as(f64, @floatFromInt(okc)) * 1e6 else 0.0, first_rc });
+        }
+
+        // E4: the real protocol, from the state after selfTest: three all-reduces. noE4 skips it.
+        const no_e4: bool = if (std.c.getenv("TF_TP_FLAGLAB")) |v| std.mem.eql(u8, std.mem.span(v), "noE4") else false;
+        if (!no_e4) {
+            // The reset, as in selfTest: the flag words and the peer-consumed words of this rank's block (32 bytes
+            // from blk_flag), this rank's consumed counters, the timeout word, and g.seq.
+            try labCopy(d, off(g.blk.?, blk_flag), zero, 32);
+            try labCopy(d, g.own_cons.?, zero, 16);
+            try labCopy(d, off(g.blk.?, blk_timeout), zero, 4);
+            g.seq = 0;
+            try sendByte(conn, 4); // both ranks are reset
+            try recvByte(conn, &b);
+            const rb = try d.g.hostAlloc(48); // the timeout word (4) and the flag and consumed words (32)
+            for (0..3) |i| {
+                const t0 = q.now();
+                try g.allReduce(d, partial, 1);
+                d.settle();
+                const t1 = q.now();
+                try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, rb, off(g.blk.?, blk_timeout), 4, null, 0, null));
+                try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, off(rb, 4), off(g.blk.?, blk_flag), 32, null, 0, null));
+                d.settle();
+                const r4 = @as(*const [10]u32, @ptrCast(@alignCast(rb)));
+                std.debug.print(P ++ "E4 exchange {d} call+settle {d:.2} ms timeout 0x{x} flag0 0x{x} flag1 0x{x} pcons0 0x{x} pcons1 0x{x}\n", .{ rank, i, (t1 - t0) * 1e3, r4[0], r4[1], r4[2], r4[3], r4[4] });
+                try labCopy(d, off(g.blk.?, blk_timeout), zero, 4); // the timeout word to 0
+            }
+        }
+
+        std.debug.print(P ++ "done\n", .{rank});
+        std.process.exit(0);
+    }
 };
 
 const cmsg_space = ((@sizeOf(linux.cmsghdr) + 2 * 4 + 7) / 8) * 8; // a control message with two fds
@@ -874,6 +1281,55 @@ fn sendByte(sock: linux.fd_t, b: u8) !void {
     var v = [1]u8{b};
     const rc = linux.write(sock, &v, 1);
     if (failed(rc) or rc != 1) return error.ByteSend;
+}
+
+/// The flag lab: a copy on d.list, then a settle (as push and selfTest do).
+fn labCopy(d: *Dev, dst: *anyopaque, src: *anyopaque, n: usize) !void {
+    try dev.copy(d, dst, src, n);
+    d.settle();
+}
+
+/// The flag lab: queue the probe's four words to the host and settle; the values are good until the next launch
+/// into `out`.
+fn labOut(d: *Dev, out: *anyopaque, hout: *anyopaque) !*[4]u64 {
+    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, hout, out, 32, null, 0, null));
+    d.settle();
+    return @ptrCast(@alignCast(hout));
+}
+
+/// The flag lab: the spin probe (one group of 16, only global id 0 works). Five arguments: the pointer, the two
+/// u64 words, the i32 form, the pointer.
+fn labProbe(d: *Dev, p: *anyopaque, want: u64, max_spins: u64, form: i32, out: *anyopaque) !void {
+    try d.launch(d.k.tp_probe, .{ .x = 1 }, .{ p, want, max_spins, form, out });
+}
+
+/// The flag lab E5: a counter based event on `word` (device) with `host` as the external host word; null when the
+/// driver refuses the create (its rc is printed in hex).
+fn labE5Create(d: *Dev, cb: ze.CbApi, variant: u32, want: u64, word: *anyopaque, host: *anyopaque, rank: u32) ze.H {
+    const waddr: *u64 = @ptrCast(@alignCast(word));
+    const haddr: *u64 = @ptrCast(@alignCast(host));
+    var sync: ze.CbExternalSync = .{ .deviceAddress = waddr, .completionValue = want };
+    var desc: ze.CbEventDesc = .{ .flags = 1, .signal = 2, .wait = 2 }; // immediate lists; device scope on both sides
+    if (variant == 2 or variant == 0) sync.hostAddress = haddr;
+    if (variant == 0) desc.wait = 0;
+    desc.pNext = &sync;
+    var ev: ze.H = null;
+    const rc = cb.zeEventCounterBasedCreate(d.g.context, d.g.device, &desc, &ev);
+    std.debug.print("flaglab rank {d}: E5 event v{d} create rc 0x{x}\n", .{ rank, variant, rc });
+    if (rc != 0) return null;
+    return ev;
+}
+
+/// The flag lab E5: the probe launch that waits for the counter based event (no signal event, one wait event).
+fn labE5Launch(d: *Dev, ev: ze.H, word: *anyopaque, out: *anyopaque) !void {
+    try d.g.arg(d.k.tp_probe, 0, word);
+    try d.g.arg(d.k.tp_probe, 1, @as(u64, 0)); // want
+    try d.g.arg(d.k.tp_probe, 2, @as(u64, 0)); // max_spins
+    try d.g.arg(d.k.tp_probe, 3, @as(i32, 0)); // form
+    try d.g.arg(d.k.tp_probe, 4, out);
+    var groups: ze.GroupCount = .{ .x = 1 };
+    var wa = [1]ze.H{ev};
+    try ze.check(d.g.api.zeCommandListAppendLaunchKernel(d.list, d.k.tp_probe, &groups, null, 1, &wa));
 }
 
 fn recvByte(sock: linux.fd_t, b: *u8) !void {

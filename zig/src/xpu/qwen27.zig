@@ -449,6 +449,7 @@ pub const Runner = struct {
             .tp_norm_tp = try d.kernel(mg, "add_rmsnorm_dec_tp", 512),
             .tp_norm_peer = try d.kernel(mg, "add_rmsnorm_dec_peer", 512),
             .tp_consume = try d.kernel(mg, "tp_consume", 16),
+            .tp_probe = try d.kernel(mg, "tp_probe", 16),
             .attn_prompt = try d.kernel(md, "attn_prompt", 128),
             .attn_prompt8 = try d.kernel(md, "attn_prompt8", 128),
             .embed_dense = try d.kernel(mg, "embed_dense", 256),
@@ -506,9 +507,14 @@ pub const Runner = struct {
         try d.fill(r.acts.zeros, @as(u16, 0), maxRows() * GDN_V_HEADS * 128 * 2);
         try d.fill(r.acts.ones, @as(f32, 1.0), maxRows() * GDN_V_HEADS * 4);
         r.host_logits = try alloc.alloc(f32, VOCAB);
-        // TF_TP_EXBENCH=1: the exchange cost a round at 1, 8, 16 and 32 rows, in the mode the group opened in.
-        // Both ranks run it at load (the same count of exchanges), so the pair times as it does in a forward.
-        if (tp.group) |*g| if (std.c.getenv("TF_TP_EXBENCH") != null) try g.exchangeBench(d, r.acts.r);
+        // TF_TP_FLAGLAB=1: the flag lab (the socket open kept for it, lab_conn), just before the bench;
+        // it ends the process. noE4 skips the real-protocol exchanges.
+        if (tp.group) |*g| {
+            if (std.c.getenv("TF_TP_FLAGLAB") != null and g.devflag) try g.flagLab(d, r.acts.r);
+            // TF_TP_EXBENCH=1: the exchange cost a round at 1, 8, 16 and 32 rows, in the mode the group opened in.
+            // Both ranks run it at load (the same count of exchanges), so the pair times as it does in a forward.
+            if (std.c.getenv("TF_TP_EXBENCH") != null) try g.exchangeBench(d, r.acts.r);
+        }
         return r;
     }
 

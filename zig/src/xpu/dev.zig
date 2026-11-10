@@ -113,6 +113,10 @@ pub const Checkpoint = struct {
 /// A list that will not drain may still read or write host memory its callers free: the process ends (tests swap it).
 pub var lost: *const fn (rc: u32) void = exitLost;
 
+/// The limit of `settle` in ns (maxInt: none). The device-flag event mode sets it (TF_TP_DEVFLAG=2), so a launch
+/// that waits for a peer's word that never comes ends the process instead of holding the card.
+pub var settle_ns: u64 = std.math.maxInt(u64);
+
 fn exitLost(rc: u32) void {
     std.log.err("XPU: a command list did not drain (Level Zero 0x{x}): its copies may still use host memory, so the process ends", .{rc});
     std.process.exit(1);
@@ -156,6 +160,7 @@ pub const Dev = struct {
         tp_norm_tp: ze.H = null, // the exchange fused into the residual add and norm (TF_TP_DEVFLAG)
         tp_norm_peer: ze.H = null, // the device-direct exchange joined into the norm that follows (XPU_FUSE bit 1)
         tp_consume: ze.H = null, // the consumed counter and the ring's backpressure (TF_TP_DEVFLAG)
+        tp_probe: ze.H = null, // the flag lab spin probe (TF_TP_FLAGLAB)
         attn_prompt: ze.H,
         attn_prompt8: ze.H,
         embed_dense: ze.H,
@@ -195,7 +200,7 @@ pub const Dev = struct {
     /// Waits for every command on the list; callers settle before host memory a queued copy reads or writes goes.
     pub fn settle(d: *Dev) void {
         const t0: f64 = if (q.stat.on) q.now() else 0; // XPU_ROUND_STATS: the host wait time of this call
-        const rc = d.g.api.zeCommandListHostSynchronize(d.list, std.math.maxInt(u64));
+        const rc = d.g.api.zeCommandListHostSynchronize(d.list, settle_ns);
         if (rc != 0) lost(rc);
         if (q.stat.on) {
             q.stat.settles += 1;
@@ -250,6 +255,22 @@ pub const Dev = struct {
             q.prof.used += 1;
         }
         try ze.check(d.g.api.zeCommandListAppendLaunchKernel(d.list, k, &groups, ev, 0, null));
+    }
+
+    /// `launch` with one wait event: the launch starts only when the event is complete (TF_TP_DEVFLAG=2, the
+    /// counter based event on the peer's flag word). The signal event of a profile run is kept as `launch` keeps it.
+    pub fn launchEv(d: *Dev, k: ze.H, groups: ze.GroupCount, args: anytype, ev: ze.H) !void {
+        inline for (args, 0..) |a, i| try d.g.arg(k, i, a);
+        if (q.stat.on) q.stat.launches += 1;
+        var sig: ze.H = null;
+        if (q.prof.on) {
+            if (q.prof.used == q.prof.events.len) try d.sync();
+            sig = q.prof.events[q.prof.used];
+            q.prof.kernel[q.prof.used] = k;
+            q.prof.used += 1;
+        }
+        var wa = [1]ze.H{ev};
+        try ze.check(d.g.api.zeCommandListAppendLaunchKernel(d.list, k, &groups, sig, 1, &wa));
     }
 
     pub fn sync(d: *Dev) !void {
