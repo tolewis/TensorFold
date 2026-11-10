@@ -140,7 +140,7 @@ pub const Round = struct {
 pub fn treeRound(dr: *Drafter, pending: u32, depths: u32, nodes: u32, draw: ?Draw, out: *[MAXL]u32) !Round {
     const r = dr.r;
     const p0: u64 = r.pos;
-    const t0 = q.stat.on and q.now() or 0.0; // XPU_ROUND_STATS: the drafter pass of this round
+    const t0: f64 = if (q.stat.on) q.now() else 0; // XPU_ROUND_STATS: the drafter pass of this round
     try dr.lattice(pending, depths);
     var noise: [MAXL][TOPK]f64 = undefined;
     if (draw) |dw| for (0..depths) |dd| for (0..TOPK) |j| {
@@ -153,9 +153,9 @@ pub fn treeRound(dr: *Drafter, pending: u32, depths: u32, nodes: u32, draw: ?Dra
     var rows: [MAXL]i32 = undefined; // the tree in verified rows: row 0 the pending token
     rows[0] = 0;
     for (1..n + 1) |i| rows[i] = if (par[i] < 0) 0 else par[i] + 1;
-    const v0 = q.stat.on and q.now() or 0.0; // XPU_ROUND_STATS: the verify of the tree
+    const v0: f64 = if (q.stat.on) q.now() else 0; // XPU_ROUND_STATS: the verify of the tree
     const greedy = try r.verifyTree(ids[0 .. n + 1], rows[0 .. n + 1]);
-    const tv = q.stat.on and q.now() or 0.0;
+    const tv: f64 = if (q.stat.on) q.now() else 0;
     var path: [MAXL]u32 = undefined;
     path[0] = 0;
     var len: u32 = 1;

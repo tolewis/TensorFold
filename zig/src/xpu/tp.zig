@@ -624,7 +624,7 @@ pub const Group = struct {
             d.settle();
             g.counter(g.rank).store(g.seq, .seq_cst); // the counter and the liveness word are the rank's heartbeat
             aliveWord(g, g.rank).store(@intFromFloat(q.now()), .release);
-            const w0 = q.stat.on and q.now() or 0.0; // XPU_ROUND_STATS: the peer wait time
+            const w0: f64 = if (q.stat.on) q.now() else 0; // XPU_ROUND_STATS: the peer wait time
             if (g.waitPeers()) |_| {} else |e| {
                 // the group is lost: this rank closes it and exits instead of waiting 180 s or serving broken rounds
                 waitGroupLost(g, e);
@@ -639,7 +639,7 @@ pub const Group = struct {
         @memcpy(g.slot(g.rank, g.seq)[0..n], g.mine[0..n]);
         g.counter(g.rank).store(g.seq, .seq_cst); // the counter and the liveness word are the rank's heartbeat
         aliveWord(g, g.rank).store(@intFromFloat(q.now()), .release);
-        const w0 = q.stat.on and q.now() or 0.0; // XPU_ROUND_STATS: the peer wait time
+        const w0: f64 = if (q.stat.on) q.now() else 0; // XPU_ROUND_STATS: the peer wait time
         if (g.waitPeers()) |_| {} else |e| {
             // the group is lost: this rank closes it and exits instead of waiting 180 s or serving broken rounds
             waitGroupLost(g, e);

@@ -193,7 +193,7 @@ pub const Dev = struct {
 
     /// Waits for every command on the list; callers settle before host memory a queued copy reads or writes goes.
     pub fn settle(d: *Dev) void {
-        const t0 = q.stat.on and q.now() or 0.0; // XPU_ROUND_STATS: the host wait time of this call
+        const t0: f64 = if (q.stat.on) q.now() else 0; // XPU_ROUND_STATS: the host wait time of this call
         const rc = d.g.api.zeCommandListHostSynchronize(d.list, std.math.maxInt(u64));
         if (rc != 0) lost(rc);
         if (q.stat.on) {
