@@ -329,9 +329,9 @@ pub const Prof = struct {
     site_total: [16]f64 = @splat(0),
     site_count: [16]u64 = @splat(0),
     used: usize = 0,
-    names: [96]struct { k: ze.H = null, name: []const u8 = "" } = @splat(.{}),
-    total: [96]f64 = @splat(0),
-    count: [96]u64 = @splat(0), // launches a kernel, reset at each report
+    names: [192]struct { k: ze.H = null, name: []const u8 = "" } = @splat(.{}),
+    total: [192]f64 = @splat(0),
+    count: [192]u64 = @splat(0), // launches a kernel, reset at each report
 };
 
 pub fn profReport(label: []const u8) void {

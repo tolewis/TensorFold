@@ -194,6 +194,20 @@ pub fn gemm(d: *Dev, pscr: *anyopaque, h: *anyopaque, ahi: *anyopaque, alo: *any
     return gemmRows(d, pscr, h, ahi, alo, w, out, m, m > 16);
 }
 
+/// XPU_MV cold shadows (lane p4-k-mv): the weights of each call site in the order of their first launch.
+var mv_ring: [16][128]Proj = undefined;
+var mv_ring_n: [16]u32 = @splat(0);
+
+/// The place of `w` in the ring of its call site (a new W joins the ring). Null when the ring is full.
+fn mvRingIndex(site: usize, w: Proj) ?u32 {
+    const n = mv_ring_n[site];
+    for (mv_ring[site][0..n], 0..) |r, i| if (r.w == w.w) return @as(u32, @intCast(i));
+    if (n == mv_ring[site].len) return null;
+    mv_ring[site][n] = w;
+    mv_ring_n[site] = n + 1;
+    return n;
+}
+
 /// `gemm` with the path chosen by the caller: `wide`, the nGEN prompt GEMMs whatever the rows (a prompt's chunk).
 pub fn gemmRows(d: *Dev, pscr: *anyopaque, h: *anyopaque, ahi: *anyopaque, alo: *anyopaque, w: Proj, out: *anyopaque, m: u32, wide: bool) !void {
     const M: i32 = @intCast(m);
@@ -209,11 +223,26 @@ pub fn gemmRows(d: *Dev, pscr: *anyopaque, h: *anyopaque, ahi: *anyopaque, alo: 
     const ngen_narrow = if (g128) k.ngen_narrow_g128 else k.ngen_narrow;
     const mp: i32 = @intCast((m + 7) / 8 * 8);
     // XPU_MV shadows (lane p4-k-mv): timing launches of other kernels on this call's shape, the output to a scratch buffer
-    if (!wide and !g128) for (q.mv_shadow[@intFromEnum(q.prof.site)]) |sh| {
-        const shd = sh orelse break;
-        if (w.n % shd.div == 0 and @as(usize, m) * w.n * 2 <= q.mv_scratch_bytes)
-            try d.launch(shd.k, .{ .x = 1, .y = w.n / shd.div }, .{ h, w.w, w.s, w.bg, q.mv_scratch.?, M, N, K, ahi, alo, mp, G });
-    };
+    // A cold shadow (`@@`) reads the W of another layer of the site: slot j takes the layer (j + 1) x n / 16 places on
+    // in the ring of the site's n layers, so a W is read again after 4 layers at the earliest (64 layers).
+    const site = @intFromEnum(q.prof.site);
+    if (!wide and !g128 and q.mv_shadow[site][0] != null) {
+        const at = mvRingIndex(site, w);
+        const n = mv_ring_n[site];
+        const step = @max(1, n / 16);
+        for (q.mv_shadow[site], 0..) |sh, j| {
+            const shd = sh orelse break;
+            var ws = w;
+            if (shd.cold) {
+                const i = at orelse continue;
+                const t = (i + step * (@as(u32, @intCast(j)) + 1)) % n;
+                ws = mv_ring[site][t];
+                if (t == i or ws.n != w.n or ws.k != w.k or ws.gs != w.gs or ws.wide != w.wide) continue;
+            }
+            if (w.n % shd.div == 0 and @as(usize, m) * w.n * 2 <= q.mv_scratch_bytes)
+                try d.launch(shd.k, .{ .x = 1, .y = w.n / shd.div }, .{ h, ws.w, ws.s, ws.bg, q.mv_scratch.?, M, N, K, ahi, alo, mp, G });
+        }
+    }
     // XPU_MV (lane p4-k-mv): the pick of this call site (q.prof.site), for a shape its tile divides
     const pick: ?q.MvPick = if (!wide and !g128) q.mv_pick[@intFromEnum(q.prof.site)] else null;
     if (pick != null and pick.?.wide == w.wide and w.n % pick.?.div == 0) {

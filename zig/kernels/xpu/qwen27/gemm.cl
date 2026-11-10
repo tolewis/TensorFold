@@ -83,6 +83,10 @@ kernel void rowsum(global const half *A, global float *Asum, int M, int Mp, int 
 #define W4_WXY(j, kb) (int2)(n0 + 16 * (j), W4_WROW(kb))
 #define W4_ACOL(kb) ((kb) * 64)
 #define W4_DPAS_I(SG_M) ((SG_M) / 8)
+#define W4_WREAD(j, kb, dst) intel_sub_group_2d_block_read_32b_8r16x1c(W4_WSURF(j), W4_WXY(j, kb), dst)
+#define W4_PFA 1
+#define W4_T2N 2
+#define W4_TOUCH
 
 // Common body: one group g, DPAS partial sum, then acc += s*part + b*sum a; R rows per A read, PF prefetch.
 #define GROUP_STEP(SG_M, SG_N, R, READ_A, PF, g, acc) GROUP_STEP_B(SG_M, SG_N, R, READ_A, PF, 1, g, acc)
@@ -96,13 +100,13 @@ kernel void rowsum(global const half *A, global float *Asum, int M, int Mp, int 
       if (PF > 0 && kb + PF < K / 64) {                                                                              \
         for (int j = 0; j < SG_N / 16; j++)                                                                          \
           intel_sub_group_2d_block_prefetch_32b_8r16x1c(W4_WSURF(j), W4_WXY(j, kb + PF));                           \
-        for (int r = 0; r < SG_M / R; r++)                                                                           \
+        if (W4_PFA) for (int r = 0; r < SG_M / R; r++)                                                               \
           for (int h = 0; h < 2; h++)                                                                                \
             intel_sub_group_2d_block_prefetch_16b_8r16x2c((global void *)A, K * 2, M, K * 2, (int2)(W4_ACOL(kb + PF) + 32 * h, m0 + R * r)); \
       }                                                                                                              \
       uint w[SG_N / 16][8];                                                                                           \
       for (int j = 0; j < SG_N / 16; j++) {                                                                          \
-        intel_sub_group_2d_block_read_32b_8r16x1c(W4_WSURF(j), W4_WXY(j, kb), w[j]);                                 \
+        W4_WREAD(j, kb, w[j]);                                                                                       \
         if (u == 0) {                                                                                                \
           s[j] = (float)S[(g) * N + n0 + 16 * j + lane] * 16777216.0f;                                               \
           if (BIAS) b[j] = (float)B[(g) * N + n0 + 16 * j + lane];                                                   \
@@ -111,7 +115,8 @@ kernel void rowsum(global const half *A, global float *Asum, int M, int Mp, int 
       if (u == 0)                                                                                                    \
         for (int i = 0; i < SG_M / 8; i++)                                                                           \
           for (int j = 0; j < SG_N / 16; j++) part[i][j] = 0.0f;                                                     \
-      for (int t2 = 0; t2 < 2; t2++) {                                                                               \
+      W4_TOUCH                                                                                                       \
+      for (int t2 = 0; t2 < W4_T2N; t2++) {                                                                               \
         ushort ab[SG_M / R][2 * R];                                                                                  \
         for (int r = 0; r < SG_M / R; r++)                                                                           \
           READ_A((global void *)A, K * 2, M, K * 2, (int2)(W4_ACOL(kb) + t2 * 32, m0 + R * r), ab[r]);            \
@@ -383,3 +388,34 @@ W4K_KERNEL_SL(w4k1_wseq, 16, 32, 4, 16, READ16, 2, 1)
 #undef W4_WXY
 #define W4_WSURF(j) (global void *)W, N * 4, K / 8, N * 4
 #define W4_WXY(j, kb) (int2)(n0 + 16 * (j), W4_WROW(kb))
+
+// Window p4k3 (lane p4-k-mv). p8: prefetch 8 blocks ahead. pw: no prefetch of A. Both have the bits of w4k1_decode.
+W4K_KERNEL_SL(w4k1_p8, 16, 32, 4, 16, READ16, 8, 1)
+#undef W4_PFA
+#define W4_PFA 0
+W4K_KERNEL_SL(w4k1_pw, 16, 32, 4, 16, READ16, 2, 1)
+// Shadow-only probes. wt: the W stream alone (the block reads of W, no A read, no DPAS; the xor keeps the read alive).
+// wlt: the same stream with plain loads (16 uint a row a subgroup). wl: the full kernel with plain loads of W.
+#undef W4_T2N
+#define W4_T2N 0
+#undef W4_TOUCH
+#define W4_TOUCH                                                                                                     \
+  for (int j = 0; j < SG_N / 16; j++) {                                                                              \
+    uint x_ = 0;                                                                                                     \
+    for (int r_ = 0; r_ < 8; r_++) x_ ^= w[j][r_];                                                                   \
+    part[0][j] += (float8)((float)(x_ & 15u));                                                                       \
+  }
+W4K_KERNEL_SL(w4k1_wt, 16, 32, 4, 16, READ16, 2, 1)
+#undef W4_WREAD
+#define W4_WREAD(j, kb, dst)                                                                                         \
+  for (int r_ = 0; r_ < 8; r_++) (dst)[r_] = W[(long)(W4_WROW(kb) + r_) * N + n0 + 16 * (j) + lane]
+W4K_KERNEL_SL(w4k1_wlt, 16, 32, 4, 16, READ16, 2, 1)
+#undef W4_T2N
+#define W4_T2N 2
+#undef W4_TOUCH
+#define W4_TOUCH
+#undef W4_PFA
+#define W4_PFA 1
+W4K_KERNEL_SL(w4k1_wl, 16, 32, 4, 16, READ16, 2, 1)
+#undef W4_WREAD
+#define W4_WREAD(j, kb, dst) intel_sub_group_2d_block_read_32b_8r16x1c(W4_WSURF(j), W4_WXY(j, kb), dst)

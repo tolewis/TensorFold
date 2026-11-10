@@ -151,11 +151,15 @@ pub var gdn_bits: u32 = 0;
 /// same bits as the default. Default: no pick.
 /// A variant after an `@` (gate_up:@d64) is a shadow: the kernel runs before the site's own kernel and writes a scratch
 /// buffer. The model keeps its bits, and the row `mv_<variant>_<site>` holds the time of the variant on this shape.
-/// Up to 8 shadows a site, any variant on any site. `ref` and `nref` are the default wide and narrow kernels.
+/// Up to 16 shadows a site, any variant on any site. `ref` and `nref` are the default wide and narrow kernels.
+/// A launch that reads a W again within about 100 us gets it from a cache of the card (window p4k2), so only the
+/// first `@` shadow of a site is a cold time. `@@` is a cold shadow (gate_up:@@p4): it reads the W of another layer
+/// of the same site (forward.zig, mv_ring), so no launch reads a W that a launch read in the last milliseconds.
 /// w0, a0, wa0, h8 and wseq are probes with wrong results (gemm.cl), so they run as shadows only.
 pub const MvPick = struct { k: ze.H, div: u32, wide: bool };
 pub var mv_pick: [16]?MvPick = @splat(null);
-pub var mv_shadow: [16][8]?MvPick = @splat(@splat(null));
+pub const MvShadow = struct { k: ze.H, div: u32, cold: bool, name: []const u8 };
+pub var mv_shadow: [16][16]?MvShadow = @splat(@splat(null));
 pub var mv_scratch: ?*anyopaque = null;
 pub const mv_scratch_bytes: usize = 32 << 20;
 const MvVariant = struct { name: []const u8, row: []const u8, kernel: [*:0]const u8, local: u32, div: u32, wide: bool, bits: bool = false, probe: bool = false };
@@ -175,6 +179,11 @@ const mv_variants = [_]MvVariant{
     .{ .name = "wa0", .row = "mv_wa0", .kernel = "w4k1_wa0", .local = 64, .div = 128, .wide = true, .probe = true }, // no W and no A stream
     .{ .name = "h8", .row = "mv_h8", .kernel = "w4k1_h8", .local = 64, .div = 128, .wide = true, .probe = true }, // the DPAS of 8 rows
     .{ .name = "wseq", .row = "mv_wseq", .kernel = "w4k1_wseq", .local = 64, .div = 128, .wide = true, .probe = true }, // one W stream a 16-column block
+    .{ .name = "p8", .row = "mv_p8", .kernel = "w4k1_p8", .local = 64, .div = 128, .wide = true }, // prefetch 8 blocks ahead
+    .{ .name = "pw", .row = "mv_pw", .kernel = "w4k1_pw", .local = 64, .div = 128, .wide = true }, // no prefetch of A
+    .{ .name = "wl", .row = "mv_wl", .kernel = "w4k1_wl", .local = 64, .div = 128, .wide = true, .probe = true }, // plain loads of W
+    .{ .name = "wt", .row = "mv_wt", .kernel = "w4k1_wt", .local = 64, .div = 128, .wide = true, .probe = true }, // the W stream alone, block reads
+    .{ .name = "wlt", .row = "mv_wlt", .kernel = "w4k1_wlt", .local = 64, .div = 128, .wide = true, .probe = true }, // the W stream alone, plain loads
 };
 /// Int8 K/V cache (XPU_KV_INT8=1): 256 int8 per position and head, then float scales after MAX_CTX positions.
 pub var kv_i8 = false;
@@ -544,19 +553,26 @@ pub const Runner = struct {
                 const colon = std.mem.indexOfScalar(u8, pair, ':') orelse return error.BadMvPick;
                 const site = std.meta.stringToEnum(Site, pair[0..colon]) orelse return error.BadMvSite;
                 const shadow = pair.len > colon + 1 and pair[colon + 1] == '@';
-                const vname = pair[colon + 1 + @intFromBool(shadow) ..];
+                const cold = shadow and pair.len > colon + 2 and pair[colon + 2] == '@';
+                const vname = pair[colon + 1 + @intFromBool(shadow) + @intFromBool(cold) ..];
                 const v = for (mv_variants) |v| {
                     if (std.mem.eql(u8, v.name, vname)) break v;
                 } else return error.BadMvVariant;
                 if (v.probe and !shadow) return error.MvProbeIsShadowOnly;
                 const k = try d.kernel(mm, v.kernel, v.local);
-                const row: []const u8 = if (shadow) try std.fmt.allocPrint(alloc, "mv_{s}_{s}", .{ v.name, @tagName(site) }) else v.row;
+                var row: []const u8 = v.row;
                 if (shadow) {
                     if (mv_scratch == null) mv_scratch = try d.g.deviceAlloc(mv_scratch_bytes);
+                    var nth: u32 = 1; // a variant can run two times on a site (the control first and last): rows mv_ref_<site>, mv_ref2_<site>
                     const slot = for (&mv_shadow[@intFromEnum(site)]) |*sl| {
-                        if (sl.* == null) break sl;
+                        const other = sl.* orelse break sl;
+                        if (std.mem.eql(u8, other.name, v.name)) nth += 1;
                     } else return error.TooManyMvShadows;
-                    slot.* = .{ .k = k, .div = v.div, .wide = v.wide };
+                    slot.* = .{ .k = k, .div = v.div, .cold = cold, .name = v.name };
+                    row = if (nth == 1)
+                        try std.fmt.allocPrint(alloc, "mv_{s}_{s}", .{ v.name, @tagName(site) })
+                    else
+                        try std.fmt.allocPrint(alloc, "mv_{s}{d}_{s}", .{ v.name, nth, @tagName(site) });
                 } else mv_pick[@intFromEnum(site)] = .{ .k = k, .div = v.div, .wide = v.wide };
                 if (prof.on) {
                     const free = for (&prof.names) |*slot| {
@@ -565,7 +581,7 @@ pub const Runner = struct {
                     free.* = .{ .k = k, .name = row };
                 }
                 if (shadow)
-                    std.debug.print("mv: XPU_MV {s} shadow {s} ({s}), row {s}\n", .{ @tagName(site), v.name, std.mem.span(v.kernel), row })
+                    std.debug.print("mv: XPU_MV {s} {s}shadow {s} ({s}), row {s}\n", .{ @tagName(site), if (cold) "cold " else "", v.name, std.mem.span(v.kernel), row })
                 else
                     std.debug.print("mv: XPU_MV {s} on {s} ({s}){s}\n", .{ @tagName(site), v.name, std.mem.span(v.kernel), if (v.bits) ", the bits change: a timing probe" else "" });
             }
