@@ -232,16 +232,17 @@ pub const Store = struct {
         else
             s.victimBut(null, &.{}, 0);
         const at_ = i orelse return false;
-        if (!policy.extended(s, s.entries.items[at_]) and s.tryPark(at_, "least recently used")) {
+        const leaving = s.entries.items[at_];
+        if (!policy.extended(s, leaving) and s.tryPark(at_, "least recently used")) {
             s.forced += 1;
             return true;
         }
-        const leaving = s.entries.items[at_];
+        const j = s.indexOf(leaving) orelse return false;
         if (leaving.parked) {
             s.counts.park_drops += 1;
             s.logParkDrop(leaving.at, leaving.tier_bytes, "superseded by a kept state");
         }
-        s.remove(at_);
+        s.remove(j);
         s.noteEvict(.stream);
         s.forced += 1;
         return true;
@@ -367,6 +368,12 @@ pub const Store = struct {
         return true;
     }
 
+    /// Where `e` sits after a tier drop has moved the entries before it.
+    fn indexOf(s: *const Store, e: *Entry) ?usize {
+        for (s.entries.items, 0..) |item, i| if (item == e) return i;
+        return null;
+    }
+
     /// Parks the victim when the tier can take it. The entry stays, and it holds no pool page.
     fn tryPark(s: *Store, i: usize, reason: []const u8) bool {
         if (!s.tierOn()) return false;
@@ -385,16 +392,34 @@ pub const Store = struct {
     }
 
     /// The victim leaves the pool. The tier parks it when it can. A superseded state is dropped.
+    /// A failed park looks the victim up again: making tier room may have removed an earlier entry.
     fn depart(s: *Store, i: usize, prompt: []const u32, born: u32, bytes_short: bool) void {
+        const e = s.entries.items[i];
         const reason = policy.victimReason(s, i, prompt, born);
         if (std.mem.indexOf(u8, reason, "superseded") == null and s.tryPark(i, reason)) return;
-        const e = s.entries.items[i];
+        const j = s.indexOf(e) orelse return;
         if (e.parked) {
             s.counts.park_drops += 1;
             s.logParkDrop(e.at, e.tier_bytes, reason);
         } else evicted(e.at, s.freedOf(e), reason);
-        s.remove(i);
+        s.remove(j);
         s.noteEvict(whyOf(reason, bytes_short));
+    }
+
+    /// Parked states this new state supersedes leave now, even when the budget has room. A borrowed one stays.
+    fn dropParkedSubsumed(s: *Store, prompt: []const u32, born: u32, at: u32) void {
+        var i: usize = 0;
+        while (i < s.entries.items.len) {
+            const other = s.entries.items[i];
+            if (!other.parked or !policy.subsumes(s, prompt, born, at, other)) {
+                i += 1;
+                continue;
+            }
+            s.counts.park_drops += 1;
+            s.logParkDrop(other.at, other.tier_bytes, "superseded by the state this pass keeps");
+            s.remove(i);
+            s.noteEvict(.superseded);
+        }
     }
 
     /// What the budget leaves past the kept states and the spare storage: a family readies storage only inside it.
@@ -701,6 +726,7 @@ pub const Store = struct {
             }
             s.depart(victim, prompt, born, bytes_short); // a superseded victim is dropped; another may park
         }
+        s.dropParkedSubsumed(prompt, born, at);
         if (s.entries.items.len == 0) if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| bytes);
         const e = s.gpa.create(Entry) catch return s.fail(at, error.OutOfMemory);
         const tokens = s.gpa.dupe(u32, prompt[0..n]) catch {

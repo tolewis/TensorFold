@@ -175,6 +175,8 @@ const Snaps = struct {
         .copy_ms = copyMs,
     };
     fn vtable() *const api.prompt_cache.Snapshots.VTable {
+        // Rank 0 decides. A follower replays save_slot, restore_slot and drop_snap and does not call these hooks.
+        if (xq.RANK != 0) return &plain;
         if (xq.park_on and xq.keep_pages) return &parking;
         return if (xq.keep_pages) &counted else &plain;
     }

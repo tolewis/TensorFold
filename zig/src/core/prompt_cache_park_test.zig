@@ -170,6 +170,111 @@ test "park: a new state that supersedes a parked one drops it" {
     try std.testing.expect(s.counts.park_drops >= 1);
 }
 
+test "park: a failed park after a tier drop removes the victim, not its neighbour" {
+    const gpa = std.testing.allocator;
+    var f: Shared = .{ .gpa = gpa, .page = 64 };
+    defer f.deinit();
+    var s = open(&f, 10_000, 64);
+    defer s.deinit();
+    s.most = 2;
+    var a: [65]u32 = undefined;
+    var b: [65]u32 = undefined;
+    var c: [65]u32 = undefined;
+    var d: [65]u32 = undefined;
+    fill(&a, 1);
+    fill(&b, 1000);
+    fill(&c, 2000);
+    fill(&d, 3000);
+    try f.grow(64);
+    try std.testing.expect(s.keep(&a, 64, null, &.{}, &.{}));
+    f.resetLive();
+    try f.grow(64);
+    try std.testing.expect(s.keep(&b, 64, null, &.{}, &.{}));
+    f.resetLive();
+    try f.grow(64);
+    try std.testing.expect(s.keep(&c, 64, null, &.{}, &.{}));
+    try std.testing.expect(s.find(&a, &.{}, &.{}).?.parked);
+    f.fail_park = true;
+    f.resetLive();
+    try f.grow(64);
+    try std.testing.expect(s.keep(&d, 64, null, &.{}, &.{}));
+    try std.testing.expect(s.find(&a, &.{}, &.{}) == null);
+    try std.testing.expect(s.find(&b, &.{}, &.{}) == null);
+    try std.testing.expect(!s.find(&c, &.{}, &.{}).?.parked);
+    try std.testing.expect(s.find(&d, &.{}, &.{}) != null);
+    try std.testing.expectEqual(@as(u64, 1), s.counts.parks);
+}
+
+test "park: a borrowed parked state holds the tier and the victim itself leaves" {
+    const gpa = std.testing.allocator;
+    var f: Shared = .{ .gpa = gpa, .page = 64 };
+    defer f.deinit();
+    var s = open(&f, 10_000, 128);
+    defer s.deinit();
+    s.most = 2;
+    var a: [65]u32 = undefined;
+    var b: [65]u32 = undefined;
+    var c: [129]u32 = undefined;
+    var d: [65]u32 = undefined;
+    var e: [65]u32 = undefined;
+    fill(&a, 1);
+    fill(&b, 1000);
+    fill(&c, 2000);
+    fill(&d, 3000);
+    fill(&e, 4000);
+    try f.grow(64);
+    try std.testing.expect(s.keep(&a, 64, null, &.{}, &.{}));
+    f.resetLive();
+    try f.grow(64);
+    try std.testing.expect(s.keep(&b, 64, null, &.{}, &.{}));
+    f.resetLive();
+    try f.grow(128);
+    try std.testing.expect(s.keep(&c, 128, null, &.{}, &.{}));
+    try std.testing.expect(s.find(&a, &.{}, &.{}).?.parked);
+    f.resetLive();
+    try f.grow(64);
+    try std.testing.expect(s.keep(&d, 64, null, &.{}, &.{}));
+    try std.testing.expect(s.find(&b, &.{}, &.{}).?.parked);
+    s.find(&b, &.{}, &.{}).?.borrowers = 1;
+    f.resetLive();
+    try f.grow(64);
+    try std.testing.expect(s.keep(&e, 64, null, &.{}, &.{}));
+    try std.testing.expect(s.find(&a, &.{}, &.{}) == null);
+    try std.testing.expect(s.find(&b, &.{}, &.{}).?.parked);
+    try std.testing.expect(s.find(&c, &.{}, &.{}) == null);
+    try std.testing.expect(!s.find(&d, &.{}, &.{}).?.parked);
+    try std.testing.expect(s.find(&e, &.{}, &.{}) != null);
+    try std.testing.expectEqual(@as(u64, 2), s.counts.parks);
+}
+
+test "park: a new state drops a parked state it supersedes when nothing is short" {
+    const gpa = std.testing.allocator;
+    var f: Shared = .{ .gpa = gpa, .page = 64 };
+    defer f.deinit();
+    var s = open(&f, 1_000_000, 10_000);
+    defer s.deinit();
+    s.most = 1;
+    var prompt: [129]u32 = undefined;
+    var other: [65]u32 = undefined;
+    fill(&prompt, 1);
+    fill(&other, 1000);
+    try f.grow(64);
+    try std.testing.expect(s.keep(prompt[0..65], 64, null, &.{}, &.{}));
+    f.resetLive();
+    try f.grow(64);
+    try std.testing.expect(s.keep(&other, 64, null, &.{}, &.{}));
+    try std.testing.expect(s.find(prompt[0..65], &.{}, &.{}).?.parked);
+    s.most = 100;
+    f.resetLive();
+    try f.grow(128);
+    try std.testing.expect(s.keep(&prompt, 128, null, &.{}, &.{}));
+    try std.testing.expect(s.find(prompt[0..65], &.{}, &.{}) == null);
+    try std.testing.expectEqual(@as(u32, 128), s.find(&prompt, &.{}, &.{}).?.at);
+    try std.testing.expect(s.find(&other, &.{}, &.{}) != null);
+    try std.testing.expect(s.counts.park_drops >= 1);
+    try std.testing.expectEqual(@as(u64, 0), s.tier_used);
+}
+
 test "park: with the tier off, a short budget still drops the least recently used state" {
     const gpa = std.testing.allocator;
     var f: Shared = .{ .gpa = gpa, .page = 64 };

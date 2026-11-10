@@ -219,6 +219,7 @@ pub const Shared = struct {
     kept_pages: u32 = 0,
     live: std.ArrayList(u32) = .empty, // the stream's page table
     at: u32 = 0,
+    fail_park: bool = false, // the next park hook returns an error and changes nothing
 
     const State = struct {
         ids: []u32,
@@ -364,6 +365,7 @@ pub const Shared = struct {
 
     fn parkFn(ptr: *anyopaque, saved: Saved) anyerror!f64 {
         const f = of(ptr);
+        if (f.fail_park) return error.ParkFailed;
         const st: *State = @ptrCast(@alignCast(saved));
         if (st.parked) return 0;
         st.held_ids = try f.gpa.dupe(u32, st.ids);
