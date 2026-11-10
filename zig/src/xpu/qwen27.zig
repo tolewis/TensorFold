@@ -203,6 +203,24 @@ const k1_probes = [_]K1Probe{
     .{ .name = "nqi", .row = "k1_nqi", .kernel = "attn_k1_nqi" }, // QK with a constant in place of the Q read
     .{ .name = "nx", .row = "k1_nx", .kernel = "attn_k1_nx" }, // no exp2
 };
+/// XPU_NORM_SHADOW=ref,n0,... (lane p4-k-norm, default off): timing launches of the norm probes (glue.cl, NORM_OLD
+/// and NORM_NEW) before each add_rmsnorm_dec launch. They write scratch buffers, so the model keeps its bits. The
+/// row `nm_<name>` of the profile holds the time of the probe. `ref` is the body of add_rmsnorm_dec (the control).
+pub var norm_shadow: [12]?ze.H = @splat(null);
+const NormProbe = struct { name: []const u8, row: []const u8, kernel: [*:0]const u8, local: u32 };
+const norm_probes = [_]NormProbe{
+    .{ .name = "ref", .row = "nm_ref", .kernel = "norm_ref", .local = 512 },
+    .{ .name = "n0", .row = "nm_n0", .kernel = "norm_n0", .local = 512 }, // the launch alone, 32 threads a row
+    .{ .name = "nb", .row = "nm_nb", .kernel = "norm_nb", .local = 512 }, // up to the first barrier
+    .{ .name = "nt", .row = "nm_nt", .kernel = "norm_nt", .local = 512 }, // no row sums
+    .{ .name = "b32", .row = "nm_b32", .kernel = "norm_b32", .local = 512 }, // block loads, 32 threads a row
+    .{ .name = "b16", .row = "nm_b16", .kernel = "norm_b16", .local = 256 },
+    .{ .name = "b8", .row = "nm_b8", .kernel = "norm_b8", .local = 128 },
+    .{ .name = "b4", .row = "nm_b4", .kernel = "norm_b4", .local = 64 },
+    .{ .name = "b8r", .row = "nm_b8r", .kernel = "norm_b8r", .local = 128 }, // the second loop reads X again
+    .{ .name = "b4r", .row = "nm_b4r", .kernel = "norm_b4r", .local = 64 },
+    .{ .name = "z4", .row = "nm_z4", .kernel = "norm_z4", .local = 64 }, // the launch alone, 4 threads a row
+};
 /// Int8 K/V cache (XPU_KV_INT8=1): 256 int8 per position and head, then float scales after MAX_CTX positions.
 pub var kv_i8 = false;
 /// Rotated weights (`hadamard128` in the checkpoint): every GEMM input is rotated by blocks of 128 where it is made.
@@ -627,6 +645,25 @@ pub const Runner = struct {
                     free.* = .{ .k = k, .name = v.row };
                 }
                 std.debug.print("k1: XPU_K1_SHADOW {s} ({s}), row {s}\n", .{ v.name, std.mem.span(v.kernel), v.row });
+            }
+        }
+        if (std.c.getenv("XPU_NORM_SHADOW")) |ks| { // lane p4-k-norm: one line a rank and a probe, the check of the flag
+            var it = std.mem.tokenizeScalar(u8, std.mem.span(ks), ',');
+            var n: usize = 0;
+            while (it.next()) |name| : (n += 1) {
+                const v = for (norm_probes) |v| {
+                    if (std.mem.eql(u8, v.name, name)) break v;
+                } else return error.BadNormProbe;
+                if (n == norm_shadow.len) return error.TooManyNormShadows;
+                const k = try d.kernel(mg, v.kernel, v.local);
+                norm_shadow[n] = k;
+                if (prof.on) {
+                    const free = for (&prof.names) |*slot| {
+                        if (slot.name.len == 0) break slot;
+                    } else return error.NoProfileRowLeft;
+                    free.* = .{ .k = k, .name = v.row };
+                }
+                std.debug.print("norm: XPU_NORM_SHADOW {s} ({s}), row {s}\n", .{ v.name, std.mem.span(v.kernel), v.row });
             }
         }
         const prof_on = prof.on;
