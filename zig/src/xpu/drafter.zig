@@ -21,6 +21,9 @@ pub const WIN = 2047; // context rows a block row sees (sliding_window − 1)
 /// XPU_DRAFT_WIN=N (1 .. WIN, default WIN, lane p40-roundcost): a block row sees only the last N context rows. Less
 /// attention work a round, fewer accepted drafts if the model needs the far rows. Off: WIN, the stored window.
 pub var win: u32 = WIN;
+/// XPU_DRAFT_RAGGED=1 (read once, default off): a batched lattice gives each block its own row count, so the
+/// verify rows stay at or below the decode GEMM's 16 rows. Off: every block has the same length (latticeMulti).
+pub var ragged: bool = false;
 
 /// The first context row a block row at `end` reads: the last `w` rows, none before `start`.
 pub fn windowStart(end: u32, start: u32, w: u32) u32 {
@@ -334,6 +337,8 @@ pub const Drafter = struct {
         }
         win = try parseWin(if (std.c.getenv("XPU_DRAFT_WIN")) |v| std.mem.span(v) else null);
         if (win != WIN) std.debug.print("drafter window: the last {d} context rows (XPU_DRAFT_WIN)\n", .{win});
+        if (std.c.getenv("XPU_DRAFT_RAGGED")) |v| ragged = v.len > 0 and v[0] == '1';
+        if (ragged) std.debug.print("drafter: ragged blocks (XPU_DRAFT_RAGGED)\n", .{});
         dr.logits = try d.alloc_(MAXB * @as(usize, dr.head.n) * 2);
         // XPU_PROFILE: the drafter's own kernels get a place in the table (they are not in the target's kernel list)
         if (q.prof.on) inline for (@typeInfo(@TypeOf(dr.k)).@"struct".field_names) |name| {
@@ -473,7 +478,14 @@ pub const Drafter = struct {
 
     /// One block of `count` + 1 rows a slot in one pass; take(i) makes block i's lattice the current one.
     pub fn latticeMulti(dr: *Drafter, items: []const Block, count: u32) !void {
-        try dr.run(items, count);
+        try dr.run(items, count, null);
+    }
+
+    /// XPU_DRAFT_RAGGED: each block b has counts[b] + 1 rows, in item order, `R` the sum (≤ MAXB).
+    pub fn latticeRagged(dr: *Drafter, items: []const Block, counts: []const u32) !void {
+        var count: u32 = 0;
+        for (counts) |c| count = @max(count, c);
+        try dr.run(items, count, counts);
     }
 
     pub fn take(dr: *Drafter, i: usize) void {
@@ -528,27 +540,48 @@ pub const Drafter = struct {
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, dr.ptrs_dev, &dr.ptrs_host, LAYERS * MAXS * 16, null, 0, null));
     }
 
-    fn run(dr: *Drafter, items: []const Block, count: u32) !void {
+    fn run(dr: *Drafter, items: []const Block, count: u32, counts: ?[]const u32) !void {
         const d = &dr.r.d;
-        const L = count + 1;
+        const L: u32 = count + 1;
         const S: u32 = @intCast(items.len);
-        const R = S * L;
-        if (S == 0 or S > MAXS or R > MAXB or L > MAXL) return error.TooManyRows;
         const one = S == 1;
+        const rag = counts != null and !one;
+        var offs: [MAXS]u32 = undefined;
+        var R: u32 = 0;
+        if (rag) {
+            const cs = counts.?;
+            if (cs.len != items.len) return error.TooManyRows;
+            for (cs, 0..) |c, b| {
+                const lb = c + 1;
+                if (lb > MAXL) return error.TooManyRows;
+                offs[b] = R;
+                R += lb;
+            }
+        } else {
+            if (L > MAXL) return error.TooManyRows;
+            for (0..S) |b| {
+                offs[b] = R;
+                R += L;
+            }
+        }
+        if (S == 0 or S > MAXS or R > MAXB) return error.TooManyRows;
         var tokens: [MAXB]i32 = undefined;
         for (items, 0..) |it, b| {
-            tokens[b * L] = @intCast(it.pending);
-            for (1..L) |i| tokens[b * L + i] = MASK_ID;
+            const lb: u32 = if (rag) counts.?[b] + 1 else L;
+            tokens[offs[b]] = @intCast(it.pending);
+            for (1..lb) |i| tokens[offs[b] + i] = MASK_ID;
             if (one) continue;
             try dr.use(it.slot);
             const c = dr.ctx();
             const c0: i32 = @intCast(windowStart(c.end, c.start, win));
-            for (0..L) |i| dr.rows_host[b * L + i] = .{ @intCast(c.end + i), c0, @intCast(c.end), @intCast(b) };
+            const tag: i32 = if (rag) @intCast(@as(u32, @intCast(b)) | (lb << 8)) else @intCast(b);
+            for (0..lb) |i| dr.rows_host[offs[b] + i] = .{ @intCast(c.end + i), c0, @intCast(c.end), tag };
             for (0..LAYERS) |li| dr.ptrs_host[li][b] = .{ @intFromPtr(c.kc[li]), @intFromPtr(c.vc[li]) };
         }
         if (one) try dr.use(items[0].slot) else try dr.tables(R);
         const nul: ?*anyopaque = null;
         const rows_t: ?*anyopaque = if (one) nul else dr.rows_dev;
+        const drows_t: ?*anyopaque = if (rag) dr.rows_dev else nul; // dconv's block starts only with ragged rows
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, dr.ids, &tokens, R * 4, null, 0, null));
         errdefer d.settle(); // tokens and sp live in this frame: an error returns only once the queue is idle
         const m = &dr.r.model;
@@ -561,20 +594,20 @@ pub const Drafter = struct {
             const ptrs_t: ?*anyopaque = if (one) nul else q.off(dr.ptrs_dev, li * MAXS * 16);
             try d.launch(d.k.add_rmsnorm, .{ .x = R }, .{ dr.x, dr.r16, l.in_norm, dr.h, dr.ahi, dr.alo, @as(i32, D), HIDDEN_NORM_EPS, @as(i32, 0), @as(i32, GS), q.no_q8, q.no_q8, @as(i32, 0), @as(i32, 0) });
             try q.gemm(d, dr.pscr, dr.h, dr.ahi, dr.alo, l.kp_attn, dr.dyn, R);
-            try d.launch(dr.k.dconv, .{ .x = R, .y = D / 512 }, .{ dr.h, dr.dyn, @as(i32, @intCast(l.kp_attn.n)), l.base_attn, @as(i32, 0), dr.x, @as(i32, 0), dr.h2, dr.ahi, dr.alo, l32 });
+            try d.launch(dr.k.dconv, .{ .x = R, .y = D / 512 }, .{ dr.h, dr.dyn, @as(i32, @intCast(l.kp_attn.n)), l.base_attn, @as(i32, 0), dr.x, @as(i32, 0), dr.h2, dr.ahi, dr.alo, l32, drows_t });
             try q.gemm(d, dr.pscr, dr.h2, dr.ahi, dr.alo, l.qkv, dr.p, R);
             try d.launch(dr.k.dprep, .{ .x = R, .y = 48 }, .{ dr.p, @as(i32, @intCast(l.qkv.n)), @as(i32, 0), l.qn, l.kn, dr.invf, dr.qb, kc, vc, @as(i32, CAP), end_, HIDDEN_NORM_EPS, rows_t, ptrs_t });
             try d.launch(dr.k.dattn, .{ .x = R, .y = NKV }, .{ dr.qb, kc, vc, @as(i32, CAP), c0, end_, l32, @as(i32, @intCast(win)), @as(f32, 1.0 / @sqrt(@as(f32, HD))), dr.o, rows_t, ptrs_t });
             try d.launch(dr.k.rowsums_rows, .{ .x = R }, .{ dr.o, @as(i32, NH * HD), dr.ahi, dr.alo });
             try q.gemm(d, dr.pscr, dr.o, dr.ahi, dr.alo, l.o, dr.r16, R);
-            try d.launch(dr.k.dconv, .{ .x = R, .y = D / 512 }, .{ dr.r16, dr.dyn, @as(i32, @intCast(l.kp_attn.n)), l.base_attn, @as(i32, 1), dr.x, @as(i32, 1), dr.h2, dr.ahi, dr.alo, l32 });
+            try d.launch(dr.k.dconv, .{ .x = R, .y = D / 512 }, .{ dr.r16, dr.dyn, @as(i32, @intCast(l.kp_attn.n)), l.base_attn, @as(i32, 1), dr.x, @as(i32, 1), dr.h2, dr.ahi, dr.alo, l32, drows_t });
             try d.launch(d.k.add_rmsnorm, .{ .x = R }, .{ dr.x, dr.r16, l.post_norm, dr.h, dr.ahi, dr.alo, @as(i32, D), HIDDEN_NORM_EPS, @as(i32, 0), @as(i32, GS), q.no_q8, q.no_q8, @as(i32, 0), @as(i32, 0) });
             try q.gemm(d, dr.pscr, dr.h, dr.ahi, dr.alo, l.kp_mlp, dr.dyn, R);
-            try d.launch(dr.k.dconv, .{ .x = R, .y = D / 512 }, .{ dr.h, dr.dyn, @as(i32, @intCast(l.kp_mlp.n)), l.base_mlp, @as(i32, 0), dr.x, @as(i32, 0), dr.h2, dr.ahi, dr.alo, l32 });
+            try d.launch(dr.k.dconv, .{ .x = R, .y = D / 512 }, .{ dr.h, dr.dyn, @as(i32, @intCast(l.kp_mlp.n)), l.base_mlp, @as(i32, 0), dr.x, @as(i32, 0), dr.h2, dr.ahi, dr.alo, l32, drows_t });
             try q.gemm(d, dr.pscr, dr.h2, dr.ahi, dr.alo, l.gu, dr.p, R);
             try d.launch(d.k.swiglu, .{ .x = R, .y = (FF + 1023) / 1024 }, .{ dr.p, dr.h2, dr.ahi, dr.alo, @as(i32, GS), @as(i32, 0), @as(i32, 0), @as(i32, FF) });
             try q.gemm(d, dr.pscr, dr.h2, dr.ahi, dr.alo, l.down, dr.r16, R);
-            try d.launch(dr.k.dconv, .{ .x = R, .y = D / 512 }, .{ dr.r16, dr.dyn, @as(i32, @intCast(l.kp_mlp.n)), l.base_mlp, @as(i32, 1), dr.x, @as(i32, 1), dr.h2, dr.ahi, dr.alo, l32 });
+            try d.launch(dr.k.dconv, .{ .x = R, .y = D / 512 }, .{ dr.r16, dr.dyn, @as(i32, @intCast(l.kp_mlp.n)), l.base_mlp, @as(i32, 1), dr.x, @as(i32, 1), dr.h2, dr.ahi, dr.alo, l32, drows_t });
         }
         // a block's rows 1 .. L − 1: final norm, selector projection, head over the two spans, top 16
         const first: u32 = if (one) 1 else 0;
@@ -592,8 +625,9 @@ pub const Drafter = struct {
         try d.sync();
         for (0..S) |b| {
             const x = &dr.multi[b];
-            for (0..count) |depth| {
-                const row = if (one) depth else b * L + 1 + depth;
+            const cnt: u32 = if (rag) counts.?[b] else count;
+            for (0..cnt) |depth| {
+                const row = if (one) depth else offs[b] + 1 + depth;
                 var bv: [TOPK]f32 = @splat(-std.math.inf(f32));
                 var bi: [TOPK]i32 = @splat(std.math.maxInt(i32));
                 for (0..256 * 16) |j| {
@@ -616,7 +650,7 @@ pub const Drafter = struct {
                 }
                 @memcpy(x.sp[depth * RANK ..][0..RANK], sp[row * RANK ..][0..RANK]);
             }
-            x.depths = count;
+            x.depths = cnt;
         }
     }
 };

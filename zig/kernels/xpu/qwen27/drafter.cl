@@ -35,11 +35,18 @@ static void rowsums(local const half *hl, int K, global half *AHI, global half *
 }
 
 // Two-tap grouped dynamic causal convolution in the block, y[r] = bf16(x[r]*k0 + x[r-1]*k1); RES adds to the residual.
+// With ROWS (ragged blocks): a row is first in its block when its position equals its block start.
 KERNEL(512) void dconv(global const half *X, global const half *DYN, int DS, global const ushort *BASE, int branch,
-                       global float *RES, int has_res, global half *H, global half *AHI, global half *ALO, int L) {
+                       global float *RES, int has_res, global half *H, global half *AHI, global half *ALO, int L,
+                       global const int4 *ROWS) {
   local half hl[512];
   const int r = get_group_id(0), blk = get_group_id(1), c = blk * 512 + get_local_id(0), g = c / 16;
-  const float x = (float)X[(long)r * D + c], prev = r % L > 0 ? (float)X[(long)(r - 1) * D + c] : 0.0f;
+  const float x = (float)X[(long)r * D + c];
+  float prev = 0.0f;
+  if (ROWS) {
+    const int4 ri = ROWS[r];
+    if (ri.x != ri.z) prev = (float)X[(long)(r - 1) * D + c];
+  } else if (r % L > 0) prev = (float)X[(long)(r - 1) * D + c];
   const float d0 = (float)DYN[(long)r * DS + (branch * 2) * 320 + g], d1 = (float)DYN[(long)r * DS + (branch * 2 + 1) * 320 + g];
   const float k0 = rbf(bf2f(BASE[(branch * 2) * D + c]) + d0), k1 = rbf(bf2f(BASE[(branch * 2 + 1) * D + c]) + d1);
   const float y = rbf(x * k0 + prev * k1);
@@ -75,8 +82,8 @@ KERNEL(16) void dprep(global const half *P, int PS, int qoff, global const ushor
   if (ROWS) {                                         // several sequences: the row's position and its caches
     const int4 ri = ROWS[r];
     at = ri.x;
-    KC = (global ushort *)PTRS[ri.w * 2];
-    VC = (global ushort *)PTRS[ri.w * 2 + 1];
+    KC = (global ushort *)PTRS[(ri.w & 255) * 2];
+    VC = (global ushort *)PTRS[(ri.w & 255) * 2 + 1];
   }
   const float pos = (float)at;
   if (hh >= NH + NKV) {                              // v
@@ -115,8 +122,10 @@ KERNEL(16) void dattn(global const ushort *Q, global const ushort *KC, global co
     p = ri.x;
     c0 = ri.y;
     bs = ri.z;
-    KC = (global const ushort *)PTRS[ri.w * 2];
-    VC = (global const ushort *)PTRS[ri.w * 2 + 1];
+    const int lb = ri.w >> 8;                         // a ragged block's length; 0: the uniform L
+    if (lb > 0) L = lb;
+    KC = (global const ushort *)PTRS[(ri.w & 255) * 2];
+    VC = (global const ushort *)PTRS[(ri.w & 255) * 2 + 1];
   }
   float q[4][8], o[4][8], m[4], l[4];
   for (int a = 0; a < 4; a++) {
