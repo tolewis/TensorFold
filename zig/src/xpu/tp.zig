@@ -954,7 +954,7 @@ pub const Group = struct {
             @memset(@as([*]u8, @ptrCast(hhost))[0..64], 0);
             const word = off(g.blk.?, blk_flag);
             const peer_word = off(g.peer_blk.?, blk_flag);
-            const w64 = @as(*u64, @ptrCast(hw));
+            const w64 = @as(*u64, @ptrCast(@alignCast(hw)));
             for ([_]u32{ 2, 1, 0 }) |variant| for (0..2) |i| {
                 const w: u32 = @intCast(i); // the waiter
                 for ([_]bool{ true, false }) |pre| { // E5a (the write first) and E5b (the write while the launch waits)
@@ -1065,7 +1065,7 @@ pub const Group = struct {
                 total += q.now() - tc;
                 okc += 1;
             }
-            std.debug.print(P ++ "E5c v2 create+destroy {d} of 1000 ok, mean {d:.2} us, first bad rc 0x{x}\n", .{ rank, okc, if (okc > 0) total / @as(f64, @floatFromInt(okc)) * 1e6 else 0, first_rc });
+            std.debug.print(P ++ "E5c v2 create+destroy {d} of 1000 ok, mean {d:.2} us, first bad rc 0x{x}\n", .{ rank, okc, if (okc > 0) total / @as(f64, @floatFromInt(okc)) * 1e6 else 0.0, first_rc });
         }
 
         // E4: the real protocol, from the state after selfTest: three all-reduces. noE4 skips it.
