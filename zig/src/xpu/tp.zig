@@ -935,6 +935,139 @@ pub const Group = struct {
             std.debug.print(P ++ "E3 form {d} spins {d} last 0x{x} post 0x{x} gave {d} copywait {d:.2} ms\n", .{ rank, form, o[0], o[1], o[2], o[3], (s1 - s0) * 1e3 });
         }
 
+        // E5: the wait as a counter based driver event on the waiter's flag word (spec WP1, "Second design"). The
+        // event's counter is a word the application manages: the event is complete when the word is at or above the
+        // completion value, and a launch that waits for it starts only then. Variants: v2 the device word and a host
+        // word that never changes, v1 the device word only, v0 the device word with no wait scope. Each variant runs
+        // with rank 0 and then rank 1 as the waiter: E5a the word is written before the launch, E5b while the launch
+        // waits. E5c times one create plus destroy. A create that fails prints its rc and skips that exchange.
+        if (d.g.cbapi == null) {
+            std.debug.print(P ++ "E5 skipped: no counter based event symbols\n", .{rank});
+        } else {
+            const cb = d.g.cbapi.?;
+            var maxv: u64 = 0;
+            const mrc = cb.zeDeviceGetCounterBasedEventMaxValue(d.g.device, &maxv);
+            std.debug.print(P ++ "E5 max value rc 0x{x} value {d}\n", .{ rank, mrc, maxv });
+            const rrc = cb.zeContextMakeMemoryResident(d.g.context, d.g.device, g.blk.?, blk_devflag_bytes);
+            std.debug.print(P ++ "E5 make resident rc 0x{x} bytes {d}\n", .{ rank, rrc, blk_devflag_bytes });
+            const hhost = try d.g.hostAlloc(64); // v2's host word: set to 0 and never changed
+            @memset(@as([*]u8, @ptrCast(hhost))[0..64], 0);
+            const word = off(g.blk.?, blk_flag);
+            const peer_word = off(g.peer_blk.?, blk_flag);
+            const w64 = @as(*u64, @ptrCast(hw));
+            for ([_]u32{ 2, 1, 0 }) |variant| for (0..2) |i| {
+                const w: u32 = @intCast(i); // the waiter
+                for ([_]bool{ true, false }) |pre| { // E5a (the write first) and E5b (the write while the launch waits)
+                    const want: u64 = if (pre) 5 else 6;
+                    var ev: ze.H = null;
+                    var skip = false;
+                    var t0: f64 = 0;
+                    var t1: f64 = 0;
+                    var s: u8 = 0;
+                    if (rank == w) {
+                        try labCopy(d, word, zero, 8); // the word to 0
+                        if (pre) {
+                            try sendByte(conn, 10); // the reset is down
+                            try recvByte(conn, &s); // the write is down
+                            ev = labE5Create(d, cb, variant, want, word, hhost, rank);
+                            skip = ev == null;
+                            try sendByte(conn, if (skip) @as(u8, 2) else 1); // go or skip
+                            if (!skip) {
+                                t0 = q.now();
+                                std.debug.print(P ++ "E5a v{d} launch\n", .{ rank, variant });
+                                try labE5Launch(d, ev.?, word, out);
+                            }
+                        } else {
+                            ev = labE5Create(d, cb, variant, want, word, hhost, rank);
+                            skip = ev == null;
+                            try sendByte(conn, if (skip) @as(u8, 2) else 1); // go or skip
+                            if (!skip) {
+                                std.debug.print(P ++ "E5b v{d} launch\n", .{ rank, variant });
+                                try labE5Launch(d, ev.?, word, out);
+                                t0 = q.now();
+                                try sendByte(conn, 3); // the launch is up
+                            }
+                        }
+                    } else {
+                        if (pre) {
+                            try recvByte(conn, &s); // the reset is down
+                            w64.* = want;
+                            try labCopy(d, peer_word, hw, 8);
+                            try sendByte(conn, 11); // the write is down
+                            try recvByte(conn, &s); // go or skip
+                            skip = s == 2;
+                        } else {
+                            try recvByte(conn, &s); // go or skip
+                            skip = s == 2;
+                            if (!skip) {
+                                try recvByte(conn, &s); // the launch is up
+                                std.time.sleep(200 * std.time.MilliSecond); // the launch waits
+                                w64.* = want;
+                                try labCopy(d, peer_word, hw, 8);
+                                try sendByte(conn, 12); // the write is down
+                            }
+                        }
+                    }
+                    if (skip) continue;
+                    if (rank == w) {
+                        if (!pre) {
+                            try recvByte(conn, &s); // the write is down
+                            t1 = q.now();
+                        }
+                        const tw = q.now();
+                        const wrc = d.g.api.zeCommandListHostSynchronize(d.list, 5_000_000_000);
+                        const t2 = q.now();
+                        const o = try labOut(d, out, hout);
+                        if (pre) {
+                            std.debug.print(P ++ "E5a v{d} wait rc 0x{x} out1 {d} launch+wait {d:.2} ms t2-t1 {d:.2} ms\n", .{ rank, variant, wrc, o[1], (tw - t0) * 1e3, (t2 - tw) * 1e3 });
+                        } else {
+                            std.debug.print(P ++ "E5b v{d} wait rc 0x{x} out1 {d} t1-t0 {d:.2} ms t2-t1 {d:.2} ms\n", .{ rank, variant, wrc, o[1], (t1 - t0) * 1e3, (t2 - t1) * 1e3 });
+                        }
+                        const stuck = wrc != 0;
+                        if (stuck) std.debug.print(P ++ "E5 v{d} not complete in 5 s\n", .{ rank, variant });
+                        try sendByte(conn, if (stuck) @as(u8, 2) else 1); // ok or stuck
+                        try recvByte(conn, &s); // the writer's answer
+                        if (stuck) { // the writer wrote the word again: the wait can end
+                            const wrc2 = d.g.api.zeCommandListHostSynchronize(d.list, std.math.maxInt(u64));
+                            const o2 = try labOut(d, out, hout);
+                            std.debug.print(P ++ "E5 v{d} second wait rc 0x{x} out1 {d}\n", .{ rank, variant, wrc2, o2[1] });
+                        }
+                        _ = d.g.api.zeEventDestroy(ev.?);
+                    } else {
+                        try recvByte(conn, &s); // ok or stuck
+                        if (s == 2) {
+                            w64.* = want + 1;
+                            try labCopy(d, peer_word, hw, 8);
+                        }
+                        try sendByte(conn, 13); // the writer's answer
+                    }
+                }
+            };
+            // E5c: the cost of one create and destroy, each rank alone, v2 (1,000 events; the first rc that is not 0).
+            var total: f64 = 0;
+            var okc: u32 = 0;
+            var bad: u32 = 0;
+            var first_rc: u32 = 0;
+            for (0..1000) |_| {
+                const tc = q.now();
+                var evc: ze.H = null;
+                const waddr: *u64 = @ptrCast(@alignCast(word));
+                const haddr: *u64 = @ptrCast(@alignCast(hhost));
+                var sync: ze.CbExternalSync = .{ .deviceAddress = waddr, .hostAddress = haddr, .completionValue = 1 };
+                var desc: ze.CbEventDesc = .{ .flags = 1, .signal = 2, .wait = 2, .pNext = &sync };
+                const rc = cb.zeEventCounterBasedCreate(d.g.context, d.g.device, &desc, &evc);
+                if (rc != 0) {
+                    if (bad == 0) first_rc = rc;
+                    bad += 1;
+                    continue;
+                }
+                _ = d.g.api.zeEventDestroy(evc);
+                total += q.now() - tc;
+                okc += 1;
+            }
+            std.debug.print(P ++ "E5c v2 create+destroy {d} of 1000 ok, mean {d:.2} us, first bad rc 0x{x}\n", .{ rank, okc, if (okc > 0) total / @as(f64, @floatFromInt(okc)) * 1e6 else 0, first_rc });
+        }
+
         // E4: the real protocol, from the state after selfTest: three all-reduces. noE4 skips it.
         const no_e4: bool = if (std.c.getenv("TF_TP_FLAGLAB")) |v| std.mem.eql(u8, std.mem.span(v), "noE4") else false;
         if (!no_e4) {
@@ -998,6 +1131,35 @@ fn labOut(d: *Dev, out: *anyopaque, hout: *anyopaque) !*[4]u64 {
 /// u64 words, the i32 form, the pointer.
 fn labProbe(d: *Dev, p: *anyopaque, want: u64, max_spins: u64, form: u32, out: *anyopaque) !void {
     try d.launch(d.k.tp_probe, .{ .x = 1 }, .{ p, want, max_spins, @as(i32, form), out });
+}
+
+/// The flag lab E5: a counter based event on `word` (device) with `host` as the external host word; null when the
+/// driver refuses the create (its rc is printed in hex).
+fn labE5Create(d: *Dev, cb: ze.CbApi, variant: u32, want: u64, word: *anyopaque, host: *anyopaque, rank: u32) ze.H {
+    const waddr: *u64 = @ptrCast(@alignCast(word));
+    const haddr: *u64 = @ptrCast(@alignCast(host));
+    var sync: ze.CbExternalSync = .{ .deviceAddress = waddr, .completionValue = want };
+    var desc: ze.CbEventDesc = .{ .flags = 1, .signal = 2, .wait = 2 }; // immediate lists; device scope on both sides
+    if (variant == 2 or variant == 0) sync.hostAddress = haddr;
+    if (variant == 0) desc.wait = 0;
+    desc.pNext = &sync;
+    var ev: ze.H = null;
+    const rc = cb.zeEventCounterBasedCreate(d.g.context, d.g.device, &desc, &ev);
+    std.debug.print("flaglab rank {d}: E5 event v{d} create rc 0x{x}\n", .{ rank, variant, rc });
+    if (rc != 0) return null;
+    return ev;
+}
+
+/// The flag lab E5: the probe launch that waits for the counter based event (no signal event, one wait event).
+fn labE5Launch(d: *Dev, ev: ze.H, word: *anyopaque, out: *anyopaque) !void {
+    try d.g.arg(d.k.tp_probe, 0, word);
+    try d.g.arg(d.k.tp_probe, 1, @as(u64, 0)); // want
+    try d.g.arg(d.k.tp_probe, 2, @as(u64, 0)); // max_spins
+    try d.g.arg(d.k.tp_probe, 3, @as(i32, 0)); // form
+    try d.g.arg(d.k.tp_probe, 4, out);
+    var groups: ze.GroupCount = .{ .x = 1 };
+    var wa = [1]ze.H{ev};
+    try ze.check(d.g.api.zeCommandListAppendLaunchKernel(d.list, d.k.tp_probe, &groups, null, 1, &wa));
 }
 
 fn recvByte(sock: linux.fd_t, b: *u8) !void {

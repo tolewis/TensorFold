@@ -95,6 +95,20 @@ pub const GraphApi = struct {
     zeCommandListAppendGraphExt: *const fn (H, H, ?*const anyopaque, H, u32, ?[*]H) callconv(.c) u32,
 };
 
+/// The counter based event entries (spec WP1, "Second design"): the wait as a driver event on a word the
+/// application manages. Resolved apart from `Api`, because a loader on another host can be older: a missing symbol
+/// leaves the table null and the engine opens as before.
+pub const CbApi = struct {
+    zeEventCounterBasedCreate: *const fn (H, H, *const CbEventDesc, *H) callconv(.c) u32, // context, device, desc, out event
+    zeDeviceGetCounterBasedEventMaxValue: *const fn (H, *u64) callconv(.c) u32, // device, out max
+    zeContextMakeMemoryResident: *const fn (H, H, ?*anyopaque, usize) callconv(.c) u32, // context, device, ptr, size
+};
+/// ze_event_counter_based_desc_t. flags 1 = for immediate command lists. signal and wait are ze_event_scope_flags_t
+/// (2 = device scope).
+pub const CbEventDesc = extern struct { stype: u32 = 0x0002003A, pNext: ?*const anyopaque = null, flags: u32 = 1, signal: u32 = 0, wait: u32 = 0 };
+/// ze_event_counter_based_external_sync_allocation_desc_t, passed as pNext of CbEventDesc.
+pub const CbExternalSync = extern struct { stype: u32 = 0x0002003B, pNext: ?*const anyopaque = null, deviceAddress: ?*u64 = null, hostAddress: ?*u64 = null, completionValue: u64 = 0 };
+
 pub const DeviceProperties = extern struct {
     stype: u32 = 0x00020006, // ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES_1_2: timerResolution in cycles per second
     pNext: ?*anyopaque = null,
@@ -183,10 +197,21 @@ pub fn resolve(comptime Table: type, lib: *std.DynLib) Error!Table {
     return api;
 }
 
+/// `resolve` without the print: an optional table whose missing symbol leaves it null (CbApi on an older loader).
+pub fn resolveOptional(comptime Table: type, lib: *std.DynLib) ?Table {
+    var api: Table = undefined;
+    const info = @typeInfo(Table).@"struct";
+    inline for (info.field_names, info.field_types) |name, T| {
+        @field(api, name) = lib.lookup(T, name) orelse return null;
+    }
+    return api;
+}
+
 /// The loader, a context and the first device whose PCI id is `device_id`.
 pub const Gpu = struct {
     lib: std.DynLib,
     api: Api,
+    cbapi: ?CbApi = null, // the counter based event entries; null on a loader that lacks them
     driver: H,
     device: H,
     context: H,
@@ -253,6 +278,7 @@ pub const Gpu = struct {
         var lib = std.DynLib.open("libze_loader.so.1") catch return error.LoaderUnavailable;
         errdefer lib.close();
         const api = try resolve(Api, &lib);
+        const cbapi = resolveOptional(CbApi, &lib); // the flag lab's E5 only; null is not an error
         try check(api.zeInit(1)); // ZE_INIT_FLAG_GPU_ONLY
         var nd: u32 = 8;
         var drivers: [8]H = @splat(null);
@@ -271,7 +297,7 @@ pub const Gpu = struct {
                 }
                 var ctx: H = null;
                 try check(api.zeContextCreate(drv, &.{}, &ctx));
-                return .{ .lib = lib, .api = api, .driver = drv, .device = dev, .context = ctx, .props = p };
+                return .{ .lib = lib, .api = api, .cbapi = cbapi, .driver = drv, .device = dev, .context = ctx, .props = p };
             }
         }
         return error.NoDevice;
