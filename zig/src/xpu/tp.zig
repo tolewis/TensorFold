@@ -960,7 +960,6 @@ pub const Group = struct {
             @memset(@as([*]u8, @ptrCast(hhost))[0..64], 0);
             const word = off(g.blk.?, blk_flag);
             const peer_word = off(g.peer_blk.?, blk_flag);
-            const w64 = @as(*u64, @ptrCast(@alignCast(hw)));
             for ([_]u32{ 2, 1, 0 }) |variant| for (0..2) |i| {
                 const w: u32 = @intCast(i); // the waiter
                 for ([_]bool{ true, false }) |pre| { // E5a (the write first) and E5b (the write while the launch waits)
