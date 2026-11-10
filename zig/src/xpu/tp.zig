@@ -851,7 +851,7 @@ pub const Group = struct {
         const P = "flaglab rank {d}: ";
         const rank = g.rank;
         const conn = g.lab_conn;
-        const forms = [_]u32{ 0, 1, 2 };
+        const forms = [_]i32{ 0, 1, 2 };
         const out = try d.g.deviceAlloc(64); // the probe's result (four words)
         const hout = try d.g.hostAlloc(64); // the host side of it
         const hw = try d.g.hostAlloc(8); // the writer's word
@@ -1135,8 +1135,8 @@ fn labOut(d: *Dev, out: *anyopaque, hout: *anyopaque) !*[4]u64 {
 
 /// The flag lab: the spin probe (one group of 16, only global id 0 works). Five arguments: the pointer, the two
 /// u64 words, the i32 form, the pointer.
-fn labProbe(d: *Dev, p: *anyopaque, want: u64, max_spins: u64, form: u32, out: *anyopaque) !void {
-    try d.launch(d.k.tp_probe, .{ .x = 1 }, .{ p, want, max_spins, @as(i32, form), out });
+fn labProbe(d: *Dev, p: *anyopaque, want: u64, max_spins: u64, form: i32, out: *anyopaque) !void {
+    try d.launch(d.k.tp_probe, .{ .x = 1 }, .{ p, want, max_spins, form, out });
 }
 
 /// The flag lab E5: a counter based event on `word` (device) with `host` as the external host word; null when the
