@@ -257,6 +257,51 @@ KERNEL(512) void add_rmsnorm_dec_tp(global float *X, global half *R, global cons
   out_rows(hl, D, H, t, rot, gs, A8, SA, MS, AHI, ALO);
 }
 
+// XPU_FUSE bit 1, device-direct path (TF_TP_DEVFLAG not set): the exchange fused into the residual add and norm
+// that reads the reduced tensor once. The peer's copy is on the in-order list ahead of this launch and the host has
+// already waited for the peer's counter (tp.allReducePeer), so there is no flag word and no wait here. X +=
+// f16(f32(R) + f32(PEER)) and R keeps the sum: the same bits as tp_add followed by add_rmsnorm_dec.
+// TP 3 and TP 4: the same kernel takes `global const ulong *PEERS, int np` (np = N-1 device pointers, in rank
+// order, as gdn_pre's MT holds its pointers) in place of PEER, and adds each peer partial in rank order into one
+// fp32 accumulator with a single rounding to fp16 at the end: the bits of the host-staged sum in allReduce.
+// Grid T, one work-group of 512 a row.
+KERNEL(512) void add_rmsnorm_dec_peer(global float *X, global half *R, global const ushort *PEER,
+                                      global const ushort *WN, global half *H, global half *AHI, global half *ALO,
+                                      int D, float eps, int has_r, int gs, global char *A8, global float *SA, int MS,
+                                      int rot) {
+  local float red[32];
+  local half hl[Q27_D];
+  const int t = get_group_id(0), lid = get_local_id(0);
+  float xv[Q27_D512], ss = 0.0f;
+  for (int i = 0; i < Q27_D512; i++) {
+    const int e = lid + i * 512;
+    float x = e < D ? X[(long)t * D + e] : 0.0f;
+    if (has_r && e < D) {
+      const ushort sb = as_ushort((half)((float)as_half(R[(long)t * D + e]) + (float)as_half(PEER[(long)t * D + e])));
+      R[(long)t * D + e] = sb;
+      x = rbf(x + (float)as_half(sb));
+      X[(long)t * D + e] = x;
+    }
+    xv[i] = x;
+    ss += x * x;
+  }
+  const float s = sub_group_reduce_add(ss);
+  if (get_sub_group_local_id() == 0) red[get_sub_group_id()] = s;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float tot = 0.0f;
+  for (int i = 0; i < 32; i++) tot += red[i];
+  const float inv = rsqrt(tot / D + eps);
+  for (int i = 0; i < Q27_D512; i++) {
+    const int e = lid + i * 512;
+    if (e >= D) continue;
+    const half v = convert_half_rte(rbf(xv[i] * inv * bf2f(WN[e])));
+    if (!rot) H[(long)t * D + e] = v;
+    hl[e] = v;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  out_rows(hl, D, H, t, rot, gs, A8, SA, MS, AHI, ALO);
+}
+
 // GDN, before the recurrence. P: output of the gdn.in GEMM, fp16 [T, 16 640] = qkv | z | a | b | padding.
 
 // Causal convolution of kernel 4 over qkv with the state, SiLU, bf16 rounding; q, k normalized per head.
