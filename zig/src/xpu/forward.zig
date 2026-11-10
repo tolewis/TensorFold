@@ -172,7 +172,9 @@ pub fn mlpIn(d: *Dev, m: *const Model, a: *Acts, w: Proj, T: u32, gs: i32, pre: 
         try d.launch(d.k.rowsums_ff, .{ .x = T }, .{ a.p, a.ahi, a.alo, gs, q.rot_on });
         return a.p;
     }
+    q.prof.site = .gate_up;
     try gemmRows(d, a.pscr, a.h, a.ahi, a.alo, w, a.p, T, wide);
+    q.prof.site = .none;
     try d.launch(d.k.swiglu, .{ .x = T, .y = (FF + 1023) / 1024 }, .{ a.p, a.h, a.ahi, a.alo, gs, @as(i32, @intFromBool(w.ilv)), q.rot_on, @as(i32, FF) });
     return a.h;
 }
@@ -357,20 +359,28 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
     try embedRows(d, m, a.ids, a.x, T);
     if (p0 == 0) try dump(d, a, T, "embed", false);
     for (&m.layers, 0..) |*l, i| {
+        q.prof.site = .norm_in; // XPU_PROFILE=2: the call site of the launches up to the next assignment
         if (pend) |peer| { // XPU_FUSE bit 1: the previous layer's exchange joined into this layer's input norm
             try d.launch(d.k.tp_norm_peer, .{ .x = T }, .{ a.x, a.r, peer, l.in_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs, q8a, q8s, q8ms, q.rot_on });
             pend = null;
         } else try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.in_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, if (i == 0) 0 else 1), gs, q8a, q8s, q8ms, q.rot_on });
+        q.prof.site = .none;
         const probe = p0 == 0 and i == 0;
         if (probe) try dumpBuf(d, "h0", a.h, T * D, .f16);
         // W4A8 study: the GEMM reads a quantized copy (in r, free until mixer_out); the dense a/b gates read h as is
         const min_in = if (q.a8_group != 0 and wide and q.a8_sites & 1 != 0) a.r else a.h;
         if (min_in != a.h) try copy(d, a.r, a.h, T * D * 2);
         try a8(d, a, min_in, D, T, 1);
-        try pgemm(d, m, a, min_in, l.mixer_in, a.p, T, q8on, 0, false, wide);
+        // XPU_GDN bit 1 (lane p4-k-gdn): a stashed GDN layer's GEMM and gdn_pre write the stash (the layout of the
+        // copies they replace), and gdn_step and gated_norm read it there. The same bits, six copies a layer fewer
+        const st_in: ?*anyopaque = if (q.gdn_bits & 1 != 0 and mode.stash and !wide and !l.attn) l.stash.? else null;
+        const pb = if (st_in) |st| off(st, ST_P) else a.p;
+        q.prof.site = if (l.attn) .mixer_in_attn else .mixer_in_gdn;
+        try pgemm(d, m, a, min_in, l.mixer_in, pb, T, q8on, 0, false, wide);
+        q.prof.site = .none;
         if (gemm_probe) |f| try f(d, a, l.mixer_in, min_in, T, i, 0);
-        if (l.ab) |ab| try d.launch(d.k.dense_rows, .{ .x = (T + 15) / 16, .y = 2 * HV / 16 }, .{ a.h, ab, a.p, t32, @as(i32, GDN_IN), @as(i32, GDN_AB) });
-        if (probe) try dumpBuf(d, "p0", a.p, T * GDN_IN, .f16);
+        if (l.ab) |ab| try d.launch(d.k.dense_rows, .{ .x = (T + 15) / 16, .y = 2 * HV / 16 }, .{ a.h, ab, pb, t32, @as(i32, GDN_IN), @as(i32, GDN_AB) });
+        if (probe) try dumpBuf(d, "p0", pb, T * GDN_IN, .f16);
         if (l.attn) {
             const ctx = if (mode.multi) |mm| mm.max_pos + 1 else p0 + T; // tree rows see fewer slices
             const mt: ?*anyopaque = if (mode.multi) |mm| off(mm.mt, i * 16 * 8 * 8) else null;
@@ -454,12 +464,17 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
         } else {
             const cin = l.conv[l.conv_cur].?;
             const cout = l.conv[1 - l.conv_cur].?;
+            const gq = if (st_in) |st| off(st, ST_Q) else a.q; // gdn_pre's outputs: the stash itself (XPU_GDN bit 1)
+            const gk = if (st_in) |st| off(st, ST_K) else a.k;
+            const gv = if (st_in) |st| off(st, ST_V) else a.v;
+            const gg = if (st_in) |st| off(st, ST_G) else a.g;
+            const gb = if (st_in) |st| off(st, ST_B) else a.beta;
             const gmt: ?*anyopaque = if (mode.multi) |mm| off(mm.mt, i * 16 * 8 * 8) else null;
             if (mode.multi == null) l.conv_cur = 1 - l.conv_cur; // multi: each slot's flips after the forward
             if (wide)
                 try d.launch(d.k.gdn_pre_rows, .{ .x = (T + 7) / 8, .y = (GDN_QKV / 128 + 15) / 16 }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32 })
             else
-                try d.launch(d.k.gdn_pre, .{ .x = T, .y = GDN_QKV / 256 }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32, tree, gmt });
+                try d.launch(d.k.gdn_pre, .{ .x = T, .y = GDN_QKV / 256 }, .{ pb, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, gq, gk, gv, gg, gb, t32, tree, gmt });
             if (wide and tp > T) { // neutral padding rows: the state does not move
                 const pad = tp - T;
                 const cp = struct {
@@ -473,8 +488,9 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
                 try cp(d, off(a.g, T * HV * 4), a.ones, pad * HV * 4);
             }
             if (!wide) {
-                if (mode.stash) { // inputs, for Runner.commit's replay
+                if (mode.stash and st_in == null) { // inputs, for Runner.commit's replay
                     const st = l.stash.?;
+                    q.prof.site = .copy_stash;
                     try copy(d, off(st, ST_Q), a.q, T * HK * 128 * 2);
                     try copy(d, off(st, ST_K), a.k, T * HK * 128 * 2);
                     try copy(d, off(st, ST_V), a.v, T * HV * 128 * 2);
@@ -483,7 +499,9 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
                     try copy(d, off(st, ST_P), a.p, T * GDN_IN * 2);
                 }
                 // verification: post-block state to rec_save, rec keeps the entry; tree: states to acts.sl
-                try d.launch(d.k.gdn_step, .{ .x = 16, .y = HV, .z = if (mode.multi != null) T else 1 }, .{ a.q, a.k, a.v, a.g, a.beta, l.rec.?, if (mode.stash) l.rec_save.? else l.rec.?, a.y, t32, nul, tree, a.sl, gmt });
+                q.prof.site = .gdn_verify;
+                defer q.prof.site = .none;
+                try d.launch(d.k.gdn_step, .{ .x = 16, .y = HV, .z = if (mode.multi != null) T else 1 }, .{ gq, gk, gv, gg, gb, l.rec.?, if (mode.stash) l.rec_save.? else l.rec.?, a.y, t32, nul, tree, a.sl, gmt });
             } else {
                 const nc: i32 = @intCast(tp / 64);
                 const ncu: u32 = tp / 64;
@@ -495,18 +513,20 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
                 if (gdn_probe) |f| if (p0 == 0) try f(d, a, l.rec.?, T, i);
             }
             if (probe) {
-                try dumpBuf(d, "q0", a.q, T * HK * 128, .bf16);
-                try dumpBuf(d, "k0", a.k, T * HK * 128, .bf16);
-                try dumpBuf(d, "v0", a.v, T * MIX_OUT, .bf16);
-                try dumpBuf(d, "g0", a.g, T * HV, .f32);
-                try dumpBuf(d, "beta0", a.beta, T * HV, .f32);
+                try dumpBuf(d, "q0", gq, T * HK * 128, .bf16);
+                try dumpBuf(d, "k0", gk, T * HK * 128, .bf16);
+                try dumpBuf(d, "v0", gv, T * MIX_OUT, .bf16);
+                try dumpBuf(d, "g0", gg, T * HV, .f32);
+                try dumpBuf(d, "beta0", gb, T * HV, .f32);
                 try dumpBuf(d, "y0", a.y, T * MIX_OUT, .bf16);
             }
-            try d.launch(d.k.gated_norm, .{ .x = T }, .{ a.y, a.p, l.gnorm.?, a.h, a.ahi, a.alo, EPS, gs, q.rot_on, q8oa, q8os, q8ms });
+            try d.launch(d.k.gated_norm, .{ .x = T }, .{ a.y, pb, l.gnorm.?, a.h, a.ahi, a.alo, EPS, gs, q.rot_on, q8oa, q8os, q8ms });
             if (probe) try dumpBuf(d, "o0", a.h, T * MIX_OUT, .f16);
         }
         try a8(d, a, a.h, MIX_OUT, T, 2);
+        q.prof.site = if (l.attn) .mixer_out_attn else .mixer_out_gdn;
         try pgemm(d, m, a, a.h, l.mixer_out, a.r, T, q8out, 0, q.int4_sites & 2 != 0, wide);
+        q.prof.site = .none;
         if (ranks.group) |*g| { // TP: the ranks' partial out-projections summed
             if (!wide and g.devflag) { // TF_TP_DEVFLAG: the add fused into the residual add and norm below
                 try g.allReduceNorm(d, a.r, T, .{ .x = a.x, .w = l.post_norm, .h = a.h, .ahi = a.ahi, .alo = a.alo, .a8 = q8a, .sa = q8s, .ms = q8ms, .eps = EPS, .has_r = 1, .gs = gs, .rot = q.rot_on });
@@ -519,12 +539,16 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
         }
         if (gemm_probe) |f| try f(d, a, l.mixer_out, a.h, T, i, 1);
         if (probe) try dumpBuf(d, "r0", a.r, T * D, .f16);
+        q.prof.site = .norm_post;
         if (!fused) try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs, q8a, q8s, q8ms, q.rot_on });
+        q.prof.site = .none;
         try a8(d, a, a.h, D, T, 4);
         if (gemm_probe) |f| try f(d, a, l.gu, a.h, T, i, 2);
         const act = try mlpIn(d, m, a, l.gu, T, gs, q8on, wide);
         try a8(d, a, act, FF, T, 8);
+        q.prof.site = .down;
         try pgemm(d, m, a, act, l.down, a.r, T, false, if (act == a.p) q.rot_on else 0, q.int4_sites & 8 != 0, wide);
+        q.prof.site = .none;
         if (ranks.group) |*g| { // TP: the ranks' partial down projections summed, joined into the next norm when bit 1 is set
             var tap_here = false;
             for (TAP_LAYERS) |tl| {
@@ -563,7 +587,9 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
     if (gemm_probe) |f| try f(d, a, m.head, a.h, T, LAYERS, 4);
     const first = if (mode.want == .rows) 0 else T - 1;
     const rows = T - first;
+    q.prof.site = .head;
     if (m.head.x3) |e| try exl3.project(e, m.exl3.?, d, off(a.h, first * D * 2), a.logits, rows, false) else try gemm(d, a.pscr, off(a.h, first * D * 2), off(a.ahi, first * (D / m.head.gs) * 2), off(a.alo, first * (D / m.head.gs) * 2), m.head, a.logits, rows);
+    q.prof.site = .none;
     try d.launch(d.k.argmax_part, .{ .x = 256, .y = rows }, .{ a.logits, @as(i32, VOCAB), a.pv, a.pi });
     try d.launch(d.k.argmax, .{ .x = rows }, .{ a.pv, a.pi, a.tok });
     var toks: [16]i32 = undefined;

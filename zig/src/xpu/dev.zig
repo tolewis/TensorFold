@@ -252,6 +252,7 @@ pub const Dev = struct {
             if (q.prof.used == q.prof.events.len) try d.sync();
             ev = q.prof.events[q.prof.used];
             q.prof.kernel[q.prof.used] = k;
+            q.prof.at[q.prof.used] = q.prof.site;
             q.prof.used += 1;
         }
         try ze.check(d.g.api.zeCommandListAppendLaunchKernel(d.list, k, &groups, ev, 0, null));
@@ -277,16 +278,21 @@ pub const Dev = struct {
         d.settle();
         if (q.stat.on) q.stat.syncs += 1;
         if (q.prof.on) {
-            for (q.prof.events[0..q.prof.used], q.prof.kernel[0..q.prof.used]) |e, k| {
-                const t = try d.g.seconds(e);
+            for (q.prof.events[0..q.prof.used], q.prof.kernel[0..q.prof.used], q.prof.at[0..q.prof.used]) |e, k, site| {
+                // a copy (no kernel): its event may hold no kernel timestamp, which counts as 0
+                const t = if (k == null) d.g.seconds(e) catch 0 else try d.g.seconds(e);
                 try ze.check(d.g.api.zeEventHostReset(e));
-                for (&q.prof.names, &q.prof.total, &q.prof.count) |n, *tot, *cnt| {
+                if (site != .none) {
+                    q.prof.site_total[@intFromEnum(site)] += t;
+                    q.prof.site_count[@intFromEnum(site)] += 1;
+                }
+                if (k != null) for (&q.prof.names, &q.prof.total, &q.prof.count) |n, *tot, *cnt| {
                     if (n.k == k) {
                         tot.* += t;
                         cnt.* += 1; // one launch of this kernel in the synced window
                         break;
                     }
-                }
+                };
             }
             q.prof.used = 0;
         }
@@ -303,18 +309,36 @@ pub const Dev = struct {
 
 pub fn copy(d: *Dev, dst: *anyopaque, src: *anyopaque, n: usize) !void {
     if (q.stat.on) q.stat.copies += 1;
-    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, dst, src, n, null, 0, null));
+    var ev: ze.H = null;
+    if (q.prof.on and q.prof.sites_on) { // XPU_PROFILE=2: the copy gets an event and a site row (no kernel row)
+        if (q.prof.used == q.prof.events.len) try d.sync();
+        ev = q.prof.events[q.prof.used];
+        q.prof.kernel[q.prof.used] = null;
+        q.prof.at[q.prof.used] = if (q.prof.site == .copy_stash) .copy_stash else .copy_other;
+        q.prof.used += 1;
+    }
+    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, dst, src, n, ev, 0, null));
 }
 
 pub fn off(p: *anyopaque, bytes: usize) *anyopaque {
     return @ptrFromInt(@intFromPtr(p) + bytes);
 }
 
-/// XPU_PROFILE=1: GPU time per kernel, summed over the run.
+/// A call site of the decode pass (XPU_PROFILE=2, lane p4-k-gdn): the matvec shapes, the two uses of gdn_step, the
+/// norms and the device copies each get a row of their own under the kernel rows.
+pub const Site = enum(u8) { none, norm_in, mixer_in_gdn, mixer_in_attn, mixer_out_gdn, mixer_out_attn, norm_post, gate_up, down, head, gdn_verify, gdn_commit, copy_stash, copy_other };
+
+/// XPU_PROFILE=1: GPU time per kernel, summed over the run. XPU_PROFILE=2: also one row a call site (`Site`) and an
+/// event on every device copy that goes through `copy`.
 pub const Prof = struct {
     on: bool = false,
+    sites_on: bool = false, // XPU_PROFILE=2
+    site: Site = .none, // the call site of the launches that follow (forward sets and clears it)
     events: [4096]ze.H = @splat(null),
     kernel: [4096]ze.H = @splat(null),
+    at: [4096]Site = @splat(.none),
+    site_total: [16]f64 = @splat(0),
+    site_count: [16]u64 = @splat(0),
     used: usize = 0,
     names: [96]struct { k: ze.H = null, name: []const u8 = "" } = @splat(.{}),
     total: [96]f64 = @splat(0),
@@ -331,4 +355,10 @@ pub fn profReport(label: []const u8) void {
         t.* = 0;
         c.* = 0;
     }
+    if (q.prof.sites_on) for (std.enums.values(Site)) |site| {
+        const i = @intFromEnum(site);
+        if (q.prof.site_count[i] > 0) std.debug.print("  @{s:<13} {d:8.2} ms {d:5.1} % {d:>8} launches\n", .{ @tagName(site), q.prof.site_total[i] * 1e3, q.prof.site_total[i] / sum * 100, q.prof.site_count[i] });
+        q.prof.site_total[i] = 0;
+        q.prof.site_count[i] = 0;
+    };
 }
