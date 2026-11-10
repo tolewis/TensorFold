@@ -136,7 +136,7 @@ test "park: a state that a later state extends is dropped, not parked" {
     var prompt: [129]u32 = undefined;
     fill(&prompt, 1);
     try f.grow(64);
-    try std.testing.expect(s.keep(&prompt, 64, null, &.{}, &.{}));
+    try std.testing.expect(s.keep(prompt[0..65], 64, null, &.{}, &.{}));
     f.resetLive();
     try f.grow(128);
     try std.testing.expect(s.keep(&prompt, 128, null, &.{}, &.{}));
