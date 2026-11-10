@@ -635,7 +635,7 @@ pub const Group = struct {
                 g.stampAlive(); // the pair's liveness rule, as the host and device-direct paths stamp it
                 try g.pushEv(d, partial, n, par);
                 const fev = try g.newEvent(d, off(g.blk.?, blk_flag + par * 8), g.seq);
-                try dev.launchEv(d, d.k.tp_add_flag, .{ .x = @intCast((n + 255) / 256) }, .{
+                try d.launchEv(d.k.tp_add_flag, .{ .x = @intCast((n + 255) / 256) }, .{
                     partial,                                   // out: this rank's partial, the sum lands here
                     off(g.blk.?, par * slot_bytes),            // the peer's push, read after the event completes
                     @as(i32, @intCast(n)),                     //
@@ -731,7 +731,7 @@ pub const Group = struct {
             nrm.ms,                                   //
             nrm.rot,                                  //
         };
-        if (g.ev) try dev.launchEv(d, d.k.tp_norm_tp, groups, args, fev.?) else try d.launch(d.k.tp_norm_tp, groups, args);
+        if (g.ev) try d.launchEv(d.k.tp_norm_tp, groups, args, fev.?) else try d.launch(d.k.tp_norm_tp, groups, args);
         if (g.ev) try g.consumeEv(d, par) else try g.consume(d, par);
     }
 

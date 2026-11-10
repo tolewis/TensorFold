@@ -272,7 +272,8 @@ pub const Dev = struct {
         try ze.check(d.g.api.zeCommandListAppendLaunchKernel(d.list, k, &groups, sig, 1, &wa));
     }
 
-    pub fn sync(d: *Dev) !void {        d.settle();
+    pub fn sync(d: *Dev) !void {
+        d.settle();
         if (q.stat.on) q.stat.syncs += 1;
         if (q.prof.on) {
             for (q.prof.events[0..q.prof.used], q.prof.kernel[0..q.prof.used]) |e, k| {
