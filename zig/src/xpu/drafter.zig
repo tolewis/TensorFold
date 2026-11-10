@@ -472,7 +472,7 @@ pub const Drafter = struct {
 
     /// The drafter's block after `pending`: per depth 1 .. count the top 16 candidates and the selector projection.
     pub fn lattice(dr: *Drafter, pending: u32, count: u32) !void {
-        try dr.run(&.{.{ .slot = dr.cur, .pending = pending }}, count);
+        try dr.run(&.{.{ .slot = dr.cur, .pending = pending }}, count, null);
         dr.take(0);
     }
 
