@@ -159,6 +159,18 @@ pub var embed_host: bool = false;
 pub var fmt_mlx: bool = false;
 pub var prof: Prof = .{};
 
+/// XPU_ROUND_STATS: host waits and command counts, summed until the round stats line prints them.
+pub const Stat = struct {
+    on: bool = false,
+    settles: u64 = 0,
+    settle_s: f64 = 0,
+    peer_s: f64 = 0,
+    launches: u64 = 0,
+    copies: u64 = 0,
+    syncs: u64 = 0,
+};
+pub var stat: Stat = .{};
+
 /// The XPU_* options as the process had them before its first open, put back at every open (Runner.init).
 const Options = struct {
     dump_dir: ?[]const u8,

@@ -249,7 +249,10 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
     h.back.slice = slice != null;
     if (std.c.getenv("XPU_ROUND_STATS")) |v| { // rank 0 drafts and prints; a follower stays off
         const every = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0;
-        if (every > 0 and xq.RANK == 0) h.back.rs = .{ .on = true, .every = every };
+        if (every > 0 and xq.RANK == 0) {
+            h.back.rs = .{ .on = true, .every = every };
+            xq.stat.on = true; // the host waits and command counts behind the round stats line
+        }
     }
     if (drafter != null) {
         try h.back.measure();

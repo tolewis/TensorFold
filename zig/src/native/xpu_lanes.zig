@@ -638,7 +638,23 @@ pub const Lanes = struct {
         const draft = rs.sum_draft * 1e3 / n;
         const verify = rs.sum_verify * 1e3 / n;
         if (xq.prof.on) try b.runner.d.sync(); // drain the event ring into the totals before the report
-        std.debug.print("round stats: {d} rounds, streams {d:.2} (mean), rows {d:.1} (mean), accepted {d:.2} a stream a round, round {d:.2} ms, drafter {d:.2} ms, verify {d:.2} ms, other {d:.2} ms\n", .{ rs.rounds, streams, rows, acc, round, draft, verify, round - draft - verify });
+        std.debug.print("round stats: {d} rounds, streams {d:.2} (mean), rows {d:.1} (mean), accepted {d:.2} a stream a round, round {d:.2} ms, drafter {d:.2} ms, verify {d:.2} ms, other {d:.2} ms, settle {d:.2} ms in {d:.1} waits, peer wait {d:.2} ms, launches {d:.0}, copies {d:.0}, syncs {d:.1}\n", .{
+            rs.rounds,
+            streams,
+            rows,
+            acc,
+            round,
+            draft,
+            verify,
+            round - draft - verify,
+            xq.stat.settle_s * 1e3 / n, // means a round, XPU_ROUND_STATS counters
+            @as(f64, @floatFromInt(xq.stat.settles)) / n,
+            xq.stat.peer_s * 1e3 / n,
+            @as(f64, @floatFromInt(xq.stat.launches)) / n,
+            @as(f64, @floatFromInt(xq.stat.copies)) / n,
+            @as(f64, @floatFromInt(xq.stat.syncs)) / n,
+        });
+        xq.stat = .{ .on = xq.stat.on }; // the counters reset; on stays
         if (xq.prof.on) {
             var buf: [96]u8 = undefined;
             xq.profReport(try std.fmt.bufPrint(&buf, "{d} rounds, {d:.2} streams a round", .{ rs.rounds, streams }));

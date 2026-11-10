@@ -193,8 +193,13 @@ pub const Dev = struct {
 
     /// Waits for every command on the list; callers settle before host memory a queued copy reads or writes goes.
     pub fn settle(d: *Dev) void {
+        const t0 = q.stat.on and q.now() or 0.0; // XPU_ROUND_STATS: the host wait time of this call
         const rc = d.g.api.zeCommandListHostSynchronize(d.list, std.math.maxInt(u64));
         if (rc != 0) lost(rc);
+        if (q.stat.on) {
+            q.stat.settles += 1;
+            q.stat.settle_s += q.now() - t0;
+        }
     }
 
     pub fn kernel(d: *Dev, m: ze.H, name: [*:0]const u8, local: u32) !ze.H {
@@ -235,6 +240,7 @@ pub const Dev = struct {
 
     pub fn launch(d: *Dev, k: ze.H, groups: ze.GroupCount, args: anytype) !void {
         inline for (args, 0..) |a, i| try d.g.arg(k, i, a);
+        if (q.stat.on) q.stat.launches += 1;
         var ev: ze.H = null;
         if (q.prof.on) {
             if (q.prof.used == q.prof.events.len) try d.sync();
@@ -247,6 +253,7 @@ pub const Dev = struct {
 
     pub fn sync(d: *Dev) !void {
         d.settle();
+        if (q.stat.on) q.stat.syncs += 1;
         if (q.prof.on) {
             for (q.prof.events[0..q.prof.used], q.prof.kernel[0..q.prof.used]) |e, k| {
                 const t = try d.g.seconds(e);
@@ -273,6 +280,7 @@ pub const Dev = struct {
 };
 
 pub fn copy(d: *Dev, dst: *anyopaque, src: *anyopaque, n: usize) !void {
+    if (q.stat.on) q.stat.copies += 1;
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, dst, src, n, null, 0, null));
 }
 

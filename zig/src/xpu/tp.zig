@@ -624,10 +624,12 @@ pub const Group = struct {
             d.settle();
             g.counter(g.rank).store(g.seq, .seq_cst); // the counter and the liveness word are the rank's heartbeat
             aliveWord(g, g.rank).store(@intFromFloat(q.now()), .release);
+            const w0 = q.stat.on and q.now() or 0.0; // XPU_ROUND_STATS: the peer wait time
             if (g.waitPeers()) |_| {} else |e| {
                 // the group is lost: this rank closes it and exits instead of waiting 180 s or serving broken rounds
                 waitGroupLost(g, e);
             }
+            if (q.stat.on) q.stat.peer_s += q.now() - w0;
             try dev.copy(d, g.pbuf[par], g.peer[par].?, n * 2); // over PCIe, on the in-order list
             try d.launch(d.k.tp_add, .{ .x = @intCast((n + 255) / 256) }, .{ partial, g.dslot[par], g.pbuf[par], @as(i32, @intCast(n)) });
             return;
@@ -637,10 +639,12 @@ pub const Group = struct {
         @memcpy(g.slot(g.rank, g.seq)[0..n], g.mine[0..n]);
         g.counter(g.rank).store(g.seq, .seq_cst); // the counter and the liveness word are the rank's heartbeat
         aliveWord(g, g.rank).store(@intFromFloat(q.now()), .release);
+        const w0 = q.stat.on and q.now() or 0.0; // XPU_ROUND_STATS: the peer wait time
         if (g.waitPeers()) |_| {} else |e| {
             // the group is lost: this rank closes it and exits instead of waiting 180 s or serving broken rounds
             waitGroupLost(g, e);
         }
+        if (q.stat.on) q.stat.peer_s += q.now() - w0;
         // the sum in fp32, rounded once: the ranks add in the same order, so both hold the same bits
         for (0..n) |i| {
             var acc: f32 = 0;
