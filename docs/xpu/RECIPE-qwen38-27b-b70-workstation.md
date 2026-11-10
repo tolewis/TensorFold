@@ -3,9 +3,89 @@
 This recipe serves Qwen3.8-27B from one Intel Arc Pro B70 in a workstation. The same card drives the desktop
 display. The server loads the model on the first request, and it gives the VRAM back to the desktop after 300 s
 idle. Production since 2026-11-03: one stream of 217,088 tokens with K1 decode attention and DFlash2 chains.
+Since 2026-11-10 (phase 1) it also runs two driver keys for the shared card and a drafter window of 512 rows.
 
-Measured on jubiku on 2026-11-02 and 2026-11-03. For the two-card server recipe, see
+Measured on jubiku on 2026-11-02, 2026-11-03 and 2026-11-10. For the two-card server recipe, see
 [RECIPE-qwen38-27b-b70.md](RECIPE-qwen38-27b-b70.md).
+
+## Phase 1 (2026-11-10): the production config
+
+Build `lane/fleet-serve`, commit `690e93f6`, `-Dtp=1 -Dcpu=skylake_avx512`. Production since 2026-11-10 08:14Z.
+The spec and the receipts are in `tolewis/Intel-B70-Recipe`: `docs/JUBIKU-PHASE-1.md`,
+`lanes/qwen27/receipts/p1-jubiku-window-1.md` and `p1-jubiku-window-2.md`.
+
+`qwen27.env`:
+
+```sh
+QWEN_BIN=$HOME/b70/qwen27/bin/tensorfold-native-690e93f6-fleetserve-tp1-skx
+QWEN_MODEL=$HOME/models/qwen38-27b/Qwen3.8-27B-Uncensored-MLX-4bit
+QWEN_DRAFTER=$HOME/models/qwen38-27b/Qwen3.8-27B-DFlash2
+QWEN_PARALLEL=1
+QWEN_CONTEXT=217088
+QWEN_POOL_TOKENS=245760
+QWEN_IDLE_UNLOAD=300
+QWEN_LOOP_GUARD=1
+TF_REPLY_FLOOR=1
+XPU_MTP=0
+XPU_KV_POOL=1
+XPU_EMBED_HOST=1
+XPU_KEEP_SHARED=1
+XPU_CHUNK=896
+XPU_K1=1
+XPU_TREE=0
+XPU_DRAFT_WIN=512
+NEOReadDebugKeys=1
+EnableRecoverablePageFaults=0
+```
+
+What phase 1 changed:
+
+| Change | Effect | Evidence |
+|---|---|---|
+| `NEOReadDebugKeys=1`, `EnableRecoverablePageFaults=0` | No GPU engine reset from the desktop's render jobs. No speed change. | Five test starts ended with the fault. With the keys, three gate runs (3 h 49 min of load) had no kernel `xe` line. |
+| `XPU_DRAFT_WIN=512` on the `690e93f6` binary | +4.7% tok/s on the mean of 7 thinking runs (40k, 100k, 150k) | Window 2: 61.7 against 58.9 tok/s |
+| The `690e93f6` binary with no new flag | The same speed. 1 GiB less card memory (26.45 against 27.43 GiB). | Window 2, set N0 |
+
+Why the driver keys are needed. The Level Zero driver makes the server's memory map in page-fault mode by default.
+The `xe` driver then suspends the server's compute queue for each render job of the desktop (Hyprland, quickshell).
+The GuC resets the engine when the server's context does not leave it in 640 ms. The kernel log shows
+`Engine reset: engine_class=ccs` and `Timedout job`, and the server ends with
+`XPU: a command list did not drain (Level Zero 0x70000001)`. `EnableRecoverablePageFaults=0` turns page-fault mode
+off. `NEOReadDebugKeys=1` makes a release driver read the key. A server on a card with no desktop does not need them.
+
+Speed, thinking on, effort low, temperature 1.0, 3,000 tokens a reply (the fleet's request shape):
+
+| Prompt tokens | Before phase 1 | Phase 1 | Change |
+|---|---|---|---|
+| 48,357 | 62.2 tok/s | 65.5 tok/s | +5.5% |
+| 99,611 | 60.3 tok/s | 62.5 tok/s | +3.7% |
+| 151,460 | 53.7 tok/s | 56.7 tok/s | +5.6% |
+
+These rates are lower than the greedy code rates of 2026-11-03 below. A sampled thinking reply lands fewer drafts
+(about 3.2 tokens a round).
+
+The drafter's context starts new at each request and grows with the reply. Its cost goes from 4.0 ms a round to
+10.9 ms at its cap of 2,047 rows. `XPU_DRAFT_WIN=512` holds it at 5.5 ms and loses 0.11 accepted drafts a round.
+A reply under about 600 tokens gets no gain. A reply over 2,200 tokens saves 5.4 ms a round on its later part.
+A window of 256 rows gave +2.7% on this host, less than 512.
+
+Other numbers of the phase 1 config:
+
+- Cold prefill: 1,498 tok/s at 48k, 1,254 at 100k, 1,076 at 151k. First token on a cold 48k prompt: 32.3 s.
+  A warm turn starts in 0.2 s. No phase 1 flag changes prefill.
+- The card sits at its stock 275 W cap in a prefill (p95 277 W). There is no higher cap to set.
+- Greedy decode, thinking off, 2,000 tokens: 76 tok/s at 48k, 77 at 100k, 70 at 151k.
+- Gate: needles at 151k found at depths 10, 50 and 90 percent, greedy eval 40 of 41 (the base also 40),
+  12 of 12 valid tool calls in a 12-turn agent run to 184k tokens, with a cache hit on every turn after the first.
+
+Checked and not shipped:
+
+- `XPU_K1_TREE=1` without `XPU_TREE=0` (a lone DFlash2 tree on K1). It is 7 to 12% faster on the mean. It fails the
+  eval bar (39 of 41 against 40), and its reply text changes from start to start for the same seed.
+  The next step is a log probability test of the tree's logits.
+- `XPU_K1_WAVE` 1, 2 and 3. No value passed the speed rule.
+
+One run moves by up to 17% for the same reply on this host. Judge a change on the mean of several runs.
 
 ## Production benchmark (2026-11-03, p39 K1)
 
@@ -86,10 +166,10 @@ same sha (`75dc6c44ecfd`) and the same text.
 |---|---|
 | Host | Dell Precision 7820, 2 × Xeon Platinum 8168 (Skylake-SP), 157 GB RAM |
 | GPU | Intel Arc Pro B70, 32 GB, `xe` driver, stock 275 W. Do not set a power cap. |
-| Runtime | Level Zero 1.32.0, compute-runtime 26.35.39758.10 |
+| Runtime | Level Zero 1.32.0, compute-runtime 26.35.39758.10, kernel 7.2.11-arch1-1 (2026-11-10) |
 | Model | `Qwen3.8-27B-Uncensored-MLX-4bit` (MLX affine 4-bit, group 64) |
 | Drafter | `Qwen3.8-27B-DFlash2` |
-| Engine | TensorFold `lane/p36-mlx-tp2`, commit `a6bcd2a3ffa83996fdec8699fbeadb9c9d372e87`. This lane is not on `main` yet. |
+| Engine | TensorFold `lane/p36-mlx-tp2`, commit `a6bcd2a3ffa83996fdec8699fbeadb9c9d372e87`, for the benchmark of 2026-11-02. Production runs `lane/fleet-serve` `690e93f6` (see Phase 1). |
 
 MLX 4/64 is faster than EXL3 on Xe. The verify window stays at 32 to 37 ms from 1 to 16 rows. EXL3 went from 49 ms
 to 82 ms. MLX decode was about 2× the EXL3 decode on the same card.
@@ -110,7 +190,7 @@ Copy `<out>/xpu/bin/tensorfold-native` to the workstation.
 
 ## Configuration
 
-`qwen27.env`:
+`qwen27.env` of the two-stream benchmark (2026-11-02). The production file is in the Phase 1 section.
 
 ```sh
 QWEN_BIN=$HOME/b70/qwen27/bin/tensorfold-native-a6bcd2a3f-p36-tp1-skx
@@ -167,6 +247,9 @@ tailnet. Nothing listens on the LAN.
 - Long-context decode is slow: 16 to 18 tok/s at 120k and about 8 tok/s at 180k. Decode attention is the
   limit.
 - A DFlash2 tree at temperature 0 can give different text on repeat runs (`d317b4792cff`, `7b62cdadaf9b`).
+- A server on the card that drives the desktop needs the two driver keys of the Phase 1 section. Without them the
+  GuC can reset the engine under desktop render load.
+- A lone DFlash2 tree on K1 (`XPU_K1_TREE=1`) fails the eval bar at TP 1. Production keeps `XPU_TREE=0`.
 
 ## Phase two (done 2026-11-03)
 
