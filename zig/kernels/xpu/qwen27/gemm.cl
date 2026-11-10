@@ -76,6 +76,12 @@ kernel void rowsum(global const half *A, global float *Asum, int M, int Mp, int 
   Asum[g * Mp + m] = s;
 }
 
+// Hooks of the timing probes at the end of this file (lane p4-k-mv). A kernel takes the definitions in force where it
+// is made: the row of a W block, the column of an A block, the count of 8-row DPAS tiles.
+#define W4_WROW(kb) ((kb) * 8)
+#define W4_ACOL(kb) ((kb) * 64)
+#define W4_DPAS_I(SG_M) ((SG_M) / 8)
+
 // Common body: one group g, DPAS partial sum, then acc += s*part + b*sum a; R rows per A read, PF prefetch.
 #define GROUP_STEP(SG_M, SG_N, R, READ_A, PF, g, acc) GROUP_STEP_B(SG_M, SG_N, R, READ_A, PF, 1, g, acc)
 // BIAS = 0: without the b·Σa term (s4dpb family, bias by DPAS at the end of the kernel).
@@ -87,14 +93,14 @@ kernel void rowsum(global const half *A, global float *Asum, int M, int Mp, int 
       const int kb = (g) * SUBS + u;                                                                                 \
       if (PF > 0 && kb + PF < K / 64) {                                                                              \
         for (int j = 0; j < SG_N / 16; j++)                                                                          \
-          intel_sub_group_2d_block_prefetch_32b_8r16x1c((global void *)W, N * 4, K / 8, N * 4, (int2)(n0 + 16 * j, (kb + PF) * 8)); \
+          intel_sub_group_2d_block_prefetch_32b_8r16x1c((global void *)W, N * 4, K / 8, N * 4, (int2)(n0 + 16 * j, W4_WROW(kb + PF))); \
         for (int r = 0; r < SG_M / R; r++)                                                                           \
           for (int h = 0; h < 2; h++)                                                                                \
-            intel_sub_group_2d_block_prefetch_16b_8r16x2c((global void *)A, K * 2, M, K * 2, (int2)((kb + PF) * 64 + 32 * h, m0 + R * r)); \
+            intel_sub_group_2d_block_prefetch_16b_8r16x2c((global void *)A, K * 2, M, K * 2, (int2)(W4_ACOL(kb + PF) + 32 * h, m0 + R * r)); \
       }                                                                                                              \
       uint w[SG_N / 16][8];                                                                                           \
       for (int j = 0; j < SG_N / 16; j++) {                                                                          \
-        intel_sub_group_2d_block_read_32b_8r16x1c((global void *)W, N * 4, K / 8, N * 4, (int2)(n0 + 16 * j, kb * 8), w[j]); \
+        intel_sub_group_2d_block_read_32b_8r16x1c((global void *)W, N * 4, K / 8, N * 4, (int2)(n0 + 16 * j, W4_WROW(kb)), w[j]); \
         if (u == 0) {                                                                                                \
           s[j] = (float)S[(g) * N + n0 + 16 * j + lane] * 16777216.0f;                                               \
           if (BIAS) b[j] = (float)B[(g) * N + n0 + 16 * j + lane];                                                   \
@@ -106,13 +112,13 @@ kernel void rowsum(global const half *A, global float *Asum, int M, int Mp, int 
       for (int t2 = 0; t2 < 2; t2++) {                                                                               \
         ushort ab[SG_M / R][2 * R];                                                                                  \
         for (int r = 0; r < SG_M / R; r++)                                                                           \
-          READ_A((global void *)A, K * 2, M, K * 2, (int2)(kb * 64 + t2 * 32, m0 + R * r), ab[r]);                  \
+          READ_A((global void *)A, K * 2, M, K * 2, (int2)(W4_ACOL(kb) + t2 * 32, m0 + R * r), ab[r]);            \
         for (int h = 0; h < 2; h++) {                                                                                \
           const int t = 2 * t2 + h;                                                                                  \
           for (int j = 0; j < SG_N / 16; j++) {                                                                      \
             const uint w0 = w[j][2 * t], w1 = w[j][2 * t + 1];                                                       \
             int8 bb = as_int8((uint8)(w0, w0 >> 4, w0 >> 8, w0 >> 12, w1, w1 >> 4, w1 >> 8, w1 >> 12) & 0x000F000Fu); \
-            for (int i = 0; i < SG_M / 8; i++) {                                                                     \
+            for (int i = 0; i < W4_DPAS_I(SG_M); i++) {                                                              \
               const short8 a = as_short8(vload8(0, &ab[(8 * i) / R][h * R + (8 * i) % R]));                          \
               part[i][j] = intel_sub_group_f16_f16_matrix_mad_k16(a, bb, part[i][j]);                                \
             }                                                                                                        \
@@ -342,3 +348,24 @@ W4K_KERNEL_SL(w4k1_v32, 32, 32, 4, 32, READ32, 2, 1)
 // Prefetch probes of the wide decode kernel (lane p4-k-mv, XPU_MV p0 and p4): the same tile and the same bits.
 W4K_KERNEL_SL(w4k1_p0, 16, 32, 4, 16, READ16, 0, 1)
 W4K_KERNEL_SL(w4k1_p4, 16, 32, 4, 16, READ16, 4, 1)
+
+// Timing probes of the wide decode kernel (lane p4-k-mv, XPU_MV shadows w0, a0, wa0, h8). Their results are wrong:
+// they run as shadow launches into a scratch buffer and never feed the model. w0 reads two W blocks of a tile again
+// and again (no W stream from memory), a0 does the same with A, wa0 both, h8 runs the DPAS of rows 0 to 7 only.
+// The block changes with kb, so the compiler cannot lift the read out of the loop.
+#undef W4_WROW
+#define W4_WROW(kb) (((kb) & 1) * 8)
+W4K_KERNEL_SL(w4k1_w0, 16, 32, 4, 16, READ16, 2, 1)
+#undef W4_ACOL
+#define W4_ACOL(kb) (((kb) & 1) * 64)
+W4K_KERNEL_SL(w4k1_wa0, 16, 32, 4, 16, READ16, 2, 1)
+#undef W4_WROW
+#define W4_WROW(kb) ((kb) * 8)
+W4K_KERNEL_SL(w4k1_a0, 16, 32, 4, 16, READ16, 2, 1)
+#undef W4_ACOL
+#define W4_ACOL(kb) ((kb) * 64)
+#undef W4_DPAS_I
+#define W4_DPAS_I(SG_M) 1
+W4K_KERNEL_SL(w4k1_h8, 16, 32, 4, 16, READ16, 2, 1)
+#undef W4_DPAS_I
+#define W4_DPAS_I(SG_M) ((SG_M) / 8)

@@ -208,6 +208,12 @@ pub fn gemmRows(d: *Dev, pscr: *anyopaque, h: *anyopaque, ahi: *anyopaque, alo: 
     const ngen_wide = if (g128) k.ngen_wide_g128 else k.ngen_wide;
     const ngen_narrow = if (g128) k.ngen_narrow_g128 else k.ngen_narrow;
     const mp: i32 = @intCast((m + 7) / 8 * 8);
+    // XPU_MV shadows (lane p4-k-mv): timing launches of other kernels on this call's shape, the output to a scratch buffer
+    if (!wide and !g128) for (q.mv_shadow[@intFromEnum(q.prof.site)]) |sh| {
+        const shd = sh orelse break;
+        if (w.n % shd.div == 0 and @as(usize, m) * w.n * 2 <= q.mv_scratch_bytes)
+            try d.launch(shd.k, .{ .x = 1, .y = w.n / shd.div }, .{ h, w.w, w.s, w.bg, q.mv_scratch.?, M, N, K, ahi, alo, mp, G });
+    };
     // XPU_MV (lane p4-k-mv): the pick of this call site (q.prof.site), for a shape its tile divides
     const pick: ?q.MvPick = if (!wide and !g128) q.mv_pick[@intFromEnum(q.prof.site)] else null;
     if (pick != null and pick.?.wide == w.wide and w.n % pick.?.div == 0) {
