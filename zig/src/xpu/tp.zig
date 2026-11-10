@@ -861,59 +861,65 @@ pub const Group = struct {
         var b: u8 = 0;
 
         // E1: the write lands before the kernel starts. Expected: spins 0 (a kernel reads the peer's write at all).
-        for (forms) |form| for (0..2) |i| {
-            const w: u32 = @intCast(i); // the waiter
-            if (rank == w) {
-                try labCopy(d, off(g.blk.?, blk_flag), zero, 8); // the flag word to 0
-                try sendByte(conn, 1);
-            } else {
-                try recvByte(conn, &b);
-                w64.* = 1;
-                try labCopy(d, off(g.peer_blk.?, blk_flag), hw, 8);
-                try sendByte(conn, 2);
-            }
-            if (rank == w) {
-                try recvByte(conn, &b);
-                const t0 = q.now();
-                try labProbe(d, off(g.blk.?, blk_flag), 1, 1 << 24, form, out);
-                d.settle();
-                const o = try labOut(d, out, hout);
-                std.debug.print(P ++ "E1 form {d} spins {d} last 0x{x} post 0x{x} gave {d} launch+settle {d:.2} ms\n", .{ rank, form, o[0], o[1], o[2], o[3], (q.now() - t0) * 1e3 });
+        // Zig 0.17 needs a block body for a nested loop (lane p4-cbwait: the base wrote `for (a) |x| for (b) |y| {`).
+        for (forms) |form| {
+            for (0..2) |i| {
+                const w: u32 = @intCast(i); // the waiter
+                if (rank == w) {
+                    try labCopy(d, off(g.blk.?, blk_flag), zero, 8); // the flag word to 0
+                    try sendByte(conn, 1);
+                } else {
+                    try recvByte(conn, &b);
+                    w64.* = 1;
+                    try labCopy(d, off(g.peer_blk.?, blk_flag), hw, 8);
+                    try sendByte(conn, 2);
+                }
+                if (rank == w) {
+                    try recvByte(conn, &b);
+                    const t0 = q.now();
+                    try labProbe(d, off(g.blk.?, blk_flag), 1, 1 << 24, form, out);
+                    d.settle();
+                    const o = try labOut(d, out, hout);
+                    std.debug.print(P ++ "E1 form {d} spins {d} last 0x{x} post 0x{x} gave {d} launch+settle {d:.2} ms\n", .{ rank, form, o[0], o[1], o[2], o[3], (q.now() - t0) * 1e3 });
+                }
             }
         }
 
         // E2: the write lands while the kernel spins. The main experiment.
-        for (forms) |form| for (0..2) |i| {
-            const w: u32 = @intCast(i);
-            if (rank == w) {
-                try labCopy(d, off(g.blk.?, blk_flag), zero, 8); // the flag word to 0
-                try sendByte(conn, 1); // the reset is down
-            } else {
-                try recvByte(conn, &b);
-            }
-            if (rank == w) {
-                try labProbe(d, off(g.blk.?, blk_flag), 2, 1 << 28, form, out);
-                const t0 = q.now();
-                try sendByte(conn, 2); // the probe runs
-            } else {
-                try recvByte(conn, &b);
-                std.time.sleep(200 * std.time.MilliSecond); // the kernel runs
-                w64.* = 2;
-                try labCopy(d, off(g.peer_blk.?, blk_flag), hw, 8);
-                try sendByte(conn, 3); // the write is down
-            }
-            if (rank == w) {
-                try recvByte(conn, &b);
-                const t1 = q.now();
-                d.settle();
-                const t2 = q.now();
-                const o = try labOut(d, out, hout);
-                std.debug.print(P ++ "E2 form {d} spins {d} last 0x{x} post 0x{x} gave {d} t1-t0 {d:.2} ms t2-t1 {d:.2} ms\n", .{ rank, form, o[0], o[1], o[2], o[3], (t1 - t0) * 1e3, (t2 - t1) * 1e3 });
-                // E2b: a new kernel right after E2, no new write. Does it see what the spinning kernel did not?
-                try labProbe(d, off(g.blk.?, blk_flag), 2, 1 << 16, form, out);
-                d.settle();
-                const o2 = try labOut(d, out, hout);
-                std.debug.print(P ++ "E2b form {d} spins {d} last 0x{x} post 0x{x} gave {d}\n", .{ rank, form, o2[0], o2[1], o2[2], o2[3] });
+        for (forms) |form| {
+            for (0..2) |i| {
+                const w: u32 = @intCast(i);
+                if (rank == w) {
+                    try labCopy(d, off(g.blk.?, blk_flag), zero, 8); // the flag word to 0
+                    try sendByte(conn, 1); // the reset is down
+                } else {
+                    try recvByte(conn, &b);
+                }
+                var t0: f64 = 0; // the probe's launch time (E2: the waiter's block ends before the print)
+                if (rank == w) {
+                    try labProbe(d, off(g.blk.?, blk_flag), 2, 1 << 28, form, out);
+                    t0 = q.now();
+                    try sendByte(conn, 2); // the probe runs
+                } else {
+                    try recvByte(conn, &b);
+                    std.time.sleep(200 * std.time.MilliSecond); // the kernel runs
+                    w64.* = 2;
+                    try labCopy(d, off(g.peer_blk.?, blk_flag), hw, 8);
+                    try sendByte(conn, 3); // the write is down
+                }
+                if (rank == w) {
+                    try recvByte(conn, &b);
+                    const t1 = q.now();
+                    d.settle();
+                    const t2 = q.now();
+                    const o = try labOut(d, out, hout);
+                    std.debug.print(P ++ "E2 form {d} spins {d} last 0x{x} post 0x{x} gave {d} t1-t0 {d:.2} ms t2-t1 {d:.2} ms\n", .{ rank, form, o[0], o[1], o[2], o[3], (t1 - t0) * 1e3, (t2 - t1) * 1e3 });
+                    // E2b: a new kernel right after E2, no new write. Does it see what the spinning kernel did not?
+                    try labProbe(d, off(g.blk.?, blk_flag), 2, 1 << 16, form, out);
+                    d.settle();
+                    const o2 = try labOut(d, out, hout);
+                    std.debug.print(P ++ "E2b form {d} spins {d} last 0x{x} post 0x{x} gave {d}\n", .{ rank, form, o2[0], o2[1], o2[2], o2[3] });
+                }
             }
         }
 
