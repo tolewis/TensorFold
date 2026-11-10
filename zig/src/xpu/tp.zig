@@ -105,6 +105,7 @@ pub var group: ?Group = null;
 var one_slot = false;
 var trace = false;
 var devflag = false; // TF_TP_DEVFLAG: the device-flag all-reduce (default off)
+var evmode = false; // TF_TP_DEVFLAG=2: the flag wait is a counter based driver event, not a kernel poll
 
 /// A peer that dies in the handshake closes its end: without a timeout the surviving rank blocks in recvFds forever.
 /// 180 s matches every other deadline: the device-flag self test builds a kernel on the first open and the other rank
@@ -270,6 +271,11 @@ pub const Group = struct {
     gen: u64 = 0,
     /// The TF_TP_FLAGLAB socket (the handshake's conn, kept open by open): the lab steps on it at load.
     lab_conn: linux.fd_t = -1,
+    /// TF_TP_DEVFLAG=2: the counter based events this rank's exchanges wait on (created an exchange, destroyed at
+    /// check after a settle has passed them), the driver's maximum completion value, and the event mode itself.
+    ev: bool = false,
+    evs: std.ArrayListUnmanaged(ze.H) = .empty,
+    ev_max: u64 = 0,
 
     /// The generation rank 0 published after it reset every shared word. 0: no rank has published one yet.
     fn genWord(g: *const Group) *std.atomic.Value(u64) {
@@ -390,6 +396,12 @@ pub const Group = struct {
         one_slot = std.c.getenv("TF_TP_ONE_SLOT") != null;
         trace = std.c.getenv("TF_TP_TRACE") != null;
         devflag = std.c.getenv("TF_TP_DEVFLAG") != null;
+        // TF_TP_DEVFLAG=2: the wait is a counter based event with the device scope on its wait side (spec WP1,
+        // "Second design"). 1 (or any other value): the kernel poll.
+        if (std.c.getenv("TF_TP_DEVFLAG")) |v| {
+            const s = std.mem.span(v);
+            evmode = s.len > 0 and s[0] == '2';
+        }
         record_wait = 180.0;
         if (std.c.getenv("TF_TP_RECORD_WAIT")) |v| {
             const want = std.fmt.parseFloat(f64, std.mem.span(v)) catch 180.0;
@@ -602,6 +614,14 @@ pub const Group = struct {
         lostAt(g, "rank {d}: all-reduce {d}: the group is lost ({s})\n", .{ g.rank, g.seq, @errorName(e) });
     }
 
+    /// TF_TP_DEVFLAG=2: a settle that a lost peer holds past the limit ends the process, as every other lost-group
+    /// path does, so the pair is restarted instead of holding the card.
+    fn lostSettle(rc: u32) void {
+        if (group) |*g| markClosed(g);
+        std.log.err("qwen27-xpu: a settle did not drain (Level Zero 0x{x}): the device-flag event's peer is lost, the process ends", .{rc});
+        std.process.exit(1);
+    }
+
     /// `partial` on the device holds `rows` x D fp16: on return it holds the ranks' sum. Every rank calls this the
     /// same number of times in the same order.
     pub fn allReduce(g: *Group, d: *Dev, partial: *anyopaque, rows: u32) !void {
@@ -609,6 +629,23 @@ pub const Group = struct {
         const n: usize = @as(usize, rows) * D;
         g.seq += 1;
         if (g.devflag) {
+            if (g.ev) { // TF_TP_DEVFLAG=2: the wait is a counter based event (spec WP1, "Second design")
+                if (g.seq > g.ev_max) try g.resetWords(d); // the completion value stays under the driver's maximum
+                const par: usize = @intCast(g.seq % 2);
+                g.stampAlive(); // the pair's liveness rule, as the host and device-direct paths stamp it
+                try g.pushEv(d, partial, n, par);
+                const fev = try g.newEvent(d, off(g.blk.?, blk_flag + par * 8), g.seq);
+                try dev.launchEv(d, d.k.tp_add_flag, .{ .x = @intCast((n + 255) / 256) }, .{
+                    partial,                                   // out: this rank's partial, the sum lands here
+                    off(g.blk.?, par * slot_bytes),            // the peer's push, read after the event completes
+                    @as(i32, @intCast(n)),                     //
+                    off(g.blk.?, blk_flag + par * 8),          // the flag the peer wrote (tp_wait returns at once)
+                    g.seq,                                     //
+                    off(g.blk.?, blk_timeout),                 //
+                }, fev);
+                try g.consumeEv(d, par);
+                return;
+            }
             const par: usize = @intCast(g.seq % 2);
             try g.push(d, partial, n, par);
             try d.launch(d.k.tp_add_flag, .{ .x = @intCast((n + 255) / 256) }, .{
@@ -666,9 +703,15 @@ pub const Group = struct {
         if (rows > rows_max) return error.TooManyRows;
         const n: usize = @as(usize, rows) * D;
         g.seq += 1;
+        if (g.ev and g.seq > g.ev_max) try g.resetWords(d);
         const par: usize = @intCast(g.seq % 2);
-        try g.push(d, partial, n, par);
-        try d.launch(d.k.tp_norm_tp, .{ .x = rows }, .{
+        const fev: ze.H = if (g.ev) try g.newEvent(d, off(g.blk.?, blk_flag + par * 8), g.seq) else null;
+        if (g.ev) {
+            g.stampAlive();
+            try g.pushEv(d, partial, n, par);
+        } else try g.push(d, partial, n, par);
+        const groups: ze.GroupCount = .{ .x = rows };
+        const args = .{
             nrm.x,                                    // X fp32 residual
             partial,                                  // R fp16, keeps the sum
             off(g.blk.?, par * slot_bytes),           // the peer's push
@@ -687,8 +730,9 @@ pub const Group = struct {
             nrm.sa,                                   //
             nrm.ms,                                   //
             nrm.rot,                                  //
-        });
-        try g.consume(d, par);
+        };
+        if (g.ev) try dev.launchEv(d, d.k.tp_norm_tp, groups, args, fev.?) else try d.launch(d.k.tp_norm_tp, groups, args);
+        if (g.ev) try g.consumeEv(d, par) else try g.consume(d, par);
     }
 
     /// Pushes this rank's partial into the peer's slot and then the flag, both on the in-order list: the peer's
@@ -715,6 +759,69 @@ pub const Group = struct {
         try dev.copy(d, off(g.peer_blk.?, blk_pcons + par * 8), off(g.own_cons.?, par * 8), 8);
     }
 
+    /// TF_TP_DEVFLAG=2: the push with the peer's consumption of this slot as a wait event on the first copy: the slot
+    /// is not overwritten until the peer read it (two slots, so a rank is at most one exchange ahead). The flag copy
+    /// follows on the in-order list, as in `push`.
+    fn pushEv(g: *Group, d: *Dev, partial: *anyopaque, n: usize, par: usize) !void {
+        const pb = g.peer_blk.?;
+        const need: u64 = if (g.seq >= 3) g.seq - 2 else 0; // the peer's consumed counter for this slot
+        if (q.stat.on) q.stat.copies += 1;
+        if (need > 0) {
+            const pev = try g.newEvent(d, off(g.blk.?, blk_pcons + par * 8), need);
+            var wa = [1]ze.H{pev};
+            try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, off(pb, par * slot_bytes), partial, n * 2, null, 1, &wa));
+        } else {
+            try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, off(pb, par * slot_bytes), partial, n * 2, null, 0, null));
+        }
+        const hi: usize = @intCast(g.seq % fh_ring);
+        g.fh[hi] = g.seq;
+        try dev.copy(d, off(pb, blk_flag + par * 8), @ptrCast(&g.fh[hi]), 8);
+    }
+
+    /// TF_TP_DEVFLAG=2: publish the consumed counter with the kernel's poll turned off (need 0 makes `tp_wait`
+    /// return at once), then push it into the peer's block. The next exchange's push waits for it with an event.
+    fn consumeEv(g: *Group, d: *Dev, par: usize) !void {
+        try d.launch(d.k.tp_consume, .{ .x = 1 }, .{
+            off(g.own_cons.?, par * 8),                 // this rank's consumed counter, pushed to the peer next
+            g.seq,                                      //
+            off(g.blk.?, blk_pcons + (1 - par) * 8),    // the peer's consumption of the slot the next exchange reuses
+            @as(u64, 0),                                // no wait in the kernel: the event does it
+            off(g.blk.?, blk_timeout),                  //
+        });
+        try dev.copy(d, off(g.peer_blk.?, blk_pcons + par * 8), off(g.own_cons.?, par * 8), 8);
+    }
+
+    /// TF_TP_DEVFLAG=2: a counter based event on `word` (this rank's device memory) that completes at `cv`. The
+    /// handle goes into `evs` and is destroyed at the next check, after a settle has passed it.
+    /// TP 3 and TP 4: the design is one event a peer, so N − 1 events a rank (3 at TP 4), each on that peer's flag
+    /// word with the sequence number as the completion value, and the adds of the peers' slots behind their events.
+    /// At 4 ranks the two-step sum (pairs (0,1) and (2,3), then (0,2) and (1,3)) needs 2 events a rank an exchange,
+    /// 2 copies and 2 waits, as spec WP1 states; at 3 ranks a rank reads N − 1 slots. This build's exchange is the
+    /// two-rank one (`openDirect` asks TP 2), so TP 3 and TP 4 keep the host path until WP7.
+    fn newEvent(g: *Group, d: *Dev, word: *anyopaque, cv: u64) !ze.H {
+        const cb = d.g.cbapi orelse return error.NoCounterBasedEvent;
+        const waddr: *u64 = @ptrCast(@alignCast(word));
+        var sync: ze.CbExternalSync = .{ .deviceAddress = waddr, .completionValue = cv };
+        var desc: ze.CbEventDesc = .{ .flags = 1, .signal = 2, .wait = 2 }; // immediate list; device scope on both sides
+        desc.pNext = &sync;
+        var ev: ze.H = null;
+        try ze.check(cb.zeEventCounterBasedCreate(d.g.context, d.g.device, &desc, &ev));
+        try g.evs.append(q.alloc, ev);
+        return ev;
+    }
+
+    /// TF_TP_DEVFLAG=2: both ranks reach this at the same exchange (the count is symmetric), so the flag words, the
+    /// consumed counters and the sequence go to 0 together before a completion value would pass the driver's maximum
+    /// (2^32 − 1: about 12 days of decode with no pause).
+    fn resetWords(g: *Group, d: *Dev) !void {
+        const zero = try d.g.hostAlloc(64);
+        @memset(@as([*]u8, @ptrCast(zero))[0..64], 0);
+        try labCopy(d, off(g.blk.?, blk_flag), zero, 32); // this rank's block: the flags and the peer-consumed words
+        try labCopy(d, g.own_cons.?, zero, 16);
+        try labCopy(d, off(g.peer_blk.?, blk_flag), zero, 32); // the flags and consumed counters this rank wrote there
+        g.seq = 0;
+    }
+
     /// TF_TP_EXBENCH=1: at load, the cost of 128 exchanges (a round) at 1, 8, 16 and 32 rows in the group's
     /// mode. Both ranks run it, so the pair times as it does in a forward. The host waits a mode has are inside
     /// the figure, which is what the gate asks for.
@@ -737,6 +844,11 @@ pub const Group = struct {
     /// (the kernel spin cannot see the peer's host liveness word, so its timeout word is the only detector here).
     pub fn check(g: *Group, d: *Dev) !void {
         if (!g.devflag) return;
+        if (g.ev) { // the events of the exchanges a settle has passed are complete: give them back
+            for (g.evs.items) |e| _ = d.g.api.zeEventDestroy(e);
+            g.evs.clearRetainingCapacity();
+            return;
+        }
         var t: u32 = 0;
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &t, off(g.blk.?, blk_timeout), 4, null, 0, null));
         try d.sync();
@@ -782,14 +894,31 @@ pub const Group = struct {
             g.fh = @ptrCast(@alignCast(try d.g.hostAlloc(fh_ring * 8)));
             g.own_cons = try d.g.deviceAlloc(64);
             const list = try d.g.immediate(0, 0);
-            mode = if (try g.selfTest(d, list, conn)) 1 else 2;
+            // 1: the kernel poll (TF_TP_DEVFLAG=1); 3: the counter based event (TF_TP_DEVFLAG=2, needs the loader's
+            // event symbols); 2: the self test failed and both ranks take the host path.
+            mode = if (try g.selfTest(d, list, conn)) (if (evmode and d.g.cbapi != null) 3 else 1) else 2;
         }
         var peer_mode: u8 = 0;
         try sendByte(conn, mode);
         try recvByte(conn, &peer_mode);
-        if (mode == 1 and peer_mode == 1) {
+        if ((mode == 1 or mode == 3) and peer_mode == mode) {
             g.devflag = true;
             g.direct = true;
+            if (mode == 3) {
+                const cb = d.g.cbapi.?;
+                var maxv: u64 = 0;
+                if (cb.zeDeviceGetCounterBasedEventMaxValue(d.g.device, &maxv) != 0) maxv = std.math.maxInt(u32);
+                g.ev_max = maxv;
+                g.ev = true;
+                // the block stays resident, so the peer's writes into it are read by the event's counter
+                const rrc = cb.zeContextMakeMemoryResident(d.g.context, d.g.device, blk, blk_devflag_bytes);
+                if (rrc != 0) std.log.warn("qwen27-xpu: TP rank {d}: the block is not made resident (Level Zero 0x{x})", .{ g.rank, rrc });
+                // bounded time when the peer stops: a settle that a lost peer holds ends the process (the group's
+                // own deadline is 180 s; a round's settle is milliseconds and a prompt slice's is seconds)
+                dev.settle_ns = 60_000_000_000;
+                dev.lost = lostSettle;
+                std.log.info("qwen27-xpu: TP rank {d}: the device-flag wait is a counter based event (max value {d})", .{ g.rank, maxv });
+            }
             return;
         }
         if (mode != 0 or peer_mode != 0) {
