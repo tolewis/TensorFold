@@ -61,6 +61,9 @@ pub const Acts = struct {
     pm: *anyopaque,
     pl: *anyopaque,
     po: *anyopaque,
+    spm: ?*anyopaque = null, // XPU_K1_SHADOW: the scratch partials of the shadow launches
+    spl: ?*anyopaque = null,
+    spo: ?*anyopaque = null,
     pscr: *anyopaque, // fp32 [maxRows, D] (slice totals of the narrow prompt GEMM)
     logits: *anyopaque, // fp16 [16, VOCAB]
     taps: *anyopaque, // bf16 [maxRows, 5 D]: hidden states after TAP_LAYERS, when Mode.taps
@@ -113,6 +116,9 @@ pub const Acts = struct {
             .pm = try d.alloc_(16 * HQ * ns * 4),
             .pl = try d.alloc_(16 * HQ * ns * 4),
             .po = try d.alloc_(16 * HQ * ns * 256 * 4),
+            .spm = if (q.k1_shadow[0] != null) try d.alloc_(16 * HQ * ns * 4) else null,
+            .spl = if (q.k1_shadow[0] != null) try d.alloc_(16 * HQ * ns * 4) else null,
+            .spo = if (q.k1_shadow[0] != null) try d.alloc_(16 * HQ * ns * 256 * 4) else null,
             .pscr = try d.alloc_(rows * D * 4),
             .logits = try d.alloc_(16 * VOCAB * 2),
             .tok = try d.alloc_(16 * 4),
@@ -460,6 +466,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
                     // the partials' stride is ns + 1 (k1.cl attn_k1_draft): the prefix launch and the merge take it as NS,
                     // the draft takes ns as its slice index
                     const ns_stride: i32 = @as(i32, @intCast(plan.ns)) + 1;
+                    if (a.spo != null) for (q.k1_shadow) |sh| try d.launch(sh orelse break, .{ .x = plan.ns, .y = AKV, .z = n }, .{ a.q, l.kc.?, l.vc.?, a.spm.?, a.spl.?, a.spo.?, @as(i32, p0i), ns_stride, plan.span, @as(f32, 1.0 / 16.0), a.kmt, a.kpos, kvCap(), l.pt.?, a.grp }); // XPU_K1_SHADOW: timing launches, scratch partials
                     try d.launch(d.k.attn_k1.?, .{ .x = plan.ns, .y = AKV, .z = n }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, p0i), ns_stride, plan.span, @as(f32, 1.0 / 16.0), a.kmt, a.kpos, kvCap(), l.pt.?, a.grp });
                     try d.launch(d.k.attn_k1_draft.?, .{ .x = 1, .y = AKV, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, p0i), @as(i32, @intCast(plan.ns)), @as(f32, 1.0 / 16.0), a.tree, l.pt.? });
                     try d.launch(d.k.merge_span, .{ .x = HQ, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, p0i), ns_stride, plan.span, a.kposm });
@@ -482,6 +489,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
                     // the partials' stride is ns + 1 (k1.cl attn_k1_draft_mt): the prefix launch and the merge take
                     // it as NS, the draft takes ns as its slice index
                     const ns_stride: i32 = @as(i32, @intCast(plan.ns)) + 1;
+                    if (a.spo != null and !rd.k16) for (q.k1_shadow) |sh| try d.launch(sh orelse break, .{ .x = plan.ns, .y = AKV, .z = rd.n }, .{ a.q, l.kc.?, l.vc.?, a.spm.?, a.spl.?, a.spo.?, @as(i32, @intCast(p0)), ns_stride, plan.span, @as(f32, 1.0 / 16.0), mt, a.kpos, kvCap(), l.pt.?, a.grp }); // XPU_K1_SHADOW: timing launches, scratch partials
                     try d.launch(kern, .{ .x = plan.ns, .y = AKV, .z = rd.n }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), ns_stride, plan.span, @as(f32, 1.0 / 16.0), mt, a.kpos, kvCap(), l.pt.?, a.grp });
                     try d.launch(d.k.attn_k1_draft_mt.?, .{ .x = 1, .y = AKV, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(plan.ns)), @as(f32, 1.0 / 16.0), a.tree, mt, mm2.pos });
                     try d.launch(d.k.merge_span, .{ .x = HQ, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), ns_stride, plan.span, a.kposm });
@@ -491,6 +499,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
                     const plan = k1mod.planTile(ctx, rd.n, AKV, k1mod.wave, tile);
                     const kern = if (rd.k16) d.k.attn_k1_16.? else d.k.attn_k1.?;
                     try k1mod.queueGroups(d, a.grp, grp_host[0 .. 2 * rd.n], rd.n);
+                    if (a.spo != null and !rd.k16) for (q.k1_shadow) |sh| try d.launch(sh orelse break, .{ .x = plan.ns, .y = AKV, .z = rd.n }, .{ a.q, l.kc.?, l.vc.?, a.spm.?, a.spl.?, a.spo.?, @as(i32, @intCast(p0)), @as(i32, @intCast(plan.ns)), plan.span, @as(f32, 1.0 / 16.0), mt, mpos, kvCap(), l.pt.?, a.grp }); // XPU_K1_SHADOW: timing launches, scratch partials
                     try d.launch(kern, .{ .x = plan.ns, .y = AKV, .z = rd.n }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(plan.ns)), plan.span, @as(f32, 1.0 / 16.0), mt, mpos, kvCap(), l.pt.?, a.grp });
                     try d.launch(d.k.merge_span, .{ .x = HQ, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(plan.ns)), plan.span, mpos });
                 } else {

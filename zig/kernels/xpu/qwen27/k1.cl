@@ -22,7 +22,9 @@ static inline float bf2f(ushort h) { return as_float((uint)h << 16); }
 #define K1_P ((K1_C + 15) / 16)
 #define K1_T 256
 #define K1_G 16
+#define K1_PROBE 0
 #include "k1_body.h"
+#undef K1_PROBE
 #undef K1_FN
 #undef K1_R
 #undef K1_C
@@ -36,8 +38,58 @@ static inline float bf2f(ushort h) { return as_float((uint)h << 16); }
 #define K1_P ((K1_C + 15) / 16)
 #define K1_T 128
 #define K1_G 8
+#define K1_PROBE 0
+#include "k1_body.h"
+#undef K1_PROBE
+#undef K1_FN
+#undef K1_R
+#undef K1_C
+#undef K1_P
+#undef K1_T
+#undef K1_G
+
+// Timing probes of attn_k1_decode (lane p4-k-k1, XPU_K1_SHADOW): shadow launches into scratch partials. See
+// K1_PROBE in k1_body.h. They never feed the model.
+#define K1_R 8
+#define K1_C (8 * Q27_GQA)
+#define K1_P ((K1_C + 15) / 16)
+#define K1_T 256
+#define K1_G 16
+#define K1_FN attn_k1_nb3
+#define K1_PROBE 1
 #include "k1_body.h"
 #undef K1_FN
+#undef K1_PROBE
+#define K1_FN attn_k1_nb
+#define K1_PROBE 2
+#include "k1_body.h"
+#undef K1_FN
+#undef K1_PROBE
+#define K1_FN attn_k1_nv
+#define K1_PROBE 4
+#include "k1_body.h"
+#undef K1_FN
+#undef K1_PROBE
+#define K1_FN attn_k1_nq
+#define K1_PROBE 8
+#include "k1_body.h"
+#undef K1_FN
+#undef K1_PROBE
+#define K1_FN attn_k1_ns
+#define K1_PROBE 16
+#include "k1_body.h"
+#undef K1_FN
+#undef K1_PROBE
+#define K1_FN attn_k1_nqi
+#define K1_PROBE 32
+#include "k1_body.h"
+#undef K1_FN
+#undef K1_PROBE
+#define K1_FN attn_k1_nx
+#define K1_PROBE 64
+#include "k1_body.h"
+#undef K1_FN
+#undef K1_PROBE
 #undef K1_R
 #undef K1_C
 #undef K1_P

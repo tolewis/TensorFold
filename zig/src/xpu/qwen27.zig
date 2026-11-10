@@ -188,6 +188,21 @@ const mv_variants = [_]MvVariant{
     .{ .name = "wt", .row = "mv_wt", .kernel = "w4k1_wt", .local = 64, .div = 128, .wide = true, .probe = true }, // the W stream alone, block reads
     .{ .name = "wlt", .row = "mv_wlt", .kernel = "w4k1_wlt", .local = 64, .div = 128, .wide = true, .probe = true }, // the W stream alone, plain loads
 };
+/// XPU_K1_SHADOW=ref,nb3,... (lane p4-k-k1, default off): timing launches of K1 probe kernels (k1.cl, K1_PROBE)
+/// before each K1 launch of 8-row groups. They write scratch partials, so the model keeps its bits. The row
+/// `k1_<name>` of the profile holds the time of the probe. `ref` is the default kernel (the control).
+pub var k1_shadow: [8]?ze.H = @splat(null);
+const K1Probe = struct { name: []const u8, row: []const u8, kernel: [*:0]const u8 };
+const k1_probes = [_]K1Probe{
+    .{ .name = "ref", .row = "k1_ref", .kernel = "attn_k1_decode" },
+    .{ .name = "nb3", .row = "k1_nb3", .kernel = "attn_k1_nb3" }, // no barrier at the end of a tile (the same bits)
+    .{ .name = "nb", .row = "k1_nb", .kernel = "attn_k1_nb" }, // no barrier in a tile
+    .{ .name = "nv", .row = "k1_nv", .kernel = "attn_k1_nv" }, // no V read and no PV
+    .{ .name = "nq", .row = "k1_nq", .kernel = "attn_k1_nq" }, // no K read and no QK
+    .{ .name = "ns", .row = "k1_ns", .kernel = "attn_k1_ns" }, // PV with a constant in place of the P read
+    .{ .name = "nqi", .row = "k1_nqi", .kernel = "attn_k1_nqi" }, // QK with a constant in place of the Q read
+    .{ .name = "nx", .row = "k1_nx", .kernel = "attn_k1_nx" }, // no exp2
+};
 /// Int8 K/V cache (XPU_KV_INT8=1): 256 int8 per position and head, then float scales after MAX_CTX positions.
 pub var kv_i8 = false;
 /// Rotated weights (`hadamard128` in the checkpoint): every GEMM input is rotated by blocks of 128 where it is made.
@@ -591,6 +606,27 @@ pub const Runner = struct {
                     std.debug.print("mv: XPU_MV {s} {s}shadow {s} ({s}), row {s}\n", .{ @tagName(site), if (cold) "cold " else "", v.name, std.mem.span(v.kernel), row })
                 else
                     std.debug.print("mv: XPU_MV {s} on {s} ({s}){s}\n", .{ @tagName(site), v.name, std.mem.span(v.kernel), if (v.bits) ", the bits change: a timing probe" else "" });
+            }
+        }
+        if (std.c.getenv("XPU_K1_SHADOW")) |ks| { // lane p4-k-k1: one line a rank and a probe, the check of the flag
+            const mk1 = try d.g.module(&kb.k1);
+            var it = std.mem.tokenizeScalar(u8, std.mem.span(ks), ',');
+            var n: usize = 0;
+            while (it.next()) |name| : (n += 1) {
+                const v = for (k1_probes) |v| {
+                    if (std.mem.eql(u8, v.name, name)) break v;
+                } else return error.BadK1Probe;
+                if (n == k1_shadow.len) return error.TooManyK1Shadows;
+                const k = try d.kernel(mk1, v.kernel, 256);
+                try d.g.indirect(k);
+                k1_shadow[n] = k;
+                if (prof.on) {
+                    const free = for (&prof.names) |*slot| {
+                        if (slot.name.len == 0) break slot;
+                    } else return error.NoProfileRowLeft;
+                    free.* = .{ .k = k, .name = v.row };
+                }
+                std.debug.print("k1: XPU_K1_SHADOW {s} ({s}), row {s}\n", .{ v.name, std.mem.span(v.kernel), v.row });
             }
         }
         const prof_on = prof.on;
