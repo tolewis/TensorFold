@@ -1036,6 +1036,7 @@ pub const Group = struct {
                         } else {
                             const o = try labOut(d, out, hout);
                             std.debug.print(P ++ "E5b v{d} wait rc 0x{x} out1 {d} t1-t0 {d:.2} ms t2-t1 {d:.2} ms\n", .{ rank, variant, wrc, o[1], (t1 - t0) * 1e3, (t2 - t1) * 1e3 });
+                            if (o[1] == 0) std.debug.print(P ++ "E5b v{d} out1 0: the driver did not hold the launch\n", .{ rank, variant });
                         }
                         _ = d.g.api.zeEventDestroy(ev.?);
                     } else {
