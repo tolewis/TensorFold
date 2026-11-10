@@ -895,9 +895,10 @@ pub const Group = struct {
                 } else {
                     try recvByte(conn, &b);
                 }
+                var t0: f64 = 0; // the probe's launch time (E2: the waiter's block ends before the print)
                 if (rank == w) {
                     try labProbe(d, off(g.blk.?, blk_flag), 2, 1 << 28, form, out);
-                    const t0 = q.now();
+                    t0 = q.now();
                     try sendByte(conn, 2); // the probe runs
                 } else {
                     try recvByte(conn, &b);
