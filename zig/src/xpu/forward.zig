@@ -208,7 +208,11 @@ pub fn gemmRows(d: *Dev, pscr: *anyopaque, h: *anyopaque, ahi: *anyopaque, alo: 
     const ngen_wide = if (g128) k.ngen_wide_g128 else k.ngen_wide;
     const ngen_narrow = if (g128) k.ngen_narrow_g128 else k.ngen_narrow;
     const mp: i32 = @intCast((m + 7) / 8 * 8);
-    if (!wide) {
+    // XPU_MV (lane p4-k-mv): the pick of this call site (q.prof.site), for a shape its tile divides
+    const pick: ?q.MvPick = if (!wide and !g128) q.mv_pick[@intFromEnum(q.prof.site)] else null;
+    if (pick != null and pick.?.wide == w.wide and w.n % pick.?.div == 0) {
+        try d.launch(pick.?.k, .{ .x = 1, .y = w.n / pick.?.div }, .{ h, w.w, w.s, w.bg, out, M, N, K, ahi, alo, mp, G });
+    } else if (!wide) {
         if (w.wide)
             // 64 columns per subgroup for the widest shapes (gate|up, head), 32 below (measured end to end)
             if (w.n >= 30000)
