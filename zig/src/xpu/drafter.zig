@@ -337,7 +337,7 @@ pub const Drafter = struct {
         }
         win = try parseWin(if (std.c.getenv("XPU_DRAFT_WIN")) |v| std.mem.span(v) else null);
         if (win != WIN) std.debug.print("drafter window: the last {d} context rows (XPU_DRAFT_WIN)\n", .{win});
-        if (std.c.getenv("XPU_DRAFT_RAGGED")) |v| ragged = v.len > 0 and v[0] == '1';
+        if (std.c.getenv("XPU_DRAFT_RAGGED")) |v| ragged = v[0] == '1';
         if (ragged) std.debug.print("drafter: ragged blocks (XPU_DRAFT_RAGGED)\n", .{});
         dr.logits = try d.alloc_(MAXB * @as(usize, dr.head.n) * 2);
         // XPU_PROFILE: the drafter's own kernels get a place in the table (they are not in the target's kernel list)
