@@ -14,6 +14,13 @@ const alloc = q.alloc;
 pub fn run(r: *q.Runner) !void {
     const g = if (tp.group) |*x| x else return error.NotARank;
     const trace = std.c.getenv("TF_TP_TRACE") != null; // every record to stderr
+    // XPU_PROFILE: the follower's kernels a round, one table every N decode passes (XPU_ROUND_STATS a, 256)
+    var prof_every: u32 = 256;
+    var prof_passes: u32 = 0;
+    if (q.prof.on) if (std.c.getenv("XPU_ROUND_STATS")) |v| {
+        const every = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0;
+        if (every > 0) prof_every = every;
+    }
     if (g.rank == 0) return error.NotAFollower;
     var snaps: std.AutoHashMapUnmanaged(u64, slot_states.Snap) = .empty;
     defer snaps.deinit(alloc);
@@ -97,6 +104,18 @@ pub fn run(r: *q.Runner) !void {
                 },
                 else => return err,
             }
+        };
+        if (q.prof.on) switch (op) { // one decode forward pass replayed: count it toward the table
+            .verify, .verify_multi, .verify_tree => {
+                prof_passes += 1;
+                if (prof_passes == prof_every) {
+                    try r.d.sync(); // drain the event ring into the totals
+                    var lbl: [64]u8 = undefined;
+                    q.profReport(try std.fmt.bufPrint(&lbl, "rank {d}, {d} passes", .{ g.rank, prof_passes }));
+                    prof_passes = 0;
+                }
+            },
+            else => {},
         };
     }
 }
