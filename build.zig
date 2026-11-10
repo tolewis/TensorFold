@@ -125,6 +125,9 @@ pub fn build(b: *std.Build) void {
     const park_runs_run = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/park_runs.zig"), .target = target }) }));
     test_step.dependOn(&park_runs_run.step);
     b.step("test-park-runs", "consecutive K/V page ids join into one copy").dependOn(&park_runs_run.step);
+    const park_tier_run = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/park_tier.zig"), .target = target }) }));
+    test_step.dependOn(&park_tier_run.step);
+    b.step("test-park-tier", "host tier charge of a parked state, K and V counted once").dependOn(&park_tier_run.step);
     const prompt_lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = .Debug, .link_libc = true });
     const prompt_cache = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/core/prompt_cache.zig"), .target = target, .optimize = .Debug, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = prompt_lanes }} }) }));
     b.step("test-prompt-cache", "Prompt cache unit tests on the CPU, including shared-page states").dependOn(&prompt_cache.step);

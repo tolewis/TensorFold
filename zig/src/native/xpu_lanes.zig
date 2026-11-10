@@ -3,6 +3,7 @@ const std = @import("std");
 const api = @import("engine_api");
 const lanes = @import("lanes");
 const xq = @import("xpu_qwen27");
+const park_tier = @import("../xpu/park_tier.zig");
 const be = lanes.backend;
 const Drafter = xq.drafter.Drafter;
 const Allocator = std.mem.Allocator;
@@ -321,16 +322,17 @@ pub const Lanes = struct {
         return @as(u64, @intCast(b.runner.kvBytesPerToken())) * xq.PAGE;
     }
 
-    /// Host bytes a park of `saved` takes, summed over the ranks: each rank's K/V and GDN copy, plus rank 0's drafter context.
+    /// Host bytes a park of `saved` takes, summed over the ranks: each rank's K/V and kept GDN host copy, plus rank 0's drafter context.
     /// Zero when the state is shorter than `XPU_PARK_MIN` or its position is not a whole page.
+    /// `snap.bytes` is not the GDN copy. With the pool and XPU_KEPT_HOST it is the K/V page charge, so adding it counts K and V twice.
     pub fn parkTierBytes(b: *const Lanes, saved: *anyopaque) u64 {
         const k: *const Kept = @ptrCast(@alignCast(saved));
         if (k.snap.park != null) return 0;
         if (k.snap.at < xq.park_min or k.snap.at % xq.PAGE != 0) return 0;
         const kv: u64 = @as(u64, k.snap.at) * @as(u64, b.runner.kvBytesPerToken());
-        const gdn: u64 = @intCast(k.snap.bytes);
+        const gdn: u64 = @intCast(xq.keptGdnBytes(b.runner));
         const ctx: u64 = if (k.ctx != null) Drafter.ctxBytes() else 0;
-        return (kv + gdn) * @as(u64, xq.TP) + ctx;
+        return park_tier.parkTierCharge(kv, gdn, ctx, xq.TP);
     }
 
     /// Bytes the kept states hold together: each page with a kept-state reference, once.
