@@ -325,7 +325,6 @@ pub const Runner = struct {
         if (std.c.getenv("XPU_PARK_LOG")) |v| park_log = v[0] != '0';
         if (std.c.getenv("XPU_PARK_MIN")) |v| park_min = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (park_gib > 0) {
-            const keep_pages = if (std.c.getenv("XPU_KEEP_PAGES")) |v| v[0] != '0' else false;
             if (!keep_pages or !kept_host) {
                 std.log.warn("qwen27-xpu: XPU_PARK_GIB needs XPU_KEEP_PAGES=1 and XPU_KEPT_HOST=1; the host tier stays off", .{});
                 park_gib = 0;
