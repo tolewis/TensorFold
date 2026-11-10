@@ -1008,7 +1008,8 @@ pub const Group = struct {
                             skip = s == 2;
                             if (!skip) {
                                 try recvByte(conn, &s); // the launch is up
-                                std.time.sleep(200 * std.time.MilliSecond); // the launch waits
+                                var ts: std.c.timespec = .{ .sec = 0, .nsec = 200_000_000 };
+                                while (std.c.nanosleep(&ts, &ts) != 0) {} // the launch waits
                                 w64.* = want;
                                 try labCopy(d, peer_word, hw, 8);
                                 try sendByte(conn, 12); // the write is down
