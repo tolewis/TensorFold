@@ -72,6 +72,84 @@ KERNEL(16) void gdn_step(global const ushort *Q, global const ushort *K, global 
       for (int i = 0; i < 8; i++) SO[((long)h * 128 + vb * 8 + r) * 128 + i * 16 + lane] = s[r][i];
 }
 
+// gdn_step with block loads (lane p4-k-gdn, XPU_GDN bit 2): the same arguments, grid and arithmetic in the same
+// order, so the same bits. A row costs one load each for q, k, v and the tree word and one store for y, and a state
+// load or store is 8 block transfers, where gdn_step addresses each column and each v and y element on its own.
+#define GDN_ROW8(P, r) ((P) + ((long)h * 128 + vb * 8 + (r)) * 128)
+KERNEL(16) void gdn_step2(global const ushort *Q, global const ushort *K, global const ushort *V, global const float *G,
+                          global const float *BETA, global const float *S, global float *SO, global ushort *Y, int T,
+                          global const int *ROWS, global const int *TREE, global float *SL, global const ulong *MT) {
+  const int vb = get_group_id(0), h = get_group_id(1), lane = get_sub_group_local_id(), kh = h / Q27_GVK;
+  int t0 = 0;
+  if (MT) {
+    t0 = get_group_id(2);
+    if ((int)MT[t0 * 8 + 6] != t0) return;            // not a window's first row
+    S = (global const float *)MT[t0 * 8 + 4];
+    SO = (global float *)MT[t0 * 8 + 5];
+    T = t0 + (int)MT[t0 * 8 + 7];
+  }
+  float s[8][8];
+  for (int r = 0; r < 8; r++) {
+    const float8 sv = as_float8(intel_sub_group_block_read8((global const uint *)GDN_ROW8(S, r)));
+    for (int i = 0; i < 8; i++) s[r][i] = sv[i];
+  }
+  for (int t = t0; t < T; t++) {
+    const int row = ROWS ? ROWS[t] : t;
+    const int tw = TREE ? TREE[t * 17] : 0, depth = tw & 255;
+    if (TREE && depth > 0 && (tw & 512)) {              // the parent's state, from its slot
+      const long par = ANC(t, depth - 1);
+      for (int r = 0; r < 8; r++) {
+        const float8 sv = as_float8(intel_sub_group_block_read8((global const uint *)GDN_ROW8(SL + par * Q27_GV * 16384, r)));
+        for (int i = 0; i < 8; i++) s[r][i] = sv[i];
+      }
+    } else if (TREE && depth == 0)
+      for (int r = 0; r < 8; r++) {
+        const float8 sv = as_float8(intel_sub_group_block_read8((global const uint *)GDN_ROW8(S, r)));
+        for (int i = 0; i < 8; i++) s[r][i] = sv[i];
+      }
+    const ushort8 qv = intel_sub_group_block_read_us8(Q + ((long)row * Q27_GK + kh) * 128);
+    const ushort8 kv = intel_sub_group_block_read_us8(K + ((long)row * Q27_GK + kh) * 128);
+    const ushort8 vv = vload8(0, V + ((long)row * Q27_GV + h) * 128 + vb * 8);
+    float q[8], k[8];
+    for (int i = 0; i < 8; i++) {
+      q[i] = bf2f(qv[i]);
+      k[i] = bf2f(kv[i]);
+    }
+    const float g = G[(long)row * Q27_GV + h], beta = BETA[(long)row * Q27_GV + h];
+    ushort8 yo;
+    for (int r = 0; r < 8; r++) {
+      float mem = 0.0f;
+      for (int i = 0; i < 8; i++) {
+        s[r][i] *= g;
+        mem += s[r][i] * k[i];
+      }
+      mem = sub_group_reduce_add(mem);
+      const float u = (bf2f(vv[r]) - mem) * beta;
+      float y = 0.0f;
+      for (int i = 0; i < 8; i++) {
+        s[r][i] += k[i] * u;
+        y += s[r][i] * q[i];
+      }
+      y = sub_group_reduce_add(y);
+      yo[r] = f2bf(y);
+    }
+    if (lane == 0) vstore8(yo, 0, Y + ((long)t * Q27_GV + h) * 128 + vb * 8);
+    if (tw & 256)                                       // SAVE: a later row loads this state
+      for (int r = 0; r < 8; r++) {
+        float8 sv;
+        for (int i = 0; i < 8; i++) sv[i] = s[r][i];
+        intel_sub_group_block_write8((global uint *)GDN_ROW8(SL + (long)t * Q27_GV * 16384, r), as_uint8(sv));
+      }
+  }
+  if (!TREE)
+    for (int r = 0; r < 8; r++) {
+      float8 sv;
+      for (int i = 0; i < 8; i++) sv[i] = s[r][i];
+      intel_sub_group_block_write8((global uint *)GDN_ROW8(SO, r), as_uint8(sv));
+    }
+}
+#undef GDN_ROW8
+
 // Decode attention by key slices: one subgroup per (slice, K/V head and query part, row) handles Q27_QPG query heads
 // (27B: 6, all of the K/V head's); partials PM, PL, PO. Grid (slices, Q27_AKV * Q27_QPARTS, rows).
 #define SPLIT 32

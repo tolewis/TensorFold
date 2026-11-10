@@ -13,6 +13,7 @@ const k1mod = @import("k1.zig"); // XPU_K1: the split-K DPAS decode over int8 po
 pub const follow = @import("follow.zig");
 pub const limits = @import("limits.zig");
 const Prof = dev.Prof;
+pub const Site = dev.Site;
 const a8 = fwd.a8;
 const forward = fwd.forward;
 const kvCap = fwd.kvCap;
@@ -139,6 +140,10 @@ pub var dump_h: ?c_int = null;
 pub var a8_group: u32 = 0;
 /// K/V cache study (XPU_KV8): 1 rotates q, k, v by Hadamard, 2 quantizes k, v to int8 per head, 3 both.
 pub var kv8: i32 = 0;
+/// XPU_GDN (lane p4-k-gdn), bits. 1: a stashed GDN layer's GEMM and gdn_pre write the stash, so no copy follows.
+/// 2: gdn_step2, gdn_step with block loads (the same bits). 4: at the load, gdn_step2 against gdn_step on the card
+/// (gdn_check.zig), and the open fails when a value differs. Default 0.
+pub var gdn_bits: u32 = 0;
 /// Int8 K/V cache (XPU_KV_INT8=1): 256 int8 per position and head, then float scales after MAX_CTX positions.
 pub var kv_i8 = false;
 /// Rotated weights (`hadamard128` in the checkpoint): every GEMM input is rotated by blocks of 128 where it is made.
@@ -309,6 +314,7 @@ pub const Runner = struct {
         if (std.c.getenv("XPU_PREFILL_INT4") != null) prefill_int4 = true;
         if (std.c.getenv("XPU_PREFILL_INT4_SITES")) |v| int4_sites = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_KV8")) |v| kv8 = try std.fmt.parseInt(i32, std.mem.span(v), 10);
+        if (std.c.getenv("XPU_GDN")) |v| gdn_bits = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_A8_ROT") != null) a8_rot = 1;
         if (std.c.getenv("XPU_A8_SITES4")) |v| a8_sites4 = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_A8_BITS")) |v| a8_levels = if (std.mem.eql(u8, std.mem.span(v), "4")) 7 else 127;
@@ -473,6 +479,13 @@ pub const Runner = struct {
             .ngen_narrow = try d.kernel(mn, "w4g_s4dpb", 256),
         };
         // the shared rounds' kernels reach each slot's states through the per-row table (acts.mt)
+        if (gdn_bits != 0) { // lane p4-k-gdn: one line a rank, the check of the flag
+            const step1 = d.k.gdn_step;
+            const step2 = if (gdn_bits & 6 != 0) try d.kernel(md, "gdn_step2", 16) else step1;
+            std.debug.print("gdn: XPU_GDN={d} (stash in place {s}, gdn_step2 {s})\n", .{ gdn_bits, if (gdn_bits & 1 != 0) "on" else "off", if (gdn_bits & 2 != 0) "on" else "off" });
+            if (gdn_bits & 4 != 0) try @import("gdn_check.zig").run(d, step1, step2); // the two kernels on this card: the same bits
+            if (gdn_bits & 2 != 0) d.k.gdn_step = step2;
+        }
         for ([_]ze.H{ d.k.attn_prep, d.k.attn_decode, d.k.gdn_pre, d.k.gdn_step }) |k| try d.g.indirect(k);
         if (k1mod.on or k1mod.multi_tree) { // XPU_K1: the K1 decode kernel (k1.cl), the scalar page-table kernel and the merge
             const mk1 = try d.g.module(&kb.k1);
@@ -485,8 +498,9 @@ pub const Runner = struct {
             d.k.attn_span = kk.span;
             d.k.merge_span = kk.merge2; // K1's partials are log2-base: the exp2 merge
         }
-        if (std.c.getenv("XPU_PROFILE") != null) {
+        if (std.c.getenv("XPU_PROFILE")) |pv| {
             prof.on = true;
+            prof.sites_on = pv[0] == '2'; // a row a call site and an event a device copy (lane p4-k-gdn)
             prof.events = try d.g.events(4096);
             inline for (@typeInfo(@TypeOf(d.k)).@"struct".field_names, 0..) |name, i| prof.names[i] = .{ .k = @field(d.k, name), .name = name };
         }
@@ -934,7 +948,9 @@ pub const Runner = struct {
                 continue;
             }
             const st = l.stash.?;
+            prof.site = .gdn_commit;
             try r.d.launch(r.d.k.gdn_step, .{ .x = 16, .y = GDN_V_HEADS }, .{ off(st, ST_Q), off(st, ST_K), off(st, ST_V), off(st, ST_G), off(st, ST_B), l.rec.?, l.rec.?, r.acts.y, rows, r.acts.path, nul, nul, nul });
+            prof.site = .none;
             try r.d.launch(r.d.k.conv_commit, .{ .x = GDN_QKV / 256 }, .{ l.conv[1 - l.conv_cur].?, off(st, ST_P), l.conv[l.conv_cur].?, rows, r.acts.path });
         }
         if (r.taps_on and !straight) for (path, 0..) |row, dd| if (row != dd)
