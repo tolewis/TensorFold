@@ -60,6 +60,44 @@ KERNEL(16) void tp_consume(global ulong *mine, ulong seq, global volatile ulong 
   tp_wait(theirs, need, timeout);
 }
 
+// The flag lab (TF_TP_FLAGLAB): the spin probe. One group of 16, only global id 0 works. `form` picks the loop read:
+// 0 a plain volatile read (as tp_wait), 1 that with an acquire fence every 64 spins, 2 a 32-bit atomic load
+// (the low word). out: [0] the spins, [1] the last value read in the loop, [2] the value read after one acquire
+// fence, [3] 1 when it gave up.
+KERNEL(16) void tp_probe(global volatile ulong *p, ulong want, ulong max_spins, int form, global ulong *out) {
+  if (get_global_id(0) != 0) return;
+  ulong spins = 0;
+  ulong last = 0;
+  ulong gave = 0;
+  if (form == 2) {
+    volatile atomic_uint *a = (volatile atomic_uint *)p;
+    while (1) {
+      last = (ulong)atomic_load_explicit(a, memory_order_seq_cst, memory_scope_device);
+      if (last >= want) break;
+      if (++spins > max_spins) {
+        gave = 1;
+        break;
+      }
+    }
+  } else {
+    while (1) {
+      last = *p;
+      if (last >= want) break;
+      if (++spins > max_spins) {
+        gave = 1;
+        break;
+      }
+      if (form == 1 and spins % 64 == 0)
+        atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_acquire, memory_scope_device);
+    }
+  }
+  out[0] = spins;
+  out[1] = last;
+  atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_acquire, memory_scope_device);
+  out[2] = *p;
+  out[3] = gave;
+}
+
 KERNEL(16) void rot_heads(global ushort *O) {
   const int t = get_group_id(0), hh = get_group_id(1), lane = get_sub_group_local_id();
   global ushort *o = O + ((long)t * Q27_AQ + hh) * 256;

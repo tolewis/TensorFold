@@ -268,6 +268,8 @@ pub const Group = struct {
     /// generation, because a rank 0 that restarted replaced it.
     name: [*:0]const u8 = undefined,
     gen: u64 = 0,
+    /// The TF_TP_FLAGLAB socket (the handshake's conn, kept open by open): the lab steps on it at load.
+    lab_conn: linux.fd_t = -1,
 
     /// The generation rank 0 published after it reset every shared word. 0: no rank has published one yet.
     fn genWord(g: *const Group) *std.atomic.Value(u64) {
@@ -404,12 +406,13 @@ pub const Group = struct {
         const size = hdr + q.TP * line + 2 * q.TP * slot_bytes + line + ring_len * @sizeOf(Rec);
         const sa = try sockAddr(base);
         var g: Group = undefined;
+        g.lab_conn = -1; // the rank branches re-initialize it from the field default; the early error paths must not read it
         var conn: linux.fd_t = -1;
         var sock: linux.fd_t = -1;
         // The handshake socket lives to the end of this function. A defer inside the rank branch would close it before
-        // sendFds, which was the W2 defect.
+        // sendFds, which was the W2 defect. TF_TP_FLAGLAB keeps it for the lab (lab_conn).
         defer {
-            if (conn >= 0) _ = linux.close(conn);
+            if (conn >= 0 and g.lab_conn != conn) _ = linux.close(conn);
         }
         defer {
             if (sock >= 0) {
@@ -481,6 +484,7 @@ pub const Group = struct {
                 g.direct = false;
             },
         };
+        if (std.c.getenv("TF_TP_FLAGLAB") != null) g.lab_conn = conn; // the lab steps on the socket at load
         std.log.info("qwen27-xpu: TP {d} rank {d}: all-reduce {s}", .{ g.tp, g.rank, if (g.devflag) "device-flag (the peer's slot pushed over PCIe, the add polls a flag)" else if (g.direct) "device-direct (the peer's slots over PCIe)" else "host-staged" });
         return g;
     }
@@ -836,6 +840,130 @@ pub const Group = struct {
         if (!ok) std.log.warn("qwen27-xpu: TP rank {d}: the peer's block did not take the writes (flag 0x{x}, push 0x{x})", .{ g.rank, got_flag, got_push });
         return ok;
     }
+
+    /// TF_TP_FLAGLAB: the lab that shows which of the flag's writes a running kernel sees (H6, window p4w0: the
+    /// device-flag open and self test pass, the first flag wait never ends). Both ranks run it at load, in step
+    /// on the socket open kept for it (lab_conn): one rank is the waiter, the other the writer, and each
+    /// experiment runs twice, once a rank the waiter. The word under test is the flag word 0 (blk_flag) of the
+    /// waiter's block; E3 writes its own card's buffer instead. It prints one line a experiment and ends the
+    /// process. noE4 skips E4 (a give-up there takes about 20 s a kernel).
+    pub fn flagLab(g: *Group, d: *Dev, partial: *anyopaque) !void {
+        const P = "flaglab rank {d}: ";
+        const rank = g.rank;
+        const conn = g.lab_conn;
+        const forms = [_]u32{ 0, 1, 2 };
+        const out = try d.g.deviceAlloc(64); // the probe's result (four words)
+        const hout = try d.g.hostAlloc(64); // the host side of it
+        const hw = try d.g.hostAlloc(8); // the writer's word
+        const w64 = @as(*u64, @ptrCast(hw));
+        const zero = try d.g.hostAlloc(64);
+        @memset(@as([*]u8, @ptrCast(zero))[0..64], 0);
+        var b: u8 = 0;
+
+        // E1: the write lands before the kernel starts. Expected: spins 0 (a kernel reads the peer's write at all).
+        for (forms) |form| for (0..2) |i| {
+            const w: u32 = @intCast(i); // the waiter
+            if (rank == w) {
+                try labCopy(d, off(g.blk.?, blk_flag), zero, 8); // the flag word to 0
+                try sendByte(conn, 1);
+            } else {
+                try recvByte(conn, &b);
+                w64.* = 1;
+                try labCopy(d, off(g.peer_blk.?, blk_flag), hw, 8);
+                try sendByte(conn, 2);
+            }
+            if (rank == w) {
+                try recvByte(conn, &b);
+                const t0 = q.now();
+                try labProbe(d, off(g.blk.?, blk_flag), 1, 1 << 24, form, out);
+                d.settle();
+                const o = try labOut(d, out, hout);
+                std.debug.print(P ++ "E1 form {d} spins {d} last 0x{x} post 0x{x} gave {d} launch+settle {d:.2} ms\n", .{ rank, form, o[0], o[1], o[2], o[3], (q.now() - t0) * 1e3 });
+            }
+        }
+
+        // E2: the write lands while the kernel spins. The main experiment.
+        for (forms) |form| for (0..2) |i| {
+            const w: u32 = @intCast(i);
+            if (rank == w) {
+                try labCopy(d, off(g.blk.?, blk_flag), zero, 8); // the flag word to 0
+                try sendByte(conn, 1); // the reset is down
+            } else {
+                try recvByte(conn, &b);
+            }
+            if (rank == w) {
+                try labProbe(d, off(g.blk.?, blk_flag), 2, 1 << 28, form, out);
+                const t0 = q.now();
+                try sendByte(conn, 2); // the probe runs
+            } else {
+                try recvByte(conn, &b);
+                std.time.sleep(200 * std.time.MilliSecond); // the kernel runs
+                w64.* = 2;
+                try labCopy(d, off(g.peer_blk.?, blk_flag), hw, 8);
+                try sendByte(conn, 3); // the write is down
+            }
+            if (rank == w) {
+                try recvByte(conn, &b);
+                const t1 = q.now();
+                d.settle();
+                const t2 = q.now();
+                const o = try labOut(d, out, hout);
+                std.debug.print(P ++ "E2 form {d} spins {d} last 0x{x} post 0x{x} gave {d} t1-t0 {d:.2} ms t2-t1 {d:.2} ms\n", .{ rank, form, o[0], o[1], o[2], o[3], (t1 - t0) * 1e3, (t2 - t1) * 1e3 });
+                // E2b: a new kernel right after E2, no new write. Does it see what the spinning kernel did not?
+                try labProbe(d, off(g.blk.?, blk_flag), 2, 1 << 16, form, out);
+                d.settle();
+                const o2 = try labOut(d, out, hout);
+                std.debug.print(P ++ "E2b form {d} spins {d} last 0x{x} post 0x{x} gave {d}\n", .{ rank, form, o2[0], o2[1], o2[2], o2[3] });
+            }
+        }
+
+        // E3: the same on one card: a kernel spinning on a word its own card's copy engine writes. Both ranks run
+        // it at the same time, each alone (no socket).
+        const wbuf = try d.g.deviceAlloc(64); // the word (not exported)
+        const list2 = try d.g.immediate(1, 0); // the copy queue group, in order
+        for (forms) |form| {
+            try labCopy(d, wbuf, zero, 8); // the word to 0
+            try labProbe(d, wbuf, 3, 1 << 28, form, out);
+            std.time.sleep(200 * std.time.MilliSecond); // the kernel runs
+            w64.* = 3;
+            try ze.check(d.g.api.zeCommandListAppendMemoryCopy(list2, wbuf, hw, 8, null, 0, null));
+            const s0 = q.now();
+            try ze.check(d.g.api.zeCommandListHostSynchronize(list2, std.math.maxInt(u64)));
+            const s1 = q.now();
+            d.settle();
+            const o = try labOut(d, out, hout);
+            std.debug.print(P ++ "E3 form {d} spins {d} last 0x{x} post 0x{x} gave {d} copywait {d:.2} ms\n", .{ rank, form, o[0], o[1], o[2], o[3], (s1 - s0) * 1e3 });
+        }
+
+        // E4: the real protocol, from the state after selfTest: three all-reduces. noE4 skips it.
+        const no_e4: bool = if (std.c.getenv("TF_TP_FLAGLAB")) |v| std.mem.eql(u8, std.mem.span(v), "noE4") else false;
+        if (!no_e4) {
+            // The reset, as in selfTest: the flag words and the peer-consumed words of this rank's block (32 bytes
+            // from blk_flag), this rank's consumed counters, the timeout word, and g.seq.
+            try labCopy(d, off(g.blk.?, blk_flag), zero, 32);
+            try labCopy(d, g.own_cons.?, zero, 16);
+            try labCopy(d, off(g.blk.?, blk_timeout), zero, 4);
+            g.seq = 0;
+            try sendByte(conn, 4); // both ranks are reset
+            try recvByte(conn, &b);
+            const rb = try d.g.hostAlloc(48); // the timeout word (4) and the flag and consumed words (32)
+            for (0..3) |i| {
+                const t0 = q.now();
+                try g.allReduce(d, partial, 1);
+                d.settle();
+                const t1 = q.now();
+                try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, rb, off(g.blk.?, blk_timeout), 4, null, 0, null));
+                try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, off(rb, 4), off(g.blk.?, blk_flag), 32, null, 0, null));
+                d.settle();
+                const r4 = @as(*const [10]u32, @ptrCast(rb));
+                std.debug.print(P ++ "E4 exchange {d} call+settle {d:.2} ms timeout 0x{x} flag0 0x{x} flag1 0x{x} pcons0 0x{x} pcons1 0x{x}\n", .{ rank, i, (t1 - t0) * 1e3, r4[0], r4[1], r4[2], r4[3], r4[4] });
+                try labCopy(d, off(g.blk.?, blk_timeout), zero, 4); // the timeout word to 0
+            }
+        }
+
+        std.debug.print(P ++ "done\n", .{rank});
+        std.process.exit(0);
+    }
 };
 
 const cmsg_space = ((@sizeOf(linux.cmsghdr) + 2 * 4 + 7) / 8) * 8; // a control message with two fds
@@ -850,6 +978,26 @@ fn sendByte(sock: linux.fd_t, b: u8) !void {
     var v = [1]u8{b};
     const rc = linux.write(sock, &v, 1);
     if (failed(rc) or rc != 1) return error.ByteSend;
+}
+
+/// The flag lab: a copy on d.list, then a settle (as push and selfTest do).
+fn labCopy(d: *Dev, dst: *anyopaque, src: *anyopaque, n: usize) !void {
+    try dev.copy(d, dst, src, n);
+    d.settle();
+}
+
+/// The flag lab: queue the probe's four words to the host and settle; the values are good until the next launch
+/// into `out`.
+fn labOut(d: *Dev, out: *anyopaque, hout: *anyopaque) !*[4]u64 {
+    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, hout, out, 32, null, 0, null));
+    d.settle();
+    return @ptrCast(hout);
+}
+
+/// The flag lab: the spin probe (one group of 16, only global id 0 works). Five arguments: the pointer, the two
+/// u64 words, the i32 form, the pointer.
+fn labProbe(d: *Dev, p: *anyopaque, want: u64, max_spins: u64, form: u32, out: *anyopaque) !void {
+    try d.launch(d.k.tp_probe, .{ .x = 1 }, .{ p, want, max_spins, @as(i32, form), out });
 }
 
 fn recvByte(sock: linux.fd_t, b: *u8) !void {
