@@ -152,7 +152,7 @@ pub var gdn_bits: u32 = 0;
 /// A variant after a `+` (gate_up:+d64) is a shadow: the kernel runs before the site's own kernel and writes a scratch
 /// buffer. The model keeps its bits, and the row `mv_<variant>_<site>` holds the time of the variant on this shape.
 /// Up to 8 shadows a site, any variant on any site. `ref` and `nref` are the default wide and narrow kernels.
-/// w0, a0, wa0 and h8 are probes with wrong results (gemm.cl), so they run as shadows only.
+/// w0, a0, wa0, h8 and wseq are probes with wrong results (gemm.cl), so they run as shadows only.
 pub const MvPick = struct { k: ze.H, div: u32, wide: bool };
 pub var mv_pick: [16]?MvPick = @splat(null);
 pub var mv_shadow: [16][8]?MvPick = @splat(@splat(null));
@@ -174,6 +174,7 @@ const mv_variants = [_]MvVariant{
     .{ .name = "a0", .row = "mv_a0", .kernel = "w4k1_a0", .local = 64, .div = 128, .wide = true, .probe = true }, // no A stream
     .{ .name = "wa0", .row = "mv_wa0", .kernel = "w4k1_wa0", .local = 64, .div = 128, .wide = true, .probe = true }, // no W and no A stream
     .{ .name = "h8", .row = "mv_h8", .kernel = "w4k1_h8", .local = 64, .div = 128, .wide = true, .probe = true }, // the DPAS of 8 rows
+    .{ .name = "wseq", .row = "mv_wseq", .kernel = "w4k1_wseq", .local = 64, .div = 128, .wide = true, .probe = true }, // one W stream a 16-column block
 };
 /// Int8 K/V cache (XPU_KV_INT8=1): 256 int8 per position and head, then float scales after MAX_CTX positions.
 pub var kv_i8 = false;

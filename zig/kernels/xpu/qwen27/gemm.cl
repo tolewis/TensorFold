@@ -79,6 +79,8 @@ kernel void rowsum(global const half *A, global float *Asum, int M, int Mp, int 
 // Hooks of the timing probes at the end of this file (lane p4-k-mv). A kernel takes the definitions in force where it
 // is made: the row of a W block, the column of an A block, the count of 8-row DPAS tiles.
 #define W4_WROW(kb) ((kb) * 8)
+#define W4_WSURF(j) (global void *)W, N * 4, K / 8, N * 4
+#define W4_WXY(j, kb) (int2)(n0 + 16 * (j), W4_WROW(kb))
 #define W4_ACOL(kb) ((kb) * 64)
 #define W4_DPAS_I(SG_M) ((SG_M) / 8)
 
@@ -93,14 +95,14 @@ kernel void rowsum(global const half *A, global float *Asum, int M, int Mp, int 
       const int kb = (g) * SUBS + u;                                                                                 \
       if (PF > 0 && kb + PF < K / 64) {                                                                              \
         for (int j = 0; j < SG_N / 16; j++)                                                                          \
-          intel_sub_group_2d_block_prefetch_32b_8r16x1c((global void *)W, N * 4, K / 8, N * 4, (int2)(n0 + 16 * j, W4_WROW(kb + PF))); \
+          intel_sub_group_2d_block_prefetch_32b_8r16x1c(W4_WSURF(j), W4_WXY(j, kb + PF));                           \
         for (int r = 0; r < SG_M / R; r++)                                                                           \
           for (int h = 0; h < 2; h++)                                                                                \
             intel_sub_group_2d_block_prefetch_16b_8r16x2c((global void *)A, K * 2, M, K * 2, (int2)(W4_ACOL(kb + PF) + 32 * h, m0 + R * r)); \
       }                                                                                                              \
       uint w[SG_N / 16][8];                                                                                           \
       for (int j = 0; j < SG_N / 16; j++) {                                                                          \
-        intel_sub_group_2d_block_read_32b_8r16x1c((global void *)W, N * 4, K / 8, N * 4, (int2)(n0 + 16 * j, W4_WROW(kb)), w[j]); \
+        intel_sub_group_2d_block_read_32b_8r16x1c(W4_WSURF(j), W4_WXY(j, kb), w[j]);                                 \
         if (u == 0) {                                                                                                \
           s[j] = (float)S[(g) * N + n0 + 16 * j + lane] * 16777216.0f;                                               \
           if (BIAS) b[j] = (float)B[(g) * N + n0 + 16 * j + lane];                                                   \
@@ -369,3 +371,15 @@ W4K_KERNEL_SL(w4k1_a0, 16, 32, 4, 16, READ16, 2, 1)
 W4K_KERNEL_SL(w4k1_h8, 16, 32, 4, 16, READ16, 2, 1)
 #undef W4_DPAS_I
 #define W4_DPAS_I(SG_M) ((SG_M) / 8)
+// wseq: each 16-column block of a tile reads its own run of K / 8 rows of 64 bytes, one after the other in memory
+// (a surface of pitch 64 at the block's offset). The bytes are not the block's weights. The probe times a W layout
+// with one stream a block in place of rows that lie N x 4 bytes apart.
+#undef W4_WSURF
+#undef W4_WXY
+#define W4_WSURF(j) (global void *)(W + (long)(n0 / 16 + (j)) * (K / 8) * 16), 64, K / 8, 64
+#define W4_WXY(j, kb) (int2)(0, W4_WROW(kb))
+W4K_KERNEL_SL(w4k1_wseq, 16, 32, 4, 16, READ16, 2, 1)
+#undef W4_WSURF
+#undef W4_WXY
+#define W4_WSURF(j) (global void *)W, N * 4, K / 8, N * 4
+#define W4_WXY(j, kb) (int2)(n0 + 16 * (j), W4_WROW(kb))
