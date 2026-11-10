@@ -395,11 +395,13 @@ pub const Group = struct {
         if (q.TP == 1) return null;
         one_slot = std.c.getenv("TF_TP_ONE_SLOT") != null;
         trace = std.c.getenv("TF_TP_TRACE") != null;
-        devflag = std.c.getenv("TF_TP_DEVFLAG") != null;
-        // TF_TP_DEVFLAG=2: the wait is a counter based event with the device scope on its wait side (spec WP1,
-        // "Second design"). 1 (or any other value): the kernel poll.
+        devflag = false;
+        evmode = false;
+        // TF_TP_DEVFLAG: 0 off, 1 the kernel poll, 2 the counter based event; unset is off. The value is parsed, so
+        // the WP1 rollback (TF_TP_DEVFLAG=0 in both env files) really turns the path off.
         if (std.c.getenv("TF_TP_DEVFLAG")) |v| {
             const s = std.mem.span(v);
+            if (s.len == 0 or s[0] != '0') devflag = true;
             evmode = s.len > 0 and s[0] == '2';
         }
         record_wait = 180.0;
@@ -496,7 +498,7 @@ pub const Group = struct {
                 g.direct = false;
             },
         };
-        if (std.c.getenv("TF_TP_FLAGLAB") != null) g.lab_conn = conn; // the lab steps on the socket at load
+        if (std.c.getenv("TF_TP_FLAGLAB") != null or evmode) g.lab_conn = conn; // the lab steps on the socket at load; the event mode resets its words on it
         std.log.info("qwen27-xpu: TP {d} rank {d}: all-reduce {s}", .{ g.tp, g.rank, if (g.devflag) "device-flag (the peer's slot pushed over PCIe, the add polls a flag)" else if (g.direct) "device-direct (the peer's slots over PCIe)" else "host-staged" });
         return g;
     }
@@ -810,16 +812,22 @@ pub const Group = struct {
         return ev;
     }
 
-    /// TF_TP_DEVFLAG=2: both ranks reach this at the same exchange (the count is symmetric), so the flag words, the
-    /// consumed counters and the sequence go to 0 together before a completion value would pass the driver's maximum
-    /// (2^32 − 1: about 12 days of decode with no pause).
+    /// TF_TP_DEVFLAG=2: both ranks reach this at the same exchange (the count is symmetric). The order: each rank
+    /// resets its own block's flag and peer-consumed words and its own consumed counters (a copy and a settle), then
+    /// one byte each way on the handshake socket, then the exchange pushes with sequence 1, so its event waits for
+    /// the peer's write of 1 (a completion value of 0 would be complete at once and the add would read a slot two
+    /// exchanges old). This runs before a completion value would pass the driver's maximum (2^32 − 1: about 12 days
+    /// of decode with no pause).
     fn resetWords(g: *Group, d: *Dev) !void {
         const zero = try d.g.hostAlloc(64);
         @memset(@as([*]u8, @ptrCast(zero))[0..64], 0);
         try labCopy(d, off(g.blk.?, blk_flag), zero, 32); // this rank's block: the flags and the peer-consumed words
         try labCopy(d, g.own_cons.?, zero, 16);
         try labCopy(d, off(g.peer_blk.?, blk_flag), zero, 32); // the flags and consumed counters this rank wrote there
-        g.seq = 0;
+        var b: u8 = 1;
+        try sendByte(g.lab_conn, b);
+        try recvByte(g.lab_conn, &b); // the barrier: neither rank pushes before the other has reset
+        g.seq = 1; // this exchange's sequence, so its event waits for the peer's write of 1
     }
 
     /// TF_TP_EXBENCH=1: at load, the cost of 128 exchanges (a round) at 1, 8, 16 and 32 rows in the group's
