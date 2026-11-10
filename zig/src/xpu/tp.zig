@@ -902,7 +902,8 @@ pub const Group = struct {
                     try sendByte(conn, 2); // the probe runs
                 } else {
                     try recvByte(conn, &b);
-                    std.time.sleep(200 * std.time.MilliSecond); // the kernel runs
+                    var ts: std.c.timespec = .{ .sec = 0, .nsec = 200_000_000 };
+                    while (std.c.nanosleep(&ts, &ts) != 0) {} // the kernel runs
                     w64.* = 2;
                     try labCopy(d, off(g.peer_blk.?, blk_flag), hw, 8);
                     try sendByte(conn, 3); // the write is down
@@ -930,7 +931,8 @@ pub const Group = struct {
         for (forms) |form| {
             try labCopy(d, wbuf, zero, 8); // the word to 0
             try labProbe(d, wbuf, 3, 1 << 28, form, out);
-            std.time.sleep(200 * std.time.MilliSecond); // the kernel runs
+            var ts: std.c.timespec = .{ .sec = 0, .nsec = 200_000_000 };
+            while (std.c.nanosleep(&ts, &ts) != 0) {} // the kernel runs
             w64.* = 3;
             try ze.check(d.g.api.zeCommandListAppendMemoryCopy(list2, wbuf, hw, 8, null, 0, null));
             const s0 = q.now();
