@@ -9,6 +9,17 @@
 // reads and i8_i8_k32, the K scale on the int32 score, P in f16 in SLM with the V scale folded in, PV as 16
 // sub-groups x 16 dimensions through transform reads and f16_f16_k16. Partials as attn_decode_span (PM, PL, PO),
 // merged by attn_merge_span.
+//
+// K1_PROBE (k1.cl, 0 in the two real variants): timing probes for shadow launches (lane p4-k-k1, XPU_K1_SHADOW).
+// 1: no barrier at the end of a tile (the same bits: a sub-group that is ahead writes only its own MX slot, and MX
+// is read between the first two barriers of a tile). 2: no barrier in a tile. 4: no V read and no PV. 8: no K read
+// and no QK. 16: PV with a constant in place of the P read. 32: QK with a constant in place of the Q read.
+// 64: no exp2. The probes 2 to 64 give wrong results.
+#if K1_PROBE & 64
+#define K1_EXP2(x) (fmin(fmax((x), -1.0f), 0.0f) * 0.5f + 1.0f)
+#else
+#define K1_EXP2(x) native_exp2(x)
+#endif
 KERNEL(256) void K1_FN(global const ushort *Q, global const char *KC, global const char *VC,
                        global float *PM, global float *PL, global float *PO, int p0, int NS, int span,
                        float scale, global const ulong *MT, global const int *POS, int cap,
@@ -64,7 +75,7 @@ KERNEL(256) void K1_FN(global const ushort *Q, global const char *KC, global con
     m[p] = -INFINITY;
     l[p] = 0.0f;
   }
-  if (j0 < j1 && sg < K1_G) {                      // the first tile's K rows
+  if (!(K1_PROBE & 8) && j0 < j1 && sg < K1_G) {                      // the first tile's K rows
     const int kb = j0 + sg * 16;
     if (kb < j1) {
       global const char *kp = KC + (long)PT[kb / Q27_PAGE] * Q27_PAGE8 + hk * 256;
@@ -81,7 +92,7 @@ KERNEL(256) void K1_FN(global const ushort *Q, global const char *KC, global con
     global const char *kpage = KC + kpb + hk * 256;
     { // the next tile's V rows: this sub-group's 16 keys of it
       const int vb = k0 + K1_T + sg * 16;
-      if (sg < K1_G && vb < j1) {
+      if (!(K1_PROBE & 4) && sg < K1_G && vb < j1) {
         const int pg = vb / Q27_PAGE;
         global const char *vp = VC + (long)PT[pg] * Q27_PAGE8 + hk * 256;
         const int rows = min(Q27_PAGE, nkeys - pg * Q27_PAGE);
@@ -91,7 +102,7 @@ KERNEL(256) void K1_FN(global const ushort *Q, global const char *KC, global con
     }
     int8 si[K1_P][2];
     for (int p = 0; p < K1_P; p++) si[p][0] = si[p][1] = 0;
-    if (kin) {
+    if (kin && !(K1_PROBE & 8)) {
       __attribute__((opencl_unroll_hint))
       for (int ds = 0; ds < 8; ds++) {             // steps of 32 dimensions: 16 keys x 32 bytes, 2 A tiles of 8 keys
         ushort ka[16];
@@ -100,7 +111,7 @@ KERNEL(256) void K1_FN(global const ushort *Q, global const char *KC, global con
         for (int b = 0; b < 2; b++)
           for (int r = 0; r < 8; r++) a[b][r] = (short)ka[b * 8 + r];
         for (int p = 0; p < npass; p++) {
-          const int8 qb = as_int8(intel_sub_group_block_read8(QI + (p * 64 + ds * 8) * 16));
+          const int8 qb = (K1_PROBE & 32) ? (int8)(0x01010101) : as_int8(intel_sub_group_block_read8(QI + (p * 64 + ds * 8) * 16));
           si[p][0] = intel_sub_group_i8_i8_matrix_mad_k32(a[0], qb, si[p][0]);
           si[p][1] = intel_sub_group_i8_i8_matrix_mad_k32(a[1], qb, si[p][1]);
         }
@@ -124,17 +135,17 @@ KERNEL(256) void K1_FN(global const ushort *Q, global const char *KC, global con
       }
       MX[p][sg][lane] = mx[p];
     }
-    barrier(CLK_LOCAL_MEM_FENCE);
+    if (!(K1_PROBE & 2)) barrier(CLK_LOCAL_MEM_FENCE);
     for (int p = 0; p < K1_P; p++) {
       float tm = -INFINITY;
       for (int i = 0; i < 16; i++) tm = fmax(tm, MX[p][i][lane]);
       mn[p] = fmax(m[p], tm);
-      alpha[p] = mn[p] == -INFINITY ? 1.0f : native_exp2(m[p] - mn[p]);
+      alpha[p] = mn[p] == -INFINITY ? 1.0f : K1_EXP2(m[p] - mn[p]);
       float sum = 0.0f;
       if (p < npass && sg < K1_G) {
         __attribute__((opencl_unroll_hint))
         for (int kk = 0; kk < 16; kk++) {
-          const float pr = mn[p] == -INFINITY ? 0.0f : native_exp2(s[p][kk] - mn[p]);
+          const float pr = mn[p] == -INFINITY ? 0.0f : K1_EXP2(s[p][kk] - mn[p]);
           sum += pr;
           P[(sg * K1_C + p * 16 + lane) * 16 + kk] = as_ushort(convert_half(pr * sub_group_broadcast(vsc, kk) * K1_PSCALE));
         }
@@ -143,7 +154,7 @@ KERNEL(256) void K1_FN(global const ushort *Q, global const char *KC, global con
       if (sg == 0) AL[p * 16 + lane] = alpha[p];
       m[p] = mn[p];
     }
-    barrier(CLK_LOCAL_MEM_FENCE);
+    if (!(K1_PROBE & 2)) barrier(CLK_LOCAL_MEM_FENCE);
     for (int p = 0; p < K1_P; p++) {
       float ls = 0.0f;
       for (int i = 0; i < 16; i++) ls += SM[p][i][lane];
@@ -154,7 +165,7 @@ KERNEL(256) void K1_FN(global const ushort *Q, global const char *KC, global con
       for (int r = 0; r < 8; r++) o[q][r] *= AL[q * 8 + r];
     { // the next tile's K rows: this sub-group's 16 keys of it
       const int nb = k0 + K1_T + sg * 16;
-      if (sg < K1_G && nb < j1) {
+      if (!(K1_PROBE & 8) && sg < K1_G && nb < j1) {
         const int pg = nb / Q27_PAGE;
         global const char *np = KC + (long)PT[pg] * Q27_PAGE8 + hk * 256;
         const int rows = min(Q27_PAGE, nkeys - pg * Q27_PAGE);
@@ -162,7 +173,7 @@ KERNEL(256) void K1_FN(global const ushort *Q, global const char *KC, global con
           intel_sub_group_2d_block_prefetch_16b_16r16x1c((global void *)np, 256, rows, Q27_KVROW, (int2)(ds * 16, nb % Q27_PAGE));
       }
     }
-    for (int c2 = 0; c2 < K1_T / 32; c2++) {       // PV, 32 keys a read: lane = dimension 16 sg + lane, word j = keys 4j..
+    for (int c2 = 0; c2 < ((K1_PROBE & 4) ? 0 : K1_T / 32); c2++) {       // PV, 32 keys a read: lane = dimension 16 sg + lane, word j = keys 4j..
       const int y0 = k0 + c2 * 32;
       if (y0 >= j1) break;
       const int pg = y0 / Q27_PAGE;
@@ -181,12 +192,12 @@ KERNEL(256) void K1_FN(global const ushort *Q, global const char *KC, global con
         }
         const int kg = c2 * 2 + hc;
         for (int q = 0; q < K1_C / 8; q++) {
-          const short8 pa = as_short8(intel_sub_group_block_read_us8(P + (kg * K1_C + q * 8) * 16));
+          const short8 pa = (K1_PROBE & 16) ? (short8)(0x3c00) : as_short8(intel_sub_group_block_read_us8(P + (kg * K1_C + q * 8) * 16));
           o[q] = intel_sub_group_f16_f16_matrix_mad_k16(pa, as_int8(vw), o[q]);
         }
       }
     }
-    barrier(CLK_LOCAL_MEM_FENCE);                  // P, MX, SM and AL are reused by the next tile
+    if (!(K1_PROBE & 3)) barrier(CLK_LOCAL_MEM_FENCE); // P, MX, SM and AL are reused by the next tile
   }
   if (sg == 0)
     for (int p = 0; p < npass; p++) {
@@ -208,3 +219,4 @@ KERNEL(256) void K1_FN(global const ushort *Q, global const char *KC, global con
       }
     }
 }
+#undef K1_EXP2
