@@ -93,7 +93,7 @@ const Mlx = struct { w: *anyopaque, s: *anyopaque, b: *anyopaque, n: u32 };
 pub const Drafter = struct {
     r: *q.Runner,
     ckpt: q.Checkpoint = .{}, // the codebooks (pred, succ) are read from its mapping
-    k: struct { dconv: ze.H, dprep: ze.H, dattn: ze.H, rowsums_rows: ze.H, taps_in: ze.H, to_res: ze.H, topk_part: ze.H, quantize4: ze.H },
+    k: struct { dconv: ze.H, dprep: ze.H, dattn: ze.H, rowsums_rows: ze.H, taps_in: ze.H, to_res: ze.H, topk_part: ze.H, quantize4: ze.H, topk_merge: ze.H = null },
     layers: [LAYERS]Layer,
     fc: q.Proj,
     hidden_norm: *anyopaque,
@@ -118,6 +118,8 @@ pub const Drafter = struct {
     tapsbuf: *anyopaque, // a batched absorb's rows gathered, bf16 [MAXB, 5 D]
     pv_host: []f32,
     pi_host: []i32,
+    mv: ?*anyopaque = null, // XPU_SMALLK bit 128: topk_merge's top 16 a row, fp32 [MAXB, 16]
+    mi: ?*anyopaque = null, // and their head indices, i32 [MAXB, 16]
     // buffers
     x: *anyopaque, // fp32 [rows, D]
     h: *anyopaque, // fp16 [rows, 25 600]
@@ -340,7 +342,7 @@ pub const Drafter = struct {
         if (std.c.getenv("XPU_DRAFT_RAGGED")) |v| ragged = v[0] == '1';
         if (ragged) std.debug.print("drafter: ragged blocks (XPU_DRAFT_RAGGED)\n", .{});
         dr.logits = try d.alloc_(MAXB * @as(usize, dr.head.n) * 2);
-        if (q.smallk & 118 != 0) { // XPU_SMALLK (lane p4-kernel): the drafter's kernels; the flag line is qwen27.zig's
+        if (q.smallk & 246 != 0) { // XPU_SMALLK (lane p4-kernel): the drafter's kernels; the flag line is qwen27.zig's
             const check = @import("smallk_check.zig");
             if (q.smallk & 2 != 0) {
                 if (HEAD_N % 8 != 0 or dr.head.n % 8 != 0) return error.UnexpectedShape; // 16-byte reads of 8 values
@@ -353,6 +355,13 @@ pub const Drafter = struct {
                 const local: u32 = if (q.smallk & 64 != 0) 64 else if (q.smallk & 48 != 0) 32 else 16;
                 if (q.smallk & 8 != 0) try check.dattn(d, m, name, local, CAP, NH, NKV, HD);
                 dr.k.dattn = try kern(d, m, name, local);
+            }
+            if (q.smallk & 128 != 0) { // the host merge of the top-k lists on the device (after topk_part of bit 2 or not)
+                const merge = try kern(d, m, "topk_merge", 256);
+                if (q.smallk & 8 != 0) try check.topkMerge(d, dr.k.topk_part, merge, HEAD_N, dr.head.n);
+                dr.k.topk_merge = merge;
+                dr.mv = try d.alloc_(MAXB * 16 * 4);
+                dr.mi = try d.alloc_(MAXB * 16 * 4);
             }
         }
         // XPU_PROFILE: the drafter's own kernels get a place in the table (they are not in the target's kernel list)
@@ -634,8 +643,12 @@ pub const Drafter = struct {
         const pv = dr.pv_host;
         const pi = dr.pi_host;
         var sp: [MAXB * RANK]f16 = undefined;
-        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, pv.ptr, dr.pv, rows * 256 * 16 * 4, null, 0, null));
-        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, pi.ptr, dr.pi, rows * 256 * 16 * 4, null, 0, null));
+        // XPU_SMALLK bit 128: the device merges the lists, and 16 entries a row come back instead of 4 096
+        const merged = dr.k.topk_merge != null;
+        if (dr.k.topk_merge) |km| try d.launch(km, .{ .x = rows }, .{ dr.pv, dr.pi, dr.mv.?, dr.mi.? });
+        const per: usize = if (merged) 16 else 256 * 16;
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, pv.ptr, if (merged) dr.mv.? else dr.pv, @as(usize, rows) * per * 4, null, 0, null));
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, pi.ptr, if (merged) dr.mi.? else dr.pi, @as(usize, rows) * per * 4, null, 0, null));
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &sp, dr.selp, rows * RANK * 2, null, 0, null));
         try d.sync();
         for (0..S) |b| {
@@ -645,7 +658,10 @@ pub const Drafter = struct {
                 const row = if (one) depth else offs[b] + 1 + depth;
                 var bv: [TOPK]f32 = @splat(-std.math.inf(f32));
                 var bi: [TOPK]i32 = @splat(std.math.maxInt(i32));
-                for (0..256 * 16) |j| {
+                if (merged) {
+                    bv = pv[row * 16 ..][0..TOPK].*;
+                    bi = pi[row * 16 ..][0..TOPK].*;
+                } else for (0..256 * 16) |j| {
                     const v = pv[row * 4096 + j];
                     const ix = pi[row * 4096 + j];
                     if (ix == std.math.maxInt(i32)) continue;

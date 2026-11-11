@@ -440,6 +440,46 @@ KERNEL(16) void topk_part16(global const half *L, int N, int NS, global float *P
   PI[((long)row * 256 + gid) * 16 + lane] = bi;
 }
 
+// A key that orders (value desc, index asc) as an unsigned compare: the larger key comes first. -0 and +0 are one
+// value, as in the host compares. Index INT_MAX (an empty entry) gives a key under every entry with a real index.
+static inline ulong topk_key(float v, int ix) {
+  const uint u = v == 0.0f ? 0u : as_uint(v);
+  return ((ulong)((u & 0x80000000u) ? ~u : (u | 0x80000000u)) << 32) | (ulong)(~(uint)ix);
+}
+
+// XPU_SMALLK bit 128 (lane p4-kernel): the host merge of drafter.zig on the device. The top 16 of a row's 256 lists
+// (from topk_part or topk_part16) by (value desc, index asc), the entries with index INT_MAX left out and the rest
+// filled with (-inf, INT_MAX). Each list is in that order, so 16 rounds of a group max over the heads of the 256
+// lists give the top 16 in order. One group a row, one work-item a list. The entries keep their bits.
+KERNEL(256) void topk_merge(global const float *PV, global const int *PI, global float *OV, global int *OI) {
+  local ulong top[16];
+  const int row = get_group_id(0), l = get_local_id(0);
+  global const float *pv = PV + ((long)row * 256 + l) * 16;
+  global const int *pi = PI + ((long)row * 256 + l) * 16;
+  int h = 0;
+  float v = pv[0];
+  int ix = pi[0];
+  ulong key = topk_key(v, ix);
+  for (int i = 0; i < 16; i++) {
+    const ulong m = sub_group_reduce_max(key);
+    if (get_sub_group_local_id() == 0) top[get_sub_group_id()] = m;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    ulong best = top[0];
+    for (int s = 1; s < 16; s++) best = max(best, top[s]);
+    barrier(CLK_LOCAL_MEM_FENCE); // each work-item has read top before the next round writes it
+    if (key == best) { // one list, or empty entries only (they all write the same entry)
+      OV[row * 16 + i] = ix == 0x7fffffff ? -INFINITY : v;
+      OI[row * 16 + i] = ix;
+      h++;
+      if (h < 16) {
+        v = pv[h];
+        ix = pi[h];
+        key = topk_key(v, ix);
+      } else key = 0;
+    }
+  }
+}
+
 // Affine 4-bit quantization of a bf16 weight in groups of 64 along K (MLX layout), one work-item per (row, group).
 kernel void quantize4(global const ushort *W, int N, int K, global uint *MW, global ushort *MS, global ushort *MB) {
   const int n = get_global_id(0), g = get_global_id(1);

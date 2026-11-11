@@ -152,9 +152,11 @@ pub var gdn_bits: u32 = 0;
 /// kernel it replaces. 1: argmax_part16 in place of argmax_part (the token of each verify row). 2: the drafter's
 /// topk_part16 in place of topk_part. 4: the drafter's dattn_la4 in place of dattn (the K and V rows of the next 4
 /// positions in flight). 16: dattn_la2 in place of dattn (8 positions in flight, two query heads a subgroup), before
-/// bit 4. 32: dattn_lb2 (two buffers of 8 positions in turn, a ring index that steps, two query heads a subgroup),
-/// before bits 16 and 4. 64: dattn_lb1 (the same, one query head a subgroup), before bit 32. 8: at the load, each new kernel against the kernel it replaces on this card (smallk_check.zig), and the
-/// open fails when a token, a list entry or an output bit differs. Default 0.
+/// bit 4. 32: dattn_lb2 (two buffers of 4 positions in turn, a ring index that steps, two query heads a subgroup),
+/// before bits 16 and 4. 64: dattn_lb1 (the same, one query head a subgroup), before bit 32. 128: the drafter's
+/// topk_merge, the host merge of the top-k lists on the device (16 entries a row come back, not 4 096). 8: at the
+/// load, each new kernel against the kernel it replaces on this card (smallk_check.zig), and the open fails when a
+/// token, a list entry or an output bit differs. Default 0.
 pub var smallk: u32 = 0;
 /// XPU_MV (lane p4-k-mv): the decode matvec kernel of a call site, `site:variant` pairs separated by commas
 /// (XPU_MV=mixer_in_gdn:d16,mixer_in_attn:d16). A site is a `Site` name. A variant is a kernel of gemm.cl:
@@ -169,7 +171,7 @@ pub var smallk: u32 = 0;
 /// of the same site (forward.zig, mv_ring), so no launch reads a W that a launch read in the last milliseconds.
 /// w0, a0, wa0, h8 and wseq are probes with wrong results (gemm.cl), so they run as shadows only.
 pub const MvPick = struct { k: ze.H, div: u32, wide: bool };
-pub var mv_pick: [16]?MvPick = @splat(null);
+pub var mv_pick: [16][2]?MvPick = @splat(@splat(null)); // [site][wide]: a pick for each layout of a site (lane p4-kernel)
 pub const MvShadow = struct { k: ze.H, div: u32, cold: bool, name: []const u8 };
 pub var mv_shadow: [16][16]?MvShadow = @splat(@splat(null));
 /// XPU_MV pre1:@@ref, pre2:@@ref (lane p4-k-first): shadows on the shape of gate|up at two earlier places of a layer.
@@ -604,7 +606,7 @@ pub const Runner = struct {
         }
         if (smallk != 0) { // lane p4-kernel: one line a rank, the check of the flag (the drafter's kernels: drafter.zig)
             const la: []const u8 = if (smallk & 64 != 0) "dattn_lb1" else if (smallk & 32 != 0) "dattn_lb2" else if (smallk & 16 != 0) "dattn_la2" else if (smallk & 4 != 0) "dattn_la4" else "off";
-            std.debug.print("smallk: XPU_SMALLK={d} (argmax_part16 {s}, topk_part16 {s}, dattn {s}, check {s})\n", .{ smallk, if (smallk & 1 != 0) "on" else "off", if (smallk & 2 != 0) "on" else "off", la, if (smallk & 8 != 0) "on" else "off" });
+            std.debug.print("smallk: XPU_SMALLK={d} (argmax_part16 {s}, topk_part16 {s}, dattn {s}, topk_merge {s}, check {s})\n", .{ smallk, if (smallk & 1 != 0) "on" else "off", if (smallk & 2 != 0) "on" else "off", la, if (smallk & 128 != 0) "on" else "off", if (smallk & 8 != 0) "on" else "off" });
             if (smallk & 1 != 0) {
                 comptime std.debug.assert(VOCAB % 8 == 0); // argmax_part16 reads 8 values a lane, 16-byte aligned
                 const part16 = try d.kernel(mg, "argmax_part16", 16);
@@ -664,7 +666,7 @@ pub const Runner = struct {
                         try std.fmt.allocPrint(alloc, "mv_{s}_{s}", .{ v.name, sname })
                     else
                         try std.fmt.allocPrint(alloc, "mv_{s}{d}_{s}", .{ v.name, nth, sname });
-                } else mv_pick[@intFromEnum(site)] = .{ .k = k, .div = v.div, .wide = v.wide };
+                } else mv_pick[@intFromEnum(site)][@intFromBool(v.wide)] = .{ .k = k, .div = v.div, .wide = v.wide };
                 if (prof.on) {
                     const free = for (&prof.names) |*slot| {
                         if (slot.name.len == 0) break slot;

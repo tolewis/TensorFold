@@ -286,8 +286,9 @@ pub fn gemmRows(d: *Dev, pscr: *anyopaque, h: *anyopaque, ahi: *anyopaque, alo: 
     // With XPU_SITE_SPLIT the gate|up of an attention layer has its own profile site and the shadows and pick of gate_up.
     const site = @intFromEnum(if (q.prof.site == .gate_up_attn) q.Site.gate_up else q.prof.site);
     if (!wide and !g128) try mvShadows(d, &q.mv_shadow[site], site, 0, h, ahi, alo, w, m);
-    // XPU_MV (lane p4-k-mv): the pick of this call site, for a shape its tile divides
-    const pick: ?q.MvPick = if (!wide and !g128) q.mv_pick[site] else null;
+    // XPU_MV (lane p4-k-mv): the pick of this call site and layout, for a shape its tile divides. Site none holds the
+    // drafter's projections (lane p4-kernel).
+    const pick: ?q.MvPick = if (!wide and !g128) q.mv_pick[site][@intFromBool(w.wide)] else null;
     if (pick != null and pick.?.wide == w.wide and w.n % pick.?.div == 0) {
         try d.launch(pick.?.k, .{ .x = 1, .y = w.n / pick.?.div }, .{ h, w.w, w.s, w.bg, out, M, N, K, ahi, alo, mp, G });
     } else if (!wide) {

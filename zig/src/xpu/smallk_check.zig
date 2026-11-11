@@ -121,13 +121,10 @@ fn merge(pv: []const f32, pi: []const i32, r: usize, bv: *[16]f32, bi: *[16]i32)
     }
 }
 
-/// topk_part16 against topk_part on N columns of rows NS apart: the merged top 16 of each row. No NaN: the two
-/// kernels cut a row into other parts, and a NaN entry of topk_part depends on its part.
-pub fn topk(d: *Dev, old: ze.H, new: ze.H, N: u32, NS: u32) !void {
-    var held: Held = .{};
-    defer held.deinit(d);
+/// ROWS rows of N logits NS apart on a grid of ties, with the edge rows of the top-k kernels. No NaN: the part
+/// kernels cut a row into other parts, and a NaN entry depends on its part.
+fn logitRows(N: u32, NS: u32) ![]f16 {
     const host = try alloc.alloc(f16, ROWS * NS);
-    defer alloc.free(host);
     for (host) |*x| x.* = grid(61);
     const inf = std.math.inf(f16);
     const row = struct {
@@ -143,6 +140,19 @@ pub fn topk(d: *Dev, old: ze.H, new: ze.H, N: u32, NS: u32) !void {
         x.* = -inf;
     };
     for (row(host, NS, 6)[N..NS]) |*x| x.* = 100; // above every value, past N: never an entry
+    const nz: f16 = @bitCast(@as(u16, 0x8000));
+    for (row(host, NS, 7)[0..N], 0..) |*x, i| x.* = if (i % 3 == 0) nz else if (i % 3 == 1) 0 else -1; // -0 and +0 tie
+    for (row(host, NS, 8)[0..N], 0..) |*x, i| x.* = if (i < 5) 7 else -inf; // 5 entries, then only empty entries
+    return host;
+}
+
+/// topk_part16 against topk_part on N columns of rows NS apart: the merged top 16 of each row. No NaN: the two
+/// kernels cut a row into other parts, and a NaN entry of topk_part depends on its part.
+pub fn topk(d: *Dev, old: ze.H, new: ze.H, N: u32, NS: u32) !void {
+    var held: Held = .{};
+    defer held.deinit(d);
+    const host = try logitRows(N, NS);
+    defer alloc.free(host);
     const L = try held.put(d, f16, host);
     var pv: [2]*anyopaque = undefined;
     var pi: [2]*anyopaque = undefined;
@@ -173,6 +183,45 @@ pub fn topk(d: *Dev, old: ze.H, new: ze.H, N: u32, NS: u32) !void {
         if (r == 3) top = .{ bi[1][0], bi[1][15] };
     }
     std.debug.print("smallk check: topk_part16 against topk_part, {d} rows of {d}, {d} of {d} entries differ (row 3 entries 0 and 15: {d} {d})\n", .{ ROWS, N, bad, ROWS * 16, top[0], top[1] });
+    if (bad != 0) return error.SmallkCheck;
+}
+
+/// topk_merge (`merge`) against the host merge of drafter.zig, on the lists of `part` (topk_part or topk_part16) for
+/// the rows of logitRows. Every entry's value bits and index must agree.
+pub fn topkMerge(d: *Dev, part: ze.H, mk: ze.H, N: u32, NS: u32) !void {
+    var held: Held = .{};
+    defer held.deinit(d);
+    const host = try logitRows(N, NS);
+    defer alloc.free(host);
+    const L = try held.put(d, f16, host);
+    const pv = try held.room(d, ROWS * 256 * 16 * 4);
+    const pi = try held.room(d, ROWS * 256 * 16 * 4);
+    const ov = try held.room(d, ROWS * 16 * 4);
+    const oi = try held.room(d, ROWS * 16 * 4);
+    try d.fill(ov, @as(u32, 0x7fc00000), ROWS * 16 * 4); // NaN: an entry the kernel does not write shows
+    try d.fill(oi, @as(u32, 0x55555555), ROWS * 16 * 4);
+    try d.launch(part, .{ .x = 256, .y = ROWS }, .{ L, @as(i32, @intCast(N)), @as(i32, @intCast(NS)), pv, pi });
+    try d.launch(mk, .{ .x = ROWS }, .{ pv, pi, ov, oi });
+    const hv = try back(d, f32, pv, ROWS * 4096);
+    defer alloc.free(hv);
+    const hi = try back(d, i32, pi, ROWS * 4096);
+    defer alloc.free(hi);
+    const dv = try back(d, f32, ov, ROWS * 16);
+    defer alloc.free(dv);
+    const di = try back(d, i32, oi, ROWS * 16);
+    defer alloc.free(di);
+    var bad: usize = 0;
+    var empty: usize = 0;
+    for (0..ROWS) |r| {
+        var bv: [16]f32 = undefined;
+        var bi: [16]i32 = undefined;
+        merge(hv, hi, r, &bv, &bi);
+        for (0..16) |j| {
+            bad += @intFromBool(@as(u32, @bitCast(bv[j])) != @as(u32, @bitCast(dv[r * 16 + j])) or bi[j] != di[r * 16 + j]);
+            empty += @intFromBool(bi[j] == INT_MAX);
+        }
+    }
+    std.debug.print("smallk check: topk_merge against the host merge, {d} rows, {d} of {d} entries differ ({d} empty entries)\n", .{ ROWS, bad, ROWS * 16, empty });
     if (bad != 0) return error.SmallkCheck;
 }
 
