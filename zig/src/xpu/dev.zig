@@ -268,6 +268,7 @@ pub const Dev = struct {
             if (q.prof.used == q.prof.events.len) try d.sync();
             sig = q.prof.events[q.prof.used];
             q.prof.kernel[q.prof.used] = k;
+            q.prof.at[q.prof.used] = q.prof.site; // XPU_PROFILE=2: without it the launch takes the site of an older launch
             q.prof.used += 1;
         }
         var wa = [1]ze.H{ev};
