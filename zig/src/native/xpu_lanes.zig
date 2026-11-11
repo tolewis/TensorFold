@@ -659,7 +659,30 @@ pub const Lanes = struct {
             @as(f64, @floatFromInt(xq.stat.hcopies)) / n,
             xq.stat.hcopy_s * 1e3 / n,
         });
-        xq.stat = .{ .on = xq.stat.on }; // the counters reset; on stays
+        if (xq.stat.dr_on) { // XPU_DR_STEPS (lane p4-k-drt): the drafter's host steps of the same rounds
+            const s = xq.stat.dr_s;
+            const ms = 1e3 / n;
+            var sum: f64 = 0;
+            for (s, 0..) |x, k| {
+                if (k != @intFromEnum(xq.DrStep.absorb_sync)) sum += x; // the absorb's sync is inside absorb
+            }
+            std.debug.print("drafter steps: {d} rounds, ms a round: absorb {d:.3} (its sync {d:.3}), pre {d:.3}, layers {d:.3}, head and gather {d:.3} (settles {d:.3} in {d:.1} waits, inside layers and head), sync {d:.3}, merge {d:.3}, tree {d:.3}, rest {d:.3} of drafter {d:.3}\n", .{
+                rs.rounds,
+                s[@intFromEnum(xq.DrStep.absorb)] * ms,
+                s[@intFromEnum(xq.DrStep.absorb_sync)] * ms,
+                s[@intFromEnum(xq.DrStep.pre)] * ms,
+                s[@intFromEnum(xq.DrStep.layers)] * ms,
+                s[@intFromEnum(xq.DrStep.head)] * ms,
+                xq.stat.dr_settle_s * ms,
+                @as(f64, @floatFromInt(xq.stat.dr_settles)) / n,
+                s[@intFromEnum(xq.DrStep.sync)] * ms,
+                s[@intFromEnum(xq.DrStep.merge)] * ms,
+                s[@intFromEnum(xq.DrStep.tree)] * ms,
+                draft - sum * ms,
+                draft,
+            });
+        }
+        xq.stat = .{ .on = xq.stat.on, .dr_on = xq.stat.dr_on }; // the counters reset; on and dr_on stay
         if (xq.prof.on) {
             var buf: [96]u8 = undefined;
             xq.profReport(try std.fmt.bufPrint(&buf, "{d} rounds, {d:.2} streams a round", .{ rs.rounds, streams }));
@@ -703,7 +726,10 @@ pub const Lanes = struct {
             depth = @max(depth, counts[ni]);
             ni += 1;
         }
+        const dr_t = xq.stat.dr_on; // XPU_DR_STEPS (lane p4-k-drt): the host time of the drafter's steps
+        var tm: f64 = if (dr_t) xq.now() else 0;
         try b.absorb(which[0..na], ps[0..na]);
+        if (dr_t) xq.drMark(.absorb, &tm);
         if (ni == 0) return;
         for (requests) |q| if (q.depth > 0) {
             try d.use(b.slotOf(q.stream).?);
@@ -727,6 +753,8 @@ pub const Lanes = struct {
                 if (e == g) e = g + 1; // a block alone: 8 rows at most
             }
             if (xq.drafter.ragged and ni > 1) try d.latticeRagged(items[g..e], counts[g..e]) else try d.latticeMulti(items[0..ni], depth);
+            var tt: f64 = if (dr_t) xq.now() else 0;
+            defer if (dr_t) xq.drMark(.tree, &tt);
             // each stream's best-first tree of its asked drafts over its lattice, with the target's keyed noise if sampled
             for (items[g..e], asked[g..e], reqs[g..e], 0..) |it, n, q, i| {
                 d.take(i);

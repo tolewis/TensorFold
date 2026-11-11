@@ -292,8 +292,28 @@ pub const Stat = struct {
     syncs: u64 = 0,
     hcopies: u64 = 0, // host-pointer copies of the tree verify and its commit (dev.hostCopy)
     hcopy_s: f64 = 0, // host time inside those calls
+    /// XPU_DR_STEPS=1 (lane p4-k-drt, measure only, default off, rank 0 with XPU_ROUND_STATS): the host time of the
+    /// drafter's steps, a sum a step (index: DrStep), and the settles inside the drafter's pass (its exchanges).
+    dr_on: bool = false,
+    dr_s: [dr_steps]f64 = @splat(0),
+    dr_settle_s: f64 = 0,
+    dr_settles: u64 = 0,
 };
 pub var stat: Stat = .{};
+
+/// XPU_DR_STEPS: the drafter's host steps. absorb: the taps of the kept rows into the drafter's context (its sync is
+/// absorb_sync, inside absorb). pre: from the pass's start to its first launch. layers: the five layers' launches and
+/// exchanges. head: the head, the top-16 parts and the gather. sync: the wait for the card at the pass's end. merge:
+/// the host merge of the parts. tree: the trees or chains of the streams.
+pub const DrStep = enum(u8) { absorb, absorb_sync, pre, layers, head, sync, merge, tree };
+pub const dr_steps = @typeInfo(DrStep).@"enum".fields.len;
+
+/// XPU_DR_STEPS: adds the host time since `t.*` to step `k`, and moves `t.*` to now.
+pub fn drMark(k: DrStep, t: *f64) void {
+    const n = now();
+    stat.dr_s[@intFromEnum(k)] += n - t.*;
+    t.* = n;
+}
 
 /// The XPU_* options as the process had them before its first open, put back at every open (Runner.init).
 const Options = struct {

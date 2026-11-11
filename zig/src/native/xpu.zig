@@ -262,6 +262,10 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
             xq.stat.on = true; // the host waits and command counts behind the round stats line
         }
     }
+    if (std.c.getenv("XPU_DR_STEPS")) |v| if (v[0] == '1') { // lane p4-k-drt: measure only, default off
+        xq.stat.dr_on = xq.stat.on;
+        std.debug.print("drafter steps: rank {d}: XPU_DR_STEPS=1 ({s})\n", .{ xq.RANK, if (xq.stat.dr_on) "the host time of the drafter's steps, a line after each round stats line" else "no effect: this rank prints no round stats" });
+    };
     if (drafter != null) {
         try h.back.measure();
         std.log.info("qwen27-xpu: window ms by rows: 1 {d:.1}, 2 {d:.1}, 4 {d:.1}, 8 {d:.1}, 16 {d:.1}", .{ h.back.costs[0].ms, h.back.costs[1].ms, h.back.costs[3].ms, h.back.costs[7].ms, h.back.costs[15].ms });

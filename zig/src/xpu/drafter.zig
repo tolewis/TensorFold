@@ -658,7 +658,9 @@ pub const Drafter = struct {
             try dr.use(it.slot);
             dr.ctx().end += it.n;
         }
+        var ta: f64 = if (q.stat.dr_on) q.now() else 0; // XPU_DR_STEPS: the absorb's wait for the card
         try d.sync(); // the tables are read from the host
+        if (q.stat.dr_on) q.drMark(.absorb_sync, &ta);
     }
 
     /// XPU_DRAFT_TP: the step ring when this rank writes the drafter's records (rank 0 of a split drafter), else null.
@@ -747,6 +749,8 @@ pub const Drafter = struct {
 
     fn run(dr: *Drafter, items: []const Block, count: u32, counts: ?[]const u32) !void {
         const d = &dr.r.d;
+        const ts = q.stat.dr_on; // XPU_DR_STEPS (lane p4-k-drt): the host time of this pass's steps, rank 0
+        var tm: f64 = if (ts) q.now() else 0;
         const L: u32 = count + 1;
         const S: u32 = @intCast(items.len);
         const one = S == 1;
@@ -800,6 +804,9 @@ pub const Drafter = struct {
         const drows_t: ?*anyopaque = if (rag) dr.rows_dev else nul; // dconv's block starts only with ragged rows
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, dr.ids, &tokens, R * 4, null, 0, null));
         errdefer d.settle(); // tokens and sp live in this frame: an error returns only once the queue is idle
+        const s0 = q.stat.settle_s;
+        const n0 = q.stat.settles;
+        if (ts) q.drMark(.pre, &tm);
         const m = &dr.r.model;
         try q.embedRows(d, m, dr.ids, dr.x, R);
         const l32: i32 = @intCast(L);
@@ -827,6 +834,7 @@ pub const Drafter = struct {
             if (tg) |g| try g.allReduce(d, dr.r16, R);
             try d.launch(dr.k.dconv, .{ .x = R, .y = D / 512 }, .{ dr.r16, dr.dyn, @as(i32, @intCast(l.kp_mlp.n)), l.base_mlp, @as(i32, 1), dr.x, @as(i32, 1), dr.h2, dr.ahi, dr.alo, l32, drows_t });
         }
+        if (ts) q.drMark(.layers, &tm);
         // a block's rows 1 .. L − 1: final norm, selector projection, head over the two spans, top 16
         const first: u32 = if (one) 1 else 0;
         const rows = if (one) count else R;
@@ -851,7 +859,13 @@ pub const Drafter = struct {
             try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, pi.ptr + each, q.off(pb, each * 4), each * 4, null, 0, null));
         }
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &sp, dr.selp, rows * RANK * 2, null, 0, null));
+        if (ts) {
+            q.drMark(.head, &tm);
+            q.stat.dr_settle_s += q.stat.settle_s - s0; // the settles of the pass's exchanges, before its sync
+            q.stat.dr_settles += q.stat.settles - n0;
+        }
         try d.sync();
+        if (ts) q.drMark(.sync, &tm);
         const srcs: usize = if (peer != null) 2 else 1; // rank 0's parts, then rank 1's (head rows from head_rows)
         for (0..S) |b| {
             const x = &dr.multi[b];
@@ -887,6 +901,7 @@ pub const Drafter = struct {
             }
             x.depths = cnt;
         }
+        if (ts) q.drMark(.merge, &tm);
     }
 };
 
