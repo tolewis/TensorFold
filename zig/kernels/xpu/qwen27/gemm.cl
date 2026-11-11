@@ -443,6 +443,12 @@ static inline void w4_pf_uc(global void *base, int width, int height, int pitch,
 W4K_KERNEL_SL(w4k1_uc, 16, 32, 4, 16, READ16, 2, 1)
 W4K_KERNEL_SL(w4k1_d16uc, 16, 16, 4, 16, READ16, 2, 1)
 W4KS_KERNEL(w4k_dsplituc, 16, 32, 16, READ16) // the default narrow kernel, W past the last-level cache
+// Window p4k9: with the W prefetch past L3 (L1 only), down took 81.7 us against 49.1. uc0 and nuc0: no W prefetch, so
+// a W line cannot come from DRAM twice when L1 drops it before the read (the A prefetch stays).
+#undef W4_WPF
+#define W4_WPF(j, kb)
+W4K_KERNEL_SL(w4k1_uc0, 16, 32, 4, 16, READ16, 2, 1)
+W4KS_KERNEL(w4k_dsplituc0, 16, 32, 16, READ16)
 #undef W4_WREAD
 #undef W4_WPF
 #define W4_WREAD(j, kb, dst) intel_sub_group_2d_block_read_32b_8r16x1c(W4_WSURF(j), W4_WXY(j, kb), dst)
