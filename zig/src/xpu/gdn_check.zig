@@ -1,6 +1,7 @@
-//! XPU_GDN bit 4 (lane p4-k-gdn): gdn_step2 against gdn_step on this card, at the load. Four cases cover the uses of
-//! the kernel: a tree block (LOAD and SAVE), the commit replay (ROWS, the state in place), a plain chain, and two
-//! stream windows (MT). Every output value must agree, or the open fails.
+//! XPU_GDN bit 4 (lane p4-k-gdn): gdn_step2 (or gdn_step2_uc, gdn_step3) against gdn_step on this card, at the load.
+//! Four cases cover the uses of the kernel: a tree block (LOAD and SAVE), the commit replay (ROWS, the state in place),
+//! a plain chain of 40 rows, and two stream windows (MT). Every output value must agree, or the open fails. The chain
+//! is longer than 16 rows because gdn_step3 reads the first 16 rows' tree words in another way than the rows after.
 const std = @import("std");
 const ze = @import("ze");
 const dev = @import("dev.zig");
@@ -11,6 +12,7 @@ const alloc = q.alloc;
 const HK = q.GDN_K_HEADS;
 const HV = q.GDN_V_HEADS;
 const ROWS = 16;
+const LONG = 40; // the rows of the chain case, and of the inputs
 const STATE = HV * 128 * 128; // floats of one layer's state
 
 var seed: u64 = 0x9E3779B97F4A7C15;
@@ -51,7 +53,7 @@ fn differ(d: *Dev, comptime T: type, a: *anyopaque, b: *anyopaque, n: usize) !us
     return bad;
 }
 
-pub fn run(d: *Dev, old: ze.H, new: ze.H) !void {
+pub fn run(d: *Dev, old: ze.H, new: ze.H, name: []const u8) !void {
     try d.g.indirect(old);
     try d.g.indirect(new);
     const nul: ?*anyopaque = null;
@@ -60,12 +62,12 @@ pub fn run(d: *Dev, old: ze.H, new: ze.H) !void {
         for (held.items) |p| d.g.free(p);
         held.deinit(alloc);
     }
-    // inputs: 16 rows of q, k, v (bf16), g and beta, and two states
-    const qk = try alloc.alloc(u16, ROWS * HK * 128);
+    // inputs: 40 rows of q, k, v (bf16), g and beta, and two states
+    const qk = try alloc.alloc(u16, LONG * HK * 128);
     defer alloc.free(qk);
-    const v = try alloc.alloc(u16, ROWS * HV * 128);
+    const v = try alloc.alloc(u16, LONG * HV * 128);
     defer alloc.free(v);
-    const gb = try alloc.alloc(f32, ROWS * HV);
+    const gb = try alloc.alloc(f32, LONG * HV);
     defer alloc.free(gb);
     const st = try alloc.alloc(f32, STATE);
     defer alloc.free(st);
@@ -97,7 +99,7 @@ pub fn run(d: *Dev, old: ze.H, new: ze.H) !void {
     }
     var out: [2]struct { y: *anyopaque, so: *anyopaque, so2: *anyopaque, sl: *anyopaque } = undefined;
     for (&out) |*o| {
-        o.* = .{ .y = try room(d, ROWS * HV * 128 * 2), .so = try room(d, STATE * 4), .so2 = try room(d, STATE * 4), .sl = try room(d, ROWS * STATE * 4) };
+        o.* = .{ .y = try room(d, LONG * HV * 128 * 2), .so = try room(d, STATE * 4), .so2 = try room(d, STATE * 4), .sl = try room(d, ROWS * STATE * 4) };
         for ([_]*anyopaque{ o.y, o.so, o.so2, o.sl }) |p| try held.append(alloc, p);
     }
     const ks = [2]ze.H{ old, new };
@@ -143,10 +145,10 @@ pub fn run(d: *Dev, old: ze.H, new: ze.H) !void {
     const rows_y = try differ(d, u16, out[0].y, out[1].y, path.len * HV * 128);
     const rows_s = try differ(d, u32, S[2], S[3], STATE);
 
-    // 3. a plain chain of 16 rows, the state to a second buffer
-    for (ks, out) |k, o| try d.launch(k, grid, .{ Q, K, V, G, B, S[0], o.so, o.y, @as(i32, ROWS), nul, nul, nul, nul });
+    // 3. a plain chain of 40 rows, the state to a second buffer
+    for (ks, out) |k, o| try d.launch(k, grid, .{ Q, K, V, G, B, S[0], o.so, o.y, @as(i32, LONG), nul, nul, nul, nul });
     try d.sync();
-    const chain_y = try differ(d, u16, out[0].y, out[1].y, ROWS * HV * 128);
+    const chain_y = try differ(d, u16, out[0].y, out[1].y, LONG * HV * 128);
     const chain_so = try differ(d, u32, out[0].so, out[1].so, STATE);
 
     // 4. two stream windows (rows 0 to 9 on state x, rows 10 to 15 on state y) through the per-row table
@@ -169,6 +171,6 @@ pub fn run(d: *Dev, old: ze.H, new: ze.H) !void {
     const mt_so = try differ(d, u32, out[0].so, out[1].so, STATE) + try differ(d, u32, out[0].so2, out[1].so2, STATE);
 
     const bad = tree_y + tree_sl + rows_y + rows_s + chain_y + chain_so + mt_y + mt_so;
-    std.debug.print("gdn check: gdn_step2 against gdn_step, {d} values differ (tree y {d}, {d} saved states {d}; rows y {d}, state {d}; chain y {d}, state {d}; streams y {d}, states {d})\n", .{ bad, tree_y, saves, tree_sl, rows_y, rows_s, chain_y, chain_so, mt_y, mt_so });
+    std.debug.print("gdn check: {s} against gdn_step, {d} values differ (tree y {d}, {d} saved states {d}; rows y {d}, state {d}; chain y {d}, state {d}; streams y {d}, states {d})\n", .{ name, bad, tree_y, saves, tree_sl, rows_y, rows_s, chain_y, chain_so, mt_y, mt_so });
     if (bad != 0) return error.GdnStep2Differs;
 }

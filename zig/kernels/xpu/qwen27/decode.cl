@@ -149,6 +149,136 @@ KERNEL(16) void gdn_step2(global const ushort *Q, global const ushort *K, global
     }
 }
 
+// gdn_step3 (lane p4-kernel, XPU_GDN bit 16): gdn_step2 with the reads of a row made one row early. gdn_step2 waits
+// at the top of each row for the tree word, then the parent, then the parent's state, and for q, k, v, g and beta.
+// gdn_step3 reads the tree word, the parent and the row index of the first 16 rows at the start, one row a lane.
+// During row t it reads row t + 1's q, k, v, g and beta into registers, and it prefetches the state of row t + 1's
+// parent into the cache. A LOAD row has a parent before the row before it (qwen27.zig sets LOAD only when the parent is
+// not the row before), so that parent's SAVE is done. The state load after row t then hits the cache. A second state
+// in registers made IGC spill 7936 bytes, a prefetch takes no register. The same arithmetic in the same order, so the
+// same bits. A row past the first 16 reads its tree word and row index at the top of the row before, as gdn_step2.
+#define GDN_INFO(u, TW, PAR, ROW)                                                                                      \
+  if ((u) - t0 < 16) {                                                                                                 \
+    TW = sub_group_broadcast(twl, (u) - t0);                                                                           \
+    PAR = sub_group_broadcast(parl, (u) - t0);                                                                         \
+    ROW = sub_group_broadcast(rowl, (u) - t0);                                                                         \
+  } else {                                                                                                             \
+    TW = TREE ? TREE[(u) * 17] : 0;                                                                                    \
+    PAR = (TREE && (TW & 255) > 0) ? ANC((u), (TW & 255) - 1) : 0;                                                     \
+    ROW = ROWS ? ROWS[u] : (u);                                                                                        \
+  }
+#define GDN_PF8(P)                                                                                                     \
+  for (int r = 0; r < 8; r++) intel_sub_group_block_prefetch_ui8((global const uint *)GDN_ROW8(P, r));
+#define GDN_LOAD8(DST, P)                                                                                              \
+  for (int r = 0; r < 8; r++) {                                                                                        \
+    const float8 sv = as_float8(intel_sub_group_block_read8((global const uint *)GDN_ROW8(P, r)));                    \
+    for (int i = 0; i < 8; i++) DST[r][i] = sv[i];                                                                     \
+  }
+KERNEL(16) void gdn_step3(global const ushort *Q, global const ushort *K, global const ushort *V, global const float *G,
+                          global const float *BETA, global const float *S, global float *SO, global ushort *Y, int T,
+                          global const int *ROWS, global const int *TREE, global float *SL, global const ulong *MT) {
+  const int vb = get_group_id(0), h = get_group_id(1), lane = get_sub_group_local_id(), kh = h / Q27_GVK;
+  int t0 = 0;
+  if (MT) {
+    t0 = get_group_id(2);
+    if ((int)MT[t0 * 8 + 6] != t0) return;            // not a window's first row
+    S = (global const float *)MT[t0 * 8 + 4];
+    SO = (global float *)MT[t0 * 8 + 5];
+    T = t0 + (int)MT[t0 * 8 + 7];
+  }
+  const int tl = t0 + lane;                           // the lane's row of the first 16
+  int twl = 0, parl = 0, rowl = tl;
+  if (tl < T) {
+    if (TREE) {
+      twl = TREE[tl * 17];
+      if ((twl & 255) > 0) parl = ANC(tl, (twl & 255) - 1);
+    }
+    if (ROWS) rowl = ROWS[tl];
+  }
+  float s[8][8];
+  GDN_LOAD8(s, S);
+  if (t0 >= T) {
+    if (!TREE)
+      for (int r = 0; r < 8; r++) {
+        float8 sv;
+        for (int i = 0; i < 8; i++) sv[i] = s[r][i];
+        intel_sub_group_block_write8((global uint *)GDN_ROW8(SO, r), as_uint8(sv));
+      }
+    return;
+  }
+  int tw, par, row;
+  GDN_INFO(t0, tw, par, row);
+  if (TREE && (tw & 255) > 0 && (tw & 512)) GDN_LOAD8(s, SL + (long)par * Q27_GV * 16384) // the first row's state
+  ushort8 qv = intel_sub_group_block_read_us8(Q + ((long)row * Q27_GK + kh) * 128);
+  ushort8 kv = intel_sub_group_block_read_us8(K + ((long)row * Q27_GK + kh) * 128);
+  ushort8 vv = vload8(0, V + ((long)row * Q27_GV + h) * 128 + vb * 8);
+  float g = G[(long)row * Q27_GV + h], beta = BETA[(long)row * Q27_GV + h];
+  for (int t = t0; t < T; t++) {
+    int twn = 0, parn = 0, rown = 0;                  // row t + 1: its reads go out before the math of row t
+    ushort8 qn = 0, kn = 0, vn = 0;
+    float gn = 0.0f, bn = 0.0f;
+    if (t + 1 < T) {
+      GDN_INFO(t + 1, twn, parn, rown);
+      qn = intel_sub_group_block_read_us8(Q + ((long)rown * Q27_GK + kh) * 128);
+      kn = intel_sub_group_block_read_us8(K + ((long)rown * Q27_GK + kh) * 128);
+      vn = vload8(0, V + ((long)rown * Q27_GV + h) * 128 + vb * 8);
+      gn = G[(long)rown * Q27_GV + h];
+      bn = BETA[(long)rown * Q27_GV + h];
+      if (TREE && (twn & 255) > 0 && (twn & 512)) GDN_PF8(SL + (long)parn * Q27_GV * 16384)
+    }
+    float q[8], k[8];
+    for (int i = 0; i < 8; i++) {
+      q[i] = bf2f(qv[i]);
+      k[i] = bf2f(kv[i]);
+    }
+    ushort8 yo;
+    for (int r = 0; r < 8; r++) {
+      float mem = 0.0f;
+      for (int i = 0; i < 8; i++) {
+        s[r][i] *= g;
+        mem += s[r][i] * k[i];
+      }
+      mem = sub_group_reduce_add(mem);
+      const float u = (bf2f(vv[r]) - mem) * beta;
+      float y = 0.0f;
+      for (int i = 0; i < 8; i++) {
+        s[r][i] += k[i] * u;
+        y += s[r][i] * q[i];
+      }
+      y = sub_group_reduce_add(y);
+      yo[r] = f2bf(y);
+    }
+    if (lane == 0) vstore8(yo, 0, Y + ((long)t * Q27_GV + h) * 128 + vb * 8);
+    if (tw & 256)                                       // SAVE: a later row loads this state
+      for (int r = 0; r < 8; r++) {
+        float8 sv;
+        for (int i = 0; i < 8; i++) sv[i] = s[r][i];
+        intel_sub_group_block_write8((global uint *)GDN_ROW8(SL + (long)t * Q27_GV * 16384, r), as_uint8(sv));
+      }
+    if (t + 1 < T) {                                    // row t + 1's state, as gdn_step2 at the top of the row
+      if (TREE && (twn & 255) > 0 && (twn & 512))
+        GDN_LOAD8(s, SL + (long)parn * Q27_GV * 16384)
+      else if (TREE && (twn & 255) == 0)
+        GDN_LOAD8(s, S)
+      tw = twn;
+      qv = qn;
+      kv = kn;
+      vv = vn;
+      g = gn;
+      beta = bn;
+    }
+  }
+  if (!TREE)
+    for (int r = 0; r < 8; r++) {
+      float8 sv;
+      for (int i = 0; i < 8; i++) sv[i] = s[r][i];
+      intel_sub_group_block_write8((global uint *)GDN_ROW8(SO, r), as_uint8(sv));
+    }
+}
+#undef GDN_INFO
+#undef GDN_PF8
+#undef GDN_LOAD8
+
 // gdn_step2_uc (lane p4-k-first, XPU_GDN bit 8): gdn_step2 with the tree states SL past both caches. Window p4k5
 // found that dirty lines in the last-level cache slow the next long read stream by about 2.2 us a MB, and SL is the
 // largest write of a GDN layer (1.5 MB a SAVE row at 24 heads). Only this launch reads SL again. The stores and the
