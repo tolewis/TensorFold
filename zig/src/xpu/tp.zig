@@ -508,6 +508,11 @@ pub const Group = struct {
             },
         };
         if (std.c.getenv("TF_TP_FLAGLAB") != null or evmode) g.lab_conn = conn; // the lab steps on the socket at load; the event mode resets its words on it
+        if (g.ex != 0) { // lane p4-k-ex: the lost-peer watchdog (exWatch) on the kept socket, both ranks
+            const t = std.Thread.spawn(.{}, exWatch, .{ conn, g.closed(), g.rank }) catch |e| lostAt(&g, "rank {d}: the EX watchdog did not start ({s}): the group is lost\n", .{ g.rank, @errorName(e) });
+            t.detach();
+            std.log.info("qwen27-xpu: TP rank {d}: EX watchdog on the pair's socket (a peer that ends ends this rank)", .{g.rank});
+        }
         std.log.info("qwen27-xpu: TP {d} rank {d}: all-reduce {s}", .{ g.tp, g.rank, if (g.ex == 3) "EX (TF_TP_DEVFLAG=3: the partial pushed over PCIe, the flag a driver store, the wait a counter based event)" else if (g.ex == 4) "EX (TF_TP_DEVFLAG=4: the partial pushed over PCIe, the flag a copy, the wait a counter based event)" else if (g.devflag) "device-flag (the peer's slot pushed over PCIe, the add polls a flag)" else if (g.direct) "device-direct (the peer's slots over PCIe)" else "host-staged" });
         return g;
     }
@@ -1416,6 +1421,25 @@ pub const Group = struct {
         std.process.exit(0);
     }
 };
+
+/// TF_TP_DEVFLAG=3 and 4 (lane p4-k-ex): the lost-peer watchdog, one thread a rank. EX has no host wait that meets
+/// the peer. With the peer gone, the host can block inside a driver call before it reaches a settle (window p4k22:
+/// rank 0 did not exit in 181 s). The kernel closes the handshake socket when the peer process ends, for any
+/// cause, so this thread polls it for the hang-up once a second. It asks only for the hang-up (no POLLIN) and reads
+/// no byte, so the reset barrier of resetWords on the same socket is not touched. On the hang-up: the closed word,
+/// the group-lost line, then _exit(1) (no exit handlers: the driver's teardown could wait on the stopped queue).
+/// TP 3 and TP 4: one socket a peer pair (each follower to rank 0, 14.4 item 4), one watchdog a socket.
+fn exWatch(sock: linux.fd_t, cw: *std.atomic.Value(u64), rank: u32) void {
+    while (true) {
+        var pfd = [1]linux.pollfd{.{ .fd = sock, .events = linux.POLL.RDHUP, .revents = 0 }};
+        const rc = linux.poll(&pfd, 1, 1000);
+        if (failed(rc) or rc == 0) continue; // EINTR, or a second with no event
+        if (pfd[0].revents & (linux.POLL.HUP | linux.POLL.RDHUP | linux.POLL.ERR | linux.POLL.NVAL) == 0) continue;
+        cw.store(1, .release);
+        std.debug.print("rank {d}: the peer ended (its socket hung up, events 0x{x}): the group is lost, the process ends\n", .{ rank, pfd[0].revents });
+        linux.exit_group(1);
+    }
+}
 
 /// The E6 lab's pattern for rank `r`'s push of exchange `e` (counted from 0 in each run).
 fn e6Pat(r: u32, e: u64) u32 {
