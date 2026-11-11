@@ -84,6 +84,7 @@ kernel void rowsum(global const half *A, global float *Asum, int M, int Mp, int 
 #define W4_ACOL(kb) ((kb) * 64)
 #define W4_DPAS_I(SG_M) ((SG_M) / 8)
 #define W4_WREAD(j, kb, dst) intel_sub_group_2d_block_read_32b_8r16x1c(W4_WSURF(j), W4_WXY(j, kb), dst)
+#define W4_WPF(j, kb) intel_sub_group_2d_block_prefetch_32b_8r16x1c(W4_WSURF(j), W4_WXY(j, kb))
 #define W4_PFA 1
 #define W4_T2N 2
 #define W4_TOUCH
@@ -99,7 +100,7 @@ kernel void rowsum(global const half *A, global float *Asum, int M, int Mp, int 
       const int kb = (g) * SUBS + u;                                                                                 \
       if (PF > 0 && kb + PF < K / 64) {                                                                              \
         for (int j = 0; j < SG_N / 16; j++)                                                                          \
-          intel_sub_group_2d_block_prefetch_32b_8r16x1c(W4_WSURF(j), W4_WXY(j, kb + PF));                           \
+          W4_WPF(j, kb + PF);                                                                                        \
         if (W4_PFA) for (int r = 0; r < SG_M / R; r++)                                                               \
           for (int h = 0; h < 2; h++)                                                                                \
             intel_sub_group_2d_block_prefetch_16b_8r16x2c((global void *)A, K * 2, M, K * 2, (int2)(W4_ACOL(kb + PF) + 32 * h, m0 + R * r)); \
@@ -419,3 +420,29 @@ W4K_KERNEL_SL(w4k1_wlt, 16, 32, 4, 16, READ16, 2, 1)
 W4K_KERNEL_SL(w4k1_wl, 16, 32, 4, 16, READ16, 2, 1)
 #undef W4_WREAD
 #define W4_WREAD(j, kb, dst) intel_sub_group_2d_block_read_32b_8r16x1c(W4_WSURF(j), W4_WXY(j, kb), dst)
+
+// Lane p4-k-first (window p4k5: dirty lines in the last-level cache slow the next long read by 2.2 us a MB). uc and
+// d16uc: w4k1_decode and w4k1_d16 with the W reads and the W prefetch past the last-level cache (LSC L1C_L3UC), so a
+// W stream does not evict other lines. The message is the same 2D block read (IGC asm: load_block2d.ugm.d32.a64.ca.uc
+// in place of load_block2d.ugm.d32.a64), so the same layout and the same bits. The two builtins are internal to IGC
+// (the cache-control form of intel_sub_group_2d_block_read_32b_8r16x1c and _prefetch_), not an OpenCL extension.
+enum W4_LDCC { W4_LDCC_L1C_L3UC = 3 };
+uint8 __builtin_IB_subgroup_block_read_cacheopts_u32_m8k16v1(long base, int width_m1, int height_m1, int pitch_m1, int2 xy, enum W4_LDCC cc);
+void __builtin_IB_subgroup_block_read_prefetch_u32_m8k16v1(long base, int width_m1, int height_m1, int pitch_m1, int2 xy, enum W4_LDCC cc);
+static inline void w4_read_uc(global void *base, int width, int height, int pitch, int2 xy, private uint *dst) {
+  const uint8 v = __builtin_IB_subgroup_block_read_cacheopts_u32_m8k16v1((long)base, width - 1, height - 1, pitch - 1, xy, W4_LDCC_L1C_L3UC);
+  for (int i = 0; i < 8; i++) dst[i] = v[i];
+}
+static inline void w4_pf_uc(global void *base, int width, int height, int pitch, int2 xy) {
+  __builtin_IB_subgroup_block_read_prefetch_u32_m8k16v1((long)base, width - 1, height - 1, pitch - 1, xy, W4_LDCC_L1C_L3UC);
+}
+#undef W4_WREAD
+#undef W4_WPF
+#define W4_WREAD(j, kb, dst) w4_read_uc(W4_WSURF(j), W4_WXY(j, kb), dst)
+#define W4_WPF(j, kb) w4_pf_uc(W4_WSURF(j), W4_WXY(j, kb))
+W4K_KERNEL_SL(w4k1_uc, 16, 32, 4, 16, READ16, 2, 1)
+W4K_KERNEL_SL(w4k1_d16uc, 16, 16, 4, 16, READ16, 2, 1)
+#undef W4_WREAD
+#undef W4_WPF
+#define W4_WREAD(j, kb, dst) intel_sub_group_2d_block_read_32b_8r16x1c(W4_WSURF(j), W4_WXY(j, kb), dst)
+#define W4_WPF(j, kb) intel_sub_group_2d_block_prefetch_32b_8r16x1c(W4_WSURF(j), W4_WXY(j, kb))

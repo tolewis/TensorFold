@@ -204,6 +204,9 @@ const mv_variants = [_]MvVariant{
     .{ .name = "wt2", .row = "mv_wt2", .kernel = "w4k1_wt", .local = 64, .div = 256, .wide = true, .probe = true },
     .{ .name = "wt4", .row = "mv_wt4", .kernel = "w4k1_wt", .local = 64, .div = 512, .wide = true, .probe = true },
     .{ .name = "wt8", .row = "mv_wt8", .kernel = "w4k1_wt", .local = 64, .div = 1024, .wide = true, .probe = true },
+    // lane p4-k-first: ref and d16 with the W reads past the last-level cache (the same bits)
+    .{ .name = "uc", .row = "mv_uc", .kernel = "w4k1_uc", .local = 64, .div = 128, .wide = true },
+    .{ .name = "d16uc", .row = "mv_d16uc", .kernel = "w4k1_d16uc", .local = 64, .div = 64, .wide = true },
 };
 /// XPU_K1_SHADOW=ref,nb3,... (lane p4-k-k1, default off): timing launches of K1 probe kernels (k1.cl, K1_PROBE)
 /// before each K1 launch of 8-row groups. They write scratch partials, so the model keeps its bits. The row
