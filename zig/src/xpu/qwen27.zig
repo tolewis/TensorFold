@@ -170,6 +170,11 @@ pub var mv_pre: [2][16]?MvShadow = @splat(@splat(null));
 /// XPU_SITE_SPLIT=1 (lane p4-k-first, default off): the gate|up launches of the attention layers get the profile
 /// site gate_up_attn, so XPU_PROFILE=2 shows gate|up after a GDN mixer and after an attention mixer apart.
 pub var site_split = false;
+/// XPU_DIRTY=<MB> (lane p4-k-first, default off): a launch of `probe_wr` (glue.cl) writes MB of the matvec scratch
+/// buffer after the mixer exchange, before the norm (the place pre2). A probe of the cache state: the model keeps
+/// its bits. Row `probe_wr`.
+pub var dirty_k: ?ze.H = null;
+pub var dirty_mb: u32 = 0;
 pub var mv_scratch: ?*anyopaque = null;
 pub const mv_scratch_bytes: usize = 32 << 20;
 const MvVariant = struct { name: []const u8, row: []const u8, kernel: [*:0]const u8, local: u32, div: u32, wide: bool, bits: bool = false, probe: bool = false };
@@ -194,6 +199,10 @@ const mv_variants = [_]MvVariant{
     .{ .name = "wl", .row = "mv_wl", .kernel = "w4k1_wl", .local = 64, .div = 128, .wide = true, .probe = true }, // plain loads of W
     .{ .name = "wt", .row = "mv_wt", .kernel = "w4k1_wt", .local = 64, .div = 128, .wide = true, .probe = true }, // the W stream alone, block reads
     .{ .name = "wlt", .row = "mv_wlt", .kernel = "w4k1_wlt", .local = 64, .div = 128, .wide = true, .probe = true }, // the W stream alone, plain loads
+    // lane p4-k-first: the W stream alone over the first half, quarter and eighth of the columns (fewer work-groups)
+    .{ .name = "wt2", .row = "mv_wt2", .kernel = "w4k1_wt", .local = 64, .div = 256, .wide = true, .probe = true },
+    .{ .name = "wt4", .row = "mv_wt4", .kernel = "w4k1_wt", .local = 64, .div = 512, .wide = true, .probe = true },
+    .{ .name = "wt8", .row = "mv_wt8", .kernel = "w4k1_wt", .local = 64, .div = 1024, .wide = true, .probe = true },
 };
 /// XPU_K1_SHADOW=ref,nb3,... (lane p4-k-k1, default off): timing launches of K1 probe kernels (k1.cl, K1_PROBE)
 /// before each K1 launch of 8-row groups. They write scratch partials, so the model keeps its bits. The row
@@ -680,6 +689,20 @@ pub const Runner = struct {
                 }
                 std.debug.print("norm: XPU_NORM_SHADOW {s} ({s}), row {s}\n", .{ v.name, std.mem.span(v.kernel), v.row });
             }
+        }
+        if (std.c.getenv("XPU_DIRTY")) |v| { // lane p4-k-first: one line a rank, the check of the flag
+            dirty_mb = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+            if (dirty_mb == 0 or dirty_mb > mv_scratch_bytes >> 20) return error.BadDirtyMb;
+            if (mv_scratch == null) mv_scratch = try d.g.deviceAlloc(mv_scratch_bytes);
+            const k = try d.kernel(mg, "probe_wr", 256);
+            dirty_k = k;
+            if (prof.on) {
+                const free = for (&prof.names) |*slot| {
+                    if (slot.name.len == 0) break slot;
+                } else return error.NoProfileRowLeft;
+                free.* = .{ .k = k, .name = "probe_wr" };
+            }
+            std.debug.print("dirty: XPU_DIRTY={d} MB written after the mixer exchange, row probe_wr\n", .{dirty_mb});
         }
         const prof_on = prof.on;
         prof.on = false; // not during the load

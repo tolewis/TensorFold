@@ -710,5 +710,11 @@ NORM_NEW(norm_b8r, 8, 4, 1, 0)
 NORM_NEW(norm_z4, 4, 8, 0, 1)
 
 
+// Window p4k5 (lane p4-k-first, XPU_DIRTY): each work-item writes one uint (a probe of dirty cache lines).
+__attribute__((intel_reqd_sub_group_size(16))) kernel void probe_wr(global uint *P) {
+  const size_t i = get_global_id(0);
+  P[i] = (uint)i;
+}
+
 #include "glue_attn.cl"
 #include "glue_quant.cl"

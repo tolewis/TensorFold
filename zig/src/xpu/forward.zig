@@ -248,6 +248,15 @@ fn mvShadows(d: *Dev, list: *const [16]?q.MvShadow, site: usize, j0: u32, h: *an
     }
 }
 
+/// XPU_DIRTY (lane p4-k-first): `probe_wr` writes dirty_mb MB of the matvec scratch buffer (256 uint a work-group).
+fn dirtyProbe(d: *Dev) !void {
+    const k = q.dirty_k orelse return;
+    const site = q.prof.site;
+    q.prof.site = .none;
+    defer q.prof.site = site;
+    try d.launch(k, .{ .x = q.dirty_mb * 1024 }, .{q.mv_scratch.?});
+}
+
 /// XPU_MV pre1 and pre2 (lane p4-k-first): timing launches on the shape of the layer's gate|up before the launch
 /// of that site. Place 0 (pre1): after mixer_out, before its exchange. Place 1 (pre2): after that exchange, before
 /// the norm. They read h as it is and write the scratch buffer, so the model keeps its bits. Decode rows only.
@@ -620,6 +629,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
             } else if (fuse1 and g.direct) { // XPU_FUSE bit 1: the same add and norm on the device-direct path
                 const peer = try g.allReducePeer(d, a.r, T);
                 try mvPre(d, a, 1, l.gu, T);
+                try dirtyProbe(d);
                 try d.launch(d.k.tp_norm_peer, .{ .x = T }, .{ a.x, a.r, peer, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs, q8a, q8s, q8ms, q.rot_on });
                 fused = true;
             } else try g.allReduce(d, a.r, T);
@@ -627,6 +637,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
         if (gemm_probe) |f| try f(d, a, l.mixer_out, a.h, T, i, 1);
         if (probe) try dumpBuf(d, "r0", a.r, T * D, .f16);
         if (!fused and !wide) try mvPre(d, a, 1, l.gu, T); // the device-flag exchange holds the norm: it has no place 1
+        if (!fused and !wide) try dirtyProbe(d);
         q.prof.site = .norm_post;
         if (!fused and !wide) try normShadows(d, a, T, l.post_norm, 1, gs, q8ms);
         if (!fused) try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs, q8a, q8s, q8ms, q.rot_on });
