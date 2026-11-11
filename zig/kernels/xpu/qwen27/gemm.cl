@@ -476,7 +476,8 @@ W4K_KERNEL_SL(w4k1_d16uc0, 16, 16, 4, 16, READ16, 2, 1)
     }                                                                                                                \
   }
 
-// Group g from slot SC: GROUP_STEP_B with BIAS 0, SUBS 1 and the A prefetch two groups ahead, W and s from the ring.
+// Group g from slot SC: GROUP_STEP_B with BIAS 0, SUBS 1, R 16 (READ16) and the A prefetch two groups ahead, W and s
+// from the ring.
 #define RP_COMPUTE(SC, g)                                                                                            \
   {                                                                                                                  \
     float8 part[SG_M / 8][SG_N / 16];                                                                                \
@@ -489,7 +490,7 @@ W4K_KERNEL_SL(w4k1_d16uc0, 16, 16, 4, 16, READ16, 2, 1)
     for (int t2 = 0; t2 < 2; t2++) {                                                                                 \
       ushort ab[SG_M / R][2 * R];                                                                                    \
       for (int r = 0; r < SG_M / R; r++)                                                                             \
-        READ_A((global void *)A, K * 2, M, K * 2, (int2)((g) * 64 + t2 * 32, m0 + R * r), ab[r]);                    \
+        READ16((global void *)A, K * 2, M, K * 2, (int2)((g) * 64 + t2 * 32, m0 + R * r), ab[r]);                    \
       for (int h = 0; h < 2; h++) {                                                                                  \
         const int t = 2 * t2 + h;                                                                                    \
         for (int j = 0; j < SG_N / 16; j++) {                                                                        \
@@ -538,9 +539,9 @@ W4K_KERNEL_SL(w4k1_d16uc0, 16, 16, 4, 16, READ16, 2, 1)
   }
 
 // Wide shapes: W4K_KERNEL_SL with SL 1 (w4k1_decode, w4k1_d16), the groups through the ring.
-#define W4RP_KERNEL(NAME, SG_M_, SG_N_, WG_N, R_, READ_A, D_, CC)                                                    \
+#define W4RP_KERNEL(NAME, SG_M_, SG_N_, WG_N, D_, CC)                                                                \
   KERNEL_HEAD_K(NAME, 16 * WG_N) {                                                                                   \
-    enum { SG_M = SG_M_, SG_N = SG_N_, R = R_, RP_D = D_, RP_R = D_ + 1 };                                           \
+    enum { SG_M = SG_M_, SG_N = SG_N_, R = 16, RP_D = D_, RP_R = D_ + 1 };                                           \
     const int sg = get_sub_group_id(), lane = get_sub_group_local_id();                                             \
     const int m0 = get_group_id(0) * SG_M, n0 = (get_group_id(1) * WG_N + sg) * SG_N;                               \
     uint8 rw[RP_R][SG_N / 16];                                                                                     \
@@ -558,9 +559,9 @@ W4K_KERNEL_SL(w4k1_d16uc0, 16, 16, 4, 16, READ16, 2, 1)
 
 // Narrow shapes: W4KS_KERNEL (w4k_dsplit), each subgroup's K slice through the ring. Subgroup sg adds the bias of
 // tile sg (TI * TJ = SLICES), so it prefetches the bias rows of that tile's column block only.
-#define W4RPS_KERNEL(NAME, SG_M_, SG_N_, R_, READ_A, D_, CC)                                                         \
+#define W4RPS_KERNEL(NAME, SG_M_, SG_N_, D_, CC)                                                                     \
   KERNEL_HEAD_K(NAME, 64) {                                                                                          \
-    enum { SG_M = SG_M_, SG_N = SG_N_, TI = SG_M_ / 8, TJ = SG_N_ / 16, R = R_, RP_D = D_, RP_R = D_ + 1 };          \
+    enum { SG_M = SG_M_, SG_N = SG_N_, TI = SG_M_ / 8, TJ = SG_N_ / 16, R = 16, RP_D = D_, RP_R = D_ + 1 };          \
     local float8 buf[SLICES][TI][TJ][16];                                                                            \
     const int sg = get_sub_group_id(), lane = get_sub_group_local_id();                                             \
     const int m0 = get_group_id(0) * SG_M, n0 = get_group_id(1) * SG_N;                                             \
@@ -585,11 +586,11 @@ W4K_KERNEL_SL(w4k1_d16uc0, 16, 16, 4, 16, READ16, 2, 1)
     }                                                                                                                \
   }
 
-W4RP_KERNEL(w4k1_rp, 16, 32, 4, 16, READ16, 2, W4_LDCC_L1UC_L3UC)
-W4RP_KERNEL(w4k1_rp3, 16, 32, 4, 16, READ16, 3, W4_LDCC_L1UC_L3UC)
-W4RP_KERNEL(w4k1_rpc, 16, 32, 4, 16, READ16, 2, W4_LDCC_L1C_L3UC) // the L1 policy of uc0: the pipeline alone
-W4RP_KERNEL(w4k1_d16rp, 16, 16, 4, 16, READ16, 2, W4_LDCC_L1UC_L3UC)
-W4RP_KERNEL(w4k1_d16rp3, 16, 16, 4, 16, READ16, 3, W4_LDCC_L1UC_L3UC)
-W4RPS_KERNEL(w4k_dsplitrp, 16, 32, 16, READ16, 2, W4_LDCC_L1UC_L3UC)
-W4RPS_KERNEL(w4k_dsplitrp3, 16, 32, 16, READ16, 3, W4_LDCC_L1UC_L3UC)
+W4RP_KERNEL(w4k1_rp, 16, 32, 4, 2, W4_LDCC_L1UC_L3UC)
+W4RP_KERNEL(w4k1_rp3, 16, 32, 4, 3, W4_LDCC_L1UC_L3UC)
+W4RP_KERNEL(w4k1_rpc, 16, 32, 4, 2, W4_LDCC_L1C_L3UC) // the L1 policy of uc0: the pipeline alone
+W4RP_KERNEL(w4k1_d16rp, 16, 16, 4, 2, W4_LDCC_L1UC_L3UC)
+W4RP_KERNEL(w4k1_d16rp3, 16, 16, 4, 3, W4_LDCC_L1UC_L3UC)
+W4RPS_KERNEL(w4k_dsplitrp, 16, 32, 2, W4_LDCC_L1UC_L3UC)
+W4RPS_KERNEL(w4k_dsplitrp3, 16, 32, 3, W4_LDCC_L1UC_L3UC)
 #endif
