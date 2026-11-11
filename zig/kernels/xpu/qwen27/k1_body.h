@@ -14,7 +14,18 @@
 // 1: no barrier at the end of a tile (the same bits: a sub-group that is ahead writes only its own MX slot, and MX
 // is read between the first two barriers of a tile). 2: no barrier in a tile. 4: no V read and no PV. 8: no K read
 // and no QK. 16: PV with a constant in place of the P read. 32: QK with a constant in place of the Q read.
-// 64: no exp2. The probes 2 to 64 give wrong results.
+// 64: no exp2. 128: PV with the V words as read, no int8 to fp16 conversion. The probes 2 to 128 give wrong results.
+//
+// K1_LEAN (lane p4-kernel, XPU_K1_LEAN; 0 in attn_k1_decode): the same operations in the same order on each column,
+// so the same bits. 1: V int8 to fp16 by a magic constant: the half 0x6400 | (v ^ 0x80) is 1024 + v + 128, exact,
+// minus 1152 is v, exact; the IGC form of convert_half4 takes 4 moves a value. 2: MX and SM a column's 16 slots in
+// a row (one vector read in place of 16 reads), P as one 32-byte store a column (16 two-byte stores with bank
+// conflicts before), alpha by a broadcast from the lane that holds it (in place of AL in local memory). 4: the K
+// and V scales of the next tile are read during the PV of this tile (a load the QK waited for).
+#ifndef K1_LEAN
+#define K1_LEAN 0
+#define K1_LEAN_UNSET
+#endif
 #if K1_PROBE & 64
 #define K1_EXP2(x) (fmin(fmax((x), -1.0f), 0.0f) * 0.5f + 1.0f)
 #else
@@ -84,6 +95,17 @@ KERNEL(256) void K1_FN(global const ushort *Q, global const char *KC, global con
         intel_sub_group_2d_block_prefetch_16b_16r16x1c((global void *)kp, 256, rows, Q27_KVROW, (int2)(ds * 16, kb % Q27_PAGE));
     }
   }
+#if K1_LEAN & 4
+  float ksn = 0.0f, vsn = 0.0f;                    // the scales of key k0 + sg * 16 + lane of the tile to come
+  {
+    const int kb = j0 + sg * 16, key = kb + lane;
+    if (sg < K1_G && kb < j1 && key < j1) {
+      const long sb = (long)PT[kb / Q27_PAGE] * Q27_PAGE8 + (long)Q27_PAGE * Q27_KVROW;
+      ksn = ((global const float *)(KC + sb))[(key % Q27_PAGE) * Q27_AKV + hk];
+      vsn = ((global const float *)(VC + sb))[(key % Q27_PAGE) * Q27_AKV + hk];
+    }
+  }
+#endif
   for (int k0 = j0; k0 < j1; k0 += K1_T) {
     const int kb = k0 + sg * 16, kpg = kb / Q27_PAGE;
     const bool kin = sg < K1_G && kb < j1;
@@ -117,10 +139,14 @@ KERNEL(256) void K1_FN(global const ushort *Q, global const char *KC, global con
         }
       }
     }
+#if K1_LEAN & 4
+    const float ksc = ksn, vsc = vsn;
+#else
     const int key = kb + lane;
     const bool kok = kin && key < j1;
     const float ksc = kok ? ((global const float *)(KC + kpb + (long)Q27_PAGE * Q27_KVROW))[(key % Q27_PAGE) * Q27_AKV + hk] : 0.0f;
     const float vsc = kok ? ((global const float *)(VC + kpb + (long)Q27_PAGE * Q27_KVROW))[(key % Q27_PAGE) * Q27_AKV + hk] : 0.0f;
+#endif
     float s[K1_P][16], mx[K1_P], alpha[K1_P], mn[K1_P];
     for (int p = 0; p < K1_P; p++) {
       mx[p] = -INFINITY;
@@ -133,36 +159,70 @@ KERNEL(256) void K1_FN(global const ushort *Q, global const char *KC, global con
           mx[p] = fmax(mx[p], x);
         }
       }
+#if K1_LEAN & 2
+      MX[p][lane][sg] = mx[p];
+#else
       MX[p][sg][lane] = mx[p];
+#endif
     }
     if (!(K1_PROBE & 2)) barrier(CLK_LOCAL_MEM_FENCE);
     for (int p = 0; p < K1_P; p++) {
       float tm = -INFINITY;
+#if K1_LEAN & 2
+      const float16 mxr = vload16(0, &MX[p][lane][0]);
+      __attribute__((opencl_unroll_hint))
+      for (int i = 0; i < 16; i++) tm = fmax(tm, mxr[i]);
+#else
       for (int i = 0; i < 16; i++) tm = fmax(tm, MX[p][i][lane]);
+#endif
       mn[p] = fmax(m[p], tm);
       alpha[p] = mn[p] == -INFINITY ? 1.0f : K1_EXP2(m[p] - mn[p]);
       float sum = 0.0f;
       if (p < npass && sg < K1_G) {
+#if K1_LEAN & 2
+        ushort16 pw;
+#endif
         __attribute__((opencl_unroll_hint))
         for (int kk = 0; kk < 16; kk++) {
           const float pr = mn[p] == -INFINITY ? 0.0f : K1_EXP2(s[p][kk] - mn[p]);
           sum += pr;
+#if K1_LEAN & 2
+          pw[kk] = as_ushort(convert_half(pr * sub_group_broadcast(vsc, kk) * K1_PSCALE));
+#else
           P[(sg * K1_C + p * 16 + lane) * 16 + kk] = as_ushort(convert_half(pr * sub_group_broadcast(vsc, kk) * K1_PSCALE));
+#endif
         }
+#if K1_LEAN & 2
+        vstore16(pw, 0, P + (sg * K1_C + p * 16 + lane) * 16);
+#endif
       }
+#if K1_LEAN & 2
+      SM[p][lane][sg] = sum;
+#else
       SM[p][sg][lane] = sum;
       if (sg == 0) AL[p * 16 + lane] = alpha[p];
+#endif
       m[p] = mn[p];
     }
     if (!(K1_PROBE & 2)) barrier(CLK_LOCAL_MEM_FENCE);
     for (int p = 0; p < K1_P; p++) {
       float ls = 0.0f;
+#if K1_LEAN & 2
+      const float16 smr = vload16(0, &SM[p][lane][0]);
+      __attribute__((opencl_unroll_hint))
+      for (int i = 0; i < 16; i++) ls += smr[i];
+#else
       for (int i = 0; i < 16; i++) ls += SM[p][i][lane];
+#endif
       l[p] = l[p] * alpha[p] + ls;
     }
     for (int q = 0; q < K1_C / 8; q++)
       __attribute__((opencl_unroll_hint))
+#if K1_LEAN & 2
+      for (int r = 0; r < 8; r++) o[q][r] *= sub_group_broadcast(alpha[(q * 8 + r) / 16], (q * 8 + r) % 16);
+#else
       for (int r = 0; r < 8; r++) o[q][r] *= AL[q * 8 + r];
+#endif
     { // the next tile's K rows: this sub-group's 16 keys of it
       const int nb = k0 + K1_T + sg * 16;
       if (!(K1_PROBE & 8) && sg < K1_G && nb < j1) {
@@ -172,6 +232,15 @@ KERNEL(256) void K1_FN(global const ushort *Q, global const char *KC, global con
         for (int ds = 0; ds < 8; ds++)
           intel_sub_group_2d_block_prefetch_16b_16r16x1c((global void *)np, 256, rows, Q27_KVROW, (int2)(ds * 16, nb % Q27_PAGE));
       }
+#if K1_LEAN & 4
+      const int key = nb + lane;
+      ksn = vsn = 0.0f;
+      if (sg < K1_G && nb < j1 && key < j1) {
+        const long sb = (long)PT[nb / Q27_PAGE] * Q27_PAGE8 + (long)Q27_PAGE * Q27_KVROW;
+        ksn = ((global const float *)(KC + sb))[(key % Q27_PAGE) * Q27_AKV + hk];
+        vsn = ((global const float *)(VC + sb))[(key % Q27_PAGE) * Q27_AKV + hk];
+      }
+#endif
     }
     for (int c2 = 0; c2 < ((K1_PROBE & 4) ? 0 : K1_T / 32); c2++) {       // PV, 32 keys a read: lane = dimension 16 sg + lane, word j = keys 4j..
       const int y0 = k0 + c2 * 32;
@@ -186,9 +255,20 @@ KERNEL(256) void K1_FN(global const ushort *Q, global const char *KC, global con
         uint8 vw;
         __attribute__((opencl_unroll_hint))
         for (int j = 0; j < 4; j++) {
+#if K1_PROBE & 128
+          vw[2 * j] = w8[hc * 4 + j];
+          vw[2 * j + 1] = w8[hc * 4 + j] ^ 0x3c003c00u;
+#elif K1_LEAN & 1
+          const uint x = w8[hc * 4 + j];           // keys 4j to 4j + 3, a byte each
+          const uint lo = ((x & 0xFFu) | ((x << 8) & 0xFF0000u)) ^ 0x64806480u;
+          const uint hi = (((x >> 16) & 0xFFu) | ((x >> 8) & 0xFF0000u)) ^ 0x64806480u;
+          vw[2 * j] = as_uint(as_half2(lo) - (half2)(1152.0h));
+          vw[2 * j + 1] = as_uint(as_half2(hi) - (half2)(1152.0h));
+#else
           const half4 h = convert_half4(as_char4(w8[hc * 4 + j]));
           vw[2 * j] = as_uint(h.s01);
           vw[2 * j + 1] = as_uint(h.s23);
+#endif
         }
         const int kg = c2 * 2 + hc;
         for (int q = 0; q < K1_C / 8; q++) {
@@ -220,3 +300,7 @@ KERNEL(256) void K1_FN(global const ushort *Q, global const char *KC, global con
     }
 }
 #undef K1_EXP2
+#ifdef K1_LEAN_UNSET
+#undef K1_LEAN
+#undef K1_LEAN_UNSET
+#endif

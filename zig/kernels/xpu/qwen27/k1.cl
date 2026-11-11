@@ -4,6 +4,7 @@
 // attn_k1_decode (8 rows a group, 256-key tiles) and attn_k1_decode16 (16 rows a group, 96 columns, 128-key
 // tiles: a 16-row window reads each K/V block once). See k1_body.h for the layout and the argument list.
 #pragma OPENCL FP_CONTRACT OFF
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
 #include "shape.h"
 
 #define KERNEL(N) __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(N, 1, 1))) kernel
@@ -89,6 +90,36 @@ static inline float bf2f(ushort h) { return as_float((uint)h << 16); }
 #define K1_PROBE 64
 #include "k1_body.h"
 #undef K1_FN
+#undef K1_PROBE
+#define K1_FN attn_k1_nc
+#define K1_PROBE 128
+#include "k1_body.h"
+#undef K1_FN
+#undef K1_PROBE
+
+// Lane p4-kernel (XPU_K1_LEAN, K1_LEAN in k1_body.h): attn_k1_decode with the same bits and fewer instructions.
+// attn_k1_lean takes the three changes. attn_k1_l1, attn_k1_l2 and attn_k1_l4 take one each (timing shadows).
+#define K1_PROBE 0
+#define K1_FN attn_k1_lean
+#define K1_LEAN 7
+#include "k1_body.h"
+#undef K1_FN
+#undef K1_LEAN
+#define K1_FN attn_k1_l1
+#define K1_LEAN 1
+#include "k1_body.h"
+#undef K1_FN
+#undef K1_LEAN
+#define K1_FN attn_k1_l2
+#define K1_LEAN 2
+#include "k1_body.h"
+#undef K1_FN
+#undef K1_LEAN
+#define K1_FN attn_k1_l4
+#define K1_LEAN 4
+#include "k1_body.h"
+#undef K1_FN
+#undef K1_LEAN
 #undef K1_PROBE
 #undef K1_R
 #undef K1_C
