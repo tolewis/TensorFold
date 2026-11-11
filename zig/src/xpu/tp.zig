@@ -1429,12 +1429,13 @@ pub const Group = struct {
 /// no byte, so the reset barrier of resetWords on the same socket is not touched. On the hang-up: the closed word,
 /// the group-lost line, then _exit(1) (no exit handlers: the driver's teardown could wait on the stopped queue).
 /// TP 3 and TP 4: one socket a peer pair (each follower to rank 0, 14.4 item 4), one watchdog a socket.
+const pollrdhup = 0x2000; // POLLRDHUP (Linux): the peer closed its end; this zig's linux.POLL has no name for it
 fn exWatch(sock: linux.fd_t, cw: *std.atomic.Value(u64), rank: u32) void {
     while (true) {
-        var pfd = [1]linux.pollfd{.{ .fd = sock, .events = linux.POLL.RDHUP, .revents = 0 }};
+        var pfd = [1]linux.pollfd{.{ .fd = sock, .events = pollrdhup, .revents = 0 }};
         const rc = linux.poll(&pfd, 1, 1000);
         if (failed(rc) or rc == 0) continue; // EINTR, or a second with no event
-        if (pfd[0].revents & (linux.POLL.HUP | linux.POLL.RDHUP | linux.POLL.ERR | linux.POLL.NVAL) == 0) continue;
+        if (pfd[0].revents & (linux.POLL.HUP | pollrdhup | linux.POLL.ERR | linux.POLL.NVAL) == 0) continue;
         cw.store(1, .release);
         std.debug.print("rank {d}: the peer ended (its socket hung up, events 0x{x}): the group is lost, the process ends\n", .{ rank, pfd[0].revents });
         linux.exit_group(1);
