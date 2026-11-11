@@ -176,8 +176,9 @@ pub fn run(d: *Dev, old: ze.H, new: ze.H, name: []const u8) !void {
 
 /// XPU_GDN bits 64 and 4 (lane p4-k-sk1, GS1): gdn_commit4 and conv_commit_ml (one launch for every layer, the
 /// addresses from a table) against `step` (the gdn_step in use) and `conv` (conv_commit), a launch a layer, as
-/// Runner.commitPath runs them. Three layers, each with its own inputs and states, a tree path and a straight path.
-/// Every state value and every convolution value must agree, or the open fails.
+/// Runner.commitPath runs them. Three layers, each with its own inputs and states. Paths: a tree path, a straight
+/// path, and paths of 1 and 2 rows (these keep rows of the convolution state in). Every state value and every
+/// convolution value must agree, or the open fails.
 pub fn commitAll(d: *Dev, step: ze.H, conv: ze.H, step_ml: ze.H, conv_ml: ze.H) !void {
     const NL = 3;
     const NCONV = q.GDN_QKV;
@@ -230,7 +231,13 @@ pub fn commitAll(d: *Dev, step: ze.H, conv: ze.H, step_ml: ze.H, conv_ml: ze.H) 
     const y = try room(d, LONG * HV * 128 * 2);
     try held.append(alloc, y);
     const Case = struct { path: []const i32, what: []const u8 };
-    const cases = [_]Case{ .{ .path = &.{ 0, 4, 13, 14 }, .what = "a tree path" }, .{ .path = &.{ 0, 1, 2, 3, 4 }, .what = "a straight path" } };
+    // Paths of 1 and 2 rows keep rows of the convolution state in (keep < 3: CIN, word 8 of the table)
+    const cases = [_]Case{
+        .{ .path = &.{ 0, 4, 13, 14 }, .what = "a tree path" },
+        .{ .path = &.{ 0, 1, 2, 3, 4 }, .what = "a straight path" },
+        .{ .path = &.{0}, .what = "a path of 1 row" },
+        .{ .path = &.{ 0, 3 }, .what = "a tree path of 2 rows" },
+    };
     var bad: usize = 0;
     for (cases) |c| {
         const PATH = try put(d, i32, c.path);
