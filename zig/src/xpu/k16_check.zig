@@ -2,8 +2,10 @@
 //! Each case is a lone tree verify as forward.zig runs it: the prefix keys through the K1 decode kernel, the draft
 //! keys through attn_k1_draft into slice NS, and attn_merge_span2. The two paths differ only in the prefix kernel
 //! (two 8-row groups at 256-key tiles, or one 16-row group at 128-key tiles), so their outputs differ by f16 and
-//! fp32 rounding only. Every (row, head) output must keep a cosine of MIN_COS and a mean relative error of at most
-//! MAX_MEAN_REL against the 8-row path, or the open fails. Random K/V and Q, as k1_bench.zig fills them.
+//! fp32 rounding only. Every (row, head) output must keep a cosine of MIN_COS and a relative L2 error
+//! (|x - y| / |y| over the 256 values) of at most MAX_REL_L2 against the 8-row path, or the open fails. The mean
+//! relative error a value is printed, not bounded: with random V many outputs lie near 0, so one value can have a
+//! large relative error at a cosine of 0.999999 (window p4k17). Random K/V and Q, as k1_bench.zig fills them.
 const std = @import("std");
 const ze = @import("ze");
 const dev = @import("dev.zig");
@@ -16,8 +18,8 @@ const PAGE: usize = 64;
 const AQ = q.ATT_Q_HEADS;
 const AKV = q.ATT_KV_HEADS;
 const PAGE8: usize = PAGE * (AKV * 256 + AKV * 4);
-const MIN_COS = 0.999;
-const MAX_MEAN_REL = 0.02;
+const MIN_COS = 0.9999;
+const MAX_REL_L2 = 0.01;
 
 fn bf16(v: f32) u16 {
     return @truncate(@as(u32, @bitCast(v)) >> 16);
@@ -42,7 +44,7 @@ const Held = struct {
     }
 };
 
-const Result = struct { cos: f64, rel: f64 };
+const Result = struct { cos: f64, l2: f64, rel: f64 };
 
 /// One case: a tree of `rows` rows (parent row t / 2) over `p0` prefix keys.
 fn case(d: *Dev, kk: k1.Kernels, rnd: std.Random, p0: u32, rows: u32) !Result {
@@ -125,23 +127,27 @@ fn case(d: *Dev, kk: k1.Kernels, rnd: std.Random, p0: u32, rows: u32) !Result {
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, o.*.ptr, out, n * 2, null, 0, null));
         try d.sync();
     }
-    var res: Result = .{ .cos = 1.0, .rel = 0.0 };
+    var res: Result = .{ .cos = 1.0, .l2 = 0.0, .rel = 0.0 };
     for (0..@as(usize, rows) * AQ) |rh| {
         var dot: f64 = 0;
         var n1: f64 = 0;
         var n2: f64 = 0;
         var rel: f64 = 0;
+        var e2: f64 = 0;
         for (0..256) |i| {
             const x: f64 = @as(f32, @bitCast(@as(u32, outs[1][rh * 256 + i]) << 16));
             const y: f64 = @as(f32, @bitCast(@as(u32, outs[0][rh * 256 + i]) << 16));
-            if (std.math.isNan(x) or std.math.isNan(y)) return .{ .cos = 0, .rel = std.math.inf(f64) };
+            if (std.math.isNan(x) or std.math.isNan(y)) return .{ .cos = 0, .l2 = std.math.inf(f64), .rel = std.math.inf(f64) };
             dot += x * y;
             n1 += x * x;
             n2 += y * y;
             rel += if (y != 0) @abs(x - y) / @abs(y) else 0;
+            e2 += (x - y) * (x - y);
         }
         const cos: f64 = if (n1 > 0 and n2 > 0) dot / @sqrt(n1 * n2) else if (n1 == n2) @as(f64, 1.0) else @as(f64, 0.0);
+        const l2: f64 = if (n2 > 0) @sqrt(e2 / n2) else if (e2 == 0) @as(f64, 0.0) else std.math.inf(f64);
         res.cos = @min(res.cos, cos);
+        res.l2 = @max(res.l2, l2);
         res.rel = @max(res.rel, rel / 256.0);
     }
     return res;
@@ -154,13 +160,15 @@ pub fn run(d: *Dev, kk: k1.Kernels) !void {
     // 16 rows (6 passes) and 11 rows (5 passes, a half with 2), short and long prefixes, a prefix that is no whole
     // number of tiles
     const cases = [_][2]u32{ .{ 16, 300 }, .{ 16, 20011 }, .{ 11, 4093 }, .{ 9, 1000 } };
-    var worst: Result = .{ .cos = 1.0, .rel = 0.0 };
+    var worst: Result = .{ .cos = 1.0, .l2 = 0.0, .rel = 0.0 };
     for (cases) |c| {
         const r = try case(d, kk, rnd, c[1], c[0]);
+        std.debug.print("  k16 case: {d} rows, {d} prefix keys: min cos {d:.7}, max rel L2 {d:.5}, max mean rel {d:.5}\n", .{ c[0], c[1], r.cos, r.l2, r.rel });
         worst.cos = @min(worst.cos, r.cos);
+        worst.l2 = @max(worst.l2, r.l2);
         worst.rel = @max(worst.rel, r.rel);
     }
-    const ok = worst.cos >= MIN_COS and worst.rel <= MAX_MEAN_REL;
-    std.debug.print("k16 check: attn_k1_k16 against two 8-row groups, {d} cases, min cos {d:.6}, mean rel {d:.5} ({s}, bounds {d}, {d})\n", .{ cases.len, worst.cos, worst.rel, if (ok) "pass" else "FAIL", MIN_COS, MAX_MEAN_REL });
+    const ok = worst.cos >= MIN_COS and worst.l2 <= MAX_REL_L2;
+    std.debug.print("k16 check: attn_k1_k16 against two 8-row groups, {d} cases, min cos {d:.7}, rel L2 {d:.5}, mean rel {d:.5} not bounded ({s}, bounds cos {d}, rel L2 {d})\n", .{ cases.len, worst.cos, worst.l2, worst.rel, if (ok) "pass" else "FAIL", MIN_COS, MAX_REL_L2 });
     if (!ok) return error.K16Differs;
 }
