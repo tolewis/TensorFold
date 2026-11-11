@@ -426,7 +426,7 @@ W4K_KERNEL_SL(w4k1_wl, 16, 32, 4, 16, READ16, 2, 1)
 // W stream does not evict other lines. The message is the same 2D block read (IGC asm: load_block2d.ugm.d32.a64.ca.uc
 // in place of load_block2d.ugm.d32.a64), so the same layout and the same bits. The two builtins are internal to IGC
 // (the cache-control form of intel_sub_group_2d_block_read_32b_8r16x1c and _prefetch_), not an OpenCL extension.
-enum W4_LDCC { W4_LDCC_L1C_L3UC = 3 };
+enum W4_LDCC { W4_LDCC_L1UC_L3UC = 1, W4_LDCC_L1C_L3UC = 3 };
 uint8 __builtin_IB_subgroup_block_read_cacheopts_u32_m8k16v1(long base, int width_m1, int height_m1, int pitch_m1, int2 xy, enum W4_LDCC cc);
 void __builtin_IB_subgroup_block_read_prefetch_u32_m8k16v1(long base, int width_m1, int height_m1, int pitch_m1, int2 xy, enum W4_LDCC cc);
 static inline void w4_read_uc(global void *base, int width, int height, int pitch, int2 xy, private uint *dst) {
@@ -456,3 +456,140 @@ W4K_KERNEL_SL(w4k1_d16uc0, 16, 16, 4, 16, READ16, 2, 1)
 #undef W4_WPF
 #define W4_WREAD(j, kb, dst) intel_sub_group_2d_block_read_32b_8r16x1c(W4_WSURF(j), W4_WXY(j, kb), dst)
 #define W4_WPF(j, kb) intel_sub_group_2d_block_prefetch_32b_8r16x1c(W4_WSURF(j), W4_WXY(j, kb))
+
+// --- Lane p4-k-rp: the register pipeline (g64 only, decode picks of XPU_MV).
+// The uc0 kernels read the W block of a group just before its DPAS, with no W prefetch, so a subgroup has one W read
+// in flight and waits the DRAM latency once a group. Here a subgroup reads the W blocks and the scales of group
+// g + RP_D into registers while the DPAS of group g run: RP_D + 1 W reads in flight, no W line in L1 or L3 (cc 1,
+// L1UC_L3UC) or in L1 only (cc 3, as uc0). The bias table of the tile is prefetched RP_D + 1 groups before the end,
+// so the bias step at the end does not wait on DRAM. Each output takes the operations of w4k1_decode (wide) and of
+// w4k_dsplit (narrow) in the same order: the same bits. The ring of RP_D + 1 slots has constant indices only, so the
+// main loop runs RP_D + 1 groups an iteration, each behind a uniform test against the end.
+#if GSZ == 64
+// Read group gn into slot SN: the W block and the scale of each 16-column block of the tile.
+#define RP_ISSUE(SN, gn, ge, CC)                                                                                     \
+  if ((gn) < (ge)) {                                                                                                 \
+    for (int j = 0; j < SG_N / 16; j++) {                                                                            \
+      rw[SN][j] = __builtin_IB_subgroup_block_read_cacheopts_u32_m8k16v1((long)W, N * 4 - 1, K / 8 - 1, N * 4 - 1,   \
+                                                                          (int2)(n0 + 16 * j, (gn) * 8), CC);       \
+      rs[SN][j] = S[(gn) * N + n0 + 16 * j + lane];                                                                  \
+    }                                                                                                                \
+  }
+
+// Group g from slot SC: GROUP_STEP_B with BIAS 0, SUBS 1 and the A prefetch two groups ahead, W and s from the ring.
+#define RP_COMPUTE(SC, g)                                                                                            \
+  {                                                                                                                  \
+    float8 part[SG_M / 8][SG_N / 16];                                                                                \
+    if ((g) + 2 < K / 64)                                                                                            \
+      for (int r = 0; r < SG_M / R; r++)                                                                             \
+        for (int h = 0; h < 2; h++)                                                                                  \
+          intel_sub_group_2d_block_prefetch_16b_8r16x2c((global void *)A, K * 2, M, K * 2, (int2)(((g) + 2) * 64 + 32 * h, m0 + R * r)); \
+    for (int i = 0; i < SG_M / 8; i++)                                                                               \
+      for (int j = 0; j < SG_N / 16; j++) part[i][j] = 0.0f;                                                         \
+    for (int t2 = 0; t2 < 2; t2++) {                                                                                 \
+      ushort ab[SG_M / R][2 * R];                                                                                    \
+      for (int r = 0; r < SG_M / R; r++)                                                                             \
+        READ_A((global void *)A, K * 2, M, K * 2, (int2)((g) * 64 + t2 * 32, m0 + R * r), ab[r]);                    \
+      for (int h = 0; h < 2; h++) {                                                                                  \
+        const int t = 2 * t2 + h;                                                                                    \
+        for (int j = 0; j < SG_N / 16; j++) {                                                                        \
+          const uint w0 = rw[SC][j][2 * t], w1 = rw[SC][j][2 * t + 1];                                               \
+          int8 bb = as_int8((uint8)(w0, w0 >> 4, w0 >> 8, w0 >> 12, w1, w1 >> 4, w1 >> 8, w1 >> 12) & 0x000F000Fu); \
+          for (int i = 0; i < SG_M / 8; i++) {                                                                       \
+            const short8 a = as_short8(vload8(0, &ab[(8 * i) / R][h * R + (8 * i) % R]));                            \
+            part[i][j] = intel_sub_group_f16_f16_matrix_mad_k16(a, bb, part[i][j]);                                  \
+          }                                                                                                          \
+        }                                                                                                            \
+      }                                                                                                              \
+    }                                                                                                                \
+    for (int j = 0; j < SG_N / 16; j++) {                                                                            \
+      const float s = (float)rs[SC][j] * 16777216.0f;                                                                \
+      for (int i = 0; i < SG_M / 8; i++) acc[i][j] = fma(part[i][j], (float8)(s), acc[i][j]);                       \
+    }                                                                                                                \
+  }
+
+// The bias table rows of the 16-column blocks j0 .. j1 - 1 of the tile (BIAS_TILE reads them at the end).
+#define RP_BIAS_PF(j0, j1)                                                                                           \
+  for (int j = (j0); j < (j1); j++)                                                                                  \
+    for (int st = 0; st < (G + 15) / 16; st++)                                                                       \
+      intel_sub_group_2d_block_prefetch_16b_16r16x1c((global void *)Bg, N * 2, G, N * 2, (int2)(n0 + 16 * j, 16 * st));
+
+// One group: read group g + RP_D into the slot that group g - 1 used, then group g.
+#define RP_STEP(C, g, ge, gpf, CC, J0, J1)                                                                           \
+  {                                                                                                                  \
+    RP_ISSUE(((C) + RP_D) % RP_R, (g) + RP_D, ge, CC)                                                                \
+    if ((g) == (gpf)) RP_BIAS_PF(J0, J1)                                                                             \
+    RP_COMPUTE(C, g)                                                                                                 \
+  }
+
+// Groups gb .. ge - 1 into acc, RP_D <= 3.
+#define RP_LOOP(gb, ge, CC, J0, J1)                                                                                  \
+  {                                                                                                                  \
+    const int gb_ = (gb), ge_ = (ge), gpf_ = max(gb_, ge_ - 1 - RP_D);                                               \
+    RP_ISSUE(0, gb_, ge_, CC)                                                                                        \
+    if (RP_D > 1) RP_ISSUE(1 % RP_R, gb_ + 1, ge_, CC)                                                               \
+    if (RP_D > 2) RP_ISSUE(2 % RP_R, gb_ + 2, ge_, CC)                                                               \
+    for (int g0 = gb_; g0 < ge_; g0 += RP_R) {                                                                       \
+      RP_STEP(0, g0, ge_, gpf_, CC, J0, J1)                                                                          \
+      if (RP_R > 1 && g0 + 1 < ge_) RP_STEP(1 % RP_R, g0 + 1, ge_, gpf_, CC, J0, J1)                                 \
+      if (RP_R > 2 && g0 + 2 < ge_) RP_STEP(2 % RP_R, g0 + 2, ge_, gpf_, CC, J0, J1)                                 \
+      if (RP_R > 3 && g0 + 3 < ge_) RP_STEP(3 % RP_R, g0 + 3, ge_, gpf_, CC, J0, J1)                                 \
+    }                                                                                                                \
+  }
+
+// Wide shapes: W4K_KERNEL_SL with SL 1 (w4k1_decode, w4k1_d16), the groups through the ring.
+#define W4RP_KERNEL(NAME, SG_M_, SG_N_, WG_N, R_, READ_A, D_, CC)                                                    \
+  KERNEL_HEAD_K(NAME, 16 * WG_N) {                                                                                   \
+    enum { SG_M = SG_M_, SG_N = SG_N_, R = R_, RP_D = D_, RP_R = D_ + 1 };                                           \
+    const int sg = get_sub_group_id(), lane = get_sub_group_local_id();                                             \
+    const int m0 = get_group_id(0) * SG_M, n0 = (get_group_id(1) * WG_N + sg) * SG_N;                               \
+    uint8 rw[RP_R][SG_N / 16];                                                                                     \
+    half rs[RP_R][SG_N / 16];                                                                                        \
+    float8 total[SG_M / 8][SG_N / 16], acc[SG_M / 8][SG_N / 16];                                                     \
+    for (int i = 0; i < SG_M / 8; i++)                                                                               \
+      for (int j = 0; j < SG_N / 16; j++) total[i][j] = acc[i][j] = 0.0f;                                            \
+    RP_LOOP(0, G, CC, 0, SG_N / 16)                                                                                  \
+    for (int i = 0; i < SG_M / 8; i++)                                                                               \
+      for (int j = 0; j < SG_N / 16; j++) total[i][j] += acc[i][j];                                                  \
+    for (int i = 0; i < SG_M / 8; i++)                                                                               \
+      for (int j = 0; j < SG_N / 16; j++) BIAS_TILE(total[i][j], i, j)                                               \
+    STORE_HALF(total)                                                                                                \
+  }
+
+// Narrow shapes: W4KS_KERNEL (w4k_dsplit), each subgroup's K slice through the ring. Subgroup sg adds the bias of
+// tile sg (TI * TJ = SLICES), so it prefetches the bias rows of that tile's column block only.
+#define W4RPS_KERNEL(NAME, SG_M_, SG_N_, R_, READ_A, D_, CC)                                                         \
+  KERNEL_HEAD_K(NAME, 64) {                                                                                          \
+    enum { SG_M = SG_M_, SG_N = SG_N_, TI = SG_M_ / 8, TJ = SG_N_ / 16, R = R_, RP_D = D_, RP_R = D_ + 1 };          \
+    local float8 buf[SLICES][TI][TJ][16];                                                                            \
+    const int sg = get_sub_group_id(), lane = get_sub_group_local_id();                                             \
+    const int m0 = get_group_id(0) * SG_M, n0 = get_group_id(1) * SG_N;                                             \
+    const int per = G / SLICES;                                                                                      \
+    uint8 rw[RP_R][SG_N / 16];                                                                                     \
+    half rs[RP_R][SG_N / 16];                                                                                        \
+    float8 acc[TI][TJ];                                                                                              \
+    for (int i = 0; i < TI; i++)                                                                                     \
+      for (int j = 0; j < TJ; j++) acc[i][j] = 0.0f;                                                                 \
+    RP_LOOP(sg * per, (sg + 1) * per, CC, sg % TJ, sg % TJ + 1)                                                      \
+    for (int i = 0; i < TI; i++)                                                                                     \
+      for (int j = 0; j < TJ; j++) buf[sg][i][j][lane] = acc[i][j];                                                  \
+    barrier(CLK_LOCAL_MEM_FENCE);                                                                                    \
+    for (int t = sg; t < TI * TJ; t += SLICES) {                                                                     \
+      const int i = t / TJ, j = t % TJ;                                                                              \
+      if (m0 + 8 * i >= M) break;                                                                                    \
+      float8 tot = 0.0f;                                                                                             \
+      for (int s = 0; s < SLICES; s++) tot += buf[s][i][j][lane];                                                    \
+      BIAS_TILE(tot, i, j)                                                                                           \
+      half8 h = convert_half8_rte(tot);                                                                              \
+      intel_sub_group_2d_block_write_16b_8r16x1c(C, N * 2, M, N * 2, (int2)(n0 + 16 * j, m0 + 8 * i), (private ushort *)&h); \
+    }                                                                                                                \
+  }
+
+W4RP_KERNEL(w4k1_rp, 16, 32, 4, 16, READ16, 2, W4_LDCC_L1UC_L3UC)
+W4RP_KERNEL(w4k1_rp3, 16, 32, 4, 16, READ16, 3, W4_LDCC_L1UC_L3UC)
+W4RP_KERNEL(w4k1_rpc, 16, 32, 4, 16, READ16, 2, W4_LDCC_L1C_L3UC) // the L1 policy of uc0: the pipeline alone
+W4RP_KERNEL(w4k1_d16rp, 16, 16, 4, 16, READ16, 2, W4_LDCC_L1UC_L3UC)
+W4RP_KERNEL(w4k1_d16rp3, 16, 16, 4, 16, READ16, 3, W4_LDCC_L1UC_L3UC)
+W4RPS_KERNEL(w4k_dsplitrp, 16, 32, 16, READ16, 2, W4_LDCC_L1UC_L3UC)
+W4RPS_KERNEL(w4k_dsplitrp3, 16, 32, 16, READ16, 3, W4_LDCC_L1UC_L3UC)
+#endif

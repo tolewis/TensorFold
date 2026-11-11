@@ -178,6 +178,8 @@ pub var draft_tp: bool = false;
 /// w0, a0, wa0, h8 and wseq are probes with wrong results (gemm.cl), so they run as shadows only.
 pub const MvPick = struct { k: ze.H, div: u32, wide: bool };
 pub var mv_pick: [16]?MvPick = @splat(null);
+var mv_checked: [16][]const u8 = undefined; // lane p4-k-rp: the variants mv_check.zig has run on this card
+var mv_checked_n: usize = 0;
 pub const MvShadow = struct { k: ze.H, div: u32, cold: bool, name: []const u8 };
 pub var mv_shadow: [16][16]?MvShadow = @splat(@splat(null));
 /// XPU_MV pre1:@@ref, pre2:@@ref (lane p4-k-first): shadows on the shape of gate|up at two earlier places of a layer.
@@ -194,7 +196,9 @@ pub var dirty_k: ?ze.H = null;
 pub var dirty_mb: u32 = 0;
 pub var mv_scratch: ?*anyopaque = null;
 pub const mv_scratch_bytes: usize = 32 << 20;
-const MvVariant = struct { name: []const u8, row: []const u8, kernel: [*:0]const u8, local: u32, div: u32, wide: bool, bits: bool = false, probe: bool = false };
+/// `check`: at the load, the kernel runs against the default kernel of its family on random data (mv_check.zig), and
+/// the open fails if an output bit differs.
+const MvVariant = struct { name: []const u8, row: []const u8, kernel: [*:0]const u8, local: u32, div: u32, wide: bool, bits: bool = false, probe: bool = false, check: bool = false };
 const mv_variants = [_]MvVariant{
     .{ .name = "d16", .row = "mv_d16", .kernel = "w4k1_d16", .local = 64, .div = 64, .wide = true }, // 16 columns a subgroup: two times the threads
     .{ .name = "d64", .row = "mv_d64", .kernel = "w4k1_d64", .local = 64, .div = 256, .wide = true }, // 64 columns: half the threads
@@ -227,6 +231,16 @@ const mv_variants = [_]MvVariant{
     .{ .name = "uc0", .row = "mv_uc0", .kernel = "w4k1_uc0", .local = 64, .div = 128, .wide = true }, // uc with no W prefetch
     .{ .name = "nuc0", .row = "mv_nuc0", .kernel = "w4k_dsplituc0", .local = 64, .div = 32, .wide = false }, // nuc with no W prefetch
     .{ .name = "d16uc0", .row = "mv_d16uc0", .kernel = "w4k1_d16uc0", .local = 64, .div = 64, .wide = true }, // d16 with uc0 reads
+    // lane p4-k-rp: the register pipeline. The W blocks and scales of group g + D in registers during the DPAS of
+    // group g (D 2, or 3 for the names that end in 3), W reads past L1 and L3 (rpc: past L3, as uc0), the bias table
+    // prefetched before the end. The same bits as the default kernel of the family.
+    .{ .name = "rp", .row = "mv_rp", .kernel = "w4k1_rp", .local = 64, .div = 128, .wide = true, .check = true },
+    .{ .name = "rp3", .row = "mv_rp3", .kernel = "w4k1_rp3", .local = 64, .div = 128, .wide = true, .check = true },
+    .{ .name = "rpc", .row = "mv_rpc", .kernel = "w4k1_rpc", .local = 64, .div = 128, .wide = true, .check = true },
+    .{ .name = "d16rp", .row = "mv_d16rp", .kernel = "w4k1_d16rp", .local = 64, .div = 64, .wide = true, .check = true },
+    .{ .name = "d16rp3", .row = "mv_d16rp3", .kernel = "w4k1_d16rp3", .local = 64, .div = 64, .wide = true, .check = true },
+    .{ .name = "nrp", .row = "mv_nrp", .kernel = "w4k_dsplitrp", .local = 64, .div = 32, .wide = false, .check = true },
+    .{ .name = "nrp3", .row = "mv_nrp3", .kernel = "w4k_dsplitrp3", .local = 64, .div = 32, .wide = false, .check = true },
 };
 /// XPU_K1_SHADOW=ref,nb3,... (lane p4-k-k1, default off): timing launches of K1 probe kernels (k1.cl, K1_PROBE)
 /// before each K1 launch of 8-row groups. They write scratch partials, so the model keeps its bits. The row
@@ -666,6 +680,17 @@ pub const Runner = struct {
                 if (v.probe and !shadow) return error.MvProbeIsShadowOnly;
                 if (pre != null and !shadow) return error.MvPreIsShadowOnly;
                 const k = try d.kernel(mm, v.kernel, v.local);
+                if (v.check) { // lane p4-k-rp: once a variant, before its first use
+                    const seen = for (mv_checked[0..mv_checked_n]) |done| {
+                        if (std.mem.eql(u8, done, v.name)) break true;
+                    } else false;
+                    if (!seen) {
+                        try @import("mv_check.zig").run(d, k, v.div, if (v.wide) d.k.dec_wide else d.k.dec_narrow, if (v.wide) 128 else 32, v.wide, v.name, v.kernel, if (v.wide) "w4k1_decode" else "w4k_dsplit");
+                        if (mv_checked_n == mv_checked.len) return error.TooManyMvChecks;
+                        mv_checked[mv_checked_n] = v.name;
+                        mv_checked_n += 1;
+                    }
+                }
                 var row: []const u8 = v.row;
                 if (shadow) {
                     if (mv_scratch == null) mv_scratch = try d.g.deviceAlloc(mv_scratch_bytes);
