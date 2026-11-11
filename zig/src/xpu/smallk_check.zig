@@ -237,3 +237,75 @@ pub fn dattn(d: *Dev, m: ze.H, name: [*:0]const u8, local: u32, CAP: u32, NH: u3
     std.debug.print("smallk check: {s} against dattn, {d} cases, {d} values differ, {d} values of dattn not finite\n", .{ name, cases.len, bad, nan });
     if (bad != 0 or nan != 0) return error.SmallkCheck;
 }
+
+/// NP1 (lane p4-k-sk1, bit 128): add_rmsnorm_dec_peer2 against add_rmsnorm_dec_peer on 16 rows. X, H, AHI and ALO
+/// must agree in every bit. R is not compared: the new kernel does not write it. Each launch gets its own copy of X
+/// and R (the old kernel writes both). Cases: the residual add on and off, the group sums of 64 and 128, and the
+/// rotated output (no W4A8 at these sites in production, so A8 stays null).
+pub fn norm(d: *Dev, old: ze.H, new: ze.H) !void {
+    const D = q.D;
+    var held: Held = .{};
+    defer held.deinit(d);
+    const nul: ?*anyopaque = null;
+    const xh = try alloc.alloc(f32, ROWS * D);
+    defer alloc.free(xh);
+    for (xh) |*x| x.* = unit() * 4.0;
+    const rh = try alloc.alloc(f16, ROWS * D);
+    defer alloc.free(rh);
+    for (rh) |*x| x.* = @floatCast(unit() * 2.0);
+    const ph = try alloc.alloc(f16, ROWS * D);
+    defer alloc.free(ph);
+    for (ph) |*x| x.* = @floatCast(unit() * 2.0);
+    const wh = try alloc.alloc(u16, D);
+    defer alloc.free(wh);
+    for (wh) |*x| x.* = bf16(1.0 + unit() * 0.5);
+    const PEER = try held.put(d, f16, ph);
+    const WN = try held.put(d, u16, wh);
+    const Case = struct { has_r: i32, gs: i32, rot: i32, what: []const u8 };
+    const cases = [_]Case{
+        .{ .has_r = 1, .gs = 64, .rot = 0, .what = "add, sums of 64" },
+        .{ .has_r = 1, .gs = 128, .rot = 0, .what = "add, sums of 128" },
+        .{ .has_r = 0, .gs = 64, .rot = 0, .what = "no add" },
+        .{ .has_r = 1, .gs = 128, .rot = 1, .what = "add, rotated" }, // the rotated sums are by 128 (out_rows)
+    };
+    var bad: usize = 0;
+    var nan: usize = 0;
+    for (cases) |c| {
+        const groups: usize = ROWS * (D / @as(usize, @intCast(c.gs)));
+        var X: [2]*anyopaque = undefined;
+        var H: [2]*anyopaque = undefined;
+        var AHI: [2]*anyopaque = undefined;
+        var ALO: [2]*anyopaque = undefined;
+        for ([2]ze.H{ old, new }, 0..) |k, s| {
+            X[s] = try held.put(d, f32, xh);
+            const R = try held.put(d, f16, rh);
+            H[s] = try held.room(d, ROWS * D * 2);
+            AHI[s] = try held.room(d, groups * 2);
+            ALO[s] = try held.room(d, groups * 2);
+            for ([_]*anyopaque{ H[s], AHI[s], ALO[s] }, [_]usize{ ROWS * D * 2, groups * 2, groups * 2 }) |p, n| try d.fill(p, @as(u16, 0x7E00), n); // NaN where a kernel writes nothing
+            try d.launch(k, .{ .x = ROWS }, .{ X[s], R, PEER, WN, H[s], AHI[s], ALO[s], @as(i32, D), q.EPS, c.has_r, c.gs, nul, nul, @as(i32, 0), c.rot });
+        }
+        var n: usize = 0;
+        {
+            const a = try back(d, u32, X[0], ROWS * D);
+            defer alloc.free(a);
+            const b = try back(d, u32, X[1], ROWS * D);
+            defer alloc.free(b);
+            for (a, b) |u, w| n += @intFromBool(u != w);
+        }
+        for ([_][2]*anyopaque{ H, AHI, ALO }, [_]usize{ ROWS * D, groups, groups }) |pair, len| {
+            const a = try back(d, u16, pair[0], len);
+            defer alloc.free(a);
+            const b = try back(d, u16, pair[1], len);
+            defer alloc.free(b);
+            for (a, b) |u, w| {
+                n += @intFromBool(u != w);
+                nan += @intFromBool(u & 0x7C00 == 0x7C00);
+            }
+        }
+        if (n != 0) std.debug.print("smallk check: add_rmsnorm_dec_peer2 against add_rmsnorm_dec_peer, {s}: {d} values differ\n", .{ c.what, n });
+        bad += n;
+    }
+    std.debug.print("smallk check: add_rmsnorm_dec_peer2 against add_rmsnorm_dec_peer, {d} cases, {d} values differ, {d} values of the old kernel not finite\n", .{ cases.len, bad, nan });
+    if (bad != 0 or nan != 0) return error.SmallkCheck;
+}

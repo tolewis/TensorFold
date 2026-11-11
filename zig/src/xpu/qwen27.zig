@@ -156,7 +156,8 @@ pub var gdn_bits: u32 = 0;
 /// positions in flight). 16: dattn_la2 in place of dattn (8 positions in flight, two query heads a subgroup), before
 /// bit 4. 32: dattn_lb2 (two buffers of 8 positions in turn, a ring index that steps, two query heads a subgroup),
 /// before bits 16 and 4. 64: dattn_lb1 (the same, one query head a subgroup), before bit 32. 8: at the load, each new kernel against the kernel it replaces on this card (smallk_check.zig), and the
-/// open fails when a token, a list entry or an output bit differs. Default 0.
+/// open fails when a token, a list entry or an output bit differs. 128 (lane p4-k-sk1, NP1): add_rmsnorm_dec_peer2
+/// in place of add_rmsnorm_dec_peer (tp_norm_peer): no R store, WN read with X, R and PEER (the same bits). Default 0.
 pub var smallk: u32 = 0;
 /// XPU_DRAFT_TP=1 (lane p4-kernel, a -Dtp=2 build; default off): both ranks run the DFlash2 drafter, each with half
 /// its heads, half its MLP columns and half its head rows (drafter.zig). Rank 0 writes the drafter's calls as step
@@ -636,12 +637,17 @@ pub const Runner = struct {
         }
         if (smallk != 0) { // lane p4-kernel: one line a rank, the check of the flag (the drafter's kernels: drafter.zig)
             const la: []const u8 = if (smallk & 64 != 0) "dattn_lb1" else if (smallk & 32 != 0) "dattn_lb2" else if (smallk & 16 != 0) "dattn_la2" else if (smallk & 4 != 0) "dattn_la4" else "off";
-            std.debug.print("smallk: XPU_SMALLK={d} (argmax_part16 {s}, topk_part16 {s}, dattn {s}, check {s})\n", .{ smallk, if (smallk & 1 != 0) "on" else "off", if (smallk & 2 != 0) "on" else "off", la, if (smallk & 8 != 0) "on" else "off" });
+            std.debug.print("smallk: XPU_SMALLK={d} (argmax_part16 {s}, topk_part16 {s}, dattn {s}, tp_norm_peer2 {s}, check {s})\n", .{ smallk, if (smallk & 1 != 0) "on" else "off", if (smallk & 2 != 0) "on" else "off", la, if (smallk & 128 != 0) "on" else "off", if (smallk & 8 != 0) "on" else "off" });
             if (smallk & 1 != 0) {
                 comptime std.debug.assert(VOCAB % 8 == 0); // argmax_part16 reads 8 values a lane, 16-byte aligned
                 const part16 = try d.kernel(mg, "argmax_part16", 16);
                 if (smallk & 8 != 0) try @import("smallk_check.zig").argmax(d, d.k.argmax_part, part16, d.k.argmax);
                 d.k.argmax_part = part16;
+            }
+            if (smallk & 128 != 0) { // NP1 (lane p4-k-sk1): the fused exchange's norm without the R store
+                const np1 = try d.kernel(mg, "add_rmsnorm_dec_peer2", 512);
+                if (smallk & 8 != 0) try @import("smallk_check.zig").norm(d, d.k.tp_norm_peer, np1);
+                d.k.tp_norm_peer = np1;
             }
         }
         for ([_]ze.H{ d.k.attn_prep, d.k.attn_decode, d.k.gdn_pre, d.k.gdn_step }) |k| try d.g.indirect(k);

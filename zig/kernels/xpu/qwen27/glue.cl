@@ -302,6 +302,48 @@ KERNEL(512) void add_rmsnorm_dec_peer(global float *X, global half *R, global co
   out_rows(hl, D, H, t, rot, gs, A8, SA, MS, AHI, ALO);
 }
 
+// NP1 (lane p4-k-sk1, XPU_SMALLK bit 128): add_rmsnorm_dec_peer with no R store, and WN read in the first loop with
+// X, R and PEER, so its loads overlap theirs. No command reads R after this kernel at any of its three sites (the
+// next GEMM writes R first, Recipe log 2026-11-11 14:37Z). The old store was also a value conversion of the bits,
+// not the sum. The sums, their order and the outputs X, H, AHI and ALO are those of add_rmsnorm_dec_peer.
+KERNEL(512) void add_rmsnorm_dec_peer2(global float *X, global const half *R, global const ushort *PEER,
+                                       global const ushort *WN, global half *H, global half *AHI, global half *ALO,
+                                       int D, float eps, int has_r, int gs, global char *A8, global float *SA, int MS,
+                                       int rot) {
+  local float red[32];
+  local half hl[Q27_D];
+  const int t = get_group_id(0), lid = get_local_id(0);
+  float xv[Q27_D512], ss = 0.0f;
+  ushort wv[Q27_D512];
+  for (int i = 0; i < Q27_D512; i++) {
+    const int e = lid + i * 512;
+    wv[i] = e < D ? WN[e] : 0;
+    float x = e < D ? X[(long)t * D + e] : 0.0f;
+    if (has_r && e < D) {
+      const ushort sb = as_ushort((half)((float)as_half(R[(long)t * D + e]) + (float)as_half(PEER[(long)t * D + e])));
+      x = rbf(x + (float)as_half(sb));
+      X[(long)t * D + e] = x;
+    }
+    xv[i] = x;
+    ss += x * x;
+  }
+  const float s = sub_group_reduce_add(ss);
+  if (get_sub_group_local_id() == 0) red[get_sub_group_id()] = s;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float tot = 0.0f;
+  for (int i = 0; i < 32; i++) tot += red[i];
+  const float inv = rsqrt(tot / D + eps);
+  for (int i = 0; i < Q27_D512; i++) {
+    const int e = lid + i * 512;
+    if (e >= D) continue;
+    const half v = convert_half_rte(rbf(xv[i] * inv * bf2f(wv[i])));
+    if (!rot) H[(long)t * D + e] = v;
+    hl[e] = v;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  out_rows(hl, D, H, t, rot, gs, A8, SA, MS, AHI, ALO);
+}
+
 // GDN, before the recurrence. P: output of the gdn.in GEMM, fp16 [T, 16 640] = qkv | z | a | b | padding.
 
 // Causal convolution of kernel 4 over qkv with the state, SiLU, bf16 rounding; q, k normalized per head.
