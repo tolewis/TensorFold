@@ -492,8 +492,14 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
                            // through attn_k1_draft into slice NS, merged as one row of partials a (row, head)
                     const wf: [1]u32 = .{0};
                     const wn: [1]u32 = .{T};
-                    const n = k1mod.rowGroups(&wf, &wn, grp_host[0..32]);
-                    const plan = k1mod.planTile(p0, n, AKV, k1mod.wave, k1mod.TILE);
+                    // XPU_K1_R16=2 (lane p4-kernel): a window of 9 to 16 rows is one group through attn_k1_k16
+                    const k16 = k1mod.k16t and T > k1mod.ROWS and d.k.attn_k1_k16 != null;
+                    const n = if (k16) blk: {
+                        grp_host[0] = 0;
+                        grp_host[1] = @intCast(T);
+                        break :blk @as(u32, 1);
+                    } else k1mod.rowGroups(&wf, &wn, grp_host[0..32]);
+                    const plan = k1mod.planTile(p0, n, AKV, k1mod.wave, if (k16) k1mod.TILE_K16 else k1mod.TILE);
                     const p0i: i32 = @intCast(p0);
                     const posm: i32 = @as(i32, @intCast(plan.ns)) * plan.span + plan.span - 1; // used = NS + 1
                     for (0..16) |r| {
@@ -513,7 +519,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
                     // the draft takes ns as its slice index
                     const ns_stride: i32 = @as(i32, @intCast(plan.ns)) + 1;
                     if (a.spo != null) for (q.k1_shadow) |sh| try d.launch(sh orelse break, .{ .x = plan.ns, .y = AKV, .z = n }, .{ a.q, l.kc.?, l.vc.?, a.spm.?, a.spl.?, a.spo.?, @as(i32, p0i), ns_stride, plan.span, @as(f32, 1.0 / 16.0), a.kmt, a.kpos, kvCap(), l.pt.?, a.grp }); // XPU_K1_SHADOW: timing launches, scratch partials
-                    try d.launch(d.k.attn_k1.?, .{ .x = plan.ns, .y = AKV, .z = n }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, p0i), ns_stride, plan.span, @as(f32, 1.0 / 16.0), a.kmt, a.kpos, kvCap(), l.pt.?, a.grp });
+                    try d.launch(if (k16) d.k.attn_k1_k16.? else d.k.attn_k1.?, .{ .x = plan.ns, .y = AKV, .z = n }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, p0i), ns_stride, plan.span, @as(f32, 1.0 / 16.0), a.kmt, a.kpos, kvCap(), l.pt.?, a.grp });
                     try d.launch(d.k.attn_k1_draft.?, .{ .x = 1, .y = AKV, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, p0i), @as(i32, @intCast(plan.ns)), @as(f32, 1.0 / 16.0), a.tree, l.pt.? });
                     try d.launch(d.k.merge_span, .{ .x = HQ, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, p0i), ns_stride, plan.span, a.kposm });
                 } else if (k1mt) { // K1 multi-tree (lane p33-multitree, XPU_MULTI_TREE): the prefix keys through the

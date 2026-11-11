@@ -238,6 +238,87 @@ KERNEL(16) void gdn_step2_uc(global const ushort *Q, global const ushort *K, glo
 }
 #undef GDN_ROW8
 
+// gdn_step4 (lane p4-kernel, XPU_GDN bit 32): gdn_step2 with 4 v rows a sub-group, two sub-groups a work-group of
+// 32. Window p4k16 found that gdn_step2 is bound by its instruction count: 16 x 24 sub-groups on 256 EUs, about
+// 1.5 threads an EU, so each instruction waits for the one before it. gdn_step4 runs 768 sub-groups, each with half
+// the rows. The grid (16 x V heads groups) and the arguments are those of gdn_step2. Each v row keeps its own
+// state, sums and order, so the bits are those of gdn_step2.
+#define GDN_ROW4(P, r) ((P) + ((long)h * 128 + vb * 8 + sg * 4 + (r)) * 128)
+KERNEL(32) void gdn_step4(global const ushort *Q, global const ushort *K, global const ushort *V, global const float *G,
+                          global const float *BETA, global const float *S, global float *SO, global ushort *Y, int T,
+                          global const int *ROWS, global const int *TREE, global float *SL, global const ulong *MT) {
+  const int vb = get_group_id(0), h = get_group_id(1), sg = get_sub_group_id(), lane = get_sub_group_local_id();
+  const int kh = h / Q27_GVK;
+  int t0 = 0;
+  if (MT) {
+    t0 = get_group_id(2);
+    if ((int)MT[t0 * 8 + 6] != t0) return;            // not a window's first row
+    S = (global const float *)MT[t0 * 8 + 4];
+    SO = (global float *)MT[t0 * 8 + 5];
+    T = t0 + (int)MT[t0 * 8 + 7];
+  }
+  float s[4][8];
+  for (int r = 0; r < 4; r++) {
+    const float8 sv = as_float8(intel_sub_group_block_read8((global const uint *)GDN_ROW4(S, r)));
+    for (int i = 0; i < 8; i++) s[r][i] = sv[i];
+  }
+  for (int t = t0; t < T; t++) {
+    const int row = ROWS ? ROWS[t] : t;
+    const int tw = TREE ? TREE[t * 17] : 0, depth = tw & 255;
+    if (TREE && depth > 0 && (tw & 512)) {              // the parent's state, from its slot
+      const long par = ANC(t, depth - 1);
+      for (int r = 0; r < 4; r++) {
+        const float8 sv = as_float8(intel_sub_group_block_read8((global const uint *)GDN_ROW4(SL + par * Q27_GV * 16384, r)));
+        for (int i = 0; i < 8; i++) s[r][i] = sv[i];
+      }
+    } else if (TREE && depth == 0)
+      for (int r = 0; r < 4; r++) {
+        const float8 sv = as_float8(intel_sub_group_block_read8((global const uint *)GDN_ROW4(S, r)));
+        for (int i = 0; i < 8; i++) s[r][i] = sv[i];
+      }
+    const ushort8 qv = intel_sub_group_block_read_us8(Q + ((long)row * Q27_GK + kh) * 128);
+    const ushort8 kv = intel_sub_group_block_read_us8(K + ((long)row * Q27_GK + kh) * 128);
+    const ushort4 vv = vload4(0, V + ((long)row * Q27_GV + h) * 128 + vb * 8 + sg * 4);
+    float q[8], k[8];
+    for (int i = 0; i < 8; i++) {
+      q[i] = bf2f(qv[i]);
+      k[i] = bf2f(kv[i]);
+    }
+    const float g = G[(long)row * Q27_GV + h], beta = BETA[(long)row * Q27_GV + h];
+    ushort4 yo;
+    for (int r = 0; r < 4; r++) {
+      float mem = 0.0f;
+      for (int i = 0; i < 8; i++) {
+        s[r][i] *= g;
+        mem += s[r][i] * k[i];
+      }
+      mem = sub_group_reduce_add(mem);
+      const float u = (bf2f(vv[r]) - mem) * beta;
+      float y = 0.0f;
+      for (int i = 0; i < 8; i++) {
+        s[r][i] += k[i] * u;
+        y += s[r][i] * q[i];
+      }
+      y = sub_group_reduce_add(y);
+      yo[r] = f2bf(y);
+    }
+    if (lane == 0) vstore4(yo, 0, Y + ((long)t * Q27_GV + h) * 128 + vb * 8 + sg * 4);
+    if (tw & 256)                                       // SAVE: a later row loads this state
+      for (int r = 0; r < 4; r++) {
+        float8 sv;
+        for (int i = 0; i < 8; i++) sv[i] = s[r][i];
+        intel_sub_group_block_write8((global uint *)GDN_ROW4(SL + (long)t * Q27_GV * 16384, r), as_uint8(sv));
+      }
+  }
+  if (!TREE)
+    for (int r = 0; r < 4; r++) {
+      float8 sv;
+      for (int i = 0; i < 8; i++) sv[i] = s[r][i];
+      intel_sub_group_block_write8((global uint *)GDN_ROW4(SO, r), as_uint8(sv));
+    }
+}
+#undef GDN_ROW4
+
 // Decode attention by key slices: one subgroup per (slice, K/V head and query part, row) handles Q27_QPG query heads
 // (27B: 6, all of the K/V head's); partials PM, PL, PO. Grid (slices, Q27_AKV * Q27_QPARTS, rows).
 #define SPLIT 32

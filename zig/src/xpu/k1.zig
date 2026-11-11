@@ -13,6 +13,8 @@ pub const ROWS: u32 = 8;
 /// window reads each K/V block once instead of twice (lanes/qwen27 handoff p22-k1, risk 1).
 pub const ROWS16: u32 = 16;
 pub const TILE16: u32 = 128;
+/// attn_k1_k16's tile (k1.cl K16_T, lane p4-kernel).
+pub const TILE_K16: u32 = 128;
 /// Xe cores of the B70 (Arc Pro B70, BMG-G31).
 pub const XE_CORES: u32 = 32;
 
@@ -22,6 +24,10 @@ pub var on = false;
 pub var wave: u32 = 4;
 /// XPU_K1_R16: 16-row groups for a 16-row window (1). XPU_K1_R16=0: 8-row groups, as lane p22-k1.
 pub var r16 = true;
+/// XPU_K1_R16=2 (lane p4-kernel): the lone tree verify's prefix keys as one group of up to 16 rows through
+/// attn_k1_k16 (k1.cl), which reads and converts each K/V row once for the 16 rows. Chain and shared windows keep
+/// 8-row groups, as XPU_K1_R16=0. The values differ from the 8-row groups by f16 and fp32 rounding (k1.cl).
+pub var k16t = false;
 /// Set when the k1 image carries attn_k1_decode16 (k1.load); groups() only picks it when it does.
 pub var have16 = false;
 /// XPU_K1_TREE: the single-stream tree verify's prefix goes through K1, its draft keys through attn_k1_draft
@@ -38,7 +44,10 @@ pub var multi_tree = false;
 pub fn readEnv() void {
     if (std.c.getenv("XPU_K1")) |v| on = v[0] != '0';
     if (std.c.getenv("XPU_K1_WAVE")) |v| wave = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 4;
-    if (std.c.getenv("XPU_K1_R16")) |v| r16 = v[0] != '0';
+    if (std.c.getenv("XPU_K1_R16")) |v| {
+        k16t = v[0] == '2';
+        r16 = v[0] != '0' and !k16t;
+    }
     if (std.c.getenv("XPU_K1_TREE")) |v| tree = v[0] != '0';
     multi_tree = tree; // the shared tree round follows the lone tree unless XPU_MULTI_TREE says
     if (std.c.getenv("XPU_MULTI_TREE")) |v| multi_tree = v[0] != '0';
@@ -95,6 +104,7 @@ pub var posm_host: [16]i32 = undefined;
 pub const Kernels = struct {
     decode: ze.H = null, // attn_k1_decode (k1.cl): 8-row groups
     decode16: ze.H = null, // attn_k1_decode16 (k1.cl): 16-row groups, 128-key tiles
+    k16: ze.H = null, // attn_k1_k16 (k1.cl): the lone tree verify's 16-row prefix pass (XPU_K1_R16=2)
     draft: ze.H = null, // attn_k1_draft (k1.cl): the tree verify's draft keys into slice NS
     draft_mt: ze.H = null, // attn_k1_draft_mt (k1.cl): the shared round's tree rows' draft keys (XPU_MULTI_TREE)
     span: ze.H = null, // attn_decode_span (decode.cl): the scalar page-table kernel K1 is checked against
@@ -109,6 +119,7 @@ pub fn load(d: *dev.Dev, md: ze.H, mk1: ze.H) !Kernels {
     const k = Kernels{
         .decode = try d.kernel(mk1, "attn_k1_decode", 256),
         .decode16 = try d.kernel(mk1, "attn_k1_decode16", 256),
+        .k16 = try d.kernel(mk1, "attn_k1_k16", 256),
         .draft = try d.kernel(mk1, "attn_k1_draft", 16),
         .draft_mt = try d.kernel(mk1, "attn_k1_draft_mt", 16),
         .span = try d.kernel(md, "attn_decode_span", 16),
@@ -119,6 +130,7 @@ pub fn load(d: *dev.Dev, md: ze.H, mk1: ze.H) !Kernels {
     };
     try d.g.indirect(k.decode);
     try d.g.indirect(k.decode16);
+    try d.g.indirect(k.k16);
     try d.g.indirect(k.span);
     have16 = k.decode16 != null;
     return k;

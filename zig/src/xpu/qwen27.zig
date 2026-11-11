@@ -146,7 +146,9 @@ pub var kv8: i32 = 0;
 /// XPU_GDN (lane p4-k-gdn), bits. 1: a stashed GDN layer's GEMM and gdn_pre write the stash, so no copy follows.
 /// 2: gdn_step2, gdn_step with block loads (the same bits). 4: at the load, gdn_step2 against gdn_step on the card
 /// (gdn_check.zig), and the open fails when a value differs. 8 (lane p4-k-first): gdn_step2_uc in place of gdn_step2,
-/// the tree states SL past both caches (the same bits). With 4, the check runs gdn_step2_uc. Default 0.
+/// the tree states SL past both caches (the same bits). With 4, the check runs gdn_step2_uc. 32 (lane p4-kernel):
+/// gdn_step4 in place of gdn_step2 and gdn_step2_uc, 4 v rows a sub-group and 2 sub-groups a work-group (the same
+/// bits). With 4, the check runs gdn_step4. Default 0.
 pub var gdn_bits: u32 = 0;
 /// XPU_SMALLK (lane p4-kernel), bits: small kernels of a round that wait on memory, each with the results of the
 /// kernel it replaces. 1: argmax_part16 in place of argmax_part (the token of each verify row). 2: the drafter's
@@ -597,10 +599,12 @@ pub const Runner = struct {
         // the shared rounds' kernels reach each slot's states through the per-row table (acts.mt)
         if (gdn_bits != 0) { // lane p4-k-gdn: one line a rank, the check of the flag
             const step1 = d.k.gdn_step;
-            const step2 = if (gdn_bits & 14 != 0) try d.kernel(md, if (gdn_bits & 8 != 0) "gdn_step2_uc" else "gdn_step2", 16) else step1;
-            std.debug.print("gdn: XPU_GDN={d} (stash in place {s}, gdn_step2 {s}, SL uncached {s})\n", .{ gdn_bits, if (gdn_bits & 1 != 0) "on" else "off", if (gdn_bits & 10 != 0) "on" else "off", if (gdn_bits & 8 != 0) "on" else "off" });
-            if (gdn_bits & 4 != 0) try @import("gdn_check.zig").run(d, step1, step2); // the two kernels on this card: the same bits
-            if (gdn_bits & 10 != 0) d.k.gdn_step = step2;
+            const four = gdn_bits & 32 != 0; // gdn_step4: a work-group of 2 sub-groups, the same grid
+            const name: [:0]const u8 = if (four) "gdn_step4" else if (gdn_bits & 8 != 0) "gdn_step2_uc" else "gdn_step2";
+            const step2 = if (gdn_bits & 46 != 0) try d.kernel(md, name.ptr, if (four) 32 else 16) else step1;
+            std.debug.print("gdn: XPU_GDN={d} (stash in place {s}, gdn_step2 {s}, SL uncached {s}, gdn_step4 {s})\n", .{ gdn_bits, if (gdn_bits & 1 != 0) "on" else "off", if (gdn_bits & 10 != 0 and !four) "on" else "off", if (gdn_bits & 8 != 0 and !four) "on" else "off", if (four) "on" else "off" });
+            if (gdn_bits & 4 != 0) try @import("gdn_check.zig").run(d, step1, step2, name); // the two kernels on this card: the same bits
+            if (gdn_bits & 42 != 0) d.k.gdn_step = step2;
         }
         if (smallk != 0) { // lane p4-kernel: one line a rank, the check of the flag (the drafter's kernels: drafter.zig)
             const la: []const u8 = if (smallk & 64 != 0) "dattn_lb1" else if (smallk & 32 != 0) "dattn_lb2" else if (smallk & 16 != 0) "dattn_la2" else if (smallk & 4 != 0) "dattn_la4" else "off";
@@ -618,6 +622,11 @@ pub const Runner = struct {
             const kk = try k1mod.load(d, md, mk1);
             d.k.attn_k1 = kk.decode;
             d.k.attn_k1_16 = kk.decode16;
+            if (k1mod.k16t) { // XPU_K1_R16=2 (lane p4-kernel): the lone tree's prefix pass as one 16-row group
+                d.k.attn_k1_k16 = kk.k16;
+                std.debug.print("k1: XPU_K1_R16=2 (lone tree 16-row pass attn_k1_k16 on, tile {d}, chain and shared windows 8-row groups)\n", .{k1mod.TILE_K16});
+                try @import("k16_check.zig").run(d, kk); // against two 8-row groups on this card: the open fails past the bounds
+            }
             d.k.attn_k1_draft = kk.draft;
             d.k.attn_k1_draft_mt = kk.draft_mt;
             k1mod.have16 = kk.decode16 != null;
