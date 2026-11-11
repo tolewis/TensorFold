@@ -210,6 +210,7 @@ const mv_variants = [_]MvVariant{
     .{ .name = "nuc", .row = "mv_nuc", .kernel = "w4k_dsplituc", .local = 64, .div = 32, .wide = false },
     .{ .name = "uc0", .row = "mv_uc0", .kernel = "w4k1_uc0", .local = 64, .div = 128, .wide = true }, // uc with no W prefetch
     .{ .name = "nuc0", .row = "mv_nuc0", .kernel = "w4k_dsplituc0", .local = 64, .div = 32, .wide = false }, // nuc with no W prefetch
+    .{ .name = "d16uc0", .row = "mv_d16uc0", .kernel = "w4k1_d16uc0", .local = 64, .div = 64, .wide = true }, // d16 with uc0 reads
 };
 /// XPU_K1_SHADOW=ref,nb3,... (lane p4-k-k1, default off): timing launches of K1 probe kernels (k1.cl, K1_PROBE)
 /// before each K1 launch of 8-row groups. They write scratch partials, so the model keeps its bits. The row

@@ -449,6 +449,9 @@ W4KS_KERNEL(w4k_dsplituc, 16, 32, 16, READ16) // the default narrow kernel, W pa
 #define W4_WPF(j, kb)
 W4K_KERNEL_SL(w4k1_uc0, 16, 32, 4, 16, READ16, 2, 1)
 W4KS_KERNEL(w4k_dsplituc0, 16, 32, 16, READ16)
+// Window p4k10: uc0 at mixer_in (66 and 56 tiles a rank) took 70.0 and 68.0 us against 56.3 and 52.4. d16uc0: d16
+// (16 columns a subgroup, twice the threads) with the same W reads.
+W4K_KERNEL_SL(w4k1_d16uc0, 16, 16, 4, 16, READ16, 2, 1)
 #undef W4_WREAD
 #undef W4_WPF
 #define W4_WREAD(j, kb, dst) intel_sub_group_2d_block_read_32b_8r16x1c(W4_WSURF(j), W4_WXY(j, kb), dst)
