@@ -186,7 +186,7 @@ pub fn mlpIn(d: *Dev, m: *const Model, a: *Acts, w: Proj, T: u32, gs: i32, pre: 
         try d.launch(d.k.rowsums_ff, .{ .x = T }, .{ a.p, a.ahi, a.alo, gs, q.rot_on });
         return a.p;
     }
-    q.prof.site = .gate_up;
+    q.prof.site = gate_site;
     try gemmRows(d, a.pscr, a.h, a.ahi, a.alo, w, a.p, T, wide);
     q.prof.site = .none;
     try d.launch(d.k.swiglu, .{ .x = T, .y = (FF + 1023) / 1024 }, .{ a.p, a.h, a.ahi, a.alo, gs, @as(i32, @intFromBool(w.ilv)), q.rot_on, @as(i32, FF) });
@@ -208,6 +208,9 @@ pub fn gemm(d: *Dev, pscr: *anyopaque, h: *anyopaque, ahi: *anyopaque, alo: *any
     return gemmRows(d, pscr, h, ahi, alo, w, out, m, m > 16);
 }
 
+/// XPU_SITE_SPLIT (lane p4-k-first): the profile site of the gate|up launch of the layer in work. `forward` sets it.
+var gate_site: q.Site = .gate_up;
+
 /// XPU_MV cold shadows (lane p4-k-mv): the weights of each call site in the order of their first launch.
 var mv_ring: [16][128]Proj = undefined;
 var mv_ring_n: [16]u32 = @splat(0);
@@ -220,6 +223,40 @@ fn mvRingIndex(site: usize, w: Proj) ?u32 {
     mv_ring[site][n] = w;
     mv_ring_n[site] = n + 1;
     return n;
+}
+
+/// The shadow launches of `list` on the shape of `w` (lane p4-k-mv). A cold shadow (`@@`) reads the W of another layer
+/// of `site`: slot j takes the layer (j + 1) x n / 16 places on in the ring of the site's n layers, so a W is read
+/// again after 4 layers at the earliest (64 layers). `j0` moves the slots of a list, so the lists of two places of
+/// a layer read different layers.
+fn mvShadows(d: *Dev, list: *const [16]?q.MvShadow, site: usize, j0: u32, h: *anyopaque, ahi: *anyopaque, alo: *anyopaque, w: Proj, m: u32) !void {
+    if (list[0] == null) return;
+    const at = mvRingIndex(site, w);
+    const n = mv_ring_n[site];
+    const step = @max(1, n / 16);
+    for (list, 0..) |sh, j| {
+        const shd = sh orelse break;
+        var ws = w;
+        if (shd.cold) {
+            const i = at orelse continue;
+            const t = (i + step * (j0 + @as(u32, @intCast(j)) + 1)) % n;
+            ws = mv_ring[site][t];
+            if (t == i or ws.n != w.n or ws.k != w.k or ws.gs != w.gs or ws.wide != w.wide) continue;
+        }
+        if (w.n % shd.div == 0 and @as(usize, m) * w.n * 2 <= q.mv_scratch_bytes)
+            try d.launch(shd.k, .{ .x = 1, .y = w.n / shd.div }, .{ h, ws.w, ws.s, ws.bg, q.mv_scratch.?, @as(i32, @intCast(m)), @as(i32, @intCast(w.n)), @as(i32, @intCast(w.k)), ahi, alo, @as(i32, @intCast((m + 7) / 8 * 8)), @as(i32, @intCast(w.k / w.gs)) });
+    }
+}
+
+/// XPU_MV pre1 and pre2 (lane p4-k-first): timing launches on the shape of the layer's gate|up before the launch
+/// of that site. Place 0 (pre1): after mixer_out, before its exchange. Place 1 (pre2): after that exchange, before
+/// the norm. They read h as it is and write the scratch buffer, so the model keeps its bits. Decode rows only.
+fn mvPre(d: *Dev, a: *Acts, place: usize, w: Proj, T: u32) !void {
+    if (w.x3 != null or w.gs == 128) return;
+    const site = q.prof.site;
+    q.prof.site = .none; // a row of its own kernel only
+    defer q.prof.site = site;
+    try mvShadows(d, &q.mv_pre[place], @intFromEnum(q.Site.gate_up), @intCast(5 * (place + 1)), a.h, a.ahi, a.alo, w, T);
 }
 
 /// `gemm` with the path chosen by the caller: `wide`, the nGEN prompt GEMMs whatever the rows (a prompt's chunk).
@@ -236,29 +273,12 @@ pub fn gemmRows(d: *Dev, pscr: *anyopaque, h: *anyopaque, ahi: *anyopaque, alo: 
     const ngen_wide = if (g128) k.ngen_wide_g128 else k.ngen_wide;
     const ngen_narrow = if (g128) k.ngen_narrow_g128 else k.ngen_narrow;
     const mp: i32 = @intCast((m + 7) / 8 * 8);
-    // XPU_MV shadows (lane p4-k-mv): timing launches of other kernels on this call's shape, the output to a scratch buffer
-    // A cold shadow (`@@`) reads the W of another layer of the site: slot j takes the layer (j + 1) x n / 16 places on
-    // in the ring of the site's n layers, so a W is read again after 4 layers at the earliest (64 layers).
-    const site = @intFromEnum(q.prof.site);
-    if (!wide and !g128 and q.mv_shadow[site][0] != null) {
-        const at = mvRingIndex(site, w);
-        const n = mv_ring_n[site];
-        const step = @max(1, n / 16);
-        for (q.mv_shadow[site], 0..) |sh, j| {
-            const shd = sh orelse break;
-            var ws = w;
-            if (shd.cold) {
-                const i = at orelse continue;
-                const t = (i + step * (@as(u32, @intCast(j)) + 1)) % n;
-                ws = mv_ring[site][t];
-                if (t == i or ws.n != w.n or ws.k != w.k or ws.gs != w.gs or ws.wide != w.wide) continue;
-            }
-            if (w.n % shd.div == 0 and @as(usize, m) * w.n * 2 <= q.mv_scratch_bytes)
-                try d.launch(shd.k, .{ .x = 1, .y = w.n / shd.div }, .{ h, ws.w, ws.s, ws.bg, q.mv_scratch.?, M, N, K, ahi, alo, mp, G });
-        }
-    }
-    // XPU_MV (lane p4-k-mv): the pick of this call site (q.prof.site), for a shape its tile divides
-    const pick: ?q.MvPick = if (!wide and !g128) q.mv_pick[@intFromEnum(q.prof.site)] else null;
+    // XPU_MV shadows (lane p4-k-mv): timing launches of other kernels on this call's shape, the output to a scratch buffer.
+    // With XPU_SITE_SPLIT the gate|up of an attention layer has its own profile site and the shadows and pick of gate_up.
+    const site = @intFromEnum(if (q.prof.site == .gate_up_attn) q.Site.gate_up else q.prof.site);
+    if (!wide and !g128) try mvShadows(d, &q.mv_shadow[site], site, 0, h, ahi, alo, w, m);
+    // XPU_MV (lane p4-k-mv): the pick of this call site, for a shape its tile divides
+    const pick: ?q.MvPick = if (!wide and !g128) q.mv_pick[site] else null;
     if (pick != null and pick.?.wide == w.wide and w.n % pick.?.div == 0) {
         try d.launch(pick.?.k, .{ .x = 1, .y = w.n / pick.?.div }, .{ h, w.w, w.s, w.bg, out, M, N, K, ahi, alo, mp, G });
     } else if (!wide) {
@@ -592,24 +612,28 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
         q.prof.site = if (l.attn) .mixer_out_attn else .mixer_out_gdn;
         try pgemm(d, m, a, a.h, l.mixer_out, a.r, T, q8out, 0, q.int4_sites & 2 != 0, wide);
         q.prof.site = .none;
+        if (!wide) try mvPre(d, a, 0, l.gu, T);
         if (ranks.group) |*g| { // TP: the ranks' partial out-projections summed
             if (!wide and g.devflag) { // TF_TP_DEVFLAG: the add fused into the residual add and norm below
                 try g.allReduceNorm(d, a.r, T, .{ .x = a.x, .w = l.post_norm, .h = a.h, .ahi = a.ahi, .alo = a.alo, .a8 = q8a, .sa = q8s, .ms = q8ms, .eps = EPS, .has_r = 1, .gs = gs, .rot = q.rot_on });
                 fused = true;
             } else if (fuse1 and g.direct) { // XPU_FUSE bit 1: the same add and norm on the device-direct path
                 const peer = try g.allReducePeer(d, a.r, T);
+                try mvPre(d, a, 1, l.gu, T);
                 try d.launch(d.k.tp_norm_peer, .{ .x = T }, .{ a.x, a.r, peer, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs, q8a, q8s, q8ms, q.rot_on });
                 fused = true;
             } else try g.allReduce(d, a.r, T);
         }
         if (gemm_probe) |f| try f(d, a, l.mixer_out, a.h, T, i, 1);
         if (probe) try dumpBuf(d, "r0", a.r, T * D, .f16);
+        if (!fused and !wide) try mvPre(d, a, 1, l.gu, T); // the device-flag exchange holds the norm: it has no place 1
         q.prof.site = .norm_post;
         if (!fused and !wide) try normShadows(d, a, T, l.post_norm, 1, gs, q8ms);
         if (!fused) try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs, q8a, q8s, q8ms, q.rot_on });
         q.prof.site = .none;
         try a8(d, a, a.h, D, T, 4);
         if (gemm_probe) |f| try f(d, a, l.gu, a.h, T, i, 2);
+        gate_site = if (q.site_split and l.attn) .gate_up_attn else .gate_up;
         const act = try mlpIn(d, m, a, l.gu, T, gs, q8on, wide);
         try a8(d, a, act, FF, T, 8);
         q.prof.site = .down;

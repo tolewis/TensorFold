@@ -163,6 +163,13 @@ pub const MvPick = struct { k: ze.H, div: u32, wide: bool };
 pub var mv_pick: [16]?MvPick = @splat(null);
 pub const MvShadow = struct { k: ze.H, div: u32, cold: bool, name: []const u8 };
 pub var mv_shadow: [16][16]?MvShadow = @splat(@splat(null));
+/// XPU_MV pre1:@@ref, pre2:@@ref (lane p4-k-first): shadows on the shape of gate|up at two earlier places of a layer.
+/// pre1: after mixer_out, before its exchange. pre2: after that exchange, before the norm. A shadow of the site
+/// gate_up runs after the norm. Rows `mv_<variant>_pre1`, `mv_<variant>_pre2`. Shadows only.
+pub var mv_pre: [2][16]?MvShadow = @splat(@splat(null));
+/// XPU_SITE_SPLIT=1 (lane p4-k-first, default off): the gate|up launches of the attention layers get the profile
+/// site gate_up_attn, so XPU_PROFILE=2 shows gate|up after a GDN mixer and after an attention mixer apart.
+pub var site_split = false;
 pub var mv_scratch: ?*anyopaque = null;
 pub const mv_scratch_bytes: usize = 32 << 20;
 const MvVariant = struct { name: []const u8, row: []const u8, kernel: [*:0]const u8, local: u32, div: u32, wide: bool, bits: bool = false, probe: bool = false };
@@ -587,11 +594,17 @@ pub const Runner = struct {
             prof.events = try d.g.events(4096);
             inline for (@typeInfo(@TypeOf(d.k)).@"struct".field_names, 0..) |name, i| prof.names[i] = .{ .k = @field(d.k, name), .name = name };
         }
+        if (std.c.getenv("XPU_SITE_SPLIT")) |v| if (v[0] != '0') { // lane p4-k-first: one line a rank, the check of the flag
+            site_split = true;
+            std.debug.print("split: XPU_SITE_SPLIT=1, the gate|up of an attention layer is site gate_up_attn\n", .{});
+        };
         if (std.c.getenv("XPU_MV")) |mv| { // lane p4-k-mv: one line a rank, the check of the flag
             var it = std.mem.tokenizeScalar(u8, std.mem.span(mv), ',');
             while (it.next()) |pair| {
                 const colon = std.mem.indexOfScalar(u8, pair, ':') orelse return error.BadMvPick;
-                const site = std.meta.stringToEnum(Site, pair[0..colon]) orelse return error.BadMvSite;
+                const sname = pair[0..colon];
+                const pre: ?usize = if (std.mem.eql(u8, sname, "pre1")) 0 else if (std.mem.eql(u8, sname, "pre2")) 1 else null;
+                const site: Site = if (pre != null) .gate_up else std.meta.stringToEnum(Site, sname) orelse return error.BadMvSite;
                 const shadow = pair.len > colon + 1 and pair[colon + 1] == '@';
                 const cold = shadow and pair.len > colon + 2 and pair[colon + 2] == '@';
                 const vname = pair[colon + 1 + @intFromBool(shadow) + @intFromBool(cold) ..];
@@ -599,20 +612,22 @@ pub const Runner = struct {
                     if (std.mem.eql(u8, v.name, vname)) break v;
                 } else return error.BadMvVariant;
                 if (v.probe and !shadow) return error.MvProbeIsShadowOnly;
+                if (pre != null and !shadow) return error.MvPreIsShadowOnly;
                 const k = try d.kernel(mm, v.kernel, v.local);
                 var row: []const u8 = v.row;
                 if (shadow) {
                     if (mv_scratch == null) mv_scratch = try d.g.deviceAlloc(mv_scratch_bytes);
                     var nth: u32 = 1; // a variant can run two times on a site (the control first and last): rows mv_ref_<site>, mv_ref2_<site>
-                    const slot = for (&mv_shadow[@intFromEnum(site)]) |*sl| {
+                    const list: *[16]?MvShadow = if (pre) |pl| &mv_pre[pl] else &mv_shadow[@intFromEnum(site)];
+                    const slot = for (list) |*sl| {
                         const other = sl.* orelse break sl;
                         if (std.mem.eql(u8, other.name, v.name)) nth += 1;
                     } else return error.TooManyMvShadows;
                     slot.* = .{ .k = k, .div = v.div, .cold = cold, .name = v.name };
                     row = if (nth == 1)
-                        try std.fmt.allocPrint(alloc, "mv_{s}_{s}", .{ v.name, @tagName(site) })
+                        try std.fmt.allocPrint(alloc, "mv_{s}_{s}", .{ v.name, sname })
                     else
-                        try std.fmt.allocPrint(alloc, "mv_{s}{d}_{s}", .{ v.name, nth, @tagName(site) });
+                        try std.fmt.allocPrint(alloc, "mv_{s}{d}_{s}", .{ v.name, nth, sname });
                 } else mv_pick[@intFromEnum(site)] = .{ .k = k, .div = v.div, .wide = v.wide };
                 if (prof.on) {
                     const free = for (&prof.names) |*slot| {
@@ -621,7 +636,7 @@ pub const Runner = struct {
                     free.* = .{ .k = k, .name = row };
                 }
                 if (shadow)
-                    std.debug.print("mv: XPU_MV {s} {s}shadow {s} ({s}), row {s}\n", .{ @tagName(site), if (cold) "cold " else "", v.name, std.mem.span(v.kernel), row })
+                    std.debug.print("mv: XPU_MV {s} {s}shadow {s} ({s}), row {s}\n", .{ sname, if (cold) "cold " else "", v.name, std.mem.span(v.kernel), row })
                 else
                     std.debug.print("mv: XPU_MV {s} on {s} ({s}){s}\n", .{ @tagName(site), v.name, std.mem.span(v.kernel), if (v.bits) ", the bits change: a timing probe" else "" });
             }

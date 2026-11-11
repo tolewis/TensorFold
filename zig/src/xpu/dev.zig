@@ -337,7 +337,7 @@ pub fn off(p: *anyopaque, bytes: usize) *anyopaque {
 
 /// A call site of the decode pass (XPU_PROFILE=2, lane p4-k-gdn): the matvec shapes, the two uses of gdn_step, the
 /// norms and the device copies each get a row of their own under the kernel rows.
-pub const Site = enum(u8) { none, norm_in, mixer_in_gdn, mixer_in_attn, mixer_out_gdn, mixer_out_attn, norm_post, gate_up, down, head, gdn_verify, gdn_commit, copy_stash, copy_other };
+pub const Site = enum(u8) { none, norm_in, mixer_in_gdn, mixer_in_attn, mixer_out_gdn, mixer_out_attn, norm_post, gate_up, down, head, gdn_verify, gdn_commit, copy_stash, copy_other, gate_up_attn };
 
 /// XPU_PROFILE=1: GPU time per kernel, summed over the run. XPU_PROFILE=2: also one row a call site (`Site`) and an
 /// event on every device copy that goes through `copy`.
