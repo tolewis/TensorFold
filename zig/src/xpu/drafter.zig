@@ -719,6 +719,7 @@ pub const Drafter = struct {
                     try dr.place(w[0], w[2..4]);
                     it.* = .{ .slot = w[0], .pending = w[1] };
                 }
+                win = @intCast(id); // XPU_DRAFT_WIN: rank 0's
                 try dr.run(items[0..S], a, if (b != 0) data[S * 4 ..][0..S] else null);
             },
             .dr_save => {
@@ -776,7 +777,7 @@ pub const Drafter = struct {
                 w[b * 4 ..][0..4].* = .{ it.slot, it.pending, dr.ctx().start, dr.ctx().end };
             }
             if (counts) |cs| @memcpy(w[S * 4 ..][0..S], cs[0..S]);
-            try g.record(.dr_run, count, @intFromBool(counts != null), 0, w[0 .. S * @as(usize, if (counts != null) 5 else 4)]);
+            try g.record(.dr_run, count, @intFromBool(counts != null), win, w[0 .. S * @as(usize, if (counts != null) 5 else 4)]); // id: rank 0's window
         }
         // XPU_DRAFT_TP: the ranks' o and down partials summed after each GEMM, the head's top-16 parts gathered
         const tg: ?*tp.Group = if (dr.split) (if (tp.group) |*x| x else return error.DraftTpNoGroup) else null;
