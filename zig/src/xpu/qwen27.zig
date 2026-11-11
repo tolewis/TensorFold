@@ -407,6 +407,7 @@ pub const Runner = struct {
     tree_on: bool = false, // the last verified block was a tree (commitPath)
     tree_host: [16 * 17]i32 = @splat(0),
     path_host: [16]i32 = @splat(0),
+    ended: bool = false, // lane p4-k-sk1: the engine's close at a stop sets it, so deinit marks the group ended
     slot: u32 = 0, // the selected sequence (select)
     mt_host: [LAYERS * 16 * 8]u64 = @splat(0), // verifyMulti's per-row state addresses, by layer
     pos_host: [16]i32 = @splat(0),
@@ -792,7 +793,9 @@ pub const Runner = struct {
     pub fn deinit(r: *Runner) void {
         if (tp.group) |*g| {
             g.record(.close, 0, 0, 0, &.{}) catch {};
-            g.markClosed(); // a rank that stops closes the group: its peer sees it at once, not after the wait
+            // a rank that stops closes the group: its peer sees it at once, not after the wait. The engine's close
+            // at a stop (`ended`) marks it ended on purpose, so the peer's watchdog exits with 0 (lane p4-k-sk1)
+            if (r.ended) g.markEnded() else g.markClosed();
         }
         r.d.deinit();
         prof.on = false;

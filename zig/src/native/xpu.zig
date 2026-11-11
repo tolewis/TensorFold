@@ -89,6 +89,7 @@ const LaneServed = struct {
         if (h.back.masked_ids) |x| h.gpa.free(x);
         h.gpa.destroy(@as(*Allocator, @ptrCast(@alignCast(h.back.pick_ctx))));
         if (h.back.drafter) |d| d.deinit();
+        h.back.runner.ended = true; // a stop, not an error: the group's flag says so (lane p4-k-sk1, tp.markEnded)
         h.back.runner.deinit(); // the card's memory and context, after the engine has stopped
         h.gpa.destroy(h);
     }

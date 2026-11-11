@@ -320,8 +320,16 @@ pub const Group = struct {
     }
 
     /// A rank closes the shared segment (the group's flag and its peers' view of it) when its session ends or errors.
+    /// An end mark (`closed_end`, `markEnded`) stays: the flag is set only when it is 0.
     pub fn markClosed(g: *Group) void {
-        closed(g).store(1, .release);
+        _ = closed(g).cmpxchgStrong(0, 1, .acq_rel, .acquire);
+    }
+
+    /// Lane p4-k-sk1: rank 0 ends its session on purpose (the engine's close at a stop, after the close record). The
+    /// flag takes `closed_end`, which every reader of the flag also takes as closed. A watchdog that then sees the
+    /// peer's socket hang up ends its process with status 0, not 1 (exWatch).
+    pub fn markEnded(g: *Group) void {
+        _ = closed(g).cmpxchgStrong(0, closed_end, .acq_rel, .acquire);
     }
 
     /// A follower stamps its liveness word while it waits for a record, so rank 0 sees a follower that died while no
@@ -1429,17 +1437,60 @@ const pollrdhup = 0x2000; // POLLRDHUP (Linux): the peer closed its end; this zi
 /// rank 0 did not exit in 181 s). The kernel closes the handshake socket when the peer process ends, for any
 /// cause, so this thread polls it for the hang-up once a second. It asks only for the hang-up (no POLLIN) and reads
 /// no byte, so the reset barrier of resetWords on the same socket is not touched. On the hang-up: the closed word,
-/// the group-lost line, then _exit(1) (no exit handlers: the driver's teardown could wait on the stopped queue).
+/// the group-lost line, then _exit (no exit handlers: the driver's teardown could wait on the stopped queue).
 /// TP 3 and TP 4: one socket a peer pair (each follower to rank 0, 14.4 item 4), one watchdog a socket.
+/// Lane p4-k-sk1, the exit status: 0 when the stop of the pair began here or at the peer, else 1. Rank 0's stop
+/// began when it took SIGTERM or SIGINT (`own_stop`, the server's drain). The peer's stop began when the flag holds
+/// `closed_end` (rank 0's engine close, markEnded). So a clean stop leaves both units inactive, not failed, in
+/// either order of the two ends. A lost peer (a kill, a crash) still ends this rank with 1.
 fn exWatch(sock: linux.fd_t, cw: *std.atomic.Value(u64), rank: u32) void {
     while (true) {
         var pfd = [1]linux.pollfd{.{ .fd = sock, .events = pollrdhup, .revents = 0 }};
         const rc = linux.poll(&pfd, 1, 1000);
-        if (failed(rc) or rc == 0) continue; // EINTR, or a second with no event
+        if (failed(rc) or rc == 0) { // EINTR, or a second with no event
+            if (rank == 0) chainStop();
+            continue;
+        }
         if (pfd[0].revents & (linux.POLL.HUP | pollrdhup | linux.POLL.ERR | linux.POLL.NVAL) == 0) continue;
-        cw.store(1, .release);
-        std.debug.print("rank {d}: the peer ended (its socket hung up, events 0x{x}): the group is lost, the process ends\n", .{ rank, pfd[0].revents });
-        linux.exit_group(1);
+        const own = own_stop.load(.acquire);
+        const peer = cw.load(.acquire) == closed_end;
+        _ = cw.cmpxchgStrong(0, 1, .acq_rel, .acquire); // an end mark stays
+        const why: []const u8 = if (own) ": this rank's stop began, status 0" else if (peer) ": the peer ended its session, status 0" else "";
+        std.debug.print("rank {d}: the peer ended (its socket hung up, events 0x{x}): the group is lost, the process ends{s}\n", .{ rank, pfd[0].revents, why });
+        linux.exit_group(if (own or peer) 0 else 1);
+    }
+}
+
+/// The flag value of a session that ended on purpose (markEnded). 1: closed by an error or a lost peer.
+const closed_end: u64 = 2;
+
+/// Lane p4-k-sk1: rank 0 took SIGTERM or SIGINT. The handler sets it, then calls the server's handler.
+var own_stop = std.atomic.Value(bool).init(false);
+var prev_term: std.posix.Sigaction = undefined;
+var prev_int: std.posix.Sigaction = undefined;
+
+fn onStop(sig: std.posix.SIG) callconv(.c) void {
+    own_stop.store(true, .release);
+    const prev = if (sig == .INT) prev_int else prev_term;
+    const f = prev.handler.handler orelse return;
+    if (f != std.posix.SIG.DFL and f != std.posix.SIG.IGN) f(sig);
+}
+
+/// Rank 0's watchdog, once a second: puts onStop in front of the server's SIGTERM and SIGINT handlers. The server
+/// installs its handlers after the load (serve.zig), so the watchdog checks each second and chains again when a
+/// handler other than onStop is in place. With no handler yet (the default action, or ignore) it changes nothing,
+/// so the default action of a signal during the load stays.
+fn chainStop() void {
+    inline for (.{ .{ std.posix.SIG.TERM, &prev_term }, .{ std.posix.SIG.INT, &prev_int } }) |s| {
+        var cur: std.posix.Sigaction = undefined;
+        std.posix.sigaction(s[0], null, &cur);
+        // the default action is a null handler, ignore is address 1 (std.os.linux SIG.DFL and SIG.IGN)
+        const at: usize = if (cur.handler.handler) |f| @intFromPtr(f) else 0;
+        if (at > 1 and at != @intFromPtr(&onStop)) {
+            s[1].* = cur; // the server's action first: onStop reads it as soon as it is in place
+            const act: std.posix.Sigaction = .{ .handler = .{ .handler = onStop }, .mask = std.posix.sigemptyset(), .flags = 0 };
+            std.posix.sigaction(s[0], &act, null);
+        }
     }
 }
 
