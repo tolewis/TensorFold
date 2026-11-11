@@ -306,7 +306,7 @@ pub var stat: Stat = .{};
 /// exchanges. head: the head, the top-16 parts and the gather. sync: the wait for the card at the pass's end. merge:
 /// the host merge of the parts. tree: the trees or chains of the streams.
 pub const DrStep = enum(u8) { absorb, absorb_sync, pre, layers, head, sync, merge, tree };
-pub const dr_steps = @typeInfo(DrStep).@"enum".fields.len;
+pub const dr_steps = std.meta.fields(DrStep).len;
 
 /// XPU_DR_STEPS: adds the host time since `t.*` to step `k`, and moves `t.*` to now.
 pub fn drMark(k: DrStep, t: *f64) void {
