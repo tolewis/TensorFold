@@ -1422,6 +1422,8 @@ pub const Group = struct {
     }
 };
 
+const pollrdhup = 0x2000; // POLLRDHUP (Linux): the peer closed its end; this zig's linux.POLL has no name for it
+
 /// TF_TP_DEVFLAG=3 and 4 (lane p4-k-ex): the lost-peer watchdog, one thread a rank. EX has no host wait that meets
 /// the peer. With the peer gone, the host can block inside a driver call before it reaches a settle (window p4k22:
 /// rank 0 did not exit in 181 s). The kernel closes the handshake socket when the peer process ends, for any
@@ -1429,7 +1431,6 @@ pub const Group = struct {
 /// no byte, so the reset barrier of resetWords on the same socket is not touched. On the hang-up: the closed word,
 /// the group-lost line, then _exit(1) (no exit handlers: the driver's teardown could wait on the stopped queue).
 /// TP 3 and TP 4: one socket a peer pair (each follower to rank 0, 14.4 item 4), one watchdog a socket.
-const pollrdhup = 0x2000; // POLLRDHUP (Linux): the peer closed its end; this zig's linux.POLL has no name for it
 fn exWatch(sock: linux.fd_t, cw: *std.atomic.Value(u64), rank: u32) void {
     while (true) {
         var pfd = [1]linux.pollfd{.{ .fd = sock, .events = pollrdhup, .revents = 0 }};
