@@ -148,6 +148,90 @@ KERNEL(16) void gdn_step2(global const ushort *Q, global const ushort *K, global
       intel_sub_group_block_write8((global uint *)GDN_ROW8(SO, r), as_uint8(sv));
     }
 }
+
+// gdn_step2_uc (lane p4-k-first, XPU_GDN bit 8): gdn_step2 with the tree states SL past both caches. Window p4k5
+// found that dirty lines in the last-level cache slow the next long read stream by about 2.2 us a MB, and SL is the
+// largest write of a GDN layer (1.5 MB a SAVE row at 24 heads). Only this launch reads SL again. The stores and the
+// loads of SL use LSC L1UC_L3UC, so SL lines never enter the cache. The IGC builtins below are internal (IGC
+// BiF, not an OpenCL extension). IGC gives load.ugm.d32.a64.uc.uc and store.ugm.d32.a64.uc.uc for value 1. Each
+// lane moves element i at i * 16 + lane, the layout of intel_sub_group_block_read8 and _write8. The rest of the
+// kernel is gdn_step2, the same arithmetic in the same order, so the same bits.
+enum LSC_LDCC { LSC_LDCC_DEFAULT = 0, LSC_LDCC_L1UC_L3UC = 1 };
+enum LSC_STCC { LSC_STCC_DEFAULT = 0, LSC_STCC_L1UC_L3UC = 1 };
+uint __builtin_IB_lsc_load_global_uint(global uint *base, int immElemOff, enum LSC_LDCC cacheOpt);
+void __builtin_IB_lsc_store_global_uint(global uint *base, int immElemOff, uint val, enum LSC_STCC cacheOpt);
+KERNEL(16) void gdn_step2_uc(global const ushort *Q, global const ushort *K, global const ushort *V,
+                             global const float *G, global const float *BETA, global const float *S, global float *SO,
+                             global ushort *Y, int T, global const int *ROWS, global const int *TREE, global float *SL,
+                             global const ulong *MT) {
+  const int vb = get_group_id(0), h = get_group_id(1), lane = get_sub_group_local_id(), kh = h / Q27_GVK;
+  int t0 = 0;
+  if (MT) {
+    t0 = get_group_id(2);
+    if ((int)MT[t0 * 8 + 6] != t0) return;            // not a window's first row
+    S = (global const float *)MT[t0 * 8 + 4];
+    SO = (global float *)MT[t0 * 8 + 5];
+    T = t0 + (int)MT[t0 * 8 + 7];
+  }
+  float s[8][8];
+  for (int r = 0; r < 8; r++) {
+    const float8 sv = as_float8(intel_sub_group_block_read8((global const uint *)GDN_ROW8(S, r)));
+    for (int i = 0; i < 8; i++) s[r][i] = sv[i];
+  }
+  for (int t = t0; t < T; t++) {
+    const int row = ROWS ? ROWS[t] : t;
+    const int tw = TREE ? TREE[t * 17] : 0, depth = tw & 255;
+    if (TREE && depth > 0 && (tw & 512)) {              // the parent's state, from its slot, past the caches
+      const long par = ANC(t, depth - 1);
+      for (int r = 0; r < 8; r++) {
+        global uint *p = (global uint *)GDN_ROW8(SL + par * Q27_GV * 16384, r) + lane;
+        for (int i = 0; i < 8; i++) s[r][i] = as_float(__builtin_IB_lsc_load_global_uint(p + i * 16, 0, LSC_LDCC_L1UC_L3UC));
+      }
+    } else if (TREE && depth == 0)
+      for (int r = 0; r < 8; r++) {
+        const float8 sv = as_float8(intel_sub_group_block_read8((global const uint *)GDN_ROW8(S, r)));
+        for (int i = 0; i < 8; i++) s[r][i] = sv[i];
+      }
+    const ushort8 qv = intel_sub_group_block_read_us8(Q + ((long)row * Q27_GK + kh) * 128);
+    const ushort8 kv = intel_sub_group_block_read_us8(K + ((long)row * Q27_GK + kh) * 128);
+    const ushort8 vv = vload8(0, V + ((long)row * Q27_GV + h) * 128 + vb * 8);
+    float q[8], k[8];
+    for (int i = 0; i < 8; i++) {
+      q[i] = bf2f(qv[i]);
+      k[i] = bf2f(kv[i]);
+    }
+    const float g = G[(long)row * Q27_GV + h], beta = BETA[(long)row * Q27_GV + h];
+    ushort8 yo;
+    for (int r = 0; r < 8; r++) {
+      float mem = 0.0f;
+      for (int i = 0; i < 8; i++) {
+        s[r][i] *= g;
+        mem += s[r][i] * k[i];
+      }
+      mem = sub_group_reduce_add(mem);
+      const float u = (bf2f(vv[r]) - mem) * beta;
+      float y = 0.0f;
+      for (int i = 0; i < 8; i++) {
+        s[r][i] += k[i] * u;
+        y += s[r][i] * q[i];
+      }
+      y = sub_group_reduce_add(y);
+      yo[r] = f2bf(y);
+    }
+    if (lane == 0) vstore8(yo, 0, Y + ((long)t * Q27_GV + h) * 128 + vb * 8);
+    if (tw & 256)                                       // SAVE: a later row loads this state, past the caches
+      for (int r = 0; r < 8; r++) {
+        global uint *p = (global uint *)GDN_ROW8(SL + (long)t * Q27_GV * 16384, r) + lane;
+        for (int i = 0; i < 8; i++) __builtin_IB_lsc_store_global_uint(p + i * 16, 0, as_uint(s[r][i]), LSC_STCC_L1UC_L3UC);
+      }
+  }
+  if (!TREE)
+    for (int r = 0; r < 8; r++) {
+      float8 sv;
+      for (int i = 0; i < 8; i++) sv[i] = s[r][i];
+      intel_sub_group_block_write8((global uint *)GDN_ROW8(SO, r), as_uint8(sv));
+    }
+}
 #undef GDN_ROW8
 
 // Decode attention by key slices: one subgroup per (slice, K/V head and query part, row) handles Q27_QPG query heads

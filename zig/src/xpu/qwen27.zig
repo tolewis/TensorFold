@@ -145,7 +145,8 @@ pub var a8_group: u32 = 0;
 pub var kv8: i32 = 0;
 /// XPU_GDN (lane p4-k-gdn), bits. 1: a stashed GDN layer's GEMM and gdn_pre write the stash, so no copy follows.
 /// 2: gdn_step2, gdn_step with block loads (the same bits). 4: at the load, gdn_step2 against gdn_step on the card
-/// (gdn_check.zig), and the open fails when a value differs. Default 0.
+/// (gdn_check.zig), and the open fails when a value differs. 8 (lane p4-k-first): gdn_step2_uc in place of gdn_step2,
+/// the tree states SL past both caches (the same bits). With 4, the check runs gdn_step2_uc. Default 0.
 pub var gdn_bits: u32 = 0;
 /// XPU_MV (lane p4-k-mv): the decode matvec kernel of a call site, `site:variant` pairs separated by commas
 /// (XPU_MV=mixer_in_gdn:d16,mixer_in_attn:d16). A site is a `Site` name. A variant is a kernel of gemm.cl:
@@ -580,10 +581,10 @@ pub const Runner = struct {
         // the shared rounds' kernels reach each slot's states through the per-row table (acts.mt)
         if (gdn_bits != 0) { // lane p4-k-gdn: one line a rank, the check of the flag
             const step1 = d.k.gdn_step;
-            const step2 = if (gdn_bits & 6 != 0) try d.kernel(md, "gdn_step2", 16) else step1;
-            std.debug.print("gdn: XPU_GDN={d} (stash in place {s}, gdn_step2 {s})\n", .{ gdn_bits, if (gdn_bits & 1 != 0) "on" else "off", if (gdn_bits & 2 != 0) "on" else "off" });
+            const step2 = if (gdn_bits & 14 != 0) try d.kernel(md, if (gdn_bits & 8 != 0) "gdn_step2_uc" else "gdn_step2", 16) else step1;
+            std.debug.print("gdn: XPU_GDN={d} (stash in place {s}, gdn_step2 {s}, SL uncached {s})\n", .{ gdn_bits, if (gdn_bits & 1 != 0) "on" else "off", if (gdn_bits & 10 != 0) "on" else "off", if (gdn_bits & 8 != 0) "on" else "off" });
             if (gdn_bits & 4 != 0) try @import("gdn_check.zig").run(d, step1, step2); // the two kernels on this card: the same bits
-            if (gdn_bits & 2 != 0) d.k.gdn_step = step2;
+            if (gdn_bits & 10 != 0) d.k.gdn_step = step2;
         }
         for ([_]ze.H{ d.k.attn_prep, d.k.attn_decode, d.k.gdn_pre, d.k.gdn_step }) |k| try d.g.indirect(k);
         if (k1mod.on or k1mod.multi_tree) { // XPU_K1: the K1 decode kernel (k1.cl), the scalar page-table kernel and the merge
