@@ -340,7 +340,7 @@ pub const Drafter = struct {
         if (std.c.getenv("XPU_DRAFT_RAGGED")) |v| ragged = v[0] == '1';
         if (ragged) std.debug.print("drafter: ragged blocks (XPU_DRAFT_RAGGED)\n", .{});
         dr.logits = try d.alloc_(MAXB * @as(usize, dr.head.n) * 2);
-        if (q.smallk & 22 != 0) { // XPU_SMALLK (lane p4-kernel): the drafter's kernels; the flag line is qwen27.zig's
+        if (q.smallk & 118 != 0) { // XPU_SMALLK (lane p4-kernel): the drafter's kernels; the flag line is qwen27.zig's
             const check = @import("smallk_check.zig");
             if (q.smallk & 2 != 0) {
                 if (HEAD_N % 8 != 0 or dr.head.n % 8 != 0) return error.UnexpectedShape; // 16-byte reads of 8 values
@@ -348,9 +348,9 @@ pub const Drafter = struct {
                 if (q.smallk & 8 != 0) try check.topk(d, dr.k.topk_part, part16, HEAD_N, dr.head.n);
                 dr.k.topk_part = part16;
             }
-            if (q.smallk & 20 != 0) {
-                const name: [*:0]const u8 = if (q.smallk & 16 != 0) "dattn_la2" else "dattn_la4";
-                const local: u32 = if (q.smallk & 16 != 0) 32 else 16;
+            if (q.smallk & 116 != 0) {
+                const name: [*:0]const u8 = if (q.smallk & 64 != 0) "dattn_lb1" else if (q.smallk & 32 != 0) "dattn_lb2" else if (q.smallk & 16 != 0) "dattn_la2" else "dattn_la4";
+                const local: u32 = if (q.smallk & 64 != 0) 64 else if (q.smallk & 48 != 0) 32 else 16;
                 if (q.smallk & 8 != 0) try check.dattn(d, m, name, local, CAP, NH, NKV, HD);
                 dr.k.dattn = try kern(d, m, name, local);
             }

@@ -237,6 +237,113 @@ DATTN_LA(dattn_la4, 4, 4)
 DATTN_LA(dattn_la2, 2, 8)
 #undef DATTN_LA
 
+// XPU_SMALLK bit 32 or 64 (lane p4-kernel): dattn_lb2 and dattn_lb1, with DLB_NA (2 or 1) of the 4 query heads in each
+// subgroup. Window p4k13: dattn_la2 kept its read buffers in scratch memory, and each position of dattn waited on an
+// integer division (j % CAP) before its reads. Here the reads use a ring index that steps by one, and two named
+// buffers of 4 positions (A and B) take turns: the rows of the next 4 positions are in flight during a tile. A whole
+// tile has no branch, so the dot products of its positions can overlap. A read past the block end reads a row of
+// the ring that no position uses. For each query head the operations and their order are those of dattn.
+#define DLB_DECL(X) ushort8 X##k0, X##k1, X##k2, X##k3, X##v0, X##v1, X##v2, X##v3
+#define DLB_LD(K, V)                                                                                                   \
+  {                                                                                                                    \
+    K = intel_sub_group_block_read_us8(kh + (long)ljr * HD);                                                           \
+    V = intel_sub_group_block_read_us8(vh + (long)ljr * HD);                                                           \
+    ljr = ljr + 1 == CAP ? 0 : ljr + 1;                                                                                \
+  }
+#define DLB_LD4(X) DLB_LD(X##k0, X##v0) DLB_LD(X##k1, X##v1) DLB_LD(X##k2, X##v2) DLB_LD(X##k3, X##v3)
+#define DLB_POS(K, V)                                                                                                  \
+  {                                                                                                                    \
+    float kv[8];                                                                                                       \
+    for (int i = 0; i < 8; i++) kv[i] = bf2f(K[i]);                                                                    \
+    float sc[DLB_NA];                                                                                                  \
+    for (int a = 0; a < DLB_NA; a++) {                                                                                 \
+      float d = 0.0f;                                                                                                  \
+      for (int i = 0; i < 8; i++) d += q[a][i] * kv[i];                                                                \
+      sc[a] = sub_group_reduce_add(d) * scale;                                                                         \
+    }                                                                                                                  \
+    for (int i = 0; i < 8; i++) kv[i] = bf2f(V[i]);                                                                    \
+    for (int a = 0; a < DLB_NA; a++) {                                                                                 \
+      const float mn = fmax(m[a], sc[a]);                                                                              \
+      const float al = exp(m[a] - mn), pe = exp(sc[a] - mn);                                                           \
+      l[a] = l[a] * al + pe;                                                                                           \
+      for (int i = 0; i < 8; i++) o[a][i] = o[a][i] * al + pe * kv[i];                                                 \
+      m[a] = mn;                                                                                                       \
+    }                                                                                                                  \
+  }
+#define DLB_TILE(X, N) /* the first N positions of buffer X: a constant 4 gives a tile with no branch */              \
+  {                                                                                                                    \
+    DLB_POS(X##k0, X##v0)                                                                                              \
+    if ((N) > 1) DLB_POS(X##k1, X##v1)                                                                                 \
+    if ((N) > 2) DLB_POS(X##k2, X##v2)                                                                                 \
+    if ((N) > 3) DLB_POS(X##k3, X##v3)                                                                                 \
+  }
+#define DLB_KERNEL(NAME)                                                                                               \
+  KERNEL(64 / DLB_NA) void NAME(global const ushort *Q, global const ushort *KC, global const ushort *VC, int CAP,      \
+                                int c0, int pos0, int L, int WIN, float scale, global half *O, global const int4 *ROWS, \
+                                global const ulong *PTRS) {                                                            \
+    const int r = get_group_id(0), h = get_group_id(1), lane = get_sub_group_local_id();                             \
+    const int a0 = get_sub_group_id() * DLB_NA;                                                                        \
+    int p = pos0 + r, bs = pos0;                                                                                       \
+    if (ROWS) {                                                                                                        \
+      const int4 ri = ROWS[r];                                                                                         \
+      p = ri.x;                                                                                                        \
+      c0 = ri.y;                                                                                                       \
+      bs = ri.z;                                                                                                       \
+      const int lb = ri.w >> 8;                                                                                        \
+      if (lb > 0) L = lb;                                                                                              \
+      KC = (global const ushort *)PTRS[(ri.w & 255) * 2];                                                              \
+      VC = (global const ushort *)PTRS[(ri.w & 255) * 2 + 1];                                                          \
+    }                                                                                                                  \
+    float q[DLB_NA][8], o[DLB_NA][8], m[DLB_NA], l[DLB_NA];                                                            \
+    for (int a = 0; a < DLB_NA; a++) {                                                                                 \
+      for (int i = 0; i < 8; i++) {                                                                                    \
+        q[a][i] = bf2f(Q[((long)r * NH + h * 4 + a0 + a) * HD + i * 16 + lane]);                                       \
+        o[a][i] = 0.0f;                                                                                                \
+      }                                                                                                                \
+      m[a] = -INFINITY;                                                                                                \
+      l[a] = 0.0f;                                                                                                     \
+    }                                                                                                                  \
+    const int first = max(c0, p - WIN), end = bs + L;                                                                  \
+    global const ushort *kh = KC + (long)h * CAP * HD, *vh = VC + (long)h * CAP * HD;                                  \
+    DLB_DECL(A);                                                                                                       \
+    DLB_DECL(B);                                                                                                       \
+    if (first < end) {                                                                                                 \
+      int ljr = first % CAP; /* the ring row of the next read */                                                       \
+      DLB_LD4(A)                                                                                                       \
+      for (int j0 = first;;) {                                                                                         \
+        DLB_LD4(B)                                                                                                     \
+        if (end - j0 >= 4) DLB_TILE(A, 4) else {                                                                       \
+          DLB_TILE(A, end - j0)                                                                                        \
+          break;                                                                                                       \
+        }                                                                                                              \
+        j0 += 4;                                                                                                       \
+        if (j0 >= end) break;                                                                                          \
+        DLB_LD4(A)                                                                                                     \
+        if (end - j0 >= 4) DLB_TILE(B, 4) else {                                                                       \
+          DLB_TILE(B, end - j0)                                                                                        \
+          break;                                                                                                       \
+        }                                                                                                              \
+        j0 += 4;                                                                                                       \
+        if (j0 >= end) break;                                                                                          \
+      }                                                                                                                \
+    }                                                                                                                  \
+    for (int a = 0; a < DLB_NA; a++)                                                                                   \
+      for (int i = 0; i < 8; i++)                                                                                      \
+        O[(long)r * NH * HD + (h * 4 + a0 + a) * HD + i * 16 + lane] = convert_half_rte(rbf(o[a][i] / l[a]));          \
+  }
+#define DLB_NA 2
+DLB_KERNEL(dattn_lb2)
+#undef DLB_NA
+#define DLB_NA 1
+DLB_KERNEL(dattn_lb1)
+#undef DLB_NA
+#undef DLB_KERNEL
+#undef DLB_TILE
+#undef DLB_POS
+#undef DLB_LD4
+#undef DLB_LD
+#undef DLB_DECL
+
 // Row sums for a fp16 matrix already written (o_proj's input after dattn): grid L, groups of 256.
 KERNEL(256) void rowsums_rows(global const half *H, int K, global half *AHI, global half *ALO) {
   local half hl[25600];

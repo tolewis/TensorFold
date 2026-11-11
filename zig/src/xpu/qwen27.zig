@@ -152,7 +152,8 @@ pub var gdn_bits: u32 = 0;
 /// kernel it replaces. 1: argmax_part16 in place of argmax_part (the token of each verify row). 2: the drafter's
 /// topk_part16 in place of topk_part. 4: the drafter's dattn_la4 in place of dattn (the K and V rows of the next 4
 /// positions in flight). 16: dattn_la2 in place of dattn (8 positions in flight, two query heads a subgroup), before
-/// bit 4. 8: at the load, each new kernel against the kernel it replaces on this card (smallk_check.zig), and the
+/// bit 4. 32: dattn_lb2 (two buffers of 8 positions in turn, a ring index that steps, two query heads a subgroup),
+/// before bits 16 and 4. 64: dattn_lb1 (the same, one query head a subgroup), before bit 32. 8: at the load, each new kernel against the kernel it replaces on this card (smallk_check.zig), and the
 /// open fails when a token, a list entry or an output bit differs. Default 0.
 pub var smallk: u32 = 0;
 /// XPU_MV (lane p4-k-mv): the decode matvec kernel of a call site, `site:variant` pairs separated by commas
@@ -602,7 +603,7 @@ pub const Runner = struct {
             if (gdn_bits & 10 != 0) d.k.gdn_step = step2;
         }
         if (smallk != 0) { // lane p4-kernel: one line a rank, the check of the flag (the drafter's kernels: drafter.zig)
-            const la: []const u8 = if (smallk & 16 != 0) "dattn_la2" else if (smallk & 4 != 0) "dattn_la4" else "off";
+            const la: []const u8 = if (smallk & 64 != 0) "dattn_lb1" else if (smallk & 32 != 0) "dattn_lb2" else if (smallk & 16 != 0) "dattn_la2" else if (smallk & 4 != 0) "dattn_la4" else "off";
             std.debug.print("smallk: XPU_SMALLK={d} (argmax_part16 {s}, topk_part16 {s}, dattn {s}, check {s})\n", .{ smallk, if (smallk & 1 != 0) "on" else "off", if (smallk & 2 != 0) "on" else "off", la, if (smallk & 8 != 0) "on" else "off" });
             if (smallk & 1 != 0) {
                 comptime std.debug.assert(VOCAB % 8 == 0); // argmax_part16 reads 8 values a lane, 16-byte aligned
