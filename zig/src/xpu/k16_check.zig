@@ -140,7 +140,7 @@ fn case(d: *Dev, kk: k1.Kernels, rnd: std.Random, p0: u32, rows: u32) !Result {
             n2 += y * y;
             rel += if (y != 0) @abs(x - y) / @abs(y) else 0;
         }
-        const cos = if (n1 > 0 and n2 > 0) dot / @sqrt(n1 * n2) else if (n1 == n2) 1.0 else 0.0;
+        const cos: f64 = if (n1 > 0 and n2 > 0) dot / @sqrt(n1 * n2) else if (n1 == n2) @as(f64, 1.0) else @as(f64, 0.0);
         res.cos = @min(res.cos, cos);
         res.rel = @max(res.rel, rel / 256.0);
     }
