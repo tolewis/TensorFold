@@ -148,6 +148,13 @@ pub var kv8: i32 = 0;
 /// (gdn_check.zig), and the open fails when a value differs. 8 (lane p4-k-first): gdn_step2_uc in place of gdn_step2,
 /// the tree states SL past both caches (the same bits). With 4, the check runs gdn_step2_uc. Default 0.
 pub var gdn_bits: u32 = 0;
+/// XPU_SMALLK (lane p4-kernel), bits: small kernels of a round that wait on memory, each with the results of the
+/// kernel it replaces. 1: argmax_part16 in place of argmax_part (the token of each verify row). 2: the drafter's
+/// topk_part16 in place of topk_part. 4: the drafter's dattn_la4 in place of dattn (the K and V rows of the next 4
+/// positions in flight). 16: dattn_la2 in place of dattn (8 positions in flight, two query heads a subgroup), before
+/// bit 4. 8: at the load, each new kernel against the kernel it replaces on this card (smallk_check.zig), and the
+/// open fails when a token, a list entry or an output bit differs. Default 0.
+pub var smallk: u32 = 0;
 /// XPU_MV (lane p4-k-mv): the decode matvec kernel of a call site, `site:variant` pairs separated by commas
 /// (XPU_MV=mixer_in_gdn:d16,mixer_in_attn:d16). A site is a `Site` name. A variant is a kernel of gemm.cl:
 /// wide sites (the family with no K slices): d16, d64, w8, p0, p4, the same bits as the default. `slice` puts a wide
@@ -418,6 +425,7 @@ pub const Runner = struct {
         if (std.c.getenv("XPU_PREFILL_INT4_SITES")) |v| int4_sites = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_KV8")) |v| kv8 = try std.fmt.parseInt(i32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_GDN")) |v| gdn_bits = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+        if (std.c.getenv("XPU_SMALLK")) |v| smallk = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_A8_ROT") != null) a8_rot = 1;
         if (std.c.getenv("XPU_A8_SITES4")) |v| a8_sites4 = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_A8_BITS")) |v| a8_levels = if (std.mem.eql(u8, std.mem.span(v), "4")) 7 else 127;
@@ -592,6 +600,16 @@ pub const Runner = struct {
             std.debug.print("gdn: XPU_GDN={d} (stash in place {s}, gdn_step2 {s}, SL uncached {s})\n", .{ gdn_bits, if (gdn_bits & 1 != 0) "on" else "off", if (gdn_bits & 10 != 0) "on" else "off", if (gdn_bits & 8 != 0) "on" else "off" });
             if (gdn_bits & 4 != 0) try @import("gdn_check.zig").run(d, step1, step2); // the two kernels on this card: the same bits
             if (gdn_bits & 10 != 0) d.k.gdn_step = step2;
+        }
+        if (smallk != 0) { // lane p4-kernel: one line a rank, the check of the flag (the drafter's kernels: drafter.zig)
+            const la: []const u8 = if (smallk & 16 != 0) "dattn_la2" else if (smallk & 4 != 0) "dattn_la4" else "off";
+            std.debug.print("smallk: XPU_SMALLK={d} (argmax_part16 {s}, topk_part16 {s}, dattn {s}, check {s})\n", .{ smallk, if (smallk & 1 != 0) "on" else "off", if (smallk & 2 != 0) "on" else "off", la, if (smallk & 8 != 0) "on" else "off" });
+            if (smallk & 1 != 0) {
+                comptime std.debug.assert(VOCAB % 8 == 0); // argmax_part16 reads 8 values a lane, 16-byte aligned
+                const part16 = try d.kernel(mg, "argmax_part16", 16);
+                if (smallk & 8 != 0) try @import("smallk_check.zig").argmax(d, d.k.argmax_part, part16, d.k.argmax);
+                d.k.argmax_part = part16;
+            }
         }
         for ([_]ze.H{ d.k.attn_prep, d.k.attn_decode, d.k.gdn_pre, d.k.gdn_step }) |k| try d.g.indirect(k);
         if (k1mod.on or k1mod.multi_tree) { // XPU_K1: the K1 decode kernel (k1.cl), the scalar page-table kernel and the merge

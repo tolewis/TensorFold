@@ -160,6 +160,83 @@ KERNEL(16) void dattn(global const ushort *Q, global const ushort *KC, global co
     for (int i = 0; i < 8; i++) O[(long)r * NH * HD + (h * 4 + a) * HD + i * 16 + lane] = convert_half_rte(rbf(o[a][i] / l[a]));
 }
 
+// XPU_SMALLK bit 4 or 16 (lane p4-kernel): dattn with the K and V rows of the next DT positions read before the math
+// of this tile, so a position does not wait for its own reads. The reads are subgroup block reads of the same values.
+// Each subgroup takes NA of the 4 query heads of its K/V head. The 4 / NA subgroups of a group share the reads in
+// the L1 of their core. For each query head the operations and their order are those of dattn: the same bits.
+#define DATTN_LA(NAME, NA, DT)                                                                                         \
+  KERNEL(64 / NA) void NAME(global const ushort *Q, global const ushort *KC, global const ushort *VC, int CAP, int c0,  \
+                            int pos0, int L, int WIN, float scale, global half *O, global const int4 *ROWS,            \
+                            global const ulong *PTRS) {                                                                \
+    const int r = get_group_id(0), h = get_group_id(1), lane = get_sub_group_local_id(), a0 = get_sub_group_id() * NA; \
+    int p = pos0 + r, bs = pos0;                                                                                       \
+    if (ROWS) {                                                                                                        \
+      const int4 ri = ROWS[r];                                                                                         \
+      p = ri.x;                                                                                                        \
+      c0 = ri.y;                                                                                                       \
+      bs = ri.z;                                                                                                       \
+      const int lb = ri.w >> 8;                                                                                        \
+      if (lb > 0) L = lb;                                                                                              \
+      KC = (global const ushort *)PTRS[(ri.w & 255) * 2];                                                              \
+      VC = (global const ushort *)PTRS[(ri.w & 255) * 2 + 1];                                                          \
+    }                                                                                                                  \
+    float q[NA][8], o[NA][8], m[NA], l[NA];                                                                            \
+    for (int a = 0; a < NA; a++) {                                                                                     \
+      for (int i = 0; i < 8; i++) {                                                                                    \
+        q[a][i] = bf2f(Q[((long)r * NH + h * 4 + a0 + a) * HD + i * 16 + lane]);                                       \
+        o[a][i] = 0.0f;                                                                                                \
+      }                                                                                                                \
+      m[a] = -INFINITY;                                                                                                \
+      l[a] = 0.0f;                                                                                                     \
+    }                                                                                                                  \
+    const int first = max(c0, p - WIN), end = bs + L;                                                                  \
+    global const ushort *kh = KC + (long)h * CAP * HD, *vh = VC + (long)h * CAP * HD;                                  \
+    ushort8 ck[DT], cv[DT], nk[DT], nv[DT];                                                                            \
+    if (first < end)                                                                                                   \
+      for (int t = 0; t < DT; t++) {                                                                                   \
+        const long jr = min(first + t, end - 1) % CAP; /* the cache is a ring of CAP positions */                      \
+        nk[t] = intel_sub_group_block_read_us8(kh + jr * HD);                                                          \
+        nv[t] = intel_sub_group_block_read_us8(vh + jr * HD);                                                          \
+      }                                                                                                                \
+    for (int j0 = first; j0 < end; j0 += DT) {                                                                         \
+      for (int t = 0; t < DT; t++) {                                                                                   \
+        ck[t] = nk[t];                                                                                                 \
+        cv[t] = nv[t];                                                                                                 \
+      }                                                                                                                \
+      if (j0 + DT < end)                                                                                               \
+        for (int t = 0; t < DT; t++) {                                                                                 \
+          const long jr = min(j0 + DT + t, end - 1) % CAP;                                                             \
+          nk[t] = intel_sub_group_block_read_us8(kh + jr * HD);                                                        \
+          nv[t] = intel_sub_group_block_read_us8(vh + jr * HD);                                                        \
+        }                                                                                                              \
+      for (int t = 0; t < DT; t++) {                                                                                   \
+        if (j0 + t >= end) break;                                                                                      \
+        float kv[8];                                                                                                   \
+        for (int i = 0; i < 8; i++) kv[i] = bf2f(ck[t][i]);                                                            \
+        float sc[NA];                                                                                                  \
+        for (int a = 0; a < NA; a++) {                                                                                 \
+          float d = 0.0f;                                                                                              \
+          for (int i = 0; i < 8; i++) d += q[a][i] * kv[i];                                                            \
+          sc[a] = sub_group_reduce_add(d) * scale;                                                                     \
+        }                                                                                                              \
+        for (int i = 0; i < 8; i++) kv[i] = bf2f(cv[t][i]);                                                            \
+        for (int a = 0; a < NA; a++) {                                                                                 \
+          const float mn = fmax(m[a], sc[a]);                                                                          \
+          const float al = exp(m[a] - mn), pe = exp(sc[a] - mn);                                                       \
+          l[a] = l[a] * al + pe;                                                                                       \
+          for (int i = 0; i < 8; i++) o[a][i] = o[a][i] * al + pe * kv[i];                                             \
+          m[a] = mn;                                                                                                   \
+        }                                                                                                              \
+      }                                                                                                                \
+    }                                                                                                                  \
+    for (int a = 0; a < NA; a++)                                                                                       \
+      for (int i = 0; i < 8; i++)                                                                                      \
+        O[(long)r * NH * HD + (h * 4 + a0 + a) * HD + i * 16 + lane] = convert_half_rte(rbf(o[a][i] / l[a]));          \
+  }
+DATTN_LA(dattn_la4, 4, 4)
+DATTN_LA(dattn_la2, 2, 8)
+#undef DATTN_LA
+
 // Row sums for a fp16 matrix already written (o_proj's input after dattn): grid L, groups of 256.
 KERNEL(256) void rowsums_rows(global const half *H, int K, global half *AHI, global half *ALO) {
   local half hl[25600];
@@ -209,6 +286,51 @@ KERNEL(16) void topk_part(global const half *L, int N, int NS, global float *PV,
       PV[((long)row * 256 + gid) * 16 + i] = bv[i];
       PI[((long)row * 256 + gid) * 16 + i] = bi[i];
     }
+}
+
+// XPU_SMALLK bit 2 (lane p4-kernel): topk_part with the whole subgroup. Lane l holds entry l of the part's list. The
+// lanes read the part with 16-byte reads, all in flight together. Then each value goes through the insertion of
+// topk_part in rising index order, with the same compares, so a part gives the same list as topk_part would give
+// for it. A part is P values, P = ceil(N / 256) rounded up to 8: N % 8 == 0 and NS % 8 == 0 (the host checks). The
+// host merge takes the same top 16 from these parts as from the parts of topk_part.
+KERNEL(16) void topk_part16(global const half *L, int N, int NS, global float *PV, global int *PI) {
+  const int gid = get_group_id(0), row = get_group_id(1), lane = get_sub_group_local_id();
+  const int per = ((N + 255) / 256 + 7) & ~7, a = min(N, gid * per), b = min(N, a + per);
+  global const half *x = L + (long)row * NS;
+  float bv = -INFINITY, t15 = -INFINITY; // this lane's entry, and entry 15 (the same in every lane)
+  int bi = 0x7fffffff;
+  for (int c0 = a; c0 < b; c0 += 4 * 128) {
+    half8 h[4];
+    for (int c = 0; c < 4; c++) {
+      const int i = c0 + c * 128 + lane * 8;
+      h[c] = i < b ? as_half8(*(global const uint4 *)(x + i)) : as_half8((uint4)(0xFC00FC00u)); // -inf
+    }
+    for (int c = 0; c < 4; c++)
+      for (int s = 0; s < 16; s++) { // the 8 values of lane s: c0 + c * 128 + s * 8 + e
+        // No value of lane s enters when each is <= entry 15: the bound only rises, and with a NaN bound none is <=.
+        int any = 0;
+        for (int e = 0; e < 8; e++) any |= !((float)h[c][e] <= t15);
+        if (!sub_group_broadcast(any, s)) continue;
+        for (int e = 0; e < 8; e++) {
+          const float v = sub_group_broadcast((float)h[c][e], s);
+          if (v <= t15) continue;
+          // topk_part: k = 15, while (k > 0 && v > bv[k - 1]) move entry k - 1 to k, k--. Then entry k = v.
+          const int k = 1 + sub_group_reduce_max(lane < 15 && !(v > bv) ? lane : -1);
+          const float up = sub_group_shuffle(bv, max(lane - 1, 0));
+          const int upi = sub_group_shuffle(bi, max(lane - 1, 0));
+          if (lane > k) {
+            bv = up;
+            bi = upi;
+          } else if (lane == k) {
+            bv = v;
+            bi = c0 + c * 128 + s * 8 + e;
+          }
+          t15 = sub_group_broadcast(bv, 15);
+        }
+      }
+  }
+  PV[((long)row * 256 + gid) * 16 + lane] = bv;
+  PI[((long)row * 256 + gid) * 16 + lane] = bi;
 }
 
 // Affine 4-bit quantization of a bf16 weight in groups of 64 along K (MLX layout), one work-item per (row, group).

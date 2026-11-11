@@ -171,6 +171,39 @@ KERNEL(256) void argmax_part(global const half *L, int V, global float *PV, glob
     PI[row * 256 + gid] = idx;
   }
 }
+// XPU_SMALLK bit 1 (lane p4-kernel): argmax_part with one subgroup a part. Each lane reads 8 values with one 16-byte
+// read, and the reads of 8 such blocks are in flight together. A part is P values, P = ceil(V / 256) rounded up to
+// 8, so every read is 16-byte aligned when V % 8 == 0 (the host checks). A part past V gives (-inf, INT_MAX). Each
+// lane keeps its first largest value (strict >, rising index), the subgroup keeps the largest and its lowest index:
+// the same token as argmax_part, the same ties.
+KERNEL(16) void argmax_part16(global const half *L, int V, global float *PV, global int *PI) {
+  const int lane = get_sub_group_local_id(), gid = get_group_id(0), row = get_group_id(1);
+  const int per = ((V + 255) / 256 + 7) & ~7, a = min(V, gid * per), b = min(V, a + per);
+  global const half *x = L + (long)row * V;
+  float best = -INFINITY;
+  int idx = 0x7fffffff;
+  for (int c0 = a; c0 < b; c0 += 8 * 128) {
+    half8 h[8];
+    for (int c = 0; c < 8; c++) {
+      const int i = c0 + c * 128 + lane * 8;
+      h[c] = i < b ? as_half8(*(global const uint4 *)(x + i)) : as_half8((uint4)(0xFC00FC00u)); // -inf
+    }
+    for (int c = 0; c < 8; c++)
+      for (int e = 0; e < 8; e++) {
+        const float v = (float)h[c][e];
+        if (v > best) {
+          best = v;
+          idx = c0 + c * 128 + lane * 8 + e;
+        }
+      }
+  }
+  const float m = sub_group_reduce_max(best);
+  const int j = sub_group_reduce_min(best == m ? idx : 0x7fffffff);
+  if (lane == 0) {
+    PV[row * 256 + gid] = m;
+    PI[row * 256 + gid] = j;
+  }
+}
 // Structured output: argmax_part over logits rows ROWS[j], among the tokens grammar mask j allows; same ties.
 KERNEL(256) void argmax_part_masked(global const half *L, int V, global const uint *MASK, int W, global const int *ROWS,
                                     global float *PV, global int *PI) {
