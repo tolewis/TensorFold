@@ -160,6 +160,10 @@ enum LSC_LDCC { LSC_LDCC_DEFAULT = 0, LSC_LDCC_L1UC_L3UC = 1 };
 enum LSC_STCC { LSC_STCC_DEFAULT = 0, LSC_STCC_L1UC_L3UC = 1 };
 uint __builtin_IB_lsc_load_global_uint(global uint *base, int immElemOff, enum LSC_LDCC cacheOpt);
 void __builtin_IB_lsc_store_global_uint(global uint *base, int immElemOff, uint val, enum LSC_STCC cacheOpt);
+// The element offset must be a literal (IGC: "element offset operand must be immediate"). One address a row and eight
+// literal offsets keep the register count of gdn_step2: an address a column made IGC spill 2240 bytes.
+#define GDN_UC1(X, I) { enum { i = I, OFF = I * 16 }; X; }
+#define GDN_UC8(X) { GDN_UC1(X, 0) GDN_UC1(X, 1) GDN_UC1(X, 2) GDN_UC1(X, 3) GDN_UC1(X, 4) GDN_UC1(X, 5) GDN_UC1(X, 6) GDN_UC1(X, 7) }
 KERNEL(16) void gdn_step2_uc(global const ushort *Q, global const ushort *K, global const ushort *V,
                              global const float *G, global const float *BETA, global const float *S, global float *SO,
                              global ushort *Y, int T, global const int *ROWS, global const int *TREE, global float *SL,
@@ -185,7 +189,7 @@ KERNEL(16) void gdn_step2_uc(global const ushort *Q, global const ushort *K, glo
       const long par = ANC(t, depth - 1);
       for (int r = 0; r < 8; r++) {
         global uint *p = (global uint *)GDN_ROW8(SL + par * Q27_GV * 16384, r) + lane;
-        for (int i = 0; i < 8; i++) s[r][i] = as_float(__builtin_IB_lsc_load_global_uint(p + i * 16, 0, LSC_LDCC_L1UC_L3UC));
+        GDN_UC8(s[r][i] = as_float(__builtin_IB_lsc_load_global_uint(p, OFF, LSC_LDCC_L1UC_L3UC)));
       }
     } else if (TREE && depth == 0)
       for (int r = 0; r < 8; r++) {
@@ -222,7 +226,7 @@ KERNEL(16) void gdn_step2_uc(global const ushort *Q, global const ushort *K, glo
     if (tw & 256)                                       // SAVE: a later row loads this state, past the caches
       for (int r = 0; r < 8; r++) {
         global uint *p = (global uint *)GDN_ROW8(SL + (long)t * Q27_GV * 16384, r) + lane;
-        for (int i = 0; i < 8; i++) __builtin_IB_lsc_store_global_uint(p + i * 16, 0, as_uint(s[r][i]), LSC_STCC_L1UC_L3UC);
+        GDN_UC8(__builtin_IB_lsc_store_global_uint(p, OFF, as_uint(s[r][i]), LSC_STCC_L1UC_L3UC));
       }
   }
   if (!TREE)
