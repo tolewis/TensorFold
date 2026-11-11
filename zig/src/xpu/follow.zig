@@ -9,9 +9,11 @@ const q = @import("qwen27.zig");
 const tp = @import("tp.zig");
 const multi = @import("runner_multi.zig");
 const slot_states = @import("slot_states.zig");
+const drafter = @import("drafter.zig");
 const alloc = q.alloc;
 
-pub fn run(r: *q.Runner) !void {
+/// `dr`: this rank's half of the drafter (XPU_DRAFT_TP), which replays rank 0's drafter records; else null.
+pub fn run(r: *q.Runner, dr: ?*drafter.Drafter) !void {
     const g = if (tp.group) |*x| x else return error.NotARank;
     const trace = std.c.getenv("TF_TP_TRACE") != null; // every record to stderr
     // XPU_PROFILE: the follower's kernels a round, one table every N decode passes (XPU_ROUND_STATS a, 256)
@@ -94,16 +96,19 @@ pub fn run(r: *q.Runner) !void {
             .restore_slot => if (snaps.get(id)) |s| slot_states.restoreSlot(r, rec.a, s) else error.NoSuchSnap,
             .drop_snap => if (snaps.fetchRemove(id)) |kv| slot_states.dropSnap(r, kv.value) else error.NoSuchSnap, // an unknown id is a lost or reordered drop: exit before the pools drift
             .ensure => slot_states.ensure(r, rec.a),
+            .dr_taps, .dr_absorb, .dr_run, .dr_save, .dr_restore, .dr_drop => if (dr) |x| x.follow(op, rec.a, rec.b, id, data) else error.NoDrafter,
             .close => return,
             .more => error.BadRecord,
         };
         done catch |err| {
             // a park that fails on this rank while rank 0 parked leaves the pools different
             if (op == .park_snap) return err;
+            const dr_op = @intFromEnum(op) >= @intFromEnum(tp.Op.dr_taps); // a drafter record: its checks return before its work
             switch (err) {
                 error.BadBlock, error.BadCommit, error.ContextFull, error.NoSuchSlot, error.SlotNotThere => {
                     std.debug.print("follow: rank 0's {s} returned {s} here too\n", .{ @tagName(op), @errorName(err) });
                 },
+                error.TooManyRows, error.TooManyBlocks => if (dr_op) std.debug.print("follow: rank 0's {s} returned {s} here too\n", .{ @tagName(op), @errorName(err) }) else return err,
                 else => return err,
             }
         };

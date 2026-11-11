@@ -103,12 +103,12 @@ pub fn argmax(d: *Dev, old: ze.H, new: ze.H, fin: ze.H) !void {
 }
 
 /// The host merge of drafter.zig (Drafter.lattice): the top 16 of a row's part lists, ties to the lower index.
-fn merge(pv: []const f32, pi: []const i32, r: usize, bv: *[16]f32, bi: *[16]i32) void {
+fn merge(pv: []const f32, pi: []const i32, r: usize, w: usize, bv: *[16]f32, bi: *[16]i32) void {
     bv.* = @splat(-std.math.inf(f32));
     bi.* = @splat(INT_MAX);
-    for (0..256 * 16) |j| {
-        const v = pv[r * 4096 + j];
-        const ix = pi[r * 4096 + j];
+    for (0..w) |j| {
+        const v = pv[r * w + j];
+        const ix = pi[r * w + j];
         if (ix == INT_MAX) continue;
         if (v < bv[15] or (v == bv[15] and ix > bi[15])) continue;
         var k: usize = 15;
@@ -122,8 +122,9 @@ fn merge(pv: []const f32, pi: []const i32, r: usize, bv: *[16]f32, bi: *[16]i32)
 }
 
 /// topk_part16 against topk_part on N columns of rows NS apart: the merged top 16 of each row. No NaN: the two
-/// kernels cut a row into other parts, and a NaN entry of topk_part depends on its part.
-pub fn topk(d: *Dev, old: ze.H, new: ze.H, N: u32, NS: u32) !void {
+/// kernels cut a row into other parts, and a NaN entry of topk_part depends on its part. `parts`: the image's
+/// TOPK_PARTS (256, or 128 in the XPU_DRAFT_TP image).
+pub fn topk(d: *Dev, old: ze.H, new: ze.H, N: u32, NS: u32, parts: u32) !void {
     var held: Held = .{};
     defer held.deinit(d);
     const host = try alloc.alloc(f16, ROWS * NS);
@@ -151,7 +152,7 @@ pub fn topk(d: *Dev, old: ze.H, new: ze.H, N: u32, NS: u32) !void {
         i.* = try held.room(d, ROWS * 256 * 16 * 4);
         try d.fill(v.*, @as(u32, 0), ROWS * 256 * 16 * 4);
         try d.fill(i.*, @as(u32, 0), ROWS * 256 * 16 * 4);
-        try d.launch(k, .{ .x = 256, .y = ROWS }, .{ L, @as(i32, @intCast(N)), @as(i32, @intCast(NS)), v.*, i.* });
+        try d.launch(k, .{ .x = parts, .y = ROWS }, .{ L, @as(i32, @intCast(N)), @as(i32, @intCast(NS)), v.*, i.* });
     }
     var hv: [2][]f32 = undefined;
     var hi: [2][]i32 = undefined;
@@ -168,7 +169,7 @@ pub fn topk(d: *Dev, old: ze.H, new: ze.H, N: u32, NS: u32) !void {
     for (0..ROWS) |r| {
         var bv: [2][16]f32 = undefined;
         var bi: [2][16]i32 = undefined;
-        for (0..2) |s| merge(hv[s], hi[s], r, &bv[s], &bi[s]);
+        for (0..2) |s| merge(hv[s], hi[s], r, @as(usize, parts) * 16, &bv[s], &bi[s]);
         for (0..16) |j| bad += @intFromBool(@as(u32, @bitCast(bv[0][j])) != @as(u32, @bitCast(bv[1][j])) or bi[0][j] != bi[1][j]);
         if (r == 3) top = .{ bi[1][0], bi[1][15] };
     }

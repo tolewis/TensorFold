@@ -9,8 +9,17 @@
 #define GS 64
 #define D 5120
 #define HD 128
+// The heads of one rank: 32 and 8 whole. XPU_DRAFT_TP (lane p4-kernel) builds a second image with each TP 2 rank's
+// 16 and 4 (zig/build/xpu.zig, drafter_tp). TOPK_PARTS: the parts of a row's top 16 (256, or 128 on half the head).
+#ifndef NH
 #define NH 32
+#endif
+#ifndef NKV
 #define NKV 8
+#endif
+#ifndef TOPK_PARTS
+#define TOPK_PARTS 256
+#endif
 #define KERNEL(N) __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(N, 1, 1))) kernel
 
 static inline float bf2f(ushort h) { return as_float((uint)h << 16); }
@@ -372,10 +381,11 @@ KERNEL(256) void to_res(global const half *H, global float *X) {
   X[i] = rbf((float)H[i]);
 }
 
-// Top 16 of each row of logits in two passes: 256 groups per row keep their top 16, the host merges; ties: lower index.
+// Top 16 of each row of logits in two passes: TOPK_PARTS groups per row keep their top 16, the host merges; ties:
+// lower index.
 KERNEL(16) void topk_part(global const half *L, int N, int NS, global float *PV, global int *PI) {
   const int gid = get_group_id(0), row = get_group_id(1), lane = get_sub_group_local_id();
-  const int per = (N + 255) / 256, a = gid * per, b = min(N, a + per);
+  const int per = (N + TOPK_PARTS - 1) / TOPK_PARTS, a = gid * per, b = min(N, a + per);
   float bv[16];
   int bi[16];
   for (int i = 0; i < 16; i++) { bv[i] = -INFINITY; bi[i] = 0x7fffffff; }
@@ -390,19 +400,19 @@ KERNEL(16) void topk_part(global const half *L, int N, int NS, global float *PV,
     }
   if (lane == 0)
     for (int i = 0; i < 16; i++) {
-      PV[((long)row * 256 + gid) * 16 + i] = bv[i];
-      PI[((long)row * 256 + gid) * 16 + i] = bi[i];
+      PV[((long)row * TOPK_PARTS + gid) * 16 + i] = bv[i];
+      PI[((long)row * TOPK_PARTS + gid) * 16 + i] = bi[i];
     }
 }
 
 // XPU_SMALLK bit 2 (lane p4-kernel): topk_part with the whole subgroup. Lane l holds entry l of the part's list. The
 // lanes read the part with 16-byte reads, all in flight together. Then each value goes through the insertion of
 // topk_part in rising index order, with the same compares, so a part gives the same list as topk_part would give
-// for it. A part is P values, P = ceil(N / 256) rounded up to 8: N % 8 == 0 and NS % 8 == 0 (the host checks). The
+// for it. A part is P values, P = ceil(N / TOPK_PARTS) rounded up to 8: N % 8 == 0 and NS % 8 == 0 (the host checks). The
 // host merge takes the same top 16 from these parts as from the parts of topk_part.
 KERNEL(16) void topk_part16(global const half *L, int N, int NS, global float *PV, global int *PI) {
   const int gid = get_group_id(0), row = get_group_id(1), lane = get_sub_group_local_id();
-  const int per = ((N + 255) / 256 + 7) & ~7, a = min(N, gid * per), b = min(N, a + per);
+  const int per = ((N + TOPK_PARTS - 1) / TOPK_PARTS + 7) & ~7, a = min(N, gid * per), b = min(N, a + per);
   global const half *x = L + (long)row * NS;
   float bv = -INFINITY, t15 = -INFINITY; // this lane's entry, and entry 15 (the same in every lane)
   int bi = 0x7fffffff;
@@ -436,8 +446,8 @@ KERNEL(16) void topk_part16(global const half *L, int N, int NS, global float *P
         }
       }
   }
-  PV[((long)row * 256 + gid) * 16 + lane] = bv;
-  PI[((long)row * 256 + gid) * 16 + lane] = bi;
+  PV[((long)row * TOPK_PARTS + gid) * 16 + lane] = bv;
+  PI[((long)row * TOPK_PARTS + gid) * 16 + lane] = bi;
 }
 
 // Affine 4-bit quantization of a bf16 weight in groups of 64 along K (MLX layout), one work-item per (row, group).

@@ -307,7 +307,10 @@ pub const Lanes = struct {
 
     pub fn keepDrop(b: *Lanes, k: *Kept) void {
         b.runner.dropSnap(k.snap);
-        if (k.ctx) |x| xq.freeAfterQueue(&b.runner.d, x);
+        if (k.ctx) |x| {
+            if (b.drafter) |d| d.dropSaved(x); // XPU_DRAFT_TP: the follower drops its copy too
+            xq.freeAfterQueue(&b.runner.d, x);
+        }
         b.gpa.destroy(k);
     }
 

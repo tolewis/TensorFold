@@ -37,7 +37,7 @@ pub fn main(init: std.process.Init) !void {
     defer r.deinit(); // at TP 2 the close record lets a follower stop
     if (q.kv_pool) try q.openPool(r, 1, 0); // XPU_KV_POOL: one slot's pages, sized from the card
     std.debug.print("loaded in {d:.1} s\n", .{q.now() - t_load});
-    if (std.c.getenv("TF_TP_FOLLOW") != null) return q.follow.run(r); // a rank above 0 replays rank 0's calls
+    if (std.c.getenv("TF_TP_FOLLOW") != null) return q.follow.run(r, null); // a rank above 0 replays rank 0's calls
     if (std.c.getenv("XPU_FIDELITY") != null) return fp64_ref.fidelity(r, ids.items);
     if (std.c.getenv("XPU_FP64_REF") != null) fp64_ref.arm(r);
     const t0 = q.now();

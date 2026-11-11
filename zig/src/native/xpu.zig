@@ -196,6 +196,13 @@ fn slotsThatFit(runner: *xq.Runner, want: u32, reserve: u64) !u32 {
     return admit.streamsThatFit(m, margin, reserve, runner.slotBytes(), want, xq.MAX_SLOTS);
 }
 
+/// XPU_DRAFT_TP (lane p4-kernel): a TP rank's free card memory and pool, for the drafter split's memory read.
+fn memLine(runner: *xq.Runner, when: []const u8, pages: u32) void {
+    if (xq.TP == 1) return;
+    const mem = runner.d.g.memory() catch return;
+    std.log.info("qwen27-xpu: rank {d}: card memory {d} MiB free of {d} MiB {s} ({d} MiB counted), pool {d} pages", .{ xq.RANK, mem.free >> 20, mem.size >> 20, when, runner.d.allocated >> 20, pages });
+}
+
 fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter, o: api.Open, context: u32) !api.Opened {
     const want = @min(@max(o.lanes, 1), xq.MAX_SLOTS);
     var budget: u64 = 0;
@@ -211,6 +218,7 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
         if (by_pool == 0) return error.StreamDoesNotFit;
         slots = by_pool;
         try runner.allocPool(pages);
+        memLine(runner, "after the pool", pages);
         // kept prompt states hold the pool's pages past the streams' contexts; their GDN copies have a reserve of their own
         const e = (context + xq.PAGE - 1) / xq.PAGE;
         var spare = pages -| slots * e;
@@ -351,7 +359,7 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
     if (o.kv_pool_tokens != null) xq.kv_pool = true;
     const runner = xq.Runner.init(o.dir, context) catch |err| {
         if (err == error.ModeMismatch) {
-            problem.* = "the XPU engine mode diverges from rank 0's (ModeMismatch): this rank's XPU_KV_POOL, XPU_KEEP_SHARED, XPU_KEPT_HOST, XPU_PARK_GIB, XPU_KV_INT8, XPU_EMBED_HOST, XPU_K1, XPU_K1_TREE, XPU_K1_R16 or XPU_K1_WAVE differs, so the pair cannot run";
+            problem.* = "the XPU engine mode diverges from rank 0's (ModeMismatch): this rank's XPU_KV_POOL, XPU_KEEP_SHARED, XPU_KEPT_HOST, XPU_PARK_GIB, XPU_KV_INT8, XPU_EMBED_HOST, XPU_K1, XPU_K1_TREE, XPU_K1_R16, XPU_K1_WAVE or XPU_DRAFT_TP differs, so the pair cannot run";
         } else {
             problem.* = try std.fmt.allocPrint(a, "the XPU engine could not load {s}: {s}", .{ o.dir, @errorName(err) });
         }
@@ -362,18 +370,38 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
         problem.* = try std.fmt.allocPrint(a, "a follower needs TF_TP_RANK above 0 (1 to {d})", .{xq.TP - 1});
         return false;
     }
+    // XPU_DRAFT_TP: this rank holds half the drafter and replays rank 0's drafter records
+    var dr: ?*Drafter = null;
+    if (xq.draft_tp) {
+        const dir = o.drafter orelse {
+            problem.* = "XPU_DRAFT_TP=1 needs --drafter on rank 1 too (the same DFlash2 checkpoint as rank 0)";
+            return false;
+        };
+        dr = Drafter.init(runner, dir) catch |err| {
+            problem.* = try std.fmt.allocPrint(a, "rank {d} could not load its half of the drafter {s}: {s}", .{ xq.RANK, dir, @errorName(err) });
+            return false;
+        };
+        runner.taps_on = true; // its forwards fill the taps that rank 0's drafter records point into
+    }
+    defer if (dr) |x| x.deinit();
+    memLine(runner, "after the load", 0);
     if (xq.kv_pool) { // the pool rank 0 sized: both ranks map the same page ids
-        const pages = xq.poolPagesShared(runner, @min(@max(o.lanes, 1), xq.MAX_SLOTS), true, 0) catch |err| {
+        const lanes_n = @min(@max(o.lanes, 1), xq.MAX_SLOTS);
+        // this card's own count by rank 0's formula (its drafter contexts too), beside the count rank 0 publishes
+        const own: ?u32 = if (dr != null) xq.poolPages(runner, lanes_n, xq.pool_tokens, true, Drafter.ctxBytes()) catch null else null;
+        const pages = xq.poolPagesShared(runner, lanes_n, true, 0) catch |err| {
             problem.* = try std.fmt.allocPrint(a, "rank {d} could not size the K/V pool: {s}", .{ xq.RANK, @errorName(err) });
             return false;
         };
+        if (own) |n| std.log.info("qwen27-xpu: rank {d}: XPU_DRAFT_TP: this card fits {d} pages by rank 0's formula, rank 0 published {d}", .{ xq.RANK, n, pages });
         runner.allocPool(pages) catch |err| {
             problem.* = try std.fmt.allocPrint(a, "rank {d} could not make a K/V pool of {d} pages: {s}", .{ xq.RANK, pages, @errorName(err) });
             return false;
         };
+        memLine(runner, "after the pool", pages);
     }
     std.log.info("qwen27-xpu: rank {d} of {d} holds its half of {s} and follows rank 0", .{ xq.RANK, xq.TP, o.dir });
-    xq.follow.run(runner) catch |err| {
+    xq.follow.run(runner, dr) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "rank {d} stopped: {s}", .{ xq.RANK, @errorName(err) });
         return false;
     };
@@ -405,6 +433,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
             return null;
         };
     };
+    memLine(runner, "after the load", 0);
     return openLanes(gpa, io, runner, dr, o, context) catch |err| {
         if (dr) |x| x.deinit();
         runner.deinit();

@@ -7,6 +7,7 @@ const exl3_layout = core.exl3_layout;
 const kb = @import("xpu_qwen27_kernels");
 const q = @import("qwen27.zig");
 const dtree = @import("drafter_tree.zig");
+const tp = @import("tp.zig");
 
 const alloc = q.alloc;
 const D = q.D;
@@ -48,6 +49,17 @@ const HEAD_N = SPAN_LO + (q.VOCAB - SPAN_HI0); // 98 592
 pub const RANK = 256;
 pub const TOPK = 16;
 pub const DEPTHS = MAXL;
+const TAP_ROW = 5 * D * 2; // a target tap row, bf16 [5 D]
+/// XPU_DRAFT_TP: the exchange rows (D fp16 each) that hold `rows` rows of top-16 parts, values and ids (4 bytes each).
+fn gatherRows(rows: u32, parts: u32) u32 {
+    const bytes = @as(usize, rows) * parts * 16 * 8;
+    return @intCast((bytes + D * 2 - 1) / (D * 2));
+}
+
+/// XPU_DRAFT_TP: a rank's KV heads (NKV whole, or its share), the size of its context rings.
+fn kvHeads() u32 {
+    return if (q.draft_tp) NKV / q.TP else NKV;
+}
 
 const Layer = struct {
     in_norm: *anyopaque,
@@ -89,6 +101,31 @@ pub const Absorb = struct { slot: u32, taps: *anyopaque, n: u32, rows: ?[]const 
 
 /// A device-side MLX affine part (words [n, k/8], scales and biases bf16 [n, k/64]) to repack at column n0.
 const Mlx = struct { w: *anyopaque, s: *anyopaque, b: *anyopaque, n: u32 };
+
+/// A bf16 checkpoint weight [n, k], whole or a slice: rows rows[0] .. rows[1], columns cols[0] .. cols[1] (0, 0: all).
+const Part = struct { name: []const u8, rows: [2]u32 = .{ 0, 0 }, cols: [2]u32 = .{ 0, 0 } };
+
+/// XPU_DRAFT_TP: this rank's share [lo, hi) of `total` (0, 0: whole, the drafter not split).
+fn share(split: bool, total: u32) [2]u32 {
+    if (!split) return .{ 0, 0 };
+    const n = total / q.TP;
+    return .{ q.RANK * n, (q.RANK + 1) * n };
+}
+
+/// The target vocab rows of head rows lo .. lo + n (head row h: id h below SPAN_LO, else SPAN_HI0 + h - SPAN_LO).
+fn headSpans(lo: u32, n: u32, out: *[2][2]u32) usize {
+    const hi = lo + n;
+    var k: usize = 0;
+    if (lo < SPAN_LO) {
+        out[k] = .{ lo, @min(hi, SPAN_LO) };
+        k += 1;
+    }
+    if (hi > SPAN_LO) {
+        out[k] = .{ SPAN_HI0 + @max(lo, SPAN_LO) - SPAN_LO, SPAN_HI0 + hi - SPAN_LO };
+        k += 1;
+    }
+    return k;
+}
 
 pub const Drafter = struct {
     r: *q.Runner,
@@ -135,6 +172,16 @@ pub const Drafter = struct {
     pi: *anyopaque,
     ids: *anyopaque,
     pscr: *anyopaque,
+    // XPU_DRAFT_TP (lane p4-kernel): each rank of a TP 2 pair holds half the attention heads, half the MLP and half the
+    // head. Two exchanges a layer (after o and down), one gather of the top-16 parts; rank 0 merges and selects.
+    split: bool = false,
+    nh: u32 = NH, // this rank's query heads, KV heads and MLP width
+    nkv: u32 = NKV,
+    ff: u32 = FF,
+    head_rows: u32 = HEAD_N, // this rank's head rows, from RANK x head_rows
+    parts: u32 = 256, // the top-16 parts a row (TOPK_PARTS of the kernel image)
+    gbuf: ?*anyopaque = null, // the gather: this rank's top-16 parts, values then ids
+    saved: std.AutoHashMapUnmanaged(u64, *anyopaque) = .empty, // a follower's context copies, by rank 0's buffer
 
     fn pack(d: *q.Dev, parts: []const Mlx, k: u32, wide: bool) !q.Proj {
         var n_real: u32 = 0;
@@ -154,19 +201,29 @@ pub const Drafter = struct {
         return out;
     }
 
-    /// bf16 weights [n_i, k] stacked on N, quantized to affine 4/64 on the device, then repacked.
-    fn quantized(dr: *Drafter, c: *const q.Checkpoint, names: []const []const u8, wide: bool, stage: *anyopaque) !q.Proj {
+    /// bf16 weights [n_i, k] (whole or a slice) stacked on N, quantized to affine 4/64 on the device, then repacked.
+    fn quantized(dr: *Drafter, c: *const q.Checkpoint, names: []const Part, wide: bool, stage: *anyopaque) !q.Proj {
         const d = &dr.r.d;
         var parts: [4]Mlx = undefined;
         var k: u32 = 0;
         var at: usize = 0;
         for (names, 0..) |name, i| {
-            const t = try c.get(name);
-            const n: u32 = @intCast(t.shape[0]);
-            k = @intCast(t.shape[1]);
+            const t = try c.get(name.name);
+            const n_all: u32 = @intCast(t.shape[0]);
+            const k_all: u32 = @intCast(t.shape[1]);
+            const rr: [2]u32 = if (name.rows[1] > 0) name.rows else .{ 0, n_all };
+            const cc: [2]u32 = if (name.cols[1] > 0) name.cols else .{ 0, k_all };
+            const n: u32 = rr[1] - rr[0];
+            k = cc[1] - cc[0];
             const raw = q.off(stage, at);
-            try d.copyIn(raw, t.bytes);
-            at += t.bytes.len;
+            const src = t.bytes[@as(usize, rr[0]) * k_all * 2 .. @as(usize, rr[1]) * k_all * 2];
+            if (k == k_all) try d.copyIn(raw, src) else { // a column slice: each row's columns, gathered on the host
+                const tmp = try alloc.alloc(u8, @as(usize, n) * k * 2);
+                defer alloc.free(tmp);
+                for (0..n) |row| @memcpy(tmp[row * k * 2 ..][0 .. @as(usize, k) * 2], src[row * k_all * 2 + @as(usize, cc[0]) * 2 ..][0 .. @as(usize, k) * 2]);
+                try d.copyIn(raw, tmp); // copyIn waits for its copy: tmp is free after it
+            }
+            at += @as(usize, n) * k * 2;
             const mw = q.off(stage, at);
             at += @as(usize, n) * (k / 8) * 4;
             const ms = q.off(stage, at);
@@ -190,14 +247,24 @@ pub const Drafter = struct {
         try c.addShard(path);
         const dr = try alloc.create(Drafter);
         errdefer alloc.destroy(dr);
-        const m = try d.g.module(&kb.drafter);
+        // XPU_DRAFT_TP: the rank's half of the drafter, its own kernel image (NH 16, NKV 4, TOPK_PARTS 128)
+        const split = q.draft_tp;
+        if (split) {
+            const g = if (tp.group) |*x| x else return error.DraftTpNoGroup;
+            if (!g.direct or g.devflag) return error.DraftTpNeedsDirect; // the gather is allReducePeer's raw copy
+        }
+        const img: []const u8 = if (comptime q.TP == 2) (if (split) &kb.drafter_tp else &kb.drafter) else &kb.drafter;
+        const m = try d.g.module(img);
+        const nh: u32 = if (split) NH / q.TP else NH;
+        const nkv: u32 = if (split) NKV / q.TP else NKV;
+        const ff: u32 = if (split) FF / q.TP else FF;
         const kern = struct {
             fn f(dd: *q.Dev, mm: ze.H, name: [*:0]const u8, local: u32) !ze.H {
                 return dd.kernel(mm, name, local);
             }
         }.f;
         const rows = @max(q.CHUNK, MAXB);
-        const pv_host = try alloc.alloc(f32, MAXB * 256 * 16);
+        const pv_host = try alloc.alloc(f32, MAXB * 256 * 16); // split: the two ranks' MAXB x 128 x 16 each
         errdefer alloc.free(pv_host);
         const pi_host = try alloc.alloc(i32, MAXB * 256 * 16);
         errdefer alloc.free(pi_host);
@@ -215,14 +282,14 @@ pub const Drafter = struct {
             .succ = (try c.get("candidate_selector.successor_codebook")).bytes,
             .x = try d.alloc_(rows * D * 4),
             .h = try d.alloc_(rows * 25600 * 2),
-            .h2 = try d.alloc_(MAXB * FF * 2),
+            .h2 = try d.alloc_(MAXB * @as(usize, ff) * 2),
             .ahi = try d.alloc_(rows * 400 * 2),
             .alo = try d.alloc_(rows * 400 * 2),
-            .p = try d.alloc_(rows * 2 * FF * 2),
+            .p = try d.alloc_(rows * 2 * @as(usize, ff) * 2),
             .r16 = try d.alloc_(rows * D * 2),
             .dyn = try d.alloc_(MAXB * 1280 * 2),
-            .qb = try d.alloc_(MAXB * NH * HD * 2),
-            .o = try d.alloc_(MAXB * NH * HD * 2),
+            .qb = try d.alloc_(MAXB * @as(usize, nh) * HD * 2),
+            .o = try d.alloc_(MAXB * @as(usize, nh) * HD * 2),
             .logits = undefined,
             .selp = try d.alloc_(MAXB * RANK * 2),
             .pv = try d.alloc_(MAXB * 256 * 16 * 4),
@@ -234,7 +301,14 @@ pub const Drafter = struct {
             .pv_host = pv_host,
             .pi_host = pi_host,
             .pscr = try d.alloc_(rows * D * 4),
+            .split = split,
+            .nh = nh,
+            .nkv = nkv,
+            .ff = ff,
+            .head_rows = if (split) HEAD_N / q.TP else HEAD_N,
+            .parts = if (split) 256 / q.TP else 256,
         };
+        if (split) dr.gbuf = try d.alloc_(gatherRows(MAXB, dr.parts) * D * 2);
         dr.ckpt = c;
         const stage = try d.alloc_(800 << 20);
         defer d.g.free(stage);
@@ -248,27 +322,33 @@ pub const Drafter = struct {
                 return std.fmt.allocPrint(alloc, "layers.{d}.{s}", .{ l, s }) catch unreachable;
             }
         }.f;
-        dr.fc = try dr.quantized(&c, &.{"fc.weight"}, false, stage);
+        dr.fc = try dr.quantized(&c, &.{.{ .name = "fc.weight" }}, false, stage);
         dr.hidden_norm = try bf(d, &c, "hidden_norm.weight");
         dr.norm = try bf(d, &c, "norm.weight");
-        dr.sel = try dr.quantized(&c, &.{"candidate_selector.hidden_projection.weight"}, false, stage);
+        dr.sel = try dr.quantized(&c, &.{.{ .name = "candidate_selector.hidden_projection.weight" }}, false, stage);
+        // XPU_DRAFT_TP: q, k, v and gate, up are row slices (this rank's heads and MLP columns), o and down column
+        // slices (their sum over the ranks is the whole projection); the rest is whole on each rank
+        const sq = share(split, NH * HD);
+        const skv = share(split, NKV * HD);
+        const sff = share(split, FF);
         for (&dr.layers, 0..) |*l, i| l.* = .{
             .in_norm = try bf(d, &c, nm(i, "input_layernorm.weight")),
             .post_norm = try bf(d, &c, nm(i, "post_attention_layernorm.weight")),
-            .kp_attn = try dr.quantized(&c, &.{nm(i, "attention_conv.kernel_projection.weight")}, false, stage),
+            .kp_attn = try dr.quantized(&c, &.{.{ .name = nm(i, "attention_conv.kernel_projection.weight") }}, false, stage),
             .base_attn = try bf(d, &c, nm(i, "attention_conv.base_kernel")),
-            .qkv = try dr.quantized(&c, &.{ nm(i, "self_attn.q_proj.weight"), nm(i, "self_attn.k_proj.weight"), nm(i, "self_attn.v_proj.weight") }, false, stage),
-            .kv = try dr.quantized(&c, &.{ nm(i, "self_attn.k_proj.weight"), nm(i, "self_attn.v_proj.weight") }, false, stage),
+            .qkv = try dr.quantized(&c, &.{ .{ .name = nm(i, "self_attn.q_proj.weight"), .rows = sq }, .{ .name = nm(i, "self_attn.k_proj.weight"), .rows = skv }, .{ .name = nm(i, "self_attn.v_proj.weight"), .rows = skv } }, false, stage),
+            .kv = try dr.quantized(&c, &.{ .{ .name = nm(i, "self_attn.k_proj.weight"), .rows = skv }, .{ .name = nm(i, "self_attn.v_proj.weight"), .rows = skv } }, false, stage),
             .qn = try bf(d, &c, nm(i, "self_attn.q_norm.weight")),
             .kn = try bf(d, &c, nm(i, "self_attn.k_norm.weight")),
-            .o = try dr.quantized(&c, &.{nm(i, "self_attn.o_proj.weight")}, false, stage),
-            .kp_mlp = try dr.quantized(&c, &.{nm(i, "mlp_conv.kernel_projection.weight")}, false, stage),
+            .o = try dr.quantized(&c, &.{.{ .name = nm(i, "self_attn.o_proj.weight"), .cols = sq }}, false, stage),
+            .kp_mlp = try dr.quantized(&c, &.{.{ .name = nm(i, "mlp_conv.kernel_projection.weight") }}, false, stage),
             .base_mlp = try bf(d, &c, nm(i, "mlp_conv.base_kernel")),
-            .gu = try dr.quantized(&c, &.{ nm(i, "mlp.gate_proj.weight"), nm(i, "mlp.up_proj.weight") }, true, stage),
-            .down = try dr.quantized(&c, &.{nm(i, "mlp.down_proj.weight")}, false, stage),
+            .gu = try dr.quantized(&c, &.{ .{ .name = nm(i, "mlp.gate_proj.weight"), .rows = sff }, .{ .name = nm(i, "mlp.up_proj.weight"), .rows = sff } }, true, stage),
+            .down = try dr.quantized(&c, &.{.{ .name = nm(i, "mlp.down_proj.weight"), .cols = sff }}, false, stage),
         };
         // the head: the target's lm_head rows of the two spans, quantized as the target's head is
         if (!r.ckpt.has("lm_head.scales")) {
+            if (split) return error.DraftTpNeedsMlxHead; // XPU_DRAFT_TP splits the MLX head only
             // dense f16 rows [n, kk]: the stored lm_head.weight (row = vocab id), or an EXL3 head decoded on the host
             // into the two spans back to back (row = span row)
             const exl3_head = r.ckpt.has("lm_head.trellis");
@@ -319,7 +399,10 @@ pub const Drafter = struct {
             const sr = kk / GS * 2;
             var parts: [2]Mlx = undefined;
             var at: usize = 0;
-            for ([_][2]u32{ .{ 0, SPAN_LO }, .{ SPAN_HI0, q.VOCAB } }, 0..) |span, j| {
+            // this rank's head rows (all of them unless XPU_DRAFT_TP): their target vocab spans
+            var spans: [2][2]u32 = undefined;
+            const ns = headSpans(if (split) q.RANK * dr.head_rows else 0, dr.head_rows, &spans);
+            for (spans[0..ns], 0..) |span, j| {
                 const n = span[1] - span[0];
                 const pw = q.off(stage, at);
                 try d.copyIn(pw, w.bytes[span[0] * wr .. span[1] * wr]);
@@ -333,7 +416,7 @@ pub const Drafter = struct {
                 at = (at + 4095) / 4096 * 4096;
                 parts[j] = .{ .w = pw, .s = ps, .b = pb, .n = n };
             }
-            dr.head = try pack(d, &parts, kk, true);
+            dr.head = try pack(d, parts[0..ns], kk, true);
         }
         win = try parseWin(if (std.c.getenv("XPU_DRAFT_WIN")) |v| std.mem.span(v) else null);
         if (win != WIN) std.debug.print("drafter window: the last {d} context rows (XPU_DRAFT_WIN)\n", .{win});
@@ -343,15 +426,15 @@ pub const Drafter = struct {
         if (q.smallk & 118 != 0) { // XPU_SMALLK (lane p4-kernel): the drafter's kernels; the flag line is qwen27.zig's
             const check = @import("smallk_check.zig");
             if (q.smallk & 2 != 0) {
-                if (HEAD_N % 8 != 0 or dr.head.n % 8 != 0) return error.UnexpectedShape; // 16-byte reads of 8 values
+                if (dr.head_rows % 8 != 0 or dr.head.n % 8 != 0) return error.UnexpectedShape; // 16-byte reads of 8 values
                 const part16 = try kern(d, m, "topk_part16", 16);
-                if (q.smallk & 8 != 0) try check.topk(d, dr.k.topk_part, part16, HEAD_N, dr.head.n);
+                if (q.smallk & 8 != 0) try check.topk(d, dr.k.topk_part, part16, dr.head_rows, dr.head.n, dr.parts);
                 dr.k.topk_part = part16;
             }
             if (q.smallk & 116 != 0) {
                 const name: [*:0]const u8 = if (q.smallk & 64 != 0) "dattn_lb1" else if (q.smallk & 32 != 0) "dattn_lb2" else if (q.smallk & 16 != 0) "dattn_la2" else "dattn_la4";
                 const local: u32 = if (q.smallk & 64 != 0) 64 else if (q.smallk & 48 != 0) 32 else 16;
-                if (q.smallk & 8 != 0) try check.dattn(d, m, name, local, CAP, NH, NKV, HD);
+                if (q.smallk & 8 != 0) try check.dattn(d, m, name, local, CAP, nh, nkv, HD);
                 dr.k.dattn = try kern(d, m, name, local);
             }
         }
@@ -366,6 +449,7 @@ pub const Drafter = struct {
         for (&invf, 0..) |*f, i| f.* = @floatCast(1.0 / std.math.pow(f64, 1e7, @as(f64, @floatFromInt(2 * i)) / 128.0));
         dr.invf = try d.upload(std.mem.sliceAsBytes(&invf));
         try dr.use(0);
+        if (split) std.log.info("qwen27-xpu: rank {d}: drafter: XPU_DRAFT_TP=1 (this rank's {d} of {d} heads, {d} KV heads, {d} MLP columns, head rows {d} .. {d}; {d} MiB counted on the card)", .{ q.RANK, nh, NH, nkv, ff, q.RANK * dr.head_rows, (q.RANK + 1) * dr.head_rows, d.allocated >> 20 });
         return dr;
     }
 
@@ -374,6 +458,7 @@ pub const Drafter = struct {
         dr.r.d.settle(); // the host tables and the top-k buffers below may still be in a queued copy
         alloc.free(dr.pv_host);
         alloc.free(dr.pi_host);
+        dr.saved.deinit(alloc);
         dr.ckpt.deinit();
         alloc.destroy(dr);
     }
@@ -385,8 +470,8 @@ pub const Drafter = struct {
             const d = &dr.r.d;
             var x: Ctx = undefined;
             for (&x.kc, &x.vc) |*k, *v| {
-                k.* = try d.alloc_(@as(usize, NKV) * CAP * HD * 2);
-                v.* = try d.alloc_(@as(usize, NKV) * CAP * HD * 2);
+                k.* = try d.alloc_(@as(usize, dr.nkv) * CAP * HD * 2);
+                v.* = try d.alloc_(@as(usize, dr.nkv) * CAP * HD * 2);
             }
             x.start = 0;
             x.end = 0;
@@ -401,14 +486,15 @@ pub const Drafter = struct {
 
     /// A slot context's bytes (its K and V rings).
     pub fn ctxBytes() usize {
-        return LAYERS * 2 * @as(usize, NKV) * CAP * HD * 2;
+        return LAYERS * 2 * @as(usize, kvHeads()) * CAP * HD * 2;
     }
 
     /// Copies `slot`'s context into `dst` (ctxBytes); its start and end.
     pub fn saveCtx(dr: *Drafter, slot: u32, dst: *anyopaque) ![2]u32 {
         try dr.use(slot);
+        if (dr.recorder()) |g| try g.record(.dr_save, slot, 0, @intFromPtr(dst), &.{});
         const c = dr.ctx();
-        const n = @as(usize, NKV) * CAP * HD * 2;
+        const n = @as(usize, dr.nkv) * CAP * HD * 2;
         for (c.kc, c.vc, 0..) |k, v, i| {
             try q.copy(&dr.r.d, q.off(dst, (2 * i) * n), k, n);
             try q.copy(&dr.r.d, q.off(dst, (2 * i + 1) * n), v, n);
@@ -419,8 +505,9 @@ pub const Drafter = struct {
     /// `slot`'s context from `src` (saveCtx's), ending at `range[1]`.
     pub fn restoreCtx(dr: *Drafter, slot: u32, src: *anyopaque, range: [2]u32) !void {
         try dr.use(slot);
+        if (dr.recorder()) |g| try g.record(.dr_restore, slot, 0, @intFromPtr(src), &range);
         const c = dr.ctx();
-        const n = @as(usize, NKV) * CAP * HD * 2;
+        const n = @as(usize, dr.nkv) * CAP * HD * 2;
         for (c.kc, c.vc, 0..) |k, v, i| {
             try q.copy(&dr.r.d, k, q.off(src, (2 * i) * n), n);
             try q.copy(&dr.r.d, v, q.off(src, (2 * i + 1) * n), n);
@@ -447,6 +534,11 @@ pub const Drafter = struct {
 
     /// Appends `n` committed target rows (taps bf16 [n, 5 D]) to the context: fc, its norm, then each layer's k and v.
     pub fn addTaps(dr: *Drafter, taps: *anyopaque, n: u32) !void {
+        if (dr.recorder()) |g| try g.record(.dr_taps, dr.cur, n, try dr.tapsOff(taps), &.{ dr.ctx().start, dr.ctx().end });
+        return dr.addTapsAt(taps, n);
+    }
+
+    fn addTapsAt(dr: *Drafter, taps: *anyopaque, n: u32) !void {
         const d = &dr.r.d;
         const nul: ?*anyopaque = null;
         const base = dr.ctx().end;
@@ -463,7 +555,7 @@ pub const Drafter = struct {
             const c = dr.ctx();
             for (&dr.layers, c.kc, c.vc) |*l, kc, vc| {
                 try q.gemm(d, dr.pscr, dr.h, dr.ahi, dr.alo, l.kv, dr.p, rows);
-                try d.launch(dr.k.dprep, .{ .x = rows, .y = 16 }, .{ dr.p, @as(i32, @intCast(l.kv.n)), @as(i32, -1), l.qn, l.kn, dr.invf, dr.qb, kc, vc, @as(i32, CAP), @as(i32, @intCast(base + done)), HIDDEN_NORM_EPS, nul, nul });
+                try d.launch(dr.k.dprep, .{ .x = rows, .y = 2 * dr.nkv }, .{ dr.p, @as(i32, @intCast(l.kv.n)), @as(i32, -1), l.qn, l.kn, dr.invf, dr.qb, kc, vc, @as(i32, CAP), @as(i32, @intCast(base + done)), HIDDEN_NORM_EPS, nul, nul });
             }
             done += rows;
         }
@@ -514,9 +606,30 @@ pub const Drafter = struct {
     /// Each item's rows into its slot's context, in one pass (fc, its norm, each layer's k and v).
     pub fn absorbMulti(dr: *Drafter, items: []const Absorb) !void {
         if (items.len == 0) return;
+        if (dr.recorder()) |g| { // per item: slot, n, taps offset, context start and end, has rows, then the rows
+            if (items.len > MAXS) return error.TooManyBlocks;
+            var w: [MAXS * 6 + MAXB]u32 = undefined;
+            var at: usize = 0;
+            for (items) |it| {
+                try dr.use(it.slot);
+                const c = dr.ctx();
+                const extra: usize = if (it.rows != null) it.n else 0;
+                if (at + 6 + extra > w.len) return error.TooManyRows;
+                w[at..][0..6].* = .{ it.slot, it.n, @intCast(try dr.tapsOff(it.taps)), c.start, c.end, @intFromBool(it.rows != null) };
+                at += 6;
+                if (it.rows) |rows| @memcpy(w[at..][0..it.n], rows[0..it.n]);
+                at += extra;
+            }
+            try g.record(.dr_absorb, @intCast(items.len), 0, 0, w[0..at]);
+        }
+        return dr.absorbAt(items);
+    }
+
+    fn absorbAt(dr: *Drafter, items: []const Absorb) !void {
+        if (items.len == 0) return;
         if (items.len == 1 and items[0].rows == null) {
             try dr.use(items[0].slot);
-            return dr.addTaps(items[0].taps, items[0].n);
+            return dr.addTapsAt(items[0].taps, items[0].n);
         }
         if (items.len > MAXS) return error.TooManyBlocks;
         const d = &dr.r.d;
@@ -539,13 +652,89 @@ pub const Drafter = struct {
         try d.launch(d.k.add_rmsnorm, .{ .x = R }, .{ dr.x, dr.r16, dr.hidden_norm, dr.h, dr.ahi, dr.alo, @as(i32, D), HIDDEN_NORM_EPS, @as(i32, 0), @as(i32, GS), q.no_q8, q.no_q8, @as(i32, 0), @as(i32, 0) });
         for (&dr.layers, 0..) |*l, li| {
             try q.gemm(d, dr.pscr, dr.h, dr.ahi, dr.alo, l.kv, dr.p, R);
-            try d.launch(dr.k.dprep, .{ .x = R, .y = 16 }, .{ dr.p, @as(i32, @intCast(l.kv.n)), @as(i32, -1), l.qn, l.kn, dr.invf, dr.qb, dr.ptrs_host[li][0][0], dr.ptrs_host[li][0][1], @as(i32, CAP), @as(i32, 0), HIDDEN_NORM_EPS, dr.rows_dev, q.off(dr.ptrs_dev, li * MAXS * 16) });
+            try d.launch(dr.k.dprep, .{ .x = R, .y = 2 * dr.nkv }, .{ dr.p, @as(i32, @intCast(l.kv.n)), @as(i32, -1), l.qn, l.kn, dr.invf, dr.qb, dr.ptrs_host[li][0][0], dr.ptrs_host[li][0][1], @as(i32, CAP), @as(i32, 0), HIDDEN_NORM_EPS, dr.rows_dev, q.off(dr.ptrs_dev, li * MAXS * 16) });
         }
         for (items) |it| {
             try dr.use(it.slot);
             dr.ctx().end += it.n;
         }
         try d.sync(); // the tables are read from the host
+    }
+
+    /// XPU_DRAFT_TP: the step ring when this rank writes the drafter's records (rank 0 of a split drafter), else null.
+    fn recorder(dr: *const Drafter) ?*tp.Group {
+        if (!dr.split or q.RANK != 0) return null;
+        return if (tp.group) |*g| g else null;
+    }
+
+    /// A taps pointer as its byte offset in the runner's taps (the follower's own taps hold the same rows).
+    fn tapsOff(dr: *const Drafter, taps: *anyopaque) !u64 {
+        const base = @intFromPtr(dr.r.acts.taps);
+        const p = @intFromPtr(taps);
+        if (p < base or (p - base) % TAP_ROW != 0) return error.DraftTpTaps;
+        return p - base;
+    }
+
+    /// `slot`'s context made the current one, standing where rank 0's stood (start, end).
+    fn place(dr: *Drafter, slot: u32, at: []const u32) !void {
+        if (at.len < 2) return error.BadRecord;
+        try dr.use(slot);
+        dr.ctx().start = at[0];
+        dr.ctx().end = at[1];
+    }
+
+    /// XPU_DRAFT_TP: keepDrop's drop of a context copy (saveCtx's `buf`); the follower frees its own copy.
+    pub fn dropSaved(dr: *Drafter, buf: *anyopaque) void {
+        if (dr.recorder()) |g| g.record(.dr_drop, 0, 0, @intFromPtr(buf), &.{}) catch {};
+    }
+
+    /// XPU_DRAFT_TP, rank 1: one of rank 0's drafter records replayed (follow.zig).
+    pub fn follow(dr: *Drafter, op: tp.Op, a: u32, b: u32, id: u64, data: []const u32) anyerror!void {
+        switch (op) {
+            .dr_taps => {
+                try dr.place(a, data);
+                try dr.addTapsAt(q.off(dr.r.acts.taps, @intCast(id)), b);
+            },
+            .dr_absorb => {
+                if (a == 0 or a > MAXS) return error.BadRecord;
+                var items: [MAXS]Absorb = undefined;
+                var at: usize = 0;
+                for (items[0..a]) |*it| {
+                    if (at + 6 > data.len) return error.BadRecord;
+                    const w = data[at..][0..6];
+                    const extra: usize = if (w[5] != 0) w[1] else 0;
+                    if (at + 6 + extra > data.len) return error.BadRecord;
+                    try dr.place(w[0], w[3..5]);
+                    it.* = .{ .slot = w[0], .taps = q.off(dr.r.acts.taps, w[2]), .n = w[1], .rows = if (w[5] != 0) data[at + 6 ..][0..extra] else null };
+                    at += 6 + extra;
+                }
+                try dr.absorbAt(items[0..a]);
+            },
+            .dr_run => {
+                const S = data.len / @as(usize, if (b != 0) 5 else 4);
+                if (S == 0 or S > MAXS) return error.BadRecord;
+                var items: [MAXS]Block = undefined;
+                for (items[0..S], 0..) |*it, i| {
+                    const w = data[i * 4 ..][0..4];
+                    try dr.place(w[0], w[2..4]);
+                    it.* = .{ .slot = w[0], .pending = w[1] };
+                }
+                try dr.run(items[0..S], a, if (b != 0) data[S * 4 ..][0..S] else null);
+            },
+            .dr_save => {
+                const d = &dr.r.d;
+                if (dr.saved.fetchRemove(id)) |kv| q.freeAfterQueue(d, kv.value);
+                const buf = if (q.kv_pool and q.kept_host) try d.hostAlloc(ctxBytes()) else try d.alloc_(ctxBytes());
+                try dr.saved.put(alloc, id, buf);
+                _ = try dr.saveCtx(a, buf);
+            },
+            .dr_restore => {
+                if (data.len < 2) return error.BadRecord;
+                try dr.restoreCtx(a, dr.saved.get(id) orelse return error.NoSuchSnap, .{ data[0], data[1] });
+            },
+            .dr_drop => if (dr.saved.fetchRemove(id)) |kv| q.freeAfterQueue(&dr.r.d, kv.value),
+            else => return error.BadRecord,
+        }
     }
 
     /// The batched pass's row and cache tables to the device.
@@ -580,6 +769,17 @@ pub const Drafter = struct {
             }
         }
         if (S == 0 or S > MAXS or R > MAXB) return error.TooManyRows;
+        if (dr.recorder()) |g| { // per item: slot, pending, context start and end; then the counts
+            var w: [MAXS * 5]u32 = undefined;
+            for (items, 0..) |it, b| {
+                try dr.use(it.slot);
+                w[b * 4 ..][0..4].* = .{ it.slot, it.pending, dr.ctx().start, dr.ctx().end };
+            }
+            if (counts) |cs| @memcpy(w[S * 4 ..][0..S], cs[0..S]);
+            try g.record(.dr_run, count, @intFromBool(counts != null), 0, w[0 .. S * @as(usize, if (counts != null) 5 else 4)]);
+        }
+        // XPU_DRAFT_TP: the ranks' o and down partials summed after each GEMM, the head's top-16 parts gathered
+        const tg: ?*tp.Group = if (dr.split) (if (tp.group) |*x| x else return error.DraftTpNoGroup) else null;
         var tokens: [MAXB]i32 = undefined;
         for (items, 0..) |it, b| {
             const lb: u32 = if (rag) counts.?[b] + 1 else L;
@@ -611,33 +811,47 @@ pub const Drafter = struct {
             try q.gemm(d, dr.pscr, dr.h, dr.ahi, dr.alo, l.kp_attn, dr.dyn, R);
             try d.launch(dr.k.dconv, .{ .x = R, .y = D / 512 }, .{ dr.h, dr.dyn, @as(i32, @intCast(l.kp_attn.n)), l.base_attn, @as(i32, 0), dr.x, @as(i32, 0), dr.h2, dr.ahi, dr.alo, l32, drows_t });
             try q.gemm(d, dr.pscr, dr.h2, dr.ahi, dr.alo, l.qkv, dr.p, R);
-            try d.launch(dr.k.dprep, .{ .x = R, .y = 48 }, .{ dr.p, @as(i32, @intCast(l.qkv.n)), @as(i32, 0), l.qn, l.kn, dr.invf, dr.qb, kc, vc, @as(i32, CAP), end_, HIDDEN_NORM_EPS, rows_t, ptrs_t });
-            try d.launch(dr.k.dattn, .{ .x = R, .y = NKV }, .{ dr.qb, kc, vc, @as(i32, CAP), c0, end_, l32, @as(i32, @intCast(win)), @as(f32, 1.0 / @sqrt(@as(f32, HD))), dr.o, rows_t, ptrs_t });
-            try d.launch(dr.k.rowsums_rows, .{ .x = R }, .{ dr.o, @as(i32, NH * HD), dr.ahi, dr.alo });
+            try d.launch(dr.k.dprep, .{ .x = R, .y = dr.nh + 2 * dr.nkv }, .{ dr.p, @as(i32, @intCast(l.qkv.n)), @as(i32, 0), l.qn, l.kn, dr.invf, dr.qb, kc, vc, @as(i32, CAP), end_, HIDDEN_NORM_EPS, rows_t, ptrs_t });
+            try d.launch(dr.k.dattn, .{ .x = R, .y = dr.nkv }, .{ dr.qb, kc, vc, @as(i32, CAP), c0, end_, l32, @as(i32, @intCast(win)), @as(f32, 1.0 / @sqrt(@as(f32, HD))), dr.o, rows_t, ptrs_t });
+            try d.launch(dr.k.rowsums_rows, .{ .x = R }, .{ dr.o, @as(i32, @intCast(dr.nh * HD)), dr.ahi, dr.alo });
             try q.gemm(d, dr.pscr, dr.o, dr.ahi, dr.alo, l.o, dr.r16, R);
+            if (tg) |g| try g.allReduce(d, dr.r16, R);
             try d.launch(dr.k.dconv, .{ .x = R, .y = D / 512 }, .{ dr.r16, dr.dyn, @as(i32, @intCast(l.kp_attn.n)), l.base_attn, @as(i32, 1), dr.x, @as(i32, 1), dr.h2, dr.ahi, dr.alo, l32, drows_t });
             try d.launch(d.k.add_rmsnorm, .{ .x = R }, .{ dr.x, dr.r16, l.post_norm, dr.h, dr.ahi, dr.alo, @as(i32, D), HIDDEN_NORM_EPS, @as(i32, 0), @as(i32, GS), q.no_q8, q.no_q8, @as(i32, 0), @as(i32, 0) });
             try q.gemm(d, dr.pscr, dr.h, dr.ahi, dr.alo, l.kp_mlp, dr.dyn, R);
             try d.launch(dr.k.dconv, .{ .x = R, .y = D / 512 }, .{ dr.h, dr.dyn, @as(i32, @intCast(l.kp_mlp.n)), l.base_mlp, @as(i32, 0), dr.x, @as(i32, 0), dr.h2, dr.ahi, dr.alo, l32, drows_t });
             try q.gemm(d, dr.pscr, dr.h2, dr.ahi, dr.alo, l.gu, dr.p, R);
-            try d.launch(d.k.swiglu, .{ .x = R, .y = (FF + 1023) / 1024 }, .{ dr.p, dr.h2, dr.ahi, dr.alo, @as(i32, GS), @as(i32, 0), @as(i32, 0), @as(i32, FF) });
+            try d.launch(d.k.swiglu, .{ .x = R, .y = (dr.ff + 1023) / 1024 }, .{ dr.p, dr.h2, dr.ahi, dr.alo, @as(i32, GS), @as(i32, 0), @as(i32, 0), @as(i32, @intCast(dr.ff)) });
             try q.gemm(d, dr.pscr, dr.h2, dr.ahi, dr.alo, l.down, dr.r16, R);
+            if (tg) |g| try g.allReduce(d, dr.r16, R);
             try d.launch(dr.k.dconv, .{ .x = R, .y = D / 512 }, .{ dr.r16, dr.dyn, @as(i32, @intCast(l.kp_mlp.n)), l.base_mlp, @as(i32, 1), dr.x, @as(i32, 1), dr.h2, dr.ahi, dr.alo, l32, drows_t });
         }
         // a block's rows 1 .. L − 1: final norm, selector projection, head over the two spans, top 16
         const first: u32 = if (one) 1 else 0;
         const rows = if (one) count else R;
         try d.launch(d.k.add_rmsnorm, .{ .x = rows }, .{ q.off(dr.x, first * D * 4), dr.r16, dr.norm, dr.h, dr.ahi, dr.alo, @as(i32, D), HIDDEN_NORM_EPS, @as(i32, 0), @as(i32, GS), q.no_q8, q.no_q8, @as(i32, 0), @as(i32, 0) });
-        try q.gemm(d, dr.pscr, dr.h, dr.ahi, dr.alo, dr.sel, dr.selp, rows);
+        if (q.RANK == 0) try q.gemm(d, dr.pscr, dr.h, dr.ahi, dr.alo, dr.sel, dr.selp, rows);
         try q.gemm(d, dr.pscr, dr.h, dr.ahi, dr.alo, dr.head, dr.logits, rows);
-        try d.launch(dr.k.topk_part, .{ .x = 256, .y = rows }, .{ dr.logits, @as(i32, HEAD_N), @as(i32, @intCast(dr.head.n)), dr.pv, dr.pi });
+        const P = dr.parts;
+        const each: usize = @as(usize, rows) * P * 16; // a rank's values (and ids) of all rows
+        const pv_d = if (tg != null) dr.gbuf.? else dr.pv;
+        const pi_d = if (tg != null) q.off(dr.gbuf.?, each * 4) else dr.pi;
+        try d.launch(dr.k.topk_part, .{ .x = P, .y = rows }, .{ dr.logits, @as(i32, @intCast(dr.head_rows)), @as(i32, @intCast(dr.head.n)), pv_d, pi_d });
+        // the peer's parts, a raw copy (the exchange's slot holds rows x D fp16: the parts fit gatherRows rows)
+        const peer: ?*anyopaque = if (tg) |g| try g.allReducePeer(d, dr.gbuf.?, gatherRows(rows, P)) else null;
+        if (q.RANK != 0) return; // the follower's share is in rank 0's merge; its frame's host copies ran before the exchange
         const pv = dr.pv_host;
         const pi = dr.pi_host;
         var sp: [MAXB * RANK]f16 = undefined;
-        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, pv.ptr, dr.pv, rows * 256 * 16 * 4, null, 0, null));
-        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, pi.ptr, dr.pi, rows * 256 * 16 * 4, null, 0, null));
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, pv.ptr, pv_d, each * 4, null, 0, null));
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, pi.ptr, pi_d, each * 4, null, 0, null));
+        if (peer) |pb| {
+            try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, pv.ptr + each, pb, each * 4, null, 0, null));
+            try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, pi.ptr + each, q.off(pb, each * 4), each * 4, null, 0, null));
+        }
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &sp, dr.selp, rows * RANK * 2, null, 0, null));
         try d.sync();
+        const srcs: usize = if (peer != null) 2 else 1; // rank 0's parts, then rank 1's (head rows from head_rows)
         for (0..S) |b| {
             const x = &dr.multi[b];
             const cnt: u32 = if (rag) counts.?[b] else count;
@@ -645,18 +859,23 @@ pub const Drafter = struct {
                 const row = if (one) depth else offs[b] + 1 + depth;
                 var bv: [TOPK]f32 = @splat(-std.math.inf(f32));
                 var bi: [TOPK]i32 = @splat(std.math.maxInt(i32));
-                for (0..256 * 16) |j| {
-                    const v = pv[row * 4096 + j];
-                    const ix = pi[row * 4096 + j];
-                    if (ix == std.math.maxInt(i32)) continue;
-                    if (v < bv[TOPK - 1] or (v == bv[TOPK - 1] and ix > bi[TOPK - 1])) continue;
-                    var k: usize = TOPK - 1;
-                    while (k > 0 and (v > bv[k - 1] or (v == bv[k - 1] and ix < bi[k - 1]))) : (k -= 1) {
-                        bv[k] = bv[k - 1];
-                        bi[k] = bi[k - 1];
+                for (0..srcs) |src| {
+                    const base = src * each + row * P * 16;
+                    const add: i32 = @intCast(src * dr.head_rows);
+                    for (0..P * 16) |j| {
+                        const v = pv[base + j];
+                        const ix0 = pi[base + j];
+                        if (ix0 == std.math.maxInt(i32)) continue;
+                        const ix = ix0 + add;
+                        if (v < bv[TOPK - 1] or (v == bv[TOPK - 1] and ix > bi[TOPK - 1])) continue;
+                        var k: usize = TOPK - 1;
+                        while (k > 0 and (v > bv[k - 1] or (v == bv[k - 1] and ix < bi[k - 1]))) : (k -= 1) {
+                            bv[k] = bv[k - 1];
+                            bi[k] = bi[k - 1];
+                        }
+                        bv[k] = v;
+                        bi[k] = ix;
                     }
-                    bv[k] = v;
-                    bi[k] = ix;
                 }
                 for (0..TOPK) |j| {
                     const local: u32 = @intCast(bi[j]);

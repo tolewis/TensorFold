@@ -44,12 +44,16 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .{ "gemm128", "zig/kernels/xpu/qwen27/gemm.cl", " -DGSZ=128" },
         .{ "gdn", "zig/kernels/xpu/qwen27/gdn_chunk.cl", "" },
         .{ "drafter", "zig/kernels/xpu/qwen27/drafter.cl", "" },
+        // XPU_DRAFT_TP (lane p4-kernel): the drafter of one TP 2 rank, half its heads and half the head's top-k parts.
+        // Built at -Dtp=2 only.
+        .{ "drafter_tp", "zig/kernels/xpu/qwen27/drafter.cl", " -DNH=16 -DNKV=4 -DTOPK_PARTS=128" },
         // Sage-A1.5 (qwen3_5_moe): the same sources at its shape (shape.h); the GEMM and GDN chunk images are shared
         .{ "sage_glue", "zig/kernels/xpu/qwen27/glue.cl", " " ++ sage_config.sage_defines },
         .{ "sage_decode", "zig/kernels/xpu/qwen27/decode.cl", " " ++ sage_config.sage_defines },
         .{ "sage_moe", "zig/kernels/xpu/sage_moe.cl", "" },
         .{ "qwen_vision", "zig/kernels/xpu/qwen_vision.cl", "" },
     }) |k| {
+        if (std.mem.eql(u8, k[0], "drafter_tp") and tp_ranks != 2) continue;
         const c = b.addSystemCommand(&.{ ocloc, "compile", "-q", "-file" });
         c.addFileArg(b.path(k[1]));
         const tp_defs = if (tp_ranks == 2 and tpKernel(k[0])) tp2_defines else "";
@@ -82,7 +86,8 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         run.addArgs(z[2]);
         _ = files.addCopyFile(out, b.fmt("{s}.zebin", .{z[0]}));
     }
-    const embedded = b.createModule(.{ .root_source_file = files.add("xpu_qwen27_kernels.zig",
+    const embedded = b.createModule(.{ .root_source_file = files.add("xpu_qwen27_kernels.zig", b.fmt("{s}{s}", .{
+        if (tp_ranks == 2) "pub const drafter_tp align(8) = @embedFile(\"drafter_tp.bin\").*;\n" else "",
         \\pub const glue align(8) = @embedFile("glue.bin").*;
         \\pub const decode align(8) = @embedFile("decode.bin").*;
         \\pub const k1 align(8) = @embedFile("k1.bin").*;
@@ -104,7 +109,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         \\pub const sage_moe align(8) = @embedFile("sage_moe.bin").*;
         \\pub const qwen_vision align(8) = @embedFile("qwen_vision.bin").*;
         \\
-    ) });
+    })) });
     const ze_mod = zeModule(b, target, optimize);
     const lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const nem = nemotronModules(b, target, optimize, ocloc, device, ze_mod, lanes);

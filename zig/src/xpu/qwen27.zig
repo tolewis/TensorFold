@@ -158,6 +158,12 @@ pub var gdn_bits: u32 = 0;
 /// before bits 16 and 4. 64: dattn_lb1 (the same, one query head a subgroup), before bit 32. 8: at the load, each new kernel against the kernel it replaces on this card (smallk_check.zig), and the
 /// open fails when a token, a list entry or an output bit differs. Default 0.
 pub var smallk: u32 = 0;
+/// XPU_DRAFT_TP=1 (lane p4-kernel, a -Dtp=2 build; default off): both ranks run the DFlash2 drafter, each with half
+/// its heads, half its MLP columns and half its head rows (drafter.zig). Rank 0 writes the drafter's calls as step
+/// records, the follower replays them, and the two meet at two all-reduces a drafter layer and one gather of the
+/// head's top-16 parts. Both ranks need the flag (mode word bit 24) and --drafter. Off: the drafter runs whole on
+/// rank 0, as before.
+pub var draft_tp: bool = false;
 /// XPU_MV (lane p4-k-mv): the decode matvec kernel of a call site, `site:variant` pairs separated by commas
 /// (XPU_MV=mixer_in_gdn:d16,mixer_in_attn:d16). A site is a `Site` name. A variant is a kernel of gemm.cl:
 /// wide sites (the family with no K slices): d16, d64, w8, p0, p4, the same bits as the default. `slice` puts a wide
@@ -429,6 +435,7 @@ pub const Runner = struct {
         if (std.c.getenv("XPU_KV8")) |v| kv8 = try std.fmt.parseInt(i32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_GDN")) |v| gdn_bits = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_SMALLK")) |v| smallk = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+        draft_tp = TP == 2 and (if (std.c.getenv("XPU_DRAFT_TP")) |v| v[0] == '1' else false);
         if (std.c.getenv("XPU_A8_ROT") != null) a8_rot = 1;
         if (std.c.getenv("XPU_A8_SITES4")) |v| a8_sites4 = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_A8_BITS")) |v| a8_levels = if (std.mem.eql(u8, std.mem.span(v), "4")) 7 else 127;
@@ -521,7 +528,7 @@ pub const Runner = struct {
         tp.group = try tp.Group.open(&r.d); // null at TP 1
         if (tp.group) |*g| {
             if (g.rank != 0 and g.readMode() != modeWord()) {
-                std.log.err("rank {d}: the mode word does not match rank 0's: this rank's XPU_KV_POOL, XPU_KEEP_SHARED, XPU_KEPT_HOST, XPU_PARK_GIB, XPU_KV_INT8, XPU_EMBED_HOST, XPU_K1, XPU_K1_TREE, XPU_MULTI_TREE, XPU_K1_R16 or XPU_K1_WAVE diverges, or this rank loads a different weight format (EXL3 or MLX), and the pair sizes its cards differently\n", .{RANK});
+                std.log.err("rank {d}: the mode word does not match rank 0's: this rank's XPU_KV_POOL, XPU_KEEP_SHARED, XPU_KEPT_HOST, XPU_PARK_GIB, XPU_KV_INT8, XPU_EMBED_HOST, XPU_K1, XPU_K1_TREE, XPU_MULTI_TREE, XPU_K1_R16, XPU_K1_WAVE or XPU_DRAFT_TP diverges, or this rank loads a different weight format (EXL3 or MLX), and the pair sizes its cards differently\n", .{RANK});
                 g.markClosed(); // rank 0 sees the closed segment at its first all-reduce and exits at once
                 return error.ModeMismatch;
             }
@@ -1059,6 +1066,9 @@ pub const Runner = struct {
         // drops it makes are step records the follower replays before this call
         const upto: u64 = @as(u64, r.pos) + ids.len;
         if (upto <= r.context) try r.makeRoom(r.slot, @intCast(upto));
+        // XPU_DRAFT_TP: the follower absorbs a pass's taps from the drafter's record after the whole call, so a call
+        // with taps is one forward (the lane host calls a chunk at a time)
+        if (draft_tp and r.taps_on and r.on_taps != null and chunkEnd(0, ids.len) != ids.len) return error.DraftTpChunks;
         if (tp.group) |*g| try g.record(.prompt, @intFromBool(last), 0, 0, ids);
         var at: usize = 0;
         while (at < ids.len) {
@@ -1289,7 +1299,8 @@ pub fn poolPages(r: *Runner, slots: u32, tokens: ?u32, cache: bool, extra: u64) 
 
 /// The run flags a pair must agree on: one bit each for kv_pool, keep_shared, kv_i8, embed_host, k1, k1_tree and
 /// k1 r16, four bits for the k1 wave (XPU_K1_WAVE, a small count), then multi_tree (XPU_MULTI_TREE), then the weight
-/// format (bit 12: MLX), then kept_host (bit 13: XPU_KEPT_HOST), then the host tier (bit 23: XPU_PARK_GIB).
+/// format (bit 12: MLX), then kept_host (bit 13: XPU_KEPT_HOST), then the host tier (bit 23: XPU_PARK_GIB), then the
+/// drafter split (bit 24: XPU_DRAFT_TP).
 pub fn modeWord() u64 {
     var w: u64 = 0;
     w |= @as(u64, @intFromBool(kv_pool));
@@ -1305,6 +1316,7 @@ pub fn modeWord() u64 {
     w |= @as(u64, @intFromBool(kept_host)) << 13; // kept states' copies in host memory: both ranks hold theirs there
     w |= @as(u64, @intFromBool(park_on)) << 23; // idle kept states park in host memory: all ranks, or neither
     w |= @as(u64, @intFromBool(fuse & 1 != 0)) << 14; // XPU_FUSE bit 1: both ranks fuse the exchange into the norm
+    w |= @as(u64, @intFromBool(draft_tp)) << 24; // XPU_DRAFT_TP: both ranks run half the drafter, or neither
     return w;
 }
 
