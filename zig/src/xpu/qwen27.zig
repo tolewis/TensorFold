@@ -148,7 +148,10 @@ pub var kv8: i32 = 0;
 /// (gdn_check.zig), and the open fails when a value differs. 8 (lane p4-k-first): gdn_step2_uc in place of gdn_step2,
 /// the tree states SL past both caches (the same bits). With 4, the check runs gdn_step2_uc. 32 (lane p4-kernel):
 /// gdn_step4 in place of gdn_step2 and gdn_step2_uc, 4 v rows a sub-group and 2 sub-groups a work-group (the same
-/// bits). With 4, the check runs gdn_step4. Default 0.
+/// bits). With 4, the check runs gdn_step4. 64 (lane p4-k-sk1, GS1): commitPath replays every GDN layer in one
+/// gdn_commit4 launch and one conv_commit_ml launch (a table of the layers' addresses, the same bits). With 4, the
+/// check runs them against the launch a layer. 128 (lane p4-k-sk1, GS4): commitPath ends with no wait for the card
+/// (the order proof: Recipe log 2026-11-11 14:37Z). Default 0.
 pub var gdn_bits: u32 = 0;
 /// XPU_SMALLK (lane p4-kernel), bits: small kernels of a round that wait on memory, each with the results of the
 /// kernel it replaces. 1: argmax_part16 in place of argmax_part (the token of each verify row). 2: the drafter's
@@ -293,6 +296,12 @@ pub const Stat = struct {
     syncs: u64 = 0,
     hcopies: u64 = 0, // host-pointer copies of the tree verify and its commit (dev.hostCopy)
     hcopy_s: f64 = 0, // host time inside those calls
+    // lane p4-k-sk1 (GS2, measure only): the lone tree path's verified tree rows, the rows of them with LOAD (the
+    // parent is not the row before), the kept paths, and the paths of rows 0 .. n (no K/V move, no taps copy)
+    tree_rows: u64 = 0,
+    load_rows: u64 = 0,
+    paths: u64 = 0,
+    straight: u64 = 0,
     /// XPU_DR_STEPS=1 (lane p4-k-drt, measure only, default off, rank 0 with XPU_ROUND_STATS): the host time of the
     /// drafter's steps, a sum a step (index: DrStep), and the settles inside the drafter's pass (its exchanges).
     dr_on: bool = false,
@@ -408,6 +417,10 @@ pub const Runner = struct {
     tree_on: bool = false, // the last verified block was a tree (commitPath)
     tree_host: [16 * 17]i32 = @splat(0),
     path_host: [16]i32 = @splat(0),
+    // XPU_GDN bit 64 (lane p4-k-sk1): commitPath's table for gdn_commit4 and conv_commit_ml, 16 words a GDN layer
+    // (k at 1, v, g, beta, the state at 5; the convolution state in at 8, the stash's P, the state out at 10)
+    ctab_host: [LAYERS * 16]u64 = @splat(0),
+    ctab: ?*anyopaque = null, // its copy on the card (made at the load, with the bit)
     ended: bool = false, // lane p4-k-sk1: the engine's close at a stop sets it, so deinit marks the group ended
     slot: u32 = 0, // the selected sequence (select)
     mt_host: [LAYERS * 16 * 8]u64 = @splat(0), // verifyMulti's per-row state addresses, by layer
@@ -634,6 +647,15 @@ pub const Runner = struct {
             std.debug.print("gdn: XPU_GDN={d} (stash in place {s}, gdn_step2 {s}, SL uncached {s}, gdn_step4 {s})\n", .{ gdn_bits, if (gdn_bits & 1 != 0) "on" else "off", if (gdn_bits & 10 != 0 and !four) "on" else "off", if (gdn_bits & 8 != 0 and !four) "on" else "off", if (four) "on" else "off" });
             if (gdn_bits & 4 != 0) try @import("gdn_check.zig").run(d, step1, step2, name); // the two kernels on this card: the same bits
             if (gdn_bits & 42 != 0) d.k.gdn_step = step2;
+            if (gdn_bits & 64 != 0) { // GS1 (lane p4-k-sk1): the commit of every GDN layer in one launch
+                d.k.gdn_commit = try d.kernel(md, "gdn_commit4", 32);
+                d.k.conv_commit_ml = try d.kernel(mg, "conv_commit_ml", 256);
+                try d.g.indirect(d.k.gdn_commit); // the kernels read the layers' addresses from the table
+                try d.g.indirect(d.k.conv_commit_ml);
+                r.ctab = try d.alloc_(LAYERS * 16 * 8);
+                if (gdn_bits & 4 != 0) try @import("gdn_check.zig").commitAll(d, d.k.gdn_step, d.k.conv_commit, d.k.gdn_commit, d.k.conv_commit_ml);
+            }
+            std.debug.print("gdn: commit in one launch (GS1) {s}, no wait after the commit (GS4) {s}\n", .{ if (gdn_bits & 64 != 0) "on" else "off", if (gdn_bits & 128 != 0) "on" else "off" });
         }
         if (smallk != 0) { // lane p4-kernel: one line a rank, the check of the flag (the drafter's kernels: drafter.zig)
             const la: []const u8 = if (smallk & 64 != 0) "dattn_lb1" else if (smallk & 32 != 0) "dattn_lb2" else if (smallk & 16 != 0) "dattn_la2" else if (smallk & 4 != 0) "dattn_la4" else "off";
@@ -1188,12 +1210,18 @@ pub const Runner = struct {
             row[1 + @as(usize, @intCast(row[0]))] = @intCast(t);
             depth_max = @max(depth_max, @as(u32, @intCast(row[0])));
         }
+        var loads: u64 = 0;
         for (1..ids.len) |t| { // LOAD: the parent is not the row before ; SAVE: a child is not the row after
             const p: usize = @intCast(parents[t]);
             if (p + 1 != t) {
                 r.tree_host[t * 17] |= 512;
                 r.tree_host[p * 17] |= 256;
+                loads += 1;
             }
+        }
+        if (stat.on) { // XPU_ROUND_STATS (lane p4-k-sk1, GS2): the tree's rows, and its LOAD rows
+            stat.tree_rows += @intCast(ids.len);
+            stat.load_rows += loads;
         }
         if (r.pos + depth_max + 1 > r.context or r.pos + ids.len > r.context) return error.ContextFull;
         // The draft K/V rows sit at pos + the row index, which reaches ids.len - 1: the tree table's rows past
@@ -1219,10 +1247,40 @@ pub const Runner = struct {
             r.path_host[dd] = @intCast(row);
             straight = straight and row == dd;
         }
+        if (stat.on) { // XPU_ROUND_STATS (lane p4-k-sk1, GS2): kept paths, and those of rows 0 .. n
+            stat.paths += 1;
+            stat.straight += @intFromBool(straight);
+        }
         const rows: i32 = @intCast(path.len);
         try dev.hostCopy(&r.d, r.acts.path, &r.path_host, path.len * 4);
         const nul: ?*anyopaque = null;
-        for (&r.model.layers) |*l| {
+        if (r.ctab) |ctab| { // XPU_GDN bit 64 (GS1): the table of the GDN layers, then one launch for each kernel
+            var n: usize = 0;
+            for (&r.model.layers) |*l| {
+                if (l.attn) {
+                    if (!straight) try r.d.launch(r.d.k.kv_move, .{ .x = ATT_KV_HEADS }, .{ l.kc.?, l.vc.?, @as(i32, @intCast(r.pos)), r.acts.path, rows, kvCap(), r.pt[r.slot] });
+                    continue;
+                }
+                const st = l.stash.?;
+                const e = r.ctab_host[n * 16 ..][0..16];
+                e[1] = @intFromPtr(off(st, ST_K));
+                e[2] = @intFromPtr(off(st, ST_V));
+                e[3] = @intFromPtr(off(st, ST_G));
+                e[4] = @intFromPtr(off(st, ST_B));
+                e[5] = @intFromPtr(l.rec.?);
+                e[8] = @intFromPtr(l.conv[1 - l.conv_cur].?);
+                e[9] = @intFromPtr(off(st, ST_P));
+                e[10] = @intFromPtr(l.conv[l.conv_cur].?);
+                n += 1;
+            }
+            // ctab_host has the order of path_host: written here only, read by this queued copy, and the next
+            // write waits for verifyTree's sync (the GS4 proof, Recipe log 2026-11-11 14:37Z)
+            try dev.hostCopy(&r.d, ctab, &r.ctab_host, n * 16 * 8);
+            prof.site = .gdn_commit;
+            try r.d.launch(r.d.k.gdn_commit, .{ .x = 16, .y = GDN_V_HEADS, .z = @intCast(n) }, .{ ctab, rows, r.acts.path });
+            prof.site = .none;
+            try r.d.launch(r.d.k.conv_commit_ml, .{ .x = GDN_QKV / 256, .y = @intCast(n) }, .{ ctab, rows, r.acts.path });
+        } else for (&r.model.layers) |*l| {
             if (l.attn) {
                 if (!straight) try r.d.launch(r.d.k.kv_move, .{ .x = ATT_KV_HEADS }, .{ l.kc.?, l.vc.?, @as(i32, @intCast(r.pos)), r.acts.path, rows, kvCap(), r.pt[r.slot] });
                 continue;
@@ -1239,7 +1297,10 @@ pub const Runner = struct {
         r.last = r.block[path[path.len - 1]];
         r.block_rows = 0;
         r.tree_on = false;
-        try r.d.sync(); // path_host is read by the queued copy
+        // path_host (and ctab_host) is read by the queued copy. XPU_GDN bit 128 (lane p4-k-sk1, GS4): no wait here.
+        // The next write of path_host is in the next commitPath, which needs tree_on, which only verifyTree sets,
+        // after its sync on this list (the proof: Recipe log 2026-11-11 14:37Z, reviewed by p4-lead)
+        if (gdn_bits & 128 == 0) try r.d.sync();
     }
 
     /// Structured output: each row's greedy token among those its grammar `bits` allow, computed on the device.

@@ -317,6 +317,48 @@ KERNEL(32) void gdn_step4(global const ushort *Q, global const ushort *K, global
       intel_sub_group_block_write8((global uint *)GDN_ROW4(SO, r), as_uint8(sv));
     }
 }
+
+// gdn_commit4 (lane p4-k-sk1, XPU_GDN bit 64, GS1): the commit replay of gdn_step4 (ROWS, no TREE, no MT, the state
+// read and written in place) for every GDN layer in one launch. The layers' commits read their own stash and state,
+// so they do not depend on each other. Grid (16, V heads, layers): z picks the layer's 16 words of LT (q, k, v, g,
+// beta, the state). Each v row keeps the sums and the order of gdn_step4. Y is not written: no command reads a
+// commit's Y (the next forward writes Y before each read), and all layers would write the same Y at once.
+KERNEL(32) void gdn_commit4(global const ulong *LT, int T, global const int *ROWS) {
+  global const ulong *e = LT + (long)get_group_id(2) * 16;
+  global const ushort *K = (global const ushort *)e[1], *V = (global const ushort *)e[2];
+  global const float *G = (global const float *)e[3], *BETA = (global const float *)e[4];
+  global float *S = (global float *)e[5];
+  const int vb = get_group_id(0), h = get_group_id(1), sg = get_sub_group_id();
+  const int kh = h / Q27_GVK;
+  float s[4][8];
+  for (int r = 0; r < 4; r++) {
+    const float8 sv = as_float8(intel_sub_group_block_read8((global const uint *)GDN_ROW4(S, r)));
+    for (int i = 0; i < 8; i++) s[r][i] = sv[i];
+  }
+  for (int t = 0; t < T; t++) {
+    const int row = ROWS[t];
+    const ushort8 kv = intel_sub_group_block_read_us8(K + ((long)row * Q27_GK + kh) * 128);
+    const ushort4 vv = vload4(0, V + ((long)row * Q27_GV + h) * 128 + vb * 8 + sg * 4);
+    float k[8];
+    for (int i = 0; i < 8; i++) k[i] = bf2f(kv[i]);
+    const float g = G[(long)row * Q27_GV + h], beta = BETA[(long)row * Q27_GV + h];
+    for (int r = 0; r < 4; r++) {
+      float mem = 0.0f;
+      for (int i = 0; i < 8; i++) {
+        s[r][i] *= g;
+        mem += s[r][i] * k[i];
+      }
+      mem = sub_group_reduce_add(mem);
+      const float u = (bf2f(vv[r]) - mem) * beta;
+      for (int i = 0; i < 8; i++) s[r][i] += k[i] * u;
+    }
+  }
+  for (int r = 0; r < 4; r++) {
+    float8 sv;
+    for (int i = 0; i < 8; i++) sv[i] = s[r][i];
+    intel_sub_group_block_write8((global uint *)GDN_ROW4(S, r), as_uint8(sv));
+  }
+}
 #undef GDN_ROW4
 
 // Decode attention by key slices: one subgroup per (slice, K/V head and query part, row) handles Q27_QPG query heads

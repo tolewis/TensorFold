@@ -261,6 +261,19 @@ KERNEL(256) void conv_commit(global const half *CIN, global const half *P, globa
   }
 }
 
+// conv_commit_ml (lane p4-k-sk1, XPU_GDN bit 64, GS1): conv_commit for every GDN layer in one launch. Grid
+// (GDN_QKV / 256 groups, layers): y picks the layer's words 8 to 10 of LT (the state in, the stash's P, the state out).
+KERNEL(256) void conv_commit_ml(global const ulong *LT, int keep, global const int *PATH) {
+  global const ulong *e = LT + (long)get_group_id(1) * 16;
+  global const half *CIN = (global const half *)e[8], *P = (global const half *)e[9];
+  global half *COUT = (global half *)e[10];
+  const int c = get_global_id(0);
+  for (int r = 0; r < 3; r++) {
+    const int i = keep + r;                           // row of concat(state, qkv), 3 + keep rows
+    COUT[r * NCONV + c] = i < 3 ? CIN[i * NCONV + c] : P[(long)(PATH ? PATH[i - 3] : i - 3) * Q27_GDN_IN + c];
+  }
+}
+
 // Load-time repack of an MLX projection into the GEMM layout: interleaved nibbles, fp16 scales, biases × 64.
 kernel void repack(global const uint *MW, global const ushort *MS, global const ushort *MB, global uint *W,
                    global half *S, global half *BG, int N, int K, int NT, int n0, int ILV) {

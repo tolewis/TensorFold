@@ -162,6 +162,8 @@ pub const Dev = struct {
         tp_norm_peer: ze.H = null, // the device-direct exchange joined into the norm that follows (XPU_FUSE bit 1)
         tp_consume: ze.H = null, // the consumed counter and the ring's backpressure (TF_TP_DEVFLAG)
         tp_probe: ze.H = null, // the flag lab spin probe (TF_TP_FLAGLAB)
+        gdn_commit: ze.H = null, // XPU_GDN bit 64 (lane p4-k-sk1): every GDN layer's commit replay in one launch
+        conv_commit_ml: ze.H = null, // and every GDN layer's convolution state commit in one launch
         attn_prompt: ze.H,
         attn_prompt8: ze.H,
         embed_dense: ze.H,

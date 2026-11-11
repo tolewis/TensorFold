@@ -173,3 +173,107 @@ pub fn run(d: *Dev, old: ze.H, new: ze.H, name: []const u8) !void {
     std.debug.print("gdn check: {s} against gdn_step, {d} values differ (tree y {d}, {d} saved states {d}; rows y {d}, state {d}; chain y {d}, state {d}; streams y {d}, states {d})\n", .{ name, bad, tree_y, saves, tree_sl, rows_y, rows_s, chain_y, chain_so, mt_y, mt_so });
     if (bad != 0) return error.GdnStep2Differs;
 }
+
+/// XPU_GDN bits 64 and 4 (lane p4-k-sk1, GS1): gdn_commit4 and conv_commit_ml (one launch for every layer, the
+/// addresses from a table) against `step` (the gdn_step in use) and `conv` (conv_commit), a launch a layer, as
+/// Runner.commitPath runs them. Three layers, each with its own inputs and states, a tree path and a straight path.
+/// Every state value and every convolution value must agree, or the open fails.
+pub fn commitAll(d: *Dev, step: ze.H, conv: ze.H, step_ml: ze.H, conv_ml: ze.H) !void {
+    const NL = 3;
+    const NCONV = q.GDN_QKV;
+    const GIN = q.GDN_IN;
+    const nul: ?*anyopaque = null;
+    var held: std.ArrayList(*anyopaque) = .empty;
+    defer {
+        for (held.items) |p| d.g.free(p);
+        held.deinit(alloc);
+    }
+    const Layer = struct { k: *anyopaque, v: *anyopaque, g: *anyopaque, b: *anyopaque, p: *anyopaque, cin: *anyopaque, st: []f32 };
+    var lay: [NL]Layer = undefined;
+    const sts = try alloc.alloc(f32, NL * STATE);
+    defer alloc.free(sts);
+    const qk = try alloc.alloc(u16, LONG * HK * 128);
+    defer alloc.free(qk);
+    for (qk) |*x| x.* = bf16(next() * 0.09);
+    const Q = try put(d, u16, qk); // the launch a layer computes Y from q: one q for all layers (Y is not compared)
+    try held.append(alloc, Q);
+    const v = try alloc.alloc(u16, LONG * HV * 128);
+    defer alloc.free(v);
+    const gb = try alloc.alloc(f32, LONG * HV);
+    defer alloc.free(gb);
+    const ph = try alloc.alloc(f16, LONG * GIN);
+    defer alloc.free(ph);
+    const ch = try alloc.alloc(f16, 3 * NCONV);
+    defer alloc.free(ch);
+    for (&lay, 0..) |*l, li| {
+        for (qk) |*x| x.* = bf16(next() * 0.09);
+        l.k = try put(d, u16, qk);
+        try held.append(alloc, l.k);
+        for (v) |*x| x.* = bf16(next());
+        l.v = try put(d, u16, v);
+        try held.append(alloc, l.v);
+        for (gb) |*x| x.* = 0.95 + 0.05 * next();
+        l.g = try put(d, f32, gb);
+        try held.append(alloc, l.g);
+        for (gb) |*x| x.* = 0.5 + 0.5 * next();
+        l.b = try put(d, f32, gb);
+        try held.append(alloc, l.b);
+        for (ph) |*x| x.* = @floatCast(next());
+        l.p = try put(d, f16, ph);
+        try held.append(alloc, l.p);
+        for (ch) |*x| x.* = @floatCast(next());
+        l.cin = try put(d, f16, ch);
+        try held.append(alloc, l.cin);
+        l.st = sts[li * STATE ..][0..STATE];
+        for (l.st) |*x| x.* = next() * 0.5;
+    }
+    const y = try room(d, LONG * HV * 128 * 2);
+    try held.append(alloc, y);
+    const Case = struct { path: []const i32, what: []const u8 };
+    const cases = [_]Case{ .{ .path = &.{ 0, 4, 13, 14 }, .what = "a tree path" }, .{ .path = &.{ 0, 1, 2, 3, 4 }, .what = "a straight path" } };
+    var bad: usize = 0;
+    for (cases) |c| {
+        const PATH = try put(d, i32, c.path);
+        try held.append(alloc, PATH);
+        const rows: i32 = @intCast(c.path.len);
+        var s: [2][NL]*anyopaque = undefined; // 0: a launch a layer, 1: one launch
+        var co: [2][NL]*anyopaque = undefined;
+        for (0..2) |w| for (&lay, 0..) |*l, i| {
+            s[w][i] = try put(d, f32, l.st);
+            try held.append(alloc, s[w][i]);
+            co[w][i] = try room(d, 3 * NCONV * 2);
+            try held.append(alloc, co[w][i]);
+            try d.fill(co[w][i], @as(u16, 0x7E00), 3 * NCONV * 2); // NaN where a kernel writes nothing
+        };
+        for (&lay, 0..) |*l, i| {
+            try d.launch(step, .{ .x = 16, .y = HV }, .{ Q, l.k, l.v, l.g, l.b, s[0][i], s[0][i], y, rows, PATH, nul, nul, nul });
+            try d.launch(conv, .{ .x = NCONV / 256 }, .{ l.cin, l.p, co[0][i], rows, PATH });
+        }
+        var tab: [NL * 16]u64 = @splat(0);
+        for (&lay, 0..) |*l, i| {
+            const e = tab[i * 16 ..][0..16];
+            e[1] = @intFromPtr(l.k);
+            e[2] = @intFromPtr(l.v);
+            e[3] = @intFromPtr(l.g);
+            e[4] = @intFromPtr(l.b);
+            e[5] = @intFromPtr(s[1][i]);
+            e[8] = @intFromPtr(l.cin);
+            e[9] = @intFromPtr(l.p);
+            e[10] = @intFromPtr(co[1][i]);
+        }
+        const LT = try put(d, u64, &tab);
+        try held.append(alloc, LT);
+        try d.launch(step_ml, .{ .x = 16, .y = HV, .z = NL }, .{ LT, rows, PATH });
+        try d.launch(conv_ml, .{ .x = NCONV / 256, .y = NL }, .{ LT, rows, PATH });
+        try d.sync();
+        var n: usize = 0;
+        for (0..NL) |i| {
+            n += try differ(d, u32, s[0][i], s[1][i], STATE);
+            n += try differ(d, u16, co[0][i], co[1][i], 3 * NCONV);
+        }
+        if (n != 0) std.debug.print("gdn check: gdn_commit4 and conv_commit_ml, {s}: {d} values differ\n", .{ c.what, n });
+        bad += n;
+    }
+    std.debug.print("gdn check: gdn_commit4 and conv_commit_ml against a launch a layer, {d} layers, {d} paths, {d} values differ\n", .{ NL, cases.len, bad });
+    if (bad != 0) return error.GdnCommitDiffers;
+}

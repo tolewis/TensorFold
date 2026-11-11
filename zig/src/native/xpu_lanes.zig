@@ -659,6 +659,16 @@ pub const Lanes = struct {
             @as(f64, @floatFromInt(xq.stat.hcopies)) / n,
             xq.stat.hcopy_s * 1e3 / n,
         });
+        if (xq.stat.paths > 0) { // lane p4-k-sk1 (GS2): the lone tree path's rows and paths of the same rounds
+            const paths: f64 = @floatFromInt(xq.stat.paths);
+            std.debug.print("tree stats: {d} rounds, {d} paths, tree rows {d:.2} a path, LOAD rows {d:.2} a path, straight paths {d:.1} %\n", .{
+                rs.rounds,
+                xq.stat.paths,
+                @as(f64, @floatFromInt(xq.stat.tree_rows)) / paths,
+                @as(f64, @floatFromInt(xq.stat.load_rows)) / paths,
+                @as(f64, @floatFromInt(xq.stat.straight)) * 100.0 / paths,
+            });
+        }
         if (xq.stat.dr_on) { // XPU_DR_STEPS (lane p4-k-drt): the drafter's host steps of the same rounds
             const s = xq.stat.dr_s;
             const ms = 1e3 / n;
