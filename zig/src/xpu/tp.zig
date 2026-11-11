@@ -107,6 +107,9 @@ var one_slot = false;
 var trace = false;
 var devflag = false; // TF_TP_DEVFLAG: the device-flag all-reduce (default off)
 var evmode = false; // TF_TP_DEVFLAG=2: the flag wait is a counter based driver event, not a kernel poll
+/// TF_TP_DEVFLAG=3 and 4 (lane p4-k-ex, package EX): the push exchange with the event wait and no consumed counter.
+/// 3: the flag is a driver store (zexCommandListAppendWriteToMemory). 4: the flag is an 8-byte copy, as in 2.
+var exmode: u8 = 0;
 
 /// A peer that dies in the handshake closes its end: without a timeout the surviving rank blocks in recvFds forever.
 /// 180 s matches every other deadline: the device-flag self test builds a kernel on the first open and the other rank
@@ -277,6 +280,8 @@ pub const Group = struct {
     ev: bool = false,
     evs: std.ArrayListUnmanaged(ze.H) = .empty,
     ev_max: u64 = 0,
+    /// TF_TP_DEVFLAG=3 or 4 (lane p4-k-ex): the EX exchange (exPush), with `ev` set. 0: off.
+    ex: u8 = 0,
 
     /// The generation rank 0 published after it reset every shared word. 0: no rank has published one yet.
     fn genWord(g: *const Group) *std.atomic.Value(u64) {
@@ -398,12 +403,15 @@ pub const Group = struct {
         trace = std.c.getenv("TF_TP_TRACE") != null;
         devflag = false;
         evmode = false;
-        // TF_TP_DEVFLAG: 0 off, 1 the kernel poll, 2 the counter based event; unset is off. The value is parsed, so
-        // the WP1 rollback (TF_TP_DEVFLAG=0 in both env files) really turns the path off.
+        exmode = 0;
+        // TF_TP_DEVFLAG: 0 off, 1 the kernel poll, 2 the counter based event, 3 and 4 the EX exchange (lane p4-k-ex);
+        // unset is off. The value is parsed, so the WP1 rollback (TF_TP_DEVFLAG=0 in both env files) really turns the
+        // path off.
         if (std.c.getenv("TF_TP_DEVFLAG")) |v| {
             const s = std.mem.span(v);
             if (s.len == 0 or s[0] != '0') devflag = true;
-            evmode = s.len > 0 and s[0] == '2';
+            exmode = if (s.len > 0 and (s[0] == '3' or s[0] == '4')) s[0] - '0' else 0;
+            evmode = s.len > 0 and (s[0] == '2' or exmode != 0);
         }
         record_wait = 180.0;
         if (std.c.getenv("TF_TP_RECORD_WAIT")) |v| {
@@ -500,7 +508,7 @@ pub const Group = struct {
             },
         };
         if (std.c.getenv("TF_TP_FLAGLAB") != null or evmode) g.lab_conn = conn; // the lab steps on the socket at load; the event mode resets its words on it
-        std.log.info("qwen27-xpu: TP {d} rank {d}: all-reduce {s}", .{ g.tp, g.rank, if (g.devflag) "device-flag (the peer's slot pushed over PCIe, the add polls a flag)" else if (g.direct) "device-direct (the peer's slots over PCIe)" else "host-staged" });
+        std.log.info("qwen27-xpu: TP {d} rank {d}: all-reduce {s}", .{ g.tp, g.rank, if (g.ex == 3) "EX (TF_TP_DEVFLAG=3: the partial pushed over PCIe, the flag a driver store, the wait a counter based event)" else if (g.ex == 4) "EX (TF_TP_DEVFLAG=4: the partial pushed over PCIe, the flag a copy, the wait a counter based event)" else if (g.devflag) "device-flag (the peer's slot pushed over PCIe, the add polls a flag)" else if (g.direct) "device-direct (the peer's slots over PCIe)" else "host-staged" });
         return g;
     }
 
@@ -632,6 +640,12 @@ pub const Group = struct {
         const n: usize = @as(usize, rows) * D;
         g.seq += 1;
         if (g.devflag) {
+            if (g.ex != 0) { // TF_TP_DEVFLAG=3, 4 (lane p4-k-ex): the push, the flag, the event wait, then tp_add
+                const peer = try g.exPush(d, partial, n);
+                // the own partial first and the peer's second, as tp_add(partial, dslot, pbuf) of the direct path
+                try d.launch(d.k.tp_add, .{ .x = @intCast((n + 255) / 256) }, .{ partial, partial, peer, @as(i32, @intCast(n)) });
+                return;
+            }
             if (g.ev) { // TF_TP_DEVFLAG=2: the wait is a counter based event (spec WP1, "Second design")
                 if (g.seq > g.ev_max) try g.resetWords(d); // the completion value stays under the driver's maximum
                 const par: usize = @intCast(g.seq % 2);
@@ -704,10 +718,11 @@ pub const Group = struct {
     /// that buffer as PEER, so the sum has the same bits as tp_add and the norm after it.
     /// TP 3 and TP 4: the same steps and one pbuf a peer; the caller's kernel takes the N-1 peer partials.
     pub fn allReducePeer(g: *Group, d: *Dev, partial: *anyopaque, rows: u32) !*anyopaque {
-        if (!g.direct) return error.NotDirect;
+        if (!g.peerPath()) return error.NotDirect;
         if (rows > rows_max) return error.TooManyRows;
         const n: usize = @as(usize, rows) * D;
         g.seq += 1;
+        if (g.ex != 0) return g.exPush(d, partial, n); // lane p4-k-ex: the peer's partial in this rank's block
         const par: usize = @intCast(g.seq % 2);
         try dev.copy(d, g.dslot[par], partial, n * 2);
         d.settle();
@@ -721,6 +736,126 @@ pub const Group = struct {
         if (q.stat.on) q.stat.peer_s += q.now() - w0;
         try dev.copy(d, g.pbuf[par], g.peer[par].?, n * 2); // over PCIe, on the in-order list
         return g.pbuf[par];
+    }
+
+    /// allReducePeer works in this mode: the device-direct path, or the EX exchange (TF_TP_DEVFLAG=3, 4). The
+    /// device-flag modes 1 and 2 have no raw exchange (forward.zig takes allReduceNorm there).
+    pub fn peerPath(g: *const Group) bool {
+        return g.direct and (!g.devflag or g.ex != 0);
+    }
+
+    /// TF_TP_DEVFLAG=3 and 4 (lane p4-k-ex, package EX). `g.seq` is this exchange's number. On this rank's in-order
+    /// list: the push of the partial into this rank's slot of the peer's block (one copy, parity seq % 2), the flag
+    /// (this rank's flag word in the peer's block takes seq: a driver store in mode 3, an 8-byte copy in mode 4),
+    /// then the wait for the peer's flag in this rank's block (a counter based event, device scope, completion value
+    /// seq), which also makes the peer's pushed slot visible. Returns that slot. No consumed counter: the peer's push
+    /// of exchange s + 2 into slot s % 2 is queued after its wait for this rank's flag s + 1, and this rank writes
+    /// that flag after every command it queued before exchange s + 1. So the rule for callers: a pushed slot is read
+    /// only by commands queued before this rank's next exchange.
+    /// TP 3 and TP 4: one slot pair and one flag word pair a sender in each block, N - 1 pushes, flags and events,
+    /// and an add over the N partials in rank order (fp32, one rounding). This build opens two ranks only.
+    fn exPush(g: *Group, d: *Dev, partial: *anyopaque, n: usize) !*anyopaque {
+        if (g.seq > g.ev_max) try g.resetWords(d); // the completion value stays under the driver's maximum
+        const par: usize = @intCast(g.seq % 2);
+        g.stampAlive(); // the pair's liveness rule, as the other paths stamp it
+        const pb = g.peer_blk.?;
+        try dev.copy(d, off(pb, par * slot_bytes), partial, n * 2); // the push: posted writes over PCIe
+        const flag = off(pb, blk_flag + par * 8);
+        if (g.ex == 3) {
+            const desc: ze.ZexWriteDesc = .{ .writeScope = 4 }; // host scope: the word is on the peer, outside this device
+            try ze.check(d.g.zex_write.?(d.list, &desc, flag, g.seq));
+        } else {
+            const hi: usize = @intCast(g.seq % fh_ring);
+            g.fh[hi] = g.seq;
+            try dev.copy(d, flag, @ptrCast(&g.fh[hi]), 8);
+        }
+        var wa = [1]ze.H{try g.newEvent(d, off(g.blk.?, blk_flag + par * 8), g.seq)};
+        try ze.check(d.g.api.zeCommandListAppendWaitOnEvents(d.list, 1, &wa));
+        return off(g.blk.?, par * slot_bytes);
+    }
+
+    /// TF_TP_FLAGLAB=6 (lane p4-k-ex, package EX, lab E6): the EX exchange's order test with the real exPush. Each
+    /// exchange e: a fill of this rank's partial with e6Pat(rank, e) (on the list), allReducePeer, then a copy of the
+    /// peer's slot to a host ring. A settle each ring, then the host compares each word with e6Pat(peer, e). A flag
+    /// that lands before the push's data shows the older push (e - 2, "stale"); a push that overwrites a slot the
+    /// rank still reads shows a newer one (e + 2, "ahead"). In every other batch one rank queues with a 100 us sleep
+    /// after each exchange, so the other rank's wait is armed before the flag lands. Runs: 1 row x 2,000, 16 rows
+    /// x 10,000 (the bar: 0 bad slots), and min(maxRows, 512) rows x 300.
+    fn labE6(g: *Group, d: *Dev, partial: *anyopaque) !void {
+        const P = "flaglab rank {d}: ";
+        const rank = g.rank;
+        if (g.ex == 0) {
+            std.debug.print(P ++ "E6 skipped: the group did not open in the EX mode (TF_TP_DEVFLAG=3 or 4)\n", .{rank});
+            return;
+        }
+        // the reset, as E4: this rank's flag words and g.seq, then one byte each way
+        const zero = try d.g.hostAlloc(64);
+        @memset(@as([*]u8, @ptrCast(zero))[0..64], 0);
+        try labCopy(d, off(g.blk.?, blk_flag), zero, 32);
+        g.seq = 0;
+        var b: u8 = 6;
+        try sendByte(g.lab_conn, b);
+        try recvByte(g.lab_conn, &b);
+        const peer_r: u32 = 1 - rank;
+        const big: u32 = @min(q.maxRows(), 512);
+        const Run = struct { rows: u32, n: u64, ring: usize };
+        const runs = [_]Run{ .{ .rows = 1, .n = 2000, .ring = 64 }, .{ .rows = 16, .n = 10_000, .ring = 64 }, .{ .rows = big, .n = 300, .ring = 8 } };
+        const pats = @as([*]u32, @ptrCast(@alignCast(try d.g.hostAlloc(64 * 4)))); // the fill values, kept to the settle
+        for (runs) |run| {
+            const words: usize = @as(usize, run.rows) * D / 2; // u32 words in the slot's rows x D fp16
+            const bytes = words * 4;
+            const ring = @as([*]u32, @ptrCast(@alignCast(try d.g.hostAlloc(run.ring * bytes))));
+            var bad_slots: u64 = 0;
+            var bad_words: u64 = 0;
+            var stale: u64 = 0;
+            var ahead: u64 = 0;
+            var f_e: u64 = 0;
+            var f_w: usize = 0;
+            var f_got: u32 = 0;
+            const t0 = q.now();
+            var e0: u64 = 0;
+            while (e0 < run.n) {
+                const batch: usize = @intCast(@min(run.ring, run.n - e0));
+                const slow = (e0 / run.ring) % 2 == rank; // this rank queues slowly, so the peer's wait is armed first
+                for (0..batch) |k| {
+                    const e = e0 + k;
+                    pats[k] = e6Pat(rank, e);
+                    try ze.check(d.g.api.zeCommandListAppendMemoryFill(d.list, partial, @ptrCast(&pats[k]), 4, bytes, null, 0, null));
+                    const peer = try g.allReducePeer(d, partial, run.rows);
+                    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, @ptrCast(ring + k * words), peer, bytes, null, 0, null));
+                    if (slow) {
+                        var ts: std.c.timespec = .{ .sec = 0, .nsec = 100_000 };
+                        _ = std.c.nanosleep(&ts, null);
+                    }
+                }
+                d.settle();
+                try g.check(d); // gives back the batch's events
+                for (0..batch) |k| {
+                    const e = e0 + k;
+                    const want = e6Pat(peer_r, e);
+                    var nb: u64 = 0;
+                    for (ring[k * words .. (k + 1) * words], 0..) |w, j| {
+                        if (w == want) continue;
+                        if (nb == 0 and bad_slots == 0) {
+                            f_e = e;
+                            f_w = j;
+                            f_got = w;
+                        }
+                        nb += 1;
+                        if (e >= 2 and w == e6Pat(peer_r, e - 2)) stale += 1 else if (w == e6Pat(peer_r, e + 2)) ahead += 1;
+                    }
+                    if (nb > 0) bad_slots += 1;
+                    bad_words += nb;
+                }
+                e0 += batch;
+            }
+            const wall = q.now() - t0;
+            std.debug.print(P ++ "E6 mode {d} rows {d} exchanges {d} bad slots {d} bad words {d} (stale {d}, ahead {d}) wall {d:.1} ms, {d:.1} us an exchange\n", .{ rank, g.ex, run.rows, run.n, bad_slots, bad_words, stale, ahead, wall * 1e3, wall / @as(f64, @floatFromInt(run.n)) * 1e6 });
+            if (bad_slots > 0) std.debug.print(P ++ "E6 first bad: exchange {d} word {d} got 0x{x} want 0x{x}\n", .{ rank, f_e, f_w, f_got, e6Pat(peer_r, f_e) });
+            b = 7;
+            try sendByte(g.lab_conn, b); // the runs start together
+            try recvByte(g.lab_conn, &b);
+        }
     }
 
     /// The mixer's exchange fused into the residual add and norm that reads the reduced tensor once
@@ -928,16 +1063,22 @@ pub const Group = struct {
             g.own_cons = try d.g.deviceAlloc(64);
             const list = try d.g.immediate(0, 0);
             // 1: the kernel poll (TF_TP_DEVFLAG=1); 3: the counter based event (TF_TP_DEVFLAG=2, needs the loader's
-            // event symbols); 2: the self test failed and both ranks take the host path.
-            mode = if (try g.selfTest(d, list, conn)) (if (evmode and d.g.cbapi != null) 3 else 1) else 2;
+            // event symbols); 2: the self test failed and both ranks take the host path. 5 and 6: the EX exchange
+            // (TF_TP_DEVFLAG=3 and 4, lane p4-k-ex). 5 needs the driver's store; without it the rank says 2.
+            const ok = try g.selfTest(d, list, conn);
+            const ev_ok = evmode and d.g.cbapi != null;
+            if (exmode == 3 and d.g.zex_write == null) std.log.warn("qwen27-xpu: TP rank {d}: TF_TP_DEVFLAG=3 needs the driver's zexCommandListAppendWriteToMemory, which it does not give", .{g.rank});
+            if (exmode != 0 and !ev_ok) std.log.warn("qwen27-xpu: TP rank {d}: TF_TP_DEVFLAG={d} needs the counter based event symbols", .{ g.rank, exmode });
+            mode = if (!ok) 2 else if (exmode == 3) (if (ev_ok and d.g.zex_write != null) 5 else 2) else if (exmode == 4) (if (ev_ok) 6 else 2) else if (ev_ok) 3 else 1;
         }
         var peer_mode: u8 = 0;
         try sendByte(conn, mode);
         try recvByte(conn, &peer_mode);
-        if ((mode == 1 or mode == 3) and peer_mode == mode) {
+        if ((mode == 1 or mode == 3 or mode == 5 or mode == 6) and peer_mode == mode) {
             g.devflag = true;
             g.direct = true;
-            if (mode == 3) {
+            if (mode == 5 or mode == 6) g.ex = mode - 2; // 3 the store, 4 the copy
+            if (mode >= 3) {
                 const cb = d.g.cbapi.?;
                 var maxv: u64 = 0;
                 if (cb.zeDeviceGetCounterBasedEventMaxValue(d.g.device, &maxv) != 0) maxv = std.math.maxInt(u32);
@@ -1012,6 +1153,12 @@ pub const Group = struct {
     pub fn flagLab(g: *Group, d: *Dev, partial: *anyopaque) !void {
         const P = "flaglab rank {d}: ";
         const rank = g.rank;
+        // TF_TP_FLAGLAB=6 (lane p4-k-ex): E6 only, then the process ends.
+        if (std.c.getenv("TF_TP_FLAGLAB")) |v| if (v[0] == '6') {
+            g.labE6(d, partial) catch |e| std.debug.print(P ++ "E6 ended on {s}\n", .{ rank, @errorName(e) });
+            std.debug.print(P ++ "done\n", .{rank});
+            std.process.exit(0);
+        };
         const conn = g.lab_conn;
         const forms = [_]i32{ 0, 1, 2 };
         const out = try d.g.deviceAlloc(64); // the probe's result (four words)
@@ -1269,6 +1416,11 @@ pub const Group = struct {
         std.process.exit(0);
     }
 };
+
+/// The E6 lab's pattern for rank `r`'s push of exchange `e` (counted from 0 in each run).
+fn e6Pat(r: u32, e: u64) u32 {
+    return 0xA500_0000 | (r << 20) | @as(u32, @intCast(e & 0xF_FFFF));
+}
 
 const cmsg_space = ((@sizeOf(linux.cmsghdr) + 2 * 4 + 7) / 8) * 8; // a control message with two fds
 

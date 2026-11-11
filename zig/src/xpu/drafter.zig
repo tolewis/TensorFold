@@ -251,7 +251,7 @@ pub const Drafter = struct {
         const split = q.draft_tp;
         if (split) {
             const g = if (tp.group) |*x| x else return error.DraftTpNoGroup;
-            if (!g.direct or g.devflag) return error.DraftTpNeedsDirect; // the gather is allReducePeer's raw copy
+            if (!g.peerPath()) return error.DraftTpNeedsDirect; // the gather is allReducePeer's raw copy (direct or EX)
         }
         const img: []const u8 = if (comptime q.TP == 2) (if (split) &kb.drafter_tp else &kb.drafter) else &kb.drafter;
         const m = try d.g.module(img);

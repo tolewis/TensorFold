@@ -629,10 +629,10 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
         q.prof.site = .none;
         if (!wide) try mvPre(d, a, 0, l.gu, T);
         if (ranks.group) |*g| { // TP: the ranks' partial out-projections summed
-            if (!wide and g.devflag) { // TF_TP_DEVFLAG: the add fused into the residual add and norm below
+            if (!wide and g.devflag and g.ex == 0) { // TF_TP_DEVFLAG 1, 2: the add fused into the residual add and norm below
                 try g.allReduceNorm(d, a.r, T, .{ .x = a.x, .w = l.post_norm, .h = a.h, .ahi = a.ahi, .alo = a.alo, .a8 = q8a, .sa = q8s, .ms = q8ms, .eps = EPS, .has_r = 1, .gs = gs, .rot = q.rot_on });
                 fused = true;
-            } else if (fuse1 and g.direct) { // XPU_FUSE bit 1: the same add and norm on the device-direct path
+            } else if (fuse1 and g.peerPath()) { // XPU_FUSE bit 1: the same add and norm on the device-direct or EX path
                 const peer = try g.allReducePeer(d, a.r, T);
                 try mvPre(d, a, 1, l.gu, T);
                 try dirtyProbe(d);
@@ -664,7 +664,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
             // tap and dump read r before that norm, so their layers keep the separate add
             const keep_r = (mode.taps and tap_here) or (q.dump_dir != null and p0 == 0 and i < 4);
             const has_norm = i + 1 < LAYERS or want or q.dump_h != null; // a norm follows this exchange
-            if (fuse1 and g.direct and !g.devflag and !keep_r and has_norm) {
+            if (fuse1 and g.peerPath() and !keep_r and has_norm) {
                 pend = try g.allReducePeer(d, a.r, T);
             } else try g.allReduce(d, a.r, T);
         }

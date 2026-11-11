@@ -25,6 +25,8 @@ pub const Api = struct {
     zeCommandListAppendLaunchKernel: *const fn (H, H, *const GroupCount, H, u32, ?[*]H) callconv(.c) u32,
     zeCommandListAppendMemoryCopy: *const fn (H, ?*anyopaque, ?*const anyopaque, usize, H, u32, ?[*]H) callconv(.c) u32,
     zeCommandListAppendBarrier: *const fn (H, H, u32, ?[*]H) callconv(.c) u32,
+    zeCommandListAppendWaitOnEvents: *const fn (H, u32, [*]H) callconv(.c) u32, // list, count, events (TF_TP_DEVFLAG=3, 4)
+    zeCommandListAppendMemoryFill: *const fn (H, ?*anyopaque, *const anyopaque, usize, usize, H, u32, ?[*]H) callconv(.c) u32, // the E6 lab
     zeMemAllocDevice: *const fn (H, *const DeviceAllocDesc, usize, usize, H, *?*anyopaque) callconv(.c) u32,
     zeMemAllocHost: *const fn (H, *const HostAllocDesc, usize, usize, *?*anyopaque) callconv(.c) u32,
     zeMemFree: *const fn (H, ?*anyopaque) callconv(.c) u32,
@@ -108,6 +110,18 @@ pub const CbApi = struct {
 pub const CbEventDesc = extern struct { stype: u32 = 0x0002003A, pNext: ?*const anyopaque = null, flags: u32 = 1, signal: u32 = 0, wait: u32 = 0 };
 /// ze_event_counter_based_external_sync_allocation_desc_t, passed as pNext of CbEventDesc.
 pub const CbExternalSync = extern struct { stype: u32 = 0x0002003B, pNext: ?*const anyopaque = null, deviceAddress: ?*u64 = null, hostAddress: ?*u64 = null, completionValue: u64 = 0 };
+
+/// The loader's entry to a driver's extension functions (lane p4-k-ex). Optional, as CbApi.
+pub const ExtApi = struct {
+    zeDriverGetExtensionFunctionAddress: *const fn (H, [*:0]const u8, *?*anyopaque) callconv(.c) u32, // driver, name, out
+};
+/// zex_write_to_mem_desc_t of the Intel driver (compute-runtime `driver_experimental/zex_common.h`): one u32,
+/// writeScope, a zex_mem_action_scope_flags_t (1 sub-device, 2 device, 4 host). No stype, no pNext.
+pub const ZexWriteDesc = extern struct { writeScope: u32 = 2 };
+/// zexCommandListAppendWriteToMemory(list, desc, ptr, data): a barrier with a post-sync write of the 64-bit
+/// immediate `data` at `ptr`, no kernel and no read (TF_TP_DEVFLAG=3, the flag of the EX exchange). On an in-order
+/// list the driver puts the wait for the previous command before it (cmdlist_hw.inl, appendWriteToMemory).
+pub const ZexWrite = *const fn (H, *const ZexWriteDesc, ?*anyopaque, u64) callconv(.c) u32;
 
 pub const DeviceProperties = extern struct {
     stype: u32 = 0x00020006, // ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES_1_2: timerResolution in cycles per second
@@ -212,6 +226,7 @@ pub const Gpu = struct {
     lib: std.DynLib,
     api: Api,
     cbapi: ?CbApi = null, // the counter based event entries; null on a loader that lacks them
+    zex_write: ?ZexWrite = null, // zexCommandListAppendWriteToMemory of the driver; null when the driver lacks it
     driver: H,
     device: H,
     context: H,
@@ -297,7 +312,14 @@ pub const Gpu = struct {
                 }
                 var ctx: H = null;
                 try check(api.zeContextCreate(drv, &.{}, &ctx));
-                return .{ .lib = lib, .api = api, .cbapi = cbapi, .driver = drv, .device = dev, .context = ctx, .props = p };
+                var zw: ?ZexWrite = null; // lane p4-k-ex: only TF_TP_DEVFLAG=3 calls it
+                if (resolveOptional(ExtApi, &lib)) |x| {
+                    var fp: ?*anyopaque = null;
+                    if (x.zeDriverGetExtensionFunctionAddress(drv, "zexCommandListAppendWriteToMemory", &fp) == 0) {
+                        if (fp) |f| zw = @ptrCast(f);
+                    }
+                }
+                return .{ .lib = lib, .api = api, .cbapi = cbapi, .zex_write = zw, .driver = drv, .device = dev, .context = ctx, .props = p };
             }
         }
         return error.NoDevice;
