@@ -554,7 +554,7 @@ pub const Kv = struct {
     /// lanes.prefillFn's placement (shard-parts.md's six steps): plan; `full` applied (its refusals counted once a
     /// request) and error.ContextFull; `relocate` applied, sent, its move run and finished, then planned again;
     /// `placed` applied, sent, its ops acted on in order. `source`: the kept state it resumes from (lanes checked it
-    /// usable), `patient`: held(source) and lanes' wait clock still runs.
+    /// usable), `patient`: lanes' wait clock (held_wait_ns) still runs for source.
     pub fn admit(kv: *Kv, key: usize, tag: u64, slot: u32, size: usize, source: ?u64, patient: bool) !Admitted {
         try kv.start();
         const id = try kv.idFor(key, tag);
@@ -615,25 +615,41 @@ pub const Kv = struct {
     /// A spill restore's destination (lanes.spillReserve, TF_DS_KV_SHARD with the spill tier): a hold of `want` rows
     /// in `part` (the point's recorded part: its owner holds the codes there) when that fits without staling a kept
     /// state, else of `min` (the point's rows) staling there only (planRestore's evictions, its stage ops first), applied,
-    /// sent and acted on. The hold, `id` (the restore's Snap), is invisible until `restored` or `unhold`.
-    /// error.ContextFull, nothing changed or sent, when the part has no room at all.
+    /// sent and acted on. The hold, `id` (the restore's Snap), is invisible until `restored` or `unhold`. A part that
+    /// evictions cannot free has a live stream moved away first when that frees it (planRestore's `relocate`: applied,
+    /// sent, its move run and finished, then planned again), max_relocations at most, as `place` does for an admission.
+    /// error.ContextFull, nothing more changed or sent, when the part still has no room.
     pub fn restore(kv: *Kv, id: u64, want: usize, min: usize, part: u8) !struct { base: usize, size: usize } {
         try kv.start();
         if (min == 0 or want < min) return error.BadSize;
-        var size = @min(want, kv.planner.part_rows);
-        var plan = try kv.planner.planRestore(kv.gpa, id, size, part);
-        defer plan.deinit(kv.gpa);
-        if (size > min and (plan.status != .placed or staling(&plan))) {
-            plan.deinit(kv.gpa);
-            plan = .{};
-            size = min;
-            plan = try kv.planner.planRestore(kv.gpa, id, size, part);
+        var relocations: usize = 0;
+        while (true) {
+            var size = @min(want, kv.planner.part_rows);
+            var plan = try kv.planner.planRestore(kv.gpa, id, size, part);
+            defer plan.deinit(kv.gpa);
+            if (size > min and (plan.status != .placed or staling(&plan))) {
+                plan.deinit(kv.gpa);
+                plan = .{};
+                size = min;
+                plan = try kv.planner.planRestore(kv.gpa, id, size, part);
+            }
+            switch (plan.status) {
+                .full => return error.ContextFull,
+                .relocate => {
+                    if (relocations == max_relocations) return error.ContextFull;
+                    relocations += 1;
+                    const sent = try kv.applyPlan(&plan);
+                    _ = try kv.runOps(plan.ops.items, sent);
+                    kv.counts.relocations += 1;
+                },
+                .placed => {
+                    const sent = try kv.applyPlan(&plan);
+                    errdefer if (!kv.ended()) kv.unhold(id) catch |err| std.log.warn("dsv41: a failed restore kept its part's hold: {s}", .{@errorName(err)});
+                    _ = try kv.runOps(plan.ops.items, sent);
+                    return .{ .base = plan.base, .size = size };
+                },
+            }
         }
-        if (plan.status != .placed) return error.ContextFull;
-        const sent = try kv.applyPlan(&plan);
-        errdefer if (!kv.ended()) kv.unhold(id) catch |err| std.log.warn("dsv41: a failed restore kept its part's hold: {s}", .{@errorName(err)});
-        _ = try kv.runOps(plan.ops.items, sent);
-        return .{ .base = plan.base, .size = size };
     }
 
     fn staling(plan: *const parts.Plan) bool {
@@ -1606,6 +1622,66 @@ test "spill + shard: a restore holds rows in the recorded part on both ranks, fa
     try testing.expect(c.resumed and c.mode != .fresh);
     try p.same();
     try p.kv.release(c.id);
+}
+
+test "spill + shard: a restore whose part only a live move frees moves the decoding stream away first on both ranks, then holds" {
+    const gpa = testing.allocator;
+    const p = try Pair.init(gpa, sharded, .{ .twins = false });
+    defer p.deinit();
+    const half = sharded.cap / 2;
+    // part 0: x (14 blocks at 0, 18 free); part 1: z (10 blocks, 22 free). A 20-block restore into part 0 fits only
+    // with x gone, and part 1 has room for x and its headroom.
+    const x = try p.kv.admit(1, 1, 0, 14 * C, null, false);
+    const z = try p.kv.admit(2, 2, 1, 10 * C, null, false);
+    try testing.expectEqual(@as(u8, 0), x.part);
+    try testing.expectEqual(@as(u8, 1), z.part);
+    try p.kv.decodeStart(x.id);
+    try p.kv.decodeStart(z.id);
+    try p.kv.round(&.{ .{ .id = x.id, .valid = C + 5 }, .{ .id = z.id, .valid = 3 * C } });
+    const r = try p.kv.restore(910, 20 * C, 20 * C, 0);
+    try p.same();
+    try testing.expectEqual(@as(u64, 1), p.kv.counts.relocations);
+    try testing.expectEqualSlices(u64, &.{x.id}, p.lanes0.moved.items);
+    try testing.expectEqual(@as(usize, 1), p.dev0.copies.items.len);
+    try testing.expectEqualSlices([3]usize, p.dev0.copies.items, p.dev1.copies.items);
+    try testing.expectEqual(@as(u8, 1), p.kv.planner.lives.items[p.kv.planner.liveIndex(x.id).?].part);
+    try testing.expect(r.base + r.size <= half and r.size == 20 * C);
+    try testing.expect(p.kv.planner.holds.items.len == 1 and p.fol.planner.?.holds.items.len == 1);
+    try p.kv.unhold(910);
+    try p.same();
+    for ([_]u64{ x.id, z.id }) |id| try p.kv.release(id);
+}
+
+test "a hit whose resume in place one live stream blocks moves that stream away on both ranks, then resumes in place" {
+    const gpa = testing.allocator;
+    const p = try Pair.init(gpa, sharded, .{ .twins = false });
+    defer p.deinit();
+    // part 0: kept state 700 (12 blocks at 0, its extent 14), then x (8 blocks) at 14, in the tail a 22-block resume
+    // in place needs; part 1: z2 (20 blocks, 12 free): room for x and its headroom, not for the hit (no carry), and a
+    // copy in part 0 would need the hit's own room (it would be dropped, its prompt run from 0)
+    const y = try p.kv.admit(1, 1, 0, 14 * C, null, false);
+    try testing.expectEqual(@as(u8, 0), y.part);
+    try p.kv.keep(700, y.id, 12 * C);
+    const z = try p.kv.admit(2, 2, 1, 26 * C, null, false);
+    try p.kv.release(y.id);
+    const x = try p.kv.admit(3, 3, 2, 8 * C, null, false);
+    try testing.expect(x.part == 0 and x.base == 14 * C);
+    try p.kv.release(z.id);
+    const z2 = try p.kv.admit(4, 4, 1, 20 * C, null, false);
+    try testing.expectEqual(@as(u8, 1), z2.part);
+    try p.kv.decodeStart(x.id);
+    try p.kv.decodeStart(z2.id);
+    try p.kv.round(&.{ .{ .id = x.id, .valid = 2 * C }, .{ .id = z2.id, .valid = 3 * C } });
+    const w = try p.kv.admit(5, 5, 3, 22 * C, 700, false);
+    try p.same();
+    try testing.expect(w.resumed and w.mode == .in_place and w.part == 0 and w.base == 0 and !w.dropped);
+    try testing.expectEqual(@as(u64, 1), p.kv.counts.relocations);
+    try testing.expectEqualSlices(u64, &.{x.id}, p.lanes0.moved.items);
+    try testing.expectEqualSlices([3]usize, p.dev0.copies.items, p.dev1.copies.items);
+    try testing.expectEqual(@as(u8, 1), p.kv.planner.lives.items[p.kv.planner.liveIndex(x.id).?].part);
+    try testing.expect(!p.kv.planner.keptAt(700).?.stale);
+    for ([_]u64{ x.id, z2.id, w.id }) |id| try p.kv.release(id);
+    try p.same();
 }
 
 test "random traffic: rank 0's and the follower's planners never differ, every op list replays" {

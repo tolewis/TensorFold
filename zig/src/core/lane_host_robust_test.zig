@@ -108,6 +108,230 @@ test "with the deferral off a refused restore resumes what memory holds at once"
     try std.testing.expectEqual(@as(u64, 1), r.tier.refused);
 }
 
+/// The engine's prompt pass in pieces with cut-ins (TF_FILL_CHUNKS=1, TF_FILL_CUT_IN=8192; fbbc971's
+/// prefill_part): a pass of the fake's 3 chunks runs one a piece, and a short prompt cuts in between them. The service
+/// fence refuses parked work's service while a pass stands between its pieces (LaneHost.filling), and the run loop
+/// asks for it there; that refusal is counted and skipped as in a release build, not this patch's to change.
+fn pieces(r: *Rig) void {
+    r.core.fill_chunks = 1;
+    r.core.cut_in = 8192;
+    r.target.prefill_chunks = 3;
+    r.host.fence_panic = false;
+}
+
+/// The fake tier's refusal for the pool's room (dsv41: error.ContextFull while streams hold it): only while a stream
+/// of the rig's core is active.
+const Live = struct {
+    fn check(ctx: *anyopaque) bool {
+        const core: *lanes.Engine = @ptrCast(@alignCast(ctx));
+        return core.activeCount() > 0;
+    }
+};
+
+fn cachedNow(b: *Box) ?u32 {
+    b.mutex.lockUncancelable(io);
+    defer b.mutex.unlock(io);
+    return b.cached;
+}
+
+fn roomWaits(pre: ?*const fn (*Rig) void) !void {
+    const r = try Rig.createWith(.{ .load_ms = 5 }, pre);
+    defer r.destroy();
+    const e = r.host.engine();
+    const along = [_]u32{ 8, 6, 7, 5, 3, 0, 9, 2, 1, 4, 4, 4 };
+    var a: Box = .{};
+    defer a.deinit();
+    const areq: Request = .{ .prompt = &along, .max_tokens = 100000 };
+    try e.submit(1, &areq, a.sink());
+    while (a.count() == 0) std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
+    r.tier.refuse_if = .{ .ctx = &r.core, .check = Live.check };
+    r.tier.refuse_err = error.ContextFull;
+    r.tier.refuse = 1 << 20;
+    _ = try r.point(&t2, 8);
+    var b: Box = .{};
+    defer b.deinit();
+    const req: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
+    try e.submit(2, &req, b.sink());
+    // refused while the stream decodes: asked again (at most each second, or when a stream ends), never prefilled
+    var asked = false;
+    for (0..5000) |_| {
+        if (@atomicLoad(u64, &r.tier.refused, .monotonic) >= 2) {
+            asked = true;
+            break;
+        }
+        std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
+    }
+    try std.testing.expect(asked);
+    try std.testing.expect(b.finished() == null and cachedNow(&b) == null);
+    try std.testing.expect(a.finished() == null);
+    try std.testing.expectEqual(@as(u64, 1), r.stats().restores_room_waits);
+    e.cancel(1); // the stream ends: its room is free, the restore starts
+    try std.testing.expectEqual(Reason.cancelled, a.wait());
+    try std.testing.expectEqual(Reason.length, b.wait());
+    try std.testing.expectEqual(@as(?u32, 8), b.cached);
+    try b.exact(&t2);
+    const s = r.stats();
+    try std.testing.expectEqual(@as(u64, 1), s.disk_hits_committed);
+    try std.testing.expectEqual(@as(u64, 1), s.restores_room_waits); // once a request, however often it asked
+    try std.testing.expectEqual(@as(u64, 0), s.restores_deferred);
+    try std.testing.expectEqual(@as(u64, 0), s.parked);
+}
+
+test "a restore the pool has no room for while a stream decodes waits as a prompt pass does, then resumes its point exactly" {
+    try roomWaits(null);
+}
+
+test "a restore the pool has no room for while a stream decodes waits as a prompt pass does, then resumes its point exactly (prompt pass in pieces, cut-ins)" {
+    try roomWaits(pieces);
+}
+
+fn roomIdle(pre: ?*const fn (*Rig) void) !void {
+    const r = try Rig.createWith(.{ .load_ms = 5 }, pre);
+    defer r.destroy();
+    try shortThenPoint(r);
+    r.tier.refuse = 1;
+    r.tier.refuse_err = error.ContextFull;
+    var b: Box = .{};
+    defer b.deinit();
+    const req: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
+    try r.host.engine().submit(2, &req, b.sink());
+    try std.testing.expectEqual(Reason.length, b.wait());
+    try std.testing.expectEqual(@as(?u32, 4), b.cached);
+    try b.exact(&t2);
+    try std.testing.expectEqual(@as(u64, 0), r.stats().restores_room_waits);
+    try std.testing.expectEqual(@as(u64, 1), r.tier.refused);
+}
+
+test "with no stream active a restore the pool has no room for resumes what memory holds at once, as before" {
+    try roomIdle(null);
+}
+
+test "with no stream active a restore the pool has no room for resumes what memory holds at once, as before (prompt pass in pieces, cut-ins)" {
+    try roomIdle(pieces);
+}
+
+fn roomCancel(pre: ?*const fn (*Rig) void) !void {
+    const r = try Rig.createWith(.{ .load_ms = 5 }, pre);
+    defer r.destroy();
+    const e = r.host.engine();
+    const along = [_]u32{ 8, 6, 7, 5, 3, 0, 9, 2, 1, 4, 4, 4 };
+    var a: Box = .{};
+    defer a.deinit();
+    const areq: Request = .{ .prompt = &along, .max_tokens = 100000 };
+    try e.submit(1, &areq, a.sink());
+    errdefer {
+        e.cancel(1);
+        _ = a.wait();
+    }
+    while (a.count() == 0) std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
+    r.tier.refuse_if = .{ .ctx = &r.core, .check = Live.check };
+    r.tier.refuse_err = error.ContextFull;
+    r.tier.refuse = 1 << 20;
+    _ = try r.point(&t2, 8);
+    var b: Box = .{};
+    defer b.deinit();
+    const req: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
+    try e.submit(2, &req, b.sink());
+    try r.until(struct {
+        fn ok(s: api.CacheStats) bool {
+            return s.restores_room_waits == 1;
+        }
+    }.ok);
+    e.cancel(2);
+    try std.testing.expectEqual(Reason.cancelled, b.wait());
+    // the cancelled waiter no longer holds the queue (full_wait) for what is left of its retry second
+    r.host.mutex.lockUncancelable(io);
+    const holds = r.host.full_wait != null;
+    r.host.mutex.unlock(io);
+    try std.testing.expect(!holds);
+    const n = a.count();
+    var grew = false;
+    for (0..5000) |_| {
+        if (a.count() > n + 16) {
+            grew = true;
+            break;
+        }
+        std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
+    }
+    try std.testing.expect(grew and a.finished() == null);
+    e.cancel(1);
+    try std.testing.expectEqual(Reason.cancelled, a.wait());
+    try std.testing.expectEqual(@as(u64, 0), r.stats().disk_hits_committed);
+}
+
+test "a request waiting for room for its restore is cancelled from the queue; the stream that held the room goes on" {
+    try roomCancel(null);
+}
+
+test "a request waiting for room for its restore is cancelled from the queue; the stream that held the room goes on (prompt pass in pieces, cut-ins)" {
+    try roomCancel(pieces);
+}
+
+fn roomBound(pre: ?*const fn (*Rig) void) !void {
+    const r = try Rig.createWith(.{ .load_ms = 5, .load_wait_ms = 300 }, pre);
+    defer r.destroy();
+    const e = r.host.engine();
+    const along = [_]u32{ 8, 6, 7, 5, 3, 0, 9, 2, 1, 4, 4, 4 };
+    var a: Box = .{};
+    defer a.deinit();
+    const areq: Request = .{ .prompt = &along, .max_tokens = 100000 };
+    try e.submit(1, &areq, a.sink());
+    errdefer {
+        e.cancel(1);
+        _ = a.wait();
+    }
+    while (a.count() == 0) std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
+    r.tier.refuse_if = .{ .ctx = &r.core, .check = Live.check };
+    r.tier.refuse_err = error.ContextFull;
+    r.tier.refuse = 1 << 20;
+    _ = try r.point(&t2, 8);
+    var b: Box = .{};
+    defer b.deinit();
+    const req: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
+    try e.submit(2, &req, b.sink());
+    try r.until(struct {
+        fn ok(s: api.CacheStats) bool {
+            return s.restores_room_waits == 1;
+        }
+    }.ok);
+    // a short request with no kept state, behind the waiting restore
+    const other = [_]u32{ 2, 3, 5, 7, 1, 1 };
+    var c: Box = .{};
+    defer c.deinit();
+    const creq: Request = .{ .prompt = &other, .max_tokens = 3 };
+    try e.submit(3, &creq, c.sink());
+    var served = false; // (without the bound both wait until stream 1 ends, which here is never)
+    for (0..10000) |_| {
+        if (b.finished() != null and c.finished() != null) {
+            served = true;
+            break;
+        }
+        std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
+    }
+    try std.testing.expect(served);
+    try std.testing.expect(a.finished() == null); // served while the stream that held the room still decodes
+    try std.testing.expectEqual(Reason.length, b.wait());
+    try std.testing.expectEqual(@as(u32, 0), b.cached orelse 0); // (no memory state: it prefilled from 0, as before)
+    try b.exact(&t2);
+    try std.testing.expectEqual(Reason.length, c.wait());
+    const s = r.stats();
+    try std.testing.expectEqual(@as(u64, 1), s.restores_room_waits);
+    try std.testing.expectEqual(@as(u64, 1), s.restores_room_wait_expired);
+    try std.testing.expectEqual(@as(u64, 0), s.disk_hits_committed);
+    try std.testing.expectEqual(@as(u64, 0), s.restores_deferred); // (ContextFull is no capacity refusal: never deferred)
+    e.cancel(1);
+    try std.testing.expectEqual(Reason.cancelled, a.wait());
+    try std.testing.expectEqual(@as(u64, 0), r.stats().parked);
+}
+
+test "a restore waiting for room stops at TF_SPILL_LOAD_WAIT_MS: it prefills, and the request behind it is served while the stream decodes" {
+    try roomBound(null);
+}
+
+test "a restore waiting for room stops at TF_SPILL_LOAD_WAIT_MS: it prefills, and the request behind it is served while the stream decodes (prompt pass in pieces, cut-ins)" {
+    try roomBound(pieces);
+}
+
 test "a refusal that waiting cannot cure is not deferred; a deferred request cancelled leaves every list once" {
     const r = try Rig.create(.{ .load_ms = 5 });
     defer r.destroy();

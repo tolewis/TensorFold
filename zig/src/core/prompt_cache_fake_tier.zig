@@ -27,6 +27,9 @@ pub const FakeTier = struct {
     /// dsv41's TooManyRestores, the store's TooMany/NoSlot); `refused` counts them.
     refuse: u32 = 0,
     refuse_err: anyerror = error.TooManyRestores,
+    /// With `refuse`: a begin is refused only while this answers true (dsv41's pool: no room while streams hold it,
+    /// error.ContextFull); null: every begin while `refuse` lasts.
+    refuse_if: ?Check = null,
     refused: u64 = 0,
     begins: u64 = 0,
     /// The next `full` asks of Tier.VTable.full answer true (the tier at its cap before any room is made; `fulls`
@@ -58,6 +61,7 @@ pub const FakeTier = struct {
     pub const Pt = struct { id: u64, key: []u32, at: u32, group: u64, shared: bool, bytes: []u8, parent: ?u64, fork: u32, size: u64, lineage: []pc.Fork = &.{} };
     pub const Pending = struct { id: u64, key: []u32, at: u32, group: u64, shared: bool, saved: pc.Saved, parent: ?u64, fork: u32, size: u64, lineage: []pc.Fork };
     const Job = struct { id: u64, point: u64, left: u32, fail: ?anyerror };
+    pub const Check = struct { ctx: *anyopaque, check: *const fn (ctx: *anyopaque) bool };
 
     pub fn deinit(t: *FakeTier) void {
         for (t.points.items) |p| {
@@ -148,7 +152,7 @@ pub const FakeTier = struct {
         t.lock();
         defer t.unlock();
         t.begins += 1;
-        if (t.refuse > 0) {
+        if (t.refuse > 0 and (if (t.refuse_if) |c| c.check(c.ctx) else true)) {
             t.refuse -= 1;
             t.refused += 1;
             return t.refuse_err;

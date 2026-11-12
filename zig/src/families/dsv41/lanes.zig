@@ -695,8 +695,9 @@ pub const Lanes = struct {
             const sn: *Snap = @ptrCast(@alignCast(p));
             if (self.usable(sn, len)) src = sn else s.reuse_failed = true;
         }
-        // (lanes owns the clock: patient only when a live stream holds the state, as placeKept asks)
-        const waits = if (src) |sn| k.planner.held(sn.id) and self.patient(sn) else false;
+        // (lanes owns the clock, held_wait_ns from the first wait: the planner waits on it for a live stream that holds
+        // the state, as placeKept does, and for the streams over a hit's tail, planRoom)
+        const waits = if (src) |sn| self.patient(sn) else false;
         self.kvPending();
         const a = try k.admit(@intFromPtr(s), std.hash.Wyhash.hash(0, s.id), @intCast(slot), size, if (src) |sn| sn.id else null, waits);
         if (src) |sn| {

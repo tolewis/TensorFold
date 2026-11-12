@@ -12,7 +12,10 @@
 //!   process exits with a distinct code for its supervisor to restart both ranks; a deadline thread enforces the exit
 //!   even when a round is blocked on a dead peer.
 //! - Restores the tier refuses for capacity are deferred briefly and asked again (bounded), keeping the best memory
-//!   state meanwhile, instead of a prefill from 0 (`restores_deferred`).
+//!   state meanwhile, instead of a prefill from 0 (`restores_deferred`). A restore the backend's KV pool has no room
+//!   for while streams run (error.ContextFull) waits as a prompt pass refused for room waits, at the queue's front
+//!   until a stream ends, and asks again (`restores_room_waits`), load_wait_ns at most: then it is admitted on what
+//!   memory holds, as before (`restores_room_wait_expired`).
 //! - The service fence: parked work's service and the lone driver's pump never run inside a round, inside a prompt
 //!   pass except between its chunks (Stream.between), or while the backend reports a CUDA graph capture (`quiet`).
 const std = @import("std");
@@ -197,6 +200,8 @@ pub const LaneHost = struct {
         computed_tokens: u64 = 0, // and computed
         restores_deferred: u64 = 0, // requests whose restore was refused for capacity and asked again
         restores_deferred_expired: u64 = 0, // of them, admitted on memory at defer_ns
+        restores_room_waits: u64 = 0, // requests whose restore the pool had no room for while streams ran: they waited
+        restores_room_wait_expired: u64 = 0, // of them, admitted on memory at load_wait_ns
     };
 
     const Job = struct {
@@ -216,6 +221,7 @@ pub const LaneHost = struct {
         kept0: u64 = 0, // the store's kept count when the job looked it up
         tried_disk: bool = false, // it waited for a restore once: a later lookup takes what memory has
         deferred_since: ?i96 = null, // its restore was first refused for capacity then (asked again until defer_ns)
+        room_since: ?i96 = null, // its restore first found no room in the pool then (asked again until load_wait_ns)
         join: pc.Join = .{}, // its conversation (0111)
         parent: ?u64 = null, // the durable point its pass resumes from, and where
         fork: u32 = 0,
@@ -499,6 +505,9 @@ pub const LaneHost = struct {
         var unloaded: std.ArrayList(*pc.Restore) = .empty; // restores a cancelled job waited for
         for (ids) |id| {
             for (h.queued.items, 0..) |job, i| if (job.id == id) {
+                // the queue's front waits for room (requeue, waitRoom: full_wait holds every admission meanwhile);
+                // cancelled, nothing waits for it any more
+                if (i == 0) h.full_wait = null;
                 dropped.append(h.gpa, h.queued.orderedRemove(i)) catch {};
                 break;
             };
@@ -1111,6 +1120,7 @@ pub const LaneHost = struct {
                 } else |err| {
                     const left = store.find(key, r.chunks); // (the room may have evicted probe.memory: never read it now)
                     if (h.deferRestore(job, p, left, err, now)) return true;
+                    if (h.waitRoom(job, p, err, now)) return true;
                     if (left) |e| {
                         note("reading {d} kept tokens from disk did not start ({s}); resuming the {d} memory holds", .{ p.at, @errorName(err), e.at });
                     } else note("reading {d} kept tokens from disk did not start ({s}); prefilling", .{ p.at, @errorName(err) });
@@ -1118,6 +1128,39 @@ pub const LaneHost = struct {
             } else |_| {}
         };
         return false;
+    }
+
+    /// A restore of `p` the backend's KV pool has no room for (`err` error.ContextFull: its destination needs rows the
+    /// live streams hold) while streams run waits as a prompt pass refused for room waits (requeue): back at the queue's
+    /// front, holding no lane, admitted again once fewer streams are active or after full_retry_ns, when it asks for
+    /// the restore again; true then. The wait holds the queue, so it is bounded as a parked restore is: load_wait_ns
+    /// (TF_SPILL_LOAD_WAIT_MS) from its first refusal it stops (`restores_room_wait_expired`). The room it waits for
+    /// is in the point's recorded part only, while a prefill may take any part. With no stream active nothing would
+    /// free the room, or once the bound passed: false, and it is admitted on what memory holds, as before.
+    fn waitRoom(h: *LaneHost, job: *Job, p: pc.Point, err: anyerror, now: i96) bool {
+        const active = h.core.activeCount();
+        if (err != error.ContextFull or active == 0) return false;
+        const first = job.room_since orelse now;
+        if (now - first >= h.tier.load_wait_ns) {
+            h.host_counts.restores_room_wait_expired += 1;
+            note("reading {d} kept tokens from disk waited {d} ms for room in the pool ({d} streams hold it); it waits no longer", .{ p.at, @divTrunc(now - first, std.time.ns_per_ms), active });
+            return false;
+        }
+        h.lock();
+        h.queued.insert(h.gpa, 0, job) catch {
+            h.unlock();
+            return false;
+        };
+        h.full_wait = active;
+        h.full_retry = @min(now + full_retry_ns, first + h.tier.load_wait_ns);
+        h.unlock();
+        job.tried_disk = false; // (it asks for the restore again at its next admission)
+        if (job.room_since == null) {
+            job.room_since = first;
+            h.host_counts.restores_room_waits += 1;
+            note("reading {d} kept tokens from disk waits for room in the pool ({d} streams hold it)", .{ p.at, active });
+        }
+        return true;
     }
 
     /// A restore of `p` the tier or the budget refused with `err`: when that may change shortly (Store.deferrable)
@@ -1537,6 +1580,8 @@ pub const LaneHost = struct {
         t.restore_wait_max_ns = hc.restore_wait_max_ns;
         t.restores_deferred = hc.restores_deferred;
         t.restores_deferred_expired = hc.restores_deferred_expired;
+        t.restores_room_waits = hc.restores_room_waits;
+        t.restores_room_wait_expired = hc.restores_room_wait_expired;
         t.cached_tokens = hc.cached_tokens;
         t.computed_tokens = hc.computed_tokens;
         t.parked = h.loading.items.len + h.deferred.items.len;

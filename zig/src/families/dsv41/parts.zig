@@ -175,7 +175,7 @@ pub const Request = struct {
     slot: u32,
     size: usize, // the reservation: alignForward(len + max_new + round_rows + 2, chunk_rows)
     source: ?u64 = null, // the kept state it resumes from (lanes checked usable())
-    patient: bool = false, // held(source) and lanes' held_wait clock still runs (lanes.patient)
+    patient: bool = false, // lanes' held_wait clock still runs for source (lanes.patient); acted on only by a wait for a live stream: one that holds source, or those over a hit's tail (planRoom)
     twins: bool = true, // a fresh prompt may borrow twins
 };
 
@@ -260,6 +260,9 @@ pub const Mutant = enum {
     cheapest_ignored,
     flight_source_unprotected,
     move_end_unclamped,
+    hit_drops_for_room,
+    hit_no_wait,
+    restore_no_relocate,
 };
 
 pub const Config = struct {
@@ -735,13 +738,14 @@ pub const Planner = struct {
 
     /// Evicting the oldest kept states of part q until `size` fits there: the base, the victims (appended) and the cost
     /// (the newest victim's place in the kept order, plus one; 0 when none is needed). Null when even all leave too little.
-    fn evictCost(self: *const Planner, gpa: Allocator, q: u8, size: usize, protect: ?usize, stale: []const bool, victims: *std.ArrayList(usize)) !?struct { base: usize, cost: usize } {
+    /// `gone`: as if that live stream had moved away (planRelocate's test for a restore).
+    fn evictCost(self: *const Planner, gpa: Allocator, q: u8, size: usize, protect: ?usize, stale: []const bool, victims: *std.ArrayList(usize), gone: ?u64) !?struct { base: usize, cost: usize } {
         const local = try gpa.dupe(bool, stale);
         defer gpa.free(local);
         const mark = victims.items.len;
         var cost: usize = 0;
         while (true) {
-            if (try self.placeSoftIn(gpa, q, size, .{ .twins_free = true }, local)) |b| return .{ .base = b, .cost = cost };
+            if (try self.placeSoftIn(gpa, q, size, .{ .twins_free = true, .gone = gone }, local)) |b| return .{ .base = b, .cost = cost };
             const v = self.victim(q, local, protect) orelse {
                 victims.shrinkRetainingCapacity(mark);
                 return null;
@@ -762,7 +766,7 @@ pub const Planner = struct {
             const q: u8 = @intCast(qi);
             if (q == skip) continue;
             scratch.clearRetainingCapacity();
-            const r = try self.evictCost(gpa, q, size, protect, stale, &scratch) orelse continue;
+            const r = try self.evictCost(gpa, q, size, protect, stale, &scratch, null) orelse continue;
             const better = if (best) |b| (if (self.mut(.cheapest_ignored)) false else r.cost < b.cost) else true;
             if (better) {
                 const v = try gpa.dupe(usize, scratch.items);
@@ -971,7 +975,42 @@ pub const Planner = struct {
             plan.status = .full;
             return .full;
         }
+        if (try self.planRoom(gpa, req, si, e, stale, victims)) |o| return o;
         return .fresh;
+    }
+
+    /// A hit that its part cannot keep and that no other part takes (it would be dropped: its prompt runs from 0) gets
+    /// the room of its resume in place the way a prompt pass gets room: the kept states over its tail give theirs (as
+    /// victims do), one live stream there moves to another part (planRelocate), or the request waits for the live
+    /// streams there to end (lanes' error.ContextFull: the host tries it again when a stream ends, as for a prompt pass
+    /// no part can hold) while `patient` (lanes' held_wait_ns clock, the bound of the other wait for a live stream).
+    /// Only with carries on, for a state of carry_min tokens or more (a smaller one is cheaper to prefill again), in
+    /// place inside its part, with nothing pinned, held for a restore or read by a transfer there, and no live stream
+    /// over its own rows (that wait is simPlaceKept's). Null: dropped as before.
+    fn planRoom(self: *const Planner, gpa: Allocator, req: Request, si: usize, e: *Emit, stale: []bool, victims: *std.ArrayList(usize)) !?HitOutcome {
+        if (!self.carrying() or self.mut(.hit_drops_for_room)) return null;
+        const sn = self.kept.items[si];
+        const a = sn.base + sn.at;
+        const b = sn.base + req.size;
+        if (sn.at < carry_min or b > self.partEnd(sn.part)) return null;
+        if (self.clashLive(sn.base, a, null) or self.clashHolds(sn.base, b) or self.clashPinned(sn.base, b) or self.clashReading(a, b, si)) return null;
+        @memset(stale, false); // (the simulated victims of the copy and the carry are not this plan's)
+        victims.clearRetainingCapacity();
+        var blockers: usize = 0;
+        for (self.lives.items) |l| blockers += @intFromBool(a < l.base + l.size and l.base < b);
+        if (blockers == 0) {
+            try self.emitPlaced(gpa, e, req, victims, stale, .{ .part = sn.part, .base = sn.base, .stale_from = a, .except = si, .twins_free = true, .transfer = .{ .@"resume" = .{ .kept = sn.id, .gen = sn.gen, .stream = req.stream } } });
+            e.plan.mode = .in_place;
+            e.plan.source = sn.id;
+            return .placed;
+        }
+        if (blockers == 1 and try self.planRelocate(gpa, req.stream, .{ .span = .{ .part = sn.part, .a = a, .b = b } }, e, stale)) {
+            e.plan.status = .relocate;
+            return .wait;
+        }
+        if (self.mut(.hit_no_wait) or !req.patient) return null; // (the wait ran out: dropped as before)
+        e.plan.status = .full;
+        return .wait;
     }
 
     fn hitCopy(self: *const Planner, gpa: Allocator, e: *Emit, req: Request, si: usize, r: Sim, victims: *std.ArrayList(usize), stale: []bool) !HitOutcome {
@@ -1015,7 +1054,7 @@ pub const Planner = struct {
         }
         plan.status = .full;
         if (self.sharded()) {
-            if (try self.planRelocate(gpa, req, e, stale)) {
+            if (try self.planRelocate(gpa, req.stream, .{ .any = req.size }, e, stale)) {
                 plan.status = .relocate;
                 return;
             }
@@ -1122,11 +1161,36 @@ pub const Planner = struct {
         }
     }
 
-    /// A request no part has room for would wait: move one live stream whole to a part with room for it (and a
-    /// block of headroom a stream there plus one), the cheapest whose leaving lets the request in without evicting, if
-    /// it may move (nothing pins it, not within relocate_hold rounds of its last move, not back where it came from,
-    /// not out of a part another stream just entered). One move a plan.
-    fn planRelocate(self: *const Planner, gpa: Allocator, req: Request, e: *Emit, stale: []const bool) !bool {
+    /// What a live move must make room for: `size` rows in some part without evicting (an admission no part has room
+    /// for), `size` rows in a spill restore's recorded part evicting there as planRestore does, or rows [a, b) of a part
+    /// clear of live streams (a hit's resume in place, planRoom).
+    const Need = union(enum) {
+        any: usize,
+        restore: struct { part: u8, size: usize },
+        span: struct { part: u8, a: usize, b: usize },
+    };
+
+    /// Whether `l` leaving part p gives `need` its room.
+    fn lets(self: *const Planner, gpa: Allocator, need: Need, p: u8, l: Live, stale: []const bool) !bool {
+        switch (need) {
+            .any => |size| return try self.placeSoftIn(gpa, p, size, .{ .gone = l.stream }, stale) != null,
+            .restore => |r| {
+                if (p != r.part) return false;
+                var scratch: std.ArrayList(usize) = .empty;
+                defer scratch.deinit(gpa);
+                return try self.evictCost(gpa, p, r.size, null, stale, &scratch, l.stream) != null;
+            },
+            .span => |x| return p == x.part and x.a < l.base + l.size and l.base < x.b and !self.clashLive(x.a, x.b, l.stream),
+        }
+    }
+
+    /// A request no part has room for would wait (or a restore its part has no room for, or a hit's resume in place a
+    /// live stream stands in the way of, `need`): move one live stream whole to a part with room for it (and a
+    /// block of headroom a stream there plus one), the cheapest whose leaving gives `need` its room (an admission's:
+    /// without evicting), if it may move (nothing pins it, not within relocate_hold rounds of its last move, not back
+    /// where it came from, not out of a part another stream just entered). One move a plan. `stream`: the request's
+    /// own, never moved.
+    fn planRelocate(self: *const Planner, gpa: Allocator, stream: u64, need: Need, e: *Emit, stale: []const bool) !bool {
         if (!self.carrying()) return false;
         const plan = e.plan;
         const hold = self.holdRounds();
@@ -1137,8 +1201,8 @@ pub const Planner = struct {
             const p: u8 = @intCast(pi);
             if (!self.mut(.no_entered_guard) and self.ticks - self.entered[pi] < hold) continue;
             for (self.lives.items, 0..) |l, li| {
-                if (l.part != p or l.stream == req.stream) continue;
-                if (try self.placeSoftIn(gpa, p, req.size, .{ .gone = l.stream }, stale) == null) continue;
+                if (l.part != p or l.stream == stream) continue;
+                if (!try self.lets(gpa, need, p, l, stale)) continue;
                 wanted = true;
                 if (self.pinsMove(l)) |w| {
                     if (pin == null) pin = w;
@@ -1180,7 +1244,10 @@ pub const Planner = struct {
     }
 
     /// A spill restore's destination in the part its point was written from (GLM: back into the recorded half),
-    /// evicting there only; kept invisible (a hold) until restoredOp or unholdOp.
+    /// evicting there only; kept invisible (a hold) until restoredOp or unholdOp. A part no eviction makes the room in
+    /// has one live stream moved away when that gives the room (`relocate`: apply it, run the move, finish it, then
+    /// plan the restore again), as an admission no part can hold has; else `full` (lanes' error.ContextFull: the host
+    /// asks again when a stream ends).
     pub fn planRestore(self: *const Planner, gpa: Allocator, id: u64, size: usize, part: u8) !Plan {
         if (part >= self.cfg.parts) return error.BadPart;
         if (size == 0 or size % chunk_rows != 0 or size > self.part_rows) return error.BadSize;
@@ -1195,7 +1262,11 @@ pub const Planner = struct {
         defer victims.deinit(gpa);
         var found = try self.placeSoftIn(gpa, part, size, .{}, stale);
         if (found == null) {
-            const r = try self.evictCost(gpa, part, size, null, stale, &victims) orelse {
+            const r = try self.evictCost(gpa, part, size, null, stale, &victims, null) orelse {
+                if (self.sharded() and !self.mut(.restore_no_relocate) and try self.planRelocate(gpa, 0, .{ .restore = .{ .part = part, .size = size } }, &e, stale)) {
+                    plan.status = .relocate;
+                    return plan;
+                }
                 plan.no_part = self.sharded();
                 return plan;
             };
@@ -1779,6 +1850,13 @@ fn rq(stream: u64, size: usize, source: ?u64) Request {
     return .{ .stream = stream, .slot = @intCast(stream), .size = size, .source = source };
 }
 
+/// rq while lanes' wait clock still runs for the source (lanes.patient).
+fn rqp(stream: u64, size: usize, source: ?u64) Request {
+    var r = rq(stream, size, source);
+    r.patient = true;
+    return r;
+}
+
 fn count(p: *const Plan, tag: std.meta.Tag(Op)) usize {
     var n: usize = 0;
     for (p.ops.items) |o| n += @intFromBool(o == tag);
@@ -2015,6 +2093,7 @@ fn secTwins(t: *T) !void {
         f.lv(1).partial = true;
         try f.twin(1, P + 8 * C, 8 * C);
         try f.live(2, P + 24 * C, 8 * C);
+        f.lv(2).decoding = false; // (not movable: moving it would make the room, 11 room)
         var p = try f.pl.planRestore(t.gpa, 9, 12 * C, 1);
         defer p.deinit(t.gpa);
         t.check("9 twin: its rows are no room; none found, no op", p.status == .full and p.ops.items.len == 0);
@@ -2710,6 +2789,7 @@ fn secInvariants(t: *T) !void {
     var carried: usize = 0;
     var kinds = [_]usize{ 0, 0, 0, 0 };
     var same: usize = 0;
+    var roomed: usize = 0;
     for (0..700) |seed| {
         for ([_]bool{ false, true }) |heavy| {
             var pa: std.Random.DefaultPrng = .init(seed);
@@ -2733,6 +2813,16 @@ fn secInvariants(t: *T) !void {
                 if (on.part == k.part or a.pl.pinsKept(si) != null or k.at < carry_min) miss(t, &bad, 1, seed);
                 if (!(off.status != .placed or off.dropped or count(&off, .stale) > 0)) miss(t, &bad, 2, seed);
                 if (on.why.? != .rescued and count(&on, .stale) > 0) miss(t, &bad, 3, seed);
+            } else if (off.dropped and !on.dropped) {
+                // 11 room: where carry off drops the hit, carry on makes its resume in place room instead (in place
+                // now, a live stream moved first, or a wait), never for a state under carry_min
+                roomed += 1;
+                const k = a.pl.kept.items[a.pl.keptIndex(req.source.?).?];
+                if (k.at < carry_min) miss(t, &bad, 8, seed);
+                if (on.status == .placed and !(on.mode == .in_place and on.base == k.base and on.part == k.part and on.source.? == k.id)) miss(t, &bad, 9, seed);
+                if (on.status == .relocate and count(&on, .move) != 1) miss(t, &bad, 10, seed);
+                if (on.status == .full and on.ops.items.len != 0) miss(t, &bad, 11, seed);
+                if (on.status == .full and !req.patient) miss(t, &bad, 12, seed); // (the wait runs on lanes' clock)
             } else {
                 const st = if (on.status == .relocate) Status.full else on.status;
                 if (st != off.status or on.mode != off.mode or on.part != off.part or on.base != off.base or on.dropped != off.dropped) {
@@ -2748,6 +2838,7 @@ fn secInvariants(t: *T) !void {
     }
     t.check("10 random pools: a carry only where carry off evicted, dropped the hit or waited; else the same plan; never pinned or small; pressure/others/paused evict nothing", bad == 0);
     t.check("10 random pools: the carry happens in every kind (the sweep reaches them)", carried > 40 and kinds[@intFromEnum(Reason.rescued)] >= 3 and kinds[@intFromEnum(Reason.pressure)] >= 3 and kinds[@intFromEnum(Reason.paused)] >= 1 and same > 200);
+    t.check("11 room: random pools reach the room rule (where carry off drops the hit)", roomed > 20);
 }
 
 fn secTwoRanks(t: *T) !void {
@@ -3339,6 +3430,133 @@ fn secLifetimes(t: *T) !void {
     }
 }
 
+// 11: room for a resume or a restore, made the way an admission makes it ----------------------------------------------
+
+/// Part 0: hit 7 (10C kept at 8C: a 14C reservation in place needs [8C, 22C)), a live stream (4C) at 20C in its tail,
+/// `live3` (4C at 28C) when set; part 1: a live stream of 22C (10C free: room for the 4C one and its headroom, not
+/// for the hit and its headroom). With 7 gone a fresh 14C fits at 0: the hit was dropped and its prompt ran from 0.
+fn roomLayout(t: *T, at: usize, tail_live: bool, live3: bool) !Fx {
+    const P = 32 * C;
+    var f = try Fx.init(t, 2, P);
+    errdefer f.deinit();
+    try f.kept(7, 8 * C, at, 8 * C + at);
+    if (tail_live) try f.live(1, 20 * C, 4 * C);
+    if (live3) try f.live(3, 28 * C, 4 * C);
+    try f.live(2, P, 22 * C);
+    return f;
+}
+
+fn moveOf(p: *const Plan) ?@FieldType(Op, "move") {
+    for (p.ops.items) |o| if (o == .move) return o.move;
+    return null;
+}
+
+fn secRoom(t: *T) !void {
+    const P = 32 * C;
+    {
+        var f = try roomLayout(t, 10 * C, true, false);
+        defer f.deinit();
+        var p = try f.plan(rq(50, 14 * C, 7));
+        defer p.deinit(t.gpa);
+        const mv = moveOf(&p);
+        t.check("11 room: a live stream in a hit's tail moves to the other part; the hit is not dropped", p.status == .relocate and !p.dropped and count(&p, .move) == 1 and mv != null and mv.?.stream == 1 and mv.?.dst_part == 1 and count(&p, .stale) == 0);
+        if (p.status == .relocate) {
+            try f.apply(&p);
+            _ = try f.pl.finish(1, true);
+            var q = try f.plan(rq(50, 14 * C, 7));
+            defer q.deinit(t.gpa);
+            t.check("11 room: then the hit resumes in place, nothing staled", q.status == .placed and q.mode == .in_place and q.base == 8 * C and q.source == 7 and !q.dropped and count(&q, .stale) == 0);
+        }
+    }
+    {
+        var f = try roomLayout(t, 10 * C, true, false);
+        defer f.deinit();
+        f.lv(1).decoding = false; // (its prompt pass ended, no decode round yet: not movable)
+        var p = try f.plan(rqp(50, 14 * C, 7));
+        defer p.deinit(t.gpa);
+        t.check("11 room: a stream in a hit's tail that cannot move yet is waited for (full), the hit kept", p.status == .full and !p.dropped and p.ops.items.len == 0 and !f.kp(7).stale);
+        var o = try f.plan(rq(50, 14 * C, 7));
+        defer o.deinit(t.gpa);
+        t.check("11 room: once the wait's clock ran out (not patient) the hit is dropped as before", o.dropped and o.mode == .fresh and count(&o, .move) == 0);
+        if (p.status == .full) {
+            try f.apply(&p);
+            t.check("11 room: the wait counts the carry's refusal once and no no_part", f.pl.counters.no_part == 0 and f.pl.counters.refusals(.no_target) == 1);
+            f.lv(1).decoding = true;
+            var q = try f.plan(rqp(50, 14 * C, 7));
+            defer q.deinit(t.gpa);
+            t.check("11 room: asked again once it decodes, it moves", q.status == .relocate and count(&q, .move) == 1);
+        }
+    }
+    {
+        var f = try roomLayout(t, 10 * C, true, false);
+        defer f.deinit();
+        try f.live(4, 18 * C, 2 * C); // (a second stream in the tail: one move does not clear it)
+        var p = try f.plan(rqp(50, 14 * C, 7));
+        defer p.deinit(t.gpa);
+        t.check("11 room: two streams in the tail: no move, it waits for them", p.status == .full and !p.dropped and count(&p, .move) == 0);
+    }
+    {
+        // another conversation's kept state in the tail; a third stream leaves no room for a copy
+        var f = try roomLayout(t, 10 * C, false, true);
+        defer f.deinit();
+        try f.kept(9, 18 * C, 4 * C, 22 * C);
+        var p = try f.plan(rq(50, 14 * C, 7));
+        defer p.deinit(t.gpa);
+        t.check("11 room: kept states in a hit's tail give their room: it resumes in place", p.status == .placed and p.mode == .in_place and p.base == 8 * C and !p.dropped and staledAre(&p, &.{9}));
+    }
+    {
+        var f = try roomLayout(t, 1024, true, false);
+        defer f.deinit();
+        var p = try f.plan(rq(50, 14 * C, 7));
+        defer p.deinit(t.gpa);
+        t.check("11 room: a hit under carry_min is dropped as before (cheaper to recompute)", p.dropped and count(&p, .move) == 0);
+    }
+    {
+        var f = try Fx.initCfg(t, .{ .cap = 2 * P, .parts = 2, .carry = false });
+        defer f.deinit();
+        try f.kept(7, 8 * C, 10 * C, 18 * C);
+        try f.kept(9, 18 * C, 4 * C, 22 * C);
+        try f.live(3, 28 * C, 4 * C);
+        try f.live(2, P, 22 * C);
+        var p = try f.plan(rq(50, 14 * C, 7));
+        defer p.deinit(t.gpa);
+        t.check("11 room: carry off: the hit is dropped as before", p.dropped and p.mode == .fresh);
+    }
+    {
+        // a restore: part 0's evictions leave 18C at most, live stream 1 (4C at 10C) splits it; part 1 is empty
+        var f = try Fx.init(t, 2, P);
+        defer f.deinit();
+        try f.live(1, 10 * C, 4 * C);
+        try f.kept(30, 20 * C, 4 * C, 24 * C);
+        var p = try f.pl.planRestore(t.gpa, 900, 20 * C, 0);
+        defer p.deinit(t.gpa);
+        const mv = moveOf(&p);
+        t.check("11 room: a restore its part's evictions cannot free has a live stream moved away first", p.status == .relocate and p.restore and count(&p, .move) == 1 and mv != null and mv.?.stream == 1 and mv.?.dst_part == 1 and count(&p, .hold) == 0);
+        if (p.status == .relocate) {
+            try f.apply(&p);
+            _ = try f.pl.finish(1, true);
+            var q = try f.pl.planRestore(t.gpa, 900, 20 * C, 0);
+            defer q.deinit(t.gpa);
+            t.check("11 room: then the restore holds rows in its part, staling nobody", q.status == .placed and q.base == 0 and count(&q, .hold) == 1 and count(&q, .stale) == 0);
+        }
+    }
+    {
+        var f = try Fx.init(t, 2, P);
+        defer f.deinit();
+        try f.live(1, 10 * C, 4 * C);
+        f.lv(1).decoding = false;
+        var p = try f.pl.planRestore(t.gpa, 900, 20 * C, 0);
+        defer p.deinit(t.gpa);
+        t.check("11 room: a restore no live stream may make room for is full, nothing planned", p.status == .full and p.ops.items.len == 0);
+        var u = try Fx.init(t, 1, P);
+        defer u.deinit();
+        try u.live(1, 10 * C, 4 * C);
+        var r = try u.pl.planRestore(t.gpa, 900, 20 * C, 0);
+        defer r.deinit(t.gpa);
+        t.check("11 room: one part: a restore never moves a stream", r.status == .full and r.ops.items.len == 0);
+    }
+}
+
 const sections = .{
     .{ "1-8 parts", secParts },
     .{ "9 twins", secTwins },
@@ -3352,6 +3570,7 @@ const sections = .{
     .{ "10 relocate", secRelocate },
     .{ "10 thrash", secThrash },
     .{ "10 spill", secSpill },
+    .{ "11 room", secRoom },
     .{ "misc", secMisc },
     .{ "lifetimes", secLifetimes },
 };
@@ -3421,6 +3640,9 @@ fn killer(m: Mutant) []const u8 {
         .cheapest_ignored => "1 mirrored: the part whose newest needed victim is oldest",
         .flight_source_unprotected => "life source: an in-flight carry's source is no victim",
         .move_end_unclamped => "life end random: after random moves",
+        .hit_drops_for_room => "11 room: kept states in a hit's tail give their room",
+        .hit_no_wait => "11 room: a stream in a hit's tail that cannot move yet is waited for",
+        .restore_no_relocate => "11 room: a restore its part's evictions cannot free",
     };
 }
 

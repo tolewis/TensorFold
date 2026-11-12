@@ -204,7 +204,8 @@ pub const Spill = struct {
     turns: u32 = 4,
     /// TF_SPILL_LOAD_MS: one service's budget for every restore together, then staged writes (at least 1).
     load_ms: u32 = 40,
-    /// TF_SPILL_LOAD_WAIT_MS: how long a request waits parked on a restore before it is admitted without it.
+    /// TF_SPILL_LOAD_WAIT_MS: how long a request waits parked on a restore, or at the queue's front for the pool's room
+    /// for one, before it is admitted without it.
     load_wait_ms: u32 = 30_000,
     /// TF_SPILL_DEFER_MS: how long a request whose restore the tier refused for capacity (restores or read slots in
     /// flight) waits to ask again before it is admitted on what memory holds (0: at once).
@@ -258,6 +259,8 @@ pub const CacheStats = struct {
     restore_wait_max_ns: u64 = 0,
     restores_deferred: u64 = 0,
     restores_deferred_expired: u64 = 0,
+    restores_room_waits: u64 = 0,
+    restores_room_wait_expired: u64 = 0,
     writes_enqueued: u64 = 0,
     shared_promoted: u64 = 0,
     flushes: u64 = 0,
@@ -303,6 +306,8 @@ pub const CacheStats = struct {
         .restore_wait_max_ns = "The longest wait for a disk restore, in nanoseconds.",
         .restores_deferred = "Requests whose disk restore was refused for capacity (restores or read slots in flight) and retried shortly instead of prefilling.",
         .restores_deferred_expired = "Of them, requests admitted on what memory holds after TF_SPILL_DEFER_MS without the restore starting.",
+        .restores_room_waits = "Requests whose disk restore the KV pool had no room for while streams ran, and that waited for room as a prompt pass does instead of prefilling.",
+        .restores_room_wait_expired = "Of them, requests admitted on what memory holds after TF_SPILL_LOAD_WAIT_MS without room for the restore.",
         .writes_enqueued = "Kept states enqueued for the disk tier at their keep.",
         .shared_promoted = "Disk points promoted to shared prefixes.",
         .flushes = "Clean-shutdown flushes of the disk tier.",
