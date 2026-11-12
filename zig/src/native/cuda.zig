@@ -111,10 +111,15 @@ fn pool(a: Allocator, io: std.Io, ctx: *const cuda.Context, problem: *[]const u8
     const unified = (try ctx.attribute(.integrated)) != 0;
     const card = try ctx.memInfo();
     const text = if (unified) procText(a, io, "/proc/meminfo") else null;
-    const available = budget.counts(unified, .{ .total = card.total, .available = card.free }, text) catch {
+    // MemAvailable first, the per-CPU page lists right after, one reading for both figures: pages that drain from the
+    // lists in between are counted by neither (an undercount), never by both
+    const zones = if (unified) procText(a, io, "/proc/zoneinfo") else null;
+    const parked = if (zones) |z| budget.parkedBytes(z, std.heap.pageSize()) else 0;
+    const read = budget.counts(unified, .{ .total = card.total, .available = card.free }, text) catch {
         problem.* = "cannot read or parse /proc/meminfo's MemTotal and MemAvailable; refusing CUDA unified-memory admission";
         return null;
     };
+    const available = if (unified) budget.counting(read, parked) else read;
     const free = available.available;
     const total = available.total;
     const reserve = budget.reserveBytes(getenv("TENSORFOLD_MEMORY_RESERVE_GIB"), total) catch {
@@ -125,7 +130,7 @@ fn pool(a: Allocator, io: std.Io, ctx: *const cuda.Context, problem: *[]const u8
         problem.* = try std.fmt.allocPrint(a, "TENSORFOLD_CUDA_MEMORY_LIMIT_GB={s}: a positive number of GiB whose byte count fits in a 64-bit size", .{getenv("TENSORFOLD_CUDA_MEMORY_LIMIT_GB").?});
         return null;
     };
-    return .{ .free = free, .total = total, .reserve = reserve, .limit = limit, .unified = unified };
+    return .{ .free = free, .total = total, .reserve = reserve, .limit = limit, .unified = unified, .parked = if (unified) available.available - read.available else 0 };
 }
 
 fn readMemory(_: ?*anyopaque, reset_peak: bool) ?api.Memory {
@@ -370,6 +375,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     defer if (!opened) loaded.deinit(loaded.ctx);
     const model = cuda.usage(false).device - held0;
     const after = try pool(a, io, &g.ctx, problem) orelse return null;
+    for ([_]Pool{ before, after }, [_][]const u8{ "the weights' check", "the streams' admission" }) |p, what| if (p.parked >= 1 << 28) {
+        std.log.info("CUDA budget for {s} counts the {d:.2} GiB free on the per-CPU page lists beyond their resting level (neither MemFree nor MemAvailable does)", .{ what, toGib(p.parked) });
+    };
     const room = after.room(model);
     const streams = budget.admit(room, loaded.stream_bytes, o.lanes, o.lanes_fixed) catch |e| {
         problem.* = switch (e) {
@@ -421,6 +429,16 @@ test "this host's /proc/meminfo reads whole and parses (Linux)" {
     const text = procText(a, std.testing.io, "/proc/meminfo") orelse return error.Unreadable;
     defer a.free(text);
     try std.testing.expect(budget.meminfo(text) != null);
+}
+
+test "this host's /proc/zoneinfo reads whole; its page lists count less than the host's memory (Linux)" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const zones = procText(a, std.testing.io, "/proc/zoneinfo") orelse return error.Unreadable;
+    defer a.free(zones);
+    const mem = procText(a, std.testing.io, "/proc/meminfo") orelse return error.Unreadable;
+    defer a.free(mem);
+    try std.testing.expect(budget.parkedBytes(zones, std.heap.pageSize()) < budget.meminfo(mem).?.total);
 }
 
 test "chip classes name the compute capability as gate entries do" {
