@@ -22,6 +22,8 @@ test {
     _ = @import("reply_text.zig");
     _ = @import("tool_parse.zig");
     _ = @import("tool_stream.zig");
+    _ = @import("dsml_stream_test.zig");
+    _ = @import("dsml_fuzz_test.zig");
     _ = @import("tool_params.zig");
     _ = @import("pyrepr.zig");
     _ = @import("metrics.zig");

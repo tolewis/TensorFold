@@ -52,6 +52,8 @@ pub const Reply = struct {
     stop_sequence: ?[]const u8,
     reasoning: ?[]const u8,
     tool_calls_streamed: bool,
+    /// The DSML calls a stream sent as they decoded, for the finish to check against the parse.
+    streamed_calls: []const tool_stream.SentCall = &.{},
     finish_reason: []const u8,
     prompt_tokens: usize,
     cached_tokens: usize,
@@ -419,6 +421,18 @@ const Generation = struct {
         const vis = if (g.calls != null and g.streamed.text.items.len == 0 and
             reply_text.pyStrip(visible_content).len == 0) "" else visible_content;
         const copied = @intFromPtr(vis.ptr) >= @intFromPtr(g.hidden.items.ptr) and @intFromPtr(vis.ptr) <= @intFromPtr(g.hidden.items.ptr) + g.hidden.items.len;
+        if (g.calls) |*c| {
+            // thinking off, the finish reads Harmony channels out of a text that holds their marker, so its parse no
+            // longer reads this answer: the DSML streamer stops, and the finish follows the parse
+            if (!g.thinking and std.mem.indexOf(u8, answer, "<|channel|>") != null) c.dsml.off = true;
+            // a block under way ends before this round's prose, which can only come after it: a text delta between a
+            // call's header and its last piece ends that call for a client (LiteLLM's Messages stream, /v1/responses)
+            if (c.dsml.midCall()) {
+                var early: std.ArrayList(Value) = .empty;
+                try c.feedDsmlBlock(answer, &early);
+                for (early.items) |d| try g.emit(sink, d);
+            }
+        }
         const delta = g.streamed.after(vis, !copied);
         if (delta.len > 0) {
             try g.streamed.set(g.a, vis, delta);
@@ -427,6 +441,7 @@ const Generation = struct {
         if (g.calls) |*c| {
             var out: std.ArrayList(Value) = .empty;
             try c.feed(tool_parse.beforeDsml(answer), &out); // never the reasoning, nor a DSML block's arguments: a call they quote is not made
+            try c.feedDsml(answer, &out); // DeepSeek-V4.1's DSML calls as they decode, never the reasoning
             for (out.items) |d| try g.emit(sink, d);
         }
     }
@@ -538,11 +553,29 @@ const Generation = struct {
                 if (parsed.calls != null) shown = "";
             }
             const sent = g.streamed.text.items;
+            if (g.calls) |*c| if (c.dsml.sent.items.len > 0) {
+                // the parse reads `content`: the streamer goes on only where that extends the answer it read (thinking
+                // off, the Harmony split can give another text), and a block under way ends before the prose tail
+                c.dsml.verify(content);
+                if (c.dsml.midCall()) {
+                    var early: std.ArrayList(Value) = .empty;
+                    try c.feedDsmlBlock(content, &early);
+                    for (early.items) |d| try g.emit(sink, d);
+                }
+            };
             if (std.mem.startsWith(u8, shown, sent) and shown.len > sent.len) try g.emit(sink, .{ .string = shown[sent.len..] });
-            if (g.calls) |*c| if (close.len > 0) {
-                // the streamer reads the closers as markup the model wrote, so the call ends with the same deltas
+            if (g.calls) |*c| if (close.len > 0 and c.dsml.released == 0) {
+                // the streamer reads the closers as markup the model wrote, so the call ends with the same deltas (after
+                // DSML calls went out, the finish's check sends such a call under the next index instead)
                 var out: std.ArrayList(Value) = .empty;
                 try c.feed(if (g.thinking) content else text, &out);
+                for (out.items) |d| try g.emit(sink, d);
+            };
+            if (g.calls) |*c| if (c.dsml.sent.items.len > 0) {
+                // a stream that sent DSML calls reads the whole answer once more: what its last tokens held back (a stop
+                // string's start, a split character) ends the calls they began, as the parse reads them
+                var out: std.ArrayList(Value) = .empty;
+                try c.feedDsml(content, &out);
                 for (out.items) |d| try g.emit(sink, d);
             };
         }
@@ -593,6 +626,7 @@ const Generation = struct {
             .stop_sequence = g.stops.matched(raw),
             .reasoning = reasoning,
             .tool_calls_streamed = g.calls != null and g.calls.?.streamed,
+            .streamed_calls = if (g.calls) |*c| c.dsml.streamed() else &.{},
             .finish_reason = reason,
             .prompt_tokens = prompt_len,
             .cached_tokens = m.cached orelse 0,

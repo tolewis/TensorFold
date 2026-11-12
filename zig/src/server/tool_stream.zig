@@ -1,4 +1,4 @@
-//! Tool calls while they are written: XML calls as argument deltas, and the one-call policy's text filter.
+//! Tool calls while they are written: XML and DSML calls as argument deltas, and the one-call policy's text filter.
 const std = @import("std");
 const json = @import("json.zig");
 const ids = @import("ids.zig");
@@ -49,9 +49,15 @@ pub const Streamer = struct {
     held: []const u8 = "",
     streamed: bool = false,
     searched: usize = 0, // the answer is only ever extended, so prose already searched holds no opener
+    dsml: Dsml = .{}, // DeepSeek-V4.1's calls (feedDsml)
 
     pub fn init(a: Allocator, tools: []const Value) Allocator.Error!Streamer {
         var s: Streamer = .{ .a = a, .schemas = try tool_params.schemas(a, tools) };
+        // the offered names as tool_parse.parse reads them for a DSML block
+        for (tools) |tool| {
+            const name = try tool_specs.toolName(a, tool);
+            try s.dsml.known.put(a, try std.ascii.allocLowerString(a, name), name);
+        }
         for (tools) |tool| {
             if (tool != .object) continue;
             const spec = if (tool.get("function")) |f| (if (f == .object) f else tool) else tool;
@@ -178,6 +184,430 @@ pub const Streamer = struct {
                 .abort => return,
             }
         }
+    }
+
+    /// The deltas the reply's ``text`` (its whole answer so far, never the reasoning) adds to its DSML calls.
+    pub fn feedDsml(s: *Streamer, t: []const u8, out: *std.ArrayList(Value)) Allocator.Error!void {
+        return s.feedDsmlTo(t, out, false);
+    }
+
+    /// ``feedDsml`` that stops at the end of the block it is in: a round's prose after that block goes out after the
+    /// block's last deltas and before the next block's first (``Dsml.midCall``).
+    pub fn feedDsmlBlock(s: *Streamer, t: []const u8, out: *std.ArrayList(Value)) Allocator.Error!void {
+        return s.feedDsmlTo(t, out, true);
+    }
+
+    fn feedDsmlTo(s: *Streamer, t: []const u8, out: *std.ArrayList(Value), one_block: bool) Allocator.Error!void {
+        const d = &s.dsml;
+        const a = s.a;
+        // the saved positions hold only in a text that extends the one read before; a shorter one turns the streamer
+        // off, and the finish then follows the parse (Dsml.verify checks the whole text once)
+        if (t.len < d.read) d.off = true;
+        if (!d.off and t.len > d.read) {
+            try d.seen.appendSlice(a, t[d.read..]);
+            d.read = t.len;
+        }
+        while (!d.off) {
+            d.bounds(t);
+            switch (d.state) {
+                .outside => {
+                    if (one_block) return;
+                    // envelopes(): the next block from the end of the last, and only one that closes is the parse's
+                    const i = findIn(t, tool_parse.dsml41_open, @max(d.pos, d.from), null);
+                    if (i != .at) {
+                        d.from = @max(d.pos, t.len -| (tool_parse.dsml41_open.len - 1));
+                        return;
+                    }
+                    if ((d.sent.items.len == 0 and s.streamed) or foreignCall(t[d.gap..i.at])) {
+                        d.off = true;
+                        return;
+                    }
+                    d.pos = i.at + tool_parse.dsml41_open.len;
+                    d.block_end = null;
+                    d.block_from = d.pos;
+                    d.block_calls = 0;
+                    d.state = .block;
+                },
+                .block => switch (findIn(t, tool_parse.invoke41_open, d.pos, d.block_end)) {
+                    .wait => return,
+                    .none => {
+                        // the block's closer: every invoke in it is decided, and the calls it held go out
+                        try d.closePending(a, out);
+                        try d.release(a, out);
+                        d.pos = d.block_end.? + tool_parse.dsml41_close.len;
+                        d.gap = d.pos;
+                        d.from = d.pos;
+                        d.state = .outside;
+                    },
+                    .at => |i| {
+                        d.pos = i + 1; // where the parse looks again when this invoke is not one
+                        d.name_start = i + tool_parse.invoke41_open.len;
+                        d.state = .name;
+                    },
+                },
+                .name => switch (findIn(t, "\"", d.name_start, d.block_end)) {
+                    .wait => return,
+                    .none => d.state = .block,
+                    .at => |q| {
+                        if (q == d.name_start) {
+                            d.state = .block;
+                            continue;
+                        }
+                        if (q + 1 >= (d.block_end orelse t.len)) {
+                            if (d.block_end == null) return; // its '>' has not come yet
+                            d.state = .block;
+                            continue;
+                        }
+                        if (t[q + 1] != '>') {
+                            d.state = .block;
+                            continue;
+                        }
+                        d.q = q;
+                        d.end = null;
+                        d.end_pending = true;
+                        d.end_from = q + 2;
+                        d.state = .skip;
+                        d.bounds(t);
+                        if (!d.end_pending and d.end == null) {
+                            d.state = .block; // no closer in its block: the parse takes no call here
+                            continue;
+                        }
+                        const name = reply_text.pyStrip(t[d.name_start..q]);
+                        if (name.len == 0) continue; // the parse reads it, then takes no call: skip to its closer
+                        // the block's first call streams; a later one waits with the first call's brace for the
+                        // block's closer, since the parse takes no call from a block that never closes
+                        d.block_calls += 1;
+                        if (d.block_calls > 1) d.holding = true;
+                        try d.closePending(a, out);
+                        // the parse's name: the offered spelling, else the model's (a copy: the answer's buffer moves)
+                        const called = d.known.get(try std.ascii.allocLowerString(a, name)) orelse try a.dupe(u8, name);
+                        const function = try json.newObject(a);
+                        try function.put(a, "name", .{ .string = called });
+                        try function.put(a, "arguments", .{ .string = "" });
+                        const one = try json.newObject(a);
+                        try one.put(a, "index", try json.intValue(a, d.sent.items.len));
+                        try one.put(a, "id", .{ .string = try ids.make(a, "call_", 24) });
+                        try one.put(a, "type", .{ .string = "function" });
+                        try one.put(a, "function", .{ .object = function });
+                        try d.dest(out).append(a, try wrap(a, .{ .object = one }));
+                        try d.sent.append(a, .{ .name = called });
+                        if (!d.holding) d.released = d.sent.items.len;
+                        d.current = d.sent.items.len - 1;
+                        s.streamed = true;
+                        d.p = q + 2;
+                        d.state = .body;
+                    },
+                },
+                .skip => {
+                    if (d.end_pending) return;
+                    if (d.end) |e| d.pos = e + tool_parse.invoke41_close.len;
+                    d.state = .block;
+                },
+                .body, .key, .string_value, .json_value => if (!d.end_pending and d.end == null) {
+                    // the block closed with this invoke open: the parse drops it and looks again after its opener
+                    d.hold();
+                    d.current = null;
+                    d.state = .block;
+                    continue;
+                } else switch (d.state) {
+                    .body => switch (findIn(t, tool_parse.param41_open, d.p, d.limit())) {
+                        .wait => return,
+                        .none => {
+                            // the invoke's closer: the call is whole, and its brace waits
+                            d.closing = d.current;
+                            d.current = null;
+                            d.pos = d.end.? + tool_parse.invoke41_close.len;
+                            d.state = .block;
+                        },
+                        .at => |ps| {
+                            d.p = ps + 1; // where the parse looks again when this parameter is not one
+                            d.ns = ps + tool_parse.param41_open.len;
+                            d.state = .key;
+                        },
+                    },
+                    .key => switch (findIn(t, "\"", d.ns, d.limit())) {
+                        .wait => return,
+                        .none => d.state = .body,
+                        .at => |nq| {
+                            if (nq == d.ns) {
+                                d.state = .body;
+                                continue;
+                            }
+                            const lim = d.limit() orelse t.len;
+                            var v = nq + 1;
+                            const flag = t[@min(v, lim)..lim];
+                            var json_value = false;
+                            if (std.mem.startsWith(u8, flag, " string=\"true\"")) {
+                                v += " string=\"true\"".len;
+                            } else if (std.mem.startsWith(u8, flag, " string=\"false\"")) {
+                                v += " string=\"false\"".len;
+                                json_value = true;
+                            } else if (d.limit() == null and (std.mem.startsWith(u8, " string=\"true\"", flag) or std.mem.startsWith(u8, " string=\"false\"", flag))) return;
+                            if (v >= lim) {
+                                if (d.limit() == null) return;
+                                d.state = .body;
+                                continue;
+                            }
+                            if (t[v] != '>') {
+                                d.state = .body;
+                                continue;
+                            }
+                            d.nq = nq;
+                            d.v = v + 1;
+                            d.at = v + 1;
+                            if (json_value) {
+                                d.state = .json_value;
+                            } else {
+                                try d.key(a, t[d.ns..nq], ":\"", out);
+                                d.state = .string_value;
+                            }
+                        },
+                    },
+                    .string_value => switch (findIn(t, tool_parse.param41_close, d.at, d.limit())) {
+                        .at => |pe| {
+                            try d.value(a, t[d.at..pe], out);
+                            try d.piece(a, "\"", out);
+                            d.p = pe + tool_parse.param41_close.len;
+                            d.state = .body;
+                        },
+                        .none => {
+                            // the invoke ends inside the value: the parse drops the parameter and reads on from its opener
+                            d.hold();
+                            d.state = .body;
+                        },
+                        .wait => {
+                            const rest = t[d.at..];
+                            const keep = @max(reply_text.partialTag(rest, tool_parse.param41_close), openSequence(rest));
+                            try d.value(a, rest[0 .. rest.len - keep], out);
+                            d.at = t.len - keep;
+                            return;
+                        },
+                    },
+                    .json_value => switch (findIn(t, tool_parse.param41_close, d.at, d.limit())) {
+                        .at => |pe| {
+                            const raw = t[d.v..pe];
+                            const parsed: Value = switch (try json.parseText(a, raw)) {
+                                .ok => |x| x,
+                                .err => .{ .string = raw },
+                            };
+                            const text = try json.stringify(a, parsed, .{ .ascii = false, .compact = true });
+                            try d.key(a, t[d.ns..d.nq], try std.mem.concat(a, u8, &.{ ":", text }), out);
+                            d.p = pe + tool_parse.param41_close.len;
+                            d.state = .body;
+                        },
+                        .none => d.state = .body, // nothing of it went out
+                        .wait => {
+                            d.at = @max(d.v, t.len -| (tool_parse.param41_close.len - 1));
+                            return;
+                        },
+                    },
+                    else => unreachable,
+                },
+            }
+        }
+    }
+};
+
+/// A DSML call a stream sent: its name, the arguments text that went out, and whether it closed.
+pub const SentCall = struct {
+    name: []const u8,
+    arguments: std.ArrayList(u8) = .empty,
+    opened: bool = false, // its "{" went out with the first parameter
+    closed: bool = false, // its closing brace went out: its invoke and its block closed
+    held: bool = false, // its pieces stopped: the parse drops a value or the whole invoke that already went out
+
+    /// The parse's call ``call`` is this one: same name, the same arguments byte for byte, and closed.
+    pub fn same(c: *const SentCall, call: Value) bool {
+        const function = call.get("function") orelse return false;
+        const name = function.strField("name") orelse return false;
+        const args = function.strField("arguments") orelse return false;
+        return c.closed and !c.held and std.mem.eql(u8, name, c.name) and std.mem.eql(u8, args, c.arguments.items);
+    }
+};
+
+/// Where ``needle`` starts in ``t`` at or after ``from`` and before ``limit``: the parse's ``find`` on a slice that ends at
+/// ``limit``. With no limit yet (its closer has not arrived) a miss waits for more text: a complete needle in the text so
+/// far is inside the slice, since no DSML closer can overlap another piece of DSML markup.
+const Found = union(enum) { at: usize, none, wait };
+
+fn findIn(t: []const u8, needle: []const u8, from: usize, limit: ?usize) Found {
+    const hay = t[0..@min(t.len, limit orelse t.len)];
+    if (from <= hay.len) if (std.mem.indexOfPos(u8, hay, from, needle)) |i| return .{ .at = i };
+    return if (limit != null) .none else .wait;
+}
+
+/// Bytes at the end of ``s`` that begin a character the text does not hold whole yet.
+fn openSequence(s: []const u8) usize {
+    var back: usize = 0;
+    while (back < @min(4, s.len)) {
+        back += 1;
+        const b = s[s.len - back];
+        if (b & 0xc0 == 0x80) continue;
+        const n = std.unicode.utf8ByteSequenceLength(b) catch return 0;
+        return if (n > back) back else 0;
+    }
+    return 0;
+}
+
+/// Another call form in the text before a DSML block: tool_parse.parse reads its calls there too, in text order.
+fn foreignCall(text: []const u8) bool {
+    return std.ascii.findIgnoreCase(text, "<tool_call>") != null or std.ascii.findIgnoreCase(text, ":tool_call>") != null or
+        std.mem.indexOf(u8, text, "<|tool_call>") != null or std.mem.indexOf(u8, text, tool_parse.dsml_open) != null;
+}
+
+/// DeepSeek-V4.1's DSML calls as they decode, read the way ``tool_parse.dsml41Calls`` reads the finished reply: each
+/// search is the parse's search, made on the text so far. A header goes out when its invoke name is whole and the parse
+/// would take it; a string value goes out as JSON-escaped pieces while it decodes (a tail that may begin its closer or a
+/// character is held); any other value goes out when its parameter closes, as the parse writes it; a call's closing
+/// brace waits for the next header or for its block's closer.
+pub const Dsml = struct {
+    known: std.StringArrayHashMapUnmanaged([]const u8) = .empty, // tool_parse.parse's offered names, lower-cased
+    sent: std.ArrayList(SentCall) = .empty,
+    off: bool = false, // another call form came first: the reply's calls go out when it ends, as without this patch
+    state: enum { outside, block, name, skip, body, key, string_value, json_value } = .outside,
+    pos: usize = 0, // the parse's next invoke search (outside: its next block search)
+    from: usize = 0, // where a search that waits starts again (the text before it holds no complete needle)
+    gap: usize = 0, // the end of the last block: the text from here to the next one holds no other call form
+    block_end: ?usize = null, // the block's closer, once it is in the text
+    block_from: usize = 0,
+    name_start: usize = 0,
+    q: usize = 0, // the invoke name's closing quote
+    end: ?usize = null, // the invoke's closer (null and not end_pending: the block holds none)
+    end_pending: bool = false,
+    end_from: usize = 0,
+    p: usize = 0, // the parse's next parameter search
+    ns: usize = 0,
+    nq: usize = 0,
+    v: usize = 0, // the value's start
+    at: usize = 0, // the value's bytes before this went out (a string) or hold no closer (any value)
+    current: ?usize = null, // the call whose arguments are going out
+    closing: ?usize = null, // a whole call whose brace waits
+    read: usize = 0, // the length of the text read last
+    seen: std.ArrayList(u8) = .empty, // the text read so far (verify checks the finish's text against it)
+    block_calls: usize = 0, // the calls this block made so far
+    holding: bool = false, // the block made a second call: its deltas wait for the block's closer
+    queue: std.ArrayList(Value) = .empty, // the deltas that wait
+    released: usize = 0, // the calls whose header went out: sent[0..released]
+    late: ?usize = null, // the block's first call, whose brace waits in the queue
+
+    /// A call is under way: its block opened, or its brace waits.
+    pub fn midCall(d: *const Dsml) bool {
+        return !d.off and (d.state != .outside or d.closing != null);
+    }
+
+    /// The calls the client got (their headers went out), for the finish to check against the parse.
+    pub fn streamed(d: *const Dsml) []const SentCall {
+        return d.sent.items[0..d.released];
+    }
+
+    /// The finish's ``text`` must extend the text the stream read, else its positions do not hold there: the streamer
+    /// turns off, and the finish follows the parse.
+    pub fn verify(d: *Dsml, text: []const u8) void {
+        if (!std.mem.startsWith(u8, text, d.seen.items)) d.off = true;
+    }
+
+    fn dest(d: *Dsml, out: *std.ArrayList(Value)) *std.ArrayList(Value) {
+        return if (d.holding) &d.queue else out;
+    }
+
+    /// The block closed: what it held goes out, the first call's brace first.
+    fn release(d: *Dsml, a: Allocator, out: *std.ArrayList(Value)) Allocator.Error!void {
+        if (d.late) |i| {
+            const c = &d.sent.items[i];
+            try c.arguments.appendSlice(a, if (c.opened) "}" else "{}");
+            c.closed = true;
+            d.late = null;
+        }
+        try out.appendSlice(a, d.queue.items);
+        d.queue.clearRetainingCapacity();
+        d.holding = false;
+        d.released = d.sent.items.len;
+    }
+
+    fn limit(d: *const Dsml) ?usize {
+        return if (d.end_pending) null else d.end;
+    }
+
+    /// The block's closer and the invoke's closer, found as soon as they are in the text.
+    fn bounds(d: *Dsml, t: []const u8) void {
+        if (d.state == .outside) return;
+        if (d.block_end == null) {
+            if (d.block_from <= t.len) if (std.mem.indexOfPos(u8, t, d.block_from, tool_parse.dsml41_close)) |i| {
+                d.block_end = i;
+            };
+            if (d.block_end == null) d.block_from = @max(d.block_from, t.len -| (tool_parse.dsml41_close.len - 1));
+        }
+        if (!d.end_pending) return;
+        switch (findIn(t, tool_parse.invoke41_close, d.end_from, d.block_end)) {
+            .at => |i| {
+                d.end = i;
+                d.end_pending = false;
+            },
+            .none => {
+                d.end = null;
+                d.end_pending = false;
+            },
+            .wait => d.end_from = @max(d.end_from, t.len -| (tool_parse.invoke41_close.len - 1)),
+        }
+    }
+
+    fn delta(a: Allocator, index: usize, fragment: []const u8) Allocator.Error!Value {
+        const function = try json.newObject(a);
+        try function.put(a, "arguments", .{ .string = fragment });
+        const one = try json.newObject(a);
+        try one.put(a, "index", try json.intValue(a, index));
+        try one.put(a, "function", .{ .object = function });
+        return wrap(a, .{ .object = one });
+    }
+
+    /// ``fragment`` of the current call's arguments, unless its pieces stopped.
+    fn piece(d: *Dsml, a: Allocator, fragment: []const u8, out: *std.ArrayList(Value)) Allocator.Error!void {
+        const i = d.current orelse return;
+        const c = &d.sent.items[i];
+        if (c.held or fragment.len == 0) return;
+        try c.arguments.appendSlice(a, fragment);
+        try d.dest(out).append(a, try delta(a, i, fragment));
+    }
+
+    /// A parameter's key, after "{" or ",", then ``after``.
+    fn key(d: *Dsml, a: Allocator, name: []const u8, after: []const u8, out: *std.ArrayList(Value)) Allocator.Error!void {
+        const i = d.current orelse return;
+        const c = &d.sent.items[i];
+        const quoted = try json.quote(a, name, .{ .ascii = false });
+        try d.piece(a, try std.mem.concat(a, u8, &.{ if (c.opened) "," else "{", quoted, after }), out);
+        c.opened = true;
+    }
+
+    /// The JSON-escaped text of a string value's bytes (escaping is per byte, so pieces join to the whole value's).
+    fn value(d: *Dsml, a: Allocator, bytes: []const u8, out: *std.ArrayList(Value)) Allocator.Error!void {
+        if (bytes.len == 0) return;
+        const q = try json.quote(a, bytes, .{ .ascii = false });
+        try d.piece(a, q[1 .. q.len - 1], out);
+    }
+
+    /// The brace of the whole call before this one: its invoke closed, and a new header or the block's closer came.
+    fn closePending(d: *Dsml, a: Allocator, out: *std.ArrayList(Value)) Allocator.Error!void {
+        const i = d.closing orelse return;
+        d.closing = null;
+        const c = &d.sent.items[i];
+        if (c.held) return;
+        if (d.holding and i < d.released) {
+            // the block's first call went out: its brace waits with the block's later calls, so a block that never
+            // closes leaves it open, as the parse takes none of the block's calls
+            try d.queue.append(a, try delta(a, i, if (c.opened) "}" else "{}"));
+            d.late = i;
+            return;
+        }
+        const was = d.current;
+        d.current = i;
+        try d.piece(a, if (c.opened) "}" else "{}", out);
+        d.current = was;
+        c.closed = true;
+    }
+
+    /// The current invoke's call stops: the parse drops something that already went out.
+    fn hold(d: *Dsml) void {
+        if (d.current) |i| d.sent.items[i].held = true;
     }
 };
 
@@ -401,4 +831,186 @@ fn sentArguments(a: Allocator, deltas: []const Value) Allocator.Error![]const u8
         try out.appendSlice(a, one.get("function").?.get("arguments").?.string);
     };
     return out.items;
+}
+
+// DSML calls as they decode, fed as the answer grows at many split points.
+const D = "\u{ff5c}DSML\u{ff5c}";
+const calls_open = "\n\n<" ++ D ++ " calls>\n";
+const calls_close = "\n</" ++ D ++ " calls>";
+
+fn dsmlInvoke(comptime name: []const u8, comptime body: []const u8) []const u8 {
+    return "<" ++ D ++ " invoke name=\"" ++ name ++ "\">\n" ++ body ++ "</" ++ D ++ " invoke>\n";
+}
+
+fn dsmlParam(comptime name: []const u8, comptime flag: []const u8, comptime value: []const u8) []const u8 {
+    return "<" ++ D ++ " parameter name=\"" ++ name ++ "\"" ++ flag ++ ">" ++ value ++ "</" ++ D ++ " parameter>\n";
+}
+
+const dsml_tools =
+    \\[{"type":"function","function":{"name":"Bash","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"number"}}}}},
+    \\{"type":"function","function":{"name":"Write","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}}}}}]
+;
+
+/// One streamer fed `text` as it grows by `step` bytes (`chars`: kept to whole characters), then once whole, as the
+/// finish feeds it; its deltas checked: each call's header once and in order, then only its own pieces, each valid UTF-8,
+/// joined to what the streamer records as sent.
+fn dsmlFeed(a: Allocator, text: []const u8, step: usize, chars: bool) !Streamer {
+    var s = try Streamer.init(a, (try json.parse(a, dsml_tools)).ok.array);
+    var out: std.ArrayList(Value) = .empty;
+    var end: usize = 0;
+    while (end < text.len) {
+        end = @min(text.len, end + step);
+        if (chars) {
+            while (end < text.len and text[end] & 0xc0 == 0x80) end += 1;
+        }
+        try s.feedDsml(text[0..end], &out);
+    }
+    try s.feedDsml(text, &out);
+    var joined: std.ArrayList(std.ArrayList(u8)) = .empty;
+    for (out.items) |d| for (d.get("tool_calls").?.array) |one| {
+        const index: usize = @intCast(one.get("index").?.int64().?);
+        const piece = one.get("function").?.strField("arguments").?;
+        try std.testing.expect(std.unicode.utf8ValidateSlice(piece));
+        if (one.get("id") != null) {
+            try std.testing.expectEqual(joined.items.len, index);
+            try std.testing.expectEqualStrings("", piece);
+            try joined.append(a, .empty);
+            continue;
+        }
+        try std.testing.expectEqual(joined.items.len - 1, index);
+        try joined.items[index].appendSlice(a, piece);
+    };
+    // what went out: the calls whose header went out (a block that never closes holds its later calls)
+    try std.testing.expectEqual(s.dsml.streamed().len, joined.items.len);
+    for (s.dsml.streamed(), joined.items) |c, j| try std.testing.expectEqualStrings(c.arguments.items, j.items);
+    return s;
+}
+
+const splits = [_]struct { step: usize, chars: bool }{ .{ .step = 1, .chars = false }, .{ .step = 1, .chars = true }, .{ .step = 2, .chars = false }, .{ .step = 3, .chars = true }, .{ .step = 7, .chars = false }, .{ .step = 1 << 20, .chars = true } };
+
+/// At every split the stream sends the parse's calls: the same names, the arguments byte for byte, each closed.
+fn expectDsmlParsed(text: []const u8, calls: usize) !void {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parsed = (try tool_parse.parse(a, text, (try json.parse(a, dsml_tools)).ok.array, null)).calls orelse &.{};
+    try std.testing.expectEqual(calls, parsed.len);
+    for (splits) |sp| {
+        const s = try dsmlFeed(a, text, sp.step, sp.chars);
+        try std.testing.expectEqual(parsed.len, s.dsml.streamed().len);
+        for (parsed, s.dsml.streamed()) |p, *c| try std.testing.expect(c.same(p));
+    }
+}
+
+test "DSML calls stream as the parse reads them, at every split: escapes, a split character, a name to strip, odd parameters" {
+    try expectDsmlParsed(comptime ("Running it." ++ calls_open ++ dsmlInvoke(" bash ", dsmlParam("command", " string=\"true\"", "printf '%s\\n' \"a\\\\b\" \u{1f30a}\t| tr a-z A-Z") ++
+        dsmlParam("timeout", " string=\"false\"", " 120000 ") ++ dsmlParam("note", "", "no flag: a string") ++ dsmlParam("bad", " string=\"maybe\"", "skipped") ++
+        dsmlParam("n", " string=\"false\"", "not json") ++ dsmlParam("x", " string=\"false\"", "NaN") ++ dsmlParam("empty", " string=\"true\"", "")) ++
+        dsmlInvoke("Write", dsmlParam("file_path", " string=\"true\"", "/tmp/\u{6d77}.md") ++ dsmlParam("content", " string=\"true\"", "a < b </div> </\u{ff5c}DSML\u{ff5c} par\n\u{1f469}\u{200d}\u{1f4bb}\n")) ++ calls_close), 2);
+}
+
+test "DSML calls stream as the parse reads them: an empty name, a bad invoke line, a far quote, a quoted opener, two blocks" {
+    // an invoke whose name strips to nothing is read and skipped; one without its '">' is not an invoke
+    try expectDsmlParsed(comptime (calls_open ++ dsmlInvoke("  ", dsmlParam("command", " string=\"true\"", "ls")) ++ "<" ++ D ++ " invoke name=\"Bash\" x=\"1\">\n" ++
+        dsmlInvoke("Bash", dsmlParam("command", " string=\"true\"", "pwd")) ++ calls_close), 1);
+    // a parameter name without its quotes: the parse's first quote lies in the next parameter, which it then reads
+    try expectDsmlParsed(comptime (calls_open ++ dsmlInvoke("Bash", "<" ++ D ++ " parameter name=command>ls</" ++ D ++ " parameter>\n" ++
+        dsmlParam("command", " string=\"true\"", "pwd")) ++ calls_close), 1);
+    // an opener quoted in prose pairs with the real block's closer: the parse reads the invoke after it
+    try expectDsmlParsed(comptime ("Write `<" ++ D ++ " calls>` blocks, like this one:" ++ calls_open ++ dsmlInvoke("Bash", dsmlParam("command", " string=\"true\"", "ls")) ++ calls_close), 1);
+    // two blocks with text between them, and a call to a tool the request did not offer
+    try expectDsmlParsed(comptime ("First." ++ calls_open ++ dsmlInvoke("Bash", dsmlParam("command", " string=\"true\"", "ls")) ++ calls_close ++ "\nThen." ++
+        calls_open ++ dsmlInvoke("WebFetch", dsmlParam("url", " string=\"true\"", "https://example.com/?q=\"x\"")) ++ calls_close), 2);
+    // DSML markup without its calls block is text
+    try expectDsmlParsed(comptime ("Write " ++ dsmlInvoke("Bash", dsmlParam("command", " string=\"true\"", "ls")) ++ " inside a block."), 0);
+}
+
+test "a DSML call's brace waits for its block's closer; a block left open sends none" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const whole = comptime (calls_open ++ dsmlInvoke("Bash", dsmlParam("command", " string=\"true\"", "ls -la")) ++ calls_close);
+    const open = whole[0 .. whole.len - calls_close.len];
+    const s = try dsmlFeed(a, open, 1, true);
+    try std.testing.expectEqualStrings("{\"command\":\"ls -la\"", s.dsml.sent.items[0].arguments.items);
+    try std.testing.expect(!s.dsml.sent.items[0].closed);
+    try std.testing.expect((try tool_parse.parse(a, open, (try json.parse(a, dsml_tools)).ok.array, null)).calls == null);
+    const closed = try dsmlFeed(a, whole, 1, true);
+    try std.testing.expectEqualStrings("{\"command\":\"ls -la\"}", closed.dsml.sent.items[0].arguments.items);
+    try std.testing.expect(closed.dsml.sent.items[0].closed);
+}
+
+test "where the parse drops or changes what already went out, the stream says so: the finish then follows the parse" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, dsml_tools)).ok.array;
+    // a repeated parameter: the parse keeps the first place and the last value; the stream sent both, so its text
+    // differs, and reads back (last value wins) as the parse's object
+    const twice = comptime (calls_open ++ dsmlInvoke("Bash", dsmlParam("command", " string=\"true\"", "ls") ++ dsmlParam("timeout", " string=\"false\"", "5") ++
+        dsmlParam("command", " string=\"true\"", "pwd")) ++ calls_close);
+    const parsed = (try tool_parse.parse(a, twice, tools, null)).calls.?[0];
+    const s = try dsmlFeed(a, twice, 1, true);
+    const c = &s.dsml.sent.items[0];
+    try std.testing.expect(c.closed and !c.same(parsed));
+    try std.testing.expectEqualStrings("{\"command\":\"ls\",\"timeout\":5,\"command\":\"pwd\"}", c.arguments.items);
+    try std.testing.expectEqualStrings(parsed.get("function").?.strField("arguments").?, try json.stringify(a, (try json.parse(a, c.arguments.items)).ok, .{ .ascii = false, .compact = true }));
+    // an invoke the block closes without its own closer: the parse drops it; the stream sent its start and holds it
+    const unclosed = comptime (calls_open ++ "<" ++ D ++ " invoke name=\"Bash\">\n" ++ dsmlParam("command", " string=\"true\"", "ls") ++ calls_close);
+    try std.testing.expect((try tool_parse.parse(a, unclosed, tools, null)).calls == null);
+    const u = try dsmlFeed(a, unclosed, 1, true);
+    try std.testing.expect(u.dsml.sent.items.len == 1 and u.dsml.sent.items[0].held and !u.dsml.sent.items[0].closed);
+    // a value that holds an invoke's closer: the parse ends the invoke there and drops the value
+    const cut = comptime (calls_open ++ dsmlInvoke("Write", dsmlParam("file_path", " string=\"true\"", "/a") ++ "<" ++ D ++ " parameter name=\"content\" string=\"true\">x</" ++ D ++ " invoke>y</" ++ D ++ " parameter>\n") ++ calls_close);
+    const w = (try tool_parse.parse(a, cut, tools, null)).calls.?;
+    try std.testing.expectEqualStrings("{\"file_path\":\"/a\"}", w[0].get("function").?.strField("arguments").?);
+    const v = try dsmlFeed(a, cut, 1, true);
+    try std.testing.expect(v.dsml.sent.items[0].held and !v.dsml.sent.items[0].same(w[0]));
+    // another call form first: the stream leaves every call to the finish, as before
+    const xml = comptime ("<tool_call>{\"name\":\"Bash\",\"arguments\":{\"command\":\"ls\"}}</tool_call>" ++ calls_open ++ dsmlInvoke("Bash", dsmlParam("command", " string=\"true\"", "pwd")) ++ calls_close);
+    const x = try dsmlFeed(a, xml, 3, true);
+    try std.testing.expect(x.dsml.off and x.dsml.sent.items.len == 0);
+}
+
+test "a block's second call and the first call's brace wait for the block's closer; a block cut before it sends no whole call" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, dsml_tools)).ok.array;
+    const first = comptime (calls_open ++ dsmlInvoke("Bash", dsmlParam("command", " string=\"true\"", "ls")));
+    const second = comptime (first ++ dsmlInvoke("Write", dsmlParam("file_path", " string=\"true\"", "/tmp/a") ++ dsmlParam("content", " string=\"true\"", "x")));
+    // cut in the second invoke, at every split: one call went out, open; the parse takes none
+    for ([_]usize{ second.len - 3, second.len - 1, second.len }) |cut| for (splits) |sp| {
+        const s = try dsmlFeed(a, second[0..cut], sp.step, sp.chars);
+        try std.testing.expectEqual(@as(usize, 1), s.dsml.streamed().len);
+        try std.testing.expectEqualStrings("{\"command\":\"ls\"", s.dsml.streamed()[0].arguments.items);
+        try std.testing.expect(!s.dsml.streamed()[0].closed);
+        try std.testing.expect((try tool_parse.parse(a, second[0..cut], tools, null)).calls == null);
+    };
+    // the block's closer releases both, the first call's brace first
+    const s = try dsmlFeed(a, second ++ calls_close, 1, true);
+    try std.testing.expectEqual(@as(usize, 2), s.dsml.streamed().len);
+    for (s.dsml.streamed()) |c| try std.testing.expect(c.closed);
+    try std.testing.expectEqualStrings("{\"command\":\"ls\"}", s.dsml.streamed()[0].arguments.items);
+    try std.testing.expectEqualStrings("{\"file_path\":\"/tmp/a\",\"content\":\"x\"}", s.dsml.streamed()[1].arguments.items);
+}
+
+test "a text that does not extend the one read turns the streamer off instead of reading past its end" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var s = try Streamer.init(a, (try json.parse(a, dsml_tools)).ok.array);
+    var out: std.ArrayList(Value) = .empty;
+    const streamed_text = comptime (calls_open ++ "<" ++ D ++ " invoke name=\"Bash\">\n<" ++ D ++ " parameter name=\"command\" string=\"true\">grep -n '<|channel|>' x.zig and more");
+    var end: usize = 0;
+    while (end < streamed_text.len) : (end = @min(streamed_text.len, end + 4)) try s.feedDsml(streamed_text[0..end], &out);
+    try s.feedDsml(streamed_text, &out);
+    // chat.finish, thinking off: content = parseHarmony(text).content, "" here
+    try s.feedDsml("", &out);
+    try std.testing.expect(s.dsml.off);
+    // the finish's check: a longer text with another start
+    var t = try Streamer.init(a, (try json.parse(a, dsml_tools)).ok.array);
+    try t.feedDsml(streamed_text[0..40], &out);
+    t.dsml.verify("other text, longer than forty bytes, that does not start with the first");
+    try std.testing.expect(t.dsml.off);
 }

@@ -20,7 +20,7 @@ const Envelope = struct { start: usize, end: usize, payload: []const u8 };
 
 pub const Parsed = struct { content: []const u8, calls: ?[]Value };
 
-const dsml_open = "<\u{ff5c}DSML\u{ff5c}tool_calls>";
+pub const dsml_open = "<\u{ff5c}DSML\u{ff5c}tool_calls>";
 const dsml_close = "</\u{ff5c}DSML\u{ff5c}tool_calls>";
 const invoke_open = "<\u{ff5c}DSML\u{ff5c}invoke name=\"";
 const invoke_close = "</\u{ff5c}DSML\u{ff5c}invoke>";
@@ -28,12 +28,12 @@ const param_open = "<\u{ff5c}DSML\u{ff5c}parameter name=\"";
 const param_close = "</\u{ff5c}DSML\u{ff5c}parameter>";
 // DeepSeek-V4.1's spelling (its chat template's, and the served Python lane's reply_text.py): a space after the marker,
 // the block named "calls"; read as the lane reads it (dsml41Calls)
-const dsml41_open = "<\u{ff5c}DSML\u{ff5c} calls>";
-const dsml41_close = "</\u{ff5c}DSML\u{ff5c} calls>";
-const invoke41_open = "<\u{ff5c}DSML\u{ff5c} invoke name=\"";
-const invoke41_close = "</\u{ff5c}DSML\u{ff5c} invoke>";
-const param41_open = "<\u{ff5c}DSML\u{ff5c} parameter name=\"";
-const param41_close = "</\u{ff5c}DSML\u{ff5c} parameter>";
+pub const dsml41_open = "<\u{ff5c}DSML\u{ff5c} calls>";
+pub const dsml41_close = "</\u{ff5c}DSML\u{ff5c} calls>";
+pub const invoke41_open = "<\u{ff5c}DSML\u{ff5c} invoke name=\"";
+pub const invoke41_close = "</\u{ff5c}DSML\u{ff5c} invoke>";
+pub const param41_open = "<\u{ff5c}DSML\u{ff5c} parameter name=\"";
+pub const param41_close = "</\u{ff5c}DSML\u{ff5c} parameter>";
 
 fn findCI(hay: []const u8, needle: []const u8, from: usize) ?usize {
     if (from > hay.len) return null;

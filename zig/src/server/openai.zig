@@ -10,6 +10,7 @@ const messages = @import("messages.zig");
 const tool_specs = @import("tool_specs.zig");
 const tool_parse = @import("tool_parse.zig");
 const tool_stream = @import("tool_stream.zig");
+const reply_text = @import("reply_text.zig");
 const ids = @import("ids.zig");
 const log = @import("log.zig");
 const request_log = @import("request_log.zig");
@@ -439,6 +440,35 @@ const Run = struct {
         return if (o.count() > 0) Value{ .object = o } else null;
     }
 
+    /// The DSML calls a stream sent as they decoded, checked against the reply's parse. When the sent
+    /// calls are the parse's first ones (same names, the same arguments byte for byte, each closed), the parse's other calls
+    /// (another call form after the blocks) follow under the next indexes. Otherwise the parse dropped or changed what went
+    /// out (the reply ended inside a block, the parse rejects an invoke, a repeated parameter): nothing more of the calls
+    /// goes out, no brace closes what the parse rejects, and the content goes on to the parse's content.
+    fn settle(r: *Run, reply: *const chat.Reply, calls: ?[]Value) Allocator.Error!void {
+        const a = r.a;
+        const sent = reply.streamed_calls;
+        const parsed = calls orelse &.{};
+        var k: usize = 0;
+        while (k < sent.len and k < parsed.len and sent[k].same(parsed[k])) k += 1;
+        if (k == sent.len) {
+            for (try tool_parse.deltas(a, parsed[k..])) |d| {
+                const one = d.get("tool_calls").?.array[0];
+                try one.object.put(a, "index", try json.intValue(a, k + @as(usize, @intCast(one.get("index").?.int64().?))));
+                r.emit(try r.chunk(d, null)) catch return;
+            }
+            return;
+        }
+        log.line("warning: {s}: the streamed tool call {d} is not the reply's parse ({d} sent, {d} parsed); its content follows the parse", .{ r.id, k, sent.len, parsed.len });
+        const shown = reply_text.pyLstrip(r.prose_sent.items);
+        if (!std.mem.startsWith(u8, reply.content, shown)) return;
+        const rest = reply.content[shown.len..];
+        if (reply_text.pyStrip(rest).len == 0) return;
+        r.prose() catch return;
+        try r.prose_sent.appendSlice(a, rest);
+        r.emit(try r.chunk(.{ .string = rest }, null)) catch return;
+    }
+
     /// The assistant role before the first prose of a tool-using stream.
     fn prose(r: *Run) error{Closed}!void {
         if (r.streamed_prose) return;
@@ -499,7 +529,9 @@ const Run = struct {
                 r.prose_sent.appendSlice(a, tail) catch return;
                 r.emit(r.chunk(.{ .string = tail }, null) catch return) catch return;
             }
-            if (calls != null and !reply.tool_calls_streamed) {
+            if (!r.plan.policy.single and reply.streamed_calls.len > 0) {
+                r.settle(&reply, calls) catch return;
+            } else if (calls != null and !reply.tool_calls_streamed) {
                 r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
                 const deltas = tool_parse.deltas(a, calls.?) catch return;
                 for (deltas) |d| r.emit(r.chunk(d, null) catch return) catch return;
