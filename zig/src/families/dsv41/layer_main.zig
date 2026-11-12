@@ -499,7 +499,7 @@ pub fn main(init: std.process.Init) !u8 {
         return if (ok) 0 else 1;
     }
     if (light) {
-        var gs = round_mod.Graphs.init(gpa);
+        var gs = round_mod.Graphs.init(gpa, 0);
         defer gs.deinit();
         const ok = try runLight(&run, &eng, &ch, &caches, rings, if (eh) |*x| x else null, a, &arena, rounds, tokens, if (use_graphs) &gs else null);
         if (use_graphs) {

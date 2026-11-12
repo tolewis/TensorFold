@@ -17,6 +17,9 @@
 //!                                               count so a token's bits do not change with the round's shape (16; 0: off)
 //!   TF_RDMA_DEVICES                             the decode gathers over the RDMA ring on these devices (else NCCL)
 //!   TF_DS_GRAPHS=1                              the rounds' stretches as CUDA graphs
+//!   TF_DS_GRAPH_CAP=N                           (with TF_DS_GRAPHS) the captured stretches kept at most, the least
+//!                                               recently replayed destroyed first (0 or unset: all); rank 1's
+//!                                               --graph-cap, the same number on both ranks
 //!   TF_DS_HC_SIDE=1                             the mixes' side work on a stream of its own
 //!   TF_DS_L2_PREFETCH=1                         the paced L2 prefetch of the next kernels' weights
 //!   TF_DS_ENGRAM_AIO=1                          a round's Engram reads by Linux AIO on O_DIRECT
@@ -207,6 +210,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .rdma_devices = nonEmpty(getenv("TF_RDMA_DEVICES")),
         .rdma_kernels = getenv("TF_DS_RDMA_KERNELS"),
         .graphs = if (getenv("TF_DS_GRAPHS")) |v| !std.mem.eql(u8, v, "0") else false,
+        .graph_cap = if (getenv("TF_DS_GRAPH_CAP")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadGraphCap else 0,
         .side = if (getenv("TF_DS_HC_SIDE")) |v| !std.mem.eql(u8, v, "0") else false,
         .prefetch = if (getenv("TF_DS_L2_PREFETCH")) |v| !std.mem.eql(u8, v, "0") else false,
         .engram_aio = if (getenv("TF_DS_ENGRAM_AIO")) |v| !std.mem.eql(u8, v, "0") else false,
@@ -624,6 +628,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.NoKit => "set TF_DS_KIT to the kernel kit (cubins/, the RoPE tables, engram.json)",
         error.NoFreeSlot => "this engine serves TF_DS_STREAMS streams at once (default 4): --parallel at most that",
         error.BadRoundRows => "TF_DS_ROUND_ROWS: a round's rows at most, 16 .. 48",
+        error.BadGraphCap => "TF_DS_GRAPH_CAP: the captured CUDA graphs kept at most, a count (0: all)",
         error.BadPlainRows => "TF_DS_PLAIN_ROWS: the rows a mixed pack's plain linear runs over, 0 (the round's own) or a count up to TF_DS_ROUND_ROWS",
         error.BadStreams => "TF_DS_STREAMS: the pool's streams, 1 .. 16",
         error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
