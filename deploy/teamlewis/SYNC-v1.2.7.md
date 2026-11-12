@@ -1,61 +1,57 @@
 # Sync B70 line to upstream v1.2.7
 
+State: done
+
 ## State
 
-- Time: 2026-11-12 21:20:00Z
-- Head: `577b16405` (`v1.2.7` merge `62b77f8b0` + `origin/lane/popeye-cuda`, clean)
-- Step: 5 — compile on B70 host; step 6 popeye merge **done**
+- Time: 2026-11-12 21:45:00Z
+- Head: `0a08fd1b8` on `origin/sync/v1.2.7` (v1.2.7 merge + fleet-unified deploy + popeye-cuda + 6 compile-fix commits)
+- Step: compile gate on server done; host rollout §4 still open on B70 fleet
 
 ## Done
 
-Merge conflict paths resolved and included in `62b77f8b0` (26 hand-merged paths in the dual-changed set; 0 `<<<<<<<` remain):
-
-| Area | Files |
-|------|-------|
-| Build | `build.zig`, `zig/build/cuda.zig`, `zig/build/xpu.zig` |
-| Core | `engine_api.zig`, `engine_status.zig`, `lane_host.zig`, `lane_host_fill.zig`, `lane_host_status.zig`, `prompt_cache.zig`, `prompt_cache_policy.zig`, `prompt_cache_status.zig`, `lanes/open.zig` |
-| Server | `chat.zig`, `cli.zig`, `idle_unload.zig`, `main.zig`, `openai.zig`, `responses_translate.zig`, `serve.zig` |
-| Native / XPU | `native/xpu.zig`, `native/xpu_lanes.zig`, `native/qwen27_lanes.zig`, `xpu/root.zig`, `xpu/dev.zig`, `xpu/kernels.zig`, `xpu/qwen27.zig` |
-| Docs | `docs/api.md` |
-| Kernels (fork + `sync-patches/`) | `decode.cl`, `gemm.cl`, `glue.cl`, `glue_attn.cl`, `glue_quant.cl`, `shape.h` |
-
-Also: lean baseline on `62b77f8b0` (1481 findings). Popeye CUDA: 5 files merged in `577b16405` (`cuda_kernels.zig`, `ck_lane.cu`, `ck.zig`, `qlinear.zig`, `cuda_modelopt.zig`).
+- Pushed `sync/v1.2.7` (no force).
+- Merged `origin/lane/fleet-unified` (`61d1f48a3`) and `origin/lane/popeye-cuda` (`577b16405`).
+- Server compile (Zig 0.17.0, capacity lease, `nice -n 19`):
+  - **TP2** (`inference1` README): `zig build native -Dtp=2 -Dcpu=skylake -Dversion=1.0.0 -p /tmp/sync-v127-build/tp2` → **ok** (`native/bin/tensorfold-native`).
+  - **TP1** (`jubiku-linux` README): `zig build xpu-native … -p /tmp/sync-v127-build/tp1` → **not on server** (no `ocloc`, no nGEN headers under `oneDNN/ngen`).
+  - **Popeye CUDA** (`deploy/teamlewis/popeye/README.md` `zig build native`): **not on server** (no CUDA toolkit/GPU here; not attempted).
+- Compile fixes pushed (one commit each): duplicate CUDA test steps, `decode_share` / `isActiveRewind` / `before()` / `short(h,j)`.
+- Lean: `python3 tools/zig/lean_check.py` on HEAD and on tag `v1.2.7` worktree (removed after run).
 
 ## Open
 
-1. Compile `tensorfold-native` / XPU steps on jubiku (no zig on agent host).
-2. Push `sync/v1.2.7` (then build on jubiku from pushed head).
-4. Host gates (rollout §4).
-
-**Conflict markers:** none — CL checkpoint “22 of 26 staged, 4 open” superseded by completed merge commit.
-
-Exact next command (compile on jubiku):
-
-```bash
-ssh jubiku-linux 'cd /path/to/sync-v127 && nice -n 19 zig build xpu-native -Dtp=1'
-```
-
-(Adjust clone path on jubiku to this worktree or a pushed `sync/v1.2.7`.)
+- Host gates (rollout §4): deploy only after jubiku/inference1 builds with ocloc+ngen on B70 hosts.
+- Named XPU CPU tests that link `qwen27` (`test-mode-word`, `test-draft-win`, `test-k1-*`): need B70 toolchain or `-Dxpu-images=…` zebins (same blocker as TP1).
 
 ## Needs the kernel lane
 
 | File | Note |
 |------|------|
-| `zig/kernels/xpu/qwen27/decode.cl` | Fork kept; upstream in `deploy/teamlewis/sync-patches/zig_kernels_xpu_qwen27_decode.cl.upstream` |
-| `zig/kernels/xpu/qwen27/gemm.cl` | same pattern |
+| `zig/kernels/xpu/qwen27/decode.cl` | Fork kept; upstream in `deploy/teamlewis/sync-patches/` |
+| `zig/kernels/xpu/qwen27/gemm.cl` | same |
 | `zig/kernels/xpu/qwen27/glue.cl` | same |
 | `zig/kernels/xpu/qwen27/glue_attn.cl` | same |
 | `zig/kernels/xpu/qwen27/glue_quant.cl` | same |
 | `zig/kernels/xpu/qwen27/shape.h` | same |
 
-## Compile and test results
+## Compile and test results (server 2026-11-12)
 
-(not run yet)
+| Target | Result |
+|--------|--------|
+| TP2 `native` | **pass** |
+| TP1 `xpu-native` | **blocked** (no ocloc/ngen) |
+| Popeye CUDA `native` | **N/A** (no CUDA on server) |
+| `test-mlx-tp-slice` | **pass** |
+| `test-mode-word`, `test-draft-win`, `test-k1-mt`, `test-k1-cover`, `test-k1-merge` | **blocked** (qwen27 module needs ocloc/ngen embed) |
 
 ## Lean checker counts
 
-HEAD `62b77f8b0`: 6249 files, 1481 findings (record only).
+| Rev | Files | Problems |
+|-----|-------|----------|
+| HEAD `0a08fd1b8` | 6249 | 1496 |
+| tag `v1.2.7` (`93a2e93ec`) | 6211 | 386 |
 
 ## popeye-cuda
 
-Merged at `577b16405` (no conflicts).
+Merged at `577b16405` (no conflicts). CUDA binary build not verified on this host.
