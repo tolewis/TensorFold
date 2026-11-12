@@ -184,8 +184,30 @@ pub const Lanes = struct {
         return if (t.slot == slot) t else null;
     }
 
-    /// Keeps the root path `paths[i]` of the last verify's window i.
+    fn absorb(b: *Lanes, which: []const usize, paths: []const []const u32) !void {
+        const d = b.drafter orelse return;
+        var items: [16]xq.drafter.Absorb = undefined;
+        for (which, paths, items[0..which.len]) |i, path, *it| {
+            var straight = true;
+            for (path, 0..) |row, j| straight = straight and row == j;
+            it.* = .{ .slot = b.wslots[i], .taps = xq.off(b.runner.acts.taps, @as(usize, b.wfirst[i]) * TAP_ROW), .n = @intCast(path.len), .rows = if (straight) null else path };
+            b.absorbed[i] = true;
+        }
+        try d.absorbMulti(items[0..which.len]);
+    }
+
+    /// Keeps the root path `paths[i]` of the last verify's window i (its taps to the drafter, unless taken already).
     fn keepRows(b: *Lanes, paths: []const []const u32) !void {
+        var which: [16]usize = undefined;
+        var ps: [16][]const u32 = undefined;
+        var n: usize = 0;
+        for (paths, 0..) |p, i| if (!b.absorbed[i]) {
+            which[n] = i;
+            ps[n] = p;
+            n += 1;
+        };
+        try b.absorb(which[0..n], ps[0..n]);
+        @memset(&b.absorbed, false);
         try b.runner.keepPaths(paths);
     }
 
