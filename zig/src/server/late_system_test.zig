@@ -208,3 +208,36 @@ test "a mid-conversation system message renders the same prompt on Messages and 
     try std.testing.expectEqual(@as(u16, 400), misplaced.status);
     try std.testing.expect(std.mem.indexOf(u8, misplaced.body, "mid-conversation system messages must follow a user turn and precede an assistant or end") != null);
 }
+
+const clear_old_body =
+    \\{"model":"m","max_tokens":4,"messages":[{"role":"user","content":"hi"}],"context_management":{"edits":[{"type":"clear_thinking_20250929","keep":"none"}]}}
+;
+const clear_new_body =
+    \\{"model":"m","max_tokens":4,"messages":[{"role":"user","content":"hi"}],"context_management":{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}}
+;
+const clear_bogus_body =
+    \\{"model":"m","max_tokens":4,"messages":[{"role":"user","content":"hi"}],"context_management":{"edits":[{"type":"clear_tool_uses_20250919"}]}}
+;
+
+test "context_management takes any clear_thinking edit and still refuses other edits" {
+    var text: DropLate = .{};
+    var backend: Capture = .{};
+    defer std.testing.allocator.free(backend.prompt);
+    var srv = try server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
+        .served_name = "m",
+        .model_ids = &.{"m"},
+        .enable_thinking = false,
+        .use_drafts = false,
+    }, null);
+    defer srv.deinit();
+
+    for ([_][]const u8{ clear_old_body, clear_new_body }) |body| {
+        const ok = try exchange(srv, "/v1/messages", body);
+        defer std.testing.allocator.free(ok.body);
+        try std.testing.expectEqual(@as(u16, 200), ok.status);
+    }
+    const bogus = try exchange(srv, "/v1/messages", clear_bogus_body);
+    defer std.testing.allocator.free(bogus.body);
+    try std.testing.expectEqual(@as(u16, 400), bogus.status);
+    try std.testing.expect(std.mem.indexOf(u8, bogus.body, "context_management supports clear_thinking edits only") != null);
+}

@@ -199,12 +199,15 @@ pub fn translate(cx: *Cx, body: Value, count: bool) errors.Refused!Value {
         try chat.put(a, "stop", stops);
     }
     if (body.field("context_management")) |context| {
-        const allowed = (try json.parse(a, "{\"type\": \"clear_thinking_20251015\", \"keep\": \"all\"}")).ok;
+        // Cloud tolerance: clients send any clear_thinking_<date> with keep all or none
+        // (issue: only 20251015+all was accepted, 400ing ZCode's mid-conversation messages).
         const edits = context.get("edits") orelse Value{ .array = &.{} };
         const ok = context == .object and edits == .array and for (edits.array) |e| {
-            if (!json.equal(e, allowed)) break false;
+            if (e != .object) break false;
+            const et = e.get("type") orelse Value.null;
+            if (et != .string or !std.mem.startsWith(u8, et.string, "clear_thinking_")) break false;
         } else true;
-        if (!ok) return cx.refuse("context_management supports clear_thinking with keep: all only");
+        if (!ok) return cx.refuse("context_management supports clear_thinking edits only");
     }
     for ([_][]const u8{ "container", "mcp_servers", "service_tier" }) |name| if (body.field(name)) |v| {
         const fine = (v == .array and v.array.len == 0) or (v == .string and std.mem.eql(u8, v.string, "auto"));
