@@ -6,6 +6,7 @@ const exl3_format = core.exl3_format;
 const exl3_layout = core.exl3_layout;
 const kb = @import("xpu_qwen27_kernels");
 const q = @import("qwen27.zig");
+const dev = @import("dev.zig"); // XPU_HRING: tableCopy
 const dtree = @import("drafter_tree.zig");
 const tp = @import("tp.zig");
 
@@ -743,8 +744,8 @@ pub const Drafter = struct {
     /// The batched pass's row and cache tables to the device.
     fn tables(dr: *Drafter, rows: u32) !void {
         const d = &dr.r.d;
-        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, dr.rows_dev, &dr.rows_host, @as(usize, rows) * 16, null, 0, null));
-        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, dr.ptrs_dev, &dr.ptrs_host, LAYERS * MAXS * 16, null, 0, null));
+        try dev.tableCopy(d, dr.rows_dev, &dr.rows_host, @as(usize, rows) * 16); // XPU_HRING bit 2: through the ring
+        try dev.tableCopy(d, dr.ptrs_dev, &dr.ptrs_host, LAYERS * MAXS * 16);
     }
 
     fn run(dr: *Drafter, items: []const Block, count: u32, counts: ?[]const u32) !void {
@@ -802,7 +803,7 @@ pub const Drafter = struct {
         const nul: ?*anyopaque = null;
         const rows_t: ?*anyopaque = if (one) nul else dr.rows_dev;
         const drows_t: ?*anyopaque = if (rag) dr.rows_dev else nul; // dconv's block starts only with ragged rows
-        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, dr.ids, &tokens, R * 4, null, 0, null));
+        try dev.tableCopy(d, dr.ids, &tokens, R * 4); // XPU_HRING bit 2: through the ring
         errdefer d.settle(); // tokens and sp live in this frame: an error returns only once the queue is idle
         const s0 = q.stat.settle_s;
         const n0 = q.stat.settles;

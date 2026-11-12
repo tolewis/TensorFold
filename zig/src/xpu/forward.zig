@@ -444,7 +444,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
     // path only, and never when a probe reads the exchange's output ahead of that norm.
     const fuse1 = q.fuse & 1 != 0 and !wide and gemm_probe == null;
     var pend: ?*anyopaque = null; // the peer's partial an exchange left in pbuf, for the fused add of the next norm
-    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.ids, ids.ptr, ids.len * 4, null, 0, null));
+    try dev.tableCopy(d, a.ids, ids.ptr, ids.len * 4); // XPU_HRING bit 2: through the ring
     errdefer d.settle(); // the queued copy reads the caller's ids: an error returns only once the queue is idle
     try embedRows(d, m, a.ids, a.x, T);
     if (p0 == 0) try dump(d, a, T, "embed", false);
@@ -535,8 +535,8 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
                     const kern = if (rd.k16) d.k.attn_k1_16.? else d.k.attn_k1.?;
                     // the queued copy reads this buffer when the list runs, after forward returns: a global, not the stack
                     k1mod.mergePos(mm2.kkind, mm2.kpos, plan.ns, plan.span, &k1mod.posm_host);
-                    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.kpos, @ptrCast(&mm2.kpos[0]), 16 * 4, null, 0, null));
-                    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.kposm, &k1mod.posm_host, 16 * 4, null, 0, null));
+                    try dev.tableCopy(d, a.kpos, @ptrCast(&mm2.kpos[0]), 16 * 4); // XPU_HRING bit 2: through the ring
+                    try dev.tableCopy(d, a.kposm, &k1mod.posm_host, 16 * 4);
                     try k1mod.queueGroups(d, a.grp, grp_host[0 .. 2 * rd.n], rd.n);
                     // the partials' stride is ns + 1 (k1.cl attn_k1_draft_mt): the prefix launch and the merge take
                     // it as NS, the draft takes ns as its slice index

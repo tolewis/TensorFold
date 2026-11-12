@@ -481,6 +481,8 @@ pub const Runner = struct {
         if (std.c.getenv("XPU_CHUNK")) |v| CHUNK = try limits.chunk(std.mem.span(v));
         if (std.c.getenv("TF_TP_RANK")) |v| RANK = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         k1mod.readEnv(); // XPU_K1, XPU_K1_WAVE
+        if (std.c.getenv("XPU_HRING")) |v| dev.hring = try std.fmt.parseInt(u32, std.mem.span(v), 10); // lane p4-k-hring
+        if (dev.hring != 0) std.debug.print("hring: XPU_HRING={d} (rank {d}: host to card copies through a USM host ring, bit 1 hostCopy, bit 2 the decode tables)\n", .{ dev.hring, RANK });
         if (RANK >= TP) return error.RankOutOfRange;
         if (fuse != 0) std.debug.print("fuse: rank {d}: XPU_FUSE={d} bit 1: the exchange joined into the norm that follows (mixer and MLP)\n", .{ RANK, fuse });
         // the shared K/V pool: a page holds int8 rows and their scales, so pool mode is int8 K/V

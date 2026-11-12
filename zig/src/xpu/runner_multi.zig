@@ -127,7 +127,7 @@ pub fn verifyMulti(r: *Runner, wins: []const Win) !void {
                 max_pos = @max(max_pos, p + @as(u32, @intCast(row[0] & 255)));
             }
         }
-        try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, r.acts.tree, &r.tree_host, T * 17 * 4, null, 0, null));
+        try dev.tableCopy(&r.d, r.acts.tree, &r.tree_host, T * 17 * 4); // XPU_HRING bit 2: through the ring
     }
     // XPU_MULTI_TREE host inputs, after the tree table (k1mtFill): chain rows their mpos, tree rows the window
     // base - 1; the NO_DRAFT sentinel on the chain rows' table rows when the draft kernel will read the table
@@ -153,8 +153,8 @@ pub fn verifyMulti(r: *Runner, wins: []const Win) !void {
         }
     };
     const d = &r.d;
-    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, r.acts.mt, &r.mt_host, LAYERS * 16 * 8 * 8, null, 0, null));
-    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, r.acts.mpos, &r.pos_host, T * 4, null, 0, null));
+    try dev.tableCopy(d, r.acts.mt, &r.mt_host, LAYERS * 16 * 8 * 8); // XPU_HRING bit 2: through the ring
+    try dev.tableCopy(d, r.acts.mpos, &r.pos_host, T * 4);
     _ = try forward(d, &r.model, &r.acts, @ptrCast(r.ids_host[0..T]), 0, .{ .want = .rows, .stash = true, .taps = r.taps_on, .tree = tree, .multi = .{ .mt = r.acts.mt, .pos = r.acts.mpos, .max_pos = max_pos, .win = r.win_host[0 .. 2 * wins.len], .kpos = r.kpos_host[0..16], .kkind = r.kkind_host[0..16] } });
     var toks: [16]i32 = undefined;
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &toks, r.acts.tok, T * 4, null, 0, null));
@@ -202,7 +202,7 @@ pub fn keepPaths(r: *Runner, paths: []const []const u32) !void {
             r.mpath_host[(i * 2 + 1) * 16 + dd] = @intCast(row);
         }
     }
-    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, r.acts.mpath, &r.mpath_host, paths.len * 2 * 16 * 4, null, 0, null));
+    try dev.tableCopy(d, r.acts.mpath, &r.mpath_host, paths.len * 2 * 16 * 4); // XPU_HRING bit 2: through the ring
     for (paths, 0..) |path, i| {
         const sl = r.multi_slots[i];
         const first: u32 = @intCast(r.win_host[2 * i]);

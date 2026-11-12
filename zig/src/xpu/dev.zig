@@ -122,10 +122,23 @@ fn exitLost(rc: u32) void {
     std.process.exit(1);
 }
 
+/// XPU_HRING (lane p4-k-hring, default off). A copy from plain host memory to the card makes the driver wait until
+/// the card has run every command before it (p4k28: 67 `hostCopy` calls a round, 17.3 ms of host time in a tshort
+/// round of 23.5 ms). So the card's queue runs dry at each such copy and waits for the host's next launch. Bit 1:
+/// `hostCopy` puts the bytes in a USM host ring and queues the copy from the ring, which does not wait. Bit 2: the
+/// other host to card copies of the decode paths (`tableCopy`) take the ring too. The same bytes reach the same
+/// buffers in the same order of the list, so the values do not change.
+pub var hring: u32 = 0;
+const ring_bytes: usize = 4 << 20;
+
 pub const Dev = struct {
     g: ze.Gpu,
     list: ze.H,
     staging: []u8 = &.{}, // USM host memory: the driver cannot copy from file-backed mmap pages directly
+    // XPU_HRING: the ring (USM host) and the offset of its next free slot. A slot is used again only after a settle
+    // that drained the list, so every queued copy has read its bytes.
+    ring: []u8 = &.{},
+    ring_at: usize = 0,
     allocated: usize = 0, // device bytes allocated (frees not counted: buffers live as long as the runner)
     k: struct {
         embed: ze.H,
@@ -205,6 +218,7 @@ pub const Dev = struct {
         const t0: f64 = if (q.stat.on) q.now() else 0; // XPU_ROUND_STATS: the host wait time of this call
         const rc = d.g.api.zeCommandListHostSynchronize(d.list, settle_ns);
         if (rc != 0) lost(rc);
+        if (rc == 0) d.ring_at = 0; // XPU_HRING: the list drained, so every queued ring copy has read its bytes
         if (q.stat.on) {
             q.stat.settles += 1;
             q.stat.settle_s += q.now() - t0;
@@ -245,6 +259,20 @@ pub const Dev = struct {
             try d.sync();
             done += n;
         }
+    }
+
+    /// XPU_HRING: `n` host bytes to `dst` through the ring. The host copies the bytes into the ring, queues the copy
+    /// from the ring and does not wait for the card. A full ring settles first (the list drains, every slot is free
+    /// again). A copy larger than a quarter of the ring goes direct, as without the flag.
+    pub fn ringCopy(d: *Dev, dst: ?*anyopaque, src: ?*const anyopaque, n: usize) !void {
+        if (n > ring_bytes / 4) return ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, dst, src, n, null, 0, null));
+        if (d.ring.len == 0) d.ring = @as([*]u8, @ptrCast(try d.g.hostAlloc(ring_bytes)))[0..ring_bytes];
+        const need = std.mem.alignForward(usize, @max(n, 1), 64);
+        if (d.ring_at + need > d.ring.len) d.settle();
+        const at = d.ring_at;
+        @memcpy(d.ring[at..][0..n], @as([*]const u8, @ptrCast(src.?))[0..n]);
+        d.ring_at = at + need;
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, dst, d.ring.ptr + at, n, null, 0, null));
     }
 
     pub fn launch(d: *Dev, k: ze.H, groups: ze.GroupCount, args: anytype) !void {
@@ -328,11 +356,18 @@ pub fn copy(d: *Dev, dst: *anyopaque, src: *anyopaque, n: usize) !void {
 /// counts the calls and the host time inside them (lane p4-k-gdn): a call that waits for the card shows there.
 pub fn hostCopy(d: *Dev, dst: ?*anyopaque, src: ?*const anyopaque, n: usize) !void {
     const t0: f64 = if (q.stat.on) q.now() else 0;
-    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, dst, src, n, null, 0, null));
+    if (hring & 1 != 0) try d.ringCopy(dst, src, n) else try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, dst, src, n, null, 0, null));
     if (q.stat.on) {
         q.stat.hcopies += 1;
         q.stat.hcopy_s += q.now() - t0;
     }
+}
+
+/// A host to card copy of a decode path outside `hostCopy` (a table or token ids from plain host memory). XPU_HRING
+/// bit 2: through the ring. Off: the direct copy, as before (no host copy count).
+pub fn tableCopy(d: *Dev, dst: ?*anyopaque, src: ?*const anyopaque, n: usize) !void {
+    if (hring & 2 != 0) return d.ringCopy(dst, src, n);
+    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, dst, src, n, null, 0, null));
 }
 
 pub fn off(p: *anyopaque, bytes: usize) *anyopaque {
