@@ -66,7 +66,12 @@ pub const flags = [_]Flag{
     .{ .name = "--prompt-cache-gib", .native = true },
     .{ .name = "--prompt-cache-over-cap", .kind = .store_true, .native = true },
     .{ .name = "--checkpoint-slots" },
-    .{ .name = "--spill-gib" },
+    // the prompt cache's disk tier (spill v2): every one off unless given
+    .{ .name = "--spill-gib", .native = true },
+    .{ .name = "--spill-dir", .native = true },
+    .{ .name = "--spill-min-free-gib", .native = true },
+    .{ .name = "--spill-min-tokens", .native = true },
+    .{ .name = "--spill-quota", .native = true },
     .{ .name = "--snapshot-dir", .native = true, .native_values = &.{"none"} },
     .{ .name = "--max-snapshots", .native = true, .native_values = &.{"0"} },
     .{ .name = "--parallel", .native = true },
@@ -97,7 +102,11 @@ pub const flags = [_]Flag{
 
 /// The variables this binary honours as the Python engine does, then the CUDA build's.
 pub const env = [_][]const u8{ "TENSORFOLD_API_KEY", "TENSORFOLD_NO_LIVE", "TENSORFOLD_SEED_SALT", "TENSORFOLD_REQUEST_LOG", "TENSORFOLD_NO_UPDATE_CHECK", "HF_HOME", "HF_HUB_CACHE", "HF_HUB_OFFLINE" } ++
+    spill_env ++
     (if (cuda_build) [_][]const u8{ "TF_CUDA_DEVICE", "TF_CUDA_SEGMENTS", "TENSORFOLD_CUDA_KERNELS", "TENSORFOLD_MEMORY_RESERVE_GIB", "TENSORFOLD_CUDA_MEMORY_LIMIT_GB" } else [_][]const u8{});
+
+/// The prompt cache tier's variables (api.Spill): its knobs beyond the flags.
+pub const spill_env = [_][]const u8{ "TF_SPILL_TURNS", "TF_SPILL_LOAD_MS", "TF_SPILL_LOAD_WAIT_MS", "TF_SPILL_FLUSH_MS" };
 
 pub const Args = struct {
     model: []const u8 = "",
@@ -135,6 +144,11 @@ pub const Args = struct {
     backend: []const u8 = "auto",
     device: ?u32 = null,
     segments: ?u32 = null,
+    spill_dir: ?[]const u8 = null, // this rank's local store for kept prompt states (with --spill-gib)
+    spill_gib: f64 = 0, // what it may hold (0: off)
+    spill_min_free_gib: f64 = 50, // no write leaves less free on its file system
+    spill_min_tokens: u32 = 8192, // shorter kept states are not written
+    spill_quota: f64 = 0, // one conversation's share of --spill-gib (0: none)
 };
 
 /// A usage error's message (argparse's ``error:`` line); the caller exits 2.
@@ -185,6 +199,7 @@ pub fn parse(a: Allocator, argv: []const []const u8, u: *Usage) error{ Usage, Ou
         try apply(a, &out, name, value, u, &alias, &keys);
     }
     out.model = model orelse return fail(u, a, "the following arguments are required: model", .{});
+    if (out.spill_gib > 0 and out.spill_dir == null) return fail(u, a, "--spill-gib needs --spill-dir: a local directory for this rank's stored prompt states", .{});
     out.alias = alias.items;
     out.api_key = keys.items;
     return out;
@@ -213,6 +228,7 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
         }
     }.f;
     if (try cudaFlag(a, out, name, v, u)) return;
+    if (try spillFlag(a, out, name, v, u)) return;
     if (is(name, "--host")) out.host = v else if (is(name, "--port")) {
         const p = try int(u, a, name, v);
         if (p < 0 or p > 65535) return fail(u, a, "argument --port: invalid port: '{s}'", .{v});
@@ -246,6 +262,51 @@ fn cudaFlag(a: Allocator, out: *Args, name: []const u8, v: []const u8, u: *Usage
     } else return false;
     return true;
 }
+
+/// The disk tier's flags; false for any other flag.
+fn spillFlag(a: Allocator, out: *Args, name: []const u8, v: []const u8, u: *Usage) error{ Usage, OutOfMemory }!bool {
+    const is = struct {
+        fn f(x: []const u8, y: []const u8) bool {
+            return std.mem.eql(u8, x, y);
+        }
+    }.f;
+    if (is(name, "--spill-gib")) out.spill_gib = try gib(u, a, name, v) else if (is(name, "--spill-dir")) {
+        if (v.len == 0) return fail(u, a, "argument --spill-dir: expected a directory", .{});
+        out.spill_dir = v;
+    } else if (is(name, "--spill-min-free-gib")) out.spill_min_free_gib = try gib(u, a, name, v) else if (is(name, "--spill-min-tokens")) {
+        out.spill_min_tokens = std.math.cast(u32, try int(u, a, name, v)) orelse return fail(u, a, "argument --spill-min-tokens: a token count from 0: '{s}'", .{v});
+    } else if (is(name, "--spill-quota")) {
+        const q = try float(u, a, name, v);
+        if (!(q >= 0 and q <= 1)) return fail(u, a, "argument --spill-quota: a share of --spill-gib from 0 (none) to 1: '{s}'", .{v});
+        out.spill_quota = q;
+    } else return false;
+    return true;
+}
+
+/// The engine's api.Spill from the flags, then the variables in `env` (`get(name)`: its value or null). An invalid
+/// variable keeps the default, and so does 0 for the restore budgets (a 0 ns budget never progresses a restore).
+pub fn spill(args: Args, env_: anytype) api.Spill {
+    var s: api.Spill = .{ .dir = args.spill_dir, .gib = args.spill_gib, .min_free_gib = args.spill_min_free_gib, .quota = args.spill_quota, .min_tokens = args.spill_min_tokens };
+    if (env_.get("TF_SPILL_TURNS")) |v| s.turns = std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch s.turns;
+    if (env_.get("TF_SPILL_LOAD_MS")) |v| s.load_ms = positive(v) orelse s.load_ms;
+    if (env_.get("TF_SPILL_LOAD_WAIT_MS")) |v| s.load_wait_ms = positive(v) orelse s.load_wait_ms;
+    if (env_.get("TF_SPILL_FLUSH_MS")) |v| s.flush_ms = std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch s.flush_ms;
+    return s;
+}
+
+/// A variable's whole number from 1 (null: invalid or 0).
+fn positive(v: []const u8) ?u32 {
+    const n = std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch return null;
+    return if (n == 0) null else n;
+}
+
+/// The process environment, for `spill`.
+pub const ProcessEnv = struct {
+    pub fn get(_: ProcessEnv, name: [:0]const u8) ?[]const u8 {
+        const v = std.c.getenv(name) orelse return null;
+        return std.mem.span(v);
+    }
+};
 
 /// ``--parallel``: "auto" is up to 8 requests at once; a number caps it.
 pub fn parallel(text: []const u8) ?u32 {
@@ -356,4 +417,44 @@ test "--device and --segments: CUDA builds serve them, values checked" {
     try std.testing.expectEqual(@as(?u32, 4), out.segments);
     try std.testing.expect(!try cudaFlag(a, &out, "--port", "1", &u));
     try std.testing.expect(parallelFixed("3") and !parallelFixed("auto") and !parallelFixed("x"));
+}
+
+test "spill flags and variables: off by default, checked, passed whole" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var u: Usage = .{};
+    const Env = struct {
+        pairs: []const [2][]const u8 = &.{},
+        pub fn get(e: @This(), name: [:0]const u8) ?[]const u8 {
+            for (e.pairs) |p| if (std.mem.eql(u8, p[0], name)) return p[1];
+            return null;
+        }
+    };
+    const off = spill(try parse(a, &.{"m"}, &u), Env{});
+    try std.testing.expect(!off.enabled());
+    try std.testing.expectEqual(api.Spill{}, off);
+    const args = try parse(a, &.{ "m", "--spill-dir", "/nvme/spill", "--spill-gib", "64", "--spill-min-free-gib=20", "--spill-min-tokens", "4096", "--spill-quota", "0.25" }, &u);
+    const on = spill(args, Env{ .pairs = &.{ .{ "TF_SPILL_TURNS", "2" }, .{ "TF_SPILL_LOAD_MS", "25" }, .{ "TF_SPILL_FLUSH_MS", "x" } } });
+    try std.testing.expect(on.enabled());
+    try std.testing.expectEqualStrings("/nvme/spill", on.dir.?);
+    try std.testing.expectEqual(@as(f64, 64), on.gib);
+    try std.testing.expectEqual(@as(f64, 20), on.min_free_gib);
+    try std.testing.expectEqual(@as(u32, 4096), on.min_tokens);
+    try std.testing.expectEqual(@as(f64, 0.25), on.quota);
+    try std.testing.expectEqual(@as(u32, 2), on.turns);
+    try std.testing.expectEqual(@as(u32, 25), on.load_ms);
+    try std.testing.expectEqual(@as(u32, 60_000), on.flush_ms); // an invalid value keeps the default
+    const zero = spill(try parse(a, &.{"m"}, &u), Env{ .pairs = &.{ .{ "TF_SPILL_LOAD_MS", "0" }, .{ "TF_SPILL_LOAD_WAIT_MS", "250" } } });
+    try std.testing.expectEqual(@as(u32, 40), zero.load_ms); // 0 would never progress a restore: the default
+    try std.testing.expectEqual(@as(u32, 250), zero.load_wait_ms);
+    try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--spill-gib", "8" }, &u)); // no directory
+    try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--spill-quota", "1.5" }, &u));
+    try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--spill-min-tokens", "-1" }, &u));
+    try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--spill-dir", "" }, &u));
+    try std.testing.expect(!spill(try parse(a, &.{ "m", "--spill-dir", "/x" }, &u), Env{}).enabled()); // a directory alone stays off
+    var out: std.Io.Writer.Allocating = .init(a);
+    try capabilities(&out.writer, .{ .version = "0.6.5" });
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"--spill-gib\": {}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"TF_SPILL_LOAD_MS\"") != null);
 }

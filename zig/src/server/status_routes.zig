@@ -30,7 +30,31 @@ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
     }
     try o.put(a, "memory", .{ .object = memory });
     try o.put(a, "live", try live.snapshot(a, srv.engine));
+    if (status.cache) |c| try putCache(a, o, c);
     routes.sendValue(conn, a, 200, .{ .object = o });
+}
+
+/// The prompt cache's counters, when its tier or grouping is on: the GLM engine's top-level names (chats_continued,
+/// chats_continued_prefill_tokens), then every
+/// counter under prompt_cache, the tier's own under prompt_cache.spill (an array, one object per rank, rank 0 first).
+pub fn putCache(a: Allocator, o: *json.Object, c: api.CacheStats) Allocator.Error!void {
+    try o.put(a, "chats_continued", try json.intValue(a, c.chats_continued));
+    try o.put(a, "chats_continued_prefill_tokens", try json.intValue(a, c.chats_continued_prefill_tokens));
+    const pc = try json.newObject(a);
+    const info = @typeInfo(api.CacheStats).@"struct";
+    inline for (info.field_names, info.field_types) |name, T| if (T == u64) try pc.put(a, name, try json.intValue(a, @field(c, name)));
+    if (c.spill) |rc| {
+        const ranks = rc.slice();
+        const arr = try a.alloc(json.Value, ranks.len);
+        for (ranks, arr, 0..) |t, *v, r| {
+            const sp = try json.newObject(a);
+            try sp.put(a, "rank", try json.intValue(a, r));
+            inline for (@typeInfo(@TypeOf(t)).@"struct".field_names) |name| try sp.put(a, name, try json.intValue(a, @field(t, name)));
+            v.* = .{ .object = sp };
+        }
+        try pc.put(a, "spill", .{ .array = arr });
+    }
+    try o.put(a, "prompt_cache", .{ .object = pc });
 }
 
 pub fn models(srv: *Server, conn: *Conn, a: Allocator) !void {
@@ -120,4 +144,26 @@ test "stats snapshot exposes counters and omits unknown memory" {
     for ([_][]const u8{ "running", "waiting", "generation_tokens_running", "prompt_tokens_total", "generation_tokens_total", "mtp_drafted_total", "mtp_accepted_total", "decode_rounds_total", "memory" }) |key|
         try std.testing.expect(object.contains(key));
     try std.testing.expectEqual(@as(usize, 0), object.get("memory").?.object.count());
+}
+
+test "health's prompt cache counters: the GLM names on top, every counter below, the tier's under spill" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const o = try json.newObject(a);
+    var ranks: api.prompt_cache.RankCounts = .{ .n = 2 };
+    ranks.ranks[0].points = 5;
+    ranks.ranks[1].points = 4;
+    try putCache(a, o, .{ .chats_continued = 1, .disk_hits_committed = 3, .spill = ranks });
+    try std.testing.expectEqualStrings("1", o.get("chats_continued").?.int);
+    const pc = o.get("prompt_cache").?.object;
+    try std.testing.expectEqualStrings("3", pc.get("disk_hits_committed").?.int);
+    const spill = pc.get("spill").?.array;
+    try std.testing.expectEqual(@as(usize, 2), spill.len);
+    try std.testing.expectEqualStrings("5", spill[0].object.get("points").?.int);
+    try std.testing.expectEqualStrings("1", spill[1].object.get("rank").?.int);
+    try std.testing.expectEqualStrings("4", spill[1].object.get("points").?.int);
+    const none = try json.newObject(a);
+    try putCache(a, none, .{});
+    try std.testing.expect(none.get("prompt_cache").?.object.get("spill") == null);
 }

@@ -1,4 +1,10 @@
 //! The lane core served to the HTTP threads: one thread owns ``core`` and steps rounds while any stream lives.
+//!
+//! Pending durable restores and continuation telemetry port wojo's GLM 0110 (PR #124; the scheduler hooks) and 0111
+//! (PR #128). A request may be parked before its prompt pass on a restore job reading a longer kept state from the
+//! prompt cache's tier (shared by every request that wants the same point). Parked requests hold no lane, count as
+//! waiting work and wake back to the front of the queue, where an ordinary lookup runs again. With no tier nothing is
+//! parked, nothing is serviced and nothing else changes.
 const std = @import("std");
 const lanes = @import("lanes");
 const api = @import("engine_api.zig");
@@ -60,6 +66,15 @@ pub const LaneHost = struct {
     interleave_ns: i96 = 0,
     passing: ?*Job = null, // the job whose prompt pass runs inside addStream (Stream.between's caller)
     between_err: ?anyerror = null,
+    // -- parked requests (0110). The lists are the engine thread's; changes take the lock (status reads their lengths).
+    ready: std.ArrayList(*Job) = .empty, // woken: admitted before the queue, in the order they woke
+    loading: std.ArrayList(Load) = .empty, // each waits for a restore job (several may share one)
+    turn: usize = 0, // which restore a service polls first (one budget, shared fairly)
+    lone_commits: u32 = 0, // the lone driver's commits since its last pump
+    tier: TierPolicy = .{},
+    host_counts: HostCounts = .{},
+    /// What status reports under `cache` (published on the engine thread at each noteLive; null until configured).
+    tele: ?api.CacheStats = null,
 
     const Mark = struct { at: i96, tokens: u64 };
     const full_retry_ns: i96 = std.time.ns_per_s;
@@ -67,6 +82,33 @@ pub const LaneHost = struct {
     const finish_ns: i96 = 5 * std.time.ns_per_s;
     const finish_left: i64 = 256;
     const window_ns: i96 = 2 * std.time.ns_per_s;
+    /// How often an idle host polls work in flight (restores, staged writes, deferred retries).
+    const poll_ns: i64 = 2 * std.time.ns_per_ms;
+    /// The lone driver pumps staged writes every this many commits.
+    const lone_pump_commits: u32 = 16;
+
+    const Load = struct { job: *Job, restore: *pc.Restore, since: i96 };
+
+    /// How parked work is serviced (LaneHost.configure; the defaults are off).
+    pub const TierPolicy = struct {
+        /// One elapsed-time budget per service for every restore together, then staged writes (TF_SPILL_LOAD_MS).
+        service_ns: u64 = 40 * std.time.ns_per_ms,
+        /// Staging's share of a service while streams decode (GLM pumped 4 blocks a round); idle, all that is left.
+        pump_ns: u64 = 2 * std.time.ns_per_ms,
+        /// How long a request waits parked on a restore before it is admitted without it (TF_SPILL_LOAD_WAIT_MS).
+        load_wait_ns: i96 = 30 * std.time.ns_per_s,
+        /// A clean shutdown's bound for draining writes (TF_SPILL_FLUSH_MS).
+        flush_ns: u64 = 60 * std.time.ns_per_s,
+    };
+
+    pub const HostCounts = struct {
+        restore_waits: u64 = 0, // requests parked on a restore
+        restore_wait_timeouts: u64 = 0, // of them admitted without it at load_wait_ns
+        restore_wait_ns: u64 = 0,
+        restore_wait_max_ns: u64 = 0,
+        cached_tokens: u64 = 0, // prompt tokens passes resumed (memory or restored)
+        computed_tokens: u64 = 0, // and computed
+    };
 
     const Job = struct {
         host: *LaneHost,
@@ -83,12 +125,20 @@ pub const LaneHost = struct {
         entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
         marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
         kept0: u64 = 0, // the store's kept count when the job looked it up
+        tried_disk: bool = false, // it waited for a restore once: a later lookup takes what memory has
+        join: pc.Join = .{}, // its conversation (0111)
+        parent: ?u64 = null, // the durable point its pass resumes from, and where
+        fork: u32 = 0,
+        lineage: []pc.Fork = &.{}, // the computation its pass's rows belong to (gpa-owned; Store.passLineage)
 
         /// The backend's prompt pass stands at a mark: the cache keeps the stream's state there.
         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
             const job: *Job = @ptrCast(@alignCast(ptr));
             job.reported(); // before a keep can evict the entry the pass restored
-            if (job.host.cache) |store| _ = store.keep(job.request.cacheKey(), at, s, job.request.chunks); // an image span keyed by its digest
+            const h = job.host;
+            const store = h.cache orelse return;
+            // an image span keyed by its digest (Request.cacheKey)
+            _ = store.keepWith(job.request.cacheKey(), at, s, job.request.chunks, .{ .group = job.join.group, .images = job.request.images.len > 0, .parent = job.parent, .fork = job.fork, .lineage = job.lineage });
         }
 
         /// Report a restored prefix or its failed copy; an untouched prefix remains kept.
@@ -98,7 +148,17 @@ pub const LaneHost = struct {
             const store = job.host.cache orelse return;
             if (!job.started) return;
             job.stream.reuse.saved = null; // the backend restores before its first chunk; a later keep may free it
-            if (job.stream.reuse_failed) store.resumed(e, job.request.cacheKey(), false) else if (job.stream.cached == e.at) store.resumed(e, job.request.cacheKey(), true);
+            const ok = !job.stream.reuse_failed and job.stream.cached == e.at;
+            if (!ok) { // it did not compute from that state's rows: a lineage of its own
+                job.parent = null;
+                job.fork = 0;
+                if (job.lineage.len > 0) {
+                    const fresh: []pc.Fork = store.passLineage(null) catch &.{};
+                    job.host.gpa.free(job.lineage);
+                    job.lineage = fresh;
+                }
+            }
+            if (job.stream.reuse_failed) store.resumed(e, job.request.cacheKey(), false) else if (ok) store.resumed(e, job.request.cacheKey(), true);
         }
     };
 
@@ -108,6 +168,17 @@ pub const LaneHost = struct {
         var ms: i96 = 0;
         if (std.c.getenv("TF_DS_PREFILL_INTERLEAVE_MS")) |v| ms = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0;
         return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced, .interleave_ns = ms * std.time.ns_per_ms };
+    }
+
+    /// The tier's switches (before start). Telemetry is published from here on when either is on: a tier on the cache
+    /// (Store.setTier), or grouping.
+    pub fn configure(h: *LaneHost, sp: api.Spill) void {
+        h.tier.service_ns = @as(u64, @max(sp.load_ms, 1)) * std.time.ns_per_ms;
+        h.tier.pump_ns = @min(h.tier.pump_ns, h.tier.service_ns);
+        h.tier.load_wait_ns = @as(i96, @max(sp.load_wait_ms, 1)) * std.time.ns_per_ms;
+        h.tier.flush_ns = @as(u64, sp.flush_ms) * std.time.ns_per_ms;
+        const store_on = if (h.cache) |s| s.tier != null or s.groups else false;
+        h.tele = if (store_on) .{} else null;
     }
 
     pub fn start(h: *LaneHost) !void {
@@ -127,6 +198,8 @@ pub const LaneHost = struct {
         h.cancels.deinit(h.gpa);
         h.decoded.deinit(h.gpa);
         h.live_tokens.deinit(h.gpa);
+        h.ready.deinit(h.gpa);
+        h.loading.deinit(h.gpa);
     }
 
     pub fn engine(h: *LaneHost) Engine {
@@ -189,12 +262,13 @@ pub const LaneHost = struct {
         @memcpy(stream_tokens[0..n], h.live_tokens.items[0..n]);
         out.* = .{
             .running = @intCast(h.admitted.items.len),
-            .waiting = @intCast(h.queued.items.len),
+            .waiting = @intCast(h.queued.items.len + h.ready.items.len + h.loading.items.len),
             .decode_tokens_per_second = @as(f64, @floatFromInt(tokens)) / 2.0,
             .prefill_tokens_per_second = if (now - h.prefill_at <= window_ns) h.prefill_rate else 0,
             .preemptions = 0,
             .streams = n,
             .generation_tokens = h.live_generated,
+            .cache = h.tele,
         };
     }
 
@@ -242,6 +316,7 @@ pub const LaneHost = struct {
     fn finish(h: *LaneHost, job: *Job, reason: Reason, message: []const u8) void {
         job.reported();
         h.gpa.free(job.marks);
+        h.gpa.free(job.lineage);
         const s = &job.stream;
         const stats: Stats = if (job.started) .{ .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .min_rows = s.min_rows, .loop_period = s.loop_period, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null } else .{};
         emit(job, .{ .finished = .{ .reason = reason, .stats = stats, .message = message } });
@@ -278,13 +353,33 @@ pub const LaneHost = struct {
         h.cancels.clearRetainingCapacity();
         if (keep) |k| if (std.mem.indexOfScalar(Id, ids, k) != null) h.cancels.append(h.gpa, k) catch {};
         var dropped: std.ArrayList(*Job) = .empty;
+        var unloaded: std.ArrayList(*pc.Restore) = .empty; // restores a cancelled job waited for
         for (ids) |id| {
             for (h.queued.items, 0..) |job, i| if (job.id == id) {
                 dropped.append(h.gpa, h.queued.orderedRemove(i)) catch {};
                 break;
             };
+            for (h.ready.items, 0..) |job, i| if (job.id == id) {
+                dropped.append(h.gpa, h.ready.orderedRemove(i)) catch {};
+                break;
+            };
+            for (h.loading.items, 0..) |l, i| if (l.job.id == id) {
+                _ = h.loading.orderedRemove(i);
+                dropped.append(h.gpa, l.job) catch {};
+                unloaded.append(h.gpa, l.restore) catch {};
+                break;
+            };
         }
         h.mutex.unlock(h.io);
+        // a restore no request waits for any more stops (its reads, DMA and reservations go), exactly once
+        for (unloaded.items, 0..) |r, k| {
+            if (std.mem.indexOfScalar(*pc.Restore, unloaded.items[0..k], r) != null) continue;
+            const wanted = for (h.loading.items) |l| {
+                if (l.restore == r) break true;
+            } else false;
+            if (!wanted) if (h.cache) |store| store.restoreCancel(r);
+        }
+        unloaded.deinit(h.gpa);
         for (dropped.items) |job| h.finish(job, .cancelled, "");
         dropped.deinit(h.gpa);
         for (ids) |id| {
@@ -313,7 +408,7 @@ pub const LaneHost = struct {
     /// Prefills the next queued request (while a pass fills, the first that core.cutsIn); false if none or no lane.
     fn admitOne(h: *LaneHost) bool {
         h.lock();
-        if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes) {
+        if ((h.queued.items.len == 0 and h.ready.items.len == 0) or h.admitted.items.len >= h.info_.lanes) {
             h.unlock();
             return false;
         }
@@ -341,7 +436,13 @@ pub const LaneHost = struct {
             }
             h.finish_until = null;
         }
-        const job = h.queued.orderedRemove(at);
+        // a woken (restored) request goes first, but not while a pass fills: then only a queued one that cuts in
+        const job = if (h.filling == null and h.ready.items.len > 0) h.ready.orderedRemove(0) else h.queued.orderedRemove(at);
+        if (h.parking()) {
+            h.unlock();
+            if (h.park(job)) return true; // waits for a restore, holding no lane
+            h.lock();
+        }
         h.admitted.append(h.gpa, job) catch {
             h.unlock();
             h.finish(job, .failed, "out of memory");
@@ -356,6 +457,13 @@ pub const LaneHost = struct {
             job.kept0 = store.counts.kept;
             job.marks = l.marks;
             reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = if (l.entry) |e| e.at else 0, .marks = l.marks, .hook = .{ .ptr = job, .at = Job.kept } };
+            if (store.groups) job.join = store.join(r.cacheKey(), l.entry, r.images.len == 0 and r.drafts);
+            if (l.entry) |e| {
+                job.parent = e.point;
+                job.fork = e.at;
+            }
+            // its rows' computation: the resumed state's forked at its position (written or not), else its own
+            job.lineage = store.passLineage(l.entry) catch &.{};
         } else |_| {};
         job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return h.drop(job, "the drafter could not start");
         job.stream = lanes.Stream.init(h.gpa, .{
@@ -392,7 +500,9 @@ pub const LaneHost = struct {
         const began = std.Io.Clock.awake.now(h.io).toNanoseconds();
         job.began = began;
         if (h.loneFits(job)) return h.runLone(job, began);
-        if (h.interleaving() and r.images.len == 0) job.stream.between = .{ .ptr = h, .wanted = betweenWanted, .run = between };
+        // between two prompt chunks: the other streams' rounds (interleave), and parked work's service, which runs
+        // with the interleave off too
+        if (r.images.len == 0 and (h.interleaving() or h.servicing())) job.stream.between = .{ .ptr = h, .wanted = betweenWanted, .run = between };
         h.passing = job;
         defer h.passing = null;
         h.core.addStream(&job.stream) catch |e| {
@@ -423,36 +533,44 @@ pub const LaneHost = struct {
 
     fn betweenWanted(ptr: *anyopaque) bool {
         const h: *LaneHost = @ptrCast(@alignCast(ptr));
-        return h.core.log == null and h.core.runnableCount() > 0;
+        if (h.core.log != null) return false;
+        return (h.interleaving() and h.core.runnableCount() > 0) or h.pending();
     }
 
     /// Stream.between: decode rounds for the other live streams, interleave_ns at most, between two of the filling
-    /// job's prompt chunks; their tokens go out as they land. Engine thread only (inside the filling job's addStream).
+    /// job's prompt chunks; their tokens go out as they land. Then parked work's service. Engine thread only (inside
+    /// the filling job's addStream).
     fn between(ptr: *anyopaque) anyerror!void {
         const h: *LaneHost = @ptrCast(@alignCast(ptr));
         if (h.core.log != null) return; // a step resets the core's arena, which a trail's open events live in
-        const t0 = std.Io.Clock.awake.now(h.io).toNanoseconds();
-        while (true) {
-            h.takeCancelsKeeping(if (h.passing) |f| f.id else null);
-            if (h.core.runnableCount() == 0 or std.Io.Clock.awake.now(h.io).toNanoseconds() - t0 >= h.interleave_ns) break;
-            h.core.step() catch |e| {
-                h.between_err = e; // the pass fails with it; run() then fails the streams the round held
-                return e;
-            };
-            var i: usize = 0;
-            while (i < h.admitted.items.len) {
-                const job = h.admitted.items[i];
-                if (job == h.passing or job.prefilled == null) {
-                    i += 1;
-                    continue;
+        if (h.interleaving()) {
+            const t0 = std.Io.Clock.awake.now(h.io).toNanoseconds();
+            while (true) {
+                h.takeCancelsKeeping(if (h.passing) |f| f.id else null);
+                if (h.core.runnableCount() == 0 or std.Io.Clock.awake.now(h.io).toNanoseconds() - t0 >= h.interleave_ns) break;
+                h.core.step() catch |e| {
+                    h.between_err = e; // the pass fails with it; run() then fails the streams the round held
+                    return e;
+                };
+                var i: usize = 0;
+                while (i < h.admitted.items.len) {
+                    const job = h.admitted.items[i];
+                    if (job == h.passing or job.prefilled == null) {
+                        i += 1;
+                        continue;
+                    }
+                    if (h.deliver(job)) {
+                        h.lock();
+                        _ = h.admitted.orderedRemove(i);
+                        h.unlock();
+                    } else i += 1;
                 }
-                if (h.deliver(job)) {
-                    h.lock();
-                    _ = h.admitted.orderedRemove(i);
-                    h.unlock();
-                } else i += 1;
+                h.noteLive();
             }
-            h.noteLive();
+        }
+        if (h.servicing()) {
+            if (h.passing) |f| f.reported(); // its restore is done (a chunk ran): a restore's room may evict that entry now
+            h.service(h.tier.service_ns);
         }
     }
 
@@ -470,7 +588,12 @@ pub const LaneHost = struct {
         job.prefilled = done;
         h.unlock();
         job.reported();
-        if (h.cache) |store| store.report(job.request.prompt.len, job.stream.cached, store.counts.kept - job.kept0);
+        h.host_counts.cached_tokens += job.stream.cached;
+        h.host_counts.computed_tokens += job.request.prompt.len -| job.stream.cached;
+        if (h.cache) |store| {
+            store.continued(job.join, job.stream.cached, job.request.prompt.len);
+            store.report(job.request.prompt.len, job.stream.cached, store.counts.kept - job.kept0);
+        }
         emit(job, .{ .prefilled = job.stream.cached });
     }
 
@@ -481,7 +604,12 @@ pub const LaneHost = struct {
         if ((r.sampling != null and !lone.sampled) or !r.drafts or r.think_budget > 0 or r.loop_guard or r.call != null or r.structure != null) return false;
         h.lock();
         defer h.unlock();
-        return h.admitted.items.len == 1 and h.queued.items.len == 0 and h.cancels.items.len == 0 and h.core.activeCount() == 0;
+        return h.admitted.items.len == 1 and h.queued.items.len == 0 and h.cancels.items.len == 0 and h.core.activeCount() == 0 and h.waitingCount() == 0;
+    }
+
+    /// Requests parked or woken (the lock held).
+    fn waitingCount(h: *const LaneHost) usize {
+        return h.ready.items.len + h.loading.items.len;
     }
 
     /// Send lone-driver tokens as they land; arrivals and cancellation return its stream to the lane core.
@@ -499,12 +627,18 @@ pub const LaneHost = struct {
                 }
                 host.send(j);
                 host.noteLive();
+                // writes enqueued at keep are staged during a long lone decode too (parked work makes it yield)
+                host.lone_commits += 1;
+                if (host.lone_commits >= lone_pump_commits and host.servicing()) {
+                    host.lone_commits = 0;
+                    if (host.cache) |store| store.pump(host.tier.pump_ns);
+                }
             }
             fn yield(ctx: *anyopaque) bool {
                 const host: *LaneHost = @ptrCast(@alignCast(ctx));
                 host.lock();
                 defer host.unlock();
-                return host.queued.items.len > 0 or host.cancels.items.len > 0 or host.closing;
+                return host.queued.items.len > 0 or host.cancels.items.len > 0 or host.closing or host.waitingCount() > 0;
             }
         };
         job.began = began;
@@ -555,6 +689,11 @@ pub const LaneHost = struct {
         job.prefilled = null;
         job.delivered = 0;
         job.prefill_sent = false;
+        job.join = .{};
+        job.parent = null;
+        job.fork = 0;
+        h.gpa.free(job.lineage);
+        job.lineage = &.{};
         h.lock();
         h.queued.insert(h.gpa, 0, job) catch {
             h.unlock();
@@ -584,6 +723,7 @@ pub const LaneHost = struct {
     }
 
     fn noteLive(h: *LaneHost) void {
+        const tele = h.telemetry();
         h.lock();
         defer h.unlock();
         h.live_tokens.clearRetainingCapacity();
@@ -592,6 +732,7 @@ pub const LaneHost = struct {
             h.live_tokens.append(h.gpa, @intCast(job.stream.context.items.len)) catch {};
             h.live_generated += @intCast(job.stream.emitted().len);
         };
+        if (tele) |t| h.tele = t;
     }
 
     /// The filling job's next piece, when its turn has come; its first tokens once its prompt pass ends.
@@ -613,6 +754,7 @@ pub const LaneHost = struct {
             h.takeCancels();
             while (h.admitOne()) {}
             h.fillOne();
+            if (h.servicing()) h.service(h.tier.service_ns); // restores, staged writes and deferred retries, between rounds and at idle
             if (h.between_err) |e| {
                 h.between_err = null;
                 h.failAll(@errorName(e));
@@ -621,9 +763,9 @@ pub const LaneHost = struct {
             h.noteLive();
             h.lock();
             if (h.closing) {
-                const left = h.queued.items.len + h.admitted.items.len;
+                const left = h.queued.items.len + h.admitted.items.len + h.waitingCount();
                 h.unlock();
-                if (left == 0) return;
+                if (left == 0) return h.shutdownTier();
                 h.closeAll();
                 continue;
             }
@@ -632,8 +774,10 @@ pub const LaneHost = struct {
                     h.unlock();
                     continue;
                 }
-                if (h.cancels.items.len == 0 and (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes))
-                    h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {};
+                if (h.cancels.items.len == 0 and ((h.queued.items.len == 0 and h.ready.items.len == 0) or h.admitted.items.len >= h.info_.lanes)) {
+                    const ms: i64 = if (h.pending()) poll_ns / std.time.ns_per_ms else 100; // work in flight: poll it
+                    h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } }) catch {};
+                }
                 h.unlock();
                 continue;
             }
@@ -672,10 +816,216 @@ pub const LaneHost = struct {
         h.lock();
         for (h.queued.items) |job| h.cancels.append(h.gpa, job.id) catch {};
         for (h.admitted.items) |job| h.cancels.append(h.gpa, job.id) catch {};
+        for (h.ready.items) |job| h.cancels.append(h.gpa, job.id) catch {};
+        for (h.loading.items) |l| h.cancels.append(h.gpa, l.job.id) catch {};
         h.unlock();
         h.takeCancels();
     }
+
+    // -- parked work (0110) ---------------------------------------------------------------------------------------
+
+    /// Whether admission may park a request: the cache has a tier.
+    fn parking(h: *const LaneHost) bool {
+        const store = h.cache orelse return false;
+        return store.tier != null;
+    }
+
+    /// Whether the engine thread services parked work (restores, staged writes, deferred retries).
+    fn servicing(h: *const LaneHost) bool {
+        return h.parking();
+    }
+
+    /// Work in flight the host must poll (engine thread): restores, writes to stage, requests parked or woken.
+    fn pending(h: *const LaneHost) bool {
+        if (h.loading.items.len > 0 or h.ready.items.len > 0) return true;
+        const store = h.cache orelse return false;
+        return store.busy();
+    }
+
+    /// Before `job`'s pass (engine thread, no lock): park it on a restore of a longer durable point (once). False:
+    /// admit it now.
+    fn park(h: *LaneHost, job: *Job) bool {
+        const store = h.cache orelse return false;
+        const r = job.request;
+        if (r.images.len > 0 and r.cache_key.len == 0) return false; // pictures without their digest key: never from disk
+        const key = r.cacheKey();
+        const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
+        const probe = store.probe(key, r.chunks);
+        if (!job.tried_disk) if (probe.durable) |p| {
+            job.tried_disk = true;
+            h.lock();
+            const room = h.loading.ensureUnusedCapacity(h.gpa, 1);
+            h.unlock();
+            if (room) |_| {
+                if (store.restoreBegin(p, key)) |rs| {
+                    h.lock();
+                    h.loading.appendAssumeCapacity(.{ .job = job, .restore = rs, .since = now });
+                    h.unlock();
+                    h.host_counts.restore_waits += 1;
+                    return true;
+                } else |err| note("reading {d} kept tokens from disk did not start ({s}); prefilling", .{ p.at, @errorName(err) });
+            } else |_| {}
+        };
+        return false;
+    }
+
+    /// A woken job to the ready list (the lock held; released here). Out of memory fails it alone.
+    fn toReady(h: *LaneHost, job: *Job) void {
+        h.ready.append(h.gpa, job) catch {
+            h.unlock();
+            return h.finish(job, .failed, "out of memory");
+        };
+        h.unlock();
+    }
+
+    /// Parked work's service (engine thread): restores progress under one elapsed-time budget shared fairly (each gets
+    /// an equal share of what is left, a different one first each time); writes are staged with what remains. Restores
+    /// that end wake every request waiting for them; deferred restores whose retry came ask again.
+    /// Called inside a fill's `between` too, so a family's restore commands there must keep the follower's ordered
+    /// stream valid (dsv41 joins Engram read-ahead before `between`, as recipe 0005 requires).
+    fn service(h: *LaneHost, budget_ns: u64) void {
+        const store = h.cache orelse return;
+        const t0 = std.Io.Clock.awake.now(h.io).toNanoseconds();
+        h.expireLoads(t0);
+        const n = store.restoring.items.len;
+        if (n > 0) { // at most 64 a service, a different first one each time: every restore is polled in turn
+            var buf: [64]*pc.Restore = undefined;
+            const m = @min(n, buf.len);
+            h.turn = (h.turn + 1) % n;
+            for (0..m) |k| buf[k] = store.restoring.items[(h.turn + k) % n];
+            for (buf[0..m], 0..) |r, k| {
+                const spent: u64 = @intCast(@max(0, std.Io.Clock.awake.now(h.io).toNanoseconds() - t0));
+                if (spent >= budget_ns and k > 0) break;
+                const share = (budget_ns -| spent) / (m - k);
+                const st = store.restorePoll(r, share);
+                if (st != .pending) h.restoreEnded(r);
+            }
+        }
+        const spent: u64 = @intCast(@max(0, std.Io.Clock.awake.now(h.io).toNanoseconds() - t0));
+        const idle = h.filling == null and h.core.activeCount() == 0; // nothing decodes: staging takes what is left
+        store.pump(if (idle) budget_ns -| spent else @min(budget_ns -| spent, h.tier.pump_ns));
+    }
+
+    /// Requests parked on a restore longer than load_wait_ns are admitted without it (they look up what memory holds);
+    /// a restore no request waits for any more stops, once.
+    fn expireLoads(h: *LaneHost, now: i96) void {
+        const store = h.cache orelse return;
+        var any = false;
+        var i: usize = 0;
+        while (i < h.loading.items.len) {
+            const l = h.loading.items[i];
+            if (now - l.since < h.tier.load_wait_ns) {
+                i += 1;
+                continue;
+            }
+            any = true;
+            h.lock();
+            _ = h.loading.orderedRemove(i);
+            const waited: u64 = @intCast(@max(0, now - l.since));
+            h.host_counts.restore_wait_timeouts += 1;
+            h.host_counts.restore_wait_ns += waited;
+            h.host_counts.restore_wait_max_ns = @max(h.host_counts.restore_wait_max_ns, waited);
+            h.toReady(l.job); // (releases the lock)
+            const wanted = for (h.loading.items) |o| {
+                if (o.restore == l.restore) break true;
+            } else false;
+            if (!wanted) store.restoreCancel(l.restore);
+        }
+        if (!any) return;
+        h.lock();
+        h.wake.signal(h.io);
+        h.unlock();
+    }
+
+    /// Restore `r` ended (adopted, dropped or failed; `r` is already freed, only its address is compared): its
+    /// waiters wake in arrival order, to look up what memory holds now.
+    fn restoreEnded(h: *LaneHost, r: *pc.Restore) void {
+        const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
+        while (true) {
+            h.lock();
+            const i = for (h.loading.items, 0..) |l, i| {
+                if (l.restore == r) break i;
+            } else {
+                h.wake.signal(h.io);
+                return h.unlock();
+            };
+            const l = h.loading.orderedRemove(i);
+            const waited: u64 = @intCast(@max(0, now - l.since));
+            h.host_counts.restore_wait_ns += waited;
+            h.host_counts.restore_wait_max_ns = @max(h.host_counts.restore_wait_max_ns, waited);
+            h.toReady(l.job);
+        }
+    }
+
+    /// Clean shutdown on the engine thread, nothing left to serve: restores stopped, writes drained within flush_ns.
+    fn shutdownTier(h: *LaneHost) void {
+        const store = h.cache orelse return;
+        if (store.tier == null) return;
+        _ = store.flush(h.tier.flush_ns);
+        if (h.telemetry()) |t| {
+            h.lock();
+            h.tele = t;
+            h.unlock();
+        }
+    }
+
+    /// The cache's counters for status (engine thread); null while telemetry is off.
+    fn telemetry(h: *LaneHost) ?api.CacheStats {
+        if (h.tele == null) return null;
+        var t: api.CacheStats = .{};
+        if (h.cache) |store| {
+            const c = store.counts;
+            const s = store.stats;
+            t.memory_hits = c.hits;
+            t.memory_misses = c.misses;
+            t.kept = c.kept;
+            t.evicted = c.evicted;
+            t.refused = c.refused;
+            t.failed = c.failed;
+            t.entries = store.entries.items.len;
+            t.held_bytes = store.held;
+            t.disk_lookups = s.disk_lookups;
+            t.disk_hits = s.disk_hits;
+            t.disk_hits_committed = s.disk_hits_committed;
+            t.restores_begun = s.restores_begun;
+            t.restores_shared = s.restores_shared;
+            t.restores_failed = s.restores_failed;
+            t.restores_cancelled = s.restores_cancelled;
+            t.restores_dropped = s.restores_dropped;
+            t.restores_refused = s.restores_refused;
+            t.restores_active = store.restoring.items.len;
+            t.restoring_bytes = store.restoring_bytes;
+            for (store.restoring.items) |r| {
+                t.restore_blocks_done += r.done;
+                t.restore_blocks_total += r.total;
+            }
+            t.restored_tokens = s.restored_tokens;
+            t.writes_enqueued = s.writes_enqueued;
+            t.shared_promoted = s.shared_promoted;
+            t.flushes = s.flushes;
+            t.flush_timeouts = s.flush_timeouts;
+            t.flush_unpublished = s.flush_unpublished;
+            t.chats_continued = s.chats_continued;
+            t.chats_continued_prefill_tokens = s.chats_continued_prefill_tokens;
+            t.spill = store.tierCounts();
+        }
+        const hc = h.host_counts;
+        t.restore_waits = hc.restore_waits;
+        t.restore_wait_timeouts = hc.restore_wait_timeouts;
+        t.restore_wait_ns = hc.restore_wait_ns;
+        t.restore_wait_max_ns = hc.restore_wait_max_ns;
+        t.cached_tokens = hc.cached_tokens;
+        t.computed_tokens = hc.computed_tokens;
+        t.parked = h.loading.items.len;
+        return t;
+    }
 };
+
+/// A line on the engine's log; tests stay quiet (the build runner fails a test that writes to stderr).
+fn note(comptime fmt: []const u8, args: anytype) void {
+    if (@import("builtin").is_test) return;
+    std.log.warn("lane host: " ++ fmt, args);
+}
 
 test "a lane host serves the core's own tokens, in order, and cancels between rounds" {
     const gpa = std.testing.allocator;
@@ -856,4 +1206,7 @@ test "prefill interleave: a decoding stream keeps getting tokens and its cancel 
     try std.testing.expectEqual(Reason.cancelled, a.wait());
 }
 
-test { _ = @import("lane_host_test.zig"); }
+test {
+    _ = @import("lane_host_test.zig");
+    _ = @import("lane_host_tier_test.zig");
+}

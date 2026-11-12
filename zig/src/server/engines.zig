@@ -14,7 +14,8 @@ pub fn capabilities(a: Allocator) cli.Engines {
 
 /// The engine for the checkpoint in ``dir``, or null with ``problem`` set.
 pub fn open(a: Allocator, gpa: Allocator, io: std.Io, dir: []const u8, model_type: []const u8, args: cli.Args, problem: *[]const u8) !?Opened {
-    return native.open(a, gpa, io, .{
+    const spill = cli.spill(args, cli.ProcessEnv{});
+    const opened = try native.open(a, gpa, io, .{
         .dir = dir,
         .model_type = model_type,
         .context = args.context,
@@ -28,5 +29,14 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, dir: []const u8, model_typ
         .learn_gib = args.learn_gib,
         .device = args.device,
         .segments = args.segments,
-    }, problem);
+        // the prompt cache's disk tier (off unless asked); the backend binds a tier to its
+        // cache when it has one (native/cuda.zig openWith binds the family's tier: dsv41's spill_tier)
+        .spill = spill,
+    }, problem) orelse return null;
+    if (spill.unbound(opened.engine)) { // asked for, never silently ignored
+        opened.close(opened.ctx);
+        problem.* = "--spill-dir/--spill-gib are not served by this engine: its backend binds no prompt-cache tier, or its prompt cache is off";
+        return null;
+    }
+    return opened;
 }
