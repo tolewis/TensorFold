@@ -125,6 +125,7 @@ pub const Engine = struct {
     plain: Rope,
     compressed: Rope,
     round_rows: usize = 16, // a concurrent round's rows at most (TF_DS_ROUND_ROWS; round.max_rows at most)
+    plain_rows: usize = 0, // a mixed pack's plain linear runs over at least these rows (TF_DS_PLAIN_ROWS; model.zig sets it)
     two: ?*const prompt2d.Two = null, // a node of the four-node 2D split (prompt2d.zig); `world` stays TP2's
     ring: ?*rdma.Ring = null, // TP2: the decode-size all-gathers over the RDMA ring (the served lane's), else NCCL
     kv: ?*shard_ops.KvShard = null, // TF_DS_KV_SHARD: the parts, the decode mode, the fetch kernels (null: replicated)
@@ -583,6 +584,15 @@ pub fn counterOf(ch: *const Chunk, l: weights.Linear) !u64 {
     return error.NoCounters;
 }
 
+/// The rows a mixed pack's plain (cuBLAS) linear runs over: `m`, padded to the engine's plain-rows setting and never
+/// beyond a round's rows (the buffers are sized for those). cuBLAS picks its kernel and split-K from the GEMM's shape
+/// and its rounding follows the pick, so a fixed shape keeps a token's bits the same whether it is decoded alone,
+/// beside other streams, or under the draft block (TF_DS_PLAIN_ROWS=0 turns the padding off).
+fn plainRows(e: *const Engine, m: usize) usize {
+    if (e.plain_rows <= m) return m;
+    return @min(e.plain_rows, e.round_rows);
+}
+
 /// Exl3Group(ls) on m (1..128) rows (linear.py): one rot_many launch rotating every layer's input rows xs[i] (bf16,
 /// row stride ldxs[i]) into the group's buffer, then a glinear launch for each (bits, warps) set, outputs into outs[i]
 /// (row stride ldos[i], dtype types[i]); programmatic dependent launches, split-K partials dropped from L2 (the served
@@ -610,14 +620,15 @@ pub fn grouped(e: *const Engine, ch: *const Chunk, m: usize, ls: []const weights
         try exl3_linear.rotMany(e.lin, e.s, calls[0..n_calls], m, true);
         try exl3_linear.glinear(e.lin, e.s, calls[0..n_calls], m, ch.gz, true, true);
     }
+    const mp = plainRows(e, m);
     for (plain[0..n_plain]) |i| {
         const l = ls[i];
         if (ldxs[i] != @as(usize, l.k) or ldos[i] != @as(usize, l.n)) return error.UnsupportedPlainLinear;
         if (types[i] == .bf16) {
-            try e.blas.linearBf16(xs[i], l.plain, outs[i], m, @as(usize, l.k), @as(usize, l.n));
+            try e.blas.linearBf16(xs[i], l.plain, outs[i], mp, @as(usize, l.k), @as(usize, l.n));
         } else {
-            try e.blas.linearBf16(xs[i], l.plain, ch.plain_tmp, m, @as(usize, l.k), @as(usize, l.n));
-            try e.ops.toF32(e.s, ch.plain_tmp, outs[i], m * @as(usize, l.n));
+            try e.blas.linearBf16(xs[i], l.plain, ch.plain_tmp, mp, @as(usize, l.k), @as(usize, l.n));
+            try e.ops.toF32(e.s, ch.plain_tmp, outs[i], mp * @as(usize, l.n));
         }
     }
 }
@@ -643,13 +654,14 @@ pub fn groupedRotated(e: *const Engine, ch: *const Chunk, m: usize, calls: []exl
     }
     for (exl3[0..n_exl3]) |*c| c.counters = try counterOf(ch, c.layer);
     if (n_exl3 > 0) try exl3_linear.glinear(e.lin, e.s, exl3[0..n_exl3], m, ch.gz, true, true);
+    const mp = plainRows(e, m);
     for (plain[0..n_plain]) |c| {
         if (c.x == 0 or c.xh != 0 or c.ldx != @as(i64, c.layer.k) or c.ldy != @as(i64, c.layer.n)) return error.UnsupportedPlainLinear;
         if (c.y_dtype == .bf16) {
-            try e.blas.linearBf16(c.x, c.layer.plain, c.y, m, @as(usize, c.layer.k), @as(usize, c.layer.n));
+            try e.blas.linearBf16(c.x, c.layer.plain, c.y, mp, @as(usize, c.layer.k), @as(usize, c.layer.n));
         } else {
-            try e.blas.linearBf16(c.x, c.layer.plain, ch.plain_tmp, m, @as(usize, c.layer.k), @as(usize, c.layer.n));
-            try e.ops.toF32(e.s, ch.plain_tmp, c.y, m * @as(usize, c.layer.n));
+            try e.blas.linearBf16(c.x, c.layer.plain, ch.plain_tmp, mp, @as(usize, c.layer.k), @as(usize, c.layer.n));
+            try e.ops.toF32(e.s, ch.plain_tmp, c.y, mp * @as(usize, c.layer.n));
         }
     }
 }
@@ -862,11 +874,12 @@ fn mmRows(e: *const Engine, ch: *const Chunk, m: usize, l: weights.Linear, x: u6
     // bf16 -> fp32 widen when the caller wants fp32 (torch's mm's out_dtype).
     if (l.plain != 0) {
         if (ldx != @as(usize, l.k) or os != @as(usize, l.n)) return error.UnsupportedPlainLinear;
+        const mp = plainRows(e, m);
         if (out_type == .bf16) {
-            try e.blas.linearBf16(x, l.plain, out, m, @as(usize, l.k), @as(usize, l.n));
+            try e.blas.linearBf16(x, l.plain, out, mp, @as(usize, l.k), @as(usize, l.n));
         } else {
-            try e.blas.linearBf16(x, l.plain, ch.plain_tmp, m, @as(usize, l.k), @as(usize, l.n));
-            try e.ops.toF32(e.s, ch.plain_tmp, out, m * @as(usize, l.n));
+            try e.blas.linearBf16(x, l.plain, ch.plain_tmp, mp, @as(usize, l.k), @as(usize, l.n));
+            try e.ops.toF32(e.s, ch.plain_tmp, out, mp * @as(usize, l.n));
         }
         return;
     }

@@ -70,6 +70,7 @@ pub const Options = struct {
     engram_aio: bool = false, // a round's Engram reads by Linux AIO on O_DIRECT (else the reader pool)
     arena_bytes: usize = 0, // the device arena's first block (0: it grows from 256 MiB blocks as the buffers ask)
     round_rows: usize = round.default_rows, // a round's rows at most (TF_DS_ROUND_ROWS; the four-node lane's 48)
+    plain_rows: usize = round.default_rows, // a mixed pack's plain linear runs over at least these rows (TF_DS_PLAIN_ROWS; 0: the round's own)
     streams: usize = draft.default_streams, // the pool's streams (--parallel; the four-node lane's 16)
     round_ms: ?[]const f64 = null, // the lane core's round costs by rows (TF_DS_ROUND_MS; null: the served ROUND_MS)
     vision_bias: ?[]const u8 = null, // gate_bias_vl.safetensors (null: the kit's vision/): the image-span routing bias
@@ -325,6 +326,7 @@ pub const Model = struct {
         }
         m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
         m.eng.round_rows = o.round_rows;
+        m.eng.plain_rows = o.plain_rows;
         m.ch = try prompt.Chunk.init(&m.eng, &m.arena, chunk_rows, m.request_cap);
         errdefer if (m.kvs) |*x| x.k.unload(); // (registered before the load: nothing between them leaks it)
         if (mode != .off) {

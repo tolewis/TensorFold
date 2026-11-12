@@ -13,6 +13,8 @@
 //!                                               served ROUND_MS unless set: a four-node lane's rounds cost less)
 //!   TF_DS_ROUND_ROWS, TF_DS_STREAMS             a round's rows at most (16; the four-node lane's 48) and the pool's
 //!                                               streams (4; its 16): --parallel at most the streams
+//!   TF_DS_PLAIN_ROWS                            the rows a mixed pack's plain (cuBLAS) linear runs over, padded to this
+//!                                               count so a token's bits do not change with the round's shape (16; 0: off)
 //!   TF_RDMA_DEVICES                             the decode gathers over the RDMA ring on these devices (else NCCL)
 //!   TF_DS_GRAPHS=1                              the rounds' stretches as CUDA graphs
 //!   TF_DS_HC_SIDE=1                             the mixes' side work on a stream of its own
@@ -213,6 +215,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .drafts = o.drafts,
         .arena_bytes = arena_gib << 30,
         .round_rows = if (getenv("TF_DS_ROUND_ROWS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadRoundRows else round.default_rows,
+        .plain_rows = if (getenv("TF_DS_PLAIN_ROWS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadPlainRows else round.default_rows,
         .round_ms = if (getenv("TF_DS_ROUND_MS")) |v| lanes_mod.parseMs(std.heap.page_allocator, v) catch return error.BadRoundMs else null,
         .streams = if (getenv("TF_DS_STREAMS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadStreams else model.max_streams_default,
     };
@@ -621,6 +624,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.NoKit => "set TF_DS_KIT to the kernel kit (cubins/, the RoPE tables, engram.json)",
         error.NoFreeSlot => "this engine serves TF_DS_STREAMS streams at once (default 4): --parallel at most that",
         error.BadRoundRows => "TF_DS_ROUND_ROWS: a round's rows at most, 16 .. 48",
+        error.BadPlainRows => "TF_DS_PLAIN_ROWS: the rows a mixed pack's plain linear runs over, 0 (the round's own) or a count up to TF_DS_ROUND_ROWS",
         error.BadStreams => "TF_DS_STREAMS: the pool's streams, 1 .. 16",
         error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
         error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
