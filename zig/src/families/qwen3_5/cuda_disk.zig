@@ -39,9 +39,10 @@ fn wordsOf(c: *const Copy) Words {
     return .{ .at = @intCast(c.at), .delta = c.delta, .format = @backingInt(c.format) };
 }
 
-fn gather(_: *anyopaque, saved: api.prompt_cache.Saved, ranges: []const rows.image.Range, out: []u8) anyerror!void {
+fn gather(ptr: *anyopaque, saved: api.prompt_cache.Saved, ranges: []const rows.image.Range, out: []u8) anyerror!void {
     const c: *const Copy = @ptrCast(@alignCast(saved));
     if (c.dev != null) return error.KeptOnDevice; // the disk tier's states are saved on the host (Target.ctx)
+    try reuse.awaitSaved(target(ptr).e, c); // the arena's copy stream may still write the bytes
     const w = wordsOf(c);
     var o: usize = 0;
     for (ranges) |g| {

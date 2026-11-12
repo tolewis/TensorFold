@@ -116,6 +116,8 @@ fn opening(self: anytype, stream: *lanes.Stream) !Fill {
     errdefer if (shared) |x| self.gpa.free(x.plan.marks);
     const cache = if (shared) |x| x.cache else try self.take(ids.len, stream.max_new);
     errdefer self.give(cache);
+    // a queued save may still read rows of this cache that the pass rewrites (a test's engine has no saves)
+    if (@TypeOf(self.e) == *E.Engine) try reuse.settled(self.e);
     // the stream's cache is found by a save at a mark (cuda_reuse.zig) while its pass runs
     try self.caches.put(self.gpa, stream, cache);
     errdefer _ = self.caches.remove(stream);

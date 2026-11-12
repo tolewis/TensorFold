@@ -3,6 +3,7 @@
 //! copy does, so the arena is pinned once and the copies only take and give ranges in it. A copy that no free
 //! range holds takes several (Parts): evictions leave gaps, so the free bytes are rarely in one range.
 const std = @import("std");
+const cuda = @import("cuda");
 
 /// A taken range starts 2 MiB aligned: the copies' rows land on page-sized runs.
 pub const unit = 2 << 20;
@@ -18,9 +19,35 @@ pub fn monotonicMs() u64 {
     return @intCast(@as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000);
 }
 
+/// The arena's copy stream: a save's device-to-host copies run there, beside the prompt pass after the mark.
+pub const Side = struct {
+    stream: cuda.Stream,
+    ready: cuda.Event, // the engine's stream at the mark: the copies wait for it
+    state: cuda.Event, // the recurrences and tails copied: the engine's stream waits, as the next pass changes them
+    done: cuda.Event, // every queued copy in: a restore and a pass that rewrites a cache's rows wait for it
+
+    pub fn init(d: *const cuda.Driver) !Side {
+        var s = try cuda.Stream.init(d, true);
+        errdefer s.deinit();
+        var ready = try cuda.Event.init(d, false);
+        errdefer ready.deinit();
+        var state = try cuda.Event.init(d, false);
+        errdefer state.deinit();
+        return .{ .stream = s, .ready = ready, .state = state, .done = try cuda.Event.init(d, false) };
+    }
+
+    pub fn deinit(x: *Side) void {
+        x.stream.deinit(); // drains the stream first
+        x.ready.deinit();
+        x.state.deinit();
+        x.done.deinit();
+    }
+};
+
 pub const Pool = struct {
     bytes: []align(16) u8, // the pinned arena
-    host: ?@import("cuda").HostBuffer = null, // the allocation behind `bytes` (null: a test's heap bytes)
+    host: ?cuda.HostBuffer = null, // the allocation behind `bytes` (null: a test's heap bytes)
+    side: ?Side = null, // the copy stream (a pinned arena's); null: a save copies on the engine's stream
     gpa: std.mem.Allocator,
     ranges: std.ArrayListUnmanaged(Range) = .empty, // free ranges, sorted by offset, never touching or overlapping
 
@@ -36,17 +63,21 @@ pub const Pool = struct {
 
     /// The engine's arena: one cuMemHostAlloc, pinned now, its first byte `unit` aligned (the allocation carries a
     /// spare unit for that, so a full-size range still fits), `slack_units` past the budget `len`.
-    pub fn pinned(gpa: std.mem.Allocator, d: *const @import("cuda").Driver, len: usize) !*Pool {
+    pub fn pinned(gpa: std.mem.Allocator, d: *const cuda.Driver, len: usize) !*Pool {
         const held = len + slack_units * unit;
-        var host = try @import("cuda").HostBuffer.alloc(d, held + unit);
+        var host = try cuda.HostBuffer.alloc(d, held + unit);
         errdefer host.free();
+        var side = try Side.init(d);
+        errdefer side.deinit();
         const off = (unit - @intFromPtr(host.bytes.ptr) % unit) % unit;
         const p = try over(gpa, @alignCast(host.bytes[off..][0..held]));
         p.host = host;
+        p.side = side;
         return p;
     }
 
     pub fn deinit(p: *Pool) void {
+        if (p.side) |*x| x.deinit(); // before the bytes its copies write go
         p.ranges.deinit(p.gpa);
         if (p.host) |*h| h.free();
         p.gpa.destroy(p);

@@ -54,8 +54,8 @@ pub fn wholePages(cache: *const Cache, l: Layout) bool {
     return cache.paged != null and l.format == .bf16 and l.at > 0;
 }
 
-/// Every bf16 piece's rows from `at`'s pages, one 2D copy a page (`tokens` rows apart there, `at` apart in `copy`).
-pub fn pageCopies(e: *Engine, cache: *const Cache, l: Layout, copy: *const Copy, off: usize, way: enum { save, restore }) !void {
+/// Every bf16 piece's rows from `at`'s pages on `s`, one 2D copy a page (`tokens` rows apart there, `at` in `copy`).
+pub fn pageCopies(e: *Engine, cache: *const Cache, l: Layout, copy: *const Copy, off: usize, way: Way, s: cuda.abi.Stream) !void {
     const pg = cache.paged.?;
     const row = head_dim * 2;
     const page_bytes = (Layout{ .g = l.g, .format = l.format, .cap = pg.tokens, .at = pg.tokens }).kvBytes();
@@ -73,18 +73,19 @@ pub fn pageCopies(e: *Engine, cache: *const Cache, l: Layout, copy: *const Copy,
             .save => .{ .src = dev, .src_pitch = pg.tokens * row, .dst_type = kind, .dst_host = host, .dst = kept, .dst_pitch = l.at * row, .width = rows * row, .height = pieces },
             .restore => .{ .src_type = kind, .src_host = host, .src = kept, .src_pitch = l.at * row, .dst = dev, .dst_pitch = pg.tokens * row, .width = rows * row, .height = pieces },
         };
-        try e.d.check(e.d.api.cuMemcpy2DAsync_v2(&m, e.stream.handle), "cuMemcpy2DAsync");
+        try e.d.check(e.d.api.cuMemcpy2DAsync_v2(&m, s), "cuMemcpy2DAsync");
     }
 }
 
-/// One device run to or from the host copy at offset `o`, split where a pooled copy's arena ranges end.
-pub fn hostRun(e: *Engine, copy: *const Copy, o: usize, dev: u64, len: usize, way: enum { save, restore }) !void {
+pub const Way = enum { save, restore };
+
+/// One device run to or from the host copy at offset `o` on `s`, split where a pooled copy's arena ranges end.
+pub fn hostRun(e: *Engine, copy: *const Copy, o: usize, dev: u64, len: usize, way: Way, s: cuda.abi.Stream) !void {
     var done: usize = 0;
     while (done < len) {
         const h = if (copy.pooled) copy.parts.at(o + done) else copy.host.bytes[o + done ..];
         const n = @min(h.len, len - done);
         if (n == 0) return error.CopyPastHost;
-        const s = e.stream.handle;
         switch (way) {
             .save => try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(h.ptr, dev + done, n, s), "cuMemcpyDtoHAsync"),
             .restore => try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(dev + done, h.ptr, n, s), "cuMemcpyHtoDAsync"),

@@ -34,6 +34,7 @@ pub const Copy = struct {
     format: Format,
     images: []Seen,
     reading: bool = false, // a restore's queued copies may still read `host`: a drop keeps it until they are done
+    saving: bool = false, // the arena's copy stream may still write `host`: a drop or a host read waits for it
     pooled: bool = false, // the bytes are `parts` of the engine's arena (cuda_host_pool.zig); `host` is the first
     parts: hp.Parts = .{}, // when there is one part, else empty
 
@@ -174,25 +175,61 @@ pub fn saveCache(e: *Engine, cache: *Cache, at: usize, seen: []const Seen, devic
         .images = images,
     };
     errdefer drainThenFree(e, copy);
+    // a host copy runs on the arena's copy stream: the next pass waits only for the recurrences and tails
+    const side = if (dev == null) sideOf(e) else null;
+    const s = if (side) |x| x.stream.handle else e.stream.handle;
+    if (side) |x| {
+        copy.saving = true;
+        try x.ready.record(e.stream);
+        try x.stream.wait(x.ready);
+    }
     var off: usize = 0;
     for (0..l.count()) |i| {
         const p = l.piece(i);
         if (i == 1 and copying.wholePages(cache, l) and copy.parts.n <= 1) {
-            try copying.pageCopies(e, cache, l, copy, off, .save);
+            try copying.pageCopies(e, cache, l, copy, off, .save, s);
             break;
         }
         var it = copying.Runs.of(cache, l, i, p);
         while (it.next()) |r| {
-            const s, const o = .{ e.stream.handle, off + r.at };
+            const o = off + r.at;
             if (dev) |b|
                 try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(b.ptr + o, r.dev, r.len, s), "cuMemcpyDtoDAsync")
             else
-                try copying.hostRun(e, copy, o, r.dev, r.len, .save);
+                try copying.hostRun(e, copy, o, r.dev, r.len, .save, s);
         }
         off += p.len;
+        // the next pass changes piece 0, the recurrences and tails; it writes no key or value row before the mark
+        if (i == 0) if (side) |x| {
+            try x.state.record(x.stream);
+            try e.stream.wait(x.state);
+        };
     }
-    try e.stream.synchronize();
+    if (side) |x| try x.done.record(x.stream) else try e.stream.synchronize();
     return copy;
+}
+
+/// The arena's copy stream (cuda_host_pool.zig Side); null: a save copies on the engine's stream and waits there.
+fn sideOf(e: *const Engine) ?*hp.Side {
+    const p = e.pool orelse return null;
+    return if (p.side) |*x| x else null;
+}
+
+/// The engine's stream waits for every queued save: a pass or a restore that rewrites a cache's rows comes after.
+pub fn settled(e: *const Engine) !void {
+    if (sideOf(e)) |x| try e.stream.wait(x.done);
+}
+
+/// Waits on the host for the copy stream when it may still write `copy`'s bytes.
+pub fn awaitSaved(e: *const Engine, copy: *const Copy) !void {
+    if (copy.saving) if (sideOf(e)) |x| try x.stream.synchronize();
+}
+
+/// Whether no queued save still writes `copy`: false when the wait failed.
+fn unwritten(e: *const Engine, copy: *Copy) bool {
+    awaitSaved(e, copy) catch return false;
+    copy.saving = false;
+    return true;
 }
 
 /// A failed save's buffer: earlier copies may still be queued into it, so it is freed once the stream drains.
@@ -201,13 +238,14 @@ fn drainThenFree(e: *Engine, copy: *Copy) void {
         cuda.completion.drain(e.d, e.stream, "qwen3_5: a failed save's device copy did not drain");
         return b.free();
     }
-    e.stream.synchronize() catch {
+    const drained = unwritten(e, copy) and if (e.stream.synchronize()) |_| true else |_| false;
+    if (!drained) {
         if (copy.pooled) std.log.warn("qwen3_5: a failed save's pooled copy stays out of the arena: no drain", .{}) else {
             std.log.warn("qwen3_5: a failed save's host copy goes to the quarantine: no drain", .{});
             cuda.copy_source.retainPinned(e.d, copy.host, e.stream);
         }
         return;
-    };
+    }
     if (copy.pooled) e.pool.?.giveParts(copy.parts) else copy.host.free();
 }
 
@@ -224,6 +262,7 @@ pub fn restoreCache(e: *Engine, cache: *Cache, saved: *anyopaque, seen: []const 
     if (copy.format != formatOf(e)) return error.KeptCacheFormat;
     if (!restorable(e, cache, copy, seen)) return error.BadReuse;
     const l: Layout = .{ .g = e.g, .format = copy.format, .cap = cache.cap, .at = copy.at };
+    try settled(e); // the copy's bytes, and the cache's rows a queued save still reads
     // the copies read the kept state until the stream drains: a restore that fails before then leaves it marked
     copy.reading = true;
     errdefer if (e.stream.synchronize()) |_| {
@@ -233,7 +272,7 @@ pub fn restoreCache(e: *Engine, cache: *Cache, saved: *anyopaque, seen: []const 
     for (0..l.count()) |i| {
         const p = l.piece(i);
         if (i == 1 and copying.wholePages(cache, l) and copy.parts.n <= 1) {
-            try copying.pageCopies(e, cache, l, copy, off, .restore);
+            try copying.pageCopies(e, cache, l, copy, off, .restore, e.stream.handle);
             break;
         }
         var it = copying.Runs.of(cache, l, i, p);
@@ -242,7 +281,7 @@ pub fn restoreCache(e: *Engine, cache: *Cache, saved: *anyopaque, seen: []const 
             if (copy.dev) |b|
                 try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(r.dev, b.ptr + o, r.len, s), "cuMemcpyDtoDAsync")
             else
-                try copying.hostRun(e, copy, o, r.dev, r.len, .restore);
+                try copying.hostRun(e, copy, o, r.dev, r.len, .restore, s);
         }
         off += p.len;
     }
@@ -284,13 +323,14 @@ pub fn dropCopy(e: *Engine, copy: *Copy) void {
     if (copy.reading) if (e.stream.synchronize()) |_| {
         copy.reading = false;
     } else |_| {};
+    const busy = copy.reading or !unwritten(e, copy); // a queued restore may read the bytes, a queued save write them
     if (copy.dev) |*b| {
         const why = "qwen3_5: a kept state's device copy stays allocated: a restore's copies did not drain";
-        if (copy.reading) std.log.warn(why, .{}) else b.free();
-    } else if (copy.reading) {
-        // pooled bytes stay out of the arena and out of the quarantine: a copy may still read them
-        if (copy.pooled) std.log.warn("qwen3_5: a pooled copy stays out of the arena: a restore did not drain", .{}) else {
-            std.log.warn("qwen3_5: a host copy goes to the copy-source quarantine: a restore did not drain", .{});
+        if (busy) std.log.warn(why, .{}) else b.free();
+    } else if (busy) {
+        // pooled bytes stay out of the arena and out of the quarantine: a copy may still read or write them
+        if (copy.pooled) std.log.warn("qwen3_5: a pooled copy stays out of the arena: copies did not drain", .{}) else {
+            std.log.warn("qwen3_5: a host copy goes to the copy-source quarantine: copies did not drain", .{});
             cuda.copy_source.retainPinned(e.d, copy.host, e.stream);
         }
     } else if (copy.pooled) e.pool.?.giveParts(copy.parts) else copy.host.free();
