@@ -677,6 +677,14 @@ pub const Runner = struct {
             const mk1 = try d.g.module(&kb.k1);
             const kk = try k1mod.load(d, md, mk1);
             d.k.attn_k1 = kk.decode;
+            if (k1mod.k1bPick()) |pick| { // K1B (lane p4-kernel, XPU_K1B): attn_k1_decode's values, other read order
+                const name = k1mod.k1b_names[pick];
+                const k1b = try d.kernel(mk1, name, 256);
+                try d.g.indirect(k1b);
+                std.debug.print("k1b: XPU_K1B={d} ({s} in place of attn_k1_decode, check {s})\n", .{ k1mod.k1b, name, if (k1mod.k1b & 4 != 0) "on" else "off" });
+                if (k1mod.k1b & 4 != 0) try @import("k1b_check.zig").run(d, kk.decode, k1b, name);
+                d.k.attn_k1 = k1b;
+            }
             d.k.attn_k1_16 = kk.decode16;
             if (k1mod.k16t) { // XPU_K1_R16=2 (lane p4-kernel): the lone tree's prefix pass as one 16-row group
                 d.k.attn_k1_k16 = kk.k16;
