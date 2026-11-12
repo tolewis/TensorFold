@@ -68,6 +68,7 @@ pub const Fns = struct {
     attn_merge: cuda.Function,
     attn_gate: cuda.Function,
     mlp_act: cuda.Function,
+    mlp_act_q4: cuda.Function, // the same values as the down projection's NVFP4 rows (cuda_act4.zig)
     argmax: cuda.Function,
     argmax_slices: cuda.Function,
     argmax_merge: cuda.Function,

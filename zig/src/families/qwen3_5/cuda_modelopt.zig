@@ -363,7 +363,7 @@ pub const Kernels = struct {
 };
 
 /// `name` unset or anything but "0": on. A prompt path behind one of these can be A/B'd with a restart.
-fn envOn(comptime name: [:0]const u8) bool {
+pub fn envOn(comptime name: [:0]const u8) bool {
     const v = std.c.getenv(name) orelse return true;
     return !std.mem.eql(u8, std.mem.span(v), "0");
 }

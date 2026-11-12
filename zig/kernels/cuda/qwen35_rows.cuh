@@ -1,6 +1,8 @@
 // qwen35.cu's row-wise kernels: the tap ring's residuals and the MLP activation, eight entries a thread.
 #pragma once
 
+#include "nvfp4q.cuh"
+
 // A tapped layer's residual bf16(h + r) into the segment's tap ring at the row's position; grid (rows, D / 2048).
 extern "C" __global__ void __launch_bounds__(256) tf_q35_tap(const __nv_bfloat16* __restrict__ H, const __nv_bfloat16* __restrict__ R,
                                                               const Seg* __restrict__ segs, const int* __restrict__ rowseg, int tap, int D,
@@ -47,4 +49,38 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_mlp_act(const __nv_bflo
     __syncthreads();
     const long long first = (long long)blockIdx.x * 1024 + threadIdx.x * 64;  // the block's 16 groups, each in order
     if (threadIdx.x < 16 && first < total) XS[first / 64] = group_sum(done + threadIdx.x * 64);
+}
+
+// tf_q35_mlp_act's bf16 values quantized as ck_lane.cu's tf_ck_quant4_rows, a 16-value block a thread, for the
+// down projection's NVFP4 prompt GEMM: e2m1 codes [rows][D / 2] at CODES, e4m3 block scales [rows][D / 16] at SCALES.
+extern "C" __global__ void __launch_bounds__(128) tf_q35_mlp_act_q4(const __nv_bfloat16* __restrict__ GATE, const __nv_bfloat16* __restrict__ UP,
+                                                                     int rows, int D, float G, uint8_t* __restrict__ CODES, uint8_t* __restrict__ SCALES) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)rows * (D / 16)) return;
+    const int row = (int)(i / (D / 16)), blk = (int)(i % (D / 16));
+    const size_t at = (size_t)row * D + blk * 16;
+    float f[16];
+#pragma unroll
+    for (int h = 0; h < 2; h++) {
+        const uint4 gw = *reinterpret_cast<const uint4*>(GATE + at + 8 * h), uw = *reinterpret_cast<const uint4*>(UP + at + 8 * h);
+        const __nv_bfloat16* gb = reinterpret_cast<const __nv_bfloat16*>(&gw);
+        const __nv_bfloat16* ub = reinterpret_cast<const __nv_bfloat16*>(&uw);
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const float gf = bf(gb[j]);
+            f[8 * h + j] = bf(__float2bfloat16_rn(gf / (1.0f + expf(-gf)) * bf(ub[j])));  // tf_q35_mlp_act's value
+        }
+    }
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        const float a = fabsf(f[j]);
+        amax = (amax > a || amax != amax) ? amax : a;  // tf_ck4p::max_nan
+    }
+    const nvfp4q::Scale sc = nvfp4q::block_scale(amax, G);
+    uint32_t w[2] = {0u, 0u};
+#pragma unroll
+    for (int j = 0; j < 16; ++j) w[j / 8] |= nvfp4q::e2m1(f[j] * sc.mul) << (4 * (j % 8));
+    *reinterpret_cast<uint2*>(CODES + (size_t)row * (D / 2) + blk * 8) = make_uint2(w[0], w[1]);
+    SCALES[(size_t)row * (D / 16) + blk] = static_cast<uint8_t>(sc.sf8);
 }

@@ -3,6 +3,7 @@ const E = @import("cuda_engine.zig");
 const cuda = @import("cuda");
 const sig = @import("cuda_signatures.zig");
 const hooks = @import("cuda_learn_hooks.zig");
+const act4 = @import("cuda_act4.zig");
 const geometry = @import("cuda_geometry.zig");
 const head_dim = geometry.head_dim;
 const max_chunks = 64;
@@ -127,10 +128,14 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     try e.projAgain(m.up, x0, e.up, rows, prompt);
                 }
                 if (e.learning) |k| try k.mlp(i, e.gate, e.up, total);
-                const n: c_longlong = @intCast(rows * g.intermediate);
-                const act_args = .{ e.gate, e.up, e.act, n, rp, @as(c_int, @intCast(g.intermediate)), sums };
-                try e.run(e.fns.mlp_act, .{ (rows * g.intermediate + 1023) / 1024, 1, 1 }, .{ 256, 1, 1 }, act_args);
-                try e.projAgain(m.down, e.act, r0, rows, prompt);
+                // prompt rows: the activation and the down projection's NVFP4 rows in one kernel (cuda_act4.zig)
+                const one = prompt and rows > 16 and sums == 0 and e.learning == null and try act4.down(e, m.down, rows, r0);
+                if (!one) {
+                    const n: c_longlong = @intCast(rows * g.intermediate);
+                    const act_args = .{ e.gate, e.up, e.act, n, rp, @as(c_int, @intCast(g.intermediate)), sums };
+                    try e.run(e.fns.mlp_act, .{ (rows * g.intermediate + 1023) / 1024, 1, 1 }, .{ 256, 1, 1 }, act_args);
+                    try e.projAgain(m.down, e.act, r0, rows, prompt);
+                }
                 if (e.mlp) |k| try k.f(k.ctx, i, e.x, e.r, total, e.taught) else try e.pockets.add(e.stream, i, e.x, e.r, total, e.taught);
             },
             .moe => |m| try e.routedRows(m.router, m.experts, x0, r0, rows, promptMoe(prompt, rows), rp),
