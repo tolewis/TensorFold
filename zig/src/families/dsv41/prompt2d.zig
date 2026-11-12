@@ -36,23 +36,72 @@ pub fn split(g: u32, world: u32) !plan.Split {
     };
 }
 
-/// The links of a run and its NCCL world: rank 0 listens on PORT + g - 1 for follower g, one follower at a time (each
-/// follower retries its connect while rank 0 gets to it), so two ranks link exactly as before (rank 1 on PORT).
-/// NCCL's unique id goes from rank 0 down every link. (The port's link to N followers replaces this.)
+/// How long a follower retries its connect to rank 0, in seconds: TF_DS_CONNECT_S, else 300. With rank 0's ports open
+/// before its weights load (`Fan.bind`) a follower that is ready first waits in its port's backlog, so this only
+/// covers rank 0's own start up to that point.
+pub fn connectSeconds() !u32 {
+    return parseConnectSeconds(if (std.c.getenv("TF_DS_CONNECT_S")) |v| std.mem.span(v) else null);
+}
+
+fn parseConnectSeconds(v: ?[]const u8) !u32 {
+    const text = v orelse return 300;
+    const n = std.fmt.parseInt(u32, text, 10) catch return error.BadConnectSeconds;
+    return if (n == 0 or n > 86400) error.BadConnectSeconds else n;
+}
+
+/// The links of a run and its NCCL world: rank 0 listens on PORT + g - 1 for follower g, so two ranks link exactly as
+/// before (rank 1 on PORT). Rank 0's ports are opened first (`bind`, before its weights load) and its followers'
+/// connections taken afterwards (`openBound`): a follower that loaded its weights earlier waits in its port's backlog
+/// instead of giving up after its retry window (a worker that loaded more than 300 s before the head exited with
+/// ConnectFailed). NCCL's unique id goes from rank 0 down every link. (The port's link to N followers replaces this.)
 pub const Fan = struct {
     links: [3]?Link = .{ null, null, null },
 
-    pub fn open(io: std.Io, ip: [4]u8, port: u16, rank: u32, world: u32) !Fan {
+    /// Rank 0's open ports, one for each follower; nothing on a follower.
+    pub const Bound = struct {
+        ls: [3]?Link.Listener = .{ null, null, null },
+
+        pub fn close(b: *Bound) void {
+            for (&b.ls) |*l| {
+                if (l.*) |*x| x.close();
+                l.* = null;
+            }
+        }
+    };
+
+    pub fn bind(ip: [4]u8, port: u16, rank: u32, world: u32) !Bound {
+        var b: Bound = .{};
+        errdefer b.close();
+        if (world > 4) return error.UnsupportedWorld;
+        if (world < 2 or rank != 0) return b;
+        _ = try connectSeconds(); // a bad TF_DS_CONNECT_S refuses on rank 0 too, not only on the follower that would read it
+        for (1..world) |g| b.ls[g - 1] = try Link.Listener.bind(ip, port + @as(u16, @intCast(g - 1)));
+        return b;
+    }
+
+    /// Rank 0 takes each follower's connection from its open port (waiting for those not there yet); a follower
+    /// connects, retrying for connectSeconds().
+    pub fn openBound(io: std.Io, b: *Bound, ip: [4]u8, port: u16, rank: u32, world: u32) !Fan {
         var f: Fan = .{};
         errdefer f.close();
         if (world > 4) return error.UnsupportedWorld;
         if (world < 2) return f;
         if (rank == 0) {
-            for (1..world) |g| f.links[g - 1] = try Link.listen(ip, port + @as(u16, @intCast(g - 1)));
+            for (1..world) |g| {
+                var l = b.ls[g - 1] orelse return error.NotBound;
+                f.links[g - 1] = try l.accept();
+                b.ls[g - 1] = null;
+            }
         } else {
-            f.links[0] = try Link.connect(io, ip, port + @as(u16, @intCast(rank - 1)), 300);
+            f.links[0] = try Link.connect(io, ip, port + @as(u16, @intCast(rank - 1)), try connectSeconds());
         }
         return f;
+    }
+
+    pub fn open(io: std.Io, ip: [4]u8, port: u16, rank: u32, world: u32) !Fan {
+        var b = try bind(ip, port, rank, world);
+        defer b.close();
+        return openBound(io, &b, ip, port, rank, world);
     }
 
     pub fn close(f: *Fan) void {
@@ -253,4 +302,40 @@ test "a node's split: TP over two, the 2D split over four" {
     try std.testing.expectEqual(plan.Split{ .rank = 0, .world = 2, .pair = 1 }, try split(2, 4));
     try std.testing.expectEqual(plan.Split{ .rank = 1, .world = 2, .pair = 1 }, try split(3, 4));
     try std.testing.expectError(error.UnsupportedWorld, split(0, 3));
+}
+
+test "a follower that connects before rank 0 takes its port is linked once rank 0 does, and NCCL's id can cross" {
+    const io = std.testing.io;
+    const port: u16 = 27600 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 90)));
+    const ip: [4]u8 = .{ 127, 0, 0, 1 };
+    var ports = try Fan.bind(ip, port, 0, 2); // rank 0 opens its port first (before its weights load)
+    defer ports.close();
+    const Follower = struct {
+        fn run(p: u16, got: *[5]u8) void {
+            var f = Fan.open(std.testing.io, .{ 127, 0, 0, 1 }, p, 1, 2) catch return;
+            defer f.close();
+            var buf: [16]u8 = undefined;
+            const r = f.links[0].?.recv(&buf) catch return;
+            if (r.len == got.len) @memcpy(got, r);
+        }
+    };
+    var got: [5]u8 = undefined;
+    @memset(&got, 0);
+    const t = try std.Thread.spawn(.{}, Follower.run, .{ port, &got });
+    // rank 0 is slow: the follower is already connected (waiting in the backlog) when it takes the port
+    std.Io.sleep(io, .fromMilliseconds(300), .awake) catch {};
+    var f = try Fan.openBound(io, &ports, ip, port, 0, 2);
+    defer f.close();
+    try f.links[0].?.send("id-ok");
+    t.join();
+    try std.testing.expectEqualStrings("id-ok", &got);
+    try std.testing.expect(ports.ls[0] == null); // taken: the port is closed
+}
+
+test "TF_DS_CONNECT_S: unset is 300 s, a count of seconds up to a day, anything else is refused" {
+    try std.testing.expectEqual(@as(u32, 300), try parseConnectSeconds(null));
+    try std.testing.expectEqual(@as(u32, 900), try parseConnectSeconds("900"));
+    try std.testing.expectEqual(@as(u32, 86400), try parseConnectSeconds("86400"));
+    for ([_][]const u8{ "", "0", "-5", "abc", "12s", "86401" }) |bad|
+        try std.testing.expectError(error.BadConnectSeconds, parseConnectSeconds(bad));
 }

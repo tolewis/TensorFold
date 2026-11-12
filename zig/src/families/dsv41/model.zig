@@ -218,6 +218,12 @@ pub const Model = struct {
         m.stream = try cuda.Stream.init(d, true);
         errdefer m.stream.deinit();
 
+        // rank 0's ports for the followers first: a worker that loads its weights sooner waits in its port's backlog
+        // (before this, rank 0 listened only after its own weights had loaded, and a worker that was ready more
+        // than TF_DS_CONNECT_S earlier exited with ConnectFailed)
+        var ports = try prompt2d.Fan.bind(o.master, o.port, o.rank, o.world);
+        defer ports.close();
+
         // the weights (and the DSpark blocks) from the lane's rank cache
         m.cache_dir = try std.Io.Dir.cwd().openDir(io, o.cache_dir, .{ .iterate = true });
         errdefer m.cache_dir.close(io);
@@ -231,8 +237,8 @@ pub const Model = struct {
         errdefer m.w.deinit();
         if (o.drafts and m.w.dspark == null) return error.NoDrafter;
 
-        // the ranks' link and NCCL (rank 0 listens: rank 1 retries its connect while rank 0 loads)
-        m.fan = try prompt2d.Fan.open(io, o.master, o.port, o.rank, o.world);
+        // the ranks' link and NCCL (rank 0 takes the connections its ports have waiting; rank 1 connects)
+        m.fan = try prompt2d.Fan.openBound(io, &ports, o.master, o.port, o.rank, o.world);
         errdefer m.fan.close();
         m.comm = try m.fan.comm(o.rank, o.world);
         errdefer m.comm.deinit();

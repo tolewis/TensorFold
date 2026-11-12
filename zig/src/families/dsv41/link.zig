@@ -34,18 +34,9 @@ pub const Link = struct {
 
     /// Rank 0: listen on `ip`:`port` and take the one peer's connection.
     pub fn listen(ip: [4]u8, port: u16) !Link {
-        const fd = try socket();
-        errdefer _ = c.close(fd);
-        const one: c_int = 1;
-        _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.REUSEADDR, std.mem.asBytes(&one), @sizeOf(c_int));
-        var a = addr(ip, port);
-        if (c.bind(fd, @ptrCast(&a), @sizeOf(c.sockaddr.in)) != 0) return error.BindFailed;
-        if (c.listen(fd, 1) != 0) return error.ListenFailed;
-        const peer = c.accept(fd, null, null);
-        if (peer < 0) return error.AcceptFailed;
-        _ = c.close(fd);
-        tune(peer);
-        return .{ .fd = peer };
+        var l = try Listener.bind(ip, port);
+        errdefer l.close();
+        return l.accept();
     }
 
     /// Rank 1: connect to rank 0, retrying for up to `seconds` while it starts.
@@ -65,6 +56,38 @@ pub const Link = struct {
         _ = c.close(l.fd);
         l.* = undefined;
     }
+
+    /// A port rank 0 listens on for one peer, before it takes the connection: a peer that connects in the meantime
+    /// is completed by the kernel (backlog 1) and waits there until `accept`, so rank 0 can open its ports first
+    /// (before it loads its weights) and take the connections afterwards.
+    pub const Listener = struct {
+        fd: c.fd_t,
+
+        pub fn bind(ip: [4]u8, port: u16) !Listener {
+            const fd = try socket();
+            errdefer _ = c.close(fd);
+            const one: c_int = 1;
+            _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.REUSEADDR, std.mem.asBytes(&one), @sizeOf(c_int));
+            var a = addr(ip, port);
+            if (c.bind(fd, @ptrCast(&a), @sizeOf(c.sockaddr.in)) != 0) return error.BindFailed;
+            if (c.listen(fd, 1) != 0) return error.ListenFailed;
+            return .{ .fd = fd };
+        }
+
+        /// The peer's connection (waited for if it has not come yet); the port is closed once it is taken.
+        pub fn accept(l: *Listener) !Link {
+            const peer = c.accept(l.fd, null, null);
+            if (peer < 0) return error.AcceptFailed;
+            l.close();
+            tune(peer);
+            return .{ .fd = peer };
+        }
+
+        pub fn close(l: *Listener) void {
+            if (l.fd >= 0) _ = c.close(l.fd);
+            l.fd = -1;
+        }
+    };
 
     fn writeAll(l: Link, bytes: []const u8) !void {
         var done: usize = 0;
@@ -327,6 +350,25 @@ test "frames cross a loopback link in order" {
     try std.testing.expectEqualStrings("polled", try l.recvSpin(&buf, 1000 * std.time.ns_per_ms));
     try std.testing.expectEqualStrings("late", try l.recvSpin(&buf, 0));
     t.join();
+}
+
+test "a peer that connects before rank 0 takes its port waits in the backlog, and the port closes once taken" {
+    const io = std.testing.io;
+    const port: u16 = 27700 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 90)));
+    var bound = try Link.Listener.bind(.{ 127, 0, 0, 1 }, port);
+    defer bound.close();
+    // the peer connects now, while nothing accepts: before this change rank 0 listened only after its weights had
+    // loaded, and a peer that was ready earlier gave up after its retry window
+    var peer = try Link.connect(io, .{ 127, 0, 0, 1 }, port, 1);
+    defer peer.close();
+    try peer.send("early");
+    var l = try bound.accept();
+    defer l.close();
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("early", try l.recv(&buf));
+    try std.testing.expectEqual(@as(c.fd_t, -1), bound.fd);
+    // the port is free again after the accept
+    try std.testing.expectError(error.ConnectFailed, Link.connect(io, .{ 127, 0, 0, 1 }, port, 0));
 }
 
 test "a reply that does not come in time is a timeout, a readable link says so" {
