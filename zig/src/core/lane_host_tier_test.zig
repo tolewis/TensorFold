@@ -303,6 +303,54 @@ test "restores progress between another request's prompt chunks with the interle
     try b.exact(&t2);
 }
 
+test "restores are serviced between a prompt pass's pieces (TF_FILL_CHUNKS): the service fence lets the run loop in there" {
+    // the fence's refusal is a panic in debug builds (these tests): the run loop asks for the service after each piece
+    const r = try Rig.createWith(.{ .load_ms = 5 }, struct {
+        fn pre(x: *Rig) void {
+            x.core.fill_chunks = 1; // one chunk a piece (TF_FILL_CHUNKS=1); cut_in set: every pass runs in pieces
+            x.core.cut_in = 8192;
+            x.target.prefill_chunks = 6;
+        }
+    }.pre);
+    defer r.destroy();
+    const e = r.host.engine();
+    r.tier.gate.store(false, .release);
+    _ = try r.point(&t2, 8);
+    var b: Box = .{};
+    defer b.deinit();
+    const req: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
+    try e.submit(1, &req, b.sink());
+    try r.until(struct {
+        fn ok(s: api.CacheStats) bool {
+            return s.restore_waits == 1;
+        }
+    }.ok);
+    const Watch = struct {
+        tier: *ft.FakeTier,
+        seen: [6]u64 = @splat(0),
+        fn call(ctx: *anyopaque, s: *lanes.Stream, chunk: usize) void {
+            const w: *@This() = @ptrCast(@alignCast(ctx));
+            if (s.prompt_len == 12 and chunk < w.seen.len) w.seen[chunk] = w.tier.polled; // (the engine thread's)
+        }
+    };
+    var watch: Watch = .{ .tier = &r.tier };
+    r.target.prefill_hook = Watch.call;
+    r.target.prefill_hook_ctx = &watch;
+    const other = [_]u32{ 8, 6, 7, 5, 3, 0, 9, 2, 1, 4, 4, 4 };
+    var o: Box = .{};
+    defer o.deinit();
+    const oreq: Request = .{ .prompt = &other, .max_tokens = 1 };
+    try e.submit(2, &oreq, o.sink());
+    try std.testing.expectEqual(Reason.length, o.wait());
+    try std.testing.expect(watch.seen[5] > watch.seen[0]); // polled while the pass ran in pieces
+    try std.testing.expectEqual(@as(u64, 0), @atomicLoad(u64, &r.host.service_refused, .monotonic)); // never refused between two pieces
+    r.tier.gate.store(true, .release);
+    try std.testing.expectEqual(Reason.length, b.wait());
+    try std.testing.expectEqual(@as(?u32, 8), b.cached);
+    try b.exact(&t2);
+    try std.testing.expectEqual(@as(u64, 0), @atomicLoad(u64, &r.host.service_refused, .monotonic));
+}
+
 test "shutdown with requests parked on a restore that never ends: they are cancelled, the restore stops once, the tier flushes" {
     const r = try Rig.create(.{ .load_ms = 5 });
     defer r.destroy();

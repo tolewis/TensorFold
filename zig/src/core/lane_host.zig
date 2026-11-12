@@ -967,7 +967,7 @@ pub const LaneHost = struct {
             h.takeCancels();
             while (h.admitOne()) {}
             h.fillOne();
-            if (h.servicing()) h.service(h.tier.service_ns); // restores, staged writes and deferred retries, between rounds and at idle
+            if (h.servicing()) h.serviceLoop(); // restores, staged writes and deferred retries, between rounds and at idle
             if (h.between_err) |e| {
                 h.between_err = null;
                 h.checkFatal(e);
@@ -1218,6 +1218,21 @@ pub const LaneHost = struct {
             return h.finish(job, .failed, "out of memory");
         };
         h.unlock();
+    }
+
+    /// The run loop's service of parked work: between rounds and at idle, and between two pieces of a prompt pass
+    /// (TF_FILL_CHUNKS: `filling` is the job in pieces). A piece ends between two chunks of its pass, in the state the
+    /// pass has at Stream.between (dsv41 joins its Engram read-ahead and drops the prompt's ids at a piece's end, as
+    /// before `between`), so the service runs there as Stream.between runs it: only when work is pending, the pass's
+    /// restore reported first, the fence's way in open for it. Before, every loop while a pass waited for its next
+    /// piece asked for the service and the fence refused it (`service_refused`; a panic in debug builds).
+    fn serviceLoop(h: *LaneHost) void {
+        const job = h.filling orelse return h.service(h.tier.service_ns);
+        if (!h.pending()) return;
+        job.reported(); // (a piece ran: a restore's room may evict the entry its pass resumed)
+        h.in_between = true;
+        defer h.in_between = false;
+        h.service(h.tier.service_ns);
     }
 
     /// Parked work's service (engine thread): restores progress under one elapsed-time budget shared fairly (each gets
