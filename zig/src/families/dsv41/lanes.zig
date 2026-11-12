@@ -774,10 +774,11 @@ pub const Lanes = struct {
         return of(ptr).prefillPart(s, chunks);
     }
 
-    fn prefillPart(self: *Lanes, s: *lanes.Stream, pieces: usize) !bool {
+    fn prefillPart(self: *Lanes, s: *lanes.Stream, chunks: usize) !bool {
         const m = self.m;
-        // TF_DS_KV_SHARD binds a pass's parts and twins for the whole pass: it runs whole (no pieces, no cut-ins)
-        const chunks = if (self.kv != null) std.math.maxInt(usize) else pieces;
+        // TF_DS_KV_SHARD: a pass in pieces keeps its extent and part between them (the planner moves decoding streams
+        // only); its twins are pinned only while a chunk runs, so a placement between two pieces may give them back
+        // (the pass then fetches: Caches.twinned), and a pass a prompt cut into binds them again as it resumes
         const t0 = m.now();
         defer if (self.prof) |*p| {
             p.prefill += m.now() - t0;
@@ -859,6 +860,9 @@ pub const Lanes = struct {
             try self.flush();
         }
         try self.m.fillBegin(f.slot, l.base);
+        // TF_DS_KV_SHARD: the cut-in's fill bound its own twins' view; the paused pass's comes back as the planner holds
+        // it now (given back meanwhile: plain, as Model.fillBegin left it), on the follower at the same frame
+        if (f.part) |id| try self.kv.?.fillBegin(id, l.base);
         self.fill = f;
         self.paused = null;
     }
@@ -1875,7 +1879,9 @@ pub fn followPair(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower, fx:
                 const base = try r.int(u64);
                 if (slot >= max_streams) return error.BadSlot;
                 fill_base = @intCast(base); // the paused pass's extent, for the spill tier's bumps (not a new prompt: no bumpSlot)
-                m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
+                if (m.fillBegin(slot, @intCast(base))) {
+                    if (kvf) |k| try k.fillBegin(slot, @intCast(base)); // (its twins' view again, as rank 0 binds it at its resume)
+                } else |err| refused(err);
                 m.fill_seq = seqs[slot].items;
             },
             .fill_chunk => {
