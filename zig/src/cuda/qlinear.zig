@@ -100,6 +100,9 @@ pub const Linear = struct {
     ck: ?*const ck.Ck = null, // the checkpoint's own math: an fp8 weight with an input scale takes e4m3 rows
     ck_rows: u64 = 0, // its e4m3 rows (at least rows * k bytes), and slice partials where no cluster meets them
     ck_part: u64 = 0,
+    ck_sa: u64 = 0, // per-row activation scales [rows] f32 for the checkpoint-math prompt GEMM
+    ck8: bool = true, // the checkpoint-math prompt GEMM for FP8 weights (TF_CK8=0 turns it off)
+    ck4: bool = true, // the same for NVFP4 weights (TF_CK4=0)
     exl3: ?*exl3.Dense = null, // the EXL3 kernels and the scratch the dense calls share
     ggml: ?*const ggml.Kernels = null, // q8_0 and iq2xxs rows of both kinds
 
@@ -108,6 +111,23 @@ pub const Linear = struct {
         if (l.ck_rows == 0) return error.NoCheckpointRows;
         try c.quant8(s, in.x, if (in.ldx == 0) q.k else in.ldx, rows, q.k, q.act, l.ck_rows);
         return c.lane8(s, l.ck_rows, rows, q, q.act, out, if (l.ck_part != 0) l.ck_part else in.part);
+    }
+
+    /// A compressed-tensors FP8 weight whose checkpoint stores a scale a row: e4m3 rows under a measured
+    /// per-row activation scale, times the weight's own row scale. Prompt rows only.
+    fn checkpointRows(l: Linear, s: Stream, c: *const ck.Ck, q: qmmf.Weight, in: Rows, out: u64, rows: usize) !void {
+        if (l.ck_rows == 0 or l.ck_sa == 0) return error.NoCheckpointRows;
+        try c.quant8Rows(s, in.x, if (in.ldx == 0) q.k else in.ldx, rows, q.k, l.ck_rows, l.ck_sa);
+        return c.lane8Rs(s, l.ck_rows, rows, q, l.ck_sa, out, if (l.ck_part != 0) l.ck_part else in.part);
+    }
+
+    /// A compressed-tensors or ModelOpt NVFP4 weight with an input scale: the checkpoint's own block-scaled
+    /// FP4 mma on NVFP4 rows. Prompt rows only.
+    fn checkpoint4(l: Linear, s: Stream, c: *const ck.Ck, q: qmmf.Weight, in: Rows, out: u64, rows: usize) !void {
+        if (l.ck_rows == 0) return error.NoCheckpointRows;
+        if (q.act == 0) return error.NoInputScale;
+        try c.quant4Rows(s, in.x, if (in.ldx == 0) q.k else in.ldx, rows, q.k, q.act, l.ck_rows);
+        return c.prompt4(s, l.ck_rows, l.ck_rows + rows * q.k / 2, q, rows, out);
     }
 
     /// Decode rows: out (rows, n) bf16, each row's bits the same at every row count the format takes.
@@ -145,9 +165,21 @@ pub const Linear = struct {
                 if (in.ldx != 0 and in.ldx != q.k) return error.RowStride;
                 return a.prompt(s, in.x, q, out, rows);
             },
-            .fp8g => |q| return l.onLane(s, q, .fp8g, in, out, rows),
+            .fp8g => |q| {
+                // the checkpoint's own math when it carries a scale a row; the bf16 lane tile otherwise
+                if (l.ck8 and l.ck != null and rows >= ck.prompt_tokens and l.ck_rows != 0 and l.ck_sa != 0) {
+                    if (l.checkpointRows(s, l.ck.?, q, in, out, rows)) |_| return else |_| {}
+                }
+                return l.onLane(s, q, .fp8g, in, out, rows);
+            },
             .mxfp8 => |q| return l.onLane(s, q, .mxfp8, in, out, rows),
-            .nvfp4 => |q| return l.onPrompt(s, q, .fp4, in, out, rows),
+            .nvfp4 => |q| {
+                // the checkpoint's own math when it carries its input scale; the bf16-decoding tile otherwise
+                if (l.ck4 and q.act != 0 and l.ck != null and rows >= ck.prompt_tokens and l.ck_rows != 0) {
+                    if (l.checkpoint4(s, l.ck.?, q, in, out, rows)) |_| return else |_| {}
+                }
+                return l.onPrompt(s, q, .fp4, in, out, rows);
+            },
             .fp8 => |q| return if (q.act != 0 and l.ck != null) l.checkpoint(s, l.ck.?, q, in, out, rows) else l.onPrompt(s, q, .fp8, in, out, rows),
             .bf16 => |q| return l.onLane(s, q, .bf16, in, out, rows),
             // prompt rows always take the prompt GEMM: a row's bits must not depend on where a prompt's chunks are cut

@@ -244,6 +244,11 @@ pub const Kernels = struct {
     embed: cuda.embed_rows.EmbedRows,
     /// Slice partials where no cluster meets them (before sm_90): the most any projection takes below fused_rows.
     part: ?DeviceBuffer = null,
+    /// The checkpoint's own math for compressed-tensors FP8 weights: e4m3 rows under a per-row activation
+    /// scale, times the weight's row scale. Prompt rows only.
+    ck: ?cuda.ck.Ck = null,
+    ck_rows: ?DeviceBuffer = null, // e4m3 rows: max_rows * the widest k a row-scale weight takes
+    ck_sa: ?DeviceBuffer = null, // per-row activation scales [max_rows] f32
     experts: ?cuda.experts.Nvfp4Experts = null, // a MoE's routed experts (cuda_modelopt_experts.zig)
 
     pub fn load(d: *const cuda.Driver, capability: u32, sms: usize, moe: bool) !Kernels {
@@ -256,10 +261,16 @@ pub const Kernels = struct {
         errdefer pack.unload();
         var experts: ?cuda.experts.Nvfp4Experts = if (moe) try cuda.experts.Nvfp4Experts.load(d, sms) else null;
         errdefer if (experts) |*x| x.unload();
-        return .{ .lane = lane, .prompt = prompt, .pack = pack, .embed = try cuda.embed_rows.EmbedRows.load(d), .experts = experts };
+        var ckm: ?cuda.ck.Ck = null;
+        errdefer if (ckm) |*x| x.unload();
+        if (capability >= 89) ckm = try cuda.ck.Ck.load(d, capability / 10, sms);
+        return .{ .lane = lane, .prompt = prompt, .pack = pack, .embed = try cuda.embed_rows.EmbedRows.load(d), .experts = experts, .ck = ckm };
     }
 
     pub fn unload(k: *Kernels) void {
+        if (k.ck_rows) |*b| b.free();
+        if (k.ck_sa) |*b| b.free();
+        if (k.ck) |*x| x.unload();
         if (k.part) |*p| p.free();
         if (k.experts) |*x| x.unload();
         k.embed.unload();
@@ -269,7 +280,16 @@ pub const Kernels = struct {
     }
 
     pub fn linear(k: *const Kernels) cuda.qlinear.Linear {
-        return .{ .lane = &k.lane, .nvfp4_prompt = &k.prompt };
+        return .{
+            .ck8 = envOn("TF_CK8"),
+            .ck4 = envOn("TF_CK4"),
+            .lane = &k.lane,
+            .nvfp4_prompt = &k.prompt,
+            .ck = if (k.ck) |*c| c else null,
+            .ck_rows = if (k.ck_rows) |b| b.ptr else 0,
+            .ck_sa = if (k.ck_sa) |b| b.ptr else 0,
+            .ck_part = if (k.part) |p| p.ptr else 0,
+        };
     }
 
     /// The slice partials every projection of `e` takes below fused_rows (none with clusters).
@@ -304,15 +324,107 @@ pub const Kernels = struct {
             }
         }
         if (most > 0) k.part = try DeviceBuffer.alloc(e.d, most);
+        if (k.ck != null) {
+            var widest: usize = 0;
+            const Widest = struct {
+                fn of(p: Proj) usize {
+                    return switch (p) {
+                        .ql => |w| switch (w) {
+                            .fp8g => |q| q.k,
+                            else => 0,
+                        },
+                        else => 0,
+                    };
+                }
+            };
+            widest = Widest.of(e.head);
+            for (e.layers) |l| {
+                switch (l.mlp) {
+                    .dense => |m| for ([_]Proj{ m.gate, m.up, m.down }) |p| {
+                        widest = @max(widest, Widest.of(p));
+                    },
+                    .moe => {},
+                }
+                switch (l.mixer) {
+                    .delta => |m| for ([_]Proj{ m.qkv, m.z, m.a, m.b, m.out }) |p| {
+                        widest = @max(widest, Widest.of(p));
+                    },
+                    .attention => |m| for ([_]Proj{ m.q, m.k, m.v, m.o }) |p| {
+                        widest = @max(widest, Widest.of(p));
+                    },
+                }
+            }
+            if (widest > 0) {
+                k.ck_rows = try DeviceBuffer.alloc(e.d, engine.max_rows * widest);
+                k.ck_sa = try DeviceBuffer.alloc(e.d, engine.max_rows * 4);
+            }
+        }
     }
 };
+
+/// `name` unset or anything but "0": on. A prompt path behind one of these can be A/B'd with a restart.
+fn envOn(comptime name: [:0]const u8) bool {
+    const v = std.c.getenv(name) orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
+
+var ck_checked = false;
+
+/// The NVFP4 prompt GEMM's first call, both ways on the same rows: logs the largest difference and keeps the
+/// checkpoint-math result. A nibble-order slip reads near the full range, a scale slip a few percent.
+fn checkFp4(e: *Engine, l: cuda.qlinear.Linear, q: cuda.qmmf.Weight, in: cuda.qlinear.Rows, out: u64, rows: usize) !void {
+    const bytes = rows * q.n * 2;
+    var a = try DeviceBuffer.alloc(e.d, bytes);
+    defer a.free();
+    var b = try DeviceBuffer.alloc(e.d, bytes);
+    defer b.free();
+    var tile = l;
+    tile.ck = null; // the bf16-decoding prompt tile
+    try tile.prompt(e.stream, .{ .nvfp4 = q }, in, a.ptr, rows);
+    try l.prompt(e.stream, .{ .nvfp4 = q }, in, b.ptr, rows);
+    try e.stream.synchronize();
+    const host_a = try e.gpa.alloc(u16, rows * q.n);
+    defer e.gpa.free(host_a);
+    const host_b = try e.gpa.alloc(u16, rows * q.n);
+    defer e.gpa.free(host_b);
+    try a.download(0, std.mem.sliceAsBytes(host_a));
+    try b.download(0, std.mem.sliceAsBytes(host_b));
+    var diff: f32 = 0;
+    var most: f32 = 0;
+    var aa: f64 = 0; // sum a^2, sum (a - b)^2 and sum a * b: the relative L2 error and the cosine
+    var dd: f64 = 0;
+    var ab: f64 = 0;
+    var bb: f64 = 0;
+    for (host_a, host_b) |ua, ub| {
+        const va: f32 = @bitCast(@as(u32, ua) << 16);
+        const vb: f32 = @bitCast(@as(u32, ub) << 16);
+        diff = @max(diff, @abs(va - vb));
+        most = @max(most, @abs(va));
+        aa += @as(f64, va) * va;
+        dd += @as(f64, va - vb) * (va - vb);
+        ab += @as(f64, va) * vb;
+        bb += @as(f64, vb) * vb;
+    }
+    const rel_l2 = if (aa > 0) @sqrt(dd / aa) else 0;
+    const cos = if (aa > 0 and bb > 0) ab / @sqrt(aa * bb) else 0;
+    std.log.info("qwen3_5: NVFP4 prompt GEMM n={d} k={d} rows={d}: largest |diff| {e:.3} against a max |value| {e:.3}; rel_l2 {e:.3} cosine {d:.4}", .{ q.n, q.k, rows, diff, most, rel_l2, cos });
+    try e.d.check(e.d.api.cuMemcpyDtoD_v2(out, b.ptr, bytes), "cuMemcpyDtoD");
+}
 
 /// out (rows, n) = x (rows, k): prompt chunks past 16 rows on prompt16, else the lane (a row's bits at any count).
 pub fn project(e: *Engine, w: Weight, x: u64, out: u64, rows: usize, prompt: bool) !void {
     const k = if (e.mo) |*m| m else return error.FormatNotLoaded;
     const l = k.linear();
     const in: cuda.qlinear.Rows = .{ .x = x, .part = if (k.part) |p| p.ptr else 0 };
-    if (prompt and rows > 16) return l.prompt(e.stream, w, in, out, rows);
+    if (prompt and rows > 16) {
+        // once, on the first prompt rows: the checkpoint-math NVFP4 GEMM against the bf16 tile that decodes the
+        // same words, so a layout slip shows as a relative error rather than as junk tokens (TF_CK4_CHECK=0: off)
+        if (!ck_checked and envOn("TF_CK4_CHECK") and w == .nvfp4 and l.ck4 and l.ck != null and rows >= cuda.ck.prompt_tokens) {
+            ck_checked = true;
+            try checkFp4(e, l, w.nvfp4, in, out, @min(rows, 256)); // the chunk's first rows: the kernels mask the rest
+        }
+        return l.prompt(e.stream, w, in, out, rows);
+    }
     if (rows >= cuda.qmmf.fused_rows) return error.WindowTooWide; // the fused tile sums its slices in another order
     return l.decode(e.stream, w, in, out, rows);
 }
@@ -374,7 +486,16 @@ pub fn linear(e: *Engine, ck: *core.Checkpoint, stage: *DeviceBuffer, pre: []con
             const words = try e.alloc(padded(n) * k / 2);
             const tiles = try e.alloc(padded(n) * k / 16);
             try p.fp4Lane(e.stream, stage.ptr, stage.ptr + codes.bytes.len, words, tiles, n, k);
-            break :blk .{ .nvfp4 = cuda.nvfp4.weight(words, tiles, global, n, k) };
+            // the input scale the checkpoint quantizes activations with, for the checkpoint-math prompt GEMM
+            const ig = if (ck.has(try tname(&buf, pre, name, "input_global_scale")))
+                try scalar(ck, try tname(&buf, pre, name, "input_global_scale"))
+            else
+                0;
+            // `act` is 1 / the input scale: the quantizer multiplies by its inverse (the full e4m3 range for a
+            // block's scale), and the epilogue by `act` itself, so the two global scales cancel exactly.
+            var q = cuda.nvfp4.weight(words, tiles, global, n, k);
+            q.act = if (ig != 0) 1.0 / ig else 0;
+            break :blk .{ .nvfp4 = q };
         },
         .affine => unreachable,
     };

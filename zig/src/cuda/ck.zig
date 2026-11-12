@@ -57,6 +57,10 @@ pub const Ck = struct {
     lane_mod: Module,
     experts_mod: Module,
     lane: [10]Function, // row tiles 16, 32, 64, 64 skipping, 128 skipping (128 x 128 clustered); plain then clustered
+    lane_r: [2]Function, // the 128-row prompt tile with the checkpoint's own per-row scales: plain, clustered
+    quant8_rows_fn: Function, // per-row activation scale, then e4m3 rows
+    quant4_rows_fn: Function, // NVFP4 rows under the checkpoint's input scale: codes then block scales
+    prompt4_fn: Function, // the NVFP4 prompt GEMM (block-scaled FP4 mma)
     reduce: Function,
     quant8_fn: Function,
     quant4_fn: Function,
@@ -82,6 +86,11 @@ pub const Ck = struct {
         for (c.lane[8..]) |f| try f.allowDynamicShared(65536);
         c.reduce = try lane_mod.function("tf_ck8_reduce");
         c.quant8_fn = try lane_mod.function("tf_ck_quant8");
+        c.quant8_rows_fn = try lane_mod.function("tf_ck_quant8_rows");
+        c.quant4_rows_fn = try lane_mod.function("tf_ck_quant4_rows");
+        c.prompt4_fn = try lane_mod.function("tf_ck4_prompt");
+        for ([_][:0]const u8{ "tf_ck8_128r", "tf_ck8_128rc" }, &c.lane_r) |name, *f| f.* = try lane_mod.function(name);
+        try c.lane_r[1].allowDynamicShared(65536);
         c.quant4_fn = try experts_mod.function("tf_ck_quant4");
         c.pack4_fn = try experts_mod.function("tf_ck_pack4");
         c.pack4_scales_fn = try experts_mod.function("tf_ck_pack4_scales");
@@ -117,6 +126,82 @@ pub const Ck = struct {
         a.add(inverse(act));
         a.add(out);
         try go(c.quant8_fn, s, .{ (m * (k / 16) + 127) / 128, 1, 1 }, 128, 0, &a);
+    }
+
+    /// bf16 rows [m, k] to e4m3 rows under a per-row scale `sa` [m] (amax / 448), in the FP8 fragment order.
+    pub fn quant8Rows(c: *const Ck, s: Stream, x: u64, ldx: usize, m: usize, k: usize, out: u64, sa: u64) !void {
+        var a: launch_.Args = .{};
+        a.add(x);
+        a.add(@as(i32, @intCast(ldx)));
+        a.add(@as(i32, @intCast(m)));
+        a.add(@as(i32, @intCast(k)));
+        a.add(out);
+        a.add(sa);
+        try go(c.quant8_rows_fn, s, .{ m, 1, 1 }, 128, 0, &a);
+    }
+
+    /// bf16 rows [m, k] to NVFP4 under the input scale `act`: e2m1 codes [m][k/2] at `out`, e4m3 block scales
+    /// [m][k/16] right after them (tf_ck_quant4's bits, so a row's codes are the decode kernels').
+    pub fn quant4Rows(c: *const Ck, s: Stream, x: u64, ldx: usize, m: usize, k: usize, act: f32, out: u64) !void {
+        var a: launch_.Args = .{};
+        a.add(x);
+        a.add(@as(i32, @intCast(ldx)));
+        a.add(@as(i32, @intCast(m)));
+        a.add(@as(i32, @intCast(k)));
+        a.add(inverse(act));
+        a.add(out);
+        a.add(out + m * k / 2);
+        try go(c.quant4_rows_fn, s, .{ (m * (k / 16) + 127) / 128, 1, 1 }, 128, 0, &a);
+    }
+
+    /// The checkpoint's NVFP4 prompt GEMM: `codes` (m, k/2) and their scales at `xs` times the packed weight,
+    /// times the two global scales, bf16 out (m, n). A row's bits take the same steps as the decode kernels'.
+    pub fn prompt4(c: *const Ck, s: Stream, codes: u64, xs: u64, w: qmmf.Weight, m: usize, y: u64) !void {
+        if (w.mode != .fp4) return error.FormatMismatch;
+        if (m < prompt_tokens) return error.NeedsPromptRows;
+        const group = @max(1, @min((m + 127) / 128, (12 << 20) / (128 * w.k)));
+        var a: launch_.Args = .{};
+        a.add(codes);
+        a.add(xs);
+        a.add(w.codes);
+        a.add(w.scales);
+        a.add(alpha(w.act, w.scale));
+        a.add(y);
+        for ([_]usize{ m, w.n, w.k, w.npad, group }) |v| a.add(@as(i32, @intCast(v)));
+        try launch_.launch(c.prompt4_fn, .{
+            .grid = .{ .x = @intCast(((m + 127) / 128) * ((w.n + 127) / 128)), .y = 1, .z = 1 },
+            .block = .{ .x = 256, .y = 1, .z = 1 },
+        }, s, &a);
+    }
+
+    /// A checkpoint's own scales on the 128-row prompt tile: `sa[row]` the activation's, the weight's from its
+    /// FP8 tile table, alpha 1. Falls back to the bf16 lane when no cluster meets its K slices.
+    pub fn lane8Rs(c: *const Ck, s: Stream, x8: u64, m: usize, w: qmmf.Weight, sa: u64, y: u64, part: u64) !void {
+        if (w.mode != .fp8g) return error.FormatMismatch;
+        if (m < prompt_tokens) return error.NeedsPromptRows;
+        const sk = qmmf.splitK(w.n, w.k);
+        const cluster = sk > 1 and sk <= 8 and c.clusters;
+        if (sk > 1 and !cluster) return error.NeedsPartials;
+        const bn: usize = if (cluster) 128 else 64;
+        const stage = (128 * 64 + bn * 64 + 127) / 128 * 128;
+        const smem: u32 = @intCast(@max(4 * stage, if (cluster) 128 * bn * 4 else 0));
+        const rows_t = (m + 127) / 128;
+        const group = @max(1, @min(rows_t, (12 << 20) / (128 * w.k)));
+        var a: launch_.Args = .{};
+        a.add(x8);
+        a.add(w.codes);
+        a.add(@as(f32, 1.0));
+        a.add(y);
+        a.add(part);
+        for ([_]usize{ m, w.n, w.k, sk, group }) |v| a.add(@as(i32, @intCast(v)));
+        a.add(sa);
+        a.add(w.scales);
+        try launch_.launch(c.lane_r[@intFromBool(cluster)], .{
+            .grid = .{ .x = @intCast(rows_t * ((w.n + bn - 1) / bn)), .y = 1, .z = sk },
+            .block = .{ .x = 256, .y = 1, .z = 1 },
+            .shared = smem,
+            .cluster = if (cluster) .{ .x = 1, .y = 1, .z = sk } else null,
+        }, s, &a);
     }
 
     /// e4m3 rows [m, k] at `x8` times the `.fp8` weight `w` under input scale `act`, bf16 at `y` [m, n].
