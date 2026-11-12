@@ -35,6 +35,16 @@ pub const CallGate = struct {
     names: []const []const u8 = &.{},
     think_open: ?u32 = null,
     think_end: ?u32 = null,
+    /// Token text the decode loop uses to finish a named call.
+    lex: CallLex,
+};
+
+/// Same signatures as lanes/call_gate.zig Lex.
+pub const CallLex = struct {
+    ctx: *anyopaque,
+    blank: *const fn (ctx: *anyopaque, token: u32) bool,
+    text: *const fn (ctx: *anyopaque, a: Allocator, token: u32) anyerror![]const u8,
+    encode: *const fn (ctx: *anyopaque, a: Allocator, text: []const u8) anyerror![]const u32,
 };
 
 /// response_format and the guided_* fields: every token keeps the reply inside this grammar.

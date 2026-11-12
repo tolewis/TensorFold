@@ -150,11 +150,14 @@ pub const Engine = struct {
         const position: u64 = s.prompt_len;
         const drawn = try e.backend.first(s, position);
         var feed: Feed = .{ .handle = drawn };
-        if (try e.forcedNext(s)) |t| feed = .{ .value = t };
+        const forced = try e.forcedNext(s);
+        if (forced) |t| feed = .{ .value = t };
+        // tool_choice required: a drawn first token passes the gate; a forced one is committed as it is
+        if (s.gate != null and forced == null) feed = .{ .value = try e.correctCall(s, try e.readFeed(feed)) };
         var asked: ?u32 = null;
         if (e.cfg.family_mtp and s.drafts) {
             // the head reads the prompt's last row and the first token, and drafts the one after it
-            const d: u32 = @intCast(try e.rule.depth(win.who(s)));
+            const d: u32 = if (s.gate != null and s.force.items.len > 0) 0 else @intCast(try e.rule.depth(win.who(s)));
             asked = d;
             try e.backend.draft(&.{.{ .stream = s, .follow = &.{}, .first = feed, .rows = null, .start = s.prompt_len, .position = position + 1, .depth = d }});
             s.dropHeld(e.gpa);
@@ -441,9 +444,20 @@ pub const Engine = struct {
         }
         const budget_cut = s.thinkCut(committed.items);
         const loop_cut = sm.loopCut(s, committed.items);
-        const loop_wins = if (loop_cut) |c| budget_cut == null or c < budget_cut.? else false;
+        const call_cut = if (s.gate) |*g| try g.cut(a, committed.items) else null;
+        const loop_at = if (loop_cut) |c| c else std.math.maxInt(usize);
+        const budget_at = if (budget_cut) |c| c else std.math.maxInt(usize);
+        const call_at = if (call_cut) |c| c.at else std.math.maxInt(usize);
         var cut: ?usize = null;
-        if (loop_wins) {
+        if (call_at <= loop_at and call_at < budget_at and call_cut != null) {
+            const hit = call_cut.?;
+            cut = hit.at;
+            path = path[0 .. hit.at + 1];
+            committed.shrinkRetainingCapacity(hit.at);
+            try committed.append(a, hit.fix[0]);
+            s.force.clearRetainingCapacity();
+            if (hit.fix.len > 1) try s.force.appendSlice(e.gpa, hit.fix[1..]);
+        } else if (loop_at < budget_at and loop_cut != null) {
             cut = loop_cut;
             path = path[0 .. loop_cut.? + 1];
             committed.shrinkRetainingCapacity(loop_cut.? + 1);
@@ -582,9 +596,14 @@ pub const Engine = struct {
         }
         var current: Feed = .{ .handle = s.inflight.? };
         s.inflight = null;
-        if (try e.forcedNext(s)) |t| current = .{ .value = t };
+        const forced = try e.forcedNext(s);
+        if (forced) |t| current = .{ .value = t };
         var token: u32 = undefined;
-        if (mode == .drain) {
+        if (s.gate != null) {
+            token = try e.readFeed(current);
+            if (forced == null) token = try e.correctCall(s, token);
+            if (mode == .drain) s.mode = .verify else try e.queueNext(s, .{ .value = token });
+        } else if (mode == .drain) {
             token = try e.readFeed(current); // the last queued step: no new one
             s.mode = .verify;
         } else {
@@ -605,8 +624,10 @@ pub const Engine = struct {
     fn landInflight(e: *Engine, s: *Stream) !void {
         var current: Feed = .{ .handle = s.inflight.? };
         s.inflight = null;
-        if (try e.forcedNext(s)) |t| current = .{ .value = t };
-        const token = try e.readFeed(current);
+        const forced = try e.forcedNext(s);
+        if (forced) |t| current = .{ .value = t };
+        var token = try e.readFeed(current);
+        if (forced == null) token = try e.correctCall(s, token);
         s.rounds += 1;
         const landed = try s.commit(e.gpa, &.{token});
         s.pending = token;
@@ -623,6 +644,16 @@ pub const Engine = struct {
             const i = try log.add(&.{ f("ev", str("queue")), f("stream", str(s.id)), f("position", int(s.cache_len)), f("token", .null) });
             try e.unread.append(e.gpa, .{ .event = i, .handle = h });
         }
+    }
+
+    /// A sampled token that breaks a required tool call becomes the fix's first token; the rest are forced.
+    fn correctCall(e: *Engine, s: *Stream, token: u32) !u32 {
+        const g = &(s.gate orelse return token);
+        const hit = (try g.cut(e.arena.allocator(), &.{token})) orelse return token;
+        if (hit.at != 0 or hit.fix.len == 0) return token;
+        s.force.clearRetainingCapacity();
+        if (hit.fix.len > 1) try s.force.appendSlice(e.gpa, hit.fix[1..]);
+        return hit.fix[0];
     }
 
     /// The thinking budget's or a forced fix's token at the next position instead of the draw.

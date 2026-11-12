@@ -159,7 +159,7 @@ pub const Server = struct {
         const required = if (f.get("tool_call_required")) |r| r.truthy() else false;
         if (has_tools and required) {
             const form = try srv.callForm(cx);
-            const opener = if (form) |fm| srv.text.tokenId(fm.opener) else null;
+            const opener = if (form) |fm| oneToken(srv, cx.a, fm.opener) else null;
             if (opener == null) return cx.refuse("tool_choice \"required\" or a named function needs a chat template that marks tool calls (<tool_call> or <|tool_call>), and this one does not: send \"auto\"");
             if (!srv.info.call_gates) return cx.refuse("tool_choice \"required\" or a named function is not supported by this engine yet: send \"auto\"");
             var names: std.ArrayList([]const u8) = .empty;
@@ -171,12 +171,46 @@ pub const Server = struct {
                 };
                 break :blk if (ids.len > 0) ids[0] else null;
             } else srv.text.tokenId("<think>");
-            request.call = .{ .opener = opener.?, .lead = form.?.lead orelse "", .tail = form.?.tail orelse "", .names = names.items, .think_open = think_open, .think_end = srv.text.tokenId(srv.markers.close) };
+            request.call = .{
+                .opener = opener.?,
+                .lead = form.?.lead orelse "",
+                .tail = form.?.tail orelse "",
+                .names = names.items,
+                .think_open = think_open,
+                .think_end = srv.text.tokenId(srv.markers.close),
+                .lex = .{ .ctx = srv, .blank = callBlank, .text = callText, .encode = callEncode },
+            };
         }
         if (try grammar.spec(cx, f)) |s| {
             if (!srv.info.structures) return cx.refuse("structured output (response_format and the guided_* fields) is not supported by this engine yet");
             request.structure = .{ .kind = s.kind, .text = s.text, .after = if (thinking) srv.text.tokenId(srv.markers.close) else null };
         }
+    }
+
+    /// A special token, or any piece that encodes as exactly one id.
+    fn oneToken(srv: *Server, a: std.mem.Allocator, piece: []const u8) ?u32 {
+        if (srv.text.tokenId(piece)) |id| return id;
+        const ids = srv.text.encode(a, piece, false) catch return null;
+        return if (ids.len == 1) ids[0] else null;
+    }
+
+    fn callBlank(ctx: *anyopaque, token: u32) bool {
+        const srv: *Server = @ptrCast(@alignCast(ctx));
+        for (srv.text.eosIds()) |e| if (e == token) return false;
+        var buf: [256]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&buf);
+        const text = srv.text.decode(fba.allocator(), &.{token}) catch return false;
+        return std.mem.trim(u8, text, " \t\r\n").len == 0;
+    }
+
+    fn callText(ctx: *anyopaque, a: std.mem.Allocator, token: u32) anyerror![]const u8 {
+        const srv: *Server = @ptrCast(@alignCast(ctx));
+        return srv.text.decode(a, &.{token});
+    }
+
+    fn callEncode(ctx: *anyopaque, a: std.mem.Allocator, text: []const u8) anyerror![]const u32 {
+        const srv: *Server = @ptrCast(@alignCast(ctx));
+        return srv.text.encode(a, text, false);
     }
 
     const Form = struct { opener: []const u8, lead: ?[]const u8, tail: ?[]const u8 };
@@ -196,8 +230,15 @@ pub const Server = struct {
                 }
             };
             if (best) |s| {
+                // The markup opener is often several tokens (<, ｜DSML｜, " calls"). The gate's first token is the
+                // first of that span; the rest, up to the name, is the lead it forces.
+                const span = text[s..at];
+                const ids = srv.text.encode(cx.a, span, false) catch return null;
+                if (ids.len == 0) return null;
+                const piece = srv.text.decode(cx.a, ids[0..1]) catch return null;
+                if (piece.len == 0 or !std.mem.startsWith(u8, span, piece)) return null;
                 const end = at + "tfprobe_fn".len;
-                return .{ .opener = opener, .lead = text[s + opener.len .. at], .tail = if (end < text.len) text[end .. end + 1] else "" };
+                return .{ .opener = piece, .lead = span[piece.len..], .tail = if (end < text.len) text[end .. end + 1] else "" };
             }
         }
         for (reply_text.calls) |c| if (srv.text.tokenId(c[0]) != null) return .{ .opener = c[0], .lead = null, .tail = null };

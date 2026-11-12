@@ -1,6 +1,7 @@
 //! One stream (Python LaneStream) and the round loop's state for it (Python's dicts keyed by stream id).
 const std = @import("std");
 const shape = @import("shape.zig");
+const call_gate = @import("call_gate.zig");
 const plan_lanes = @import("plan_lanes.zig");
 const Allocator = std.mem.Allocator;
 const Proposer = @import("proposer.zig").Proposer;
@@ -136,6 +137,16 @@ pub const Spec = struct {
     chunks: []const u32 = &.{}, // where prefill chunks start after 0 (Python's PrefillPlan); empty: the backend's step
     reuse: Reuse = .{},
     images: []const Image = &.{}, // in prompt order; the caller's until the stream is released
+    /// tool_choice required: the answer must open a call (null: the model may answer in text).
+    call: ?struct {
+        opener: u32,
+        think_open: i64 = -1,
+        think_end: i64 = -1,
+        lead: []const u8 = "",
+        names: []const []const u8 = &.{},
+        tail: []const u8 = "",
+        lex: call_gate.Lex,
+    } = null,
 };
 
 pub const Stream = struct {
@@ -190,6 +201,7 @@ pub const Stream = struct {
     served: ?u64 = null,
     granted: ?u32 = null,
     copy_width: ?u32 = null,
+    gate: ?call_gate.Gate = null,
 
     pub fn init(gpa: Allocator, spec: Spec) !Stream {
         var s: Stream = .{
@@ -211,11 +223,15 @@ pub const Stream = struct {
             .reuse = spec.reuse,
             .images = spec.images,
         };
+        if (spec.call) |c| {
+            s.gate = call_gate.Gate.afterPrompt(spec.prompt, c.opener, c.think_open, c.think_end, c.lex, c.lead, c.names, c.tail);
+        }
         try s.context.appendSlice(gpa, spec.prompt);
         return s;
     }
 
     pub fn deinit(s: *Stream, gpa: Allocator) void {
+        if (s.gate) |*g| g.deinit(gpa);
         s.context.deinit(gpa);
         s.force.deinit(gpa);
         s.dropRoundState(gpa);
@@ -307,6 +323,7 @@ pub const Stream = struct {
             if (s.finished) break;
             try s.context.append(gpa, t);
             landed += 1;
+            if (s.gate) |*g| g.observe(gpa, t) catch return error.OutOfMemory;
             if (@as(i64, t) == s.think_end) s.think_open = false;
             const fire = if (s.loop_guard and s.think_open and s.think_end >= 0 and s.loop_period == null) detectLoop(s.emitted()) else null;
             if (s.isEos(t) or s.stopped()) {
