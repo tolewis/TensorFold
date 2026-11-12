@@ -4,13 +4,18 @@ One Intel Arc Pro B70. TensorFold XPU TP 1. Qwen3.8-27B MLX 4-bit.
 
 ## Build
 
-From `lane/fleet-unified` on a Xeon 654 host or cross compile:
+From `lane/fleet-unified` on jubiku itself (Xeon 654 host or cross):
 
 ```
-zig build native -Dtp=1 -Dcpu=skylake_avx512 -Dversion=1.0.0
+zig build xpu-native -Dtp=1 -Doptimize=ReleaseFast -Dcpu=skylake_avx512 \
+  -Dngen-include=$HOME/b70/build/oneDNN/third_party/ngen -p <out>
 ```
 
-On jubiku use `nice -n 19` before the compile. Install the binary as `tensorfold-native-<sha>-fleet-unified-tp1-skx`.
+On jubiku use `nice -n 19` before the compile. Install the binary as `tensorfold-native-<sha>-fleet-tp1-skx`.
+
+Live: `tensorfold-native-ab047651-jubiku-p4-tp1-skx` (git `ab047651`, lane/jubiku-p4).
+The 2026-11-12 unify window built `c664084e3` as `tensorfold-native-c664084e-fleet-tp1-skx`
+(tag `prod/jubiku/2026-11-12`); it ran neutral to -2.5% against the live set, so the p4 binary stays.
 
 ## Serve
 
