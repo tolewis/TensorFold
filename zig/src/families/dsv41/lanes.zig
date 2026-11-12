@@ -942,12 +942,13 @@ pub const Lanes = struct {
             const image_id = m.cfg.image_token orelse return error.NoVision;
             const row_bytes = m.cfg.hidden * 2;
             var at_row: usize = 0;
+            // a resumed pass starts at the kept state's end: a picture wholly before it is already in the state (its
+            // positions stay dead in the sequence for Engram's n-grams, but it needs no rows, no run of the tower and no
+            // fill_images frame; pictureNeedsRows)
+            const resume_at: usize = if (kept) |sn| sn.at else 0;
             for (s.images) |img| {
-                if (img.tokens == 0 or @as(usize, img.at) + img.tokens > len) return error.BadImageSpan;
-                for (seq.items[img.at..][0..img.tokens]) |*q| {
-                    if (q.* != @as(i64, image_id)) return error.BadImageSpan;
-                    q.* = -1;
-                }
+                try markPicture(seq.items, img.at, img.tokens, image_id);
+                if (!pictureNeedsRows(img.at, img.tokens, resume_at)) continue;
                 if (img.rows) {
                     if (img.bytes.len != img.tokens * row_bytes) return error.BadImageRows;
                     try rows.appendSlice(gpa, img.bytes);
