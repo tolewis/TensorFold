@@ -478,6 +478,15 @@ pub const Lanes = struct {
             f.head = try m.fillChunk(seq[0 .. start + n], start, n, f.replay);
             f.start += n;
             if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
+            // the host's work between this pass's chunks (Stream.between: the prefill interleave's rounds, parked work's
+            // service): the read-ahead joined and the prompt's ids gone first, as at a piece's end and on rank 1, which
+            // reads ahead again at the next chunk
+            if (f.start < len and s.images.len == 0) if (s.between) |b| if (b.wanted(b.ptr)) {
+                m.joinAhead();
+                m.fill_seq = &.{};
+                try b.run(b.ptr);
+                m.fill_seq = seq;
+            };
         }
         if (f.start < f.len) return false;
         const done = f.*;

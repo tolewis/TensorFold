@@ -52,6 +52,14 @@ pub const LaneHost = struct {
     // Python lane's fills leave decoding its share
     finish_until: ?i96 = null,
     filling: ?*Job = null, // the job whose prompt pass runs in pieces between rounds (core.filling's)
+    // prefill interleave (TF_DS_PREFILL_INTERLEAVE_MS, 0/unset: off): between two chunks of a long prompt pass, decode
+    // rounds for the other live streams for up to this many ms, their tokens delivered, so a cold long prompt slows a
+    // chat instead of freezing it for the whole pass; the other jobs' cancels are taken there too (issue #3). The
+    // passing job itself is left alone: its own cancel stays in `cancels` for its pass to see, admissions wait.
+    // Off when TF_FILL_CHUNKS runs passes in pieces (the two are alternatives, not meant to combine).
+    interleave_ns: i96 = 0,
+    passing: ?*Job = null, // the job whose prompt pass runs inside addStream (Stream.between's caller)
+    between_err: ?anyerror = null,
 
     const Mark = struct { at: i96, tokens: u64 };
     const full_retry_ns: i96 = std.time.ns_per_s;
@@ -97,7 +105,9 @@ pub const LaneHost = struct {
     pub fn init(gpa: Allocator, io: std.Io, core: *lanes.Engine, info_: Info) LaneHost {
         var enforced = info_;
         enforced.loop_guard = true;
-        return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced };
+        var ms: i96 = 0;
+        if (std.c.getenv("TF_DS_PREFILL_INTERLEAVE_MS")) |v| ms = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0;
+        return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced, .interleave_ns = ms * std.time.ns_per_ms };
     }
 
     pub fn start(h: *LaneHost) !void {
@@ -258,9 +268,15 @@ pub const LaneHost = struct {
 
     /// Cancels queued and admitted jobs named since the last round.
     fn takeCancels(h: *LaneHost) void {
+        h.takeCancelsKeeping(null);
+    }
+
+    /// takeCancels, except a cancel of `keep` (the job in its prompt pass) stays in `cancels` for that pass to see.
+    fn takeCancelsKeeping(h: *LaneHost, keep: ?Id) void {
         h.mutex.lockUncancelable(h.io);
         const ids = h.gpa.dupe(Id, h.cancels.items) catch &.{};
         h.cancels.clearRetainingCapacity();
+        if (keep) |k| if (std.mem.indexOfScalar(Id, ids, k) != null) h.cancels.append(h.gpa, k) catch {};
         var dropped: std.ArrayList(*Job) = .empty;
         for (ids) |id| {
             for (h.queued.items, 0..) |job, i| if (job.id == id) {
@@ -272,6 +288,7 @@ pub const LaneHost = struct {
         for (dropped.items) |job| h.finish(job, .cancelled, "");
         dropped.deinit(h.gpa);
         for (ids) |id| {
+            if (keep) |k| if (id == k) continue; // its pass ends it (error.Cancelled) and admitOne finishes it
             for (h.admitted.items, 0..) |job, i| if (job.id == id) {
                 if (h.filling == job) h.filling = null;
                 if (!job.stream.finished) h.core.discard(&job.stream);
@@ -375,6 +392,9 @@ pub const LaneHost = struct {
         const began = std.Io.Clock.awake.now(h.io).toNanoseconds();
         job.began = began;
         if (h.loneFits(job)) return h.runLone(job, began);
+        if (h.interleaving() and r.images.len == 0) job.stream.between = .{ .ptr = h, .wanted = betweenWanted, .run = between };
+        h.passing = job;
+        defer h.passing = null;
         h.core.addStream(&job.stream) catch |e| {
             if (e == error.Cancelled) return h.cancel(job);
             // refused for room: while other streams run or a pass fills (this one cut in), it waits in the queue
@@ -394,6 +414,46 @@ pub const LaneHost = struct {
         }
         if (h.deliver(job)) h.remove(job);
         return true;
+    }
+
+    /// The prefill interleave is on: TF_DS_PREFILL_INTERLEAVE_MS set and passes not run in pieces (TF_FILL_CHUNKS).
+    fn interleaving(h: *const LaneHost) bool {
+        return h.interleave_ns > 0 and h.core.fill_chunks == 0;
+    }
+
+    fn betweenWanted(ptr: *anyopaque) bool {
+        const h: *LaneHost = @ptrCast(@alignCast(ptr));
+        return h.core.log == null and h.core.runnableCount() > 0;
+    }
+
+    /// Stream.between: decode rounds for the other live streams, interleave_ns at most, between two of the filling
+    /// job's prompt chunks; their tokens go out as they land. Engine thread only (inside the filling job's addStream).
+    fn between(ptr: *anyopaque) anyerror!void {
+        const h: *LaneHost = @ptrCast(@alignCast(ptr));
+        if (h.core.log != null) return; // a step resets the core's arena, which a trail's open events live in
+        const t0 = std.Io.Clock.awake.now(h.io).toNanoseconds();
+        while (true) {
+            h.takeCancelsKeeping(if (h.passing) |f| f.id else null);
+            if (h.core.runnableCount() == 0 or std.Io.Clock.awake.now(h.io).toNanoseconds() - t0 >= h.interleave_ns) break;
+            h.core.step() catch |e| {
+                h.between_err = e; // the pass fails with it; run() then fails the streams the round held
+                return e;
+            };
+            var i: usize = 0;
+            while (i < h.admitted.items.len) {
+                const job = h.admitted.items[i];
+                if (job == h.passing or job.prefilled == null) {
+                    i += 1;
+                    continue;
+                }
+                if (h.deliver(job)) {
+                    h.lock();
+                    _ = h.admitted.orderedRemove(i);
+                    h.unlock();
+                } else i += 1;
+            }
+            h.noteLive();
+        }
     }
 
     /// Whether an admitted stream decodes within finish_left tokens of its max_tokens (the lock held).
@@ -553,6 +613,11 @@ pub const LaneHost = struct {
             h.takeCancels();
             while (h.admitOne()) {}
             h.fillOne();
+            if (h.between_err) |e| {
+                h.between_err = null;
+                h.failAll(@errorName(e));
+                continue;
+            }
             h.noteLive();
             h.lock();
             if (h.closing) {
@@ -714,6 +779,81 @@ test "a lane host serves the core's own tokens, in order, and cancels between ro
     try std.testing.expectEqual(Reason.cancelled, lone.wait());
     try std.testing.expect(target.prefill_count <= 3);
     try std.testing.expectEqual(@as(usize, 0), target.lanes.count());
+}
+
+test "prefill interleave: a decoding stream keeps getting tokens and its cancel lands during another's prompt pass" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
+    host.interleave_ns = 5 * std.time.ns_per_ms;
+    try host.start();
+    defer host.stop();
+    const Box = struct {
+        mutex: std.Io.Mutex = .init,
+        tokens: usize = 0,
+        done: ?Reason = null,
+        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
+            const b: *@This() = @ptrCast(@alignCast(ctx));
+            b.mutex.lockUncancelable(std.testing.io);
+            defer b.mutex.unlock(std.testing.io);
+            switch (e.*) {
+                .tokens => |t| b.tokens += t.len,
+                .finished => |f| b.done = f.reason,
+                else => {},
+            }
+        }
+        fn read(b: *@This()) struct { tokens: usize, done: ?Reason } {
+            b.mutex.lockUncancelable(std.testing.io);
+            defer b.mutex.unlock(std.testing.io);
+            return .{ .tokens = b.tokens, .done = b.done };
+        }
+        fn wait(b: *@This()) Reason {
+            while (true) {
+                if (b.read().done) |r| return r;
+                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+            }
+        }
+    };
+    const e = host.engine();
+    // A: a long decode, admitted and decoding before B arrives
+    const prompt_a = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6 };
+    var a: Box = .{};
+    const req_a: Request = .{ .prompt = &prompt_a, .max_tokens = 100000 };
+    try e.submit(1, &req_a, .{ .ctx = &a, .event = Box.event });
+    while (a.read().tokens == 0) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    // B: a six-chunk prompt pass; at each of its chunks note A's tokens, and cancel A at chunk 3
+    const Watch = struct {
+        engine: Engine,
+        a: *Box,
+        seen: [6]usize = @splat(0),
+        done_at_5: ?Reason = null,
+        fn call(ctx: *anyopaque, _: *lanes.Stream, chunk: usize) void {
+            const w: *@This() = @ptrCast(@alignCast(ctx));
+            const r = w.a.read();
+            if (chunk < w.seen.len) w.seen[chunk] = r.tokens;
+            if (chunk == 3) w.engine.cancel(1);
+            if (chunk == 5) w.done_at_5 = r.done;
+        }
+    };
+    var watch = Watch{ .engine = e, .a = &a };
+    target.prefill_chunks = 6;
+    target.prefill_hook = Watch.call;
+    target.prefill_hook_ctx = &watch;
+    const prompt_b = [_]u32{ 8, 6, 7, 5, 3, 0, 9, 2, 1, 4 };
+    var b: Box = .{};
+    const req_b: Request = .{ .prompt = &prompt_b, .max_tokens = 1 };
+    try e.submit(2, &req_b, .{ .ctx = &b, .event = Box.event });
+    try std.testing.expectEqual(Reason.length, b.wait());
+    // A decoded during B's pass (no interleave: seen[0] == seen[2]), and its cancel ended it before B's last chunk
+    try std.testing.expect(watch.seen[2] > watch.seen[0]);
+    try std.testing.expectEqual(@as(?Reason, Reason.cancelled), watch.done_at_5);
+    try std.testing.expectEqual(Reason.cancelled, a.wait());
 }
 
 test { _ = @import("lane_host_test.zig"); }

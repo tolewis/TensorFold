@@ -131,6 +131,8 @@ pub const Fake = struct {
             if (x.prefill_hook) |hook| hook(x.prefill_hook_ctx.?, s, l.pieces);
             l.pieces += 1;
             if (s.isCancelled()) return error.Cancelled;
+            // the host's rounds for the other streams between two chunks, as dsv41's prompt pass offers them
+            if (l.pieces < total) if (s.between) |b| if (b.wanted(b.ptr)) try b.run(b.ptr);
         }
         if (l.pieces < total) return false;
         const h = &l.history;

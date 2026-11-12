@@ -149,6 +149,14 @@ pub const Spec = struct {
     } = null,
 };
 
+/// Decode rounds for the other live streams between two prompt chunks (Stream.between).
+pub const Between = struct {
+    ptr: *anyopaque,
+    /// Whether any other stream would take a round now (false: the pass keeps going, nothing joined or waited on).
+    wanted: *const fn (ptr: *anyopaque) bool,
+    run: *const fn (ptr: *anyopaque) anyerror!void,
+};
+
 pub const Stream = struct {
     id: []const u8,
     prompt_len: usize,
@@ -168,6 +176,9 @@ pub const Stream = struct {
     chunks: []const u32,
     reuse: Reuse = .{},
     images: []const Image = &.{},
+    /// Prefill interleave (TF_PREFILL_INTERLEAVE_MS): the host's decode rounds for the OTHER live streams, which a
+    /// backend may call between two of this stream's prompt chunks; null: the pass runs whole, as before.
+    between: ?Between = null,
     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
     reuse_failed: bool = false, // the backend's restore of `reuse` failed: it prefilled from 0
     context: std.ArrayList(u32) = .empty,
