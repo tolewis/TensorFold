@@ -1,0 +1,40 @@
+# /home/tlewis/.config/systemd/user/qwen27-tensorfold@.service
+[Unit]
+Description=Qwen3.8-27B (abliterated) on Arc Pro B70 %i (TensorFold XPU)
+After=network-online.target
+Conflicts=sage-tensorfold@%i.service
+
+[Service]
+EnvironmentFile=%h/b70/release/card-%i.env
+EnvironmentFile=-%h/b70/qwen27/qwen27.env
+EnvironmentFile=-%h/b70/qwen27/qwen27-%i.env
+ExecStart=%h/b70/qwen27/qwen27-serve.sh
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:%h/b70/release/logs/qwen27-tensorfold-%i.log
+StandardError=inherit
+
+[Install]
+WantedBy=default.target
+
+# /home/tlewis/.config/systemd/user/qwen27-tp2-rank1.service
+[Unit]
+Description=Qwen3.8-27B (abliterated) TP 2 rank 1 on Arc Pro B70 a (follows rank 0 on card b)
+After=network-online.target
+Conflicts=qwen27-tensorfold@a.service sage-tensorfold@a.service
+PartOf=qwen27-tensorfold@b.service
+
+[Service]
+EnvironmentFile=%h/b70/release/card-a.env
+EnvironmentFile=-%h/b70/qwen27/qwen27.env
+EnvironmentFile=-%h/b70/qwen27/qwen27-tp2.env
+UnsetEnvironment=ZE_AFFINITY_MASK
+Environment=XPU_DEVICE=1
+ExecStart=%h/b70/qwen27/qwen27-rank1.sh
+Restart=always
+RestartSec=5
+StandardOutput=append:%h/b70/release/logs/qwen27-tp2-rank1.log
+StandardError=inherit
+
+[Install]
+WantedBy=default.target

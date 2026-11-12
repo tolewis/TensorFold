@@ -1,0 +1,18 @@
+# /home/tlewis/.config/systemd/user/qwen27-jubiku.service
+[Unit]
+Description=Qwen3.8-27B on jubiku's Arc Pro B70 (TensorFold XPU, TP 1, MLX + DFlash2, 2 streams). On demand: not enabled at boot.
+After=network-online.target
+
+[Service]
+EnvironmentFile=%h/b70/qwen27/qwen27.env
+ExecStart=%h/b70/qwen27/qwen27-serve.sh
+Restart=on-failure
+RestartSec=15
+# The desktop shares this GPU and these CPUs: keep the compositor ahead of inference.
+Nice=5
+CPUWeight=50
+IOWeight=50
+MemoryHigh=24G
+MemoryMax=32G
+StandardOutput=append:%h/b70/qwen27/logs/qwen27-jubiku.log
+StandardError=inherit
