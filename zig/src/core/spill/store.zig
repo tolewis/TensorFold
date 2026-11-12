@@ -2402,6 +2402,14 @@ pub const Store = struct {
         return null;
     }
 
+    /// Whether beginRead would refuse for capacity now (TooMany: max_reads in flight; NoSlot: no restore slot free),
+    /// changing nothing: a tier asks before the prompt cache makes room for a restore (Tier.VTable.full).
+    pub fn readsFull(s: *Store) bool {
+        s.lockS();
+        defer s.unlockS();
+        return s.liveReads() >= s.cfg.max_reads or s.slots.available(.restore) == 0;
+    }
+
     fn liveReads(s: *Store) usize {
         var n: usize = 0;
         for (s.reads.items) |r| n += @intFromBool(!r.ended);

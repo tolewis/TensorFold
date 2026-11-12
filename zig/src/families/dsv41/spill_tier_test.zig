@@ -1287,16 +1287,19 @@ test "one rank: a restore past the cap is refused before anything is placed or r
     defer for (snaps) |s| gpa.destroy(s);
     try pumpUntil(ld, 3);
     r.sim.delay = 1000;
+    try testing.expect(!t.vtable.full.?(t.ptr)); // (the prompt cache asks before making room: robustness)
     var jobs: [2]u64 = undefined;
     for (0..2) |i| {
         fam.next_base = (8 + 4 * i) * bt;
         jobs[i] = try t.vtable.begin(t.ptr, &(t.vtable.lookup(t.ptr, &want(&ids[i])) orelse return error.NotFound));
     }
     const p3 = t.vtable.lookup(t.ptr, &want(&ids[2])) orelse return error.NotFound;
+    try testing.expect(t.vtable.full.?(t.ptr)); // full before begin is asked: no room made for a third
     try testing.expectError(error.TooManyRestores, t.vtable.begin(t.ptr, &p3));
     try testing.expectEqual(@as(u32, 2), fam.reserved); // no third destination placed
     for (jobs) |j| t.vtable.cancel(t.ptr, j);
     try stagingDrains(ld.side.store);
+    try testing.expect(!t.vtable.full.?(t.ptr));
     try testing.expect(t.vtable.lookup(t.ptr, &want(&ids[2])) != null); // still there for later
 }
 

@@ -983,6 +983,7 @@ pub const Lanes = struct {
         }
         const tokens: []const u32 = if (greedy) try m.roundArgmax(rows.ids.len) else &.{};
         const logits: []const f32 = if (greedy) &.{} else try m.roundLogits(rows.ids.len);
+        if (m.ringFailed()) return error.RingFailed; // (robustness: a graph's collect gave up on a dead peer's flags)
         const t3 = m.now();
         defer if (self.prof) |*p| {
             p.send += t1 - t0;

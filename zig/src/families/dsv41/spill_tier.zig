@@ -865,6 +865,7 @@ pub fn Leader(comptime Dev: type) type {
         const vt: pc.Tier.VTable = .{
             .lookup = lookupFn,
             .begin = beginFn,
+            .full = fullFn,
             .poll = pollFn,
             .cancel = cancelFn,
             .keep = keepFn,
@@ -1212,6 +1213,14 @@ pub fn Leader(comptime Dev: type) type {
         }
 
         // -- restores ---------------------------------------------------------------------------------------------
+
+        /// beginFn's capacity refusals asked before the prompt cache makes room (robustness): the restores in flight at
+        /// max_restores, or this rank's store out of reads or restore slots. A broken tier is not full: begin names it.
+        fn fullFn(ptr: *anyopaque) bool {
+            const self = of(ptr);
+            if (self.broken != null) return false;
+            return self.jobs.count() >= self.max_restores or self.side.store.readsFull();
+        }
 
         fn beginFn(ptr: *anyopaque, point: *const pc.Point) anyerror!u64 {
             const self = of(ptr);

@@ -192,6 +192,12 @@ pub const TierCounts = struct {
     };
 };
 
+/// Tier.begin's refusals for capacity (robustness): nothing was reserved and the same begin may succeed once a
+/// restore in flight ends. dsv41's spill tier: TooManyRestores (its cap of restores in flight); core/spill's store:
+/// TooMany (its reads in flight), NoSlot (no staging slot); any tier: Busy.
+/// error.TierFull: the store's own refusal when the tier reports itself full (Tier.VTable.full) before any room is made.
+pub const capacity_errors = [_]anyerror{ error.TierFull, error.TooManyRestores, error.TooMany, error.NoSlot, error.Busy };
+
 /// The ranks a tier reports counters for (TP ranks; more are not reported).
 pub const max_ranks = 8;
 
@@ -219,7 +225,14 @@ pub const Tier = struct {
         /// The longest durable point `want` allows, from the tier's own index (no disk I/O, no CUDA); null: none.
         lookup: *const fn (ptr: *anyopaque, want: *const Want) ?Point,
         /// Start restoring `point` into a new family state (reserve on every rank, then read): a job for `poll`.
+        /// A refusal for capacity that a later call may not meet (too many restores in flight, no read slot) is one
+        /// of `capacity_errors` with nothing reserved: the host then defers the request briefly and asks again
+        /// (Store.deferrable), instead of prefilling a prompt a restore would have served.
         begin: *const fn (ptr: *anyopaque, point: *const Point) anyerror!u64,
+        /// Whether `begin` would refuse for capacity now (the restores in flight at the tier's cap, no read slot), asked
+        /// before the store makes room for a restore, so a refusal costs no kept state (error.TierFull, nothing evicted).
+        /// Null: never full (a capacity refusal from `begin` then comes after the room was made).
+        full: ?*const fn (ptr: *anyopaque) bool = null,
         /// Progress the job by at most `budget_ns` of engine-thread copies; after ready or failed the job is gone.
         poll: *const fn (ptr: *anyopaque, job: u64, budget_ns: u64) Poll,
         /// Stop a pending job: reads stop, issued DMA is waited for, reservations go (called once per job at most).
@@ -268,7 +281,7 @@ pub const Stats = struct {
     restores_failed: u64 = 0,
     restores_cancelled: u64 = 0,
     restores_dropped: u64 = 0, // adopted nothing: the budget cannot hold it, or memory had it meanwhile
-    restores_refused: u64 = 0, // not begun: the budget could not hold its destination
+    restores_refused: u64 = 0, // not begun: the budget could not hold its destination, or the tier was full (once a request)
     restored_tokens: u64 = 0,
     writes_enqueued: u64 = 0,
     shared_promoted: u64 = 0,
@@ -393,6 +406,7 @@ pub const Store = struct {
     roots: std.AutoHashMapUnmanaged(u64, u32) = .empty, // each conversation's first prompt length (join)
     restoring: std.ArrayList(*Restore) = .empty,
     restoring_bytes: u64 = 0, // destinations the restores in flight reserved (charged like kept states)
+    refused_for: Refusal = .none, // why the last restoreBeginOver returned NoRoom (deferrable)
     next_lineage: u64 = 0,
     stats: Stats = .{},
 
@@ -523,15 +537,45 @@ pub const Store = struct {
     /// destination is charged to the budget from here until it ends (room made first, as for a keep; nobody holds a
     /// looked-up entry at admission, so any state may go): error.NoRoom when the budget cannot hold it.
     pub fn restoreBegin(s: *Store, p: Point, key: []const u32) !*Restore {
+        return s.restoreBeginOver(p, key, .{});
+    }
+
+    /// How restoreBeginOver treats the prompt's own memory state and counts its refusals.
+    pub const Over = struct {
+        /// The best usable memory state for the key (Probe.memory): kept while the budget holds it beside the restore.
+        have: ?*Entry = null,
+        /// The same request asking again (a deferred restore): a refusal is not counted again.
+        again: bool = false,
+    };
+
+    /// Why a restore's room was refused (NoRoom): restores in flight hold the budget's rest (their charge goes when
+    /// they end, so asking again may succeed), or the budget cannot hold the destination however long one waits.
+    pub const Refusal = enum { none, restores_in_flight, budget };
+
+    /// restoreBegin for a request whose best memory state is `o.have`. A full tier (Tier.VTable.full) refuses first,
+    /// with error.TierFull and nothing evicted, so the shorter state is still there to resume. Otherwise the room
+    /// spares `have` when the budget holds both it and the restore (a refusal by the tier then leaves it), and evicts
+    /// it as restoreBegin does when the budget cannot hold both: a restore that can start always beats the shorter
+    /// state. After a refusal `have` may be gone: look it up again (Store.find), never through the old pointer.
+    pub fn restoreBeginOver(s: *Store, p: Point, key: []const u32, o: Over) !*Restore {
         for (s.restoring.items) |r| if (r.point.id == p.id) {
             s.stats.restores_shared += 1;
             return r;
         };
         const t = s.tier orelse return error.NoTier;
         if (p.tokens > key.len) return error.BadPoint;
+        if (t.vtable.full) |full| if (full(t.ptr)) {
+            if (!o.again) s.stats.restores_refused += 1;
+            return error.TierFull;
+        };
         const bytes = s.pointBytes(p);
-        if (!s.makeRoom(bytes, null, key)) {
-            s.stats.restores_refused += 1;
+        s.refused_for = .none;
+        const spare_have = if (o.have) |e| s.restoring_bytes + bytes + e.bytes <= s.budget else false;
+        const made = s.makeRoom(bytes, if (spare_have) o.have else null, key) or (spare_have and s.makeRoom(bytes, null, key));
+        if (!made) {
+            if (!o.again) s.stats.restores_refused += 1;
+            // the room failed with nothing spared: only what the restores in flight hold stands in the way
+            s.refused_for = if (s.restoring.items.len > 0 and bytes <= s.budget) .restores_in_flight else .budget;
             return error.NoRoom;
         }
         const r = try s.gpa.create(Restore);
@@ -545,6 +589,14 @@ pub const Store = struct {
         s.restoring_bytes += bytes;
         s.stats.restores_begun += 1;
         return r;
+    }
+
+    /// Whether a refused restoreBeginOver may succeed if asked again shortly: a refusal for capacity
+    /// (capacity_errors), or a NoRoom only the restores in flight caused (their charge goes when they end). Anything
+    /// else (a missing point, a damaged one, no tier, a budget that can never hold it) will not change by waiting.
+    pub fn deferrable(s: *const Store, err: anyerror) bool {
+        if (err == error.NoRoom) return s.refused_for == .restores_in_flight and s.restoring.items.len > 0;
+        return std.mem.indexOfScalar(anyerror, &capacity_errors, err) != null;
     }
 
     /// Progress `r` by at most `budget_ns`; once it is no longer pending `r` is freed. An installed state becomes a

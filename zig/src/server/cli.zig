@@ -106,7 +106,7 @@ pub const env = [_][]const u8{ "TENSORFOLD_API_KEY", "TENSORFOLD_NO_LIVE", "TENS
     (if (cuda_build) [_][]const u8{ "TF_CUDA_DEVICE", "TF_CUDA_SEGMENTS", "TENSORFOLD_CUDA_KERNELS", "TENSORFOLD_MEMORY_RESERVE_GIB", "TENSORFOLD_CUDA_MEMORY_LIMIT_GB" } else [_][]const u8{});
 
 /// The prompt cache tier's variables (api.Spill): its knobs beyond the flags.
-pub const spill_env = [_][]const u8{ "TF_SPILL_TURNS", "TF_SPILL_LOAD_MS", "TF_SPILL_LOAD_WAIT_MS", "TF_SPILL_FLUSH_MS" };
+pub const spill_env = [_][]const u8{ "TF_SPILL_TURNS", "TF_SPILL_LOAD_MS", "TF_SPILL_LOAD_WAIT_MS", "TF_SPILL_DEFER_MS", "TF_SPILL_FLUSH_MS" };
 
 pub const Args = struct {
     model: []const u8 = "",
@@ -290,6 +290,7 @@ pub fn spill(args: Args, env_: anytype) api.Spill {
     if (env_.get("TF_SPILL_TURNS")) |v| s.turns = std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch s.turns;
     if (env_.get("TF_SPILL_LOAD_MS")) |v| s.load_ms = positive(v) orelse s.load_ms;
     if (env_.get("TF_SPILL_LOAD_WAIT_MS")) |v| s.load_wait_ms = positive(v) orelse s.load_wait_ms;
+    if (env_.get("TF_SPILL_DEFER_MS")) |v| s.defer_ms = std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch s.defer_ms;
     if (env_.get("TF_SPILL_FLUSH_MS")) |v| s.flush_ms = std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch s.flush_ms;
     return s;
 }
@@ -435,7 +436,9 @@ test "spill flags and variables: off by default, checked, passed whole" {
     try std.testing.expect(!off.enabled());
     try std.testing.expectEqual(api.Spill{}, off);
     const args = try parse(a, &.{ "m", "--spill-dir", "/nvme/spill", "--spill-gib", "64", "--spill-min-free-gib=20", "--spill-min-tokens", "4096", "--spill-quota", "0.25" }, &u);
-    const on = spill(args, Env{ .pairs = &.{ .{ "TF_SPILL_TURNS", "2" }, .{ "TF_SPILL_LOAD_MS", "25" }, .{ "TF_SPILL_FLUSH_MS", "x" } } });
+    const on = spill(args, Env{ .pairs = &.{ .{ "TF_SPILL_TURNS", "2" }, .{ "TF_SPILL_LOAD_MS", "25" }, .{ "TF_SPILL_FLUSH_MS", "x" }, .{ "TF_SPILL_DEFER_MS", "0" } } });
+    try std.testing.expectEqual(@as(u32, 0), on.defer_ms); // (0: a capacity-refused restore is not deferred)
+    try std.testing.expectEqual(@as(u32, 5_000), spill(args, Env{ .pairs = &.{.{ "TF_SPILL_DEFER_MS", "-3" }} }).defer_ms);
     try std.testing.expect(on.enabled());
     try std.testing.expectEqualStrings("/nvme/spill", on.dir.?);
     try std.testing.expectEqual(@as(f64, 64), on.gib);

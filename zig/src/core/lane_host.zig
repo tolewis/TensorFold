@@ -5,6 +5,16 @@
 //! prompt cache's tier (shared by every request that wants the same point). Parked requests hold no lane, count as
 //! waiting work and wake back to the front of the queue, where an ordinary lookup runs again. With no tier nothing is
 //! parked, nothing is serviced and nothing else changes.
+//!
+//! Robustness (round 3, docs/port/robustness.md), each off unless its backend or tier asks for it:
+//! - A broken rank pair (`pair`, the backend's TF_DS_PAIR_BROKEN=exit): nothing new is admitted, waiting requests
+//!   fail at once, decoding streams finish within a drain bound or fail, the backend's collectives stop, and the
+//!   process exits with a distinct code for its supervisor to restart both ranks; a deadline thread enforces the exit
+//!   even when a round is blocked on a dead peer.
+//! - Restores the tier refuses for capacity are deferred briefly and asked again (bounded), keeping the best memory
+//!   state meanwhile, instead of a prefill from 0 (`restores_deferred`).
+//! - The service fence: parked work's service and the lone driver's pump never run inside a round, inside a prompt
+//!   pass except between its chunks (Stream.between), or while the backend reports a CUDA graph capture (`quiet`).
 const std = @import("std");
 const lanes = @import("lanes");
 const api = @import("engine_api.zig");
@@ -78,6 +88,32 @@ pub const LaneHost = struct {
     /// A backend's KV-ownership stats (its parts), read on the engine thread at each noteLive, published as `kv_tele`.
     kv_parts: ?lanes.kv_parts.Source = null,
     kv_tele: ?api.KvParts = null,
+    // -- a broken rank pair (the backend's policy, set before start; null: off, nothing below runs) ---------------
+    pair: ?PairPolicy = null,
+    pair_state: std.atomic.Value(u8) = .init(0), // 0 whole, 1 a cause being recorded, 2 broken (why/drain/since set)
+    pair_why: [pair_why_max]u8 = undefined,
+    pair_why_len: usize = 0,
+    pair_drain: bool = true,
+    pair_since: i96 = 0,
+    pair_thread: ?std.Thread = null, // the deadline: aborts and exits even when the engine thread is stuck
+    pair_done: std.atomic.Value(bool) = .init(false), // the deadline thread may leave (the host stopped or exits)
+    pair_aborted: std.atomic.Value(bool) = .init(false),
+    pair_exited: std.atomic.Value(bool) = .init(false),
+    pair_failed: u64 = 0, // requests failed because the pair broke (engine thread)
+    pair_monitor: ?std.Thread = null, // the stall monitor: a round or a prompt chunk that never ends is a break too
+    busy_depth: u32 = 0, // engine thread: inside a round, a prompt pass or the lone driver (nested)
+    progress_at: std.atomic.Value(i64) = .init(0), // the engine thread's last progress while busy (awake ns); 0: idle
+    // -- the service fence (cache-tier's lifetime rules) -------------------------------------------------------
+    /// The backend's word that its device is between launches it may interleave with (dsv41: no CUDA graph capture
+    /// on its stream); null: always.
+    quiet: ?Quiet = null,
+    rounds_open: u32 = 0, // engine thread: inside the lane core's step (a round's launches)
+    in_between: bool = false, // engine thread: inside Stream.between (the filling pass stands between two chunks)
+    /// A service asked for where it must not run panics (debug builds), else is skipped and counted.
+    fence_panic: bool = @import("builtin").mode == .debug,
+    service_refused: u64 = 0,
+    // -- restores the tier refused for capacity, asked again shortly (engine thread's; changes take the lock) --
+    deferred: std.ArrayList(Defer) = .empty,
 
     const Mark = struct { at: i96, tokens: u64 };
     const full_retry_ns: i96 = std.time.ns_per_s;
@@ -91,6 +127,48 @@ pub const LaneHost = struct {
     const lone_pump_commits: u32 = 16;
 
     const Load = struct { job: *Job, restore: *pc.Restore, since: i96 };
+    const Defer = struct { job: *Job, retry_at: i96 };
+    const pair_why_max = 240;
+    const monitor_ms = 250;
+
+    /// The backend's device state for the service fence.
+    pub const Quiet = struct { ctx: *anyopaque, check: *const fn (ctx: *anyopaque) bool };
+
+    /// A backend error that means the rank pair broke, wherever it surfaces (a prompt pass, a round, the lone
+    /// driver); `drain`: rounds can still run, so decoding streams may finish first.
+    pub const Fatal = struct { err: anyerror, drain: bool };
+
+    /// What the host does once the backend's rank pair cannot go on (dsv41: TF_DS_PAIR_BROKEN=exit). The backend
+    /// reports a break through `pairBroken` (its hooks) or through an error in `fatal`.
+    pub const PairPolicy = struct {
+        ctx: *anyopaque,
+        /// Stop the backend's collectives so a device stream blocked on the peer drains (dsv41: ncclCommAbort).
+        /// Called once, from the engine thread or the deadline thread, possibly while the other is blocked on it.
+        abort: *const fn (ctx: *anyopaque) void,
+        /// End the process with `code` (the service's supervisor restarts the pair); returns only in tests.
+        exit: *const fn (ctx: *anyopaque, code: u8) void,
+        code: u8 = pair_exit_code,
+        /// Decoding streams may finish for this long after a break that leaves rounds runnable (`drain`).
+        drain_ns: i96 = 5 * std.time.ns_per_s,
+        /// The deadline thread aborts the collectives this long after the break if the engine thread has not exited
+        /// by then (a round blocked on a dead peer), and exits `grace_ns` later.
+        deadline_ns: i96 = pair_deadline_ns,
+        /// Before the exit: the HTTP threads send the failed requests' last events.
+        grace_ns: i96 = 300 * std.time.ns_per_ms,
+        /// A round, a prompt chunk or a lone-driver token taking longer than this is a break too (a peer that hangs
+        /// without erroring: stopped, a GPU hang, a follower stuck in its own device wait, whose RDMA writes still
+        /// complete at the NIC so nothing on this rank fails). Longer than every rank_wire reply deadline (validate:
+        /// 90 s) and any one chunk; 0: no monitor.
+        stall_ns: i96 = pair_stall_ns,
+        fatal: []const Fatal = &.{},
+    };
+
+    /// PairPolicy's bounds: the deadline thread's after a break, and the stall monitor's.
+    pub const pair_deadline_ns: i96 = 15 * std.time.ns_per_s;
+    pub const pair_stall_ns: i96 = 120 * std.time.ns_per_s;
+
+    /// The process exit status after a broken pair (EX_TEMPFAIL: restart and retry).
+    pub const pair_exit_code: u8 = 75;
 
     /// How parked work is serviced (LaneHost.configure; the defaults are off).
     pub const TierPolicy = struct {
@@ -102,6 +180,12 @@ pub const LaneHost = struct {
         load_wait_ns: i96 = 30 * std.time.ns_per_s,
         /// A clean shutdown's bound for draining writes (TF_SPILL_FLUSH_MS).
         flush_ns: u64 = 60 * std.time.ns_per_s,
+        /// A restore the tier refused for capacity (Store.deferrable) is asked again every defer_retry_ns, and when a
+        /// restore in flight ends, for at most defer_ns (TF_SPILL_DEFER_MS; 0: never, admitted on memory at once),
+        /// when it would save at least defer_min tokens over memory (0: the store's grid, or 1).
+        defer_ns: i96 = 5 * std.time.ns_per_s,
+        defer_retry_ns: i96 = 25 * std.time.ns_per_ms,
+        defer_min: u32 = 0,
     };
 
     pub const HostCounts = struct {
@@ -111,6 +195,8 @@ pub const LaneHost = struct {
         restore_wait_max_ns: u64 = 0,
         cached_tokens: u64 = 0, // prompt tokens passes resumed (memory or restored)
         computed_tokens: u64 = 0, // and computed
+        restores_deferred: u64 = 0, // requests whose restore was refused for capacity and asked again
+        restores_deferred_expired: u64 = 0, // of them, admitted on memory at defer_ns
     };
 
     const Job = struct {
@@ -129,6 +215,7 @@ pub const LaneHost = struct {
         marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
         kept0: u64 = 0, // the store's kept count when the job looked it up
         tried_disk: bool = false, // it waited for a restore once: a later lookup takes what memory has
+        deferred_since: ?i96 = null, // its restore was first refused for capacity then (asked again until defer_ns)
         join: pc.Join = .{}, // its conversation (0111)
         parent: ?u64 = null, // the durable point its pass resumes from, and where
         fork: u32 = 0,
@@ -180,12 +267,19 @@ pub const LaneHost = struct {
         h.tier.pump_ns = @min(h.tier.pump_ns, h.tier.service_ns);
         h.tier.load_wait_ns = @as(i96, @max(sp.load_wait_ms, 1)) * std.time.ns_per_ms;
         h.tier.flush_ns = @as(u64, sp.flush_ms) * std.time.ns_per_ms;
+        h.tier.defer_ns = @as(i96, sp.defer_ms) * std.time.ns_per_ms;
         const store_on = if (h.cache) |s| s.tier != null or s.groups else false;
         h.tele = if (store_on) .{} else null;
     }
 
     pub fn start(h: *LaneHost) !void {
         h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, run, .{h});
+        if (h.pair) |pol| if (pol.stall_ns > 0) {
+            h.pair_monitor = std.Thread.spawn(.{}, pairMonitor, .{h}) catch |e| blk: {
+                noteErr("the rank pair's stall monitor did not start ({s}): a hung peer is caught only by its errors", .{@errorName(e)});
+                break :blk null;
+            };
+        };
     }
 
     /// Stops admitting, cancels what is left and joins the engine thread.
@@ -196,6 +290,12 @@ pub const LaneHost = struct {
         h.mutex.unlock(h.io);
         if (h.thread) |t| t.join();
         h.thread = null;
+        h.pair_done.store(true, .release);
+        if (h.pair_monitor) |t| t.join(); // (first: a break it reported started the deadline thread below)
+        h.pair_monitor = null;
+        if (h.pair_thread) |t| t.join();
+        h.pair_thread = null;
+        h.deferred.deinit(h.gpa);
         h.queued.deinit(h.gpa);
         h.admitted.deinit(h.gpa);
         h.cancels.deinit(h.gpa);
@@ -228,7 +328,7 @@ pub const LaneHost = struct {
         job.* = .{ .host = h, .id = id, .request = request, .sink = sink };
         h.mutex.lockUncancelable(h.io);
         defer h.mutex.unlock(h.io);
-        if (h.closing) {
+        if (h.closing or h.isBroken()) { // (a broken pair admits nothing more: the process restarts)
             h.gpa.destroy(job);
             return error.Closed;
         }
@@ -265,7 +365,7 @@ pub const LaneHost = struct {
         @memcpy(stream_tokens[0..n], h.live_tokens.items[0..n]);
         out.* = .{
             .running = @intCast(h.admitted.items.len),
-            .waiting = @intCast(h.queued.items.len + h.ready.items.len + h.loading.items.len),
+            .waiting = @intCast(h.queued.items.len + h.waitingCount()),
             .decode_tokens_per_second = @as(f64, @floatFromInt(tokens)) / 2.0,
             .prefill_tokens_per_second = if (now - h.prefill_at <= window_ns) h.prefill_rate else 0,
             .preemptions = 0,
@@ -273,7 +373,24 @@ pub const LaneHost = struct {
             .generation_tokens = h.live_generated,
             .cache = h.tele,
             .kv_parts = h.kv_tele,
+            .pair = h.pairStatus(now),
         };
+    }
+
+    /// The broken-pair policy's state and the fence's counter (any thread; the counters are the engine thread's,
+    /// read as they stand); null with neither the policy nor a disk tier.
+    fn pairStatus(h: *const LaneHost, now: i96) ?api.PairStatus {
+        const tier = if (h.cache) |s| s.tier != null else false;
+        if (h.pair == null and !tier) return null;
+        var p: api.PairStatus = .{ .service_refused = h.service_refused, .pair_failed = h.pair_failed };
+        const pol = h.pair orelse return p;
+        p.broken = h.isBroken();
+        const at = h.progress_at.load(.acquire);
+        const idle: i96 = if (at == 0) 0 else @max(now - at, 0);
+        p.busy_ms = @intCast(@divTrunc(idle, std.time.ns_per_ms));
+        p.stall_ms = @intCast(@divTrunc(@max(pol.stall_ns, 0), std.time.ns_per_ms));
+        p.stalled = pol.stall_ns > 0 and at != 0 and idle >= pol.stall_ns;
+        return p;
     }
 
     fn memoryFn(ctx: *anyopaque, reset_peak: bool) ?Memory {
@@ -288,6 +405,8 @@ pub const LaneHost = struct {
     /// A job's cancel hook for its prompt pass: its id is in `cancels`, or the host is closing (read under the lock).
     fn cancelled(ctx: *anyopaque) bool {
         const job: *Job = @ptrCast(@alignCast(ctx));
+        job.host.progressed(); // (asked once a prompt chunk: the stall monitor's clock restarts)
+        if (job.host.isBroken()) return true; // (a broken pair: the pass stops at its next chunk, failed below)
         job.host.lock();
         defer job.host.unlock();
         return job.host.closing or std.mem.indexOfScalar(Id, job.host.cancels.items, job.id) != null;
@@ -373,6 +492,10 @@ pub const LaneHost = struct {
                 unloaded.append(h.gpa, l.restore) catch {};
                 break;
             };
+            for (h.deferred.items, 0..) |d, i| if (d.job.id == id) {
+                dropped.append(h.gpa, h.deferred.orderedRemove(i).job) catch {};
+                break;
+            };
         }
         h.mutex.unlock(h.io);
         // a restore no request waits for any more stops (its reads, DMA and reservations go), exactly once
@@ -411,6 +534,7 @@ pub const LaneHost = struct {
 
     /// Prefills the next queued request (while a pass fills, the first that core.cutsIn); false if none or no lane.
     fn admitOne(h: *LaneHost) bool {
+        if (h.isBroken()) return false;
         h.lock();
         if ((h.queued.items.len == 0 and h.ready.items.len == 0) or h.admitted.items.len >= h.info_.lanes) {
             h.unlock();
@@ -509,12 +633,18 @@ pub const LaneHost = struct {
         if (r.images.len == 0 and (h.interleaving() or h.servicing())) job.stream.between = .{ .ptr = h, .wanted = betweenWanted, .run = between };
         h.passing = job;
         defer h.passing = null;
-        h.core.addStream(&job.stream) catch |e| {
+        h.busyEnter();
+        const added = h.core.addStream(&job.stream);
+        h.busyLeave();
+        added catch |e| {
+            if (h.isBroken()) return h.dropBroken(job);
             if (e == error.Cancelled) return h.cancel(job);
             // refused for room: while other streams run or a pass fills (this one cut in), it waits in the queue
             if (e == error.ContextFull and (h.core.activeCount() > 0 or h.filling != null)) return h.requeue(job);
+            h.checkFatal(e);
             return h.drop(job, h.words(e));
         };
+        if (h.aborted()) return h.dropBroken(job); // (the collectives were stopped under it: its rows are not the model's)
         if (h.core.filling == &job.stream) {
             h.filling = job; // its next pieces run between rounds (fillOne)
             return true;
@@ -547,15 +677,22 @@ pub const LaneHost = struct {
     fn between(ptr: *anyopaque) anyerror!void {
         const h: *LaneHost = @ptrCast(@alignCast(ptr));
         if (h.core.log != null) return; // a step resets the core's arena, which a trail's open events live in
+        h.in_between = true; // (the filling pass stands between two chunks: the service fence's one way in)
+        defer h.in_between = false;
+        h.progressed(); // (a chunk ended: the stall monitor's clock restarts)
         if (h.interleaving()) {
             const t0 = std.Io.Clock.awake.now(h.io).toNanoseconds();
             while (true) {
                 h.takeCancelsKeeping(if (h.passing) |f| f.id else null);
                 if (h.core.runnableCount() == 0 or std.Io.Clock.awake.now(h.io).toNanoseconds() - t0 >= h.interleave_ns) break;
-                h.core.step() catch |e| {
+                h.stepRound() catch |e| {
                     h.between_err = e; // the pass fails with it; run() then fails the streams the round held
                     return e;
                 };
+                if (h.aborted()) { // (the collectives were stopped under the round: its tokens are not the model's)
+                    h.between_err = error.CommAborted;
+                    return error.CommAborted;
+                }
                 var i: usize = 0;
                 while (i < h.admitted.items.len) {
                     const job = h.admitted.items[i];
@@ -613,7 +750,7 @@ pub const LaneHost = struct {
 
     /// Requests parked or woken (the lock held).
     fn waitingCount(h: *const LaneHost) usize {
-        return h.ready.items.len + h.loading.items.len;
+        return h.ready.items.len + h.loading.items.len + h.deferred.items.len;
     }
 
     /// Send lone-driver tokens as they land; arrivals and cancellation return its stream to the lane core.
@@ -625,6 +762,8 @@ pub const LaneHost = struct {
             fn committed(ctx: *anyopaque) void {
                 const host: *LaneHost = @ptrCast(@alignCast(ctx));
                 const j = host.lone_job.?;
+                host.progressed();
+                if (host.aborted()) return; // (stopped collectives: nothing more of it is sent; yield ends it)
                 if (!j.prefill_sent) {
                     j.prefill_sent = true;
                     host.prefilled(j, j.began);
@@ -635,20 +774,24 @@ pub const LaneHost = struct {
                 host.lone_commits += 1;
                 if (host.lone_commits >= lone_pump_commits and host.servicing()) {
                     host.lone_commits = 0;
-                    if (host.cache) |store| store.pump(host.tier.pump_ns);
+                    if (host.cache) |store| if (host.fenced("the lone driver's pump")) store.pump(host.tier.pump_ns);
                 }
             }
             fn yield(ctx: *anyopaque) bool {
                 const host: *LaneHost = @ptrCast(@alignCast(ctx));
                 host.lock();
                 defer host.unlock();
-                return host.queued.items.len > 0 or host.cancels.items.len > 0 or host.closing or host.waitingCount() > 0;
+                return host.queued.items.len > 0 or host.cancels.items.len > 0 or host.closing or host.waitingCount() > 0 or host.isBroken();
             }
         };
         job.began = began;
-        const paused = lone.run(lone.ctx, &job.stream, .{ .ctx = h, .committed = Hooks.committed, .yield = Hooks.yield });
+        h.busyEnter();
+        const ran = lone.run(lone.ctx, &job.stream, .{ .ctx = h, .committed = Hooks.committed, .yield = Hooks.yield });
+        h.busyLeave();
         h.lone_job = null;
+        const paused = if (h.aborted()) error.CommAborted else ran;
         const handed = paused catch |e| {
+            h.checkFatal(e);
             if (!job.prefill_sent) emit(job, .{ .prefilled = 0 });
             h.remove(job);
             h.finish(job, if (e == error.Cancelled) .cancelled else .failed, if (e == error.Cancelled) "" else h.words(e));
@@ -667,6 +810,12 @@ pub const LaneHost = struct {
     fn words(h: *const LaneHost, e: anyerror) []const u8 {
         const x = h.explain orelse return @errorName(e);
         return x.text(x.ctx, e) orelse @errorName(e);
+    }
+
+    /// A prompt pass the broken pair stopped (or ran under an abort) fails with the pair's message.
+    fn dropBroken(h: *LaneHost, job: *Job) bool {
+        h.pair_failed += 1;
+        return h.drop(job, "the engine's rank pair broke; the server restarts");
     }
 
     fn drop(h: *LaneHost, job: *Job, message: []const u8) bool {
@@ -748,11 +897,29 @@ pub const LaneHost = struct {
     /// The filling job's next piece, when its turn has come; its first tokens once its prompt pass ends.
     fn fillOne(h: *LaneHost) void {
         const job = h.filling orelse return;
-        const done = h.core.fillStep() catch |e| {
+        // a piece is a pass's collectives too: under the stall monitor, and a broken pair ends it as addStream's does
+        h.busyEnter();
+        const stepped = h.core.fillStep();
+        h.busyLeave();
+        const done = stepped catch |e| {
             h.filling = null;
-            _ = if (e == error.Cancelled) h.cancel(job) else h.drop(job, h.words(e));
+            if (h.isBroken()) {
+                _ = h.dropBroken(job);
+                return;
+            }
+            if (e == error.Cancelled) {
+                _ = h.cancel(job);
+                return;
+            }
+            h.checkFatal(e);
+            _ = h.drop(job, h.words(e));
             return;
         };
+        if (h.aborted()) { // (the collectives were stopped under it: its rows are not the model's)
+            h.filling = null;
+            _ = h.dropBroken(job);
+            return;
+        }
         if (!done) return;
         h.filling = null;
         h.prefilled(job, job.began);
@@ -761,12 +928,17 @@ pub const LaneHost = struct {
 
     fn run(h: *LaneHost) void {
         while (true) {
+            if (h.isBroken()) {
+                if (h.brokenStep()) return;
+                continue;
+            }
             h.takeCancels();
             while (h.admitOne()) {}
             h.fillOne();
             if (h.servicing()) h.service(h.tier.service_ns); // restores, staged writes and deferred retries, between rounds and at idle
             if (h.between_err) |e| {
                 h.between_err = null;
+                h.checkFatal(e);
                 h.failAll(@errorName(e));
                 continue;
             }
@@ -792,10 +964,12 @@ pub const LaneHost = struct {
                 continue;
             }
             h.unlock();
-            h.core.step() catch |e| {
+            h.stepRound() catch |e| {
+                h.checkFatal(e);
                 h.failAll(@errorName(e));
                 continue;
             };
+            if (h.aborted()) continue; // (stopped under the round: brokenStep fails its streams, nothing is delivered)
             var i: usize = 0;
             while (i < h.admitted.items.len) {
                 const job = h.admitted.items[i];
@@ -828,8 +1002,43 @@ pub const LaneHost = struct {
         for (h.admitted.items) |job| h.cancels.append(h.gpa, job.id) catch {};
         for (h.ready.items) |job| h.cancels.append(h.gpa, job.id) catch {};
         for (h.loading.items) |l| h.cancels.append(h.gpa, l.job.id) catch {};
+        for (h.deferred.items) |d| h.cancels.append(h.gpa, d.job.id) catch {};
         h.unlock();
         h.takeCancels();
+    }
+
+    /// One round of the lane core, counted open while it runs (the service fence).
+    fn stepRound(h: *LaneHost) !void {
+        h.rounds_open += 1;
+        defer h.rounds_open -= 1;
+        h.busyEnter();
+        defer h.busyLeave();
+        return h.core.step();
+    }
+
+    // -- the stall monitor's clock (engine thread; nothing without `pair`) --------------------------------------
+
+    fn busyEnter(h: *LaneHost) void {
+        if (h.pair == null) return;
+        h.busy_depth += 1;
+        h.progressed();
+    }
+
+    fn busyLeave(h: *LaneHost) void {
+        if (h.pair == null) return;
+        h.busy_depth -= 1;
+        if (h.busy_depth == 0) h.progress_at.store(0, .release) else h.progressed();
+    }
+
+    /// The engine thread moved on (a round or a chunk ended, a lone token landed): the stall clock restarts.
+    fn progressed(h: *LaneHost) void {
+        if (h.pair == null or h.busy_depth == 0) return;
+        h.progress_at.store(@intCast(std.Io.Clock.awake.now(h.io).toNanoseconds()), .release);
+    }
+
+    /// Whether the collectives were stopped (an abort ran): what a round returns after it is not the model's.
+    fn aborted(h: *const LaneHost) bool {
+        return h.pair != null and h.pair_aborted.load(.acquire);
     }
 
     // -- parked work (0110) ---------------------------------------------------------------------------------------
@@ -847,7 +1056,7 @@ pub const LaneHost = struct {
 
     /// Work in flight the host must poll (engine thread): restores, writes to stage, requests parked or woken.
     fn pending(h: *const LaneHost) bool {
-        if (h.loading.items.len > 0 or h.ready.items.len > 0) return true;
+        if (h.loading.items.len > 0 or h.ready.items.len > 0 or h.deferred.items.len > 0) return true;
         const store = h.cache orelse return false;
         return store.busy();
     }
@@ -867,16 +1076,73 @@ pub const LaneHost = struct {
             const room = h.loading.ensureUnusedCapacity(h.gpa, 1);
             h.unlock();
             if (room) |_| {
-                if (store.restoreBegin(p, key)) |rs| {
+                // (the best memory state stays while the budget holds it beside the restore: refused, the pass
+                // resumes it; a full tier refuses before any room is made)
+                if (store.restoreBeginOver(p, key, .{ .have = probe.memory, .again = job.deferred_since != null })) |rs| {
                     h.lock();
                     h.loading.appendAssumeCapacity(.{ .job = job, .restore = rs, .since = now });
                     h.unlock();
                     h.host_counts.restore_waits += 1;
+                    job.deferred_since = null;
                     return true;
-                } else |err| note("reading {d} kept tokens from disk did not start ({s}); prefilling", .{ p.at, @errorName(err) });
+                } else |err| {
+                    const left = store.find(key, r.chunks); // (the room may have evicted probe.memory: never read it now)
+                    if (h.deferRestore(job, p, left, err, now)) return true;
+                    if (left) |e| {
+                        note("reading {d} kept tokens from disk did not start ({s}); resuming the {d} memory holds", .{ p.at, @errorName(err), e.at });
+                    } else note("reading {d} kept tokens from disk did not start ({s}); prefilling", .{ p.at, @errorName(err) });
+                }
             } else |_| {}
         };
         return false;
+    }
+
+    /// A restore of `p` the tier or the budget refused with `err`: when that may change shortly (Store.deferrable)
+    /// and the point saves at least defer_min tokens over `have` (the best memory state), `job` waits on the deferred
+    /// list (holding no lane) and asks again every defer_retry_ns or when a restore in flight ends, defer_ns at most
+    /// from its first refusal; true then. False: admit it now on what memory holds (`have` is never evicted for the
+    /// restore's room, so a usable shorter state still resumes).
+    fn deferRestore(h: *LaneHost, job: *Job, p: pc.Point, have: ?*pc.Entry, err: anyerror, now: i96) bool {
+        const store = h.cache orelse return false;
+        if (h.tier.defer_ns <= 0 or !store.deferrable(err)) return false;
+        const at: u32 = if (have) |e| e.at else 0;
+        const min = if (h.tier.defer_min > 0) h.tier.defer_min else @max(store.rules.grid, 1);
+        if (p.at <= at or p.at - at < min) return false;
+        const first = job.deferred_since orelse now;
+        if (now - first >= h.tier.defer_ns) {
+            h.host_counts.restores_deferred_expired += 1;
+            note("reading {d} kept tokens from disk was refused for capacity for {d} ms ({s}); admitted on what memory holds", .{ p.at, @divTrunc(now - first, std.time.ns_per_ms), @errorName(err) });
+            return false;
+        }
+        h.lock();
+        defer h.unlock();
+        h.deferred.append(h.gpa, .{ .job = job, .retry_at = now + h.tier.defer_retry_ns }) catch return false;
+        if (job.deferred_since == null) h.host_counts.restores_deferred += 1;
+        job.deferred_since = first;
+        job.tried_disk = false; // (it asks for the restore again when it wakes)
+        return true;
+    }
+
+    /// Deferred restores whose retry time came, or every one when a restore in flight ended (`ended`: its read slot
+    /// is free now), go to the ready list to ask again.
+    fn retryDeferred(h: *LaneHost, now: i96, ended: bool) void {
+        if (h.deferred.items.len == 0) return;
+        var moved = false;
+        var i: usize = 0;
+        while (i < h.deferred.items.len) {
+            if (!ended and h.deferred.items[i].retry_at > now) {
+                i += 1;
+                continue;
+            }
+            h.lock();
+            const d = h.deferred.orderedRemove(i);
+            h.toReady(d.job); // (releases the lock)
+            moved = true;
+        }
+        if (!moved) return;
+        h.lock();
+        h.wake.signal(h.io);
+        h.unlock();
     }
 
     /// A woken job to the ready list (the lock held; released here). Out of memory fails it alone.
@@ -895,8 +1161,10 @@ pub const LaneHost = struct {
     /// stream valid (dsv41 joins Engram read-ahead before `between`, as recipe 0005 requires).
     fn service(h: *LaneHost, budget_ns: u64) void {
         const store = h.cache orelse return;
+        if (!h.fenced("parked work's service")) return;
         const t0 = std.Io.Clock.awake.now(h.io).toNanoseconds();
         h.expireLoads(t0);
+        var ended = false;
         const n = store.restoring.items.len;
         if (n > 0) { // at most 64 a service, a different first one each time: every restore is polled in turn
             var buf: [64]*pc.Restore = undefined;
@@ -908,9 +1176,13 @@ pub const LaneHost = struct {
                 if (spent >= budget_ns and k > 0) break;
                 const share = (budget_ns -| spent) / (m - k);
                 const st = store.restorePoll(r, share);
-                if (st != .pending) h.restoreEnded(r);
+                if (st != .pending) {
+                    h.restoreEnded(r);
+                    ended = true;
+                }
             }
         }
+        h.retryDeferred(std.Io.Clock.awake.now(h.io).toNanoseconds(), ended);
         const spent: u64 = @intCast(@max(0, std.Io.Clock.awake.now(h.io).toNanoseconds() - t0));
         const idle = h.filling == null and h.core.activeCount() == 0; // nothing decodes: staging takes what is left
         store.pump(if (idle) budget_ns -| spent else @min(budget_ns -| spent, h.tier.pump_ns));
@@ -965,6 +1237,222 @@ pub const LaneHost = struct {
             h.host_counts.restore_wait_max_ns = @max(h.host_counts.restore_wait_max_ns, waited);
             h.toReady(l.job);
         }
+    }
+
+    // -- the service fence --------------------------------------------------------------------------------------
+
+    /// Whether parked work may be serviced now (cache-tier's lifetime rules): no round open (its launches, or a graph
+    /// it captures, in flight), a prompt pass only from Stream.between (between two chunks, never between a chunk's
+    /// layers), and the backend not capturing a CUDA graph (`quiet`).
+    fn serviceSafe(h: *const LaneHost) bool {
+        if (h.rounds_open > 0) return false;
+        if (h.filling != null and !h.in_between) return false;
+        if (h.quiet) |q| if (!q.check(q.ctx)) return false;
+        return true;
+    }
+
+    /// serviceSafe, or the refusal: a panic in debug builds (an engine bug), else counted, logged once and skipped.
+    fn fenced(h: *LaneHost, comptime what: []const u8) bool {
+        if (h.serviceSafe()) return true;
+        h.service_refused += 1;
+        if (h.fence_panic) @panic("lane host: " ++ what ++ " asked for inside a round, a prompt chunk or a CUDA graph capture");
+        if (h.service_refused == 1) noteErr(what ++ " asked for inside a round, a prompt chunk or a CUDA graph capture: skipped (an engine bug)", .{});
+        return false;
+    }
+
+    // -- a broken rank pair ---------------------------------------------------------------------------------------
+
+    /// Whether the backend's pair broke (any thread).
+    pub fn isBroken(h: *const LaneHost) bool {
+        return h.pair_state.load(.acquire) == 2;
+    }
+
+    /// The backend's rank pair cannot go on (`why`, for the log and the failed requests; `drain`: rounds still run,
+    /// so decoding streams may finish within drain_ns). Any thread; the first cause only; nothing without `pair`.
+    /// The engine thread then admits nothing, fails what waits, ends the streams, stops the collectives and exits;
+    /// a deadline thread does the last two if the engine thread cannot (blocked on the peer).
+    pub fn pairBroken(h: *LaneHost, why: []const u8, drain: bool) void {
+        _ = h.pair orelse return;
+        if (h.pair_done.load(.acquire)) return; // stopped (a tier's teardown may still report): nothing to end
+        if (h.pair_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) return;
+        const n = @min(why.len, pair_why_max);
+        @memcpy(h.pair_why[0..n], why[0..n]);
+        h.pair_why_len = n;
+        h.pair_drain = drain;
+        h.pair_since = std.Io.Clock.awake.now(h.io).toNanoseconds();
+        h.pair_state.store(2, .release);
+        h.lock();
+        const closing = h.closing;
+        h.unlock();
+        if (closing) {
+            note("the rank pair broke during the shutdown ({s}): the streams left end, the shutdown goes on", .{why[0..n]});
+        } else noteErr("the rank pair broke ({s}): admitting nothing more; {s}", .{ why[0..n], if (drain) "decoding streams may finish first" else "every stream fails now" });
+        h.pair_thread = std.Thread.spawn(.{}, pairDeadline, .{h}) catch null;
+        h.lock();
+        h.wake.broadcast(h.io);
+        h.unlock();
+    }
+
+    /// pairBroken as a callback (a backend's hook: `ctx` is the LaneHost).
+    pub fn pairBrokenFn(ctx: *anyopaque, why: []const u8, drain: bool) void {
+        self(ctx).pairBroken(why, drain);
+    }
+
+    /// A backend error the policy names as a broken pair (`fatal`): the policy runs, its words as the cause.
+    fn checkFatal(h: *LaneHost, e: anyerror) void {
+        const pol = h.pair orelse return;
+        for (pol.fatal) |f| if (f.err == e) {
+            var buf: [pair_why_max]u8 = undefined;
+            const said = h.words(e);
+            const why = if (std.mem.eql(u8, said, @errorName(e))) said else std.fmt.bufPrint(&buf, "{s}: {s}", .{ @errorName(e), said }) catch @errorName(e);
+            return h.pairBroken(why, f.drain);
+        };
+    }
+
+    /// The engine thread's loop after the break: what waits fails; decoding streams step on within the drain bound;
+    /// then the collectives stop, every stream left fails and the process exits. True: the host is stopping (tests).
+    fn brokenStep(h: *LaneHost) bool {
+        const pol = h.pair.?;
+        var mbuf: [pair_why_max + 64]u8 = undefined;
+        const msg = std.fmt.bufPrint(&mbuf, "the engine's rank pair broke ({s}); the server restarts", .{h.pair_why[0..h.pair_why_len]}) catch "the engine's rank pair broke; the server restarts";
+        h.failWaiting(msg);
+        h.lock();
+        const closing = h.closing;
+        h.unlock();
+        if (closing and !h.pair_exited.load(.acquire)) {
+            // a break during a clean shutdown (stop.sh stops both ranks, rank 1 often first): the streams end, the
+            // communicator is stopped if a transfer may have wedged it, and the shutdown finishes as it would have
+            // (the tier's flush, an ordinary exit), not the restart exit
+            if (!h.pair_drain) h.abortPair();
+            h.failPair(msg, null);
+            h.shutdownTier();
+            return true;
+        }
+        if (h.pair_exited.load(.acquire)) { // (only when the exit hook returned: tests) idle until stopped
+            h.lock();
+            defer h.unlock();
+            if (h.closing) return true;
+            h.cancels.clearRetainingCapacity(); // (every request already ended)
+            h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } }) catch {};
+            return false;
+        }
+        const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
+        if (h.pair_drain and now - h.pair_since < pol.drain_ns and h.core.activeCount() > 0) {
+            h.takeCancels();
+            h.stepRound() catch |e| {
+                h.failPair(msg, e);
+                return false;
+            };
+            if (h.aborted()) { // (the deadline stopped the collectives under it)
+                h.failPair(msg, null);
+                return false;
+            }
+            var i: usize = 0;
+            while (i < h.admitted.items.len) {
+                const job = h.admitted.items[i];
+                if (h.deliver(job)) {
+                    h.lock();
+                    _ = h.admitted.orderedRemove(i);
+                    h.unlock();
+                } else i += 1;
+            }
+            h.noteLive();
+            return false;
+        }
+        h.abortPair(); // no round runs any more: a stream blocked on the peer drains
+        h.failPair(msg, null);
+        h.exitPair();
+        return false;
+    }
+
+    /// Every admitted stream fails with the pair's message (`e`: a round's error while draining, logged too).
+    fn failPair(h: *LaneHost, msg: []const u8, e: ?anyerror) void {
+        if (e) |x| noteErr("a round failed while the streams drained ({s}): every stream ends", .{@errorName(x)});
+        h.lock();
+        const n = h.admitted.items.len;
+        h.unlock();
+        h.pair_failed += n;
+        h.failAll(msg);
+    }
+
+    /// Everything that waits fails with `msg` (queued, woken, reading a restore, deferred), each restore it
+    /// waited for stopped once.
+    fn failWaiting(h: *LaneHost, msg: []const u8) void {
+        var jobs: std.ArrayList(*Job) = .empty;
+        defer jobs.deinit(h.gpa);
+        var restores: std.ArrayList(*pc.Restore) = .empty;
+        defer restores.deinit(h.gpa);
+        h.lock();
+        for ([_]*std.ArrayList(*Job){ &h.queued, &h.ready }) |list| {
+            for (list.items) |job| jobs.append(h.gpa, job) catch {};
+            list.clearRetainingCapacity();
+        }
+        for (h.loading.items) |l| {
+            jobs.append(h.gpa, l.job) catch {};
+            if (std.mem.indexOfScalar(*pc.Restore, restores.items, l.restore) == null) restores.append(h.gpa, l.restore) catch {};
+        }
+        h.loading.clearRetainingCapacity();
+        for (h.deferred.items) |d| jobs.append(h.gpa, d.job) catch {};
+        h.deferred.clearRetainingCapacity();
+        h.unlock();
+        if (h.cache) |store| for (restores.items) |r| store.restoreCancel(r);
+        h.pair_failed += jobs.items.len;
+        for (jobs.items) |job| h.finish(job, .failed, msg);
+    }
+
+    fn abortPair(h: *LaneHost) void {
+        const pol = h.pair orelse return;
+        if (!h.pair_aborted.swap(true, .acq_rel)) pol.abort(pol.ctx);
+    }
+
+    /// The distinct last line, a grace for the failed requests' events to leave, and the exit (once).
+    fn exitPair(h: *LaneHost) void {
+        const pol = h.pair orelse return;
+        if (h.pair_exited.swap(true, .acq_rel)) return;
+        noteErr("rank pair broken ({s}); {d} requests failed; exiting with status {d} for a restart of both ranks", .{ h.pair_why[0..h.pair_why_len], h.pair_failed, pol.code });
+        std.Io.sleep(h.io, .fromNanoseconds(@intCast(@max(pol.grace_ns, 0))), .awake) catch {};
+        h.pair_done.store(true, .release);
+        pol.exit(pol.ctx, pol.code);
+    }
+
+    /// The deadline thread: if the engine thread has not exited deadline_ns after the break (a round or a prompt
+    /// pass blocked on the dead peer), the collectives stop, which should let it fail its streams and exit; grace_ns
+    /// after that the process exits from here.
+    fn pairDeadline(h: *LaneHost) void {
+        const pol = h.pair.?;
+        if (!h.sleepUnlessDone(h.pair_since + pol.deadline_ns)) return;
+        noteErr("the engine thread did not end its streams within {d} ms of the broken pair: stopping the collectives", .{@divTrunc(pol.deadline_ns, std.time.ns_per_ms)});
+        h.abortPair();
+        if (!h.sleepUnlessDone(std.Io.Clock.awake.now(h.io).toNanoseconds() + pol.grace_ns + std.time.ns_per_s)) return;
+        if (h.pair_exited.swap(true, .acq_rel)) return;
+        noteErr("rank pair broken ({s}); the engine thread is stuck; exiting with status {d} for a restart of both ranks", .{ h.pair_why[0..h.pair_why_len], pol.code });
+        pol.exit(pol.ctx, pol.code);
+    }
+
+    /// The stall monitor: the engine thread busy (a round, a prompt pass, the lone driver) without progress for
+    /// stall_ns is a break that drains nothing (the deadline thread then stops the collectives and exits). Leaves at
+    /// the first break, or when the host stops.
+    fn pairMonitor(h: *LaneHost) void {
+        const pol = h.pair.?;
+        while (!h.pair_done.load(.acquire) and h.pair_state.load(.acquire) == 0) {
+            std.Io.sleep(h.io, .fromMilliseconds(monitor_ms), .awake) catch {};
+            const at = h.progress_at.load(.acquire);
+            if (at == 0) continue;
+            const idle = std.Io.Clock.awake.now(h.io).toNanoseconds() - at;
+            if (idle < pol.stall_ns) continue;
+            var buf: [pair_why_max]u8 = undefined;
+            const why = std.fmt.bufPrint(&buf, "a round or prompt chunk made no progress for {d} s (a peer that stopped answering, or a device hang)", .{@divTrunc(idle, std.time.ns_per_s)}) catch "a round made no progress";
+            return h.pairBroken(why, false);
+        }
+    }
+
+    /// Sleeps until `until` in 10 ms steps; false as soon as pair_done is set.
+    fn sleepUnlessDone(h: *LaneHost, until: i96) bool {
+        while (std.Io.Clock.awake.now(h.io).toNanoseconds() < until) {
+            if (h.pair_done.load(.acquire)) return false;
+            std.Io.sleep(h.io, .fromMilliseconds(10), .awake) catch {};
+        }
+        return !h.pair_done.load(.acquire);
     }
 
     /// Clean shutdown on the engine thread, nothing left to serve: restores stopped, writes drained within flush_ns.
@@ -1024,9 +1512,11 @@ pub const LaneHost = struct {
         t.restore_wait_timeouts = hc.restore_wait_timeouts;
         t.restore_wait_ns = hc.restore_wait_ns;
         t.restore_wait_max_ns = hc.restore_wait_max_ns;
+        t.restores_deferred = hc.restores_deferred;
+        t.restores_deferred_expired = hc.restores_deferred_expired;
         t.cached_tokens = hc.cached_tokens;
         t.computed_tokens = hc.computed_tokens;
-        t.parked = h.loading.items.len;
+        t.parked = h.loading.items.len + h.deferred.items.len;
         return t;
     }
 };
@@ -1035,6 +1525,12 @@ pub const LaneHost = struct {
 fn note(comptime fmt: []const u8, args: anytype) void {
     if (@import("builtin").is_test) return;
     std.log.warn("lane host: " ++ fmt, args);
+}
+
+/// An error line (the broken pair's, the fence's); tests stay quiet too.
+fn noteErr(comptime fmt: []const u8, args: anytype) void {
+    if (@import("builtin").is_test) return;
+    std.log.err("lane host: " ++ fmt, args);
 }
 
 test "a lane host serves the core's own tokens, in order, and cancels between rounds" {
@@ -1216,7 +1712,47 @@ test "prefill interleave: a decoding stream keeps getting tokens and its cancel 
     try std.testing.expectEqual(Reason.cancelled, a.wait());
 }
 
+test "the service fence: never inside a round, a prompt pass's chunk or a graph capture; skipped and counted when not panicking" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
+    defer host.stop(); // (never started: frees the lists)
+    host.fence_panic = false;
+    try std.testing.expect(host.fenced("service")); // the run loop between rounds, or idle
+    host.rounds_open = 1; // inside the lane core's step: a round's launches in flight
+    try std.testing.expect(!host.fenced("service"));
+    host.rounds_open = 0;
+    var job: LaneHost.Job = undefined;
+    host.filling = &job; // a prompt pass running its chunk
+    try std.testing.expect(!host.fenced("service"));
+    host.in_between = true; // ... standing between two chunks (Stream.between)
+    try std.testing.expect(host.fenced("service"));
+    host.rounds_open = 1; // an interleaved round inside between
+    try std.testing.expect(!host.fenced("service"));
+    host.rounds_open = 0;
+    host.filling = null;
+    host.in_between = false;
+    const Capture = struct {
+        var on = true;
+        fn quiet(_: *anyopaque) bool {
+            return !on;
+        }
+    };
+    host.quiet = .{ .ctx = &host, .check = Capture.quiet }; // the backend capturing a CUDA graph
+    try std.testing.expect(!host.fenced("the lone driver's pump"));
+    Capture.on = false;
+    try std.testing.expect(host.fenced("the lone driver's pump"));
+    try std.testing.expectEqual(@as(u64, 4), host.service_refused);
+}
+
 test {
     _ = @import("lane_host_test.zig");
     _ = @import("lane_host_tier_test.zig");
+    _ = @import("lane_host_robust_test.zig");
 }

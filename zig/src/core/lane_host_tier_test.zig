@@ -15,13 +15,13 @@ const Reason = api.Reason;
 const gpa = std.testing.allocator;
 const io = std.testing.io;
 
-const Box = struct {
+pub const Box = struct {
     mutex: std.Io.Mutex = .init,
     tokens: std.ArrayList(u32) = .empty,
     cached: ?u32 = null,
     done: ?Reason = null,
 
-    fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
+    pub fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
         const b: *Box = @ptrCast(@alignCast(ctx));
         b.mutex.lockUncancelable(io);
         defer b.mutex.unlock(io);
@@ -31,10 +31,10 @@ const Box = struct {
             .finished => |f| b.done = f.reason,
         }
     }
-    fn sink(b: *Box) api.Sink {
+    pub fn sink(b: *Box) api.Sink {
         return .{ .ctx = b, .event = event };
     }
-    fn wait(b: *Box) Reason {
+    pub fn wait(b: *Box) Reason {
         while (true) {
             b.mutex.lockUncancelable(io);
             const d = b.done;
@@ -43,21 +43,21 @@ const Box = struct {
             std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
         }
     }
-    fn deinit(b: *Box) void {
+    pub fn deinit(b: *Box) void {
         b.tokens.deinit(gpa);
     }
-    fn finished(b: *Box) ?Reason {
+    pub fn finished(b: *Box) ?Reason {
         b.mutex.lockUncancelable(io);
         defer b.mutex.unlock(io);
         return b.done;
     }
-    fn count(b: *Box) usize {
+    pub fn count(b: *Box) usize {
         b.mutex.lockUncancelable(io);
         defer b.mutex.unlock(io);
         return b.tokens.items.len;
     }
     /// The reply equals the fake target's over `prompt` (any slip in the restored history changes it).
-    fn exact(b: *Box, prompt: []const u32) !void {
+    pub fn exact(b: *Box, prompt: []const u32) !void {
         var history: std.ArrayList(u32) = .empty;
         defer history.deinit(gpa);
         try history.appendSlice(gpa, prompt);
@@ -69,7 +69,7 @@ const Box = struct {
 };
 
 /// The fake backend, a prompt cache over its states, an in-memory tier and the host, at stable addresses.
-const Rig = struct {
+pub const Rig = struct {
     cfg: lanes.Config,
     target: lanes.fake.Fake,
     clock: lanes.fake.FixedClock = .{},
@@ -106,7 +106,12 @@ const Rig = struct {
         return kept;
     }
 
-    fn create(sp: api.Spill) !*Rig {
+    pub fn create(sp: api.Spill) !*Rig {
+        return createWith(sp, null);
+    }
+
+    /// `pre` runs on the host before its thread starts (the robustness tests' policies).
+    pub fn createWith(sp: api.Spill, pre: ?*const fn (*Rig) void) !*Rig {
         const r = try gpa.create(Rig);
         errdefer gpa.destroy(r);
         r.* = .{ .cfg = undefined, .target = .{ .gpa = gpa }, .core = undefined, .store = undefined, .tier = .{ .gpa = gpa, .codec = .{ .ctx = r, .pack = pack, .unpack = unpack } }, .host = undefined };
@@ -118,17 +123,18 @@ const Rig = struct {
         r.host.interleave_ns = 0;
         r.host.cache = &r.store;
         r.host.configure(sp);
+        if (pre) |f| f(r);
         try r.host.start();
         return r;
     }
 
-    fn stop(r: *Rig) void {
+    pub fn stop(r: *Rig) void {
         if (r.stopped) return;
         r.stopped = true;
         r.host.stop();
     }
 
-    fn destroy(r: *Rig) void {
+    pub fn destroy(r: *Rig) void {
         r.stop();
         r.store.deinit();
         r.tier.deinit();
@@ -139,18 +145,18 @@ const Rig = struct {
     }
 
     /// A published point of `key[0..at]` whose state is those tokens (the fake backend's state is its history).
-    fn point(r: *Rig, key: []const u32, at: u32) !u64 {
+    pub fn point(r: *Rig, key: []const u32, at: u32) !u64 {
         return r.tier.put(key[0..at], at, std.mem.sliceAsBytes(key[0..at]), 0, 0, false);
     }
 
-    fn stats(r: *Rig) api.CacheStats {
+    pub fn stats(r: *Rig) api.CacheStats {
         var st: api.Status = .{};
         r.host.engine().status(&st, &.{});
         return st.cache.?;
     }
 
     /// Waits (5 s at most) until the published counters satisfy `ok`.
-    fn until(r: *Rig, comptime ok: fn (api.CacheStats) bool) !void {
+    pub fn until(r: *Rig, comptime ok: fn (api.CacheStats) bool) !void {
         for (0..5000) |_| {
             if (ok(r.stats())) return;
             std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
@@ -159,8 +165,8 @@ const Rig = struct {
     }
 };
 
-const t1 = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3 };
-const t2 = t1 ++ [_]u32{ 7, 7, 5, 3, 8, 8 };
+pub const t1 = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3 };
+pub const t2 = t1 ++ [_]u32{ 7, 7, 5, 3, 8, 8 };
 
 test "a turn whose state left memory waits parked for its restore, resumes it exactly, and writes its own keeps forked from it" {
     const r = try Rig.create(.{ .load_ms = 5, .flush_ms = 1000 });

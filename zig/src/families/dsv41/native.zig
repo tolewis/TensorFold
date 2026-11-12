@@ -65,6 +65,9 @@ const prompt = @import("prompt.zig");
 const core = @import("core");
 const shard = @import("shard.zig");
 const kv_lanes = @import("kv_lanes.zig");
+const api = @import("engine_api");
+const comm = @import("comm.zig");
+const rdma = @import("rdma.zig");
 
 pub const model_type = "deepseek_v41";
 pub const formats: []const []const u8 = &.{"exl3-mul1"};
@@ -112,6 +115,10 @@ pub const Loaded = struct {
     replay: u32 = 0,
     /// TF_DS_KV_SHARD: the parts' counters and rows for /health and /metrics (null: the switch off).
     kv_parts: ?lanes.kv_parts.Source = null,
+    /// The broken-pair policy's hooks (TF_DS_PAIR_BROKEN, exit by default; null: degrade). `ctx` is `ctx`.
+    pair: ?Pair = null,
+    /// Whether the model's stream is free of a CUDA graph capture (the lane host's service fence), with `ctx`.
+    quiet: ?*const fn (ctx: *anyopaque) bool = null,
 };
 
 pub const Snaps = struct {
@@ -134,6 +141,9 @@ const State = struct {
     vision: ?*vision_mod.Vision = null,
     staging: ?cuda.HostBuffer = null, // the spill tier's pinned staging (allocated before the pool)
     events: []cuda.Event = &.{}, // one a staging slot
+    pair_host: ?*anyopaque = null, // the broken-pair policy's report (pairWatch): the lane host and its call
+    pair_broken: ?*const fn (host: *anyopaque, why: []const u8, drain: bool) void = null,
+    watch: ?link.Watch = null, // the followers' links, watched for a close while the policy is on (pairWatch)
 };
 
 fn getenv(name: [:0]const u8) ?[]const u8 {
@@ -169,11 +179,15 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const port = std.fmt.parseInt(u16, getenv("TF_TP_PORT") orelse "29620", 10) catch return error.BadPort;
     const arena_gib = if (getenv("TF_DS_ARENA_GIB")) |t| std.fmt.parseInt(usize, t, 10) catch return error.BadArena else 0;
     if (o.spill != null) try spillPreflight(getenvFn); // (before the staging, the weights and the pool)
+    const pair_mode = try pairMode(getenvFn); // (a bad value refused before anything loads)
     const st = try gpa.create(State);
     errdefer gpa.destroy(st);
     st.gpa = gpa;
     st.staging = null;
     st.events = &.{};
+    st.pair_host = null;
+    st.pair_broken = null;
+    st.watch = null;
     // the spill tier's staging comes out of memory before the pool is sized (PORT-SPILL-V2: budgeted first)
     if (o.spill) |sp| st.staging = try spillStaging(ctx, sp);
     errdefer if (st.staging) |*b| b.free();
@@ -245,11 +259,130 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         tier = st.lanes.spill.?.tier();
     }
     const kv_parts: ?lanes.kv_parts.Source = if (st.m.kvs != null) .{ .ctx = &st.lanes, .read = L.kvPartsFn } else null;
-    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null, .window = window, .tier = tier, .grid = model.chunk_rows, .replay = @intCast(st.m.cfg.window), .kv_parts = kv_parts };
+    const pair: ?Pair = if (pair_mode == .exit) .{ .watch = pairWatch, .abort = pairAbort } else null;
+    if (pair != null) std.log.info("dsv41: a broken rank pair ends this server with status {d} for a restart of both ranks (TF_DS_PAIR_BROKEN=degrade: requests fail one by one instead)", .{api.LaneHost.pair_exit_code});
+    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null, .window = window, .tier = tier, .grid = model.chunk_rows, .replay = @intCast(st.m.cfg.window), .kv_parts = kv_parts, .pair = pair, .quiet = quietFn };
+}
+
+// -- the broken-pair policy (robustness, docs/port/robustness.md) ------------------------------------------------
+
+/// TF_DS_PAIR_BROKEN: what rank 0 does once the pair cannot go on (a follower ended or stopped answering, a KV
+/// transfer failed across parts or timed out, the ranks' spill/KV-shard command streams diverged). `exit`, the
+/// default (unset or empty): the lane host admits nothing more, fails what waits, lets decoding streams finish within
+/// its bound (or fails them when the device stream is wedged), aborts the NCCL communicator and exits with
+/// LaneHost.pair_exit_code, so the service's supervisor (systemd) restarts both ranks; the communicator cannot be
+/// rebuilt in place, and the stock engine's rank 0 would wait on the dead peer forever. `degrade`: the old behaviour
+/// (requests fail one by one, the spill tier stops writing and restoring; the process stays up). Either way nothing
+/// acts before a failure: replies are unchanged. A server with one rank has no pair and no policy (dsv41 always runs
+/// two or four, TF_TP_WORLD).
+pub const PairMode = enum { degrade, exit };
+
+pub fn pairMode(env: *const fn ([:0]const u8) ?[]const u8) !PairMode {
+    const v = std.mem.trim(u8, nonEmpty(env("TF_DS_PAIR_BROKEN")) orelse return .exit, " ");
+    if (std.mem.eql(u8, v, "exit")) return .exit;
+    if (std.mem.eql(u8, v, "degrade")) return .degrade;
+    return error.BadPairBroken;
+}
+
+/// The errors from a prompt pass or a round that mean the pair broke (rank_wire's PairBroken; kv_lanes' transfers;
+/// a follower's StaleExtent/ShardDiverged reach rank 0 as its link going down; an aborted communicator; an RDMA ring
+/// that saw a dead peer or was aborted, RingFailed). None of them drains: the next round's collective would wait on
+/// the peer.
+pub const pair_fatal = [_]api.LaneHost.Fatal{
+    .{ .err = error.PairBroken, .drain = false },
+    .{ .err = error.TransferTimeout, .drain = false },
+    .{ .err = error.TransferFailed, .drain = false },
+    .{ .err = error.ShardDiverged, .drain = false },
+    .{ .err = error.PeerDown, .drain = false },
+    .{ .err = error.CommAborted, .drain = false },
+    .{ .err = error.RingFailed, .drain = false },
+};
+
+/// Loaded.pair: the hooks the server wires to its lane host (native/cuda.zig).
+pub const Pair = struct {
+    /// The family's own breaks reach `broken(host, ...)` from now on: the spill tier's on_broken and the KV
+    /// planner's on_end (call it once, after the lane host is set up and before it starts).
+    watch: *const fn (ctx: *anyopaque, host: *anyopaque, broken: *const fn (host: *anyopaque, why: []const u8, drain: bool) void) void,
+    /// Rank 0's NCCL communicator aborted (comm.zig, once): any stream wedged behind an unmatched call drains.
+    abort: *const fn (ctx: *anyopaque) void,
+    fatal: []const api.LaneHost.Fatal = &pair_fatal,
+};
+
+fn pairWatch(ctx: *anyopaque, host: *anyopaque, broken: *const fn (*anyopaque, []const u8, bool) void) void {
+    const st: *State = @ptrCast(@alignCast(ctx));
+    st.pair_host = host;
+    st.pair_broken = broken;
+    if (st.lanes.spill) |t| {
+        t.on_broken = spillBroken;
+        t.broken_ctx = st;
+    }
+    if (st.lanes.kv) |k| k.on_end = .{ .ctx = st, .call = kvEnded };
+    // a follower that died (killed, crashed) closes its link at once: the pair breaks now, not at the stall bound
+    st.watch = link.Watch.init(st.m.followers(), st, linkLost);
+    st.watch.?.start() catch |e| {
+        std.log.warn("dsv41: no watch over the followers' links ({s}): a dead follower is found by the stall monitor", .{@errorName(e)});
+        st.watch = null;
+    };
+}
+
+/// A follower's link closed (link.Watch, its thread): the process on the other end is gone, so every collective is
+/// stopped at once (a round blocked on the peer returns) and the pair is broken; nothing drains.
+fn linkLost(ctx: *anyopaque, follower: usize) void {
+    pairAbort(ctx);
+    const st: *State = @ptrCast(@alignCast(ctx));
+    var wbuf: [160]u8 = undefined;
+    report(st, linkLostWhy(&wbuf, follower), false);
+}
+
+/// The broken pair's cause when follower `i`'s link closed.
+pub fn linkLostWhy(buf: []u8, follower: usize) []const u8 {
+    return std.fmt.bufPrint(buf, "rank {d}'s link to rank 0 closed (its process ended or the connection reset)", .{follower + 1}) catch "a follower's link closed";
+}
+
+/// Every collective of this rank stopped (comm.abortAll): the RDMA rings' abort word (TP2's decode gathers run on
+/// the ring whenever TF_RDMA_DEVICES is set, and ncclCommAbort does not release a collect kernel spinning on a dead
+/// peer's flags), then NCCL. Any thread, once each.
+fn pairAbort(ctx: *anyopaque) void {
+    const st: *State = @ptrCast(@alignCast(ctx));
+    var buf: [3]*rdma.Ring = undefined;
+    _ = comm.abortAll(&st.m.comm, st.m.rdmaRings(&buf), "rank pair broken");
+}
+
+fn report(st: *State, why: []const u8, drain: bool) void {
+    if (st.pair_broken) |f| f(st.pair_host.?, why, drain);
+}
+
+/// The spill tier's agreement broke (it logged the rank and cause, and stops writing and restoring): rounds do not
+/// depend on it, so decoding streams may drain (the lane host's deadline bounds a round stuck on a dead peer).
+fn spillBroken(ctx: ?*anyopaque, err: anyerror) void {
+    const st: *State = @ptrCast(@alignCast(ctx.?));
+    var buf: [192]u8 = undefined;
+    var wbuf: [224]u8 = undefined;
+    const lead = if (st.lanes.spill) |t| t.lead else null;
+    const cause = if (lead) |l| (if (l.broken) |b| rank_wire.describeBroken(b, &buf) else @errorName(err)) else @errorName(err);
+    report(st, std.fmt.bufPrint(&wbuf, "the spill tier's agreement: {s}", .{cause}) catch cause, true);
+}
+
+/// Rank 0 ended the pair for a KV transfer of its own (kv_lanes.Kv.endPair): its stream may hold an unmatched NCCL
+/// half, so the communicator is aborted at once and nothing drains.
+fn kvEnded(ctx: *anyopaque, err: anyerror) void {
+    pairAbort(ctx);
+    const st: *State = @ptrCast(@alignCast(ctx));
+    var wbuf: [160]u8 = undefined;
+    report(st, std.fmt.bufPrint(&wbuf, "a KV transfer between the ranks: {s}", .{@errorName(err)}) catch @errorName(err), false);
+}
+
+/// Loaded.quiet: no CUDA graph capture in progress on the model's stream (a driver error reads as quiet: the
+/// fence then rests on the lane host's own round and chunk rules).
+fn quietFn(ctx: *anyopaque) bool {
+    const st: *State = @ptrCast(@alignCast(ctx));
+    const status = cuda.graph.captureStatus(st.m.stream) catch return true;
+    return status == .none;
 }
 
 fn deinitFn(ptr: *anyopaque) void {
     const st: *State = @ptrCast(@alignCast(ptr));
+    if (st.watch) |*w| w.end(); // (before the links close: rank 1 ending after `done` is no break)
     // the tier after the prompt cache's store (cuda.zig frees it first) and before the family: its store closes
     if (st.lanes.spill) |t| t.destroy();
     st.lanes.spill = null;
@@ -516,6 +649,9 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.TransferTimeout => "TF_DS_KV_SHARD=1: a KV transfer did not complete in time (a rank's half never ran, or a device fault; the GPU stream holds the unmatched call): restart; if it recurs, TF_DS_KV_SHARD_CARRY=0 or TF_DS_KV_SHARD=0",
         error.KvShardNotStarted, error.BadPlan => "TF_DS_KV_SHARD=1: the KV-part planner was not set up as the lanes need (an engine bug): restart with TF_DS_KV_SHARD=0",
         error.FollowerScanStalled => "rank 1's spill store scan stopped making progress (its log names the store): check its spill disk (TF_DS_SPILL_DIR), or start it with a fresh directory",
+        error.BadPairBroken => "TF_DS_PAIR_BROKEN: exit (the default: a broken rank pair ends the server with status 75 for its supervisor to restart both ranks) or degrade (requests fail one by one, the server stays up)",
+        error.CommAborted => "the ranks' NCCL communicator was aborted after a broken pair (a transfer that never completed): the server restarts both ranks",
+        error.RingFailed => "the ranks' RDMA ring failed (the peer stopped answering, or the ring was aborted after a broken pair): the server restarts both ranks",
         else => null,
     };
 }
@@ -528,6 +664,30 @@ test "refusals name what to set" {
         try std.testing.expect(std.mem.indexOf(u8, explain(null, err).?, "TF_DS_KV_SHARD=0") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoFreeSlot).?, "TF_DS_STREAMS") != null);
     try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));
+}
+
+test "TF_DS_PAIR_BROKEN: exit by default (spill and KV sharding off), degrade the opt-out, a bad value refused" {
+    const E = struct {
+        var v: ?[]const u8 = null;
+        fn get(name: [:0]const u8) ?[]const u8 {
+            if (std.mem.eql(u8, name, "TF_DS_PAIR_BROKEN")) return v;
+            if (std.mem.eql(u8, name, "TF_DS_KV_SHARD")) return "0";
+            return null; // (no TF_DS_SPILL_DIR; pairMode takes nothing of the spill tier either)
+        }
+    };
+    try std.testing.expectEqual(PairMode.exit, try pairMode(E.get)); // (unset)
+    E.v = "";
+    try std.testing.expectEqual(PairMode.exit, try pairMode(E.get)); // (empty: unset)
+    E.v = " exit ";
+    try std.testing.expectEqual(PairMode.exit, try pairMode(E.get));
+    E.v = "degrade";
+    try std.testing.expectEqual(PairMode.degrade, try pairMode(E.get));
+    for ([_][]const u8{ "restart", "Exit", "0", "1" }) |bad| {
+        E.v = bad;
+        try std.testing.expectError(error.BadPairBroken, pairMode(E.get));
+    }
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.BadPairBroken).?, "degrade") != null);
+    for (pair_fatal) |f| try std.testing.expect(!f.drain);
 }
 
 test "the spill tier's refusals from the environment come before anything loads, and each says what to set" {
@@ -564,4 +724,153 @@ test "the spill tier's refusals from the environment come before anything loads,
         try std.testing.expect(explain(null, err) != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SpillNotStarted).?, "TF_DS_SPILL_DIR") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoWeightsId).?, "TF_DS_RANK_CACHE_SHA") != null);
+}
+
+test "a follower killed mid-round: the link watch stops the collectives and the pair ends within a second" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    // a backend whose next round waits on the peer until the collectives are stopped (an RDMA collect spinning on a
+    // dead rank's flag), then fails as an aborted communicator does
+    const Stuck = struct {
+        inner: lanes.backend.Backend,
+        stuck: std.atomic.Value(bool) = .init(false),
+        entered: std.atomic.Value(bool) = .init(false),
+        aborted: std.atomic.Value(bool) = .init(false),
+        exits: std.atomic.Value(u32) = .init(0),
+        code: std.atomic.Value(u8) = .init(0),
+
+        fn backend(f: *@This()) lanes.backend.Backend {
+            return .{ .ptr = f, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
+        }
+        fn of(ptr: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(ptr));
+        }
+        fn round(f: *@This()) !void {
+            if (!f.stuck.load(.acquire)) return;
+            f.entered.store(true, .release);
+            while (!f.aborted.load(.acquire)) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+            return error.CommAborted;
+        }
+        fn prefill(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
+            return of(ptr).inner.vtable.prefill(of(ptr).inner.ptr, s);
+        }
+        fn first(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
+            return of(ptr).inner.vtable.first(of(ptr).inner.ptr, s, position);
+        }
+        fn queue(ptr: *anyopaque, s: *lanes.Stream, feed: lanes.backend.Feed, position: u64) anyerror!u64 {
+            try of(ptr).round();
+            return of(ptr).inner.vtable.queue(of(ptr).inner.ptr, s, feed, position);
+        }
+        fn read(ptr: *anyopaque, handle: u64) anyerror!u32 {
+            return of(ptr).inner.vtable.read(of(ptr).inner.ptr, handle);
+        }
+        fn verify(ptr: *anyopaque, windows: []const lanes.backend.Window, out: []lanes.backend.Verified) anyerror!void {
+            try of(ptr).round();
+            return of(ptr).inner.vtable.verify(of(ptr).inner.ptr, windows, out);
+        }
+        fn keep(ptr: *anyopaque, windows: []const lanes.backend.Window, paths: []const []const u32) anyerror!void {
+            return of(ptr).inner.vtable.keep(of(ptr).inner.ptr, windows, paths);
+        }
+        fn draft(ptr: *anyopaque, requests: []const lanes.backend.DraftRequest) anyerror!void {
+            return of(ptr).inner.vtable.draft(of(ptr).inner.ptr, requests);
+        }
+        fn release(ptr: *anyopaque, s: *lanes.Stream) void {
+            of(ptr).inner.vtable.release(of(ptr).inner.ptr, s);
+        }
+        fn abort(ctx: *anyopaque) void {
+            of(ctx).aborted.store(true, .release);
+        }
+        fn exit(ctx: *anyopaque, code: u8) void {
+            of(ctx).code.store(code, .release);
+            _ = of(ctx).exits.fetchAdd(1, .acq_rel);
+        }
+    };
+    // what linkLost does with the State's hooks: stop the collectives, then break the pair with nothing to drain
+    const Glue = struct {
+        stuck: *Stuck,
+        host: *api.LaneHost,
+        fn lost(ctx: *anyopaque, follower: usize) void {
+            const g: *@This() = @ptrCast(@alignCast(ctx));
+            Stuck.abort(g.stuck);
+            var buf: [160]u8 = undefined;
+            g.host.pairBroken(linkLostWhy(&buf, follower), false);
+        }
+    };
+    const Reply = struct {
+        mutex: std.Io.Mutex = .init,
+        tokens: usize = 0,
+        done: ?api.Reason = null,
+        message: [256]u8 = undefined,
+        len: usize = 0,
+        fn event(ctx: *anyopaque, _: api.Id, e: *const api.Event) void {
+            const b: *@This() = @ptrCast(@alignCast(ctx));
+            b.mutex.lockUncancelable(std.testing.io);
+            defer b.mutex.unlock(std.testing.io);
+            switch (e.*) {
+                .tokens => |t| b.tokens += t.len,
+                .finished => |f| {
+                    b.done = f.reason;
+                    b.len = @min(f.message.len, b.message.len);
+                    @memcpy(b.message[0..b.len], f.message[0..b.len]);
+                },
+                else => {},
+            }
+        }
+        fn state(b: *@This()) struct { tokens: usize, done: ?api.Reason } {
+            b.mutex.lockUncancelable(std.testing.io);
+            defer b.mutex.unlock(std.testing.io);
+            return .{ .tokens = b.tokens, .done = b.done };
+        }
+    };
+    const Follower = struct {
+        fn run(p: u16) void {
+            var l = link.Link.connect(std.testing.io, .{ 127, 0, 0, 1 }, p, 10) catch return;
+            var buf: [8]u8 = undefined;
+            _ = l.recv(&buf) catch {}; // "die"
+            l.close(); // (kill -9: the kernel closes the process's sockets)
+        }
+    };
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var stuck: Stuck = .{ .inner = target.backend() };
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    var clock: lanes.fake.FixedClock = .{};
+    var core_e = lanes.Engine.init(gpa, &cfg, stuck.backend(), clock.clock());
+    defer core_e.deinit();
+    var host = api.LaneHost.init(gpa, io, &core_e, .{ .lanes = 1 });
+    host.interleave_ns = 0;
+    // the deadline (30 s) and the stall monitor (off) cannot be what ends this
+    host.pair = .{ .ctx = &stuck, .abort = Stuck.abort, .exit = Stuck.exit, .deadline_ns = 30 * std.time.ns_per_s, .grace_ns = std.time.ns_per_ms, .stall_ns = 0, .fatal = &pair_fatal };
+    try host.start();
+    defer host.stop();
+    const port: u16 = 27100 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 400)));
+    const ft = try std.Thread.spawn(.{}, Follower.run, .{port});
+    var l = try link.Link.listen(.{ 127, 0, 0, 1 }, port);
+    defer l.close();
+    var glue: Glue = .{ .stuck = &stuck, .host = &host };
+    var w = link.Watch.init(&.{@as(?link.Link, l)}, &glue, Glue.lost);
+    try w.start();
+    defer w.end();
+    var a: Reply = .{};
+    const prompt_ids = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6 };
+    const long: api.Request = .{ .prompt = &prompt_ids, .max_tokens = 1 << 30 };
+    try host.engine().submit(1, &long, .{ .ctx = &a, .event = Reply.event });
+    while (a.state().tokens == 0) std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
+    stuck.stuck.store(true, .release); // the next round waits on rank 1
+    while (!stuck.entered.load(.acquire)) std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
+    const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
+    try l.send("die");
+    ft.join();
+    while (a.state().done == null or stuck.exits.load(.acquire) == 0) {
+        if (std.Io.Clock.awake.now(io).toNanoseconds() - t0 > 5 * std.time.ns_per_s) return error.Timeout;
+        std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
+    }
+    const took = std.Io.Clock.awake.now(io).toNanoseconds() - t0;
+    try std.testing.expect(took < std.time.ns_per_s); // (the watch's 100 ms period and 500 ms grace, then the abort)
+    try std.testing.expectEqual(api.Reason.failed, a.state().done.?);
+    try std.testing.expect(host.isBroken());
+    try std.testing.expect(std.mem.startsWith(u8, host.pair_why[0..host.pair_why_len], "rank 1's link to rank 0 closed"));
+    try std.testing.expect(!host.pair_drain);
+    try std.testing.expectEqual(api.LaneHost.pair_exit_code, stuck.code.load(.acquire));
 }

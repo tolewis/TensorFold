@@ -164,6 +164,10 @@ const Host = struct {
     kv_parts: ?lanes.kv_parts.Source = null, // the family's KV-ownership stats (its pool sharded over the ranks)
     snap_vt: api.prompt_cache.Snapshots.VTable = undefined,
     spill: ?api.Spill = null, // the spill tier the family bound: the lane host is configured with it
+    // robustness: the family's broken-pair policy and service fence, handed to the lane host before it starts
+    pair: ?api.LaneHost.PairPolicy = null,
+    pair_watch: ?*const fn (*anyopaque, *anyopaque, *const fn (*anyopaque, []const u8, bool) void) void = null,
+    quiet: ?api.LaneHost.Quiet = null,
 
     fn close(p: *anyopaque) void {
         const h: *Host = @ptrCast(@alignCast(p));
@@ -211,6 +215,9 @@ const Host = struct {
         if (h.cache) |*store| h.host.cache = store;
         h.host.kv_parts = h.kv_parts;
         if (h.spill) |sp| h.host.configure(sp); // (after the cache and its tier: Spill.unbound sees Status.cache)
+        h.host.pair = h.pair;
+        h.host.quiet = h.quiet;
+        if (h.pair_watch) |w| w(h.family, &h.host, api.LaneHost.pairBrokenFn); // (the family's breaks reach the host)
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
         try h.host.start();
     }
@@ -420,6 +427,15 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     });
     errdefer gpa.free(h.startup);
     if (@hasField(@TypeOf(loaded), "kv_parts")) h.kv_parts = loaded.kv_parts;
+    // robustness: a family's broken-pair policy (dsv41: TF_DS_PAIR_BROKEN=exit) and its device's word for the
+    // lane host's service fence; both null keep the host exactly as before
+    if (@hasField(@TypeOf(loaded), "pair")) if (loaded.pair) |p| {
+        h.pair = .{ .ctx = loaded.ctx, .abort = p.abort, .exit = pairExit, .fatal = p.fatal };
+        h.pair_watch = p.watch;
+    };
+    if (@hasField(@TypeOf(loaded), "quiet")) if (loaded.quiet) |q| {
+        h.quiet = .{ .ctx = loaded.ctx, .check = q };
+    };
     // a family that keeps prompt states (its snapshots) gets the prompt cache: states at its chunk ends
     if (@hasField(@TypeOf(loaded), "snaps")) if (loaded.snaps) |sn| {
         const want: u64 = @intFromFloat((o.prompt_cache_gib orelse 0.5) * gib);
@@ -448,6 +464,14 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(served), .startup = h.startup, .efforts = familyEfforts(F), .vision = vision, .call_gates = true }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
+}
+
+/// The broken-pair policy's exit (robustness): the lane host has failed every request and stopped the collectives;
+/// _exit skips the CUDA driver's exit handlers, which could wait on a stream a dead peer left wedged. The service's
+/// supervisor (systemd) restarts both ranks (rank 1 ends when its link to this rank goes).
+fn pairExit(_: *anyopaque, code: u8) void {
+    std.log.err("tensorfold: the rank pair broke; exiting with status {d} for a restart of both ranks", .{code});
+    std.c._exit(code);
 }
 
 /// A family's reasoning efforts as numbers its chat template takes (F.efforts: name and value), else none.

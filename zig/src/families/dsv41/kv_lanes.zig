@@ -290,6 +290,12 @@ pub const Kv = struct {
     peers_n: usize = 0,
     stats_at: u64 = 0,
     stats_wanted: bool = false, // /health or /metrics read the parts' stats since the last stats ask (wantStats)
+    /// robustness: told when rank 0 ends the pair for a transfer of its own (endPair: one across parts failed to
+    /// enqueue, or a side did not complete in time), whose device stream may then hold an unmatched NCCL half; the
+    /// server's broken-pair policy aborts the communicator and exits (native.zig). null: the error alone.
+    on_end: ?End = null,
+
+    pub const End = struct { ctx: *anyopaque, call: *const fn (ctx: *anyopaque, err: anyerror) void };
 
     const Wait = struct { key: usize, tag: u64, id: u64 };
     /// Waiting requests remembered at most (a request the host gave up while it waited is never told to the backend:
@@ -505,6 +511,7 @@ pub const Kv = struct {
     /// Rank 0 ends the pair for a cause of its own (rank_wire's Leader.fail: `broken` names rank 0 and the cause,
     /// the first cause wins). No followers: the cause itself.
     fn endPair(kv: *Kv, err: anyerror) anyerror {
+        defer if (kv.on_end) |e| e.call(e.ctx, err); // (after `broken` names the cause)
         kv.counts.failed_sides += 1;
         const l = kv.leader orelse return err;
         return l.fail(0, err);
@@ -1710,6 +1717,46 @@ test "a carry across parts: a follower half that fails to enqueue, or rank 0's s
         p.dev0.fail_next = true;
         try testing.expectError(error.PairBroken, p.kv.admit(4, 4, 0, 12 * C, 500, false));
         try testing.expectEqual(@as(anyerror, error.InjectedFailure), p.leader.broken.?.err);
+    }
+}
+
+test "rank 0 ending the pair for its own transfer tells the broken-pair policy once, with the cause; a refused carry does not" {
+    const gpa = testing.allocator;
+    const Seen = struct {
+        calls: usize = 0,
+        err: ?anyerror = null,
+        broken_first: bool = false,
+        leader: ?*rank_wire.Leader = null,
+        fn call(ctx: *anyopaque, err: anyerror) void {
+            const x: *@This() = @ptrCast(@alignCast(ctx));
+            x.calls += 1;
+            x.err = err;
+            x.broken_first = x.leader.?.broken != null; // the cause is recorded before the policy hears it
+        }
+    };
+    for ([_]bool{ false, true }) |timeout| {
+        const p = try Pair.init(gpa, sharded, .{ .twins = false });
+        defer p.deinit();
+        var seen: Seen = .{ .leader = &p.leader };
+        p.kv.on_end = .{ .ctx = &seen, .call = Seen.call };
+        _ = try carrySetup(p);
+        if (timeout) p.dev0.fail_wait = true else p.dev0.fail_next = true;
+        try testing.expectError(error.PairBroken, p.kv.admit(4, 4, 0, 12 * C, 500, false));
+        try testing.expectEqual(@as(usize, 1), seen.calls);
+        try testing.expectEqual(@as(anyerror, if (timeout) error.TransferTimeout else error.InjectedFailure), seen.err.?);
+        try testing.expect(seen.broken_first);
+    }
+    {
+        const p = try Pair.init(gpa, sharded, .{ .twins = false });
+        defer p.deinit();
+        var seen: Seen = .{ .leader = &p.leader };
+        p.kv.on_end = .{ .ctx = &seen, .call = Seen.call };
+        _ = try carrySetup(p);
+        p.dev0.fail_check = true;
+        p.dev1.fail_check = true;
+        _ = try p.kv.admit(4, 4, 0, 12 * C, 500, false); // refused alike: finished failed, the pair goes on
+        try testing.expectEqual(@as(usize, 0), seen.calls);
+        try testing.expect(p.leader.broken == null);
     }
 }
 

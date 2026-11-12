@@ -742,3 +742,70 @@ test "lineage: a fresh pass starts its own, a resumed one forks its state's at t
     try std.testing.expectEqual(@as(u32, 2), rc.n);
     try std.testing.expectEqual(@as(u64, 1), rc.slice()[1].crc_errors);
 }
+
+test "a restore refused for room or capacity: the shorter memory state stays when it can, a restore that can start wins" {
+    var f: Sum = .{};
+    var tier: FakeTier = .{ .gpa = gpa, .codec = f.codec() };
+    defer tier.deinit();
+    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 1 << 20); // states of 100 + at bytes
+    defer s.deinit();
+    s.setTier(tier.tier(), 0);
+    const a = seq(48, 1);
+    try std.testing.expect(keepAt(&s, &f, &a, 10, .{})); // memory: 110 bytes at 10
+    _ = try tier.put(a[0..30], 30, std.mem.asBytes(&Sum.State{ .at = 30, .sum = Sum.fresh(&a, 30) }), 0, 0, false);
+    const pr = s.probe(&a, &.{});
+    const hit = pr.memory.?;
+    const p = pr.durable.?;
+    // the tier full before any room is made: refused with nothing evicted and nothing asked of begin, counted once a
+    // request however often it asks again
+    tier.full = 2;
+    try std.testing.expectError(error.TierFull, s.restoreBeginOver(p, &a, .{ .have = hit }));
+    try std.testing.expectError(error.TierFull, s.restoreBeginOver(p, &a, .{ .have = hit, .again = true }));
+    try std.testing.expect(s.deferrable(error.TierFull));
+    try std.testing.expectEqual(@as(u64, 1), s.stats.restores_refused);
+    try std.testing.expectEqual(@as(u64, 0), tier.begins);
+    try std.testing.expectEqual(hit, s.find(&a, &.{}).?); // the pass resumes at 10, not 0
+    // room for both: the tier's own capacity refusal at begin leaves the hit too
+    tier.refuse = 1;
+    try std.testing.expectError(error.TooManyRestores, s.restoreBeginOver(p, &a, .{ .have = hit }));
+    try std.testing.expect(s.deferrable(error.TooManyRestores));
+    for ([_]anyerror{ error.TooMany, error.NoSlot, error.Busy }) |e| try std.testing.expect(s.deferrable(e));
+    try std.testing.expect(!s.deferrable(error.PointMissing));
+    try std.testing.expectEqual(@as(usize, 0), s.restoring.items.len);
+    try std.testing.expectEqual(@as(u64, 0), s.restoring_bytes);
+    try std.testing.expectEqual(hit, s.find(&a, &.{}).?);
+    // a budget that holds the restore (130) but not both (240): the restore starts, evicting the shorter state as
+    // restoreBegin always did (a 2k memory hit never costs a 100k restore)
+    s.budget = 200;
+    const r = try s.restoreBeginOver(p, &a, .{ .have = hit });
+    try std.testing.expectEqual(@as(usize, 0), s.entries.items.len);
+    try std.testing.expectEqual(pc.Restored.adopted, settle(&s, r));
+    try std.testing.expectEqual(@as(u32, 30), s.find(&a, &.{}).?.at);
+}
+
+test "a NoRoom is worth waiting for only when the restores in flight hold the rest of the budget" {
+    var f: Sum = .{};
+    var tier: FakeTier = .{ .gpa = gpa, .codec = f.codec() };
+    defer tier.deinit();
+    tier.polls = 1 << 20; // restores stay in flight
+    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 300);
+    defer s.deinit();
+    s.setTier(tier.tier(), 0);
+    const a = seq(48, 1);
+    const b = seq(48, 101);
+    _ = try tier.put(a[0..30], 30, std.mem.asBytes(&Sum.State{ .at = 30, .sum = Sum.fresh(&a, 30) }), 0, 0, false);
+    _ = try tier.put(b[0..40], 40, std.mem.asBytes(&Sum.State{ .at = 40, .sum = Sum.fresh(&b, 40) }), 0, 0, false);
+    const ra = try s.restoreBeginOver(s.probe(&a, &.{}).durable.?, &a, .{}); // 130 of 300 in flight
+    // b's 140 beside a's 130 fit; with the budget at 250 they do not, until a's ends
+    s.budget = 250;
+    try std.testing.expectError(error.NoRoom, s.restoreBeginOver(s.probe(&b, &.{}).durable.?, &b, .{}));
+    try std.testing.expect(s.deferrable(error.NoRoom));
+    try std.testing.expectEqual(@as(u64, 1), s.stats.restores_refused);
+    s.restoreCancel(ra);
+    try std.testing.expect(!s.deferrable(error.NoRoom)); // (nothing in flight: waiting frees nothing)
+    // a budget that can never hold it: never deferred (the probe already refuses such a point; asked directly here)
+    const pb = s.probe(&b, &.{}).durable.?;
+    s.budget = 100;
+    try std.testing.expectError(error.NoRoom, s.restoreBeginOver(pb, &b, .{}));
+    try std.testing.expect(!s.deferrable(error.NoRoom));
+}

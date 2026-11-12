@@ -23,6 +23,16 @@ pub const FakeTier = struct {
     polls: u32 = 1,
     /// The next restore fails with this error (on its first poll).
     fail_next: ?anyerror = null,
+    /// The next `refuse` begins are refused with `refuse_err` before anything is reserved (a tier at its capacity:
+    /// dsv41's TooManyRestores, the store's TooMany/NoSlot); `refused` counts them.
+    refuse: u32 = 0,
+    refuse_err: anyerror = error.TooManyRestores,
+    refused: u64 = 0,
+    begins: u64 = 0,
+    /// The next `full` asks of Tier.VTable.full answer true (the tier at its cap before any room is made; `fulls`
+    /// counts the asks).
+    full: u32 = 0,
+    fulls: u64 = 0,
     /// Shorter states are not written.
     min_tokens: u32 = 0,
     /// A flush cannot drain: its queue is left unpublished.
@@ -65,7 +75,7 @@ pub const FakeTier = struct {
     }
 
     pub fn tier(t: *FakeTier) pc.Tier {
-        return .{ .ptr = t, .vtable = &.{ .lookup = lookup, .begin = begin, .poll = poll, .cancel = cancel, .keep = keep, .release = release, .share = share, .touch = touch, .forget = forget, .pump = pump, .busy = busy, .flush = flush, .counts = counts } };
+        return .{ .ptr = t, .vtable = &.{ .lookup = lookup, .begin = begin, .full = isFull, .poll = poll, .cancel = cancel, .keep = keep, .release = release, .share = share, .touch = touch, .forget = forget, .pump = pump, .busy = busy, .flush = flush, .counts = counts } };
     }
 
     fn lock(t: *FakeTier) void {
@@ -123,10 +133,26 @@ pub const FakeTier = struct {
         return .{ .id = p.id, .at = p.at, .tokens = @intCast(p.key.len), .bytes = p.size, .group = p.group, .shared = p.shared };
     }
 
+    fn isFull(ptr: *anyopaque) bool {
+        const t = of(ptr);
+        t.lock();
+        defer t.unlock();
+        t.fulls += 1;
+        if (t.full == 0) return false;
+        t.full -= 1;
+        return true;
+    }
+
     fn begin(ptr: *anyopaque, p: *const pc.Point) anyerror!u64 {
         const t = of(ptr);
         t.lock();
         defer t.unlock();
+        t.begins += 1;
+        if (t.refuse > 0) {
+            t.refuse -= 1;
+            t.refused += 1;
+            return t.refuse_err;
+        }
         if (t.find(p.id) == null) {
             t.c.presence_refused += 1;
             return error.PointMissing;

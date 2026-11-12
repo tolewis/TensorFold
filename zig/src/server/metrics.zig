@@ -143,8 +143,23 @@ pub const Metrics = struct {
         if (status.preemptions) |p| try gauge(w, "preemptions_total", "counter", "Requests that had to give a lane up to a later one.", p);
         if (status.cache) |c| try cacheFamilies(w, c);
         if (status.kv_parts) |k| try kvPartFamilies(w, k);
+        if (status.pair) |p| try pairFamilies(w, p);
     }
 };
+
+/// The rank pair's robustness counters and state (a backend with a broken-pair policy or a disk tier):
+/// tensorfold:service_refused and tensorfold:pair_failed (counters, /health's names), then the gauges
+/// tensorfold:pair_busy_ms, pair_stall_ms, pair_stalled and pair_broken (booleans as 0/1).
+pub fn pairFamilies(w: *std.Io.Writer, p: api.PairStatus) !void {
+    const H = api.PairStatus.help;
+    const info = @typeInfo(api.PairStatus).@"struct";
+    inline for (info.field_names, info.field_types) |name, T| {
+        const v: u64 = if (T == bool) @intFromBool(@field(p, name)) else @field(p, name);
+        const kind = comptime kindOf(&api.PairStatus.gauges, name);
+        const full = comptime if (std.mem.eql(u8, kind, "counter")) name else "pair_" ++ name;
+        try gauge(w, full, kind, @field(H, name), v);
+    }
+}
 
 /// The prompt cache's counters (its tier or grouping on): the GLM engine's names for continuation, then
 /// tensorfold:prompt_cache_* and the tier's tensorfold:spill_*{rank="N"}.
@@ -400,6 +415,33 @@ test "cache families: present only with the cache's counters, every field with i
         "tensorfold:spill_writes_committed{rank=\"1\"} 8\n",
         "tensorfold:spill_crc_errors{rank=\"1\"} 1\n",
         "# TYPE tensorfold:spill_staging_peak gauge\n",
+    }) |line| try std.testing.expect(std.mem.indexOf(u8, body, line) != null);
+}
+
+test "pair families: present only with the pair's status, the two counters and the stall state" {
+    const gpa = std.testing.allocator;
+    var m: Metrics = .{ .gpa = gpa };
+    var stub: RenderStub = .{};
+    var plain: std.Io.Writer.Allocating = .init(gpa);
+    defer plain.deinit();
+    try m.render(std.testing.io, &plain.writer, stub.engine(), 4096);
+    try std.testing.expect(std.mem.indexOf(u8, plain.written(), "service_refused") == null);
+    try std.testing.expect(std.mem.indexOf(u8, plain.written(), "pair_") == null);
+    stub.status_value.pair = .{ .service_refused = 3, .pair_failed = 2, .busy_ms = 121000, .stall_ms = 120000, .stalled = true };
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try m.render(std.testing.io, &out.writer, stub.engine(), 4096);
+    const body = out.written();
+    for ([_][]const u8{
+        "# TYPE tensorfold:service_refused counter\n",
+        "tensorfold:service_refused 3\n",
+        "# TYPE tensorfold:pair_failed counter\n",
+        "tensorfold:pair_failed 2\n",
+        "# TYPE tensorfold:pair_busy_ms gauge\n",
+        "tensorfold:pair_busy_ms 121000\n",
+        "tensorfold:pair_stall_ms 120000\n",
+        "tensorfold:pair_stalled 1\n",
+        "tensorfold:pair_broken 0\n",
     }) |line| try std.testing.expect(std.mem.indexOf(u8, body, line) != null);
 }
 

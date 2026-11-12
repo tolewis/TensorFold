@@ -9,18 +9,24 @@ const Conn = @import("http_conn.zig").Conn;
 const Value = json.Value;
 const Allocator = std.mem.Allocator;
 
-/// With keys on, health names nothing about the model.
+/// With keys on, health names nothing about the model. A rank pair whose round is past its stall bound, or that
+/// broke, answers 503 with status "stalled" or "broken" (only a backend with a broken-pair policy reports one).
 pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
-    if (srv.keys) |k| if (k.enabled()) return conn.sendJson(200, "{\"status\": \"ok\"}");
+    var status: api.Status = .{};
+    srv.engine.status(&status, &.{});
+    const word = if (status.pair) |p| p.health() else "ok";
+    const code: u16 = if (std.mem.eql(u8, word, "ok")) 200 else 503;
+    if (srv.keys) |k| if (k.enabled()) {
+        if (code == 200) return conn.sendJson(200, "{\"status\": \"ok\"}");
+        return conn.sendJson(code, if (std.mem.eql(u8, word, "broken")) "{\"status\": \"broken\"}" else "{\"status\": \"stalled\"}");
+    };
     const o = try json.newObject(a);
-    try o.put(a, "status", .{ .string = "ok" });
+    try o.put(a, "status", .{ .string = word });
     try o.put(a, "model", .{ .string = srv.config.served_name });
     const ids = try a.alloc(Value, srv.config.model_ids.len);
     for (srv.config.model_ids, ids) |id, *slot| slot.* = .{ .string = id };
     try o.put(a, "model_ids", .{ .array = ids });
     try o.put(a, "max_batch_size", try json.intValue(a, srv.info.lanes));
-    var status: api.Status = .{};
-    srv.engine.status(&status, &.{});
     try o.put(a, "warming", .{ .bool = status.warming });
     const memory = try json.newObject(a);
     if (srv.engine.memory(std.mem.indexOf(u8, conn.path, "reset_peak=1") != null)) |mem| {
@@ -32,7 +38,17 @@ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
     try o.put(a, "live", try live.snapshot(a, srv.engine));
     if (status.cache) |c| try putCache(a, o, c);
     if (status.kv_parts) |k| try putKvParts(a, o, k);
-    routes.sendValue(conn, a, 200, .{ .object = o });
+    if (status.pair) |p| try putPair(a, o, p);
+    routes.sendValue(conn, a, code, .{ .object = o });
+}
+
+/// The rank pair's robustness counters and state, under "pair" (a backend with a broken-pair policy or a disk tier).
+pub fn putPair(a: Allocator, o: *json.Object, p: api.PairStatus) !void {
+    const po = try json.newObject(a);
+    inline for (@typeInfo(api.PairStatus).@"struct".field_names, @typeInfo(api.PairStatus).@"struct".field_types) |name, T| {
+        if (T == bool) try po.put(a, name, .{ .bool = @field(p, name) }) else try po.put(a, name, try json.intValue(a, @field(p, name)));
+    }
+    try o.put(a, "pair", .{ .object = po });
 }
 
 /// The prompt cache's counters, when its tier or grouping is on: the GLM engine's top-level names (chats_continued,
@@ -226,4 +242,21 @@ test "health's kv shard counters: every counter under kv_shard, each part's rows
     try std.testing.expectEqualStrings("12", pr[1].object.get("owner_rounds").?.int);
     try std.testing.expectEqualStrings("1", pr[1].object.get("transfers_failed").?.int);
     try std.testing.expectEqualStrings("11", pr[0].object.get("owner_rounds").?.int);
+}
+
+test "health's pair status: every field under pair, the word is ok, stalled or broken" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const o = try json.newObject(a);
+    try putPair(a, o, .{ .service_refused = 2, .pair_failed = 1, .busy_ms = 7, .stall_ms = 120000, .stalled = true });
+    const po = o.get("pair").?.object;
+    try std.testing.expectEqualStrings("2", po.get("service_refused").?.int);
+    try std.testing.expectEqualStrings("1", po.get("pair_failed").?.int);
+    try std.testing.expectEqualStrings("120000", po.get("stall_ms").?.int);
+    try std.testing.expect(po.get("stalled").?.bool);
+    try std.testing.expect(!po.get("broken").?.bool);
+    try std.testing.expectEqualStrings("ok", (api.PairStatus{}).health());
+    try std.testing.expectEqualStrings("stalled", (api.PairStatus{ .stalled = true }).health());
+    try std.testing.expectEqualStrings("broken", (api.PairStatus{ .stalled = true, .broken = true }).health());
 }

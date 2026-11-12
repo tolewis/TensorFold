@@ -31,7 +31,7 @@ const default_nap_ns: u64 = 100 * std.time.ns_per_us;
 
 extern "c" fn prctl(option: c_int, arg2: c_ulong, arg3: c_ulong, arg4: c_ulong, arg5: c_ulong) c_int;
 
-pub const Error = error{ VerbsFailed, PostFailed, BadMtu, BadInfo, TooLarge, Failed, NoHostRegister, BadRdmaIdle, BadRdmaNap } || cuda.Error || fabric.verbs.Error || std.posix.MMapError || std.Thread.SpawnError;
+pub const Error = error{ VerbsFailed, PostFailed, BadMtu, BadInfo, TooLarge, RingFailed, NoHostRegister, BadRdmaIdle, BadRdmaNap } || cuda.Error || fabric.verbs.Error || std.posix.MMapError || std.Thread.SpawnError;
 
 /// TF_RDMA_IDLE_S: seconds with nothing posted or reaped before the proxy naps (0: never nap; default 2).
 fn parseIdleNs(text: []const u8) Error!u64 {
@@ -484,7 +484,7 @@ pub const Ring = struct {
     }
     /// recv [world x n4 float4] <- every rank's send [n4 float4] (fp32, 16-byte aligned), on `stream`.
     pub fn gather(r: *Ring, stream: cuda.Stream, send: DevicePtr, n4: u32, recv: DevicePtr) Error!void {
-        if (r.failure() != null) return error.Failed;
+        if (r.failure() != null) return error.RingFailed; // (a dead peer, or an abort: rank pair broken)
         if (@as(usize, n4) * 16 > r.s.max_bytes) return error.TooLarge;
         const own: DevicePtr = if (r.s.own_early) recv + @as(u64, r.rank) * n4 * 16 else 0;
         try r.stage(stream, send, n4, own, n4, n4);
@@ -513,7 +513,7 @@ pub const Ring = struct {
     /// Every rank's [rows, w_p] fp32 slice straight into dsts[p]; `send` is this rank's slice, contiguous. Every rank
     /// names the same widths, so each peer's ring slot holds rows x w_p floats.
     pub fn gatherInto(r: *Ring, stream: cuda.Stream, send: DevicePtr, rows: u32, own_row4: u32, dsts: []const Dst) Error!void {
-        if (r.failure() != null) return error.Failed;
+        if (r.failure() != null) return error.RingFailed; // (a dead peer, or an abort: rank pair broken)
         if (dsts.len != r.world) return error.BadInfo;
         const n4 = rows * own_row4;
         if (@as(usize, n4) * 16 > r.s.max_bytes) return error.TooLarge;

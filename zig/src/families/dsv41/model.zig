@@ -626,6 +626,30 @@ pub const Model = struct {
         }
     }
 
+    /// This rank's RDMA rings (TP2's decode gathers, or world 4's three), into `buf`: what a broken pair's abort stops.
+    pub fn rdmaRings(m: *Model, buf: *[3]*rdma.Ring) []const *rdma.Ring {
+        var n: usize = 0;
+        if (m.ring) |r| {
+            buf[n] = r;
+            n += 1;
+        }
+        if (m.rdma_rings) |rs| for ([_]*rdma.Ring{ rs.all4, rs.col, rs.pair }) |r| {
+            if (n == buf.len) break;
+            buf[n] = r;
+            n += 1;
+        };
+        return buf[0..n];
+    }
+
+    /// A ring that failed (its proxy saw a dead peer, or an abort): a round replayed from a graph does not ask the
+    /// ring, its collect kernel just gave up on the abort word, so the round's rows are not the model's. Rounds check
+    /// this after reading their tokens back (error.RingFailed: rank pair broken).
+    pub fn ringFailed(m: *Model) bool {
+        var buf: [3]*rdma.Ring = undefined;
+        for (m.rdmaRings(&buf)) |r| if (r.failure() != null) return true;
+        return false;
+    }
+
     /// The compressed rows of positions [0, at) of the extent at `from` copied into the extent at `to` (a kept prompt
     /// resumed in another extent while a live stream holds its own), in the stream's order: every kv-source layer's
     /// codes and scales and its index keys, the rows view() places at those positions.
@@ -634,18 +658,27 @@ pub const Model = struct {
     /// (the other rank holds none), across parts (a carry) the source's owner sends them straight from its plane and the
     /// destination's owner receives them into its own, both ranks in this same order (lanes.zig runs copyExtent on
     /// every rank in its frame order). The source's rows stay; nothing is freed.
+    ///
+    /// Every refusal comes first (checkExtent: the pool's bounds, the parts, every source's ratio, overlapping extents),
+    /// so a refused copy enqueues nothing: never a partial copy that leaves some layers' rows moved and others not.
+    /// With every argument valid the copies are the same, in the same order, as before the check moved up front.
     pub fn copyExtent(m: *Model, from: usize, to: usize, at: usize) !void {
-        // PORT(round3): copyExtent may call checkExtent first so a refusal never follows a partial copy; kept as it
-        // was here so the switch-off path is unchanged (kv_lanes calls checkExtent before every transfer)
+        return m.copyExtentPinned(from, to, at, null);
+    }
+
+    /// copyExtent whose source rows must still be the ones `pin` recorded (its generation stamp, spill_state's
+    /// Generations): a source rewritten since then (a placement staled it, a stream wrote over it) is refused with
+    /// error.StaleExtent before anything is enqueued, so a late copy never attaches old bytes to a reused extent.
+    pub fn copyExtentPinned(m: *Model, from: usize, to: usize, at: usize, pin: ?ExtentPin) !void {
+        const mv = try m.checkExtentPinned(from, to, at, pin);
         const c = m.eng.c;
         const cs = &m.caches;
-        const mv: ?shard.Move = if (cs.shard) |sh| try sh.extentMove(from, to, at) else null;
-        var spans: [2 * 64]comm_mod.Span = undefined;
+        var spans: [2 * max_extent_sources]comm_mod.Span = undefined;
         var ns: usize = 0;
         for (m.eng.w.layers, 0..) |lay, i| {
             if (lay.comp_wkv == null) continue;
             const r: usize = lay.ratio;
-            if (from % r != 0 or to % r != 0 or at % r != 0) return error.BadView;
+            std.debug.assert(from % r == 0 and to % r == 0 and at % r == 0 and ns + 2 <= spans.len); // (checkExtent)
             const n = at / r;
             const cb = c.head_dim / 2;
             const sb = c.head_dim / 16;
@@ -694,12 +727,48 @@ pub const Model = struct {
     /// kv source's ratio (BadView). Deterministic: every rank refuses the same arguments alike under the agreed
     /// layout (kv_lanes.zig checks before any rank enqueues its side, so a refused carry leaves no NCCL half waiting).
     pub fn checkExtent(m: *const Model, from: usize, to: usize, at: usize) !void {
-        if (m.caches.shard) |sh| _ = try sh.extentMove(from, to, at);
+        _ = try m.checkExtentPinned(from, to, at, null);
+    }
+
+    /// The kv-source layers a copyExtent carries at most (its span list: codes and scales of each).
+    pub const max_extent_sources = 64;
+
+    /// A copyExtent source's generation, recorded when its rows were the caller's (Generations.pin over
+    /// [from, from + at)): copyExtentPinned refuses the copy when they changed since.
+    pub const ExtentPin = struct { gens: *const spill.Generations, src: spill.ExtentRef };
+
+    /// checkExtent with an optional source pin; the compressed rows' move on this rank (null: replicated).
+    fn checkExtentPinned(m: *const Model, from: usize, to: usize, at: usize, pin: ?ExtentPin) !?shard.Move {
+        var ratios: [16]usize = undefined;
+        var nr: usize = 0;
+        var sources: usize = 0;
         for (m.eng.w.layers) |lay| {
             if (lay.comp_wkv == null) continue;
+            sources += 1;
+            if (sources > max_extent_sources) return error.BadView; // (copyExtent's spans: two a source)
             const r: usize = lay.ratio;
-            if (from % r != 0 or to % r != 0 or at % r != 0) return error.BadView;
+            if (std.mem.indexOfScalar(usize, ratios[0..nr], r) != null) continue;
+            if (nr == ratios.len) return error.BadView;
+            ratios[nr] = r;
+            nr += 1;
         }
+        return extentRefusal(m.caches.cap, ratios[0..nr], m.caches.shard, from, to, at, pin);
+    }
+
+    /// copyExtent's refusals as plain data (host-testable): the extents [from, from + at) and [to, to + at) inside the
+    /// pool's `cap` positions (ExtentOutOfPool), in one part each (shard.Shard.extentMove: CrossesPart), on every
+    /// source's ratio (BadView), not overlapping unless they are the same extent (ExtentsOverlap: a device copy over
+    /// its own source is undefined), and the source still at its pin's generation (StaleExtent). Returns the
+    /// compressed rows' move on this rank (sharded), else null.
+    pub fn extentRefusal(cap: usize, ratios: []const usize, sh: ?shard.Shard, from: usize, to: usize, at: usize, pin: ?ExtentPin) !?shard.Move {
+        if (from > cap or to > cap or at > cap - from or at > cap - to) return error.ExtentOutOfPool;
+        const mv: ?shard.Move = if (sh) |x| try x.extentMove(from, to, at) else null;
+        for (ratios) |r| if (r == 0 or from % r != 0 or to % r != 0 or at % r != 0) return error.BadView;
+        if (from != to and at > 0 and from < to + at and to < from + at) return error.ExtentsOverlap;
+        if (pin) |p| {
+            if (p.src.lo > from or p.src.hi < from + at or !p.gens.current(p.src)) return error.StaleExtent;
+        }
+        return mv;
     }
 
     /// Rows [from, from + n) of `plane` (rows of `row` bytes; a sharded plane's rows of this rank's part) to rows
@@ -1272,6 +1341,45 @@ pub const Model = struct {
         try dr.pass(&m.eng, &m.ch, pool, tokens, q0, slots, steps, null);
     }
 };
+
+test "copyExtent's refusals come before anything is enqueued: pool bounds, parts, ratios, overlap, a stale source" {
+    const R = Model.extentRefusal;
+    const ratios = [_]usize{ 1, 2 };
+    const cap: usize = 16384;
+    // valid: replicated (no move), the same extent (a copy onto itself stays as before), an empty copy
+    try std.testing.expectEqual(@as(?shard.Move, null), try R(cap, &ratios, null, 0, 4096, 2048, null));
+    try std.testing.expectEqual(@as(?shard.Move, null), try R(cap, &ratios, null, 2048, 2048, 2048, null));
+    _ = try R(cap, &ratios, null, 0, 14336, 2048, null); // ends exactly at the pool's end
+    // bounds: either extent past the pool (no wrap-around through a huge `at`)
+    try std.testing.expectError(error.ExtentOutOfPool, R(cap, &ratios, null, 15360, 0, 2048, null));
+    try std.testing.expectError(error.ExtentOutOfPool, R(cap, &ratios, null, 0, 15360, 2048, null));
+    try std.testing.expectError(error.ExtentOutOfPool, R(cap, &ratios, null, 20000, 0, 0, null));
+    try std.testing.expectError(error.ExtentOutOfPool, R(cap, &ratios, null, 2048, 0, std.math.maxInt(usize) - 1024, null));
+    // ratios: every source's rows whole
+    try std.testing.expectError(error.BadView, R(cap, &ratios, null, 0, 4096, 2047, null));
+    try std.testing.expectError(error.BadView, R(cap, &ratios, null, 1, 4096, 2048, null));
+    // overlapping extents (a device copy over its own source): either direction
+    try std.testing.expectError(error.ExtentsOverlap, R(cap, &ratios, null, 0, 1024, 2048, null));
+    try std.testing.expectError(error.ExtentsOverlap, R(cap, &ratios, null, 1024, 0, 2048, null));
+    _ = try R(cap, &ratios, null, 0, 2048, 2048, null); // adjacent: fine
+    // sharded (two 8192-position parts): within a part the owner copies, across parts rank 0 sends to rank 1
+    const sh = try shard.Shard.init(0, 2, cap, 48);
+    try std.testing.expectEqual(shard.Move{ .local = .{ .from = 0, .to = 4096 } }, (try R(cap, &ratios, sh, 0, 4096, 2048, null)).?);
+    try std.testing.expectEqual(shard.Move{ .send = .{ .from = 0, .peer = 1 } }, (try R(cap, &ratios, sh, 0, 8192, 2048, null)).?);
+    try std.testing.expectError(error.CrossesPart, R(cap, &ratios, sh, 7168, 0, 2048, null));
+    // a source pinned at its generation: refused once its rows changed, or when the pin does not cover them
+    var gens = try Model.spill.Generations.init(std.testing.allocator, cap, 2048);
+    defer gens.deinit(std.testing.allocator);
+    const pin: Model.ExtentPin = .{ .gens = &gens, .src = try gens.pin(4096, 8192) };
+    _ = try R(cap, &ratios, null, 4096, 0, 4096, pin);
+    try std.testing.expectError(error.StaleExtent, R(cap, &ratios, null, 4096, 10240, 6144, pin)); // past the pin
+    try std.testing.expectError(error.StaleExtent, R(cap, &ratios, null, 2048, 8192, 2048, pin)); // before it
+    gens.bump(6000, 6001); // a stream wrote over one of its rows
+    try std.testing.expectError(error.StaleExtent, R(cap, &ratios, null, 4096, 0, 4096, pin));
+    // bounds come first, then the parts, then the ratios (each refusal alike on every rank)
+    try std.testing.expectError(error.ExtentOutOfPool, R(cap, &ratios, sh, 15360, 7168, 2047, null));
+    try std.testing.expectError(error.CrossesPart, R(cap, &ratios, sh, 7168, 0, 2047, null));
+}
 
 test "pickWindow: --context wins and must match TF_DS_WINDOW; a follower takes TF_DS_WINDOW, else rank 0's" {
     try std.testing.expectEqual(@as(?usize, 1048576), try Model.pickWindow(1048576, 2101248, null));

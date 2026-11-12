@@ -2,7 +2,9 @@
 //! multi.py's Link sends them. One connection, TCP_NODELAY, SO_BUSY_POLL, blocking reads (recvSpin polls first).
 //! The other direction carries only the followers' replies to rank 0's asking rank_wire frames (recvWithin,
 //! readableAny: bounded waits; see rank_wire.zig and docs/port/rank-wire.md for the rules that keep it deadlock-free).
+//! Rank 0 also watches the followers' links for a close (Watch): a follower that died breaks the pair at once.
 const std = @import("std");
+const builtin = @import("builtin");
 const c = std.c;
 
 pub const Link = struct {
@@ -210,6 +212,85 @@ pub fn readableAny(links: []const Link, ready: []bool, timeout_ns: u64) !usize {
     }
 }
 
+/// Linux reports a peer's close (FIN or reset) as POLLRDHUP even while unread bytes wait; elsewhere (the host tests'
+/// macOS) a close is the peeked end of the stream, seen once nothing is left to read.
+const rdhup: i16 = if (builtin.os.tag == .linux) 0x2000 else 0; // POLLRDHUP (asm-generic/poll.h; not in std's aarch64 POLL)
+
+/// Which of `links` is gone (the peer closed it, reset it, or it errs), looking for up to `ms` (0: only now); null if
+/// none. Never consumes a byte: replies still waiting stay for their reader.
+pub fn gone(links: []const Link, ms: c_int) ?usize {
+    std.debug.assert(links.len <= 8);
+    var fds: [8]c.pollfd = undefined;
+    const ev: i16 = if (rdhup != 0) rdhup else c.POLL.IN;
+    for (links, 0..) |l, i| fds[i] = .{ .fd = l.fd, .events = ev, .revents = 0 };
+    const n = c.poll(&fds, @intCast(links.len), ms);
+    if (n <= 0) return null;
+    for (fds[0..links.len], 0..) |f, i| {
+        if (f.revents & (c.POLL.HUP | c.POLL.ERR | c.POLL.NVAL | rdhup) != 0) return i;
+        if (rdhup == 0 and f.revents & c.POLL.IN != 0) {
+            var b: [1]u8 = undefined;
+            const r = c.recv(f.fd, &b, 1, c.MSG.PEEK | c.MSG.DONTWAIT);
+            if (r == 0) return i; // the end of the stream
+            if (r < 0) switch (c.errno(r)) {
+                .AGAIN, .INTR => {},
+                else => return i,
+            };
+        }
+    }
+    // bytes wait to be read and nothing closed: elsewhere than Linux the next poll would return at once, so wait here
+    if (rdhup == 0 and ms > 0) _ = c.poll(&fds, 0, ms);
+    return null;
+}
+
+/// Rank 0's watch over its followers' links (TF_DS_PAIR_BROKEN=exit): a follower whose process ended (killed,
+/// crashed) closes its socket at once, so the pair is known broken within `period_ms` instead of the stall monitor's
+/// bound, even while rank 0's engine thread is blocked in a round on that peer. `lost` runs once, on this thread, with
+/// the follower's index (0: rank 1), `grace_ms` after the close was seen (a stop of both ranks at once, stop.sh's,
+/// reaches rank 0 meanwhile and ends as a shutdown); then the watch ends. A stopped follower keeps its socket open:
+/// that stays the stall monitor's. End it (`end`) before rank 0 itself closes the links.
+pub const Watch = struct {
+    links: [7]Link = undefined,
+    n: usize = 0,
+    ctx: *anyopaque,
+    lost: *const fn (ctx: *anyopaque, follower: usize) void,
+    period_ms: c_int = 100,
+    grace_ms: u32 = 500,
+    stop: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+
+    pub fn init(followers: []const ?Link, ctx: *anyopaque, lost: *const fn (*anyopaque, usize) void) Watch {
+        var w: Watch = .{ .ctx = ctx, .lost = lost };
+        for (followers) |f| if (f) |l| {
+            w.links[w.n] = l;
+            w.n += 1;
+        };
+        return w;
+    }
+
+    pub fn start(w: *Watch) !void {
+        if (w.n == 0) return;
+        w.thread = try std.Thread.spawn(.{}, run, .{w});
+    }
+
+    /// Stops the watch: it never reports after this returns. Idempotent.
+    pub fn end(w: *Watch) void {
+        w.stop.store(true, .release);
+        if (w.thread) |t| t.join();
+        w.thread = null;
+    }
+
+    fn run(w: *Watch) void {
+        while (!w.stop.load(.acquire)) {
+            const i = gone(w.links[0..w.n], w.period_ms) orelse continue;
+            var none: [1]c.pollfd = undefined; // (poll over no descriptors: a 10 ms sleep)
+            var waited: u32 = 0;
+            while (waited < w.grace_ms and !w.stop.load(.acquire)) : (waited += 10) _ = c.poll(&none, 0, 10);
+            if (!w.stop.load(.acquire)) w.lost(w.ctx, i);
+            return;
+        }
+    }
+};
+
 /// "192.0.2.7" as four bytes.
 pub fn parseIp(text: []const u8) ![4]u8 {
     var out: [4]u8 = undefined;
@@ -282,4 +363,100 @@ test "a reply that does not come in time is a timeout, a readable link says so" 
     var rest: [8]u8 = undefined;
     _ = c.recv(l.fd, &rest, rest.len, 0); // "ello"
     try std.testing.expectError(error.PeerDown, l.recvWithin(&buf, std.time.ns_per_s));
+}
+
+/// What a test's Watch saw: how many reports, the follower, and when (Link.monotonicNs).
+const Seen = struct {
+    n: std.atomic.Value(u32) = .init(0),
+    follower: std.atomic.Value(usize) = .init(99),
+    at: std.atomic.Value(u64) = .init(0),
+
+    fn lost(ctx: *anyopaque, follower: usize) void {
+        const s: *Seen = @ptrCast(@alignCast(ctx));
+        s.follower.store(follower, .release);
+        s.at.store(Link.monotonicNs(), .release);
+        _ = s.n.fetchAdd(1, .acq_rel);
+    }
+    fn waitReport(s: *Seen, ms: u32) bool {
+        var waited: u32 = 0;
+        while (s.n.load(.acquire) == 0 and waited < ms) : (waited += 5) std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake) catch {};
+        return s.n.load(.acquire) > 0;
+    }
+};
+
+/// A follower that sends a reply, waits for "go", then ends (its socket closes as a killed process's would).
+const Ending = struct {
+    fn run(p: u16) void {
+        var l = Link.connect(std.testing.io, .{ 127, 0, 0, 1 }, p, 10) catch return;
+        l.send("reply") catch {};
+        var buf: [8]u8 = undefined;
+        _ = l.recv(&buf) catch {};
+        l.close();
+    }
+};
+
+test "the watch sees a follower's link close within its period and grace, once; a reply waiting is no close" {
+    const io = std.testing.io;
+    const port: u16 = 28100 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 400)));
+    const t = try std.Thread.spawn(.{}, Ending.run, .{port});
+    var l = try Link.listen(.{ 127, 0, 0, 1 }, port);
+    defer l.close();
+    try std.testing.expect(try l.readable(2 * std.time.ns_per_s));
+    try std.testing.expectEqual(@as(?usize, null), gone(&.{l}, 50)); // the unread reply is not a close
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("reply", try l.recv(&buf));
+    var seen: Seen = .{};
+    var w = Watch.init(&.{@as(?Link, l)}, &seen, Seen.lost);
+    w.grace_ms = 200;
+    try w.start();
+    defer w.end();
+    std.Io.sleep(io, .fromMilliseconds(250), .awake) catch {};
+    try std.testing.expectEqual(@as(u32, 0), seen.n.load(.acquire)); // an open, quiet link: nothing
+    const t0 = Link.monotonicNs();
+    try l.send("go");
+    t.join(); // the follower's socket is closed
+    try std.testing.expect(seen.waitReport(2000));
+    try std.testing.expect(seen.at.load(.acquire) - t0 < std.time.ns_per_s);
+    try std.testing.expectEqual(@as(usize, 0), seen.follower.load(.acquire));
+    std.Io.sleep(io, .fromMilliseconds(150), .awake) catch {};
+    try std.testing.expectEqual(@as(u32, 1), seen.n.load(.acquire)); // once
+}
+
+test "an ended watch never reports, even when the follower then goes" {
+    const io = std.testing.io;
+    const port: u16 = 28600 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 400)));
+    const t = try std.Thread.spawn(.{}, Ending.run, .{port});
+    var l = try Link.listen(.{ 127, 0, 0, 1 }, port);
+    defer l.close();
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("reply", try l.recv(&buf));
+    var seen: Seen = .{};
+    var w = Watch.init(&.{ null, @as(?Link, l) }, &seen, Seen.lost);
+    try std.testing.expectEqual(@as(usize, 1), w.n); // (an absent follower is not watched)
+    try w.start();
+    w.end();
+    w.end(); // (idempotent)
+    try l.send("go");
+    t.join();
+    std.Io.sleep(io, .fromMilliseconds(300), .awake) catch {};
+    try std.testing.expectEqual(@as(u32, 0), seen.n.load(.acquire));
+    try std.testing.expectEqual(@as(?usize, 0), gone(&.{l}, 1000)); // (the close is there to see)
+}
+
+test "Linux: a close behind bytes not yet read is seen at once (POLLRDHUP)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    const port: u16 = 29100 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 400)));
+    const Peer = struct {
+        fn run(p: u16) void {
+            var l = Link.connect(std.testing.io, .{ 127, 0, 0, 1 }, p, 10) catch return;
+            l.send("unread") catch {};
+            l.close();
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Peer.run, .{port});
+    var l = try Link.listen(.{ 127, 0, 0, 1 }, port);
+    defer l.close();
+    t.join();
+    try std.testing.expectEqual(@as(?usize, 0), gone(&.{l}, 1000));
 }

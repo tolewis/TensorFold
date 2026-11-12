@@ -201,6 +201,9 @@ pub const Spill = struct {
     load_ms: u32 = 40,
     /// TF_SPILL_LOAD_WAIT_MS: how long a request waits parked on a restore before it is admitted without it.
     load_wait_ms: u32 = 30_000,
+    /// TF_SPILL_DEFER_MS: how long a request whose restore the tier refused for capacity (restores or read slots in
+    /// flight) waits to ask again before it is admitted on what memory holds (0: at once).
+    defer_ms: u32 = 5_000,
     /// TF_SPILL_FLUSH_MS: a clean shutdown's bound for draining writes.
     flush_ms: u32 = 60_000,
 
@@ -248,6 +251,8 @@ pub const CacheStats = struct {
     restore_wait_timeouts: u64 = 0,
     restore_wait_ns: u64 = 0,
     restore_wait_max_ns: u64 = 0,
+    restores_deferred: u64 = 0,
+    restores_deferred_expired: u64 = 0,
     writes_enqueued: u64 = 0,
     shared_promoted: u64 = 0,
     flushes: u64 = 0,
@@ -281,7 +286,7 @@ pub const CacheStats = struct {
         .restores_failed = "Disk restores aborted on every rank (missing, damaged, guarded).",
         .restores_cancelled = "Disk restores stopped: no request waited for them any more, or shutdown.",
         .restores_dropped = "Installed disk restores not adopted: no room, or memory already had them.",
-        .restores_refused = "Disk restores not begun: the memory budget could not hold their destination.",
+        .restores_refused = "Disk restores not begun: the memory budget could not hold their destination, or the tier was at its capacity (once a request).",
         .restores_active = "Disk restore jobs in flight.",
         .restoring_bytes = "Memory the disk restores in flight reserved, charged to the prompt cache's budget.",
         .restore_blocks_done = "Blocks the restores in flight have copied so far.",
@@ -291,6 +296,8 @@ pub const CacheStats = struct {
         .restore_wait_timeouts = "Requests admitted without their disk restore after TF_SPILL_LOAD_WAIT_MS.",
         .restore_wait_ns = "Nanoseconds requests waited for disk restores.",
         .restore_wait_max_ns = "The longest wait for a disk restore, in nanoseconds.",
+        .restores_deferred = "Requests whose disk restore was refused for capacity (restores or read slots in flight) and retried shortly instead of prefilling.",
+        .restores_deferred_expired = "Of them, requests admitted on what memory holds after TF_SPILL_DEFER_MS without the restore starting.",
         .writes_enqueued = "Kept states enqueued for the disk tier at their keep.",
         .shared_promoted = "Disk points promoted to shared prefixes.",
         .flushes = "Clean-shutdown flushes of the disk tier.",
@@ -338,6 +345,42 @@ pub const Status = struct {
     cache: ?CacheStats = null,
     /// KV ownership's counters and parts (a backend that shards its pool over the ranks: dsv41's TF_DS_KV_SHARD).
     kv_parts: ?KvParts = null,
+    /// The rank pair's robustness counters and state (a backend with a broken-pair policy, or the prompt cache's
+    /// disk tier); null otherwise (no /health or /metrics output).
+    pair: ?PairStatus = null,
+};
+
+/// LaneHost's broken-pair policy and service fence, for /health and /metrics.
+pub const PairStatus = struct {
+    /// Services asked for inside a round, a prompt chunk or a CUDA graph capture, skipped (an engine bug).
+    service_refused: u64 = 0,
+    /// Requests failed because the rank pair broke.
+    pair_failed: u64 = 0,
+    /// Milliseconds the engine thread has been busy (a round, a prompt chunk) without progress; 0: idle or no policy.
+    busy_ms: u64 = 0,
+    /// The stall bound in milliseconds (0: no stall monitor or no policy).
+    stall_ms: u64 = 0,
+    /// Busy without progress for at least the stall bound: /health answers 503 "stalled".
+    stalled: bool = false,
+    /// The pair broke (the server ends shortly): /health answers 503 "broken".
+    broken: bool = false,
+
+    pub const help = .{
+        .service_refused = "Parked-work services asked for inside a round, a prompt chunk or a CUDA graph capture, skipped.",
+        .pair_failed = "Requests failed because the rank pair broke.",
+        .busy_ms = "Milliseconds the engine thread has been busy without progress (0: idle).",
+        .stall_ms = "The stall bound: busy this long without progress breaks the pair (0: no stall monitor).",
+        .stalled = "1 while the engine thread has been busy past the stall bound.",
+        .broken = "1 once the rank pair broke.",
+    };
+    pub const gauges = [_][]const u8{ "busy_ms", "stall_ms", "stalled", "broken" };
+
+    /// What /health's status says: "ok", else why the server is unhealthy.
+    pub fn health(p: PairStatus) []const u8 {
+        if (p.broken) return "broken";
+        if (p.stalled) return "stalled";
+        return "ok";
+    }
 };
 
 /// A backend's KV-ownership counters and every part's rows (lanes.kv_parts).
