@@ -179,7 +179,9 @@ pub const Ck = struct {
     pub fn lane8Rs(c: *const Ck, s: Stream, x8: u64, m: usize, w: qmmf.Weight, sa: u64, y: u64, part: u64) !void {
         if (w.mode != .fp8g) return error.FormatMismatch;
         if (m < prompt_tokens) return error.NeedsPromptRows;
-        const sk = qmmf.splitK(w.n, w.k);
+        // No split-K: at a prompt's rows the 128-row tiles already fill the GPU, and one rule for every prompt
+        // chunk keeps a row's bits independent of where the chunk was cut (tf_ck8_128rc stays for other callers).
+        const sk: u32 = 1;
         const cluster = sk > 1 and sk <= 8 and c.clusters;
         if (sk > 1 and !cluster) return error.NeedsPartials;
         const bn: usize = if (cluster) 128 else 64;
