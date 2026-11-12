@@ -69,9 +69,11 @@ pub const Acts = struct {
     nsa: ?*anyopaque = null,
     nsl: ?*anyopaque = null,
     pscr: *anyopaque, // fp32 [maxRows, D] (slice totals of the narrow prompt GEMM)
-    logits: *anyopaque, // fp16 [16, VOCAB]
+    logits: *anyopaque, // fp16 [16, HEAD]: the head GEMM's rows; the full vocab, or its half with XPU_HSPLIT (WP6)
+    lfull: ?*anyopaque = null, // XPU_HSPLIT: fp16 [16, VOCAB], the full rows the masked argmax reads (both halves, rank 0)
     taps: *anyopaque, // bf16 [maxRows, 5 D]: hidden states after TAP_LAYERS, when Mode.taps
-    tok: *anyopaque, // i32
+    tok: *anyopaque, // i32 [16]
+    tokv: *anyopaque, // f32 [16] at tok + 64: the winner's value (XPU_HSPLIT, argmax_v's OUTV)
     pv: *anyopaque, // argmax partials: f32 [256], i32 [256]
     pi: *anyopaque,
     mrows: *anyopaque, // i32 [16]: argmaxMasked's rows
@@ -94,8 +96,9 @@ pub const Acts = struct {
     kpos: *anyopaque, // i32 [16]: its K1 POS (every row's last prefix key, p0 - 1)
     kposm: *anyopaque, // i32 [16]: its merge POS (p0 + span - 1, so the draft's slice NS joins)
 
-    pub fn init(d: *Dev) !Acts {
+    pub fn init(d: *Dev, head: u32) !Acts {
         const rows = q.maxRows();
+        const tok = try d.alloc_(16 * 4 * 2); // i32[16] the winners, then f32[16] their values (XPU_HSPLIT pushes both at once)
         const nc = limits.chunks(rows);
         const ns = limits.splits(q.MAX_CTX, SPLIT);
         return .{
@@ -128,8 +131,10 @@ pub const Acts = struct {
             .nsa = if (q.norm_shadow[0] != null) try d.alloc_(16 * D * 2) else null,
             .nsl = if (q.norm_shadow[0] != null) try d.alloc_(16 * D * 2) else null,
             .pscr = try d.alloc_(rows * D * 4),
-            .logits = try d.alloc_(16 * VOCAB * 2),
-            .tok = try d.alloc_(16 * 4),
+            .logits = try d.alloc_(16 * head * 2),
+            .lfull = if (head < VOCAB) try d.alloc_(16 * VOCAB * 2) else null,
+            .tok = tok,
+            .tokv = off(tok, 64),
             .pv = try d.alloc_(16 * 1024),
             .pi = try d.alloc_(16 * 1024),
             .mrows = try d.alloc_(16 * 4),
@@ -698,8 +703,11 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
     q.prof.site = .head;
     if (m.head.x3) |e| try exl3.project(e, m.exl3.?, d, off(a.h, first * D * 2), a.logits, rows, false) else try gemm(d, a.pscr, off(a.h, first * D * 2), off(a.ahi, first * (D / m.head.gs) * 2), off(a.alo, first * (D / m.head.gs) * 2), m.head, a.logits, rows);
     q.prof.site = .none;
-    try d.launch(d.k.argmax_part, .{ .x = 256, .y = rows }, .{ a.logits, @as(i32, VOCAB), a.pv, a.pi });
-    try d.launch(d.k.argmax, .{ .x = rows }, .{ a.pv, a.pi, a.tok });
+    try d.launch(d.k.argmax_part, .{ .x = 256, .y = rows }, .{ a.logits, @as(i32, @intCast(m.head.n)), a.pv, a.pi });
+    if (q.hsplit) { // XPU_HSPLIT (WP6): this rank's half-vocab winner and its value, then the two winners to the global one
+        try d.launch(d.k.argmax_v, .{ .x = rows }, .{ a.pv, a.pi, a.tok, a.tokv });
+        if (ranks.group) |*g| try g.headExchange(d, a.tok, a.logits, @intCast(rows));
+    } else try d.launch(d.k.argmax, .{ .x = rows }, .{ a.pv, a.pi, a.tok });
     var toks: [16]i32 = undefined;
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &toks, a.tok, rows * 4, null, 0, null));
     try d.sync();

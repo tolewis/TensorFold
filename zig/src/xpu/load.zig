@@ -361,7 +361,8 @@ pub fn loadMlxTp(d: *Dev, c: *const Checkpoint) !Model {
         m.embed_b = try bf16Tensor(d, c, "model.embed_tokens.biases");
     }
     m.norm = try bf16Tensor(d, c, "model.norm.weight");
-    m.head = try projection(d, c, "lm_head", &.{""}, true, false, stage); // whole on every rank: the hidden state is whole
+    // XPU_HSPLIT (WP6): each rank holds half of the head's vocab rows (rank 0 the low half, rank 1 the high). Off: whole on every rank
+    m.head = if (q.hsplit) try projectionCut(d, c, "lm_head", &.{ .{ .name = "", .cut = mlx.Cut.cols(R * (q.VOCAB / 2), q.VOCAB / 2) } }, true, false, stage) else try projection(d, c, "lm_head", &.{""}, true, false, stage);
     var invf: [32]f32 = undefined;
     for (&invf, 0..) |*f, i| f.* = @floatCast(std.math.pow(f64, 1e7, -@as(f64, @floatFromInt(i)) / 32.0));
     m.invf = try d.upload(std.mem.sliceAsBytes(&invf));

@@ -1644,6 +1644,7 @@ fn kernels(d: *Dev, mk: *MoeKernels) !void {
         .attn_gate = try d.kernel(mg, "attn_gate", 256),
         .swiglu = try d.kernel(mg, "swiglu", 256),
         .argmax = try d.kernel(mg, "argmax", 256),
+        .argmax_v = try d.kernel(mg, "argmax_v", 256),
         .argmax_part = try d.kernel(mg, "argmax_part", 256),
         .argmax_part_masked = try d.kernel(mg, "argmax_part_masked", 256),
         .tap = try d.kernel(mg, "tap", 256),

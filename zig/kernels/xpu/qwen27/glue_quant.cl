@@ -244,6 +244,36 @@ KERNEL(256) void argmax(global const float *PV, global const int *PI, global int
     OUT[row] = idx;
   }
 }
+// argmax that also writes the winner's value: OUT[row] = first-idx winner, OUTV[row] = its fp16 value. The TP head split
+// argmaxes each rank's half of the vocab, then argmax_tp picks the better of the two winners.
+KERNEL(256) void argmax_v(global const float *PV, global const int *PI, global int *OUT, global float *OUTV) {
+  local float bv[256];
+  local int bi[256];
+  const int lid = get_local_id(0), row = get_group_id(0);
+  bv[lid] = PV[row * 256 + lid];
+  bi[lid] = PI[row * 256 + lid];
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (lid == 0) {
+    float best = bv[0];
+    int idx = bi[0];
+    for (int i = 1; i < 256; i++)
+      if (bv[i] > best || (bv[i] == best && bi[i] < idx)) { best = bv[i]; idx = bi[i]; }
+    OUT[row] = idx;
+    OUTV[row] = best;
+  }
+}
+// TP head merge: this rank's half-vocab winner (OWN, idx in [0,HALF)) and the peer's (PEER) to the global winner,
+// in place on the own winner. OWN_OFF/PEER_OFF are each half's column offset (0 for the low, HALF for the high), so
+// the global idx is the offset plus the local idx. On a value tie the smaller global idx wins (as the whole-vocab argmax).
+KERNEL(16) void argmax_tp(global const int *OWNI, global const float *OWNV, global const int *PEERI, global const float *PEERV,
+                          int OWN_OFF, int PEER_OFF, global int *OUT, global float *OUTV) {
+  const int lid = get_local_id(0), row = get_group_id(0);
+  if (lid != 0) return;
+  const float ov = OWNV[row], pv = PEERV[row];
+  const int oi = OWN_OFF + OWNI[row], pi = PEER_OFF + PEERI[row];
+  if (ov > pv || (ov == pv && oi < pi)) { OUT[row] = oi; OUTV[row] = ov; }
+  else { OUT[row] = pi; OUTV[row] = pv; }
+}
 
 // Taps for the drafter: TAPS[t][slot·D + e] = bf16(x + r) (the full hidden state after the layer), [T, 5 D].
 KERNEL(256) void tap(global const float *X, global const half *R, global ushort *TAPS, int D, int slot) {

@@ -53,6 +53,9 @@ pub const FF = 17408;
 pub const TP: u32 = @import("xpu").kernel_options.tp; // -Dtp (zig/build/xpu.zig), 1 by default
 /// This process's rank, 0 to TP - 1 (TF_TP_RANK at start). Rank 0 serves and drafts. 0 at TP 1.
 pub var RANK: u32 = 0;
+/// XPU_HSPLIT (WP6, lane p4-headsplit, default off): each TP 2 rank holds half of the head's vocab rows and the ranks
+/// merge their winners (`tp.Group.headExchange`). On only with TP 2, the EX exchange (TF_TP_DEVFLAG=3 or 4) and MLX.
+pub var hsplit = false;
 pub const GDN_K_HEADS = 16 / TP; // GDN query and key heads of 128
 pub const GDN_V_HEADS = 48 / TP; // GDN value heads of 128 (and the z gate, a and b)
 pub const ATT_Q_HEADS = 24 / TP; // attention query heads of 256, each with a gate of 256
@@ -569,6 +572,11 @@ pub const Runner = struct {
             }
         }
         if (park_on and RANK == 0) std.log.info("qwen27-xpu: rank {d}: idle kept prompt states park in host memory (XPU_PARK_GIB): {d} GiB a rank", .{ RANK, park_gib / @as(f64, @floatFromInt(TP)) });
+        hsplit = false;
+        if (tp.hsplit_env) { // XPU_HSPLIT (WP6): the EX exchange carries the winners, so it needs TF_TP_DEVFLAG=3 or 4
+            if (tp.group) |*g| hsplit = TP == 2 and g.ex != 0 and fmt_mlx;
+            if (hsplit) std.debug.print("hsplit: XPU_HSPLIT=1 (rank {d}: the head holds vocab rows {d} to {d}, the winners and rank 1's halves go through the EX exchange)\n", .{ RANK, RANK * (VOCAB / 2), (RANK + 1) * (VOCAB / 2) - 1 }) else std.log.warn("qwen27-xpu: rank {d}: XPU_HSPLIT needs TP 2, TF_TP_DEVFLAG=3 or 4 and the MLX weights: the head stays whole", .{RANK});
+        }
         const d = &r.d;
         errdefer d.g.close();
         d.list = try d.g.immediate(0, 0);
@@ -592,6 +600,7 @@ pub const Runner = struct {
             .attn_gate = try d.kernel(mg, "attn_gate", 256),
             .swiglu = try d.kernel(mg, "swiglu", 256),
             .argmax = try d.kernel(mg, "argmax", 256),
+            .argmax_v = try d.kernel(mg, "argmax_v", 256),
             .argmax_part = try d.kernel(mg, "argmax_part", 256),
             .argmax_part_masked = try d.kernel(mg, "argmax_part_masked", 256),
             .tap = try d.kernel(mg, "tap", 256),
@@ -609,6 +618,7 @@ pub const Runner = struct {
             .tp_norm_peer = try d.kernel(mg, "add_rmsnorm_dec_peer", 512),
             .tp_consume = try d.kernel(mg, "tp_consume", 16),
             .tp_probe = try d.kernel(mg, "tp_probe", 16),
+            .argmax_tp = try d.kernel(mg, "argmax_tp", 16),
             .attn_prompt = try d.kernel(md, "attn_prompt", 128),
             .attn_prompt8 = try d.kernel(md, "attn_prompt8", 128),
             .embed_dense = try d.kernel(mg, "embed_dense", 256),
@@ -808,7 +818,8 @@ pub const Runner = struct {
         prof.on = false; // not during the load
         r.model = try load(d, &ckpt);
         prof.on = prof_on;
-        r.acts = try Acts.init(d);
+        if (hsplit and r.model.head.n != VOCAB / 2) return error.HeadSplitShape;
+        r.acts = try Acts.init(d, r.model.head.n); // the head GEMM's n: the full vocab, or its half with XPU_HSPLIT
         if (r.model.exl3) |x| try x.bind(d, &r.model, &r.acts); // the EXL3 plans over the activations
         r.store(); // slot 0: the states the load allocated
         try d.fill(r.acts.zeros, @as(u16, 0), maxRows() * GDN_V_HEADS * 128 * 2);
@@ -1321,7 +1332,9 @@ pub const Runner = struct {
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, r.acts.mrows, &rh, n * 4, null, 0, null));
         errdefer d.settle(); // rh and toks live in this frame and bits is the caller's: errors wait for the queue
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, r.acts.mbits, bits.ptr, bits.len * 4, null, 0, null));
-        try d.launch(d.k.argmax_part_masked, .{ .x = 256, .y = @intCast(n) }, .{ r.acts.logits, @as(i32, VOCAB), r.acts.mbits, @as(i32, @intCast(words)), r.acts.mrows, r.acts.pv, r.acts.pi });
+        const lg = if (hsplit) r.acts.lfull.? else r.acts.logits; // XPU_HSPLIT: the masked rows as full rows, on the card
+        if (hsplit) for (rows) |x| try tp.group.?.headSplice(d, r.acts.logits, x, off(lg, @as(usize, x) * VOCAB * 2), off(lg, (@as(usize, x) * VOCAB + VOCAB / 2) * 2));
+        try d.launch(d.k.argmax_part_masked, .{ .x = 256, .y = @intCast(n) }, .{ lg, @as(i32, VOCAB), r.acts.mbits, @as(i32, @intCast(words)), r.acts.mrows, r.acts.pv, r.acts.pi });
         try d.launch(d.k.argmax, .{ .x = @intCast(n) }, .{ r.acts.pv, r.acts.pi, r.acts.mtok });
         var toks: [16]i32 = undefined;
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &toks, r.acts.mtok, n * 4, null, 0, null));
@@ -1333,7 +1346,11 @@ pub const Runner = struct {
     pub fn rowLogits(r: *Runner, row: u32) ![]const f32 {
         const raw = try alloc.alloc(f16, VOCAB);
         defer alloc.free(raw);
-        try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, raw.ptr, off(r.acts.logits, row * VOCAB * 2), VOCAB * 2, null, 0, null));
+        if (hsplit) { // XPU_HSPLIT: rank 0's half from a.logits, rank 1's half from the block
+            try tp.group.?.headSplice(&r.d, r.acts.logits, row, @ptrCast(&raw[0]), @ptrCast(&raw[VOCAB / 2]));
+        } else {
+            try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, raw.ptr, off(r.acts.logits, row * VOCAB * 2), VOCAB * 2, null, 0, null));
+        }
         try r.d.sync();
         for (r.host_logits, raw) |*o, v| o.* = v;
         return r.host_logits;
@@ -1343,7 +1360,11 @@ pub const Runner = struct {
     pub fn logits(r: *Runner) ![]const f32 {
         const raw = try alloc.alloc(f16, VOCAB);
         defer alloc.free(raw);
-        try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, raw.ptr, r.acts.logits, VOCAB * 2, null, 0, null));
+        if (hsplit) {
+            try tp.group.?.headSplice(&r.d, r.acts.logits, 0, @ptrCast(&raw[0]), @ptrCast(&raw[VOCAB / 2]));
+        } else {
+            try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, raw.ptr, r.acts.logits, VOCAB * 2, null, 0, null));
+        }
         try r.d.sync();
         for (r.host_logits, raw) |*o, v| o.* = v;
         return r.host_logits;
@@ -1415,6 +1436,7 @@ pub fn modeWord() u64 {
     w |= @as(u64, @intFromBool(park_on)) << 23; // idle kept states park in host memory: all ranks, or neither
     w |= @as(u64, @intFromBool(fuse & 1 != 0)) << 14; // XPU_FUSE bit 1: both ranks fuse the exchange into the norm
     w |= @as(u64, @intFromBool(draft_tp)) << 24; // XPU_DRAFT_TP: both ranks run half the drafter, or neither
+    w |= @as(u64, @intFromBool(tp.hsplit_env)) << 25; // XPU_HSPLIT: both ranks split the head, or neither
     return w;
 }
 
