@@ -53,6 +53,7 @@ pub const lanes = @import("lanes.zig");
 pub const pool = @import("pool.zig");
 pub const spill_state = @import("spill_state.zig");
 pub const spill_tier = @import("spill_tier.zig");
+pub const kv_lanes = @import("kv_lanes.zig");
 pub const rank_wire = @import("rank_wire.zig");
 pub const fingerprint = @import("fingerprint.zig");
 pub const rank_identity = @import("rank_identity.zig");
@@ -106,6 +107,7 @@ test {
     refAll(lanes);
     refAll(pool);
     refAll(spill_state);
+    refAll(kv_lanes);
     refAll(rank_wire);
     refAll(fingerprint);
     refAll(rank_identity);

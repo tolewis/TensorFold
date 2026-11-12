@@ -173,8 +173,7 @@ pub const KvShard = struct {
     // rows and bytes, rounds by fetch and by owner decode (each of a round's compressed layers fetches or exchanges once;
     // counted when the round is issued, graphs or not), carried extents (copyExtent across parts) and their bytes
     stats: Stats = .{},
-    // PORT(round2): exported on /health and /metrics with the per-part rows (free, twin, kept, live) once lanes.zig
-    // tracks parts
+    // (exported on /health and /metrics with the parts' rows: lanes.zig kvPartsFn, core lanes.kv_parts)
 
     pub const Stats = struct {
         prompt_fetches: u64 = 0,

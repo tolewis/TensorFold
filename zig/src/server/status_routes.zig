@@ -31,6 +31,7 @@ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
     try o.put(a, "memory", .{ .object = memory });
     try o.put(a, "live", try live.snapshot(a, srv.engine));
     if (status.cache) |c| try putCache(a, o, c);
+    if (status.kv_parts) |k| try putKvParts(a, o, k);
     routes.sendValue(conn, a, 200, .{ .object = o });
 }
 
@@ -55,6 +56,24 @@ pub fn putCache(a: Allocator, o: *json.Object, c: api.CacheStats) Allocator.Erro
         try pc.put(a, "spill", .{ .array = arr });
     }
     try o.put(a, "prompt_cache", .{ .object = pc });
+}
+
+/// KV ownership's counters under `kv_shard` (a backend that shards its pool over the ranks: wojo's GLM 0118), every
+/// part's rows under kv_shard.per_part (an array, one object per part, part 0 first).
+pub fn putKvParts(a: Allocator, o: *json.Object, k: api.KvParts) Allocator.Error!void {
+    const ks = try json.newObject(a);
+    const info = @typeInfo(api.KvParts).@"struct";
+    inline for (info.field_names, info.field_types) |name, T| if (T == u64) try ks.put(a, name, try json.intValue(a, @field(k, name)));
+    const n: usize = @intCast(@min(k.parts, k.part.len));
+    const arr = try a.alloc(json.Value, n);
+    for (k.part[0..n], arr, 0..) |p, *v, i| {
+        const po = try json.newObject(a);
+        try po.put(a, "part", try json.intValue(a, i));
+        inline for (@typeInfo(@TypeOf(p)).@"struct".field_names) |name| try po.put(a, name, try json.intValue(a, @field(p, name)));
+        v.* = .{ .object = po };
+    }
+    try ks.put(a, "per_part", .{ .array = arr });
+    try o.put(a, "kv_shard", .{ .object = ks });
 }
 
 pub fn models(srv: *Server, conn: *Conn, a: Allocator) !void {
@@ -166,4 +185,22 @@ test "health's prompt cache counters: the GLM names on top, every counter below,
     const none = try json.newObject(a);
     try putCache(a, none, .{});
     try std.testing.expect(none.get("prompt_cache").?.object.get("spill") == null);
+}
+
+test "health's kv shard counters: every counter under kv_shard, each part's rows under per_part" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const o = try json.newObject(a);
+    var k: api.KvParts = .{ .parts = 2, .carries = 5, .twins_made = 1 };
+    k.part[1] = .{ .free = 7, .live = 2 };
+    try putKvParts(a, o, k);
+    const ks = o.get("kv_shard").?.object;
+    try std.testing.expectEqualStrings("5", ks.get("carries").?.int);
+    try std.testing.expectEqualStrings("1", ks.get("twins_made").?.int);
+    const pp = ks.get("per_part").?.array;
+    try std.testing.expectEqual(@as(usize, 2), pp.len);
+    try std.testing.expectEqualStrings("1", pp[1].object.get("part").?.int);
+    try std.testing.expectEqualStrings("7", pp[1].object.get("free").?.int);
+    try std.testing.expectEqualStrings("2", pp[1].object.get("live").?.int);
 }

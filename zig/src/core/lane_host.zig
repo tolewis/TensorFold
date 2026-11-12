@@ -75,6 +75,9 @@ pub const LaneHost = struct {
     host_counts: HostCounts = .{},
     /// What status reports under `cache` (published on the engine thread at each noteLive; null until configured).
     tele: ?api.CacheStats = null,
+    /// A backend's KV-ownership stats (its parts), read on the engine thread at each noteLive, published as `kv_tele`.
+    kv_parts: ?lanes.kv_parts.Source = null,
+    kv_tele: ?api.KvParts = null,
 
     const Mark = struct { at: i96, tokens: u64 };
     const full_retry_ns: i96 = std.time.ns_per_s;
@@ -269,6 +272,7 @@ pub const LaneHost = struct {
             .streams = n,
             .generation_tokens = h.live_generated,
             .cache = h.tele,
+            .kv_parts = h.kv_tele,
         };
     }
 
@@ -724,6 +728,11 @@ pub const LaneHost = struct {
 
     fn noteLive(h: *LaneHost) void {
         const tele = h.telemetry();
+        var parts: ?api.KvParts = null;
+        if (h.kv_parts) |src| {
+            parts = .{};
+            src.read(src.ctx, &parts.?);
+        }
         h.lock();
         defer h.unlock();
         h.live_tokens.clearRetainingCapacity();
@@ -733,6 +742,7 @@ pub const LaneHost = struct {
             h.live_generated += @intCast(job.stream.emitted().len);
         };
         if (tele) |t| h.tele = t;
+        if (parts) |p| h.kv_tele = p;
     }
 
     /// The filling job's next piece, when its turn has come; its first tokens once its prompt pass ends.

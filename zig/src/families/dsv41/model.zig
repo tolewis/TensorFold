@@ -473,21 +473,28 @@ pub const Model = struct {
     /// the single-conversation limit (below the window asked: said so, with the numbers), the compressed planes'
     /// bytes a rank (calculated: rows by the formula; the arena's figure is the measured one).
     fn notePlan(m: *const Model, mode: shard.Mode, pl: shard.Plan) void {
-        var src: [16]shard.Source = undefined;
-        var ns: usize = 0;
-        const c = m.eng.c;
-        for (m.w.layers) |lay| {
-            if (lay.comp_wkv == null or ns == src.len) continue;
-            src[ns] = .{ .ratio = lay.ratio, .comp_row = c.head_dim / 2 + c.head_dim / 16, .idx_row = if (lay.idx_wk != null) c.index_head_dim / 2 + c.index_head_dim / 32 else 0 };
-            ns += 1;
-        }
+        var buf: [16]shard.Source = undefined;
+        const src = m.kvSources(&buf);
         const sharded = mode != .off;
         const trash: usize = if (m.kvs) |k| k.sh.trash else 0;
-        const planes = shard.poolBytes(src[0..ns], pl.pool, m.world, sharded, trash);
-        const flat = shard.poolBytes(src[0..ns], pl.pool, m.world, false, 0);
+        const planes = shard.poolBytes(src, pl.pool, m.world, sharded, trash);
+        const flat = shard.poolBytes(src, pl.pool, m.world, false, 0);
         std.log.info("dsv41: pool {d} positions, {s} {d} a part; a conversation may use up to {d} tokens{s}; compressed planes {d} MiB a rank ({d} MiB replicated); arena {d} MiB used", .{
             pl.pool, @tagName(mode), pl.part, pl.window, if (pl.shrunk) " (less than the window asked: a part holds no more)" else "", planes >> 20, flat >> 20, m.arena.used >> 20,
         });
+    }
+
+    /// Every kv-source layer's packed row bytes (shard.Source: the capacity arithmetic's and the carry cost's), the
+    /// first `buf.len` of them.
+    pub fn kvSources(m: *const Model, buf: *[16]shard.Source) []shard.Source {
+        var ns: usize = 0;
+        const c = m.eng.c;
+        for (m.w.layers) |lay| {
+            if (lay.comp_wkv == null or ns == buf.len) continue;
+            buf[ns] = .{ .ratio = lay.ratio, .comp_row = c.head_dim / 2 + c.head_dim / 16, .idx_row = if (lay.idx_wk != null) c.index_head_dim / 2 + c.index_head_dim / 32 else 0 };
+            ns += 1;
+        }
+        return buf[0..ns];
     }
 
     pub fn close(m: *Model) void {
@@ -629,6 +636,8 @@ pub const Model = struct {
     /// destination's owner receives them into its own, both ranks in this same order (lanes.zig runs copyExtent on
     /// every rank in its frame order). The source's rows stay; nothing is freed.
     pub fn copyExtent(m: *Model, from: usize, to: usize, at: usize) !void {
+        // PORT(round3): copyExtent may call checkExtent first so a refusal never follows a partial copy; kept as it
+        // was here so the switch-off path is unchanged (kv_lanes calls checkExtent before every transfer)
         const c = m.eng.c;
         const cs = &m.caches;
         const mv: ?shard.Move = if (cs.shard) |sh| try sh.extentMove(from, to, at) else null;
@@ -666,8 +675,8 @@ pub const Model = struct {
                 try m.copySpan(cs.idx_scales[i], from / r, to / r, n, c.index_head_dim / 32);
             }
         }
-        // PORT(round2): a carry (lanes' frame order, parts.zig's carry plan: only to avoid a recompute, an eviction or a
-        // pause; staged spill writes and the new generation published after both ranks finish) calls this across parts
+        // a carry or a live move across parts (kv_lanes.zig runs parts.zig's ops in frame order on every rank, rank 0
+        // decides the transfer's ok and every rank finishes with it; the generation is published at finish)
         const x = mv orelse return;
         var bytes: usize = 0;
         for (spans[0..ns]) |sp| bytes += sp.bytes;
@@ -679,6 +688,18 @@ pub const Model = struct {
         if (m.kvs) |*k| {
             k.stats.carries += 1;
             k.stats.carry_bytes += bytes;
+        }
+    }
+
+    /// copyExtent's refusals with nothing enqueued: the extents' parts (shard.Shard.extentMove: CrossesPart) and every
+    /// kv source's ratio (BadView). Deterministic: every rank refuses the same arguments alike under the agreed
+    /// layout (kv_lanes.zig checks before any rank enqueues its side, so a refused carry leaves no NCCL half waiting).
+    pub fn checkExtent(m: *const Model, from: usize, to: usize, at: usize) !void {
+        if (m.caches.shard) |sh| _ = try sh.extentMove(from, to, at);
+        for (m.eng.w.layers) |lay| {
+            if (lay.comp_wkv == null) continue;
+            const r: usize = lay.ratio;
+            if (from % r != 0 or to % r != 0 or at % r != 0) return error.BadView;
         }
     }
 
@@ -998,6 +1019,14 @@ pub const Model = struct {
         m.view = try m.caches.view(&m.eng, slot, base);
         for (m.rings, m.ring_view) |r, *v| v.* = r + slot * m.eng.ringBytes();
         m.fill_slot = slot;
+    }
+
+    /// TF_DS_KV_SHARD: the filling prompt's view (fillBegin's, at `base`) with its borrowed twins (`on`; `local`: this
+    /// rank's twin when it does not own the extent; prompt.Caches.twinned), or plain again. Both ranks bind at the
+    /// same frame (kv_lanes.zig), between chunks only.
+    pub fn bindTwin(m: *Model, base: usize, on: bool, local: ?usize) !void {
+        const v = try m.caches.view(&m.eng, m.fill_slot, base);
+        m.view = if (on) try v.twinned(&m.caches, &m.eng, base, local) else v;
     }
 
     /// The prompt's chunk of n rows from position `start` (seq: the stream's ids through the chunk's end) through every

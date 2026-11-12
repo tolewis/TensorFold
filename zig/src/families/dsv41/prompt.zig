@@ -724,6 +724,30 @@ pub const Caches = struct {
         }
         return v;
     }
+
+    /// TF_DS_KV_SHARD's borrowed twins (stage 6, GLM 0118): view `v` of the extent at `base` while its filling prompt
+    /// holds twins (parts.zig: free rows in every other part, all or none). Both ranks then hold the prompt's
+    /// compressed rows, the owner in its extent and the other rank in its twin at `local` (null on the owner), so the
+    /// view is replicated on both (`own` null): every chunk stores its rows on both ranks and attends locally, with no
+    /// prompt fetch. The twin's rows have every row of the prompt because a twin is only made for a pass from 0, and
+    /// the owner keeps storing its own, so dropping the twin between chunks (a plain view again) is always safe.
+    pub fn twinned(v: Caches, cs: *const Caches, e: *const Engine, base: usize, local: ?usize) !Caches {
+        const sh = cs.shard orelse return error.NoKvShard;
+        if (sh.owns(base) != (local == null)) return error.BadPart; // (the owner has no twin; the other rank has one)
+        var t = v;
+        t.own = null;
+        const tb = local orelse return t;
+        if (!sh.owns(tb)) return error.BadPart; // (its rows are the reservation's, inside its part: the planner's)
+        const c = e.c;
+        for (e.w.layers, 0..) |lay, i| {
+            if (lay.comp_wkv == null) continue;
+            const r: usize = lay.ratio;
+            const lg = sh.planeBase(tb, r) orelse return error.BadPart;
+            t.comp_codes[i] = cs.comp_codes[i] + lg * c.head_dim / 2;
+            t.comp_scales[i] = cs.comp_scales[i] + lg * c.head_dim / 16;
+        }
+        return t;
+    }
 };
 
 /// What one forward carries from layer to layer (model.py _forward_k's `shared`): the latest kv-source layer, and the
@@ -952,8 +976,8 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
 /// Either way every row reads the same bytes in the same order as replicated (shard.zig's "prompt fetch" test), so its
 /// bits are the replicated ones. The owner attends its own rows after its sends, so the other rank starts at once.
 /// Needs GPU validation of the blocked launches against the whole-chunk one (docs/port/shard-attn.md).
-/// PORT(round2): borrowed twins (the other part's free rows hold a copy of the filling prompt's latents, all or none,
-/// released before the first round) skip this fetch entirely.
+/// Borrowed twins (the other part's free rows hold a copy of the filling prompt's latents, all or none, released
+/// before the first round: Caches.twinned) skip this fetch entirely: their view is replicated, own null.
 fn shardAttend(e: *const Engine, ch: *Chunk, cs: *const Caches, a: tri_attn.Attn, n_comp_end: usize) !void {
     const kv = e.kv orelse return error.NoKvShard;
     const own = cs.own.?;
@@ -1052,7 +1076,7 @@ fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, 
     const cwkv = lay.comp_wkv.?;
     if (start % r != 0) return notPorted(@src()); // the group's earlier rows from the positional store
     // TF_DS_KV_SHARD: a sharded view ends at its part's end (an extent never crosses a part: refused, not written past)
-    if (cs.own != null and start + n > cs.cap) return error.CrossesPart;
+    if (cs.shard != null and start + n > cs.cap) return error.CrossesPart;
     const full = n / r;
     if (r == 1) {
         try mm(e, ch, cwkv, ch.x, c.hidden, ch.lat2, .bf16, hd);

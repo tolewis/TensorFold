@@ -265,6 +265,7 @@ pub fn main(init: std.process.Init) !u8 {
     const reqs = (try std.json.parseFromSliceLeaky(Requests, a, text, .{ .ignore_unknown_fields = true })).requests;
     var ln = dsv41.lanes.Lanes.init(gpa, m);
     defer ln.deinit();
+    try ln.startKv(); // (TF_DS_KV_SHARD: the parts agreed with the followers before the first request)
     ln.fix_k = fix_k;
     // the spill tier and the prompt cache over it (the server's wiring: native/cuda.zig openWith)
     var events: []cuda.Event = &.{};

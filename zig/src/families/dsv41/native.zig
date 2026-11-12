@@ -109,6 +109,8 @@ pub const Loaded = struct {
     /// replay window, Lanes.usable's).
     grid: u32 = 0,
     replay: u32 = 0,
+    /// TF_DS_KV_SHARD: the parts' counters and rows for /health and /metrics (null: the switch off).
+    kv_parts: ?lanes.kv_parts.Source = null,
 };
 
 pub const Snaps = struct {
@@ -205,6 +207,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     // a start refused past here (a fingerprint mismatch at openPair, a store that does not open) frees the frames the
     // agreement wrote through the lanes (the hello: leaked on the mismatch path before); rank 1 ends on its own
     errdefer st.lanes.wire.deinit(gpa);
+    // TF_DS_KV_SHARD: the parts' planner agreed with rank 1 now (its other switches or pool fail the start, named)
+    try st.lanes.startKv();
+    errdefer st.lanes.stopKv();
     if (getenv("TF_DS_FIX_K")) |t| st.lanes.fix_k = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
     st.lanes.solo_overhead = if (getenv("TF_DS_SOLO_OVERHEAD")) |v| !std.mem.eql(u8, v, "0") else false;
     st.lanes.no_copies = if (getenv("TF_DS_NO_COPIES")) |v| !std.mem.eql(u8, v, "0") else false;
@@ -223,7 +228,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         snaps.usable = L.usableFn;
         tier = st.lanes.spill.?.tier();
     }
-    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null, .window = window, .tier = tier, .grid = model.chunk_rows, .replay = @intCast(st.m.cfg.window) };
+    const kv_parts: ?lanes.kv_parts.Source = if (st.m.kvs != null) .{ .ctx = &st.lanes, .read = L.kvPartsFn } else null;
+    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null, .window = window, .tier = tier, .grid = model.chunk_rows, .replay = @intCast(st.m.cfg.window), .kv_parts = kv_parts };
 }
 
 fn deinitFn(ptr: *anyopaque) void {
@@ -404,7 +410,7 @@ pub fn followerSpill(gpa: std.mem.Allocator, io: std.Io, m: *model.Model, mo: mo
 
 /// A request or a start this engine refuses, in words; null: none of its own.
 pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
-    if (rank_wire.explain(err)) |t| return t;
+    if (rank_wire.explain(err)) |t| return t; // the ranks' agreement (TF_DS_KV_SHARD's frames, the spill tier's)
     return switch (err) {
         error.NotPortedYet => "the native DeepSeek-V4.1 engine runs tensor parallel over two GPUs or the four nodes of the 2D split: set TF_TP_WORLD=2 or 4",
         error.NoMaster, error.BadMaster => "set TF_TP_MASTER to rank 0's fabric address (rank 1: tf-dsv41-lanes MODEL CACHE 1 2 MASTER PORT KIT; ranks 1-3 of four: ... G 4 ...)",
@@ -438,6 +444,12 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.SpillNotStarted => "rank 0 runs the spill tier (--spill-dir/--spill-gib): start this rank with it too (TF_DS_SPILL_DIR and TF_DS_SPILL_GIB, or tf-dsv41-lanes --spill-dir/--spill-gib)",
         error.BadSpillSetting => "TF_DS_SPILL_STAGING_MIB: the spill staging cap in MiB, at least 16 (default 128)",
         error.StagingTooSmall => "the spill staging cap (TF_DS_SPILL_STAGING_MIB) holds too few slots for this model's blocks and small state: raise it",
+        error.BadKvShardSetting => "TF_DS_KV_SHARD_CARRY and TF_DS_KV_SHARD_TWINS: 1 (on, the default) or 0; TF_DS_KV_SHARD_CHECK: decode rounds between the ranks' planner checks (0: at start only)",
+        error.ShardLayoutMismatch => "TF_DS_KV_SHARD=1: the ranks cut the pool into different parts (another TF_DS_POOL, --pool or build on rank 1): give every rank the same TF_DS_* environment and build",
+        error.ShardDiverged, error.StaleExtent => "TF_DS_KV_SHARD=1: the ranks' KV-part planners disagree (an engine bug; the pair stops rather than read the wrong rows): restart with TF_DS_KV_SHARD=0",
+        error.TransferFailed => "TF_DS_KV_SHARD=1: a KV transfer between the ranks failed on one rank only: restart; if it recurs, TF_DS_KV_SHARD_CARRY=0 or TF_DS_KV_SHARD=0",
+        error.TransferTimeout => "TF_DS_KV_SHARD=1: a KV transfer did not complete in time (a rank's half never ran, or a device fault; the GPU stream holds the unmatched call): restart; if it recurs, TF_DS_KV_SHARD_CARRY=0 or TF_DS_KV_SHARD=0",
+        error.KvShardNotStarted, error.BadPlan => "TF_DS_KV_SHARD=1: the KV-part planner was not set up as the lanes need (an engine bug): restart with TF_DS_KV_SHARD=0",
         else => null,
     };
 }
@@ -446,7 +458,7 @@ test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoMaster).?, "TF_TP_MASTER") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.PartTooSmall).?, "TF_DS_POOL") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.KvShardMismatch).?, "--pool") != null);
-    for ([_]anyerror{ error.BadPart, error.WindowTooWide, error.FetchTooLarge, error.BadFetch, error.NoKvShard, error.CrossesPart }) |err|
+    for ([_]anyerror{ error.BadPart, error.WindowTooWide, error.FetchTooLarge, error.BadFetch, error.NoKvShard, error.CrossesPart, error.ShardDiverged, error.StaleExtent, error.TransferFailed, error.TransferTimeout, error.KvShardNotStarted, error.BadPlan }) |err|
         try std.testing.expect(std.mem.indexOf(u8, explain(null, err).?, "TF_DS_KV_SHARD=0") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoFreeSlot).?, "TF_DS_STREAMS") != null);
     try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));

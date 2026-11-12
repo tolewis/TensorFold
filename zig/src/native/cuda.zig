@@ -161,6 +161,7 @@ const Host = struct {
     startup: []u8 = &.{},
     lone: ?LoneRun = null, // the family's driver for a lone drafted stream, called with `family`
     cache: ?api.prompt_cache.Store = null, // kept prompt states, when the family keeps them
+    kv_parts: ?lanes.kv_parts.Source = null, // the family's KV-ownership stats (its pool sharded over the ranks)
     snap_vt: api.prompt_cache.Snapshots.VTable = undefined,
     spill: ?api.Spill = null, // the spill tier the family bound: the lane host is configured with it
 
@@ -208,6 +209,7 @@ const Host = struct {
         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
         h.host.explain = explain;
         if (h.cache) |*store| h.host.cache = store;
+        h.host.kv_parts = h.kv_parts;
         if (h.spill) |sp| h.host.configure(sp); // (after the cache and its tier: Spill.unbound sees Status.cache)
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
         try h.host.start();
@@ -384,6 +386,12 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         return null;
     };
     defer if (!opened) loaded.deinit(loaded.ctx);
+    // a family's KV parts and the disk tier together need the part-salted spill identity (dsv41: round 3), refused
+    // until then rather than storing a sharded plane's local rows as pool rows
+    if (@hasField(@TypeOf(loaded), "kv_parts")) if (loaded.kv_parts != null and o.spill.enabled()) {
+        problem.* = "TF_DS_KV_SHARD=1 with --spill-dir: the disk tier does not store sharded KV yet; drop --spill-dir or set TF_DS_KV_SHARD=0";
+        return null;
+    };
     const model = cuda.usage(false).device - held0;
     const after = try pool(a, io, &g.ctx, problem) orelse return null;
     for ([_]Pool{ before, after }, [_][]const u8{ "the weights' check", "the streams' admission" }) |p, what| if (p.parked >= 1 << 28) {
@@ -407,6 +415,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         capability, device, name, if (after.unified) ", memory shared with the host" else "", toGib(model), streams, if (streams == 1) "" else "s", toGib(loaded.stream_bytes), served, toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
     });
     errdefer gpa.free(h.startup);
+    if (@hasField(@TypeOf(loaded), "kv_parts")) h.kv_parts = loaded.kv_parts;
     // a family that keeps prompt states (its snapshots) gets the prompt cache: states at its chunk ends
     if (@hasField(@TypeOf(loaded), "snaps")) if (loaded.snaps) |sn| {
         const want: u64 = @intFromFloat((o.prompt_cache_gib orelse 0.5) * gib);

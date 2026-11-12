@@ -336,7 +336,12 @@ pub const Status = struct {
     generation_tokens: u64 = 0,
     /// The prompt cache's counters, when its tier or grouping is on.
     cache: ?CacheStats = null,
+    /// KV ownership's counters and parts (a backend that shards its pool over the ranks: dsv41's TF_DS_KV_SHARD).
+    kv_parts: ?KvParts = null,
 };
+
+/// A backend's KV-ownership counters and every part's rows (lanes.kv_parts).
+pub const KvParts = lanes.kv_parts.Stats;
 
 pub const SubmitError = error{ Closed, Busy };
 

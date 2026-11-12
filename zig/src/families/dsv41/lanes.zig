@@ -22,6 +22,9 @@ const sampling = @import("sampling.zig");
 const link = @import("link.zig");
 const cuda = @import("cuda");
 const spill_tier = @import("spill_tier.zig");
+const parts = @import("parts.zig");
+const kv_lanes = @import("kv_lanes.zig");
+const shard = @import("shard.zig");
 
 const be = lanes.backend;
 const Model = model.Model;
@@ -31,6 +34,11 @@ const max_rows = round.max_rows;
 /// The spill tier on rank 0 (the prompt cache's Tier) and on a follower, over this rank's planes (spill_tier.zig).
 pub const SpillTier = spill_tier.Leader(Model.SpillDev);
 pub const SpillFollower = spill_tier.Follower(Model.SpillDev);
+
+comptime {
+    // parts.zig keeps lanes' block and growth slack (it is self-contained so `zig test` runs it alone)
+    std.debug.assert(parts.chunk_rows == model.chunk_rows and parts.growth_rows == growth_rows);
+}
 
 /// A window of the pending row and the drafter's block: the widest one the gates checked row for row.
 pub const window_rows = 6;
@@ -43,8 +51,10 @@ pub var logits_sha = false;
 
 /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
 /// fill_resume (TF_FILL_CHUNKS' pieces) is 12, after spill's two (both ranks run one build).
-/// With the spill tier on (only then): rank_wire's frames (spill_tier: restores' agreement, guards) and the spill notes
-/// (rank 0's write-at-keep and metadata).
+/// With the spill tier on: rank_wire's frames (spill_tier: restores' agreement, guards) and the spill notes (rank 0's
+/// write-at-keep and metadata). TF_DS_KV_SHARD adds rank_wire too (rank_wire.zig's frames: the parts' agreement, each
+/// plan's ops, each transfer's shard_xfer/shard_finish, the digest checks). The two are never on together
+/// (SpillWithKvShard), so one rank_wire Leader/Follower a rank serves either.
 pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, rank_wire = 10, spill = 11, fill_resume = 12 };
 
 comptime {
@@ -79,6 +89,38 @@ pub const Wire = struct {
     }
 };
 
+/// A verify frame's window: slot, extent, first position, absorb, ids; TF_DS_KV_SHARD (`sharded`) adds its extent's
+/// part (u8) and generation (u64), so a follower refuses a round for a reused extent. Off, the bytes are as ever.
+pub fn writeWin(w: *Wire, gpa: std.mem.Allocator, win: Win, sharded: bool) !void {
+    try w.int(gpa, u32, @intCast(win.slot));
+    try w.int(gpa, u64, win.base);
+    try w.int(gpa, u64, win.end);
+    try w.int(gpa, u64, win.start);
+    try w.int(gpa, u8, @intFromBool(win.absorb));
+    try w.ids(gpa, win.ids);
+    if (sharded) {
+        if (win.part < 0 or win.part >= parts.max_parts) return error.BadPart;
+        try w.int(gpa, u8, @intCast(win.part));
+        try w.int(gpa, u64, win.gen);
+    }
+}
+
+/// writeWin's window read back, its ids into `ids` (the window's slice points there).
+pub fn readWin(r: *Reader, gpa: std.mem.Allocator, ids: *std.ArrayList(i32), sharded: bool) !Win {
+    const slot: usize = try r.int(u32);
+    const base: usize = @intCast(try r.int(u64));
+    const end: usize = @intCast(try r.int(u64));
+    const start: usize = @intCast(try r.int(u64));
+    const absorb = try r.int(u8) != 0;
+    try r.ids(gpa, ids);
+    var win: Win = .{ .slot = slot, .base = base, .end = end, .start = start, .absorb = absorb, .ids = ids.items };
+    if (sharded) {
+        win.part = try r.int(u8);
+        win.gen = try r.int(u64);
+    }
+    return win;
+}
+
 /// A frame being read.
 pub const Reader = struct {
     b: []const u8,
@@ -109,8 +151,9 @@ pub const Reader = struct {
 
 /// A window of a round as both ranks build it: its stream's slot and extent, its first position, whether its rows'
 /// taps go into the drafter, its rows' ids; TF_DS_KV_SHARD: its extent's part (the rank holding its compressed rows;
-/// -1: its base's, which round.Rows.ownerOf derives and checks).
-pub const Win = struct { slot: usize, base: usize, end: usize, start: usize, absorb: bool, ids: []const i32, part: i64 = -1 };
+/// -1: its base's, which round.Rows.ownerOf derives and checks) and its extent's generation (parts.zig: a follower
+/// refuses a round naming a reused extent).
+pub const Win = struct { slot: usize, base: usize, end: usize, start: usize, absorb: bool, ids: []const i32, part: i64 = -1, gen: u64 = 0 };
 
 /// The rows of a round (round.Rows' slices point here).
 pub const Built = struct {
@@ -277,11 +320,16 @@ pub fn parseMs(a: std.mem.Allocator, text: []const u8) ![]const f64 {
     return out.items;
 }
 
-/// A stream's place in the pool and the drafts it holds.
+/// A stream's place in the pool and the drafts it holds; TF_DS_KV_SHARD: its planner stream, part and generation
+/// (parts.zig's Live), and whether its first decode round ran (planDecode).
 const Lane = struct {
     slot: usize,
     base: usize,
     end: usize,
+    id: u64 = 0,
+    part: u8 = 0,
+    gen: u64 = 0,
+    decoding: bool = false,
     first: u64 = 0, // the prompt's draw (a handle)
     held: [draft.max_block]u32 = undefined,
     confs: [draft.max_block]f32 = undefined,
@@ -305,6 +353,7 @@ pub const Snap = struct {
     slot: u32 = 0, // the slot it was kept from (the spill tier's keep note: a follower reads the prompt's ids there)
     loading: bool = false, // a restore's destination: its rows held back, not usable until every rank installed it
     restored: bool = false, // read back from the spill tier
+    part: u8 = 0, // TF_DS_KV_SHARD: the part holding its rows (parts.zig's Kept; a live move changes it)
 };
 
 /// Kept states this long or longer say so in the log when they go stale (their prompts then run again from 0).
@@ -315,7 +364,7 @@ fn noteStale(sn: *const Snap, why: []const u8) void {
 }
 
 /// A prompt pass between its pieces: the chunk it runs next and what its chunk loop reads.
-const Fill = struct { s: *const lanes.Stream, slot: usize, len: usize, replay: usize, last_end: usize, start: usize, head: bool = false, base: usize = 0, restored: bool = false };
+const Fill = struct { s: *const lanes.Stream, slot: usize, len: usize, replay: usize, last_end: usize, start: usize, head: bool = false, base: usize = 0, restored: bool = false, part: ?u64 = null };
 
 /// How long a request waits for the live stream that holds the kept state it resumes from to end (then it resumes
 /// in place and every kept state stays) before other kept states give their room for a copy of it.
@@ -348,6 +397,7 @@ pub const Lanes = struct {
     fill: ?Fill = null, // the prompt pass that runs in pieces between rounds, from its next chunk
     paused: ?Fill = null, // the pass a short prompt cut into (lanes' cut_in), resumed by its next piece
     spill: ?*SpillTier = null, // --spill-dir/--spill-gib: the spill tier (native.zig opens it; null: off, nothing changes)
+    kv: ?*kv_lanes.Kv = null, // TF_DS_KV_SHARD: the parts' planner (startKv, at open; null: the switch off)
 
     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
@@ -360,6 +410,7 @@ pub const Lanes = struct {
 
     /// Tells rank 1 to stop, then frees the host state (the model is the caller's).
     pub fn deinit(self: *Lanes) void {
+        self.stopKv();
         for (self.snaps.items) |sn| {
             sn.buf.free();
             self.gpa.destroy(sn);
@@ -446,6 +497,136 @@ pub const Lanes = struct {
         if (try self.begin(kind)) try self.flush();
     }
 
+    // -- TF_DS_KV_SHARD: kv_lanes.zig drives parts.zig's planner (docs/port/shard-lanes.md) ------------------------
+
+    /// TF_DS_KV_SHARD: the parts' planner made and agreed with the followers (hello, shard_layout, shard_set, the
+    /// first digest check), once, at open with the Lanes at their final address (the hooks point here): a follower
+    /// started with other switches or another pool fails the start, never a request. Nothing with the switch off.
+    pub fn startKv(self: *Lanes) !void {
+        const m = self.m;
+        if (m.kvs == null or self.kv != null) return;
+        const settings = try kv_lanes.Settings.fromEnv(getenv);
+        const k = try self.gpa.create(kv_lanes.Kv);
+        errdefer self.gpa.destroy(k);
+        k.* = try kv_lanes.Kv.init(self.gpa, kvConfig(m), settings, modelDev(m), .{ .ctx = self, .stale = kvStale, .moved = kvMoved });
+        errdefer k.deinit();
+        // the shard's own leader agrees on the shard's fields (the spill tier is refused with TF_DS_KV_SHARD:
+        // SpillWithKvShard). PORT(round3): with both on, pass the spill side's Leader (its full fingerprint,
+        // rank_identity.zig) here so the followers hear one hello and one Tracker sees every frame
+        if (self.peer != null) try k.lead(.{ .ctx = self, .rw = kvSendRw }, m.followers(), null, m.now() | 1, kv_lanes.shardExchange(0, m.world, k.planner.cfg, settings));
+        try k.start();
+        self.kv = k;
+    }
+
+    /// startKv undone (an open that fails after it).
+    pub fn stopKv(self: *Lanes) void {
+        const k = self.kv orelse return;
+        k.deinit();
+        self.gpa.destroy(k);
+        self.kv = null;
+    }
+
+    fn kvSendRw(ctx: *anyopaque, sub: []const u8) anyerror!void {
+        const self = of(ctx);
+        if (try self.begin(.rank_wire)) {
+            try self.wire.buf.appendSlice(self.gpa, sub);
+            try self.flush();
+        }
+    }
+
+    /// A kept state the planner gave up (a stale op): its Snap too.
+    fn kvStale(ctx: *anyopaque, kept: u64) void {
+        const self = of(ctx);
+        for (self.snaps.items) |sn| if (sn.id == kept) {
+            if (!sn.stale) noteStale(sn, "a placement needed its room (its part's oldest first)");
+            sn.stale = true;
+        };
+    }
+
+    /// A live stream moved with its kept states: every Snap's and Lane's rows from the planner again (copyExtent,
+    /// usable and the spill tier read them).
+    fn kvMoved(ctx: *anyopaque, _: u64) void {
+        of(ctx).kvSync();
+    }
+
+    fn kvSync(self: *Lanes) void {
+        const p = &(self.kv orelse return).planner;
+        for (self.snaps.items) |sn| if (p.keptAt(sn.id)) |k| {
+            sn.base = k.base;
+            sn.end = k.end;
+            sn.part = k.part;
+        };
+        var it = self.streams.valueIterator();
+        while (it.next()) |l| if (p.liveIndex(l.id)) |i| {
+            const x = p.lives.items[i];
+            l.base = x.base;
+            l.end = x.base + x.size;
+            l.part = x.part;
+            l.gen = x.gen;
+        };
+    }
+
+    const PlacedParts = struct { id: u64, part: u8, gen: u64, base: usize, kept: ?*Snap, moved: bool };
+
+    /// prefillFn's placement with the switch on (kv_lanes.Kv.admit: plan, apply, send, act on the ops in order, the
+    /// transfers finished with rank 0's ok): the extent in one part, and the kept state it resumes from when the plan
+    /// resumed it (in place, or copied or carried there and finished ok).
+    fn placeParts(self: *Lanes, k: *kv_lanes.Kv, s: *lanes.Stream, size: usize, slot: usize, len: usize) !PlacedParts {
+        var src: ?*Snap = null;
+        if (s.reuse.saved) |p| {
+            const sn: *Snap = @ptrCast(@alignCast(p));
+            if (self.usable(sn, len)) src = sn else s.reuse_failed = true;
+        }
+        // (lanes owns the clock: patient only when a live stream holds the state, as placeKept asks)
+        const waits = if (src) |sn| k.planner.held(sn.id) and self.patient(sn) else false;
+        const a = try k.admit(@intFromPtr(s), std.hash.Wyhash.hash(0, s.id), @intCast(slot), size, if (src) |sn| sn.id else null, waits);
+        if (src) |sn| {
+            sn.wanted = 0;
+            if (!a.resumed) {
+                if (sn.at >= note_rows) std.log.info("dsv41: the kept state of {d} tokens at {d} was not resumed ({s}); the prompt runs from 0", .{ sn.at, sn.base, if (a.dropped) "no room in its part" else "its transfer failed" });
+                s.reuse_failed = true;
+            }
+        }
+        const kept = if (a.resumed) src else null;
+        return .{ .id = a.id, .part = a.part, .gen = a.gen, .base = a.base, .kept = kept, .moved = if (kept) |sn| a.base != sn.base else false };
+    }
+
+    /// verifyFn's planner side: a stream's first round gives its twins back (planDecode), then the planner's clock and
+    /// every window's rows with content once this round ran (its cache length plus the round's rows, which it
+    /// writes at [cache_len, cache_len + rows): an upper bound, rejected drafts' rows included, so a live move before
+    /// the next round copies every row this one wrote), and the periodic digest check.
+    fn kvRound(self: *Lanes, k: *kv_lanes.Kv, windows: []const be.Window) !void {
+        var vs: [max_streams]kv_lanes.Kv.Valid = undefined;
+        for (windows, 0..) |w, i| {
+            const l = self.streams.getPtr(w.stream) orelse return error.UnknownStream;
+            if (!l.decoding) {
+                try k.decodeStart(l.id);
+                l.decoding = true;
+            }
+            vs[i] = .{ .id = l.id, .valid = @as(usize, @intCast(w.stream.cache_len)) + w.rows() };
+        }
+        try k.round(vs[0..windows.len]);
+    }
+
+    /// The parts' stats for /health and /metrics (native.Loaded.kv_parts: the host reads them on its engine thread).
+    pub fn kvPartsFn(ptr: *anyopaque, out: *lanes.kv_parts.Stats) void {
+        const self = of(ptr);
+        const k = self.kv orelse return;
+        k.stats(out);
+        if (self.m.kvs) |x| {
+            const st = x.stats;
+            out.prompt_fetches = st.prompt_fetches;
+            out.prompt_rows = st.prompt_rows;
+            out.prompt_picks = st.prompt_picks;
+            out.prompt_bytes = st.prompt_bytes;
+            out.prompt_syncs = st.prompt_syncs;
+            out.fetch_rounds = st.fetch_rounds;
+            out.owner_rounds = st.owner_rounds;
+            out.copies = st.carries;
+            out.copy_bytes = st.carry_bytes;
+        }
+    }
+
     // -- the vtable ---------------------------------------------------------------------------------------------
 
     /// The lowest free slot, the first extent that fits, the prompt in chunks of the served size (at multiples of it:
@@ -459,8 +640,10 @@ pub const Lanes = struct {
         return of(ptr).prefillPart(s, chunks);
     }
 
-    fn prefillPart(self: *Lanes, s: *lanes.Stream, chunks: usize) !bool {
+    fn prefillPart(self: *Lanes, s: *lanes.Stream, pieces: usize) !bool {
         const m = self.m;
+        // TF_DS_KV_SHARD binds a pass's parts and twins for the whole pass: it runs whole (no pieces, no cut-ins)
+        const chunks = if (self.kv != null) std.math.maxInt(usize) else pieces;
         const t0 = m.now();
         defer if (self.prof) |*p| {
             p.prefill += m.now() - t0;
@@ -496,7 +679,12 @@ pub const Lanes = struct {
                 try self.flush();
             }
             if (self.spill) |t| t.bump(f.base + start, f.base + start + n);
-            f.head = try m.fillChunk(seq[0 .. start + n], start, n, f.replay);
+            f.head = blk: {
+                // TF_DS_KV_SHARD: the stream's twins pinned while its chunk runs (parts.zig setPartial), not between
+                if (f.part) |id| self.kv.?.planner.setPartial(id, true);
+                defer if (f.part) |id| self.kv.?.planner.setPartial(id, false);
+                break :blk try m.fillChunk(seq[0 .. start + n], start, n, f.replay);
+            };
             f.start += n;
             if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
             // the host's work between this pass's chunks (Stream.between: the prefill interleave's rounds, parked work's
@@ -550,10 +738,14 @@ pub const Lanes = struct {
         if (len == 0) return error.EmptyPrompt;
         const size = std.mem.alignForward(usize, len + s.max_new + m.eng.round_rows + 2, model.chunk_rows);
         if (size > m.request_cap) return error.PromptTooLong; // (the pool's, unless TF_DS_POOL or TF_DS_KV_SHARD part it)
-        // PORT(round2): TF_DS_KV_SHARD places an extent inside one part (parts.zig's planner: part-local placeSoft and
-        // eviction, borrowed twins, carries) and sets Win.part; until then an extent across the parts' boundary is
-        // refused where it is used (prompt.kvSourceUpdate, round.Rows.ownerOf: CrossesPart), never written past.
-        if (self.streams.fetchRemove(s)) |old| self.used[old.value.slot] = false;
+        // TF_DS_KV_SHARD: parts.zig's planner places the extent inside one part (placeParts: part-local placeSoft and
+        // eviction, borrowed twins, carries, live moves) and the lane carries its part into every round (Win.part)
+        const kv = self.kv;
+        if (kv == null and m.kvs != null) return error.KvShardNotStarted; // (startKv at open)
+        if (self.streams.fetchRemove(s)) |old| {
+            self.used[old.value.slot] = false;
+            if (kv) |k| try k.release(old.value.id);
+        }
         const slot = std.mem.indexOfScalar(bool, self.used[0..self.m.streams], false) orelse return error.NoFreeSlot;
         if (self.spill) |t| t.bumpSlot(slot);
         var taken: [max_streams][2]usize = undefined;
@@ -566,9 +758,11 @@ pub const Lanes = struct {
         // a kept state of this prompt's prefix: the pass resumes at its chunk end, in its extent, or in one of its own
         // with the kept rows copied there when a live stream holds that extent (a burst's second request on a prompt)
         s.cached = 0;
-        var kept: ?*Snap = null;
-        var moved = false;
-        if (s.reuse.saved) |p| {
+        const parted: ?PlacedParts = if (kv) |k| try self.placeParts(k, s, size, slot, len) else null;
+        errdefer if (parted) |pp| kv.?.release(pp.id) catch |err| std.log.err("dsv41: a failed prompt pass kept its part's extent: {s}", .{@errorName(err)});
+        var kept: ?*Snap = if (parted) |pp| pp.kept else null;
+        var moved = if (parted) |pp| pp.moved else false;
+        if (parted == null) if (s.reuse.saved) |p| {
             const sn: *Snap = @ptrCast(@alignCast(p));
             // (the cache matched the images before its rows by their digests: its image rows are this prompt's)
             if (self.usable(sn, len)) {
@@ -578,8 +772,8 @@ pub const Lanes = struct {
                 // the Python lane's _place resumes "here" only in a free extent)
                 moved = sn.base + size > m.pool_cap or clashes(taken[0..nt], sn.base, sn.base + size) or self.keptOver(sn.base + sn.at, sn.base + size, sn);
             } else s.reuse_failed = true;
-        }
-        const base = if (kept != null and !moved) kept.?.base else try self.placeKept(taken[0..nt], size, kept);
+        };
+        const base = if (parted) |pp| pp.base else if (kept != null and !moved) kept.?.base else try self.placeKept(taken[0..nt], size, kept);
         if (kept) |sn| {
             sn.wanted = 0;
             if (!moved) sn.end = @max(sn.end, base + size); // its extent now: the next resume in place finds it held
@@ -590,8 +784,8 @@ pub const Lanes = struct {
             s.reuse_failed = true;
         };
         // the rows this stream writes are no other kept state's
-        self.staleOver(if (kept != null and !moved) base + kept.?.at else base, base + size, kept);
-        try self.streams.put(gpa, s, .{ .slot = slot, .base = base, .end = base + size });
+        if (parted == null) self.staleOver(if (kept != null and !moved) base + kept.?.at else base, base + size, kept);
+        try self.streams.put(gpa, s, .{ .slot = slot, .base = base, .end = base + size, .id = if (parted) |pp| pp.id else 0, .part = if (parted) |pp| pp.part else 0, .gen = if (parted) |pp| pp.gen else 0 });
         self.used[slot] = true;
         errdefer {
             _ = self.streams.remove(s);
@@ -635,6 +829,9 @@ pub const Lanes = struct {
             try self.flush();
         }
         try m.fillBegin(slot, base);
+        // (its twins' view, bound as the follower binds it at fill_begin; it stays the fill on both ranks past the last
+        // chunk, until the next fill or its release: the first decode round's untwin unbinds on both)
+        if (parted) |pp| try kv.?.fillBegin(pp.id, base);
         if (spans.items.len > 0) {
             // the spans and their rows, image_piece bytes of rows a frame (a follower's frame buffer holds 64 KiB and
             // the ids of a full pool)
@@ -661,12 +858,12 @@ pub const Lanes = struct {
             if (try self.begin(.snap_restore)) {
                 try self.wire.int(gpa, u64, sn.id);
                 try self.wire.int(gpa, u32, @intCast(slot));
-                try self.wire.int(gpa, u64, sn.base);
+                try self.wire.int(gpa, u64, if (parted != null) base else sn.base); // (TF_DS_KV_SHARD: the plan's transfer ran)
                 try self.wire.int(gpa, u64, base);
                 try self.wire.int(gpa, u64, sn.at);
                 try self.flush();
             }
-            if (base != sn.base) {
+            if (base != sn.base and parted == null) {
                 if (self.spill) |t| t.bump(base, base + sn.at);
                 try m.copyExtent(sn.base, base, sn.at);
             }
@@ -677,7 +874,7 @@ pub const Lanes = struct {
         // where this pass keeps states: the cache's marks and its last chunk end before the replay (the served lane's
         // kept prompt), each at the chunk end at or before it
         const last_end = @min(replay, len - 1) / model.chunk_rows * model.chunk_rows;
-        self.fill = .{ .s = s, .slot = slot, .len = len, .replay = replay, .last_end = last_end, .start = start, .base = base, .restored = if (kept) |sn| sn.restored else false };
+        self.fill = .{ .s = s, .slot = slot, .len = len, .replay = replay, .last_end = last_end, .start = start, .base = base, .restored = if (kept) |sn| sn.restored else false, .part = if (parted) |pp| pp.id else null };
     }
 
     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
@@ -707,30 +904,11 @@ pub const Lanes = struct {
         if (windows.len > max_streams) return error.WindowTooWide;
         var ids: [max_streams][max_rows]i32 = undefined;
         var wins: [max_streams]Win = undefined;
-        for (windows, 0..) |w, k| {
-            if (w.parents != null) return error.TreesNotBuilt;
-            const l = self.streams.getPtr(w.stream) orelse return error.UnknownStream;
-            const rows = w.rows();
-            if (rows > window_rows) return error.WindowTooWide;
-            const start: usize = @intCast(w.stream.cache_len);
-            for (w.positions, 0..) |p, r| if (p != start + 1 + r) return error.PositionMismatch;
-            if (w.held > l.nheld) return error.HeldMismatch;
-            ids[k][0] = @intCast(w.pending);
-            for (l.held[0..w.held], 0..) |t, j| ids[k][1 + j] = @intCast(t);
-            for (w.tokens, 0..) |t, j| ids[k][1 + w.held + j] = @intCast(t);
-            wins[k] = .{ .slot = l.slot, .base = l.base, .end = l.end, .start = start, .absorb = m.drafting() and w.stream.drafts, .ids = ids[k][0..rows] };
-        }
+        try self.roundWins(windows, &ids, &wins);
         const t0 = m.now();
         if (try self.begin(.verify)) {
             try self.wire.int(gpa, u32, @intCast(windows.len));
-            for (wins[0..windows.len]) |w| {
-                try self.wire.int(gpa, u32, @intCast(w.slot));
-                try self.wire.int(gpa, u64, w.base);
-                try self.wire.int(gpa, u64, w.end);
-                try self.wire.int(gpa, u64, w.start);
-                try self.wire.int(gpa, u8, @intFromBool(w.absorb));
-                try self.wire.ids(gpa, w.ids);
-            }
+            for (wins[0..windows.len]) |w| try writeWin(&self.wire, gpa, w, self.kv != null);
             try self.flush();
         }
         const t1 = m.now();
@@ -767,6 +945,25 @@ pub const Lanes = struct {
             @memcpy(o.drafts[w.held..][0..w.tokens.len], w.tokens);
             l.nheld = 0;
         }
+    }
+
+    /// verifyFn's windows as both ranks build them (each stream's Lane: slot, extent, part, generation; its pending
+    /// row, held drafts and host drafts), then the planner's round (kvRound: its frames go out before the verify's).
+    fn roundWins(self: *Lanes, windows: []const be.Window, ids: *[max_streams][max_rows]i32, wins: *[max_streams]Win) !void {
+        for (windows, 0..) |w, k| {
+            if (w.parents != null) return error.TreesNotBuilt;
+            const l = self.streams.getPtr(w.stream) orelse return error.UnknownStream;
+            const rows = w.rows();
+            if (rows > window_rows) return error.WindowTooWide;
+            const start: usize = @intCast(w.stream.cache_len);
+            for (w.positions, 0..) |p, r| if (p != start + 1 + r) return error.PositionMismatch;
+            if (w.held > l.nheld) return error.HeldMismatch;
+            ids[k][0] = @intCast(w.pending);
+            for (l.held[0..w.held], 0..) |t, j| ids[k][1 + j] = @intCast(t);
+            for (w.tokens, 0..) |t, j| ids[k][1 + w.held + j] = @intCast(t);
+            wins[k] = .{ .slot = l.slot, .base = l.base, .end = l.end, .start = start, .absorb = self.m.drafting() and w.stream.drafts, .ids = ids[k][0..rows], .part = if (self.kv != null) l.part else -1, .gen = l.gen };
+        }
+        if (self.kv) |kvp| try self.kvRound(kvp, windows);
     }
 
     /// The caches are positional: the next window starts at the stream's new length and writes over the rows past it.
@@ -855,6 +1052,7 @@ pub const Lanes = struct {
     /// prompt's replay (the rows before it ran the encoder layers alone, as a fresh pass of this prompt runs them).
     fn usable(self: *const Lanes, sn: *const Snap, len: usize) bool {
         if (std.mem.indexOfScalar(*Snap, self.snaps.items, @constCast(sn)) == null) return false;
+        if (self.kv) |k| if (k.planner.keptIndex(sn.id) == null) return false; // (TF_DS_KV_SHARD: its rows the planner holds)
         return !sn.stale and !sn.loading and sn.at > 0 and sn.at < len and sn.at % model.chunk_rows == 0 and sn.at <= len -| self.m.cfg.window;
     }
 
@@ -941,7 +1139,7 @@ pub const Lanes = struct {
         if (at == 0 or at % model.chunk_rows != 0 or at > s.prompt_len -| self.m.cfg.window) return error.NotAChunkEnd;
         const sn = try self.gpa.create(Snap);
         errdefer self.gpa.destroy(sn);
-        sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .end = l.end, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()), .slot = @intCast(l.slot) };
+        sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .end = l.end, .part = l.part, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()), .slot = @intCast(l.slot) };
         errdefer sn.buf.free();
         try self.snaps.append(self.gpa, sn);
         self.next_snap += 1;
@@ -951,6 +1149,11 @@ pub const Lanes = struct {
             try self.flush();
         }
         try self.m.snapCopy(l.slot, sn.buf.ptr, true);
+        // TF_DS_KV_SHARD: the planner keeps it too (its rows held in its part); a refused keep leaves the state unusable
+        // (usable asks the planner), never one whose rows a placement may take
+        if (self.kv) |k| k.keep(sn.id, l.id, at) catch |err| std.log.err("dsv41: the parts' planner did not keep a prompt state: {s}", .{@errorName(err)});
+        // PORT(round3): the spill tier's writes of this point mark it pending (planner.setPending) and salt its block
+        // lineage with its part (planner.saltOf, parts.Root.inPart); spill with TF_DS_KV_SHARD is refused until then
         return sn;
     }
 
@@ -968,6 +1171,8 @@ pub const Lanes = struct {
             self.wire.int(self.gpa, u64, sn.id) catch {};
             self.flush() catch |err| std.log.err("dsv41: rank 1 kept a dropped prompt state: {s}", .{@errorName(err)});
         }
+        // TF_DS_KV_SHARD: the planner's record goes too (deferred while a copy or carry still reads its rows)
+        if (self.kv) |k| k.drop(sn.id) catch |err| std.log.err("dsv41: the parts' planner kept a dropped prompt state: {s}", .{@errorName(err)});
         sn.buf.free();
         self.gpa.destroy(sn);
     }
@@ -1061,8 +1266,12 @@ pub const Lanes = struct {
         if (self.paused) |f| if (f.s == s) {
             self.paused = null;
         };
-        const kv = self.streams.fetchRemove(s) orelse return;
+        const kv = self.streams.fetchRemove(s) orelse {
+            if (self.kv) |k| k.forgetKey(@intFromPtr(s)); // (a request that never placed: its refusal record goes)
+            return;
+        };
         self.used[kv.value.slot] = false;
+        if (self.kv) |k| k.release(kv.value.id) catch |err| std.log.err("dsv41: the parts' planner kept a released stream: {s}", .{@errorName(err)});
     }
 };
 
@@ -1073,6 +1282,66 @@ pub fn survivals(conf: []const f32, out: []f64) void {
         surv *= 1.0 / (1.0 + exp(-@as(f64, cf)));
         o.* = surv;
     }
+}
+
+fn getenv(name: [:0]const u8) ?[]const u8 {
+    return std.mem.span(std.c.getenv(name) orelse return null);
+}
+
+/// The parts' planner for this model: its agreed pool in one part a rank, and the owner-only bytes a carried token
+/// costs (carryBytes over the model's kv sources).
+pub fn kvConfig(m: *const Model) parts.Config {
+    var buf: [16]shard.Source = undefined;
+    return .{ .cap = m.pool_cap, .parts = @intCast(m.world), .carry_bytes = carryBytes(m.kvSources(&buf)) };
+}
+
+/// The bytes a carried token costs, rounded up: every source's compressed codes and scales at its ratio (the owner's
+/// rows, shard.planeBytes over a whole number of every ratio's blocks, so no ratio's share truncates; the index
+/// keys copy on every rank and are not sent). (3/2 + 1) x 288 = 720 at this checkpoint.
+pub fn carryBytes(sources: []const shard.Source) usize {
+    var owner: [16]shard.Source = undefined; // (Model.kvSources' bound)
+    std.debug.assert(sources.len <= owner.len);
+    var tokens: usize = 1;
+    for (sources, owner[0..sources.len]) |s, *o| {
+        o.* = .{ .ratio = s.ratio, .comp_row = s.comp_row, .idx_row = 0 };
+        tokens = tokens / std.math.gcd(tokens, s.ratio) * s.ratio;
+    }
+    const bytes = shard.planeBytes(owner[0..sources.len], tokens, 1, false);
+    return (bytes + tokens - 1) / tokens;
+}
+
+/// The device side of the planner's ops on this rank (Model.copyExtent, Model.bindTwin).
+fn modelDev(m: *Model) kv_lanes.Dev {
+    return .{ .ctx = m, .check = devCheck, .copy = devCopy, .twin = devTwin, .wait = devWait };
+}
+
+fn devCheck(ctx: *anyopaque, from: usize, to: usize, rows: usize) anyerror!void {
+    const m: *Model = @ptrCast(@alignCast(ctx));
+    try m.checkExtent(from, to, rows);
+}
+
+/// The transfers enqueued so far done within `timeout_ns`: an event after them polled (a stream synchronize would
+/// wait forever for an NCCL half whose peer never enqueued its own).
+fn devWait(ctx: *anyopaque, timeout_ns: u64) anyerror!void {
+    const m: *Model = @ptrCast(@alignCast(ctx));
+    var ev = try cuda.Event.init(m.ctx.d, false);
+    defer ev.deinit();
+    try ev.record(m.stream);
+    const deadline = m.now() +| timeout_ns;
+    while (!try ev.done()) {
+        if (m.now() > deadline) return error.TransferTimeout;
+        std.atomic.spinLoopHint();
+    }
+}
+
+fn devCopy(ctx: *anyopaque, from: usize, to: usize, rows: usize) anyerror!void {
+    const m: *Model = @ptrCast(@alignCast(ctx));
+    try m.copyExtent(from, to, rows);
+}
+
+fn devTwin(ctx: *anyopaque, base: usize, on: bool, local: ?usize) anyerror!void {
+    const m: *Model = @ptrCast(@alignCast(ctx));
+    try m.bindTwin(base, on, local);
 }
 
 /// A primitive this rank refused: rank 0 runs the same one on the same inputs and refuses it at the same step (its
@@ -1177,6 +1446,10 @@ pub fn followWith(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower) !vo
         sd.quiesce();
     };
     var fill_base: usize = 0;
+    // TF_DS_KV_SHARD: this rank's copy of the parts' planner, fed rank 0's ops (never with the spill tier on:
+    // SpillWithKvShard, so the rank_wire frames go to one of the two)
+    const kvf: ?*kv_lanes.Follower = if (m.kvs != null) try kv_lanes.Follower.init(gpa, m.rank, kvConfig(m), try kv_lanes.Settings.fromEnv(getenv), modelDev(m)) else null;
+    defer if (kvf) |k| k.deinit();
     while (true) {
         // with spill writes or restores pending, they progress while rank 0 sends nothing (2 ms polls)
         if (spill) |sd| while (sd.busy() and !try peer.readable(2 * std.time.ns_per_ms)) sd.service(std.time.ns_per_ms);
@@ -1215,7 +1488,9 @@ pub fn followWith(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower) !vo
                 try r.ids(gpa, &seqs[slot]);
                 fill_base = @intCast(base);
                 if (spill) |sd| sd.bumpSlot(slot);
-                m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
+                if (m.fillBegin(slot, @intCast(base))) {
+                    if (kvf) |k| try k.fillBegin(slot, @intCast(base)); // (its twins' view, as rank 0 binds it)
+                } else |err| refused(err);
                 m.fill_seq = seqs[slot].items;
             },
             .fill_resume => {
@@ -1240,13 +1515,9 @@ pub fn followWith(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower) !vo
                 if (nw == 0 or nw > max_streams) return error.BadFrame;
                 var wins: [max_streams]Win = undefined;
                 for (0..nw) |k| {
-                    const s: usize = try r.int(u32);
-                    const base: usize = @intCast(try r.int(u64));
-                    const end: usize = @intCast(try r.int(u64));
-                    const start: usize = @intCast(try r.int(u64));
-                    const absorb = try r.int(u8) != 0;
-                    try r.ids(gpa, &win_ids[k]);
-                    wins[k] = .{ .slot = s, .base = base, .end = end, .start = start, .absorb = absorb, .ids = win_ids[k].items };
+                    wins[k] = try readWin(&r, gpa, &win_ids[k], kvf != null);
+                    // TF_DS_KV_SHARD: a round naming a reused extent (its part or generation not the planner's) fails closed
+                    if (kvf) |kf| try kf.checkWin(wins[k].slot, wins[k].base, wins[k].end, @intCast(wins[k].part), wins[k].gen);
                 }
                 const rows = try built.build(gpa, &seqs, wins[0..nw]);
                 if (spill) |sd| for (wins[0..nw]) |w| sd.bump(w.base + w.start, w.base + w.start + w.ids.len);
@@ -1326,7 +1597,8 @@ pub fn followWith(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower) !vo
                     b.free();
                 }
             },
-            .rank_wire => try (spill orelse return error.SpillNotStarted).wireFrame(peer, r.rest()),
+            // one rank_wire Follower a rank: the spill tier's or the KV parts' (never both: SpillWithKvShard)
+            .rank_wire => if (spill) |sd| try sd.wireFrame(peer, r.rest()) else if (kvf) |k| try k.onFrame(peer, r.rest()) else return error.Unsupported,
             .spill => try (spill orelse return error.SpillNotStarted).note(r.rest()),
             .done => {
                 if (spill) |sd| {
@@ -1508,4 +1780,283 @@ test "a restore's destination holds the waiting prompt's room past its rows whil
     // no room for the hint anywhere: null (spillReserve then places the rows alone, as placeKept does)
     try std.testing.expectEqual(@as(?usize, null), try ln.placeFree(&.{.{ 4 * c, 64 * c }}, 8 * c));
     try std.testing.expect(!kept.stale);
+}
+
+test "a verify window's frame bytes: as ever with the switch off, its part and generation added with it on" {
+    const gpa = std.testing.allocator;
+    const win: Win = .{ .slot = 2, .base = 4096, .end = 8192, .start = 7, .absorb = true, .ids = &.{ 5, 6 }, .part = 1, .gen = 9 };
+    var w: Wire = .{};
+    defer w.deinit(gpa);
+    try writeWin(&w, gpa, win, false);
+    // the layout before TF_DS_KV_SHARD: verifyFn's fields in their order
+    var old: Wire = .{};
+    defer old.deinit(gpa);
+    try old.int(gpa, u32, 2);
+    try old.int(gpa, u64, 4096);
+    try old.int(gpa, u64, 8192);
+    try old.int(gpa, u64, 7);
+    try old.int(gpa, u8, 1);
+    try old.ids(gpa, &.{ 5, 6 });
+    try std.testing.expectEqualSlices(u8, old.buf.items, w.buf.items);
+    var ids: std.ArrayList(i32) = .empty;
+    defer ids.deinit(gpa);
+    var r: Reader = .{ .b = w.buf.items };
+    const off = try readWin(&r, gpa, &ids, false);
+    try std.testing.expectEqual(@as(i64, -1), off.part);
+    try std.testing.expectEqual(@as(u64, 0), off.gen);
+    try std.testing.expectEqual(w.buf.items.len, r.at);
+    w.buf.clearRetainingCapacity();
+    try writeWin(&w, gpa, win, true);
+    try std.testing.expectEqual(old.buf.items.len + 9, w.buf.items.len);
+    r = .{ .b = w.buf.items };
+    const on = try readWin(&r, gpa, &ids, true);
+    try std.testing.expectEqual(@as(i64, 1), on.part);
+    try std.testing.expectEqual(@as(u64, 9), on.gen);
+    try std.testing.expectEqualSlices(i32, &.{ 5, 6 }, on.ids);
+    var bad = win;
+    bad.part = -1;
+    try std.testing.expectError(error.BadPart, writeWin(&w, gpa, bad, true));
+}
+
+/// The device side for the lanes tests: transfers and twin binds counted.
+const TestDev = struct {
+    copies: usize = 0,
+    binds: usize = 0,
+
+    fn dev(d: *TestDev) kv_lanes.Dev {
+        return .{ .ctx = d, .check = checkFn, .copy = copyFn, .twin = twinFn, .wait = waitFn };
+    }
+
+    fn checkFn(_: *anyopaque, _: usize, _: usize, _: usize) anyerror!void {}
+
+    fn waitFn(_: *anyopaque, _: u64) anyerror!void {}
+
+    fn copyFn(ctx: *anyopaque, _: usize, _: usize, _: usize) anyerror!void {
+        const d: *TestDev = @ptrCast(@alignCast(ctx));
+        d.copies += 1;
+    }
+
+    fn twinFn(ctx: *anyopaque, _: usize, _: bool, _: ?usize) anyerror!void {
+        const d: *TestDev = @ptrCast(@alignCast(ctx));
+        d.binds += 1;
+    }
+};
+
+/// A stream as placeParts and releaseFn read it.
+fn testStream(id: []const u8, saved: ?*Snap) lanes.Stream {
+    var s: lanes.Stream = undefined;
+    s.id = id;
+    s.reuse = .{ .saved = if (saved) |sn| @ptrCast(sn) else null };
+    s.reuse_failed = false;
+    return s;
+}
+
+fn testLanes(m: *Model) Lanes {
+    m.pool_cap = 64 * model.chunk_rows;
+    m.cfg.window = 0;
+    m.io = std.testing.io;
+    return .{ .gpa = std.testing.allocator, .m = m, .peer = null };
+}
+
+fn testPut(ln: *Lanes, s: *const lanes.Stream, slot: usize, size: usize, p: anytype) !void {
+    try ln.streams.put(ln.gpa, s, .{ .slot = slot, .base = p.base, .end = p.base + size, .id = p.id, .part = p.part, .gen = p.gen });
+    ln.used[slot] = true;
+}
+
+test "TF_DS_KV_SHARD lanes: part-local placement, a kept state resumed in place, the planner's stales reach the Snaps" {
+    const c = model.chunk_rows;
+    const gpa = std.testing.allocator;
+    var m: Model = undefined;
+    var ln = testLanes(&m);
+    defer ln.snaps.deinit(gpa);
+    defer ln.streams.deinit(gpa);
+    var dev: TestDev = .{};
+    var k = try kv_lanes.Kv.init(gpa, .{ .cap = 64 * c, .parts = 2, .carry_bytes = 720 }, .{ .twins = false }, dev.dev(), .{ .ctx = &ln, .stale = Lanes.kvStale, .moved = Lanes.kvMoved });
+    defer k.deinit();
+    ln.kv = &k;
+    // a conversation's first turn, kept at 8 blocks, then released
+    var sa = testStream("a", null);
+    const pa = try ln.placeParts(&k, &sa, 10 * c, 0, 10 * c);
+    try std.testing.expect(pa.kept == null and pa.base + 10 * c <= 32 * c);
+    try testPut(&ln, &sa, 0, 10 * c, pa);
+    var s1: Snap = .{ .id = 1, .at = 8 * c, .base = pa.base, .end = pa.base + 10 * c, .buf = undefined, .part = pa.part };
+    try ln.snaps.append(gpa, &s1);
+    try k.keep(1, pa.id, 8 * c);
+    Lanes.releaseFn(&ln, &sa);
+    try std.testing.expectEqual(@as(usize, 0), k.planner.lives.items.len);
+    // its next turn resumes it in place (the extent grows into its slack: the planner's kept end follows)
+    var sb = testStream("b", &s1);
+    const pb = try ln.placeParts(&k, &sb, 12 * c, 1, 9 * c);
+    try std.testing.expect(pb.kept == &s1 and !pb.moved and !sb.reuse_failed);
+    try std.testing.expectEqual(s1.base, pb.base);
+    try std.testing.expectEqual(pa.base + 12 * c, k.planner.keptAt(1).?.end);
+    try testPut(&ln, &sb, 1, 12 * c, pb);
+    try std.testing.expectEqual(@as(usize, 0), dev.copies); // (in place: no transfer)
+    // a long stream takes the other part; the conversation ends; a request that needs part 0 whole gives up the state
+    var sc = testStream("c", null);
+    const pc = try ln.placeParts(&k, &sc, 30 * c, 2, 30 * c);
+    try std.testing.expect(pc.part != pb.part);
+    try testPut(&ln, &sc, 2, 30 * c, pc);
+    Lanes.releaseFn(&ln, &sb);
+    var sd = testStream("d", null);
+    const pd = try ln.placeParts(&k, &sd, 30 * c, 1, 30 * c);
+    try std.testing.expectEqual(pb.part, pd.part);
+    try std.testing.expect(s1.stale); // (kvStale: the planner's stale op)
+    try std.testing.expect(!ln.usable(&s1, 9 * c));
+    // a waiting request is counted once and forgotten when the host gives it up
+    var se = testStream("e", null);
+    try std.testing.expectError(error.ContextFull, ln.placeParts(&k, &se, 20 * c, 0, 20 * c));
+    try std.testing.expectEqual(@as(usize, 1), k.waiting.items.len);
+    Lanes.releaseFn(&ln, &se);
+    try std.testing.expectEqual(@as(usize, 0), k.waiting.items.len);
+    try testPut(&ln, &sd, 1, 30 * c, pd);
+    Lanes.releaseFn(&ln, &sc);
+    Lanes.releaseFn(&ln, &sd);
+    try std.testing.expectEqual(@as(usize, 0), k.planner.lives.items.len);
+}
+
+test "TF_DS_KV_SHARD lanes: a live move rewrites the moved Lane and the Snaps inside it" {
+    const c = model.chunk_rows;
+    const gpa = std.testing.allocator;
+    var m: Model = undefined;
+    var ln = testLanes(&m);
+    defer ln.snaps.deinit(gpa);
+    defer ln.streams.deinit(gpa);
+    var dev: TestDev = .{};
+    var k = try kv_lanes.Kv.init(gpa, .{ .cap = 64 * c, .parts = 2, .carry_bytes = 720 }, .{ .twins = false }, dev.dev(), .{ .ctx = &ln, .stale = Lanes.kvStale, .moved = Lanes.kvMoved });
+    defer k.deinit();
+    ln.kv = &k;
+    var sx = testStream("x", null);
+    const px = try ln.placeParts(&k, &sx, 14 * c, 0, 14 * c);
+    try testPut(&ln, &sx, 0, 14 * c, px);
+    var sz = testStream("z", null);
+    const pz = try ln.placeParts(&k, &sz, 10 * c, 1, 10 * c);
+    try testPut(&ln, &sz, 1, 10 * c, pz);
+    try std.testing.expect(px.part != pz.part);
+    var s2: Snap = .{ .id = 2, .at = 2 * c, .base = px.base, .end = px.base + 14 * c, .buf = undefined, .part = px.part };
+    try ln.snaps.append(gpa, &s2);
+    try k.keep(2, px.id, 2 * c);
+    try k.decodeStart(px.id);
+    try k.decodeStart(pz.id);
+    try k.round(&.{ .{ .id = px.id, .valid = 2 * c }, .{ .id = pz.id, .valid = 3 * c } });
+    // a 24-block request fits neither part: x (two blocks used) moves, with its kept state
+    var sw = testStream("w", null);
+    const pw = try ln.placeParts(&k, &sw, 24 * c, 2, 24 * c);
+    const lx = ln.streams.get(&sx).?;
+    try std.testing.expectEqual(pz.part, lx.part);
+    try std.testing.expect(lx.base != px.base and lx.gen != px.gen);
+    try std.testing.expectEqual(lx.base + 14 * c, lx.end);
+    try std.testing.expectEqual(lx.base, s2.base);
+    try std.testing.expectEqual(lx.part, s2.part);
+    try std.testing.expectEqual(px.part, pw.part);
+    try std.testing.expectEqual(@as(usize, 1), dev.copies);
+    try testPut(&ln, &sw, 2, 24 * c, pw);
+    // the next round names the moved extent's generation (a follower checks it)
+    try std.testing.expectEqual(k.planner.lives.items[k.planner.liveIndex(lx.id).?].gen, lx.gen);
+}
+
+/// A window of the pending row and `n - 1` host drafts at the stream's cache length (verifyFn's input).
+fn testWindow(s: *lanes.Stream, positions: []u64, tokens: []const u32) be.Window {
+    for (positions, 0..) |*p, r| p.* = s.cache_len + 1 + r;
+    return .{ .stream = s, .pending = 1, .held = 0, .tokens = tokens, .parents = null, .positions = positions[0 .. 1 + tokens.len] };
+}
+
+test "TF_DS_KV_SHARD lanes: a round's windows reach the follower with part and generation; a move right after a round crossing a block copies its rows; the old generation is refused" {
+    const c = model.chunk_rows;
+    const gpa = std.testing.allocator;
+    var m: Model = undefined;
+    m.dr = null;
+    var ln = testLanes(&m);
+    defer ln.snaps.deinit(gpa);
+    defer ln.streams.deinit(gpa);
+    // rank 0's Kv with an in-process follower (kv_lanes.Pair), its hooks the lanes'
+    const pr = try kv_lanes.Pair.initWith(gpa, .{ .cap = 64 * c, .parts = 2, .carry_bytes = 720 }, .{ .twins = false }, .{ .ctx = &ln, .stale = Lanes.kvStale, .moved = Lanes.kvMoved });
+    defer pr.deinit();
+    ln.kv = &pr.kv;
+    var sx = testStream("x", null);
+    const px = try ln.placeParts(&pr.kv, &sx, 14 * c, 0, 14 * c);
+    try testPut(&ln, &sx, 0, 14 * c, px);
+    var sz = testStream("z", null);
+    const pz = try ln.placeParts(&pr.kv, &sz, 10 * c, 1, 10 * c);
+    try testPut(&ln, &sz, 1, 10 * c, pz);
+    // x's round starts 3 rows before its second block ends and writes 6 rows into its third
+    sx.cache_len = 2 * c - 3;
+    sx.drafts = false;
+    sz.cache_len = 3 * c;
+    sz.drafts = false;
+    var pos: [2][window_rows]u64 = undefined;
+    const drafts = [_]u32{ 2, 3, 4, 5, 6 };
+    const windows = [_]be.Window{ testWindow(&sx, &pos[0], &drafts), testWindow(&sz, &pos[1], drafts[0..1]) };
+    var ids: [max_streams][max_rows]i32 = undefined;
+    var wins: [max_streams]Win = undefined;
+    try ln.roundWins(&windows, &ids, &wins);
+    try std.testing.expectEqual(@as(usize, 2 * c + 3), pr.kv.planner.lives.items[pr.kv.planner.liveIndex(px.id).?].valid);
+    try std.testing.expectEqual(@as(usize, 3 * c + 2), pr.kv.planner.lives.items[pr.kv.planner.liveIndex(pz.id).?].valid);
+    try pr.same(); // (the first rounds' untwin plans reached the follower)
+    // the verify frame's windows as the follower reads and checks them
+    var w: Wire = .{};
+    defer w.deinit(gpa);
+    for (wins[0..2]) |x| try writeWin(&w, gpa, x, true);
+    var r: Reader = .{ .b = w.buf.items };
+    var got: std.ArrayList(i32) = .empty;
+    defer got.deinit(gpa);
+    var old_x: Win = undefined;
+    for (0..2) |k| {
+        const x = try readWin(&r, gpa, &got, true);
+        try pr.fol.checkWin(x.slot, x.base, x.end, @intCast(x.part), x.gen);
+        if (k == 0) old_x = x;
+    }
+    // a 24-block request fits neither part: x moves with every row the round wrote (whole blocks: 3, not 2)
+    var sw = testStream("w", null);
+    const pw = try ln.placeParts(&pr.kv, &sw, 24 * c, 2, 24 * c);
+    try testPut(&ln, &sw, 2, 24 * c, pw);
+    try std.testing.expectEqual(@as(usize, 1), pr.dev0.copies.items.len);
+    try std.testing.expectEqual(@as(usize, 3 * c), pr.dev0.copies.items[0][2]);
+    try std.testing.expectEqualSlices([3]usize, pr.dev0.copies.items, pr.dev1.copies.items);
+    try pr.same();
+    // the follower refuses a round naming x's old extent, and takes the next one at the new generation
+    try std.testing.expectError(error.StaleExtent, pr.fol.checkWin(old_x.slot, old_x.base, old_x.end, @intCast(old_x.part), old_x.gen));
+    sx.cache_len += 6;
+    const next = [_]be.Window{testWindow(&sx, &pos[0], drafts[0..1])};
+    try ln.roundWins(&next, &ids, &wins);
+    try std.testing.expect(wins[0].gen != old_x.gen and wins[0].base != old_x.base);
+    try pr.fol.checkWin(wins[0].slot, wins[0].base, wins[0].end, @intCast(wins[0].part), wins[0].gen);
+    for ([_]*lanes.Stream{ &sx, &sz, &sw }) |s| Lanes.releaseFn(&ln, s);
+    try pr.same();
+    try std.testing.expectEqual(@as(usize, 0), pr.fol.planner.?.lives.items.len);
+}
+
+test "TF_DS_KV_SHARD lanes: a prompt pass failing after its placement (prefillFn's errdefer) frees the extent on both ranks" {
+    const c = model.chunk_rows;
+    const gpa = std.testing.allocator;
+    var m: Model = undefined;
+    var ln = testLanes(&m);
+    defer ln.snaps.deinit(gpa);
+    defer ln.streams.deinit(gpa);
+    const pr = try kv_lanes.Pair.initWith(gpa, .{ .cap = 64 * c, .parts = 2, .carry_bytes = 720 }, .{}, .{ .ctx = &ln, .stale = Lanes.kvStale, .moved = Lanes.kvMoved });
+    defer pr.deinit();
+    ln.kv = &pr.kv;
+    var sa = testStream("a", null);
+    const pa = try ln.placeParts(&pr.kv, &sa, 30 * c, 0, 30 * c);
+    try pr.same();
+    try std.testing.expect(pr.fol.planner.?.liveIndex(pa.id) != null);
+    // (prefillFn's errdefer after placeParts: a fill chunk failed, the request cancelled)
+    try pr.kv.release(pa.id);
+    try pr.same();
+    try std.testing.expectEqual(@as(usize, 0), pr.fol.planner.?.lives.items.len);
+    // slot 0 and the whole part take the next request
+    var sb = testStream("b", null);
+    const pb = try ln.placeParts(&pr.kv, &sb, 30 * c, 0, 30 * c);
+    try testPut(&ln, &sb, 0, 30 * c, pb);
+    Lanes.releaseFn(&ln, &sb);
+    try pr.same();
+}
+
+test "TF_DS_KV_SHARD lanes: a carried token's bytes are the owners' rows over whole blocks of every ratio, rounded up" {
+    // this checkpoint's four kv sources (ratios 2, 2, 2, 1): (3/2 + 1) x 288 = 720, the index keys not sent
+    const row = shard.comp_row_bytes;
+    const idx = shard.idx_row_bytes;
+    try std.testing.expectEqual(@as(usize, 720), carryBytes(&.{ .{ .ratio = 2, .comp_row = row, .idx_row = idx }, .{ .ratio = 2, .comp_row = row, .idx_row = idx }, .{ .ratio = 2, .comp_row = row, .idx_row = idx }, .{ .ratio = 1, .comp_row = row, .idx_row = idx } }));
+    // ratios that do not divide the row: 72 + 2.25 a token rounds up to 75 (per-layer integer division said 74)
+    try std.testing.expectEqual(@as(usize, 75), carryBytes(&.{ .{ .ratio = 4, .comp_row = row, .idx_row = idx }, .{ .ratio = 128, .comp_row = row, .idx_row = 0 } }));
 }
