@@ -28,6 +28,7 @@ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
     try o.put(a, "model_ids", .{ .array = ids });
     try o.put(a, "max_batch_size", try json.intValue(a, srv.info.lanes));
     try o.put(a, "warming", .{ .bool = status.warming });
+    try putTotals(a, o, srv.metrics.totals(srv.io), srv.info.prompt_cache);
     const memory = try json.newObject(a);
     if (srv.engine.memory(std.mem.indexOf(u8, conn.path, "reset_peak=1") != null)) |mem| {
         try memory.put(a, "active", try json.intValue(a, mem.active));
@@ -40,6 +41,16 @@ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
     if (status.kv_parts) |k| try putKvParts(a, o, k);
     if (status.pair) |p| try putPair(a, o, p);
     routes.sendValue(conn, a, code, .{ .object = o });
+}
+
+/// The token counts of finished requests, as /metrics counts them (the same totals, read together): `prompt_tokens_total`
+/// (cached ones included), `cached_tokens_total` (the part restored from kept prompt states, only from an engine that
+/// keeps some; the name a dashboard such as sparkDash reads) and `generation_tokens_total`. Computed prompt tokens are
+/// the difference.
+pub fn putTotals(a: Allocator, o: *json.Object, t: @import("metrics.zig").Metrics.Totals, keeps: bool) !void {
+    try o.put(a, "prompt_tokens_total", try json.intValue(a, t.prompt));
+    if (keeps) try o.put(a, "cached_tokens_total", try json.intValue(a, t.cached));
+    try o.put(a, "generation_tokens_total", try json.intValue(a, t.generation));
 }
 
 /// The rank pair's robustness counters and state, under "pair" (a backend with a broken-pair policy or a disk tier).
@@ -111,6 +122,7 @@ pub fn models(srv: *Server, conn: *Conn, a: Allocator) !void {
         try m.put(a, "object", .{ .string = "model" });
         try m.put(a, "created", try json.intValue(a, created));
         try m.put(a, "owned_by", .{ .string = "tensorfold" });
+        if (srv.info.context_window > 0) try m.put(a, "max_model_len", try json.intValue(a, srv.info.context_window)); // the window one request may use
         slot.* = .{ .object = m };
     }
     const o = try json.newObject(a);
