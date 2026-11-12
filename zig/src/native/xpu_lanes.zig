@@ -61,6 +61,10 @@ pub const Lanes = struct {
     count: usize = 0,
     wslots: [16]u32 = undefined, // and each window's slot
     wfirst: [16]u32 = undefined, // and its first row
+    absorbed: [16]bool = @splat(false), // the window's kept rows already in its slot's drafter context
+    chain: [xq.MAX_SLOTS][16]u32 = undefined, // each slot's DFlash2 drafts for its next window (a tree)
+    chain_par: [xq.MAX_SLOTS][16]i32 = undefined, // and each one's parent (−1: the pending token)
+    chain_n: [xq.MAX_SLOTS]u32 = @splat(0),
     tapped: usize = 0, // the last verify's windows whose taps acts.taps still holds (features)
     tail: ?Tail = null, // the prompt chunk whose taps acts.taps still holds (features)
     sink: ?struct { s: *lanes.Stream, take: be.FeatureSink } = null, // a drafting prompt pass hands chunks here
@@ -438,7 +442,8 @@ pub const Lanes = struct {
     /// XPU_PROMPT_SLICE: one chunk of the prompt pass a call, false while chunks remain; the lane host runs decode
     /// rounds of the other streams between calls. The chunks are the whole pass's (chunkEnd from the pass's start,
     /// the request's chunks and the cache's marks), so the prompt's bits are the same.
-    fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
+    fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream, max_rows: u32) anyerror!bool {
+        _ = max_rows;
         const b = self(ptr);
         try b.settle();
         const held = b.slotOf(s);

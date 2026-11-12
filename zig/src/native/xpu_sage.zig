@@ -340,7 +340,8 @@ pub const Slots = struct {
     /// steps remain; the lane host runs a decode round of the other streams between steps. The step ends where the
     /// whole pass cuts a chunk, so the chunks are the whole pass's. A prompt with images runs whole in its first step:
     /// the tower's rows wait in buffers the next image prompt overwrites.
-    fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
+    fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream, max_rows: u32) anyerror!bool {
+        _ = max_rows;
         const b = of(ptr);
         const held = b.slotOf(s);
         const slot = if (held != null and b.filled[held.?].on) held.? else try b.begin(s);
@@ -738,8 +739,8 @@ pub const Slots = struct {
         errdefer b.gpa.free(ids);
         var gdn: kv.Lease = .{};
         errdefer p.finish(&gdn);
-        p.leaveReclaim(&b);
-        defer _ = p.joinReclaim(.{ .ctx = &b, .call = Slots.reclaimFn }) catch {};
+        p.leaveReclaim(b);
+        defer _ = p.joinReclaim(.{ .ctx = b, .call = Slots.reclaimFn }) catch {};
         try p.promise(&gdn, b.gdn_pages);
         try p.cover(&gdn, b.gdn_pages, null);
         @memcpy(ids[kv_n..], gdn.ids.items);

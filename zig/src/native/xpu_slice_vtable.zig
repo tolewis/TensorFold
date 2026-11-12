@@ -5,7 +5,7 @@ const lanes = @import("lanes");
 const be = lanes.backend;
 const VTable = be.Backend.VTable;
 
-pub fn Vtables(comptime whole: VTable, comptime step: *const fn (ptr: *anyopaque, s: *lanes.Stream) anyerror!bool) type {
+pub fn Vtables(comptime whole: VTable, comptime step: *const fn (ptr: *anyopaque, s: *lanes.Stream, max_rows: u32) anyerror!bool) type {
     return struct {
         pub const plain: VTable = whole;
         pub const sliced: VTable = blk: {
@@ -28,7 +28,7 @@ const Probe = struct {
         return @ptrCast(@alignCast(p));
     }
     fn prefill(_: *anyopaque, _: *lanes.Stream) anyerror!void {}
-    fn step(p: *anyopaque, _: *lanes.Stream) anyerror!bool {
+    fn step(p: *anyopaque, _: *lanes.Stream, _: u32) anyerror!bool {
         self(p).steps += 1;
         return true;
     }
@@ -72,7 +72,7 @@ test "slice vtable: the pointer backend() returns stays valid after it returns, 
     try std.testing.expect(whole.vtable.prefill_step == null);
     try std.testing.expect(!whole.vtable.reports_fill);
     var s: lanes.Stream = undefined;
-    try std.testing.expect(try sliced.vtable.prefill_step.?(sliced.ptr, &s));
+    try std.testing.expect(try sliced.vtable.prefill_step.?(sliced.ptr, &s, 0));
     try std.testing.expectEqual(@as(u32, 1), p.steps);
     try whole.vtable.prefill(whole.ptr, &s);
     // static: both live in the binary's data, not a stack frame
