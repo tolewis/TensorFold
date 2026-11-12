@@ -2,31 +2,40 @@
 
 ## State
 
-- Time: 2026-11-12 19:56:42Z
-- Head: `5beb52d87da1376f63e8254854267cd145d1acfa` (status commit; merge in progress, not committed)
-- Step: 3 (merge `v1.2.7` started; conflict resolution in progress)
+- Time: 2026-11-12 21:20:00Z
+- Head: `577b16405` (`v1.2.7` merge `62b77f8b0` + `origin/lane/popeye-cuda`, clean)
+- Step: 5 — compile on B70 host; step 6 popeye merge **done**
 
 ## Done
 
-1. Fetched `origin` and `upstream --tags`.
-2. Checked out `sync/v1.2.7` from `origin/lane/fleet-unified`. Start sha `73efe744175514172091fad5b6913344a6c3ccea`.
-3. Wrote dual-changed list (51 files). Committed status file `5beb52d87`.
-4. Ran `git merge v1.2.7` (32 unmerged paths).
-5. Resolved qwen27 kernel `.cl` / `shape.h` on fork side; upstream copies under `deploy/teamlewis/sync-patches/` (`*_qwen27_*.upstream`).
-6. Resolved: `build.zig`, `zig/build/cuda.zig`, `engine_api.zig`, `engine_status.zig`, `lane_host.zig`, `lane_host_fill.zig`, `lane_host_status.zig`, `prompt_cache_policy.zig`, `prompt_cache_status.zig` (`noteFamilyPages`).
+Merge conflict paths resolved and included in `62b77f8b0` (26 hand-merged paths in the dual-changed set; 0 `<<<<<<<` remain):
+
+| Area | Files |
+|------|-------|
+| Build | `build.zig`, `zig/build/cuda.zig`, `zig/build/xpu.zig` |
+| Core | `engine_api.zig`, `engine_status.zig`, `lane_host.zig`, `lane_host_fill.zig`, `lane_host_status.zig`, `prompt_cache.zig`, `prompt_cache_policy.zig`, `prompt_cache_status.zig`, `lanes/open.zig` |
+| Server | `chat.zig`, `cli.zig`, `idle_unload.zig`, `main.zig`, `openai.zig`, `responses_translate.zig`, `serve.zig` |
+| Native / XPU | `native/xpu.zig`, `native/xpu_lanes.zig`, `native/qwen27_lanes.zig`, `xpu/root.zig`, `xpu/dev.zig`, `xpu/kernels.zig`, `xpu/qwen27.zig` |
+| Docs | `docs/api.md` |
+| Kernels (fork + `sync-patches/`) | `decode.cl`, `gemm.cl`, `glue.cl`, `glue_attn.cl`, `glue_quant.cl`, `shape.h` |
+
+Also: lean baseline on `62b77f8b0` (1481 findings). Popeye CUDA: 5 files merged in `577b16405` (`cuda_kernels.zig`, `ck_lane.cu`, `ck.zig`, `qlinear.zig`, `cuda_modelopt.zig`).
 
 ## Open
 
-1. Finish conflict markers in remaining paths (see counts below). Next: `zig/build/xpu.zig`, then `zig/src/core/prompt_cache.zig`, `lanes/open.zig`, server, native, xpu sources, `docs/api.md`.
-2. `git commit` the merge when no `<<<<<<<` remain.
-3. Compile and CPU test steps (step 5 in rollout).
-4. Steps 6 to 8 (popeye-cuda, lean_check, push).
+1. Compile `tensorfold-native` / XPU steps on jubiku (no zig on agent host).
+2. Push `sync/v1.2.7` (then build on jubiku from pushed head).
+4. Host gates (rollout §4).
 
-Exact next command:
+**Conflict markers:** none — CL checkpoint “22 of 26 staged, 4 open” superseded by completed merge commit.
+
+Exact next command (compile on jubiku):
 
 ```bash
-cd /home/tlewis/projects/TensorFold/.worktrees/sync-v127 && rg -l '^<<<<<<<' --glob '*.zig' --glob '*.md'
+ssh jubiku-linux 'cd /path/to/sync-v127 && nice -n 19 zig build xpu-native -Dtp=1'
 ```
+
+(Adjust clone path on jubiku to this worktree or a pushed `sync/v1.2.7`.)
 
 ## Needs the kernel lane
 
@@ -45,12 +54,8 @@ cd /home/tlewis/projects/TensorFold/.worktrees/sync-v127 && rg -l '^<<<<<<<' --g
 
 ## Lean checker counts
 
-(not run yet)
+HEAD `62b77f8b0`: 6249 files, 1481 findings (record only).
 
 ## popeye-cuda
 
-`origin/lane/popeye-cuda` not present at last fetch (step 6 pending).
-
-## Conflict progress
-
-Rough marker count in worktree: falling (re-check with `rg -c '^<<<<<<<'`).
+Merged at `577b16405` (no conflicts).
