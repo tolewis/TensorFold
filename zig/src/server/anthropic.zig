@@ -106,7 +106,14 @@ const Wire = struct {
     payload: Value = .null,
 
     fn out(w: *Wire) openai.Out {
-        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole } };
+        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole, .ping = ping } };
+    }
+
+    fn ping(ctx: *anyopaque) error{Closed}!void {
+        const w: *Wire = @ptrCast(@alignCast(ctx));
+        const o = json.newObject(w.reply.a) catch return error.Closed;
+        o.put(w.reply.a, "type", .{ .string = "ping" }) catch return error.Closed;
+        return sse.event(w.reply.conn, w.reply.a, "ping", .{ .object = o });
     }
 
     fn open(ctx: *anyopaque) error{Closed}!void {

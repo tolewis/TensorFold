@@ -23,6 +23,13 @@ pub fn done(conn: *Conn) error{Closed}!void {
     return conn.writeAll("data: [DONE]\n\n");
 }
 
+/// ``: text`` and a blank line: a keep-alive comment no client parses.
+pub fn comment(conn: *Conn, text: []const u8) error{Closed}!void {
+    conn.writeAll(": ") catch return error.Closed;
+    conn.writeAll(text) catch return error.Closed;
+    return conn.writeAll("\n\n");
+}
+
 /// ``event: KIND`` then its data line (Responses and Messages events).
 pub fn event(conn: *Conn, a: Allocator, kind: []const u8, payload: json.Value) error{Closed}!void {
     const text = json.stringify(a, payload, .{}) catch return error.Closed;

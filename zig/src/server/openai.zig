@@ -34,6 +34,8 @@ pub const Out = struct {
         event: *const fn (ctx: *anyopaque, payload: ?Value) error{Closed}!void,
         /// A whole JSON reply.
         reply: *const fn (ctx: *anyopaque, status: u16, payload: Value) void,
+        /// A keep-alive the stream sends while nothing else is; optional.
+        ping: ?*const fn (ctx: *anyopaque) error{Closed}!void = null,
     };
 };
 
@@ -54,12 +56,17 @@ const ClientOut = struct {
     a: Allocator,
 
     fn out(c: *ClientOut) Out {
-        return .{ .ctx = c, .vt = &.{ .open = open, .event = event, .reply = reply } };
+        return .{ .ctx = c, .vt = &.{ .open = open, .event = event, .reply = reply, .ping = ping } };
     }
 
     fn open(ctx: *anyopaque) error{Closed}!void {
         const c: *ClientOut = @ptrCast(@alignCast(ctx));
         return sse.open(c.conn);
+    }
+
+    fn ping(ctx: *anyopaque) error{Closed}!void {
+        const c: *ClientOut = @ptrCast(@alignCast(ctx));
+        return sse.comment(c.conn, "ping");
     }
 
     fn event(ctx: *anyopaque, payload: ?Value) error{Closed}!void {
@@ -388,6 +395,11 @@ const Run = struct {
         run: *Run,
         tools: bool,
 
+        fn ping(ctx: *anyopaque) error{Closed}!void {
+            const s: *StreamSink = @ptrCast(@alignCast(ctx));
+            if (s.run.out.vt.ping) |p| return p(s.run.out.ctx);
+        }
+
         fn call(ctx: *anyopaque, delta: Value) error{Closed}!void {
             const s: *StreamSink = @ptrCast(@alignCast(ctx));
             const r = s.run;
@@ -458,7 +470,7 @@ const Run = struct {
         if (!tools and r.is_chat) r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
         var sink_state: StreamSink = .{ .run = r, .tools = tools };
         handed = true;
-        var reply = chat.generate(r.srv, &cx, prepared, .{ .ctx = &sink_state, .call = StreamSink.call }, gone) catch |e| {
+        var reply = chat.generate(r.srv, &cx, prepared, .{ .ctx = &sink_state, .call = StreamSink.call, .ping = StreamSink.ping }, gone) catch |e| {
             switch (e) {
                 error.Cancelled => return,
                 error.Refused => if (cx.kind != .other and cx.kind != .server) {
