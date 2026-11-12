@@ -101,6 +101,8 @@ pub const Linear = struct {
     ck_rows: u64 = 0, // its e4m3 rows (at least rows * k bytes), and slice partials where no cluster meets them
     ck_part: u64 = 0,
     ck_sa: u64 = 0, // per-row activation scales [rows] f32 for the checkpoint-math prompt GEMM
+    ck8: bool = true, // the checkpoint-math prompt GEMM for FP8 weights (TF_CK8=0 turns it off)
+    ck4: bool = true, // the same for NVFP4 weights (TF_CK4=0)
     exl3: ?*exl3.Dense = null, // the EXL3 kernels and the scratch the dense calls share
     ggml: ?*const ggml.Kernels = null, // q8_0 and iq2xxs rows of both kinds
 
@@ -165,7 +167,7 @@ pub const Linear = struct {
             },
             .fp8g => |q| {
                 // the checkpoint's own math when it carries a scale a row; the bf16 lane tile otherwise
-                if (l.ck != null and rows >= ck.prompt_tokens and l.ck_rows != 0 and l.ck_sa != 0) {
+                if (l.ck8 and l.ck != null and rows >= ck.prompt_tokens and l.ck_rows != 0 and l.ck_sa != 0) {
                     if (l.checkpointRows(s, l.ck.?, q, in, out, rows)) |_| return else |_| {}
                 }
                 return l.onLane(s, q, .fp8g, in, out, rows);
@@ -173,7 +175,7 @@ pub const Linear = struct {
             .mxfp8 => |q| return l.onLane(s, q, .mxfp8, in, out, rows),
             .nvfp4 => |q| {
                 // the checkpoint's own math when it carries its input scale; the bf16-decoding tile otherwise
-                if (q.act != 0 and l.ck != null and rows >= ck.prompt_tokens and l.ck_rows != 0) {
+                if (l.ck4 and q.act != 0 and l.ck != null and rows >= ck.prompt_tokens and l.ck_rows != 0) {
                     if (l.checkpoint4(s, l.ck.?, q, in, out, rows)) |_| return else |_| {}
                 }
                 return l.onPrompt(s, q, .fp4, in, out, rows);

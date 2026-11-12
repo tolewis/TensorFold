@@ -299,8 +299,9 @@ constexpr int PM = 128, PN = 128, PSTAGES = 4;  // rows, columns, staged 64-inpu
 struct Stage {
     uint4 a[PM][2];
     uint32_t sa[PM];
-    uint2 b[2][256];
+    uint2 b[2][256];   // as packed: the dense packer's bf16 m16n8k16 order
     uint32_t sb[2][64];
+    uint2 bt[2][256];  // the same words in the mxf4nvf4 order the block-scaled mma reads
 };
 
 }  // namespace tf_ck4p
@@ -364,13 +365,31 @@ extern "C" __global__ void __launch_bounds__(256)
         __syncthreads();
         if (kg + PSTAGES - 1 < KG) load((kg + PSTAGES - 1) % PSTAGES, kg + PSTAGES - 1);
         commit();
-        const Stage& p = st[kg % PSTAGES];
+        Stage& p = st[kg % PSTAGES];
+        // The dense packer orders words for the bf16 m16n8k16 mma. The block-scaled mma reads lane t, reg v as
+        // inputs 32v + 8t .. 8t + 7, so its nibble i comes from nibble t + 4(i & 1) of word v on quad-mate lane
+        // (g << 2) | (i >> 1): a 4x4 nibble-pair transpose inside each quad, once a stage.
+        for (int c = tid; c < 512; c += 256) {
+            const int tile = c >> 8, wd = c & 255, nt = wd >> 5, dl = wd & 31;
+            const int dg = dl >> 2, dt = dl & 3;
+            uint32_t v0 = 0, v1 = 0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint2 src = p.b[tile][nt * 32 + (dg << 2) + j];
+                v0 |= ((src.x >> (4 * dt)) & 0xFu) << (8 * j);
+                v0 |= ((src.x >> (4 * dt + 16)) & 0xFu) << (8 * j + 4);
+                v1 |= ((src.y >> (4 * dt)) & 0xFu) << (8 * j);
+                v1 |= ((src.y >> (4 * dt + 16)) & 0xFu) << (8 * j + 4);
+            }
+            p.bt[tile][wd] = make_uint2(v0, v1);
+        }
+        __syncthreads();
         uint2 b[4];
         uint32_t sb[4];
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const int nt = (wn & 1) * 4 + j;
-            b[j] = p.b[wn >> 1][nt * 32 + lane];
+            b[j] = p.bt[wn >> 1][nt * 32 + lane];
             sb[j] = p.sb[wn >> 1][nt * 8 + g];
         }
 #pragma unroll
