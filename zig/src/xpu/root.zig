@@ -26,4 +26,5 @@ test {
     _ = launch;
     _ = decode;
     _ = exl3;
+    _ = loader;
 }

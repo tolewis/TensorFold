@@ -4,6 +4,8 @@
 
 #include <cuda_bf16.h>
 #include <stdint.h>
+#include "common/vec.cuh"
+#include "common/act.cuh"
 
 namespace tf_act_l2 {
 
@@ -21,27 +23,12 @@ __device__ __forceinline__ float point(float v) {
     else return v;
 }
 
-__device__ __forceinline__ void unpack8(const uint4& u, float* f) {
-    const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&u);
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const float2 t = __bfloat1622float2(h[i]);
-        f[2 * i] = t.x;
-        f[2 * i + 1] = t.y;
-    }
-}
-
-__device__ __forceinline__ uint4 pack8(const float* f) {
-    uint4 u;
-    __nv_bfloat162* h = reinterpret_cast<__nv_bfloat162*>(&u);
-#pragma unroll
-    for (int i = 0; i < 4; ++i) h[i] = __floats2bfloat162_rn(f[2 * i], f[2 * i + 1]);
-    return u;
-}
+using tf_common::unpack8;
+using tf_common::pack8;
 
 // torch's fp32 sigmoid and silu: 1 / (1 + exp(-x)), x / (1 + exp(-x)), IEEE division.
-__device__ __forceinline__ float sigmoid(float x) { return __fdiv_rn(1.f, __fadd_rn(1.f, expf(-x))); }
-__device__ __forceinline__ float silu(float x) { return __fdiv_rn(x, __fadd_rn(1.f, expf(-x))); }
+__device__ __forceinline__ float sigmoid(float x) { return tf_common::sigmoid_rn(x); }
+__device__ __forceinline__ float silu(float x) { return tf_common::silu_rn(x); }
 
 // 1 / sqrt(sum + eps) of the row's squares: a thread's fma chain, the warp's xor tree, the 8 warps' tree (IEEE).
 __device__ __forceinline__ float inv_l2(const float (&v)[MOST][8], float eps) {

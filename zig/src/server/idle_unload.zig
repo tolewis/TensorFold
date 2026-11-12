@@ -5,6 +5,7 @@ const cli = @import("cli.zig");
 const log = @import("log.zig");
 const engines = @import("engines.zig");
 const server_mod = @import("server.zig");
+const wait_reason = @import("wait_reason.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -82,13 +83,19 @@ pub const Manager = struct {
 
     /// The resident engine's status read under the manager's lock, so the park cannot close it mid-read; parked: stub.
     pub fn readStatus(m: *Manager, srv: *server_mod.Server, out: *api.Status, stream_tokens: []u32) void {
+        _ = m.readStatusParked(srv, out, stream_tokens);
+    }
+
+    /// `readStatus`, and whether the stub answered it: its zero counts describe no engine, even while it closes.
+    pub fn readStatusParked(m: *Manager, srv: *server_mod.Server, out: *api.Status, stream_tokens: []u32) bool {
         m.mutex.lockUncancelable(m.io);
         defer m.mutex.unlock(m.io);
         if (m.parked) {
             out.* = .{ .healthy = false }; // the parked stub's answer, no closed-engine read
-            return;
+            return true;
         }
         srv.engine.status(out, stream_tokens);
+        return false;
     }
 
     /// The resident engine's memory read under the manager's lock; parked: null (the stub holds no weights).
@@ -97,6 +104,14 @@ pub const Manager = struct {
         defer m.mutex.unlock(m.io);
         if (m.parked) return null;
         return srv.engine.memory(reset_peak);
+    }
+
+    /// Copies the inventory while unload is excluded; a parked engine cannot attest a loaded world.
+    pub fn readBenchmark(m: *Manager, srv: *server_mod.Server, a: std.mem.Allocator) !api.Benchmark {
+        m.mutex.lockUncancelable(m.io);
+        defer m.mutex.unlock(m.io);
+        if (m.parked) return .{};
+        return api.Benchmark.copy(a, srv.info);
     }
 
     /// The resident engine's info under the manager's lock; the reload swaps `srv.info` under the same lock.
@@ -176,12 +191,16 @@ fn park(m: *Manager) void {
         m.stub = stub;
         m.parked = true;
     }
+    srv.load.detach(false); // the resident engine stops writing before it closes; unknown, not parked, until closed
     srv.engine = m.stub.?.engine();
     srv.stopKeepalive(); // each resident cycle owns a fresh ticker; it must stop before this engine closes
     m.mutex.unlock(m.io);
     m.re.close_held(m.re.ctx); // the weights leave here, outside the lock: the reload opens with them gone
     m.mutex.lockUncancelable(m.io);
-    if (m.state == .unloading) m.state = .unloaded;
+    if (m.state == .unloading) {
+        m.state = .unloaded;
+        srv.load.markParked(); // a request can reload from here, so a shaper may send its wake from here
+    }
     m.mutex.unlock(m.io);
     m.cond.broadcast(m.io);
     log.line("idle unload: the engine is closed; the next request reloads it", .{});
@@ -198,7 +217,7 @@ pub fn reload(m: *Manager, srv: *server_mod.Server, reply: Allocator, problem_ou
     }
     if (m.state == .resident) return m.mutex.unlock(m.io);
     if (m.state != .unloaded) { // stopped (or unloading before the stub swap, which `begin` already turned resident)
-        problem_out.* = "the engine is still unloading; send the request again";
+        problem_out.* = wait_reason.unloading_problem;
         m.mutex.unlock(m.io);
         return error.ReloadFailed; // the route returns the retry reason with Retry-After
     }
@@ -230,7 +249,9 @@ pub fn reload(m: *Manager, srv: *server_mod.Server, reply: Allocator, problem_ou
         problem_out.* = "the reopened engine does not draft from the recall record; send the request again";
         return error.ReloadFailed;
     }
-    const info = opened.engine.info();
+    var info = opened.engine.info();
+    info.thinking_switch = srv.info.thinking_switch; // the chat template's facts, read once at start-up, not the engine's
+    info.thinking_applicable = srv.info.thinking_applicable;
     var keepalive: ?*api.keepalive.Keepalive = null;
     if (srv.config.keep_warm_s > 0) if (opened.engine.keepaliveTarget()) |target| {
         keepalive = api.keepalive.Keepalive.start(m.gpa, m.io, target, @as(i64, srv.config.keep_warm_s) * std.time.ns_per_s) catch |e| blk: {
@@ -253,6 +274,7 @@ pub fn reload(m: *Manager, srv: *server_mod.Server, reply: Allocator, problem_ou
     m.last_activity_ns = now(m.io);
     srv.engine = opened.engine;
     srv.info = info;
+    srv.load.attach(opened.engine); // only the engine that serves publishes: a failed candidate never attached
     srv.keepalive = keepalive;
     m.re.replace(m.re.ctx, opened, scratch); // shutdown closes this engine, not the long-gone startup one
     m.mutex.unlock(m.io);

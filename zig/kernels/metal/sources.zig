@@ -1,10 +1,21 @@
 //! Metal kernel sources the engine compiles at run time, embedded in the executable.
 
+/// DeepSeek-V4.1's sources live beside their kernels: users say sources.dsv41.NAME.
+pub const dsv41 = @import("deepseek_v41/sources.zig");
+
 /// Nemotron's generated kernels (tools/zig/gen_nemotron_kernels.py).
 pub const nemotron = @import("nemotron/kernels.zig");
+/// Nemotron's KV in pages of the core pool: twins of its seven K/V kernels, each library beside its original.
+pub const nemotron_paged = @import("nemotron/paged.zig");
+/// The 27B's KV in pages of the core pool: its attention sources with the K/V address through a stream's table.
+pub const qwen27_paged = @import("qwen27/paged.zig");
 
 pub const qwen35 = @import("qwen3_5/kernels.zig");
 pub const qwen35_layout = @embedFile("qwen3_5/layout.metal");
+/// The core KV pool's page address (core/metal_kv_pages.zig checks its page size).
+pub const kv_pages = @embedFile("core/kv_pages.h");
+/// Qwen3.5-2B's KV in pages of the core pool: its layout kernels' helpers, the page address, the paged kernels.
+pub const qwen35_paged = @embedFile("qwen3_5/layout.metal") ++ kv_pages ++ @embedFile("qwen3_5/paged.metal");
 /// Gemma 4 dense decode glue around the core lane projections (families/gemma4/kernels.zig).
 pub const gemma4_glue = @embedFile("gemma4/glue.metal");
 /// Gemma 4 decode glue as the reg lane kernel's prologues and epilogue (families/gemma4/weights.zig).
@@ -15,13 +26,21 @@ pub const gemma4_prompt_attention = @embedFile("gemma4/prompt_attention.metal");
 pub const gemma4_vision = @embedFile("prefill/gemm_nax.metal") ++ @embedFile("gemma4/vision.metal");
 
 /// LFM2-MoE: embedding, norms, the short conv, attention, the route and the experts' glue.
-pub const lfm2 = @embedFile("lfm2/lfm2.metal");
+pub const lfm2 = @embedFile("lfm2/lfm2.metal") ++ @embedFile("lfm2/lfm2_segments.metal");
 /// LFM2's prompt attention on the tensor units (nax.h inlined at load, after lfm2.metal's text).
 pub const lfm2_attn_nax = @embedFile("lfm2/lfm2_attn_nax.metal");
+pub const nemotron_prompt_masked = @import("nemotron/prompt_masked.zig");
+
+pub const lfm3 = @embedFile("lfm3/ops.metal");
+pub const lfm3_attention = @embedFile("lfm3/attention.metal");
+pub const lfm3_image_rows = @embedFile("lfm3/image_rows.metal");
+pub const lfm3_projection_dual = @embedFile("lfm3/projectiondual.metal");
+pub const lfm3_projection = @embedFile("lfm3/projection.metal");
 
 /// Our glue kernels around them: embedding, MLX's RMS arithmetic, argmax, layout moves.
 pub const nemotron_glue = @embedFile("nemotron_glue.metal");
 pub const core_row_projection = @embedFile("core/row_projection.metal");
+pub const core_binned_projection = @embedFile("core/binned_projection.metal");
 pub const core_tile_qmm = @embedFile("core/tile_qmm.metal") ++ @embedFile("core/tile_qmv.metal") ++
     @embedFile("core/tile_qmv_rows.metal");
 pub const core_exl3_projection = @embedFile("core/exl3_projection.metal");
@@ -30,6 +49,8 @@ pub const core_exlr8_dense = @embedFile("core/exlr8_dense.metal");
 pub const core_exlr8_prompt = @embedFile("core/exlr8_prompt.metal");
 pub const core_exlr8_dense_prompt = @embedFile("core/exlr8_dense_prompt.metal");
 pub const core_pair = @embedFile("core/pair.metal");
+/// The row-split seam's kernels (see `pair_rows.zig`): `pair.metal` above stays as it is for glm_dsa.
+pub const core_pair_rows = @embedFile("core/pair_rows.metal");
 
 /// GLM-5.3 (glm_moe_dsa): MLA with rope over a bf16 latent cache, the DSA indexer and its top-k, fp32 glue.
 pub const glm_dsa_mla = @embedFile("glm_dsa/mla.metal");
@@ -123,6 +144,10 @@ pub const glm_vision = @embedFile("prefill/gemm_nax.metal") ++ @embedFile("glm_v
 pub const core_qwen_vision = @embedFile("prefill/gemm_nax.metal") ++ @embedFile("core/qwen_vision.metal");
 /// Qwen-Image-2.1's transformer: the prefill attention template, then its own steps (projections: core_qwen_vision).
 pub const qwen_image = @embedFile("prefill/attention_nax.metal") ++ @embedFile("qwen_image.metal");
+/// MOSS-Image: the prefill attention template, then its transformer's and encoder's steps (gemms: core_qwen_vision).
+pub const moss_image = @embedFile("prefill/attention_nax.metal") ++ @embedFile("moss_image.metal") ++ @embedFile("moss_image_encoder.metal");
+/// MOSS-Image's image decoder: its own float32 steps, without a template.
+pub const moss_image_decoder = @embedFile("moss_image_decoder.metal");
 /// A prompt chunk's KDA layer in three passes, appended to the generated kda_rows source (its helpers).
 pub const glm_kda_prompt = @embedFile("glm_kda_prompt.metal");
 /// GLM-5.3-Flash speed-up mode's exchange kernels (families/glm/ep.zig).
@@ -158,12 +183,36 @@ pub const core_simd_qmm = @embedFile("core/simd_qmm.metal");
 pub const core_simd_qmm_bits = @embedFile("core/simd_qmm_bits.metal");
 /// Step-5's glue at StepFun's rounding points: embed, norms, q/k rotation, gate, SwiGLU, residual adds.
 pub const step5_glue = @embedFile("step5/glue.metal");
+/// MiniMax-M3's glue at transformers' rounding points: norms, rotation, SwiGLU-OAI, router, indexer, decode attention.
+pub const minimax_m3_glue = @embedFile("minimax_m3/glue.metal");
+/// MiniMax-M3's prompt attention on the tensor units over each row's kept index blocks.
+pub const minimax_m3_attention_nax = @embedFile("minimax_m3/attention_nax.metal");
+/// MiniMax-M3's DSpark drafter (norms, q/k into its context rings, block attention, the Markov chain) and the taps.
+pub const minimax_m3_dspark = @embedFile("minimax_m3/dspark.metal");
+/// MiniMax-M3's decode-window experts expert by expert (after core_row_projection: its sums, each weight read once).
+pub const minimax_m3_experts = @embedFile("minimax_m3/experts.metal");
+/// incoai's DFlash2 drafter for MiniMax-M3: Qwen3 norms, full RoPE, the block convolution, top-k and the selector.
+pub const minimax_m3_dflash2 = @embedFile("minimax_m3/dflash2.metal");
+/// MiniMax-M3's indexer block scores on the tensor units (a prompt chunk's).
+pub const minimax_m3_index_nax = @embedFile("minimax_m3/index_nax.metal");
 /// Step-5's sparse indexer (summaries, scores, top-k) and its sliding, sparse and dense attention.
 pub const step5_sparse = @embedFile("step5/sparse.metal");
 /// Step-5's prompt attention on the tensor units (a KV group's 16 heads one operand; nax.h inlined at load).
 pub const step5_attend_nax = @embedFile("step5/attend_nax.metal");
 /// Step-5's image tower (perception encoder, downsampler convs, projector) on gemm_nax's tensor-unit GEMMs.
 pub const step5_vision = @embedFile("prefill/gemm_nax.metal") ++ @embedFile("step5/vision.metal");
+/// Spark2.5's glue at its PyTorch rounding points: embed, fp32 residual adds and norms, rope, head gate, exact GELU.
+pub const spark25_glue = @embedFile("spark25/glue.metal");
+/// Spark2.5's prompt attention on the tensor units (gemma4's prompt kernel; nax.h inlined at load).
+pub const spark25_attention_nax = @embedFile("spark25/attention_nax.metal");
+/// Spark2.5's bf16 prompt projections on gemm_nax's tensor-unit GEMM (nax.h inlined at load).
+pub const spark25_gemm = @embedFile("prefill/gemm_nax.metal") ++ @embedFile("spark25/gemm.metal");
+/// Llama's glue at HF's rounding points: embed, a bf16 residual and its norm, rope with bf16 cos and sin, SiLU.
+pub const llama_glue = @embedFile("llama/glue.metal");
+/// Llama's prompt attention on the tensor units (gemma4's prompt kernel, every key; nax.h inlined at load).
+pub const llama_attention_nax = @embedFile("llama/attention_nax.metal");
+/// Llama's bf16 prompt projections on gemm_nax's tensor-unit GEMM (nax.h inlined at load).
+pub const llama_gemm = @embedFile("prefill/gemm_nax.metal") ++ @embedFile("llama/gemm.metal");
 /// The kernel contract's planted controls: one kernel breaking each gate (zig/tests/contract/).
 pub const core_contract_controls = @embedFile("core/contract_controls.metal");
 
@@ -183,3 +232,11 @@ pub const drama3 = struct {
     pub const sample = @embedFile("drama3/sample.metal");
     pub const codec = @embedFile("drama3/codec.metal");
 };
+
+pub const core_weight_only_body = @embedFile("core/weight_only.h");
+pub const core_weight_only = @embedFile("core/weight_only.metal");
+pub const core_hc_activation_body = @embedFile("core/hc_activation.h");
+pub const core_hc_activation = @embedFile("core/hc_activation.metal");
+pub const core_hc_pointwise = @embedFile("core/hc_pointwise.metal");
+
+pub const lfm2_prompt_masked = @import("lfm2/prompt_masked.zig");

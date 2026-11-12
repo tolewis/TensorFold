@@ -20,7 +20,7 @@ pub const Tensor = safetensors.Tensor;
 pub const Checkpoint = struct {
     tensors: std.ArrayList(Tensor) = .empty,
     maps: std.ArrayList([]const u8) = .empty, // the shards, mapped as long as the tensors' bytes are read
-    headers: std.ArrayList(std.json.Parsed(std.json.Value)) = .empty, // the tensors' names live in them
+    headers: std.ArrayList(std.heap.ArenaAllocator) = .empty, // the tensors' names live in them
     /// Optional (buildIndex): tensor index by name without its model prefix. With it, get and has look names up
     /// instead of scanning, and `put` tensors (converted at load) take the place of the stored ones.
     index: std.StringHashMapUnmanaged(usize) = .empty,

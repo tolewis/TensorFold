@@ -35,13 +35,26 @@ A floor of -30 dBFS also catches the hum. Streams are not redrawn (see
 [Streams](#streams)): a stalled stream ends early, with the rest of the text
 unspoken.
 
+Two more flags cut a reply that never really starts. With `--silence-onset-s S` and `--silence-onset-voiced-s V`
+(both required together, and both need the floor and `--silence-seconds`; S must be above 0 and below the
+silence seconds, V above 0), a reply also ends once it has stayed S seconds below the floor while having voiced
+less than V seconds in total — the model cleared its throat but never began speaking. The startup line names the
+rule: "or after S s below it with under V s voiced". An onset trip is a `silence` finish, redrawn like any
+other.
+
 ## Seeds
 
-Redraw k (1 to N) seeds its prompt with `TENSORFOLD_SEED_SALT` plus k; the first
+Without an explicit request `seed`, redraw k (1 to N) seeds its prompt with `TENSORFOLD_SEED_SALT` plus k; the first
 take keeps the stock seed, salt plus 0. Redraws are therefore deterministic. With
 the same prompt, redraw k under salt s is the same draw as the first take under
 salt s + k, so a sweep over salts should space compared salts more than N apart,
 or N + 1 with the register guard.
+
+An explicit request `seed` instead uses that exact integer for the first take
+and seed + k modulo 2^64 for each redraw, counting both silence and register
+attempts. Requested `temperature`, `top_p` and `top_k` remain in effect through
+all redraws and control filtering; see [speech sampling](speech-sampling.md).
+The seed rule does not make timing-based redraw budgets deterministic.
 
 ## Budget
 
@@ -144,7 +157,7 @@ below 8 kHz, all-zero audio, and takes with fewer than two retained phrases are
 not measured. A measured take with no qualifying jump counts as zero.
 The detector is not Praat's analysis: its values can differ from Praat's.
 
-A take that trips is drawn once more, as the next seed, salt + k after any
+A take that trips is drawn once more, using the next seed under the [seed rule](#seeds) after any
 silence redraws, if t + d fits the budget. The redraw is sent only if it does not
 end as `silence` and has a strictly smaller jump; ties retain the first take.
 A `length` redraw can replace a `stop` take. An unmeasured redraw can win only

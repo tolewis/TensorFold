@@ -6,8 +6,8 @@
 #include <math.h>
 #include <stdint.h>
 
-#include "glue_math.cuh"
-#include "qmm_frag.cuh"
+#include "common/glue_math.cuh"
+#include "common/qmm_frag.cuh"
 
 using namespace tf_glue;
 
@@ -18,20 +18,9 @@ constexpr int HD = 256;  // head width the attention tiles are built for
 constexpr int QR = 16;   // query heads a KV head's tile holds (G <= 16, the rest zero)
 
 // A block's fixed-order sum: each warp's butterfly, then the warps' sums in warp order.
-__device__ __forceinline__ float block_sum(float v, float* scratch) {
-    v = warp_sum(v);
-    const int warps = blockDim.x >> 5;
-    if ((threadIdx.x & 31) == 0) scratch[threadIdx.x >> 5] = v;
-    __syncthreads();
-    float total = 0.0f;
-    for (int w = 0; w < warps; ++w) total = __fadd_rn(total, scratch[w]);
-    __syncthreads();
-    return total;
-}
+using tf_common::block_sum_serial;
 
-__device__ __forceinline__ float inv_rms(float ss, int width, float eps) {
-    return __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(ss, static_cast<float>(width)), eps)));
-}
+__device__ __forceinline__ float inv_rms(float ss, int n, float eps) { return tf_common::rms_scale(ss, n, eps); }
 
 // Rotate-half RoPE over the first 2 * half features at `pos`: cos and sin of the fp32 angle (full range reduction).
 __device__ __forceinline__ float rope(float xn, float xpn, int d, int half, int pos, const float* __restrict__ inv) {
@@ -42,12 +31,7 @@ __device__ __forceinline__ float rope(float xn, float xpn, int d, int half, int 
     return d < half ? __fsub_rn(__fmul_rn(xn, c), __fmul_rn(xpn, s)) : __fadd_rn(__fmul_rn(xpn, s), __fmul_rn(xn, c));
 }
 
-// ldmatrix .x4 .trans: four 8x8 bf16 tiles of shared memory, each thread's pair down a column (the B layout of rows).
-__device__ __forceinline__ void ldmatrix4t(uint32_t (&r)[4], const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                 : "r"(qmm_frag::smem(p)));
-}
+using qmm_frag::ldmatrix4t;
 
 __device__ __forceinline__ int partner(int d, int half) {
     return d < half ? d + half : (d < 2 * half ? d - half : d);
@@ -90,7 +74,7 @@ __device__ __forceinline__ void fn_attn_prep_body(const __nv_bfloat16* __restric
     const long long src = row + (head < NQ ? head * 2 * HD : (head < NQ + NKV ? NQ * 2 * HD + (head - NQ) * HD : NQ * 2 * HD + 2 * NKV * HD + (head - NQ - NKV) * IHD));
     const float* w = head < NQ ? QW : (head < NQ + NKV ? KW : IW);
     const float x = live ? bf(P[src + d]) : 0.0f;
-    const float rinv = inv_rms(block_sum(__fmul_rn(x, x), scratch), width, eps);
+    const float rinv = inv_rms(block_sum_serial(__fmul_rn(x, x), scratch), width, eps);
     if (!live) return;
     const int p = partner(d, HALF);
     const float xn = rbf(__fmul_rn(__fmul_rn(x, rinv), w[d]));
@@ -183,7 +167,7 @@ __device__ __forceinline__ void fn_qsa_pool_body(const __nv_bfloat16* __restrict
     for (int k = 1; k < RATIO; ++k) acc = __fadd_rn(acc, bf(keys[(first + k) * DI + d]));
     const float x = rbf(__fdiv_rn(acc, static_cast<float>(RATIO)));
     xs[d] = x;
-    const float rinv = inv_rms(block_sum(__fmul_rn(x, x), scratch), DI, eps);
+    const float rinv = inv_rms(block_sum_serial(__fmul_rn(x, x), scratch), DI, eps);
     const int p = partner(d, HALF);
     const float xn = rbf(__fmul_rn(__fmul_rn(x, rinv), W[d]));
     const float xpn = rbf(__fmul_rn(__fmul_rn(xs[p], rinv), W[p]));
@@ -550,11 +534,10 @@ extern "C" __global__ void __launch_bounds__(128)
 }
 
 // attention._merge, program (row, head) of HD threads: the head's chunk partials merged in chunk order, o / l.
-extern "C" __global__ void __launch_bounds__(256) fn_attn_merge(const float* __restrict__ PO, const float* __restrict__ PM,
-                                                                const float* __restrict__ PL, const int* __restrict__ POS0,
-                                                                __nv_bfloat16* __restrict__ OUT, const int* __restrict__ NKR,
-                                                                const int* __restrict__ SPR, int H, int HK, int G, int CH, int NCH,
-                                                                int QSA) {
+__device__ __forceinline__ void fn_attn_merge_body(const float* __restrict__ PO, const float* __restrict__ PM,
+                                                   const float* __restrict__ PL, const int* __restrict__ POS0,
+                                                   __nv_bfloat16* __restrict__ OUT, const int* __restrict__ NKR,
+                                                   const int* __restrict__ SPR, int H, int HK, int G, int CH, int NCH, int QSA) {
     const int r = blockIdx.x, head = blockIdx.y, d = threadIdx.x;
     int n = POS0[0] + r + 1;
     if (QSA && SPR[r] != 0) n = NKR[r];
@@ -576,6 +559,14 @@ extern "C" __global__ void __launch_bounds__(256) fn_attn_merge(const float* __r
     }
 }
 
+extern "C" __global__ void __launch_bounds__(256) fn_attn_merge(const float* __restrict__ PO, const float* __restrict__ PM,
+                                                                const float* __restrict__ PL, const int* __restrict__ POS0,
+                                                                __nv_bfloat16* __restrict__ OUT, const int* __restrict__ NKR,
+                                                                const int* __restrict__ SPR, int H, int HK, int G, int CH, int NCH,
+                                                                int QSA) {
+    fn_attn_merge_body(PO, PM, PL, POS0, OUT, NKR, SPR, H, HK, G, CH, NCH, QSA);
+}
+
 #include "flashnext_qsa_tile.cuh"
 
 // The indexer scores 8 rows a block, every head, the sums in fn_qsa_scores' order (its bits).
@@ -589,3 +580,5 @@ extern "C" __global__ void __launch_bounds__(256)
                         Pg pg) {
     qsa_tile::scores_body<8, 4, true>(IQ, POOLED, POS0, SC, NB, RATIO, TOP, rows, pg);
 }
+
+#include "flashnext_attn_lanes.cuh"

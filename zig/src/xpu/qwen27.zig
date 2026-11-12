@@ -11,6 +11,7 @@ const slot_states = @import("slot_states.zig");
 const pages_mod = @import("pages.zig");
 const k1mod = @import("k1.zig"); // XPU_K1: the split-K DPAS decode over int8 pool pages (lane p22-k1)
 pub const follow = @import("follow.zig");
+const shape = @import("qwen27_config.zig");
 pub const limits = @import("limits.zig");
 const Prof = dev.Prof;
 pub const Site = dev.Site;
@@ -44,9 +45,9 @@ pub const Mode = fwd.Mode;
 
 pub const alloc = std.heap.c_allocator;
 
-// Qwen3.8-27B shape (checked against config.json at load).
-pub const D = 5120;
-pub const FF = 17408;
+// Qwen3.8-27B shape (checked against config.json at load; layer pattern in qwen27_config.zig).
+pub const D = shape.hidden;
+pub const FF = shape.intermediate;
 /// Tensor-parallel ranks of this build. TP 1 is the one-card engine. Every per-rank width below is the whole
 /// model's divided by TP: a rank holds its share of the heads and of the MLP columns, and the hidden state (D)
 /// whole (lanes/qwen27/TP2-ASSESSMENT.md in Intel-B70-Recipe, 2026-11-01).
@@ -64,8 +65,8 @@ pub const FF_R = FF / TP; // gate and up columns a rank, down rows a rank
 pub const GDN_QKV = (2 * GDN_K_HEADS + GDN_V_HEADS) * 128; // 10240 at TP 1
 pub const GDN_Z = GDN_V_HEADS * 128; // 6144 at TP 1
 pub const GDN_AB = GDN_QKV + GDN_Z; // the dense a and b gates' first column (16384 at TP 1)
-pub const LAYERS = 64;
-pub const VOCAB = 248320;
+pub const LAYERS = shape.layers;
+pub const VOCAB = shape.vocab;
 pub const MASK_WORDS = (VOCAB + 31) / 32; // a grammar row's bits (structured output), one a token
 /// The layers' quantization group (64: MLX affine, 128: GPTQ), set at load; the head and the drafter keep 64.
 pub var GS: u32 = 64;
@@ -131,9 +132,7 @@ pub const STASH = ST_P + 16 * GDN_IN * 2;
 /// Target layers whose hidden states feed the DFlash2 drafter (its config's target_layer_ids).
 pub const TAP_LAYERS = [5]usize{ 5, 19, 33, 47, 61 };
 
-pub fn isAttention(i: usize) bool {
-    return (i + 1) % 4 == 0;
-}
+pub const isAttention = shape.isAttention;
 
 /// XPU_FUSE=1 bit 0: the device-direct exchange's tp_add joins the norm that follows it (mixer and MLP exchanges).
 /// A bit mask; with it unset or 0 the engine takes today's path. Bit 0 is the exchange-into-norm step (WP2 step 3).
@@ -476,7 +475,8 @@ pub const Runner = struct {
         draft_tp = TP == 2 and (if (std.c.getenv("XPU_DRAFT_TP")) |v| v[0] == '1' else false);
         if (std.c.getenv("XPU_A8_ROT") != null) a8_rot = 1;
         if (std.c.getenv("XPU_A8_SITES4")) |v| a8_sites4 = try std.fmt.parseInt(u32, std.mem.span(v), 10);
-        if (std.c.getenv("XPU_A8_BITS")) |v| a8_levels = if (std.mem.eql(u8, std.mem.span(v), "4")) 7 else 127;
+        const bits = try @import("sys").environment.read(u32, "XPU_A8_BITS", if (a8_levels == 7) 4 else 8);
+        a8_levels = if (bits == 4) 7 else 127;
         if (std.c.getenv("XPU_A8_SITES")) |v| a8_sites = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_A8")) |v| a8_group = if (std.mem.eql(u8, std.mem.span(v), "token")) std.math.maxInt(u32) else try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_FUSE")) |v| fuse = try std.fmt.parseInt(u32, std.mem.span(v), 10);
@@ -517,6 +517,7 @@ pub const Runner = struct {
             std.debug.print("{s}\n", .{k1mod.coverageLine(&cov, k1mod.on and kv_i8, k1mod.tree and kv_i8, k1mod.multi_tree and kv_i8)});
         }
         MAX_CTX = try limits.context(context);
+        try shape.admit(alloc, dir);
         {
             const marker = try std.fmt.allocPrintSentinel(alloc, "{s}/hadamard128", .{dir}, 0);
             defer alloc.free(marker);

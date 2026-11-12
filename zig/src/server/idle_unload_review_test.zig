@@ -65,3 +65,40 @@ test "idle review: a wake during the unload whose reload fails keeps the reopen'
     try h.reload(&problem);
     try t.expectEqual(idle.State.resident, h.state());
 }
+
+test "idle review: the ledger reads parked only once the close is done, never while a wake would be refused" {
+    var h: Harness = .{};
+    defer h.deinit();
+    try h.setup(3600);
+    h.gate_close.store(true, .release);
+    h.expire();
+    try h.waitEvent(&h.close_entered);
+    const closing = h.srv.?.load.read();
+    try t.expect(!closing.parked); // a wake now gets "still unloading": the ledger must not invite it
+    try t.expect(closing.requests == null and closing.work == null and closing.capacity == null);
+    var status: @import("engine_api").Status = .{};
+    try t.expect(h.man.?.readStatusParked(h.srv.?, &status, &.{})); // the scrape's fallback body hides the stub's zeros
+    h.close_release.set(h.io);
+    try h.waitUnloaded(2000);
+    try t.expect(h.srv.?.load.read().parked);
+    var problem: []const u8 = "";
+    try h.reload(&problem);
+    try t.expect(!h.srv.?.load.read().parked);
+}
+
+test "idle review: a reload keeps the chat template's thinking facts, which the engine does not report" {
+    var h: Harness = .{};
+    defer h.deinit();
+    try h.setup(3600);
+    h.srv.?.info.thinking_applicable = true;
+    h.srv.?.info.thinking_switch = false;
+    h.expire();
+    try h.waitUnloaded(2000);
+    var problem: []const u8 = "";
+    try h.reload(&problem);
+    try t.expectEqual(idle.State.resident, h.state());
+    try t.expect(!h.srv.?.engine.info().thinking_applicable);
+    const info = h.man.?.readInfo(h.srv.?);
+    try t.expect(info.capability(.thinking_applicable));
+    try t.expect(!info.capability(.thinking_switch));
+}

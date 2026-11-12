@@ -37,7 +37,8 @@ const staged = q.residency.stage;
 /// Ranges of a kept state's image into `out`: one blit pass on the model's queue (the engine thread's, while it idles).
 fn gather(ptr: *anyopaque, saved: api.prompt_cache.Saved, ranges: []const rows.image.Range, out: []u8) anyerror!void {
     const h = host(ptr);
-    const st: *const State = @ptrCast(@alignCast(saved));
+    const st: *State = @ptrCast(@alignCast(saved));
+    try st.landed(); // a fresh save's blit wrote it: it lands before this one reads it
     const stage = try staged(h, out.len);
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
@@ -80,13 +81,15 @@ fn scatter(_: *anyopaque, saved: api.prompt_cache.Saved, ranges: []const rows.im
 /// What disk states are read under, and the probe's prompt rate: the checkpoint, the drafter, sources, modes, bits.
 pub fn identity(h: *Host, io: std.Io, a: Allocator, dir: []const u8, drafter: ?[]const u8) !struct { id: u64, rate: f64 } {
     var w = std.hash.Wyhash.init(0x7132);
+    try @import("sys").file_identity.current(&w, a, io);
     try disk_identity.checkpoint(&w, a, io, dir);
     if (drafter) |d| try disk_identity.checkpoint(&w, a, io, d);
     const p = try probe(h, io);
     const words = [_]u64{ q.disk.sourceHash(), @intFromBool(h.model.device.tensorUnits()), @intFromBool(h.model.ane != null), @intFromBool(h.draft != null), p.hash };
     w.update(std.mem.sliceAsBytes(&words));
     disk_identity.machine(&w, std.mem.span(h.model.device.name()));
-    return .{ .id = w.final(), .rate = p.rate };
+    disk_identity.profile(&w, .{ .family = if (h.model.config.moe()) "qwen3_5_moe" else "qwen3_5", .backend = "metal" });
+    return .{ .id = withPolicy(w.final(), h), .rate = p.rate };
 }
 
 /// A fixed prompt's state through slot 0 (whole 128-row chunks, a decoded span, a short tail), hashed, and its rate.
@@ -100,7 +103,7 @@ fn probe(h: *Host, io: std.Io) !struct { hash: u64, rate: f64 } {
         fn at(ptr: *anyopaque, s: *lanes.Stream, mark: u32) void {
             const p: *@This() = @ptrCast(@alignCast(ptr));
             const slot = p.h.back.slotOf(s) orelse return;
-            p.saved = q.snapshot.saveSlot(p.h.gpa, &p.h.runner, slot, p.h.back.ringOf(slot), mark) catch |e| {
+            p.saved = q.snapshot.saveSlot(p.h.gpa, &p.h.runner, slot, p.h.back.ringOf(slot), mark, null) catch |e| {
                 p.failed = e;
                 return;
             };
@@ -131,11 +134,18 @@ fn probe(h: *Host, io: std.Io) !struct { hash: u64, rate: f64 } {
 pub fn attach(h: *Host, io: std.Io, a: Allocator, o: Learn) !void {
     const store = &(h.cache orelse return std.log.warn("Qwen3.8-27B: --learn-conversations needs the prompt cache, which --prompt-cache-gib 0 turned off", .{}));
     const id = try identity(h, io, a, o.dir, o.drafter);
-    const r = try rows.Rows.open(h.gpa, store.family, .{ .root = o.root, .identity = id.id, .cap = o.cap, .floor = o.floor, .daily = o.daily, .lookahead = store.rules.lookahead, .planned = store.rules.planned });
+    const r = try rows.attach(h.gpa, store, .{ .root = o.root, .identity = id.id, .cap = o.cap, .floor = o.floor, .daily = o.daily, .lookahead = store.rules.lookahead, .planned = store.rules.planned, .spill = o.spill, .slots = o.slots, .longest = h.host.info_.context_window });
     r.prefill_rate = id.rate;
-    store.disk = r;
     std.log.info("Qwen3.8-27B: conversation states on disk in {s} ({d} states, {d} MiB of {d} MiB)", .{ r.dir, r.states.items.len, r.held() >> 20, o.cap >> 20 });
 }
 
-/// --learn-conversations' settings, as the server read them.
-pub const Learn = struct { root: []const u8, dir: []const u8, drafter: ?[]const u8, cap: u64, floor: u64, daily: u64 };
+/// --learn-conversations' settings, as the server read them (--spill-gib's too, and --checkpoint-slots beside them).
+pub const Learn = struct { root: []const u8, dir: []const u8, drafter: ?[]const u8, cap: u64, floor: u64, daily: u64, spill: rows.Spill = .off, slots: ?usize = null };
+
+/// Extend a probe identity with the ANE columns and the chunk height; another chunk height starts cold.
+pub fn withPolicy(legacy: u64, h: anytype) u64 {
+    return @import("persistence_policy.zig").extend(legacy, "qwen-metal-policy-v1", &.{
+        if (h.model.ane) |share| share.columns else 0,
+        h.back.chunk, // not frame.capacity: it only sizes buffers and bounds a pass's rows
+    });
+}

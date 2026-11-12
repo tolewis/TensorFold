@@ -96,12 +96,15 @@ pub const Harness = struct {
             .config = .{ .served_name = "fake", .model_ids = &.{}, .keep_warm_s = 0 },
             .keys = null,
             .metrics = .{ .gpa = gpa },
+            .load = .init(self.io),
             .store = .{ .gpa = gpa },
+            .tool_ids = .of(@import("ids.zig").test_key_text),
             .arena = .init(gpa),
             .slide = .init(gpa, self.io, null),
             .teacher = .init(gpa),
         };
         self.srv = srv;
+        srv.load.attach(srv.engine); // as serve does: the resident engine is the ledger's producer
         var args: cli.Args = .{};
         args.idle_unload = idle_s;
         if (idle_unload.startServer(srv, args, self.reopen(), "d", "t") != .enabled)

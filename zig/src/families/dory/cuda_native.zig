@@ -7,6 +7,9 @@ const fwd = @import("cuda_model.zig");
 const be = @import("cuda_backend.zig");
 const snap = @import("cuda_snap.zig");
 const config = @import("config.zig");
+const pages = @import("cuda_pages.zig");
+const kv = @import("core").kv_pool;
+const kp = @import("core").kv_prompts;
 
 pub const model_type = "dory";
 pub const formats: []const []const u8 = &.{"modelopt-nvfp4"};
@@ -33,6 +36,10 @@ pub const Loaded = struct {
     ctx: *anyopaque,
     deinit: *const fn (*anyopaque) void,
     target: *be.Dory, // the prompt cache keeps this backend's states (snap_*)
+    /// The full-attention caches as pages of the core pool (null: every stream allocated at open).
+    layout: ?kv.Layout = null,
+    /// With a layout: the first stream's rows are pages too, a window of them set aside by the plan.
+    engine_paged: bool = true,
 };
 
 const Owned = struct { gpa: std.mem.Allocator, w: wts.Weights, k: fwd.Kernels, s: cuda.Stream, m: fwd.Model, db: be.Dory };
@@ -49,6 +56,18 @@ fn fit(room: u64, asked: u32, fixed: bool, plan: anytype) !usize {
     return n;
 }
 
+/// Full caches in pool pages: TF_KV_SHARE keeps prompts in them, so it pages too; else TENSORFOLD_DORY_KV_PAGES.
+fn paged() !bool {
+    return pagedBy(try kp.sharing(), @import("profile").lookup("TENSORFOLD_DORY_KV_PAGES"));
+}
+
+/// `pages` set (not 0) or TF_KV_SHARE on: pages; TF_KV_SHARE with `pages` exactly 0 is refused, never overridden.
+fn pagedBy(share: usize, pages_env: ?[]const u8) !bool {
+    const off = if (pages_env) |v| std.mem.eql(u8, v, "0") else false;
+    if (share > 0 and off) return error.KvShareWithoutPages;
+    return share > 0 or (pages_env != null and !off);
+}
+
 /// The device bytes `n` streams take: their caches by loop count and context, the scratch, the backend's buffers.
 const Plan = struct {
     own: *const Owned,
@@ -57,41 +76,71 @@ const Plan = struct {
 
     fn bytes(p: Plan, n: usize) !u64 {
         const o = p.own;
+        if (try paged()) return try fwd.Model.openBytesPaged(o.gpa, p.d, o.s, &o.w, &o.k, p.context) + be.Dory.openBytes(o.w.config.vocab, pages.max_slots);
         return try fwd.Model.openBytes(o.gpa, p.d, o.s, &o.w, &o.k, p.context, n) + be.Dory.openBytes(o.w.config.vocab, n);
     }
 };
 
+/// Paged: the first stream's rings and scratch must fit; the pool is planned by the host after.
+fn fitFirst(room: u64, plan: anytype) !usize {
+    if (try plan.bytes(1) > room) return error.NoStreamFits;
+    return 1;
+}
+
+/// The pool: `streams` more slots beside the first (rings made now) and an arena of `n` pages.
+pub fn attach(p: *anyopaque, streams: u32, n: usize) !void {
+    const own: *Owned = @ptrCast(@alignCast(p));
+    try own.db.attach(streams, n);
+}
+
+/// Whether a request's caches could start now (the lane host's admission, on its engine thread).
+pub fn fits(p: *anyopaque, prompt: u32, max_tokens: u32) bool {
+    const own: *const Owned = @ptrCast(@alignCast(p));
+    return own.db.admits(prompt, max_tokens);
+}
+
+/// The pool the lane host's ledger admits this family's promises by (#1943).
+pub fn ledgerPool(p: *anyopaque) ?*kv.Pool {
+    const own: *Owned = @ptrCast(@alignCast(p));
+    return if (own.db.pool) |*pool| pool else null;
+}
+
 /// The checkpoint at its loop count, the shared kernels and every stream's caches.
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
+    const priority_copies = try cuda.priority_copies.read("TF_DORY_COPIES", o.drafts);
     if (kernels != null) return error.CapturedKernels;
     if (o.lanes_fixed and o.lanes > be.round_rows / be.max_window) return error.ParallelPastRound;
     if (o.loops) |l| if (l == 0 or l > config.max_loops) return error.BadLoops;
     const context = try be.capacity(o.context);
+    const on_pages = try paged(); // before the weights: a refused pair costs no load
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);
     own.gpa = gpa;
     own.w = try wts.load(gpa, io, ctx.d, dir, if (o.loops) |l| @as(usize, l) else null);
     errdefer own.w.deinit();
     if (context > own.w.config.positions + 1024) return error.PastContext;
-    own.k = try fwd.Kernels.load(ctx);
+    own.k = try fwd.Kernels.load(ctx, on_pages);
     errdefer own.k.deinit();
     if (!own.k.served) return error.BuiltWithoutKernels;
     own.s = try cuda.Stream.init(ctx.d, false);
     errdefer own.s.deinit();
     const plan: Plan = .{ .own = own, .d = ctx.d, .context = context };
     const room: u64 = if (o.room) |r| r.read(r.ctx) orelse 0 else std.math.maxInt(u64);
-    const n = fit(room, o.lanes, o.lanes_fixed, plan) catch |e| {
+    const n = if (on_pages) try fitFirst(room, plan) else fit(room, o.lanes, o.lanes_fixed, plan) catch |e| {
         if (e == error.ParallelPastMemory) {
             const most = fit(room, o.lanes, false, plan) catch 0;
             std.log.err("--parallel {d} needs {d:.2} GiB at a {d}-token window and {d} loops, and the CUDA memory budget leaves {d:.2} GiB after the weights: {d} stream{s} fit", .{ o.lanes, gib(try plan.bytes(o.lanes)), context, own.w.config.loops, gib(room), most, if (most == 1) "" else "s" });
         }
         return e;
     };
-    own.m = try fwd.Model.init(gpa, ctx.d, own.s, &own.w, &own.k, context, n);
+    own.m = if (on_pages) try fwd.Model.initPaged(gpa, ctx.d, own.s, &own.w, &own.k, context) else try fwd.Model.init(gpa, ctx.d, own.s, &own.w, &own.k, context, n);
     errdefer own.m.deinit();
     own.m.graphed = !envOff("TENSORFOLD_DORY_GRAPHS"); // =0: every decode forward eager
     own.db = try be.Dory.init(gpa, ctx.d, &own.m, &own.k, own.s);
-    std.log.info("Dory at {d} loops (per_loop KV): {d} caches a stream, {d} streams, CUDA graphs {s}", .{ own.w.config.loops, own.m.sched.caches, n, if (own.m.graphed) "on" else "off" });
+    own.db.priority_copies = priority_copies;
+    if (own.m.paged) {
+        std.log.info("Dory at {d} loops (per_loop KV): {d} caches a stream, the full ones ({d}) in pages of {d} positions, CUDA graphs {s}", .{ own.w.config.loops, own.m.sched.caches, own.m.sched.cacheCount(.full), pages.tokens, if (own.m.graphed) "on" else "off" });
+    } else std.log.info("Dory at {d} loops (per_loop KV): {d} caches a stream, {d} streams, CUDA graphs {s}", .{ own.w.config.loops, own.m.sched.caches, n, if (own.m.graphed) "on" else "off" });
     return .{
         .backend = own.db.backend(),
         .facts = own.db.facts(),
@@ -101,6 +150,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .ctx = own,
         .deinit = release,
         .target = &own.db,
+        .layout = if (own.m.paged) own.m.layout() else null,
     };
 }
 
@@ -117,9 +167,22 @@ fn dory(ptr: *anyopaque) *be.Dory {
     return @ptrCast(@alignCast(ptr));
 }
 
-/// Bytes a state at `at` prompt tokens takes.
+/// Bytes a state at `at` prompt tokens takes (TF_KV_SHARE: the pool pages its rings take, past the store's pages).
 pub fn snap_bytes(ptr: *anyopaque, at: u32) u64 {
-    return snap.bytes(dory(ptr).m, at);
+    const x = dory(ptr);
+    if (x.prompts == null) return snap.bytes(x.m, at);
+    return snap.blobPages(x.m, at) * x.m.paging.?.pageBytes();
+}
+
+/// TF_KV_SHARE: the pool the store keeps prompts in (null: contiguous caches, no pool).
+pub fn share_pool(ptr: *anyopaque) ?*kv.Pool {
+    const x = dory(ptr);
+    return if (x.pool) |*p| p else null;
+}
+
+/// TF_KV_SHARE: the store the prompt passes keep and resume through (null: none, as before).
+pub fn share_attach(ptr: *anyopaque, prompts: ?kp.Prompts) void {
+    dory(ptr).prompts = prompts;
 }
 
 /// The prompt pass stands at `at` (a chunk start or a mark): copy the stream's caches there.
@@ -149,6 +212,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.UnsupportedKvMode => "this checkpoint asks for last_loop KV, whose output depends on chunk boundaries: Dory serves per_loop only",
         error.ParallelPastRound => std.fmt.comptimePrint("--parallel: Dory on CUDA holds at most {d} streams (a round's rows over 16-row windows): serve --parallel {d} or fewer, or auto", .{ be.round_rows / be.max_window, be.round_rows / be.max_window }),
         error.ParallelPastMemory => "--parallel: the CUDA memory budget fits fewer Dory streams than asked (each stream's caches, 8 + 20 per loop + 8, are allocated at load): lower --parallel, --context or --loops, serve --parallel auto, or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB",
+        error.KvShareWithoutPages => "TF_KV_SHARE keeps Dory's prompts as pool pages, and TENSORFOLD_DORY_KV_PAGES=0 turns pages off: unset one of the two",
         error.NoStreamFits => "the CUDA memory budget fits no Dory stream after the weights: lower --context or --loops, free device memory, or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB",
         else => null,
     };
@@ -170,10 +234,18 @@ test "the prompt cache's hooks compile against the store's vtable" {
 }
 
 test "every refusal of its own is worded, the rest left to the server" {
-    for ([_]anyerror{ error.PastContext, error.NoFreeSlot, error.NoDraftHead, error.StructuresUnsupported, error.CapturedKernels, error.UnsupportedDoryCudaQuantization, error.BadLoops, error.UnsupportedKvMode, error.ParallelPastRound, error.ParallelPastMemory, error.NoStreamFits }) |e| {
+    for ([_]anyerror{ error.PastContext, error.NoFreeSlot, error.NoDraftHead, error.StructuresUnsupported, error.CapturedKernels, error.UnsupportedDoryCudaQuantization, error.BadLoops, error.UnsupportedKvMode, error.ParallelPastRound, error.ParallelPastMemory, error.NoStreamFits, error.KvShareWithoutPages }) |e| {
         try std.testing.expect(explain(null, e) != null);
     }
     try std.testing.expect(explain(null, error.OutOfMemory) == null);
+}
+
+test "TF_KV_SHARE pages Dory's caches; with TENSORFOLD_DORY_KV_PAGES=0 it is refused, not overridden" {
+    try std.testing.expectError(error.KvShareWithoutPages, pagedBy(4, "0"));
+    for ([_]?[]const u8{ null, "1", "", "00" }) |v| try std.testing.expect(try pagedBy(4, v));
+    try std.testing.expect(!try pagedBy(0, null));
+    try std.testing.expect(!try pagedBy(0, "0"));
+    try std.testing.expect(try pagedBy(0, "1"));
 }
 
 /// A synthetic plan: `stream` bytes a stream plus `fixed` bytes of scratch.

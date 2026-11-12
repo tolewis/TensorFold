@@ -70,6 +70,9 @@ pub const WireKind = enum {
 
 pub const Options = struct {
     wire: WireKind = .verbs,
+    /// TF_TP_ROCE_RELAY: four ranks, two neighbours each, two half flags per source.
+    relay: bool = false,
+    relay_max_bytes: usize = 64 * 1024,
     hcas: []const rv.HcaSpec = &.{},
     traffic_class: u8 = 0,
     cpu: ?u32 = null,
@@ -96,16 +99,17 @@ const Wire = union(WireKind) {
         }
     }
 
-    fn reap(w: *Wire) !void {
+    pub fn reap(w: *Wire) !void {
         switch (w.*) {
             .verbs => |*v| try v.reap(),
             .shm => {},
         }
     }
 
-    fn hcas(w: *const Wire) u32 {
+    /// Stripes a post makes to each peer: the flags a receiver counts from every source.
+    fn stripes(w: *const Wire) u32 {
         return switch (w.*) {
-            .verbs => |v| v.n_hca,
+            .verbs => |v| v.stripes,
             .shm => |s| s.stripes,
         };
     }
@@ -114,6 +118,8 @@ const Wire = union(WireKind) {
 pub const Roce = struct {
     me: u32,
     world: u32,
+    relay: bool = false,
+    relay_max_bytes: usize = 64 * 1024,
     layout: Layout,
     slot_bytes: usize,
     timeout_ns: u64,
@@ -154,6 +160,8 @@ pub const Roce = struct {
     /// Every rank calls it after the bootstrap (2 to `max_world`); any rank failing fails every rank (collective).
     pub fn init(d: ?*const cuda.Driver, b: *Bootstrap, image: []const u8, o: Options) !*Roce {
         if (b.world < 3 or b.world > max_world) return error.UnsupportedRoceWorld;
+        if (o.relay and b.world != 4) return error.UnsupportedRoceWorld;
+        if (b.world == 4 and !try @import("roce_relay_proxy.zig").agreed(b, o.relay)) return error.BadRecord;
         if (o.max_bytes == 0) return error.InvalidRoceSlot;
         if (o.max_bytes > guard.max_write) return error.WriteTooLarge; // a slot no post could fill in one write
         const slot = std.mem.alignForward(usize, o.max_bytes, 4096);
@@ -163,7 +171,7 @@ pub const Roce = struct {
         r.* = undefined;
         r.retained = false;
         errdefer if (!r.retained) std.heap.page_allocator.destroy(r);
-        r.* = .{ .me = b.rank, .world = b.world, .layout = layout, .slot_bytes = slot, .timeout_ns = o.timeout_ns, .fast = o.fast, .max_grid = o.blocks, .region = undefined, .mapping = undefined, .wire = undefined, .cpu = o.cpu };
+        r.* = .{ .me = b.rank, .world = b.world, .relay = o.relay, .relay_max_bytes = o.relay_max_bytes, .layout = layout, .slot_bytes = slot, .timeout_ns = o.timeout_ns, .fast = o.fast, .max_grid = o.blocks, .region = undefined, .mapping = undefined, .wire = undefined, .cpu = o.cpu };
         // 1. the regions and the wire, each rank alone; every rank learns whether all did
         const ok = r.openWire(b, o, len) catch |e| blk: {
             log.warn("[tensorfold] tp roce: rank {d} setup failed: {t}", .{ b.rank, e });
@@ -215,13 +223,14 @@ pub const Roce = struct {
                 errdefer posix.munmap(r.mapping);
                 try rv.prepareRegion(r.mapping);
                 r.wire = .{ .verbs = try rv.VerbsWire.open(o.hcas, r.region, r.layout, r.me, o.traffic_class) };
+                r.wire.verbs.relay = o.relay;
             },
             .shm => {
                 r.mapping = try shm.sharedAll(b, len);
                 r.region = @alignCast(r.mapping[r.me * len ..][0..len]);
                 var regions: [max_world][]u8 = undefined; // ranks 0..world-1 only
                 for (0..r.world) |p| regions[p] = r.mapping[p * len ..][0..len];
-                r.wire = .{ .shm = .{ .regions = regions, .me = r.me, .layout = r.layout, .local = r.region, .stripes = o.shm_stripes, .tap = o.tap } };
+                r.wire = .{ .shm = .{ .regions = regions, .me = r.me, .layout = r.layout, .local = r.region, .stripes = if (o.relay) 2 else o.shm_stripes, .tap = o.tap } };
             },
         }
         return true;
@@ -307,11 +316,11 @@ pub const Roce = struct {
         };
     }
 
-    fn word(r: *const Roce, i: usize) *std.atomic.Value(u32) {
+    pub fn word(r: *const Roce, i: usize) *std.atomic.Value(u32) {
         return @ptrCast(@alignCast(r.region[ctrl_off + 4 * i ..].ptr));
     }
 
-    fn fail(r: *Roce, comptime fmt: []const u8, args: anytype) void {
+    pub fn fail(r: *Roce, comptime fmt: []const u8, args: anytype) void {
         const s = std.fmt.bufPrint(&r.err_buf, fmt, args) catch "proxy failure";
         r.err_len = s.len;
         log.err("[tensorfold] tp roce proxy: {s}", .{s});
@@ -354,6 +363,7 @@ pub const Roce = struct {
     /// The proxy loop: spin on the doorbell, post each new sequence (at most two pending), reap while idle, then nap.
     fn proxyLoop(r: *Roce) void {
         if (r.cpu) |cpu| pin(cpu);
+        if (r.relay) return @import("roce_relay_proxy.zig").run(r);
         var idle: u64 = 0;
         while (r.running.load(.monotonic)) {
             if (r.word(w_abort).load(.monotonic) != 0) return;
@@ -382,7 +392,7 @@ pub const Roce = struct {
     }
 
     pub fn fits(r: *const Roce, n: usize) bool {
-        return n <= r.slot_bytes;
+        return n <= r.slot_bytes and (!r.relay or n <= r.relay_max_bytes);
     }
 
     fn launch(r: *Roce, mode: Mode, in: DevicePtr, out: DevicePtr, n: usize, lens: DevicePtr, stream: collective.Stream) Error!void {
@@ -408,7 +418,7 @@ pub const Roce = struct {
             .timeout_ns = r.timeout_ns,
             .rank = r.me,
             .mode = @backingInt(mode),
-            .n_hca = r.wire.hcas(),
+            .n_hca = r.wire.stripes(),
             .opts = r.fast,
             .lens = lens,
             .chunk = chunk,
@@ -455,13 +465,19 @@ pub const Roce = struct {
 
     pub fn check(r: *Roce) Error!void {
         if (r.word(w_failed).load(.acquire) != 0) {
-            const src = r.word(w_failed + 6).load(.acquire);
-            const slot = r.word(w_failed + 1).load(.acquire) & 1;
-            log.warn("tp roce: rank {d}'s wait for seq {d} from rank {d} failed ({s} after {d} us; HCA {d}, flag held {d}, now {d}); doorbell {d}, posted {d}, completed {d}, abort {d}, proxy failed {d}", .{ r.me, r.word(w_failed + 1).load(.acquire), src, if (r.word(w_failed + 4).load(.acquire) == 1) "aborted" else "timed out", r.word(w_failed + 5).load(.acquire), r.word(w_failed + 3).load(.acquire), r.word(w_failed + 2).load(.acquire), r.flagWord(src, slot, 0), r.word(w_seq).load(.acquire), r.last_seq, r.word(w_completed).load(.acquire), r.word(w_abort).load(.acquire), r.word(w_proxy_failed).load(.acquire) });
+            var line: [384]u8 = undefined;
+            log.warn("{s}", .{r.describeFailure(&line)});
             return error.PeerFailed;
         }
         if (r.word(w_proxy_failed).load(.acquire) != 0) return error.BackendFailed;
         if (r.aborted.load(.acquire) or r.word(w_abort).load(.acquire) != 0) return error.Aborted;
+    }
+
+    /// The failed wait the kernel recorded, as `check` reports it: this rank, the seq and the rank it waited on.
+    fn describeFailure(r: *const Roce, buf: []u8) []const u8 {
+        const src = r.word(w_failed + 6).load(.acquire);
+        const slot = r.word(w_failed + 1).load(.acquire) & 1;
+        return std.fmt.bufPrint(buf, "tp roce: rank {d}'s wait for seq {d} from rank {d} failed ({s} after {d} us; HCA {d}, flag held {d}, now {d}); doorbell {d}, posted {d}, completed {d}, abort {d}, proxy failed {d}", .{ r.me, r.word(w_failed + 1).load(.acquire), src, if (r.word(w_failed + 4).load(.acquire) == 1) "aborted" else "timed out", r.word(w_failed + 5).load(.acquire), r.word(w_failed + 3).load(.acquire), r.word(w_failed + 2).load(.acquire), r.flagWord(src, slot, 0), r.word(w_seq).load(.acquire), r.last_seq, r.word(w_completed).load(.acquire), r.word(w_abort).load(.acquire), r.word(w_proxy_failed).load(.acquire) }) catch "tp roce: a failed wait (its report did not fit)";
     }
 
     /// The flag rank `src`'s HCA `hca` last wrote for `slot` here (0 out of range).
@@ -519,12 +535,15 @@ pub const Roce = struct {
         const t0 = sock.nowNs();
         for (0..r.world - 1) |k| {
             const p = rv.peerAt(r.me, r.world, @intCast(k));
-            for (0..r.wire.hcas()) |h| {
+            for (0..r.wire.stripes()) |h| {
                 const flag: *std.atomic.Value(u32) = @ptrCast(@alignCast(r.region[l.flagAt(p, slot, @intCast(h))..].ptr));
                 var polls: u32 = 0;
                 while (flag.load(.acquire) != seq) {
                     if (r.word(w_abort).load(.monotonic) != 0) return error.Aborted;
-                    if (sock.nowNs() - t0 > r.timeout_ns) return error.Timeout;
+                    if (sock.nowNs() - t0 > r.timeout_ns) {
+                        if (r.relay) r.fail("relay rank {d} wait for rank {d} sequence {d} timed out", .{ r.me, p, seq });
+                        return error.Timeout;
+                    }
                     // host threads only (tests run every rank on one machine): let the others run now and then
                     polls +%= 1;
                     if (polls % 1024 == 0) {
@@ -534,12 +553,37 @@ pub const Roce = struct {
             }
             @memcpy(out[p * n + off ..][0..their[p]], r.region[l.recvAt(p, slot)..][0..their[p]]);
         }
+        if (r.relay) r.word(w_completed).store(seq, .release);
         r.host_epoch = seq;
     }
 };
 
 fn pin(cpu: u32) void {
+    if (@import("builtin").os.tag != .linux) return;
     var set: std.os.linux.cpu_set_t = @splat(0);
     set[cpu / @bitSizeOf(usize)] |= @as(usize, 1) << @intCast(cpu % @bitSizeOf(usize));
     std.os.linux.sched_setaffinity(0, &set) catch log.warn("tp roce: could not pin the proxy to CPU {d}", .{cpu});
+}
+
+test "multirank check: a failed wait the kernel recorded is reported with this rank, the seq and the rank it waited on" {
+    const t = std.testing;
+    const slot = 4096;
+    const region = try t.allocator.alignedAlloc(u8, .fromByteUnits(page), Roce.regionBytes(3, slot));
+    defer t.allocator.free(region);
+    @memset(region, 0);
+    var r: Roce = undefined;
+    r.me = 1;
+    r.world = 3;
+    r.layout = Layout.of(3, slot);
+    r.region = region;
+    r.last_seq = 0;
+    r.aborted = .init(false);
+    try r.check();
+    // the kernel's record of a wait that timed out: seq 7 from rank 2 (mailbox.cu's ctrl[16 + 1] and ctrl[16 + 6])
+    r.word(w_failed + 1).store(7, .release);
+    r.word(w_failed + 6).store(2, .release);
+    r.word(w_failed).store(1, .release);
+    try t.expectError(error.PeerFailed, r.check());
+    var line: [384]u8 = undefined;
+    try t.expect(std.mem.startsWith(u8, r.describeFailure(&line), "tp roce: rank 1's wait for seq 7 from rank 2 failed (timed out after "));
 }

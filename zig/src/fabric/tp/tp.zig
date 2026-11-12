@@ -10,11 +10,13 @@ pub const sock = @import("sock.zig");
 pub const bootstrap = @import("bootstrap.zig");
 pub const fate = @import("fate.zig");
 pub const host = @import("host.zig");
+pub const device = @import("device.zig");
 pub const nccl = @import("nccl.zig");
 pub const mailbox = @import("mailbox.zig");
 pub const hybrid = @import("hybrid.zig");
 pub const roce = @import("roce.zig");
 pub const roce_multi = @import("roce_multi.zig");
+pub const roce_suite_policy = @import("roce_suite_policy.zig");
 pub const RoceLink = @import("roce_link.zig").Link;
 pub const roce_verbs = @import("roce_verbs.zig");
 pub const roce_pick = @import("roce_pick.zig");
@@ -46,7 +48,9 @@ pub const Session = struct {
         const cfg = requested.resolved();
         var b = try Bootstrap.open(cfg);
         defer b.close();
-        try b.agree(&cfg.digest(), "settings (TF_TP_WORLD, TF_COMM_BACKEND, TF_TP_MAILBOX_MAX_KB, TF_TP_ROCE_CHUNKED_KB, TF_TP_FAILFAST, TF_TP_ROCE_WIRE / _FALLBACK, TF_GRAPH_CACHE)");
+        try b.agree(&cfg.digest(), "settings (TF_TP_WORLD, TF_COMM_BACKEND, TF_TP_MAILBOX_MAX_KB, TF_TP_ROCE_RELAY_MAX_KB, TF_TP_ROCE_CHUNKED_KB, TF_TP_FAILFAST, TF_TP_ROCE_WIRE / _FALLBACK, TF_GRAPH_CACHE)");
+        var diag = cuda.p2p_report.begin(cfg.rank, cfg.world);
+        defer diag.end();
         var lib = try cuda.nccl.Library.openPath(cfg.nccl_lib);
         errdefer lib.close();
         const v = try lib.version();
@@ -71,6 +75,7 @@ pub const Session = struct {
             .roce => if (cfg.world == 2) try s.openRoce(d, &b, kernel_image) else try @import("roce_multi_session.zig").open(s, d, &b, kernel_image),
         }
         try s.agreeVar(&b);
+        cuda.p2p_report.afterInit(&diag, .{ .lib = &s.lib, .comm = s.nccl.comm, .d = d }); // after the probes' NCCL calls
         s.plan = planlink.PlanLink.init(cfg.rank, cfg.world, b.releasePlan());
         errdefer s.plan.close();
         s.plan.spin_ns = cfg.plan_spin_ns;
@@ -228,13 +233,17 @@ test {
     _ = planlink;
     _ = @import("roce_guard.zig");
     _ = @import("roce_multi_guard.zig");
+    _ = @import("roce_multi_pairs.zig");
     _ = @import("roce_verbs_test.zig");
     _ = @import("roce_multi_wire_test.zig");
     _ = @import("roce_multi_route_test.zig");
+    _ = @import("roce_multi_wait_test.zig");
+    _ = @import("roce_multi_session.zig");
     _ = @import("roce_test.zig");
     _ = @import("roce_post_test.zig");
     _ = @import("roce_inflight_test.zig");
     _ = @import("host_test.zig");
+    _ = @import("device_test.zig");
     _ = @import("fate_test.zig");
     _ = @import("fate_lifetime_test.zig");
 }

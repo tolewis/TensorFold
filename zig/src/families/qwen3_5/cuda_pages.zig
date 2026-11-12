@@ -11,10 +11,16 @@ const Cache = caches.Cache;
 /// Rows past a request's prompt and reply its pages hold: one more forward's (a verify window or a prompt chunk).
 pub const window_rows: u32 = engine.max_rows;
 
-/// TF_QWEN_KV_PAGES=n: streams beside the first take n-position pages from one pool (unset or 0: a window each).
+/// TF_QWEN_KV_PAGES unset: a window each, dense or MoE, as on main, until #2043 closes the page cost.
+pub const unset_pages: usize = 0;
+
+/// TF_QWEN_KV_PAGES=n: n-position pages from one pool, --parallel a cap (0, empty or unset: a window each, as on main).
 pub fn paging() !usize {
-    const v = std.c.getenv("TF_QWEN_KV_PAGES") orelse return 0;
-    return parsePaging(std.mem.span(v));
+    return pagingOf(@import("core").profile.given(.TF_QWEN_KV_PAGES));
+}
+
+pub fn pagingOf(v: ?[]const u8) !usize {
+    return parsePaging(v orelse return unset_pages);
 }
 
 pub fn parsePaging(v: []const u8) !usize {
@@ -23,10 +29,13 @@ pub fn parsePaging(v: []const u8) !usize {
     return n;
 }
 
-/// TF_QWEN_KV_PAGES_ALL=1: every stream on pages, the first stream's reserved window left idle (checks).
+/// TF_QWEN_KV_PAGES_ALL=1: every stream on pages, the engine's own too: no window is reserved for it (unset: off).
 pub fn pagedOnly() bool {
-    const v = std.c.getenv("TF_QWEN_KV_PAGES_ALL") orelse return false;
-    return std.mem.eql(u8, std.mem.span(v), "1");
+    return pagedOnlyOf(@import("core").profile.get(.TF_QWEN_KV_PAGES_ALL));
+}
+
+pub fn pagedOnlyOf(v: ?[]const u8) bool {
+    return std.mem.eql(u8, v orelse return false, "1");
 }
 
 /// Pages a stream maps at most: a full window and one more forward.
@@ -116,20 +125,32 @@ pub const Pages = struct {
 
     /// A free lane's cache, reset, holding the pages of `prompt` + `max_tokens` rows and a window; LaneMemory: not now.
     pub fn open(p: *Pages, prompt: usize, max_tokens: usize) !*Cache {
+        return p.openWith(prompt, max_tokens, &.{});
+    }
+
+    /// `open` with `adopted` (the prompt cache's pages, held for it) heading its table; released on any failure.
+    pub fn openWith(p: *Pages, prompt: usize, max_tokens: usize, adopted: []const u32) !*Cache {
+        var held = adopted.len > 0;
+        errdefer if (held) for (adopted) |id| p.pool.release(id);
         if (prompt > p.capacity or max_tokens > p.capacity - prompt) return error.InvalidQwenPrompt;
         const x = for (p.lanes) |*x| {
             if (!x.used) break x;
         } else return error.LaneMemory;
         const k = p.layout.runPages();
         const n = p.need(prompt, max_tokens) - k; // keys and values
-        if (n > mostPages(p.capacity, p.layout.page_tokens) or n * p.layout.page_tokens > std.math.maxInt(c_int)) return error.InvalidQwenPrompt;
-        try p.pool.promise(&x.lease, n + k);
+        if (n > mostPages(p.capacity, p.layout.page_tokens) or adopted.len > n or n * p.layout.page_tokens > std.math.maxInt(c_int)) return error.InvalidQwenPrompt;
+        try p.pool.promise(&x.lease, n - adopted.len + k);
         errdefer p.pool.finish(&x.lease);
+        if (adopted.len > 0) {
+            held = false;
+            try p.pool.adopt(&x.lease, adopted); // the lease holds them now (its finish releases them)
+        }
         // the run first: KV pages fill from the bottom, runs from the top; a fragmented pool waits (LaneMemory)
         const run = p.pool.claimRun(&x.lease, k) orelse return error.LaneMemory;
         errdefer p.pool.releaseRun(run, k);
         errdefer cuda.completion.drain(p.e.d, p.e.stream, "qwen3_5: a failed lane open did not drain");
         var up: Upload = .{ .p = p, .cache = x.cache };
+        if (adopted.len > 0) try Upload.write(&up, x.lease.ids.items, 0);
         try p.pool.cover(&x.lease, n, .{ .ctx = &up, .write = Upload.write });
         try x.cache.mapRun(p.e, p.arena.ptr + run * p.layout.pageBytes(), k * p.layout.pageBytes(), p.ring);
         try x.cache.reset(p.e);
@@ -154,6 +175,28 @@ pub const Pages = struct {
         cache.cap = 0;
         x.used = false;
         return true;
+    }
+
+    /// The lane's first pages become `path`'s (the store's), table first; QwenLaneTable: it failed, end the stream.
+    pub fn swap(p: *Pages, cache: *Cache, path: []const u32) !void {
+        const x = for (p.lanes) |*x| {
+            if (x.cache == cache) break x;
+        } else return error.UnknownQwenLane;
+        if (std.mem.eql(u32, x.lease.ids.items[0..path.len], path)) return;
+        var up: Upload = .{ .p = p, .cache = cache };
+        Upload.write(&up, path, 0) catch |err| {
+            std.log.warn("qwen3_5: a lane's table did not take the kept pages: {s}", .{@errorName(err)});
+            return error.QwenLaneTable;
+        };
+        for (path, 0..) |id, i| p.pool.share(&x.lease, i, id);
+    }
+
+    /// TF_QWEN_POOL_LOG=1: the pool's census after a prompt pass (the agent replay's memory readings).
+    pub fn log(p: *const Pages, prompt: usize, cached: usize) void {
+        const v = std.c.getenv("TF_QWEN_POOL_LOG") orelse return;
+        if (!std.mem.eql(u8, std.mem.span(v), "1")) return;
+        const n = p.pool.census();
+        std.log.info("qwen3_5 pool after a prompt of {d} (resumed at {d}): {d} pages leased, {d} held by the prompt cache, {d} free of {d}", .{ prompt, cached, n.leased, n.kept, n.free, n.total });
     }
 
     /// Whether `cache` is one of the pool's lanes.
@@ -190,4 +233,47 @@ test "KV page dimensions: pool rows fit the signed kernel argument and zero disa
     try std.testing.expectEqual(@as(usize, 48), try parsePaging("48"));
     try std.testing.expectError(error.BadQwenKvPages, parsePaging("2147483648"));
     try std.testing.expectError(error.BadQwenKvPages, parsePaging("18446744073709551615"));
+}
+
+test "Qwen pages default: unset or 0 keeps windows, a set size pages" {
+    try std.testing.expectEqual(@as(usize, 0), try pagingOf(null));
+    try std.testing.expectEqual(@as(usize, 0), try pagingOf("0"));
+    try std.testing.expectEqual(@as(usize, 256), try pagingOf("256"));
+    try std.testing.expectEqual(@as(usize, 128), try pagingOf("128"));
+    try std.testing.expectEqual(@as(usize, 1), try pagingOf("1"));
+    try std.testing.expectError(error.BadQwenKvPages, pagingOf(""));
+}
+
+test "TF_QWEN_KV_PAGES: unset, empty or whitespace-only text keeps windows, a size keeps its meaning, other text is refused" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const t = std.testing;
+    const env = @import("sys").env;
+    const name = "TF_QWEN_KV_PAGES";
+    const before = if (std.c.getenv(name)) |v| try t.allocator.dupeSentinel(u8, std.mem.span(v), 0) else null;
+    defer {
+        if (before) |v| {
+            _ = env.setenv(name, v, 1);
+            t.allocator.free(v);
+        } else _ = env.unsetenv(name);
+    }
+    _ = env.unsetenv(name);
+    try t.expectEqual(unset_pages, try paging());
+    for ([_][:0]const u8{ "", " ", "\t", " \t\r\n" }) |v| {
+        try t.expectEqual(@as(c_int, 0), env.setenv(name, v, 1));
+        try t.expectEqual(unset_pages, try paging());
+    }
+    for ([_][:0]const u8{ "0", "256", "128" }, [_]usize{ 0, 256, 128 }) |v, n| {
+        try t.expectEqual(@as(c_int, 0), env.setenv(name, v, 1));
+        try t.expectEqual(n, try paging());
+    }
+    for ([_][:0]const u8{ "on", " 256", "256 ", "2147483648" }) |v| {
+        try t.expectEqual(@as(c_int, 0), env.setenv(name, v, 1));
+        try t.expectError(error.BadQwenKvPages, paging());
+    }
+}
+
+test "Qwen pages default: TF_QWEN_KV_PAGES_ALL unset keeps the engine's stream a window, as on main; 1 pages it" {
+    try std.testing.expect(!pagedOnlyOf(null));
+    try std.testing.expect(pagedOnlyOf("1"));
+    for ([_][]const u8{ "0", "", "true", "01", " 1 " }) |v| try std.testing.expect(!pagedOnlyOf(v));
 }

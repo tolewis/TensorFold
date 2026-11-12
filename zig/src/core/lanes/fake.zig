@@ -89,6 +89,10 @@ pub const Fake = struct {
     drafts_most: usize = 0,
     fail_runs: usize = 0, // the next this many `pieces` calls fail with error.Unbound (`runBackend`)
     runs: usize = 0, // `pieces` calls that ran
+    image_words: bool = false, // an image row feeds a word of its image's identity, as a tower's row would
+    image_rows: usize = 0, // image rows fed (`image_words`): the rows a tower had to make
+    gpu_charge: ?f64 = null, // each verify and step charges its streams this many GPU seconds, as a timed backend does
+    head_accepts: ?usize = null, // head drafts a round right before one wrong (null: one in five wrong)
 
     pub fn deinit(x: *Fake) void {
         var it = x.lanes.valueIterator();
@@ -105,12 +109,12 @@ pub const Fake = struct {
     }
 
     pub fn backend(x: *Fake) be.Backend {
-        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .alternatives = alternatives, .held = heldDrafts, .reports_fill = true } };
+        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .alternatives = alternatives, .held = heldDrafts, .reports_fill = true }, .chunk_invariant = true };
     }
 
     /// The same target taking several prompts in one pass (`prefill_many`).
     pub fn batched(x: *Fake) be.Backend {
-        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_many = prefillMany, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .reports_fill = true } };
+        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_many = prefillMany, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .reports_fill = true }, .chunk_invariant = true };
     }
 
     fn prefillMany(ptr: *anyopaque, ss: []const *Stream) anyerror!bool {
@@ -130,26 +134,26 @@ pub const Fake = struct {
 
     /// The same target filling its prompt a chunk a call (`prefill_chunks`), as a backend with `prefill_step`.
     pub fn stepped(x: *Fake) be.Backend {
-        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_step = prefillStep, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .reports_fill = true } };
+        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_step = prefillStep, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .reports_fill = true }, .chunk_invariant = true };
     }
 
     pub fn batchedSteps(x: *Fake) be.Backend {
-        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_step = prefillStep, .prefill_many = prefillMany, .many_rows = 8, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .reports_fill = true } };
+        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_step = prefillStep, .prefill_many = prefillMany, .many_rows = 8, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .reports_fill = true }, .chunk_invariant = true };
     }
 
     /// The backend with prompts in pieces (begin / piece / finish) beside whole prompts.
     pub fn pieceBackend(x: *Fake) be.Backend {
-        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .begin = begin, .piece = piece, .finish = finish } };
+        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .begin = begin, .piece = piece, .finish = finish }, .chunk_invariant = true };
     }
 
     /// `pieceBackend` whose prompts may leave their last token to the stream's first round (Config.join_tail).
     pub fn joinBackend(x: *Fake) be.Backend {
-        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .begin = begin, .piece = piece, .finish = finish, .join = join } };
+        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .begin = begin, .piece = piece, .finish = finish, .join = join }, .chunk_invariant = true };
     }
 
     /// `joinBackend` that takes a round's pieces in one call (Config.piece_runs): a piece at a time, or a failure.
     pub fn runBackend(x: *Fake) be.Backend {
-        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .begin = begin, .piece = piece, .finish = finish, .join = join, .pieces = pieces } };
+        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .begin = begin, .piece = piece, .finish = finish, .join = join, .pieces = pieces }, .chunk_invariant = true };
     }
 
     fn pieces(ptr: *anyopaque, list: []const be.Backend.Piece) anyerror!void {
@@ -186,7 +190,7 @@ pub const Fake = struct {
         }
         const h = &x.lane(s).history;
         if (h.items.len != start or end + 1 > s.prompt_len) return error.PositionMismatch;
-        try h.appendSlice(x.gpa, s.prompt()[start..end]);
+        for (start..end) |at| try h.append(x.gpa, x.word(s, at));
         x.pieces_run += 1;
     }
 
@@ -194,7 +198,17 @@ pub const Fake = struct {
         const x = self(ptr);
         const h = &x.lane(s).history;
         if (h.items.len + 1 != s.prompt_len) return error.PositionMismatch;
-        try h.append(x.gpa, s.prompt()[s.prompt_len - 1]);
+        try h.append(x.gpa, x.word(s, s.prompt_len - 1));
+    }
+
+    /// What prompt row `at` feeds: its token, or with `image_words` inside an image a word of that image and row.
+    fn word(x: *Fake, s: *const Stream, at: usize) u32 {
+        if (x.image_words) for (s.images) |img| if (at >= img.at and at < @as(usize, img.at) + img.tokens) {
+            x.image_rows += 1;
+            const row: u64 = at - img.at;
+            return 0x4000_0000 | @as(u32, @truncate(std.hash.Wyhash.hash(img.hash, std.mem.asBytes(&row)) & 0x3fff_ffff));
+        };
+        return s.prompt()[at];
     }
 
     fn self(ptr: *anyopaque) *Fake {
@@ -283,7 +297,7 @@ pub const Fake = struct {
         try x.fillPrompt(got.value_ptr, s);
     }
 
-    fn prefillStep(ptr: *anyopaque, s: *Stream) anyerror!bool {
+    fn prefillStep(ptr: *anyopaque, s: *Stream, max_rows: u32) anyerror!bool {
         const x = self(ptr);
         if (x.refuse_sampled and s.sampling != null) return error.SamplingRefused;
         if (x.memory_lanes) |n| if (!x.lanes.contains(s) and x.lanes.count() >= n) return error.LaneMemory;
@@ -295,14 +309,21 @@ pub const Fake = struct {
         if (x.prefill_hook) |hook| hook(x.prefill_hook_ctx.?, s, l.filled);
         if (s.isCancelled()) return error.Cancelled;
         l.filled += 1;
-        const at = s.prompt_len * l.filled / @max(1, x.prefill_chunks);
+        const chunks: usize = @intCast(chunksFor(s.prompt_len, x.prefill_chunks, max_rows));
+        const at = @min(@as(u64, @intCast(s.prompt_len)), s.prompt_len * l.filled / @as(u64, @intCast(chunks)));
         s.fill_at.store(@intCast(at), .monotonic);
         try x.seed(l, s); // the kept rows are held from the first step, as the steps' features are asked for them
         try x.grow(l, s, at);
-        if (l.filled < @max(1, x.prefill_chunks)) return false;
+        if (l.filled < chunks) return false;
         l.filling = false;
         try x.fillPrompt(l, s);
         return true;
+    }
+
+    /// The pass's chunk count: the configured one, more when the caller caps each chunk's rows.
+    fn chunksFor(prompt_len: u64, configured: usize, max_rows: u32) usize {
+        if (max_rows == 0) return @max(1, configured);
+        return @max(@max(1, configured), (prompt_len + max_rows - 1) / max_rows);
     }
 
     /// The stream's lane, its caches reserved first when it has none yet.
@@ -336,8 +357,9 @@ pub const Fake = struct {
     fn grow(x: *Fake, l: *Lane, s: *Stream, to: usize) !void {
         const h = &l.history;
         if (to <= h.items.len) return;
-        for (s.prompt()[h.items.len..to], h.items.len + 1..) |t, at| {
-            try h.append(x.gpa, t);
+        for (h.items.len..to) |row| {
+            try h.append(x.gpa, x.word(s, row));
+            const at = row + 1;
             if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) if (s.reuse.hook) |k| k.at(k.ptr, s, @intCast(at));
         }
     }
@@ -405,6 +427,7 @@ pub const Fake = struct {
         const x = self(ptr);
         const l = x.lane(s);
         try l.history.append(x.gpa, x.value(feed));
+        if (x.gpu_charge) |g| s.chargeGpu(g);
         return x.draw(l, s, position, true);
     }
 
@@ -421,6 +444,7 @@ pub const Fake = struct {
         if (x.fail_round == x.rounds) return error.GpuFailed;
         x.last_rows = 0;
         x.last_sampled = false;
+        if (x.gpu_charge) |g| for (windows) |w| w.stream.chargeGpu(g);
         for (windows, out) |w, o| {
             x.last_rows += w.rows();
             if (w.forced) x.forced_rows += w.tokens.len;
@@ -484,7 +508,8 @@ pub const Fake = struct {
             for (0..r.depth) |j| {
                 const at = r.position + j;
                 var t = x.targetNext(guess.items, r.stream.sampling, at);
-                if ((at *% 2654435761 + j) % 5 == 0) t = (t + 1) % vocab; // a wrong guess now and then
+                const wrong = if (x.head_accepts) |k| j == k else (at *% 2654435761 + j) % 5 == 0;
+                if (wrong) t = (t + 1) % vocab; // a wrong guess now and then, or after exactly `head_accepts`
                 try l.held.append(x.gpa, t);
                 try guess.append(x.gpa, t);
             }
@@ -497,6 +522,17 @@ pub const Fake = struct {
         const l = self(ptr).lane(s);
         if (start + count > l.history.items.len) return error.RowsNotHeld;
         return .{ .buffer = @intFromPtr(l.history.items.ptr), .offset = start * 4, .rows = count, .row_bytes = 4, .space = .host, .dtype = .u32 };
+    }
+
+    /// The stream's cache rows (prompt and fed tokens), as a backend's state digest would cover them; null: no lane.
+    pub fn cache(x: *const Fake, s: *Stream) ?[]const u32 {
+        const l = x.lanes.getPtr(s) orelse return null;
+        return l.history.items;
+    }
+
+    /// A digest of `rows` as cache state, so a stream's digest after any rounds compares with a fresh run's.
+    pub fn digest(rows: []const u32) u64 {
+        return std.hash.Wyhash.hash(0x2138, std.mem.sliceAsBytes(rows));
     }
 
     fn release(ptr: *anyopaque, s: *Stream) void {

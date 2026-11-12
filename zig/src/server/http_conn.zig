@@ -5,6 +5,7 @@ const posix = platform.posix;
 const Allocator = std.mem.Allocator;
 const log = @import("log.zig");
 const deadline = @import("http_deadline.zig");
+const scope = @import("auth_scope.zig");
 
 pub const max_line = 65536;
 pub const max_headers = 100;
@@ -35,6 +36,9 @@ pub const ReadHooks = struct {
     read: *const fn (*anyopaque, []u8, i32) IoError!usize,
 };
 
+/// A cancellation check that replaces ``peerGone``'s socket probe.
+pub const GoneHook = struct { ctx: *anyopaque, call: *const fn (*anyopaque) bool };
+
 pub const Conn = struct {
     fd: posix.socket_t,
     peer: []const u8,
@@ -56,11 +60,15 @@ pub const Conn = struct {
     requestline: []const u8 = "",
     headers: []Header = &.{},
     key_label: ?[]const u8 = null,
+    key_scopes: scope.Scopes = scope.full,
+    key_digest: ?[32]u8 = null,
     auth_enabled: bool = false,
     counted: bool = false,
     hook: ?StatusHook = null,
     broken: bool = false,
     quiet_log: bool = false,
+    /// Answers ``peerGone`` in place of the socket probe (a WebSocket session reads its own frames).
+    gone_hook: ?GoneHook = null,
 
     pub fn init(gpa: Allocator, fd: posix.socket_t, peer: []const u8) !Conn {
         return .{ .fd = fd, .peer = peer, .gpa = gpa, .buf = try gpa.alloc(u8, 2 * max_line + 8192) };
@@ -71,7 +79,8 @@ pub const Conn = struct {
         c.out.deinit(c.gpa);
     }
 
-    fn fill(c: *Conn, timeout_ms: i32) IoError!usize {
+    /// Reads what the socket has into the buffer, waiting up to ``timeout_ms``; 0 is EOF.
+    pub fn readSome(c: *Conn, timeout_ms: i32) IoError!usize {
         if (c.start == c.end) {
             c.start = 0;
             c.end = 0;
@@ -91,6 +100,17 @@ pub const Conn = struct {
         _ = try c.budget.wait(c.nowMs(), timeout_ms);
         c.end += got;
         return got;
+    }
+
+    /// The bytes read but not yet consumed.
+    pub fn pending(c: *const Conn) []u8 {
+        return c.buf[c.start..c.end];
+    }
+
+    /// Marks the first ``n`` pending bytes consumed.
+    pub fn consume(c: *Conn, n: usize) void {
+        std.debug.assert(n <= c.end - c.start);
+        c.start += n;
     }
 
     pub fn nowMs(c: *const Conn) i64 {
@@ -114,7 +134,7 @@ pub const Conn = struct {
             try line.appendSlice(a, scan);
             c.start += scan.len;
             if (line.items.len >= limit) return line.items;
-            if (try c.fill(wait) == 0) return line.items;
+            if (try c.readSome(wait) == 0) return line.items;
             wait = c.timeouts.read_ms;
         }
     }
@@ -124,7 +144,7 @@ pub const Conn = struct {
         var want = n;
         while (want > 0) {
             _ = try c.budget.wait(c.nowMs(), c.timeouts.read_ms);
-            if (c.start == c.end and try c.fill(c.timeouts.read_ms) == 0) break;
+            if (c.start == c.end and try c.readSome(c.timeouts.read_ms) == 0) break;
             const take = @min(want, c.end - c.start);
             try list.appendSlice(a, c.buf[c.start .. c.start + take]);
             c.start += take;
@@ -136,6 +156,7 @@ pub const Conn = struct {
     /// Whether the peer has gone: readable with nothing to read (Python's socket_cancellation).
     pub fn peerGone(c: *Conn) bool {
         if (c.broken) return true;
+        if (c.gone_hook) |h| return h.call(h.ctx);
         var fds = [_]posix.pollfd{.{ .fd = c.fd, .events = posix.POLL.IN | posix.POLL.PRI, .revents = 0 }};
         const ready = posix.poll(&fds, 0) catch return true;
         if (ready == 0) return false;
@@ -194,6 +215,8 @@ pub const Conn = struct {
         c.budget.head(c.nowMs(), idle and c.start == c.end, c.timeouts.request);
         defer c.budget = .{};
         c.key_label = null;
+        c.key_scopes = scope.full;
+        c.key_digest = null;
         c.counted = false;
         c.response_complete = false;
         const raw = c.readLine(a, max_line + 1, if (idle) c.timeouts.idle_ms else c.timeouts.read_ms) catch |e| switch (e) {
@@ -429,6 +452,8 @@ pub fn reason(code: u16) []const u8 {
         403 => "Forbidden",
         404 => "Not Found",
         414 => "URI Too Long",
+        429 => "Too Many Requests",
+        422 => "Unprocessable Entity",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         501 => "Not Implemented",

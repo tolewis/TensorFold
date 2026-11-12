@@ -48,12 +48,14 @@ pub fn loadConfigured(gpa: Allocator, io: std.Io, model_dir: []const u8, dump_di
     try load_admission.check(gpa, io, model_dir);
     const memory = @import("flashnext_memory");
     const weights = try memory.weightBytes(@import("core").checkpoint_host, gpa, io, model_dir);
-    const inventory = try memory.weights_plan.read(@import("core").checkpoint_host.Checkpoint, @import("core").quant.mlx, gpa, io, model_dir);
+    var inventory = try memory.weights_plan.read(@import("core").checkpoint_host.Checkpoint, @import("core").quant.mlx, gpa, io, model_dir);
+    const placement = try @import("fsr_layout.zig").of(inventory, window);
+    inventory.raw = placement.raw;
     const home = if (platform.c.getenv("HOME")) |v| std.mem.span(v) else "";
     const route = try @import("pack_route.zig").plan(gpa, io, model_dir, dump_dir, home);
     defer route.deinit(gpa);
     const paired = speed_up != null or platform.c.getenv("TF_FLASHNEXT_TP") != null;
-    const requested = try std.math.add(u64, window.startup_extra, if (paired) fz.Tp2.startupBytes() else 0);
+    const requested = try std.math.add(u64, try std.math.add(u64, window.startup_extra, placement.extra), if (paired) fz.Tp2.startupBytes() else 0);
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
     const device = try mtl.Device.init();
@@ -76,6 +78,8 @@ pub fn loadConfigured(gpa: Allocator, io: std.Io, model_dir: []const u8, dump_di
         }
         return err;
     };
+    if (placement.pool) |p| std.log.info("flash next FSR plan: {d} expert slots, {d} stored bytes/slot, {d} pool bytes, {d} metadata bytes, {d} unused tail bytes; steady {d} bytes, ceiling {d}; uncached pread", .{ p.slots, p.stride, p.slabs, p.metadata + placement.extra, p.unused, startup.steady, load_limit });
+    if (window.ple_on_ssd) std.log.info("flash next FSR plan: PLE rows on SSD, bounded staging charge {d} bytes; uncached pread", .{placement.ple.?});
     // Pack construction has no engine buffers or numerical pipelines live beside its host work.
     const built_dir = if (route.needs_build) try pack_cache.ensure(gpa, io, model_dir, route.root.?, route.identity, PackBuilder{}) else null;
     defer if (built_dir) |dir| gpa.free(dir);
@@ -86,7 +90,7 @@ pub fn loadConfigured(gpa: Allocator, io: std.Io, model_dir: []const u8, dump_di
     e.copy = true;
     e.copy_min = 3;
     e.copy_long = 6;
-    e.segments = true;
+    e.segments = window.ssd_experts == null and !window.ple_on_ssd and window.fsr_trace == null;
     e.mark_taps = true;
     e.pair_min = tp_settings.pairMin(if (platform.c.getenv("FZ_PAIR_MIN")) |v| std.mem.span(v) else null, PAIR_MIN); // rank 1 takes rank 0's
     e.call_log = platform.c.getenv("FZ_CALL_LOG") != null;
@@ -168,6 +172,13 @@ fn finishLoad(context: Construction, r: *Run) !*Engine {
     var ple_values: config.PleRef = undefined;
     var attention_scale: f64 = undefined;
     var cfg = try config.Config.read(arena, io, model_dir); // read once: the reference values and the widths
+    r.ngram = @import("index.zig").ngramSpelling(index.object.get("weight_map").?.object);
+    if (r.window.ssd_experts != null or r.window.ple_on_ssd or r.window.fsr_trace != null) {
+        var widths = try @import("widths.zig").Widths.init(arena, &cfg);
+        defer widths.deinit();
+        const direct = try @import("engine_widths.zig").read(&cfg, &widths, r.ngram);
+        r.fsr = try @import("fsr_runtime.zig").Runtime.init(r, @import("index.zig").mtpRoot(index.object.get("weight_map").?.object), direct.ple, e.identity_hash);
+    }
     if (dump_dir) |d| {
         const ref_file = try r.mapFile(try std.fmt.allocPrintSentinel(arena, "{s}/ref.json", .{d}, 0));
 
@@ -194,6 +205,7 @@ fn finishLoad(context: Construction, r: *Run) !*Engine {
     }
     const m = try arena.create(Model);
     m.* = .{ .r = r, .cap = r.window.capacity, .layers = undefined, .mix = undefined, .head = undefined, .embed = undefined, .ple = undefined, .t = undefined };
+    r.sb_index = try platform.environment.read(bool, "TF_FLASHNEXT_SCALE_INDEX", false) and r.fsr == null and r.tp == null and !r.device.tensorUnits();
     for (0..LAYERS) |i| {
         const linear = i % 4 != 3;
         var L: Layer = .{ .ahc = try hcOf(r, "L{d}.ahc", .{i}), .mhc = try hcOf(r, "L{d}.mhc", .{i}), .linear = linear, .proj = undefined, .out = undefined, .router = try r.loadf("L{d}.moe.router", .{i}), .ex = undefined };
@@ -218,10 +230,11 @@ fn finishLoad(context: Construction, r: *Run) !*Engine {
         }
         for (expert_projs, 0..) |proj, j| {
             for ([_][]const u8{ "weight", "scales", "biases" }, 0..) |suffix, k| {
-                L.ex[j * 3 + k] = try r.loadf("language_model.model.layers.{d}.mlp.{s}.{s}", .{ i, proj, suffix });
+                L.ex[j * 3 + k] = if (try @import("fsr_storage.zig").expert(r, j, k)) |buffer| buffer else try r.loadf("language_model.model.layers.{d}.mlp.{s}.{s}", .{ i, proj, suffix });
             }
         }
         if (r.xpack) try r.repack(&L.ex);
+        if (r.sb_index) try @import("scale_index.zig").addAll(r, &L.ex);
         m.layers[i] = L;
     }
     m.mix = try hcOf(r, "mix", .{});
@@ -249,9 +262,13 @@ fn finishLoad(context: Construction, r: *Run) !*Engine {
     }
     r.ngram = @import("index.zig").ngramSpelling(index.object.get("weight_map").?.object);
     for (0..GROUPS) |g| {
-        m.ple.tables[3 * g + 0] = try r.group(16 * g, 16, "weight");
-        m.ple.tables[3 * g + 1] = try r.group(16 * g, 16, "scales");
-        m.ple.tables[3 * g + 2] = try r.group(16 * g, 16, "biases");
+        if (r.fsr != null and r.fsr.?.ple != null) {
+            for (0..3) |k| m.ple.tables[3 * g + k] = r.fsr.?.ple.?.buffers[k];
+        } else {
+            m.ple.tables[3 * g + 0] = try r.group(16 * g, 16, "weight");
+            m.ple.tables[3 * g + 1] = try r.group(16 * g, 16, "scales");
+            m.ple.tables[3 * g + 2] = try r.group(16 * g, 16, "biases");
+        }
     }
     m.ple.scale = try fz.ple_scale.of(r, index.object.get("weight_map").?.object);
     const B = struct {
@@ -311,10 +328,11 @@ fn finishLoad(context: Construction, r: *Run) !*Engine {
         var ex: [18]Buf = undefined;
         for (expert_projs, 0..) |proj, j| {
             for ([_][]const u8{ "weight", "scales", "biases" }, 0..) |suffix, k| {
-                ex[j * 3 + k] = try r.loadf("{s}.layers.0.mlp.{s}.{s}", .{ mtp_root, proj, suffix });
+                ex[j * 3 + k] = if (try @import("fsr_storage.zig").expert(r, j, k)) |buffer| buffer else try r.loadf("{s}.layers.0.mlp.{s}.{s}", .{ mtp_root, proj, suffix });
             }
         }
         if (r.xpack) try r.repack(&ex);
+        if (r.sb_index) try @import("scale_index.zig").addAll(r, &ex);
         m.mtp = .{
             .ahc = try hcOf(r, "mtp.ahc", .{}),
             .mhc = try hcOf(r, "mtp.mhc", .{}),
@@ -378,17 +396,22 @@ fn finishLoad(context: Construction, r: *Run) !*Engine {
     // speed-up mode: TP=2 with the peer the settings name (tp.zig); both ranks then run the same replies in...
     const tp_path: ?[]const u8 = speed_up orelse if (platform.c.getenv("TF_FLASHNEXT_TP")) |p| std.mem.span(p) else null;
     if (tp_path != null and !uniform) return error.SpeedUpNeeds6Bit32; // TP splits the 6/32 kernels only
-    if (tp_path) |path| r.tp = try fz.Tp2.init(arena, r.device, path);
+    if (tp_path) |path| r.tp = try fz.Tp2.init(arena, io, r.device, path);
     if (r.tp) |t| try r.held.appendSlice(arena, &.{ t.wbuf, t.one, t.pick_tmp }); // every pair round uses them
     if (r.tp == null) try fz.rows_load.attach(
         e.pr,
         m,
         @import("index.zig").mtpRoot(index.object.get("weight_map").?.object),
     );
-    if (r.tp == null) if (platform.c.getenv("FZ_GX")) |v| { // dev: windows from this many rows on the grouped experts
-        r.gx = try @import("gx.zig").init(r, try std.fmt.parseInt(usize, std.mem.span(v), 10));
+    // windows from this many rows run their experts grouped by expert (gx.zig): the row kernels' bits, 4/32 only
+    const grouped_rows = try platform.environment.read(usize, "TF_FLASHNEXT_GROUPED_ROWS", 5);
+    var grouped = false;
+    for (&m.layers) |*L| grouped = grouped or (L.xw != null and @import("gx.zig").applies(L.xw.?));
+    if (grouped and grouped_rows != 0 and r.tp == null and r.fsr == null and !r.device.tensorUnits()) {
+        r.gx = try @import("gx.zig").init(r, grouped_rows);
         std.log.info("flash next: grouped experts from {d} rows", .{r.gx.?.min_rows});
-    };
+    }
+    if (r.sb_index) std.log.info("flash next: {d} expert tensors' scales and biases indexed, at most {d} pairs each", .{ r.sbix.count(), r.sb_pairs });
     if (platform.c.getenv("FZ_SKIP")) |v| r.skip = try std.fmt.parseInt(u32, std.mem.span(v), 10); // dev: knock-outs by Run.class bit
     // GPU-gated lanes at this probability product: 0.4 without tensor units (FZ_GATE=tau sets it, FZ_GATE=off none)
     const gate_tau: ?[]const u8 = if (platform.c.getenv("FZ_GATE")) |v| std.mem.span(v) else if (!r.device.tensorUnits()) "0.4" else null;
@@ -410,6 +433,9 @@ fn finishLoad(context: Construction, r: *Run) !*Engine {
         e.tree = try @import("tree.zig").init(r, a, if (sib > 0) a * sib else b, feed, sib);
         if (sib > 0) std.log.info("flash next: tree rounds, a head chain of {d} and {d} head siblings a depth", .{ a, sib }) else std.log.info("flash next: tree rounds, a head chain of {d} and a branch of {d}", .{ a, b });
     };
+    if (r.fsr) |s| {
+        @import("checkpoint_cache.zig").finish(r.files.items, s.source.files);
+    } else @import("checkpoint_cache.zig").finish(r.files.items, &.{});
     return e;
 }
 

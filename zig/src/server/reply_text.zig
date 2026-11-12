@@ -1,29 +1,52 @@
 //! Reply text as it streams: think blocks, tool markup held back, Harmony channels, stop strings.
 const std = @import("std");
+const json = @import("json");
+const Value = json.Value;
 const Allocator = std.mem.Allocator;
 
 pub const Markers = struct { open: []const u8, close: []const u8 };
 /// Qwen's prompt opens the think block; Gemma 4's reply opens its thought channel.
 pub const think_markers: Markers = .{ .open = "", .close = "</think>" };
-/// The opener a reply writes itself when its template leaves the think block to it (Kolibri 1's does).
+/// MiniMax-M3's adaptive thinking: the reply writes `<mm:think>...</mm:think>` itself, or `</mm:think>` alone.
+pub const mm_markers: Markers = .{ .open = "", .close = "</mm:think>" };
+/// The opener a reply writes itself when its template leaves the think block to it (Kolibri 1's and MiniMax-M3's do).
 const think_open = "<think>";
+
+fn openerOf(m: Markers) []const u8 {
+    return if (std.mem.eql(u8, m.close, mm_markers.close)) "<mm:think>" else think_open;
+}
 pub const channel_markers: Markers = .{ .open = "<|channel>thought", .close = "<channel|>" };
-/// (opener, closer) of a tool call's markup: Qwen's, Gemma 4's, DeepSeek-V4's DSML block, LFM2's.
+/// (opener, closer) of a tool call's markup: Qwen's, Gemma 4's, DeepSeek-V4's DSML block, LFM2's, V4.1's spaced DSML.
 pub const calls = [_][2][]const u8{
     .{ "<tool_call>", "</tool_call>" },
     .{ "<|tool_call>", "<tool_call|>" },
     .{ "<\u{ff5c}DSML\u{ff5c}tool_calls>", "</\u{ff5c}DSML\u{ff5c}tool_calls>" },
     .{ "<|tool_call_start|>", "<|tool_call_end|>" },
+    .{ "<\u{ff5c}DSML\u{ff5c} calls>", "</\u{ff5c}DSML\u{ff5c} calls>" },
+    .{ "<｜DSML｜function_calls>", "</｜DSML｜function_calls>" },
 };
-/// Each opener's payload lead: Gemma 4's ``call:`` (26B: ``:``), DSML's invoke; ``<tool_call>`` and LFM2 have none.
-const leads = [calls.len][]const []const u8{ &.{}, &.{ "call:", ":" }, &.{"<\u{ff5c}DSML\u{ff5c}invoke"}, &.{} };
+/// Each opener's payload lead: Gemma 4's ``call:`` (26B: ``:``), DSML's invoke; the other openers have none.
+const leads = [calls.len][]const []const u8{ &.{}, &.{ "call:", ":" }, &.{"<\u{ff5c}DSML\u{ff5c}invoke"}, &.{}, &.{"<\u{ff5c}DSML\u{ff5c} invoke"}, &.{"<｜DSML｜invoke"} };
+
+/// The call openers a stream watches for, with their payload leads.
+pub const Openers = struct { calls: []const [2][]const u8, leads: []const []const []const u8 };
+pub const shared_openers: Openers = .{ .calls = &calls, .leads = &leads };
+/// MiniMax-M3's servers also watch for its own block, which tool_minimax.zig rewrites as DSML once it closes.
+const mm_calls = calls ++ [_][2][]const u8{.{ "]<]minimax[>[<tool_call>", "]<]minimax[>[</tool_call>" }};
+const mm_leads = leads ++ [_][]const []const u8{&.{}};
+const mm_openers: Openers = .{ .calls = &mm_calls, .leads = &mm_leads };
+
+/// The openers for a server's markers: MiniMax-M3's block only where the markers are MiniMax-M3's.
+pub fn openersOf(m: Markers) Openers {
+    return if (std.mem.eql(u8, m.close, mm_markers.close)) mm_openers else shared_openers;
+}
 
 /// Whether the text after an opener is a call's payload, may still become one, or is prose that names the opener.
-fn payloadOf(rest: []const u8, which: usize, finished: bool) enum { call, wait, prose } {
-    if (leads[which].len == 0) return .call;
+pub fn payloadOf(rest: []const u8, o: Openers, which: usize, finished: bool) enum { call, wait, prose } {
+    if (o.leads[which].len == 0) return .call;
     const body = std.mem.trimStart(u8, rest, " \t\r\n");
-    for (leads[which]) |lead| if (std.mem.startsWith(u8, body, lead)) return .call;
-    if (!finished) for (leads[which]) |lead| if (std.mem.startsWith(u8, lead, body)) return .wait;
+    for (o.leads[which]) |lead| if (std.mem.startsWith(u8, body, lead)) return .call;
+    if (!finished) for (o.leads[which]) |lead| if (std.mem.startsWith(u8, lead, body)) return .wait;
     return .prose;
 }
 
@@ -96,6 +119,7 @@ pub fn splitThinkingTokens(a: Allocator, decode: anytype, ctx: anytype, full: []
 
 /// As `splitThinking`, but the close marker is the model's own close token: the reasoning ends at that token's bytes.
 pub fn splitThinkingAt(a: Allocator, full: []const u8, finished: bool, m: Markers, close: Close) Allocator.Error!Split {
+    const o = openersOf(m);
     var text = full;
     var at: ?usize = switch (close) {
         .spelled, .pending => null,
@@ -113,7 +137,7 @@ pub fn splitThinkingAt(a: Allocator, full: []const u8, finished: bool, m: Marker
         };
         if (!finished) {
             var held = @max(partialTag(text, m.open), partialTag(text, m.close));
-            for (calls) |c| held = @max(held, partialTag(text, c[0]));
+            for (o.calls) |c| held = @max(held, partialTag(text, c[0]));
             return .{ .reasoning = "", .answer = text[0 .. text.len - held] };
         }
         return .{ .reasoning = "", .answer = text };
@@ -124,12 +148,12 @@ pub fn splitThinkingAt(a: Allocator, full: []const u8, finished: bool, m: Marker
         const trimmed = trimNewlines(rest);
         shift = m.open.len + (rest.len - trimmed.len);
         text = trimmed;
-    } else if (std.mem.startsWith(u8, text, think_open)) {
-        const rest = text[think_open.len..];
+    } else if (std.mem.startsWith(u8, text, openerOf(m))) {
+        const rest = text[openerOf(m).len..];
         const trimmed = trimNewlines(rest);
-        shift = think_open.len + (rest.len - trimmed.len);
+        shift = openerOf(m).len + (rest.len - trimmed.len);
         text = trimmed;
-    } else if (!finished and std.mem.startsWith(u8, think_open, text)) {
+    } else if (!finished and std.mem.startsWith(u8, openerOf(m), text)) {
         return .{ .reasoning = "", .answer = "" }; // held while the reply may still be writing that opener
     }
     if (at) |v| at = if (v >= shift) v - shift else null;
@@ -140,25 +164,29 @@ pub fn splitThinkingAt(a: Allocator, full: []const u8, finished: bool, m: Marker
     };
     if (end) |at_end| {
         if (at_end + m.close.len <= text.len and std.mem.startsWith(u8, text[at_end..], m.close)) {
-            return .{ .reasoning = text[0..at_end], .answer = trimNewlines(text[at_end + m.close.len ..]) };
+            const reasoning = text[0..at_end];
+            const answer = trimNewlines(text[at_end + m.close.len ..]);
+            if (pyStrip(answer).len == 0) if (@import("reply_tool_tail.zig").start(reasoning, o)) |call_start|
+                return .{ .reasoning = reasoning[0..call_start], .answer = if (finished) reasoning[call_start..] else "" };
+            return .{ .reasoning = reasoning, .answer = answer };
         }
         // the close token's bytes are not where the text says: the whole text is reasoning
     }
     var call: ?usize = null;
-    for (calls) |c| if (find(text, c[0])) |at_call| {
+    for (o.calls) |c| if (find(text, c[0])) |at_call| {
         if (call == null or at_call < call.?) call = at_call;
     };
     if (call) |at_call| {
         // a call written before the block closes: held while the block may still close, the answer if the reply ends
         if (!finished) return .{ .reasoning = text[0..at_call], .answer = "" };
-        for (calls) |c| if (std.mem.startsWith(u8, text[at_call..], c[0]) and find(text[at_call..], c[1]) != null)
+        for (o.calls) |c| if (std.mem.startsWith(u8, text[at_call..], c[0]) and find(text[at_call..], c[1]) != null)
             return .{ .reasoning = text[0..at_call], .answer = text[at_call..] };
         return .{ .reasoning = text, .answer = "" };
     }
     var held: usize = 0;
     if (!finished) {
         held = partialTag(text, m.close);
-        for (calls) |c| held = @max(held, partialTag(text, c[0]));
+        for (o.calls) |c| held = @max(held, partialTag(text, c[0]));
     }
     return .{ .reasoning = text[0 .. text.len - held], .answer = "" };
 }
@@ -166,19 +194,20 @@ pub fn splitThinkingAt(a: Allocator, full: []const u8, finished: bool, m: Marker
 /// Hides tool-call blocks and partial opening tags while streaming, so calls arrive as deltas instead.
 pub fn hideToolCalls(a: Allocator, text: []const u8, finished: bool) Allocator.Error![]const u8 {
     var out: std.ArrayList(u8) = .empty;
-    return hideInto(a, &out, text, finished);
+    return hideInto(a, &out, text, finished, false, shared_openers);
 }
 
-/// ``hideToolCalls`` into ``out`` (cleared first); text without a call block comes back as a slice of ``text``.
-pub fn hideInto(a: Allocator, out: *std.ArrayList(u8), text: []const u8, finished: bool) Allocator.Error![]const u8 {
+/// ``hideToolCalls`` into ``out`` (cleared first) for openers ``o``; text without a call block is a slice of ``text``.
+pub fn hideInto(a: Allocator, out: *std.ArrayList(u8), text: []const u8, finished: bool, defer_closed: bool, o: Openers) Allocator.Error![]const u8 {
     out.clearRetainingCapacity();
     var pos: usize = 0;
-    var next: [calls.len]?usize = undefined; // each opener at or after `pos`, searched again only once `pos` passes it
-    for (calls, &next) |c, *n| n.* = findTag(text, 0, c[0]);
+    var next_buf: [mm_calls.len]?usize = undefined; // each opener at or after `pos`, searched again only once `pos` passes it
+    const next = next_buf[0..o.calls.len];
+    for (o.calls, next) |c, *n| n.* = findTag(text, 0, c[0]);
     while (true) {
         var start: ?usize = null;
         var which: usize = 0;
-        for (calls, &next, 0..) |c, *n, i| {
+        for (o.calls, next, 0..) |c, *n, i| {
             if (n.* != null and n.*.? < pos) n.* = findTag(text, pos, c[0]);
             if (n.*) |at| if (start == null or at < start.?) {
                 start = at;
@@ -188,7 +217,7 @@ pub fn hideInto(a: Allocator, out: *std.ArrayList(u8), text: []const u8, finishe
         if (start == null) {
             const tail = text[pos..];
             var held: usize = 0;
-            if (!finished) for (calls) |c| {
+            if (!finished) for (o.calls) |c| {
                 held = @max(held, partialTag(tail, c[0]));
             };
             if (pos == 0) return text[0 .. text.len - held];
@@ -196,8 +225,8 @@ pub fn hideInto(a: Allocator, out: *std.ArrayList(u8), text: []const u8, finishe
             return out.items;
         }
         try out.appendSlice(a, text[pos..start.?]);
-        const after = start.? + calls[which][0].len;
-        switch (payloadOf(text[after..], which, finished)) {
+        const after = start.? + o.calls[which][0].len;
+        switch (payloadOf(text[after..], o, which, finished)) {
             .call => {},
             .wait => return out.items,
             .prose => {
@@ -206,23 +235,30 @@ pub fn hideInto(a: Allocator, out: *std.ArrayList(u8), text: []const u8, finishe
                 continue;
             },
         }
-        const end = findTag(text, after, calls[which][1]) orelse {
+        const end = findTag(text, after, o.calls[which][1]) orelse {
             // a finished reply's envelope that never closed is text, as tool_parse.parse keeps it in the content
             if (finished) try out.appendSlice(a, text[start.?..]);
             return out.items;
         };
-        pos = end + calls[which][1].len;
+        // Final parsing may retain this envelope, so later prose must not overtake it.
+        if (defer_closed) return out.items;
+        pos = end + o.calls[which][1].len;
     }
 }
 
 /// With tools, a stream holds trailing whitespace back until more text comes: a reply with a call does not show it.
 pub fn heldBack(text: []const u8, tools: bool) []const u8 {
+    // Only final call acceptance decides whether leading whitespace survives.
+    if (tools and pyLstrip(text).len != text.len) return text[0..0];
     return if (tools) text[0..pyRstrip(text).len] else text; // a prefix, so the stream's pointer checks still hold
 }
 
-/// ``hideToolCalls`` of a finished reply; once a call is hidden, the prose's trailing whitespace stays unsent too.
+/// Prose safe to send before final parsing settles the first hidden closed envelope.
 pub fn finishedProse(a: Allocator, text: []const u8) Allocator.Error![]const u8 {
-    const prose = try hideToolCalls(a, text, true);
+    // attachCalls has not yet decided whether to strip the reply's content.
+    if (pyLstrip(text).len != text.len) return text[0..0];
+    var out: std.ArrayList(u8) = .empty;
+    const prose = try hideInto(a, &out, text, true, true, shared_openers);
     return if (prose.len != text.len) prose[0..pyRstrip(prose).len] else prose;
 }
 
@@ -495,7 +531,11 @@ test "an opener the reply names in prose keeps the text after it, streamed and w
     try std.testing.expectEqualStrings(prose, try finishedProse(a, prose));
     const named = "Gemma opens a call with <|tool_call> and DSML with <\u{ff5c}DSML\u{ff5c}tool_calls> too.";
     try std.testing.expectEqualStrings(named, try hideToolCalls(a, named, false));
-    for ([_][]const u8{ prose, named, "a <tool_call>{\"name\"", "a <|tool_call>call:f{x:1}<tool_call|>b" }) |reply| {
+    const spaced = "DeepSeek-V4.1 opens its block with <\u{ff5c}DSML\u{ff5c} calls> instead.";
+    try std.testing.expectEqualStrings(spaced, try hideToolCalls(a, spaced, false));
+    try std.testing.expectEqualStrings("x ", try hideToolCalls(a, "x <\u{ff5c}DSML\u{ff5c} calls>\n<\u{ff5c}DSML\u{ff5c} inv", false));
+    try std.testing.expectEqualStrings("x ", try hideToolCalls(a, "x <\u{ff5c}DSML\u{ff5c} ca", false));
+    for ([_][]const u8{ prose, named, spaced, "a <tool_call>{\"name\"", "a <|tool_call>call:f{x:1}<tool_call|>b" }) |reply| {
         const whole = try hideToolCalls(a, reply, true);
         for (0..reply.len + 1) |n| try std.testing.expect(std.mem.startsWith(u8, whole, try hideToolCalls(a, reply[0..n], false)));
     }
@@ -507,4 +547,36 @@ test "an opener the reply names in prose keeps the text after it, streamed and w
     try std.testing.expectEqualStrings("a b", try hideToolCalls(a, "a <|tool_call>call:f{x:1}<tool_call|>b", false));
     // a finished reply's unclosed envelope is text, as tool_parse.parse keeps it in the content
     try std.testing.expectEqualStrings("a <tool_call>{\"name\"", try finishedProse(a, "a <tool_call>{\"name\""));
+}
+
+test "reply text: MiniMax-M3's adaptive think block, written by the reply or skipped with its close alone" {
+    const a = std.testing.allocator;
+    const full = try splitThinking(a, "<mm:think>17 * 23 = 391.</mm:think>391", true, mm_markers);
+    try std.testing.expectEqualStrings("17 * 23 = 391.", full.reasoning);
+    try std.testing.expectEqualStrings("391", full.answer);
+    const bare = try splitThinking(a, "</mm:think>Hello there", true, mm_markers);
+    try std.testing.expectEqualStrings("", bare.reasoning);
+    try std.testing.expectEqualStrings("Hello there", bare.answer);
+    const held = try splitThinking(a, "<mm:th", false, mm_markers);
+    try std.testing.expectEqualStrings("", held.answer);
+}
+
+test "reply text: MiniMax-M3's call opener is watched for only under MiniMax-M3's markers" {
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    // other models' streams keep a trailing `]`, as on main
+    try std.testing.expectEqualStrings("x = a[i]", try hideToolCalls(a, "x = a[i]", false));
+    try std.testing.expectEqualStrings("x = a[i]", try hideInto(a, &out, "x = a[i]", false, false, openersOf(think_markers)));
+    // MiniMax-M3's stream holds a partial opener back and hides an open block
+    const mm = openersOf(mm_markers);
+    try std.testing.expectEqualStrings("x = a[i", try hideInto(a, &out, "x = a[i]", false, false, mm));
+    try std.testing.expectEqualStrings("Checking. ", try hideInto(a, &out, "Checking. ]<]minimax[>[<tool_call>]<]minimax[>[<invoke", false, false, mm));
+}
+
+/// ``{key: text}``: a streamed delta (role, content or reasoning_content).
+pub fn deltaOf(a: Allocator, key: []const u8, text: []const u8) Allocator.Error!Value {
+    const o = try json.newObject(a);
+    try o.put(a, key, .{ .string = text });
+    return .{ .object = o };
 }

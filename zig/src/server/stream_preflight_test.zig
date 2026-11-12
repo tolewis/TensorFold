@@ -12,7 +12,7 @@ const Conn = @import("http_conn.zig").Conn;
 
 /// Bytes as tokens; every prompt renders as "prompt" (6 tokens).
 pub const TestText = struct {
-    fn text(t: *@This()) model_text.Text {
+    pub fn text(t: *@This()) model_text.Text {
         return .{ .ctx = t, .vtable = &.{ .encode = encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocabSize, .eos_ids = eosIds, .render = render, .template_source = templateSource } };
     }
 
@@ -133,6 +133,8 @@ const Seen = struct {
     arguments: [2048]u8 = undefined,
     arguments_len: usize = 0,
     finish: ?enum { stop, length, tool_calls } = null, // the reply's or the stream's last finish_reason
+    refusal: [160]u8 = undefined, // a whole reply's error message
+    refusal_len: usize = 0,
 
     fn keepFinish(c: *Seen, choice: json.Value) void {
         const f = choice.strField("finish_reason") orelse return;
@@ -206,7 +208,12 @@ const Seen = struct {
                 for (t.array) |call| c.keepArguments(call);
             };
         };
-        const code = (payload.get("error") orelse return).get("code") orelse return;
+        const err = payload.get("error") orelse return;
+        if (err.strField("message")) |m| {
+            c.refusal_len = @min(m.len, c.refusal.len);
+            @memcpy(c.refusal[0..c.refusal_len], m[0..c.refusal_len]);
+        }
+        const code = err.get("code") orelse return;
         c.context_code = code == .string and std.mem.eql(u8, code.string, "context_length_exceeded");
     }
 };
@@ -214,7 +221,7 @@ const Seen = struct {
 const Route = enum { chat, messages, responses };
 
 /// A Responses request with no stored conversation to read.
-const NoHistory = struct {
+pub const NoHistory = struct {
     pub fn conversation(_: NoHistory, cx: *errors.Cx, _: json.Value) errors.Refused![]json.Value {
         return cx.refuse("no stored responses in this test");
     }
@@ -410,9 +417,9 @@ test "a greedy-only engine's refusal names --temperature 0 when the server's own
         var srv = try server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), config, null);
         defer srv.deinit();
         var cx: errors.Cx = .{ .a = a };
-        try std.testing.expectError(error.Refused, srv.resolveSampling(&cx, (try json.parse(a, "{\"temperature\":0.7}")).ok, 0, &.{}));
+        try std.testing.expectError(error.Refused, srv.resolveSampling(&cx, (try json.parse(a, "{\"temperature\":0.7}")).ok, 0, &.{}, false));
         try std.testing.expectEqual(case[1], std.mem.indexOf(u8, cx.message, "--temperature 0") != null);
-        try std.testing.expect(try srv.resolveSampling(&cx, (try json.parse(a, "{\"temperature\":0}")).ok, 0, &.{}) == null);
+        try std.testing.expect(try srv.resolveSampling(&cx, (try json.parse(a, "{\"temperature\":0}")).ok, 0, &.{}, false) == null);
     }
 }
 
@@ -501,7 +508,7 @@ test "unsupported budgets leave zero unset and thinking-disabled requests valid"
     try std.testing.expectEqual(@as(usize, 3), backend.submissions);
 }
 
-test "closed or busy admission is service unavailable across chat, messages and responses" {
+test "closed, busy or memory-pressure admission is service unavailable across chat, messages and responses" {
     const ClosedEngine = struct {
         reason: api.SubmitError = error.Closed,
         fn engine(e: *@This()) api.Engine {
@@ -520,12 +527,13 @@ test "closed or busy admission is service unavailable across chat, messages and 
     defer arena.deinit();
     var wrong: usize = 0;
     var engine: ClosedEngine = .{};
-    for ([_]api.SubmitError{ error.Closed, error.Busy }) |reason| {
+    for ([_]api.SubmitError{ error.Closed, error.Busy, error.MemoryPressure }) |reason| {
         engine.reason = reason;
         for (cases) |c| for ([_]bool{ false, true }) |streaming| {
             const body = if (streaming) try std.mem.concat(arena.allocator(), u8, &.{ c.body[0 .. c.body.len - 1], ",\"stream\":true}" }) else c.body;
             const seen = try sendWith(engine.engine(), c.route, body, .{});
-            if (seen.status != 503 or seen.opened or seen.preparing != 0) {
+            const said = std.mem.eql(u8, seen.refusal[0..seen.refusal_len], api.pressure_message);
+            if (seen.status != 503 or seen.opened or seen.preparing != 0 or (reason == error.MemoryPressure) != said) {
                 wrong += 1;
                 std.debug.print("ADMISSION reason={s} route={s} stream={any} status={any} opened={any} events={d} preparing={d}\n", .{ @errorName(reason), @tagName(c.route), streaming, seen.status, seen.opened, seen.events, seen.preparing });
             }

@@ -43,19 +43,23 @@ fn config(quant: []const u8, moe: bool, pocket: bool) ![]u8 {
 const exl3 = "\"quantization_config\":{\"quant_method\":\"exl3\"}";
 const ct = "\"quantization_config\":{\"quant_method\":\"compressed-tensors\"}";
 
-test "format coexistence: EXL3 stays MoE only and ModelOpt keeps its admission and refusals" {
+test "format coexistence: EXL3 admits MoE and dense and ModelOpt keeps its admission and refusals" {
     const x = try config(exl3, true, false);
     defer t.allocator.free(x);
     const gx = try geo.parse(t.allocator, x);
     try t.expect(gx.exl3);
     try t.expect(!gx.kinds.modelopt);
+    const xd = try config(exl3, false, false);
+    defer t.allocator.free(xd);
+    const gd = try geo.parse(t.allocator, xd);
+    try t.expect(gd.exl3 and !gd.moe() and !gd.kinds.modelopt);
     const m = try config(ct, false, false);
     defer t.allocator.free(m);
     const gm = try geo.parse(t.allocator, m);
     try t.expect(gm.kinds.modelopt and gm.kinds.ct and !gm.exl3);
     try t.expectEqual(@as(u8, 16), gm.bits.embed);
     for ([_]struct { q: []const u8, moe: bool, pocket: bool, err: anyerror }{
-        .{ .q = exl3, .moe = false, .pocket = false, .err = error.UnsupportedQwenQuantization },
+        .{ .q = exl3, .moe = false, .pocket = true, .err = error.UnsupportedQwenQuantization },
         .{ .q = exl3, .moe = true, .pocket = true, .err = error.UnsupportedQwenQuantization },
         .{ .q = ct, .moe = true, .pocket = false, .err = error.UnsupportedQwenQuantization },
         .{ .q = ct, .moe = false, .pocket = true, .err = error.UnsupportedLearningFormat },
@@ -114,6 +118,9 @@ fn fullKernels(d: *cuda.Driver) modelopt.Kernels {
     out.lane.half_below = 0; // the released launch parameters: the 64-column tile's
     out.prompt.fp4 = function(d, 6);
     out.prompt.fp8 = function(d, 6);
+    out.prompt.lean = function(d, 6);
+    out.prompt.lean_f32 = function(d, 6);
+    out.prompt.sms = 48;
     out.embed.bf16_copies_fn = function(d, 2);
     return out;
 }
@@ -210,6 +217,7 @@ fn bf16Prompt(rows: usize) !void {
     e.stream = .{ .d = &d, .handle = @ptrFromInt(0x1800) };
     e.g = g;
     e.kit = &kit;
+    e.affine.mlp128 = false;
     e.affine.split = null;
     e.xs = 0;
     e.tables.ptr = 0x100000;
@@ -254,4 +262,22 @@ test "format coexistence: EXL3 BF16 prompt: 4096 rows reach both GDN scalar proj
 
 test "format coexistence: EXL3 BF16 prompt: existing rows and partial final slices keep every argument and row" {
     for ([_]usize{ 0, 1, 16, 17, 127, 128, 129, 2049, 4095 }) |rows| try bf16Prompt(rows);
+}
+
+test {
+    _ = @import("src/families/qwen3_5/cuda_host_embed.zig"); // where an EXL3 checkpoint's embedding rows live
+}
+
+test "format coexistence: disjoint mixer and dense MLP scratch regions share one arena union" {
+    const c = try config(exl3, false, false);
+    defer t.allocator.free(c);
+    var e: Engine = undefined;
+    e.g = try geo.parse(t.allocator, c);
+    e.arena = .{ .d = undefined, .ptr = 0x100000, .len = 1 << 30 };
+    e.arena_at = 0;
+    const measured = try e.scratch(.measure);
+    e.arena_at = 0;
+    try t.expectEqual(measured, try e.scratch(.allocate));
+    try t.expectEqual(e.y, e.gate);
+    try t.expectEqual(e.z, e.qraw);
 }

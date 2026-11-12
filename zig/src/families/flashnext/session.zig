@@ -30,7 +30,7 @@ pub const Session = struct {
         s.m.pos = 0;
         s.m.state = 0;
         s.m.state_row = 0;
-        s.m.recs = null;
+        if (!original) s.m.recs = null; // the GPU-side rounds run on the engine's own session
         s.m.marks = null;
         if (!original) {
             for (&s.m.layers) |*l| if (l.linear) {
@@ -140,9 +140,10 @@ pub const Session = struct {
         h.pooled_n = @min(h.pooled_n, h.pos / 4);
         @memcpy(h.slots[0].ids8.b.slice(u32, follow.len), follow);
         const cb = r.queue.commandBuffer();
-        r.enc = cb.compute(if (r.serial) .serial else .concurrent);
+        r.begin(cb, if (r.serial) .serial else .concurrent);
+        errdefer if (r.fsr != null) r.abort();
         var ended = false;
-        errdefer if (!ended) r.enc.end();
+        errdefer if (!ended) r.abort();
         for (0..depth) |i| {
             r.sel = s.draft_select[i];
             const rows = if (i == 0) follow.len else 1;

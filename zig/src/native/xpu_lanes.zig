@@ -1,4 +1,4 @@
-//! The XPU 27B on the lane host: a stream per runner slot, shared rounds across slots, a lone drafted stream on trees.
+//! The XPU 27B on the lane host: a slot per stream, shared rounds; Drafted drafts from its taps, lone streams on trees.
 const std = @import("std");
 const api = @import("engine_api");
 const lanes = @import("lanes");
@@ -9,7 +9,6 @@ const Allocator = std.mem.Allocator;
 
 const ring = 64;
 const TAP_ROW = 5 * xq.D * 2; // bf16 [5 D]
-const TREE_MIN = 5; // drafts from which a stream's window is a DFlash2 tree (below: its chain)
 
 /// A kept prompt state (prompt cache): the slot's states after `at` tokens and its DFlash2 context.
 pub const Kept = struct { snap: xq.Runner.Snap, ctx: ?*anyopaque = null, range: [2]u32 = .{ 0, 0 } };
@@ -61,16 +60,28 @@ pub const Lanes = struct {
     count: usize = 0,
     wslots: [16]u32 = undefined, // and each window's slot
     wfirst: [16]u32 = undefined, // and its first row
-    absorbed: [16]bool = @splat(false), // the window's kept rows already in its slot's drafter context
-    chain: [xq.MAX_SLOTS][16]u32 = undefined, // each slot's DFlash2 drafts for its next window (a tree)
-    chain_par: [xq.MAX_SLOTS][16]i32 = undefined, // and each one's parent (−1: the pending token)
-    chain_n: [xq.MAX_SLOTS]u32 = @splat(0),
+    tapped: usize = 0, // the last verify's windows whose taps acts.taps still holds (features)
+    tail: ?Tail = null, // the prompt chunk whose taps acts.taps still holds (features)
+    sink: ?struct { s: *lanes.Stream, take: be.FeatureSink } = null, // a drafting prompt pass hands chunks here
+    direct: bool = false, // the lone driver's prompt pass: taps straight into the slot's drafter context
+    wrap: ?*lanes.drafted.Drafted = null, // the drafter in front of this backend for lane rounds
     prompt_skip: u32 = 0, // a prefill's first rows the drafter never reads (further than WIN from the prompt's end)
     fill: [xq.MAX_SLOTS]Fill = @splat(.{}), // each slot's prompt pass in progress (a sliced pass stands between calls)
     slice: bool = false, // XPU_PROMPT_SLICE: prompt passes a chunk a call (prefill_step), decode rounds between
     costs: [16]lanes.config.Cost = undefined, // a window's ms by rows (verify and keep), timed by measure()
     timed: usize = 0,
     rs: RoundStats = .{}, // XPU_ROUND_STATS, set by the opener
+
+    pub const max_slots = xq.MAX_SLOTS;
+    pub const tap_row = TAP_ROW;
+    pub const draft_step_ms = 0.6; // a DFlash2 draft pass's ms, as the round loop prices it
+    pub const tap_layers = blk: {
+        var t: [xq.TAP_LAYERS.len]u32 = undefined;
+        for (xq.TAP_LAYERS, &t) |l, *x| x.* = l;
+        break :blk t;
+    };
+    /// Rows [start, start + rows) of a prompt pass in `slot`, their taps in acts.taps.
+    pub const Tail = struct { slot: u32, start: u64, rows: u32 };
 
     fn self(ptr: *anyopaque) *Lanes {
         return @ptrCast(@alignCast(ptr));
@@ -85,12 +96,12 @@ pub const Lanes = struct {
         return Vt.of(slice);
     }
 
-    const Vt = @import("xpu_slice_vtable.zig").Vtables(.{ .prefill = prefillFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .tree = treeFn, .release = releaseFn }, prefillStepFn);
+    const Vt = @import("xpu_slice_vtable.zig").Vtables(.{ .prefill = prefillFn, .prefill_features = prefillFeaturesFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .tree = treeFn, .release = releaseFn }, prefillStepFn);
 
     /// What the round loop reads: chains of up to 16 rows, all streams' windows in one shared forward, DFlash2 drafts
     pub fn facts(b: *const Lanes) lanes.Model {
         const head = b.drafter != null;
-        return .{ .exact_width = 16, .mtp = head, .speculate = head, .speculate_early = false, .drafts = if (head) b.block - 1 else 0, .mtp_step_ms = if (head) 0.6 else 0, .draft_streams = head, .window_costs = b.costs[0..b.timed], .hidden_rows = true, .streams_exact = true, .batch_rows = 16, .max_streams = b.slots, .lone_copies = false };
+        return .{ .exact_width = 16, .mtp = head, .speculate = head, .speculate_early = false, .drafts = if (head) b.block - 1 else 0, .mtp_step_ms = if (head) draft_step_ms else 0, .draft_streams = head, .window_costs = b.costs[0..b.timed], .hidden_rows = true, .streams_exact = true, .batch_rows = 16, .max_streams = b.slots, .lone_copies = false };
     }
 
     /// Each window width's cost on a scratch context in the last slot, for the round loop's depth rule
@@ -119,6 +130,8 @@ pub const Lanes = struct {
             c.* = .{ .width = @intCast(w), .ms = best * 1e3 };
         }
         b.timed = b.costs.len;
+        b.tapped = 0;
+        b.tail = null;
         try r.reset();
     }
 
@@ -129,6 +142,11 @@ pub const Lanes = struct {
 
     fn onTaps(ctx: *anyopaque, taps: *anyopaque, n: u32) anyerror!void {
         const b = self(ctx);
+        if (b.sink) |k| { // a prompt chunk, its first row at the runner's position (prompt() moves it after)
+            b.tail = .{ .slot = b.runner.slot, .start = b.runner.pos, .rows = n };
+            return k.take.take(k.take.ptr, k.s, rowsAt(taps, 0, n), b.runner.pos);
+        }
+        if (!b.direct) return;
         const d = b.drafter.?;
         try d.use(b.runner.slot);
         const k = @min(n, b.prompt_skip);
@@ -137,31 +155,32 @@ pub const Lanes = struct {
         if (k < n) try d.addTaps(xq.off(taps, @as(usize, k) * TAP_ROW), n - k);
     }
 
-    /// The last verify's windows `which`: each kept path's taps go into its slot's drafter context in one pass.
-    fn absorb(b: *Lanes, which: []const usize, paths: []const []const u32) !void {
-        const d = b.drafter orelse return;
-        var items: [16]xq.drafter.Absorb = undefined;
-        for (which, paths, items[0..which.len]) |i, path, *it| {
-            var straight = true;
-            for (path, 0..) |row, j| straight = straight and row == j;
-            it.* = .{ .slot = b.wslots[i], .taps = xq.off(b.runner.acts.taps, @as(usize, b.wfirst[i]) * TAP_ROW), .n = @intCast(path.len), .rows = if (straight) null else path };
-            b.absorbed[i] = true;
-        }
-        try d.absorbMulti(items[0..which.len]);
+    /// `n` tapped rows from row `row` of `taps`, as a drafter reads them.
+    fn rowsAt(taps: *anyopaque, row: u64, n: u32) be.Features {
+        return .{ .buffer = @intFromPtr(taps), .offset = row * TAP_ROW, .rows = n, .row_bytes = TAP_ROW, .space = .device, .dtype = .bf16 };
     }
 
-    /// Keeps the root path `paths[i]` of the last verify's window i (its taps to the drafter, unless taken already).
+    /// A stream's rows in acts.taps: the last verify's window (a drafter absorbs its kept rows), else its prompt chunk.
+    fn featuresFn(ptr: *anyopaque, s: *lanes.Stream, _: []const u32, start: u64, count: u32) anyerror!be.Features {
+        const b = self(ptr);
+        const slot = b.slotOf(s) orelse return error.UnknownStream;
+        if (std.mem.indexOfScalar(u32, b.wslots[0..b.tapped], slot)) |i| {
+            if (count > b.widths[i]) return error.FeaturesGone;
+            return rowsAt(b.runner.acts.taps, b.wfirst[i], count);
+        }
+        const t = b.tail orelse return error.FeaturesGone;
+        if (t.slot != slot or start < t.start or start + count > t.start + t.rows) return error.FeaturesGone;
+        return rowsAt(b.runner.acts.taps, start - t.start, count);
+    }
+
+    /// The prompt chunk in acts.taps if `slot` ran it last (the drafter takes the prompt's last row with its chunk).
+    pub fn promptTail(b: *const Lanes, slot: u32) ?Tail {
+        const t = b.tail orelse return null;
+        return if (t.slot == slot) t else null;
+    }
+
+    /// Keeps the root path `paths[i]` of the last verify's window i.
     fn keepRows(b: *Lanes, paths: []const []const u32) !void {
-        var which: [16]usize = undefined;
-        var ps: [16][]const u32 = undefined;
-        var n: usize = 0;
-        for (paths, 0..) |p, i| if (!b.absorbed[i]) {
-            which[n] = i;
-            ps[n] = p;
-            n += 1;
-        };
-        try b.absorb(which[0..n], ps[0..n]);
-        @memset(&b.absorbed, false);
         try b.runner.keepPaths(paths);
     }
 
@@ -176,7 +195,7 @@ pub const Lanes = struct {
         try b.keepRows(paths[0..n]);
     }
 
-    fn slotOf(b: *const Lanes, s: *const lanes.Stream) ?u32 {
+    pub fn slotOf(b: *const Lanes, s: *const lanes.Stream) ?u32 {
         for (b.owners[0..b.slots], 0..) |o, i| if (o == s) return @intCast(i);
         return null;
     }
@@ -215,7 +234,8 @@ pub const Lanes = struct {
         const r = b.runner;
         try r.select(slot);
         try r.reset();
-        b.chain_n[slot] = 0;
+        b.tapped = 0;
+        b.tail = null;
         if (b.drafter) |d| {
             try d.use(slot);
             d.reset();
@@ -406,6 +426,14 @@ pub const Lanes = struct {
         try b.prefillSlot(s, slot);
     }
 
+    /// A drafting stream's prompt pass (Drafted in front): each chunk's taps to `sink` while acts.taps holds them.
+    fn prefillFeaturesFn(ptr: *anyopaque, s: *lanes.Stream, _: []const u32, sink: be.FeatureSink) anyerror!void {
+        const b = self(ptr);
+        b.sink = .{ .s = s, .take = sink };
+        defer b.sink = null;
+        return prefillFn(ptr, s);
+    }
+
     /// XPU_PROMPT_SLICE: one chunk of the prompt pass a call, false while chunks remain; the lane host runs decode
     /// rounds of the other streams between calls. The chunks are the whole pass's (chunkEnd from the pass's start,
     /// the request's chunks and the cache's marks), so the prompt's bits are the same.
@@ -487,7 +515,8 @@ pub const Lanes = struct {
         try r.select(slot);
         r.taps_on = b.drafter != null;
         defer r.taps_on = false;
-        b.chain_n[slot] = 0;
+        b.tapped = 0;
+        b.tail = null;
         try r.step(try b.value(feed));
         return b.push(try b.draw(s, slot, if (s.sampling != null) try r.logits() else null, position));
     }
@@ -523,8 +552,10 @@ pub const Lanes = struct {
         const r = b.runner;
         r.taps_on = b.drafter != null;
         defer r.taps_on = false;
-        @memset(&b.absorbed, false);
+        b.tapped = 0;
+        b.tail = null;
         try r.verifyMulti(wins[0..windows.len]);
+        b.tapped = windows.len;
         // structured greedy rows: their tokens among their grammars' on the device, all in one pass
         var nm: usize = 0;
         var mwords: usize = 0;
@@ -807,6 +838,12 @@ pub const Lanes = struct {
         b.fill[slot].on = false;
     }
 
+    /// A stream the lone driver ended: out of its slot, and out of Drafted's streams if it came from the lanes.
+    fn forget(b: *Lanes, s: *lanes.Stream) void {
+        if (b.wrap) |w| return w.backend().release(s); // its release reaches releaseFn
+        if (b.slotOf(s)) |slot| b.owners[slot] = null;
+    }
+
     /// A lone drafted stream in slot 0 on DFlash2 trees until it ends (false) or another stream arrives (true).
     pub fn lone(ctx: *anyopaque, s: *lanes.Stream, hooks: api.LoneHooks) anyerror!bool {
         if (hooks.resumed) return resumeLone(ctx, s, hooks);
@@ -816,9 +853,9 @@ pub const Lanes = struct {
         if (b.owners[0] != null) return error.StreamBusy;
         b.owners[0] = s;
         var handed = false;
-        defer if (!handed) {
-            b.owners[0] = null;
-        };
+        defer if (!handed) b.forget(s);
+        b.direct = true;
+        defer b.direct = false;
         try b.prefillSlot(s, 0);
         const pending = try b.draw(s, 0, b.first_logits[0], s.prompt_len);
         _ = try s.commit(b.gpa, &.{pending}, &.{});
@@ -836,9 +873,9 @@ pub const Lanes = struct {
         const r = b.runner;
         try r.select(slot);
         var handed = false;
-        defer if (!handed) {
-            b.owners[slot] = null;
-        };
+        defer if (!handed) b.forget(s);
+        b.direct = true;
+        defer b.direct = false;
         try d.use(slot);
         if (d.end() != r.pos) d.restart(r.pos); // its context should end there: a cold one otherwise
         handed = try b.alone(s, slot, s.pending orelse return error.NoPending, hooks);
@@ -856,6 +893,7 @@ pub const Lanes = struct {
             if (hooks.yield(hooks.ctx)) {
                 s.cache_len = r.pos;
                 s.pending = pending;
+                if (b.wrap) |w| try w.adopt(s); // the lane core drafts for it from its slot's context
                 return true;
             }
             if (s.isCancelled()) return error.Cancelled;

@@ -263,7 +263,7 @@ test "voice tool: a synthetic tone's encoder codes become an attested file the c
     const out = try c.path("tone.json");
     try c.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "unrelated.txt", .data = "unrelated" });
     try c.tmp.dir.symLink(std.testing.io, "unrelated.txt", "tone.json", .{});
-    const texts = [_][]const u8{ "A small cloud passes.", "Rain taps on a tin roof." };
+    const texts = [_][]const u8{ "<|speaker:0|> A small cloud passes.", "\u{3000}<|speaker:15|> Rain taps on a tin roof." };
     try std.testing.expectEqual(@as(u8, 0), try c.call(&.{&.{
         "--codec",       "synthetic.pth", "--generate",    encoder,
         "--ref-audio",   wav,             "--ref-text",    texts[0],
@@ -340,6 +340,7 @@ test "voice tool: refusals happen before encoding and encoder failures leave exi
 
 test "voice tool: cleanup restores private directory permissions after encoder exit" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try @import("test_permissions.zig").skipIfRoot();
     for ([_]u8{ 0, 1 }) |exit_code| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
@@ -369,6 +370,7 @@ test "voice tool: cleanup restores private directory permissions after encoder e
 
 test "voice tool: cleanup failure warns after publication and accompanies encoder failure" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try @import("test_permissions.zig").skipIfRoot();
     for ([_]u8{ 0, 1 }) |exit_code| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();

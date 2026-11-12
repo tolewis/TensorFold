@@ -21,6 +21,9 @@ const Select = fz.Select;
 const GSelect = fz.GSelect;
 const Lane = fz.Lane;
 
+/// A command buffer the host commits on the engine's queue; core/segments.zig waits for it before segments commit.
+pub const WarmProbe = struct { ctx: *const anyopaque, run: *const fn (ctx: *const anyopaque) mtl.CommandBuffer };
+
 pub const Run = struct {
     window: WindowSettings = .{},
     arena: std.mem.Allocator,
@@ -32,11 +35,13 @@ pub const Run = struct {
     shapes: std.StringHashMapUnmanaged(mtl.Buffer) = .empty,
     held: std.ArrayList(mtl.Buffer) = .empty, // what buffer, load and group made: a host's residency set holds them
     follow: ?mtl.ResidencySet.Follow = null, // set once the host's set is built: later buffers join it
+    warm_probe: ?WarmProbe = null, // the host's idle keepalive command buffer, run before staggered segments commit
     loaded: usize = 0,
     rows: usize = 1,
     fused_xsum: bool = false,
     serial: bool = false,
     enc: mtl.ComputeEncoder = undefined,
+    fsr: ?*@import("fsr_runtime.zig").Runtime = null,
     rotary_pipe: ?mtl.Pipeline = null,
     rotary_enabled: bool = false,
     rotary_buffer: ?mtl.Buffer = null,
@@ -56,7 +61,7 @@ pub const Run = struct {
     force_pipe: mtl.Pipeline = undefined,
     span_pipe: mtl.Pipeline = undefined,
     positions_pipe: mtl.Pipeline = undefined,
-    draw_pipe: mtl.Pipeline = undefined, // tf_sample_full: a sampled reply's draws (sample.zig)
+    draws: @import("sample.zig").Draws = undefined, // a sampled reply's draws, and a sampled stream's drafts over the head's ids
     take_pipe: mtl.Pipeline = undefined,
     gpu_round: bool = false,
     ar: Buf = undefined,
@@ -68,6 +73,9 @@ pub const Run = struct {
     dense: bool = false,
     dense_target: bool = false,
     skip: u32 = 0,
+    sb_index: bool = false, // TF_FLASHNEXT_SCALE_INDEX: the 4/32 expert kernels read scales and biases through scale_index's tables
+    sbix: std.AutoHashMapUnmanaged(@import("scale_index.zig").Key, [2]Buf) = .empty,
+    sb_pairs: usize = 0, // the most distinct pairs any indexed tensor has
     hcskip: u32 = 0, // FZ_HCSKIP: hyper-connection knock-outs by kernel (1 norms, 2 downs, 4 ups)
     hc_up: bool = false, // fz_hc_up for the hyper-connection's up projection at 3-8 rows (the recorded kernels' bits)
     hc_up_pipe: mtl.Pipeline = undefined,
@@ -111,7 +119,8 @@ pub const Run = struct {
     tree: ?*@import("tree.zig").Tree = null, // the tree window decode is running, if any (tree.zig)
     limit: ?Buf = null, // a GPU-gated window's or head step's row count for the 4-bit row kernels (gate.zig)
     head_md1: ?Buf = null, // a gated head step's one-row dims, in place of the head's own
-    gx: ?*@import("gx.zig").Gx = null, // FZ_GX=rows: windows from that many rows on the grouped experts (gx.zig)
+    head_draw: ?@import("sample.zig").HeadDraw = null, // a sampled reply's head step drafts by its keyed rule
+    gx: ?*@import("gx.zig").Gx = null, // windows from its min_rows on the grouped experts (TF_FLASHNEXT_GROUPED_ROWS)
     xnew_header: []const u8 = "",
     tp: ?*Tp2 = null, // TP=2 across two Macs (tp.zig): the target layers' experts split by id, outputs exchanged
     tp_layer: bool = false, // the experts being encoded are a target layer's (the MTP head keeps all of its own)
@@ -128,6 +137,25 @@ pub const Run = struct {
     maps: std.ArrayList(mtl.MappedFile) = .empty,
     rows_cleanup: ?struct { ctx: *anyopaque, call: *const fn (*anyopaque) void } = null,
     closed: bool = false,
+
+    pub fn begin(r: *Run, cb: mtl.CommandBuffer, mode: mtl.DispatchType) void {
+        r.enc = if (r.fsr) |s| s.commands.begin(cb, mode) else cb.compute(mode);
+    }
+
+    pub fn finishEncoding(r: *Run, cb: mtl.CommandBuffer) !mtl.CommandBuffer {
+        if (r.fsr) |s| return s.commands.end(r.enc);
+        r.enc.end();
+        return cb;
+    }
+
+    pub fn abort(r: *Run) void {
+        if (r.fsr) |s| {
+            s.commands.abort(r.enc);
+            const drain = r.queue.commandBuffer();
+            drain.commit();
+            drain.wait();
+        } else r.enc.end();
+    }
 
     pub const deinit = @import("run_cleanup.zig").drop;
 
@@ -411,12 +439,14 @@ pub const Run = struct {
         const pairs = (rows_own[1] - rows_own[0]) * 11;
         if (r.tp != null and r.tp_layer and r.xsx) return error.TpNeedsPlainExperts;
         r.enc.setPipeline(if (r.xsx) r.xgu_sx_pipe else r.xgu_pipe);
+        if (r.fsr) |stream| if (stream.pool != null) stream.bind(r, 18, 19, 0);
         const gu = [_]Buf{ x, lg, e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7], e[8], e[9], e[10], e[11], act, pick, wts };
         for (gu, 0..) |b, j| r.enc.setBuffer(b.b, b.off, j);
         r.enc.setBytes(std.mem.asBytes(&own), 17);
         r.enc.dispatchThreads(mtl.Size.of(128, 80, pairs), mtl.Size.of(128, 1, 1));
         if (!r.serial) r.enc.barrier();
         r.enc.setPipeline(if (r.xsx) r.xdown_sx_pipe else r.xdown_pipe);
+        if (r.fsr) |stream| if (stream.pool != null) stream.bind(r, 11, 12, 0);
         const dn = [_]Buf{ act, pick, e[12], e[13], e[14], e[15], e[16], e[17], rows_buf, y };
         for (dn, 0..) |b, j| r.enc.setBuffer(b.b, b.off, j);
         r.enc.setBytes(std.mem.asBytes(&own), 10);

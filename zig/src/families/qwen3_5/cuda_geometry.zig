@@ -1,6 +1,9 @@
 //! A Qwen3.5 hybrid's widths (2B, 27B) as the CUDA engine reads them from config.json; what qwen35.cu fixes is checked.
 const std = @import("std");
 const core = @import("core");
+const layer_pattern = @import("qwen35_layers");
+const rules = @import("qwen35_rules");
+const cuda_rope = @import("cuda_rope.zig");
 
 pub const max_layers = 128;
 /// qwen35.cu's fixed widths.
@@ -56,6 +59,7 @@ pub const Kinds = struct {
     modelopt: bool = false,
     ct: bool = false, // compressed-tensors: the kinds come from the tensors the index names (cuda_modelopt.ctKinds)
     head: Kind = .affine,
+    experts: Kind = .affine, // a MoE's routed and shared experts (one recipe)
     proj: [max_layers][std.enums.values(Slot).len]Kind = @splat(@splat(.affine)),
 
     pub fn of(k: *const Kinds, layer: usize, slot: Slot) Kind {
@@ -75,7 +79,8 @@ pub const Geometry = struct {
     kv_heads: usize, // attention key/value heads
     eps: f32,
     tied: bool,
-    context: usize,
+    context: usize, // the window ceiling: max_position_embeddings, or the YaRN window --rope-yarn makes
+    rope: cuda_rope.Rope = .plain,
     linear: [max_layers]bool,
     bits: Widths = .{},
     kinds: Kinds = .{},
@@ -86,6 +91,8 @@ pub const Geometry = struct {
     expert_bits: u8 = 4,
     /// An EXL3 checkpoint (quant_method "exl3", HF tensor names): trellis projections, bf16 or f16 the rest.
     exl3: bool = false,
+    /// A plain BF16 checkpoint (no quantization at all, HF tensor names): every projection bf16, decisions only.
+    bf16: bool = false,
 
     pub fn read(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Geometry {
         const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
@@ -161,6 +168,11 @@ pub const Geometry = struct {
     }
 };
 
+/// The dense Qwen3.8-27B's shape (hidden 5120, 64 layers, no experts), whatever its checkpoint format.
+pub fn dense27(g: anytype) bool {
+    return g.hidden == 5120 and g.layers == 64 and g.experts == 0;
+}
+
 /// The supported geometry: the prompt tiles take an even group and a chunk's rows; the partials the verify rows.
 pub fn supported(g: Geometry, rows: usize, prompt: bool, partial_rows: usize) bool {
     const group = g.q_heads / g.kv_heads;
@@ -207,10 +219,15 @@ fn expertBits(q: std.json.ObjectMap, layers: usize) !struct { bits: u8, count: u
 
 /// Whether config.json's quantization_config says quant_method "exl3" (Mia-AiLab's HF-layout checkpoints).
 fn isExl3(root: std.json.ObjectMap) bool {
+    return quantMethod(root, "exl3");
+}
+
+/// Whether quantization_config names `method` as its quant_method.
+fn quantMethod(root: std.json.ObjectMap, method: []const u8) bool {
     const q = root.get("quantization_config") orelse return false;
     if (q != .object) return false;
     const m = q.object.get("quant_method") orelse return false;
-    return m == .string and std.mem.eql(u8, m.string, "exl3");
+    return m == .string and std.mem.eql(u8, m.string, method);
 }
 
 fn object(v: std.json.Value) !std.json.ObjectMap {
@@ -255,21 +272,22 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Geometry {
     };
     const t = try object(root.get("text_config") orelse return error.BadQwenConfig);
     try is(t, "model_type", []const u8, if (moe) "qwen3_5_moe_text" else "qwen3_5_text");
-    try is(t, "attention_bias", bool, false);
-    try is(t, "attn_output_gate", bool, true);
-    try is(t, "hidden_act", []const u8, "silu");
+    try rules.check(t, .cuda);
     try is(t, "head_dim", usize, head_dim);
     try is(t, "linear_key_head_dim", usize, dk);
     try is(t, "linear_value_head_dim", usize, dk);
     try is(t, "linear_conv_kernel_dim", usize, taps);
     const rope = try object(t.get("rope_parameters") orelse return error.UnsupportedQwenRotary);
-    try is(rope, if (rope.get("rope_type") != null) "rope_type" else "type", []const u8, "default"); // "type": the older key
-    if (try number(rope, "rope_theta") != 10000000 or try number(rope, "partial_rotary_factor") != 0.25) return error.UnsupportedQwenRotary;
+    if (try number(rope, "rope_theta") != cuda_rope.theta or try number(rope, "partial_rotary_factor") != 0.25) return error.UnsupportedQwenRotary;
+    // plain rope, or YaRN from the config (rope_parameters or the older rope_scaling); --rope-yarn applies later
+    const resolved = cuda_rope.resolve(t, null) catch |e| return if (e == error.BadQwenConfig) error.BadQwenConfig else error.UnsupportedQwenRotary;
     // An MLX table keeps precedence; otherwise the format selects its own loader and BF16 embedding owner.
     const qv = root.get("quantization");
     const exl3 = qv == null and isExl3(root);
     const modelopt = !exl3 and qv == null and root.get("quantization_config") != null;
-    if (!modelopt and !exl3 and qv == null) return error.UnsupportedQwenQuantization;
+    // neither table nor config: the publisher's BF16 weights (a decision backbone, dense only)
+    const bf16 = !modelopt and !exl3 and qv == null;
+    if (bf16 and moe) return error.UnsupportedQwenQuantization;
     var g: Geometry = .{
         .hidden = try integer(t, "hidden_size"),
         .intermediate = try integer(t, if (moe) "moe_intermediate_size" else "intermediate_size"),
@@ -280,14 +298,12 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Geometry {
         .q_heads = try integer(t, "num_attention_heads"),
         .kv_heads = try integer(t, "num_key_value_heads"),
         .eps = @floatCast(try number(t, "rms_norm_eps")),
-        .tied = blk: {
-            const v = t.get("tie_word_embeddings") orelse root.get("tie_word_embeddings") orelse break :blk false;
-            if (v != .bool) return error.BadQwenConfig;
-            break :blk v.bool;
-        },
-        .context = try integer(t, "max_position_embeddings"),
+        .tied = try rules.tied(root, t, .cuda),
+        .context = resolved.ceiling,
+        .rope = resolved.rope,
         .linear = @splat(false),
         .exl3 = exl3,
+        .bf16 = bf16,
     };
     if (t.get("tensorfold_learned_neurons")) |pocket| {
         if (pocket != .integer or pocket.integer < 0 or pocket.integer > 128 or @mod(pocket.integer, 64) != 0)
@@ -298,34 +314,32 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Geometry {
     }
     if (g.layers > max_layers or g.hidden % 256 != 0 or g.hidden > 8192 or g.intermediate % 64 != 0) return error.UnsupportedQwenGeometry;
     if (moe) {
-        if (modelopt) return error.UnsupportedQwenQuantization; // the routed experts read MLX tables only
+        if (modelopt and !quantMethod(root, "modelopt")) return error.UnsupportedQwenQuantization; // ModelOpt's own only
         g.experts = try integer(t, "num_experts");
         g.top_k = try integer(t, "num_experts_per_tok");
         // the shared expert runs in the routed experts' table, so it needs their width
         if (try integer(t, "shared_expert_intermediate_size") != g.intermediate) return error.UnsupportedQwenGeometry;
         if (g.experts > 256 or g.top_k > 31 or g.top_k >= g.experts) return error.UnsupportedQwenGeometry;
-        if (!exl3) {
+        if (!exl3 and !modelopt) { // an MLX table's widths; ModelOpt's experts come from their recipes
             const w = try expertBits(try object(qv.?), g.layers);
             if (w.count != 0 and w.count != 3 * g.layers) return error.UnsupportedQwenQuantization;
             g.expert_bits = w.bits;
         }
     }
     if (g.v_heads % g.k_heads != 0 or g.q_heads % g.kv_heads != 0 or g.q_heads > max_query_heads) return error.UnsupportedQwenGeometry;
-    const types = t.get("layer_types") orelse return error.UnsupportedQwenGeometry;
-    if (types != .array or types.array.items.len != g.layers) return error.UnsupportedQwenGeometry;
-    for (types.array.items, 0..) |kind, i| {
-        if (kind != .string) return error.UnsupportedQwenGeometry;
-        if (std.mem.eql(u8, kind.string, "linear_attention")) g.linear[i] = true else if (!std.mem.eql(u8, kind.string, "full_attention")) return error.UnsupportedQwenGeometry;
-    }
-    if (modelopt) {
+    var full: [max_layers]bool = undefined;
+    try layer_pattern.read(full[0..g.layers], t);
+    for (g.linear[0..g.layers], full[0..g.layers]) |*l, f| l.* = !f;
+    if (modelopt or bf16) {
         if (g.pocket > 0) return error.UnsupportedLearningFormat;
-        g.kinds = try @import("cuda_modelopt.zig").kinds(gpa, bytes, g);
+        const mo = @import("cuda_modelopt.zig");
+        g.kinds = if (bf16) try mo.plain(g) else try mo.kinds(gpa, bytes, g);
         g.bits.embed = 16; // bf16 rows: no MLX width, so learning (4-bit only) refuses it
         g.bits.head = 16;
         return g;
     }
     if (exl3) {
-        if (!moe or g.pocket != 0) return error.UnsupportedQwenQuantization;
+        if (g.pocket != 0) return error.UnsupportedQwenQuantization; // dense (Qwen3.8-27B) and MoE checkpoints alike
         return g;
     }
     g.bits = try widths(gpa, root, try object(qv.?), g);
@@ -384,6 +398,24 @@ test "the 35B-A3B's routed experts: 256 of width 512, 8 a row, the shared one th
     try std.testing.expectEqual(@as(usize, 9), g.slots());
     try std.testing.expectEqual(@as(usize, 512), g.intermediate);
     try std.testing.expectEqual(@as(usize, 8192), g.convWidth());
+    // a scaled rope, by type or as a rope_scaling block, is refused rather than read as plain rope
+    for ([_][2][]const u8{ .{ "\"rope_type\":\"default\"", "\"rope_type\":\"yarn\"" }, .{ "\"max_position_embeddings\"", "\"rope_scaling\":{\"type\":\"yarn\",\"factor\":4.0},\"max_position_embeddings\"" } }) |r| {
+        const scaled = try std.mem.replaceOwned(u8, std.testing.allocator, text, r[0], r[1]);
+        defer std.testing.allocator.free(scaled);
+        if (parse(std.testing.allocator, scaled)) |_| return error.TestUnexpectedResult else |_| {}
+    }
+    const block = try std.mem.replaceOwned(u8, std.testing.allocator, text, "\"max_position_embeddings\"", "\"rope_scaling\":{\"type\":\"yarn\"},\"max_position_embeddings\"");
+    defer std.testing.allocator.free(block);
+    try std.testing.expectError(error.UnsupportedQwenRotary, parse(std.testing.allocator, block));
+    // SGLang's staged 1M config: YaRN with factor 4 over 262,144, a 1,048,576-token ceiling
+    const one = try std.mem.replaceOwned(u8, std.testing.allocator, text, "\"max_position_embeddings\":262144", "\"max_position_embeddings\":1048576");
+    defer std.testing.allocator.free(one);
+    const staged = try std.mem.replaceOwned(u8, std.testing.allocator, one, "\"rope_type\":\"default\"", "\"rope_type\":\"yarn\",\"factor\":4.0,\"original_max_position_embeddings\":262144");
+    defer std.testing.allocator.free(staged);
+    const y = try parse(std.testing.allocator, staged);
+    try std.testing.expectEqual(@as(usize, 1048576), y.context);
+    try std.testing.expectEqual(@as(usize, 262144), y.rope.yarn.trained);
+    try std.testing.expect(g.rope == .plain and g.context == 262144);
     const odd = try std.mem.replaceOwned(u8, std.testing.allocator, text, "\"shared_expert_intermediate_size\":512", "\"shared_expert_intermediate_size\":1024");
     defer std.testing.allocator.free(odd);
     try std.testing.expectError(error.UnsupportedQwenGeometry, parse(std.testing.allocator, odd));
@@ -475,6 +507,10 @@ test "fp8 caches take e4m3 rows and a scale each: 520 bytes a position and head 
 
 test {
     _ = @import("cuda_quant_admission_test.zig");
+    _ = @import("cuda_modelopt_moe_test.zig");
+    _ = @import("cuda_modelopt_experts.zig");
     _ = @import("cuda_modelopt.zig");
     _ = @import("cuda_exl3_admission_test.zig");
+    _ = @import("cuda_bf16_admission_test.zig");
+    _ = @import("cuda_rope.zig");
 }

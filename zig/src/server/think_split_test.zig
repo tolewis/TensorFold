@@ -7,8 +7,8 @@ const model_text = @import("model_text.zig");
 const openai = @import("openai.zig");
 const Conn = @import("http_conn.zig").Conn;
 
-const think_end: u32 = 300; // the close marker as one token
-const eos: u32 = 301;
+pub const think_end: u32 = 300; // the close marker as one token
+pub const eos: u32 = 301;
 const quote_open: u32 = 302; // the quoted tag, in the three pieces a reply writes it
 const quote_mid: u32 = 303;
 const quote_close: u32 = 304;
@@ -19,8 +19,9 @@ const all_bytes = blk: {
 };
 
 /// Bytes as tokens, `</think>` as token 300 and an end token 301; every prompt renders as "prompt".
-const Text = struct {
+pub const Text = struct {
     real: ?*@import("tokenizer").Tokenizer = null,
+    markers: @import("reply_text.zig").Markers = @import("reply_text.zig").think_markers,
     close_token: bool = true, // false: the close marker is not a token, so the text's spelling is what closes
 
     fn text(t: *@This()) model_text.Text {
@@ -28,8 +29,8 @@ const Text = struct {
     }
 
     /// The close marker is one token; the quoted tag is three, so the text spells the same and the tokens differ.
-    fn piece(id: u32) []const u8 {
-        if (id == think_end) return "</think>";
+    fn piece(t: *const Text, id: u32) []const u8 {
+        if (id == think_end) return t.markers.close;
         if (id == eos) return "";
         if (id == quote_open) return "</";
         if (id == quote_mid) return "think";
@@ -47,21 +48,25 @@ const Text = struct {
         const t: *Text = @ptrCast(@alignCast(ctx));
         if (t.real) |tok| return tok.decode(a, ids, false) catch return error.OutOfMemory;
         var out: std.ArrayList(u8) = .empty;
-        for (ids) |id| try out.appendSlice(a, piece(id));
-        return out.items;
+        for (ids) |id| try out.appendSlice(a, piece(t, id));
+        if (std.unicode.utf8ValidateSlice(out.items)) return out.items;
+        defer out.deinit(a);
+        var valid: std.ArrayList(u8) = .empty;
+        try @import("tokenizer").unicode.appendLossy(&valid, a, out.items);
+        return valid.items;
     }
 
     fn tokenBytes(ctx: *anyopaque, a: std.mem.Allocator, id: u32) std.mem.Allocator.Error!?[]u8 {
         const t: *Text = @ptrCast(@alignCast(ctx));
         if (t.real != null) return null;
-        return try a.dupe(u8, piece(id));
+        return try a.dupe(u8, piece(t, id));
     }
 
     fn tokenId(ctx: *anyopaque, p: []const u8) ?u32 {
         const t: *Text = @ptrCast(@alignCast(ctx));
         if (t.real) |tok| return tok.specialTokenId(p);
         if (!t.close_token) return null;
-        return if (std.mem.eql(u8, p, "</think>")) think_end else null;
+        return if (std.mem.eql(u8, p, t.markers.close)) think_end else null;
     }
 
     fn tokenString(ctx: *anyopaque, a: std.mem.Allocator, id: u32) std.mem.Allocator.Error![]u8 {
@@ -95,7 +100,7 @@ const Script = struct {
     }
 
     fn info(_: *anyopaque) api.Info {
-        return .{ .context_window = 64 };
+        return .{ .context_window = 8192 };
     }
 
     fn submit(ctx: *anyopaque, id: api.Id, _: *const api.Request, sink: api.Sink) api.SubmitError!void {
@@ -124,7 +129,7 @@ const Script = struct {
 };
 
 /// The reply the route wrote: its status and body, or a stream's events, as JSON text (testing-allocator owned).
-const Got = struct {
+pub const Got = struct {
     status: u16 = 0,
     body: []u8 = &.{},
     events: std.ArrayList([]u8) = .empty,
@@ -133,7 +138,7 @@ const Got = struct {
         return .{ .ctx = g, .vt = &.{ .open = open, .event = event, .reply = reply } };
     }
 
-    fn deinit(g: *Got) void {
+    pub fn deinit(g: *Got) void {
         std.testing.allocator.free(g.body);
         for (g.events.items) |e| std.testing.allocator.free(e);
         g.events.deinit(std.testing.allocator);
@@ -167,7 +172,7 @@ fn sendWith(reply: []const u32, thinking: bool, body: []const u8, close_token: b
     return sendText(reply, thinking, body, .{ .close_token = close_token }, null);
 }
 
-fn sendText(reply: []const u32, thinking: bool, body: []const u8, settings: Text, stride: ?usize) !Got {
+pub fn sendText(reply: []const u32, thinking: bool, body: []const u8, settings: Text, stride: ?usize) !Got {
     var text = settings;
     var backend: Script = .{ .reply = reply, .stride = stride };
     var srv = try server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
@@ -177,6 +182,7 @@ fn sendText(reply: []const u32, thinking: bool, body: []const u8, settings: Text
         .use_drafts = false,
     }, null);
     defer srv.deinit();
+    srv.markers = settings.markers;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -290,8 +296,54 @@ test "WordPiece streams keep the answer after a decoder inserts space before the
                 if (delta.get("reasoning_content")) |v| try reasoning.appendSlice(a, v.string);
                 if (delta.get("content")) |v| try content.appendSlice(a, v.string);
             }
-            try std.testing.expectEqualStrings(case.reasoning, std.mem.trimEnd(u8, reasoning.items, " "));
+            try std.testing.expectEqualStrings(case.reasoning, reasoning.items);
             try std.testing.expectEqualStrings(" Answer", content.items);
+        }
+    }
+}
+
+/// A delta field's pieces over a stream's events, joined (testing-allocator owned).
+fn joined(got: *const Got, field: []const u8) ![]u8 {
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    for (got.events.items) |e| {
+        const chunk = try std.json.parseFromSlice(std.json.Value, a, e, .{});
+        defer chunk.deinit();
+        const choices = chunk.value.object.get("choices") orelse continue;
+        if (choices.array.items.len == 0) continue;
+        if (choices.array.items[0].object.get("delta").?.object.get(field)) |v| try out.appendSlice(a, v.string);
+    }
+    return out.toOwnedSlice(a);
+}
+
+const spaced_cases = [_]struct { ids: []const u32, reasoning: []const u8, content: []const u8 }{
+    .{ .ids = &(tokensOf("\n  Plan\n\nstep two \n") ++ [_]u32{think_end} ++ tokensOf("\n\nDone") ++ [_]u32{eos}), .reasoning = "Plan\n\nstep two", .content = "Done" },
+    .{ .ids = &(tokensOf("<think> \nPlan\n") ++ [_]u32{think_end} ++ tokensOf("Done") ++ [_]u32{eos}), .reasoning = "Plan", .content = "Done" },
+    .{ .ids = &tokensOf("Plan \t\n"), .reasoning = "Plan", .content = "" },
+    .{ .ids = &(tokensOf(" \n") ++ [_]u32{think_end} ++ tokensOf("Done") ++ [_]u32{eos}), .reasoning = "", .content = "Done" },
+};
+
+test "streamed reasoning equals the whole reply's, whitespace at either end stripped as it strips it" {
+    const a = std.testing.allocator;
+    for (spaced_cases) |case| {
+        var whole = try send(case.ids, true, ask ++ "}");
+        defer whole.deinit();
+        const parsed = try message(&whole);
+        defer parsed.deinit();
+        const m = parsed.value.object.get("choices").?.array.items[0].object.get("message").?.object;
+        const reasoning = if (m.get("reasoning_content")) |r| r.string else "";
+        try std.testing.expectEqualStrings(case.reasoning, reasoning);
+        try std.testing.expectEqualStrings(case.content, m.get("content").?.string);
+        for ([_]?usize{ 1, 2, 3, null, 256 }) |stride| {
+            var got = try sendText(case.ids, true, ask ++ ",\"stream\":true}", .{}, stride);
+            defer got.deinit();
+            const r = try joined(&got, "reasoning_content");
+            defer a.free(r);
+            try std.testing.expectEqualStrings(reasoning, r);
+            const c = try joined(&got, "content");
+            defer a.free(c);
+            try std.testing.expectEqualStrings(case.content, c);
         }
     }
 }

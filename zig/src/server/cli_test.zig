@@ -14,6 +14,87 @@ const servedBy = cli.Test.servedBy;
 const cudaFlag = cli.Test.cudaFlag;
 const gpuFlag = cli.Test.gpuFlag;
 const ranks = cli.Test.ranks;
+const spillWith = cli.Test.spillWith;
+
+test "stable profile: default and explicit spelling preserve every argument and engine open option" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var u: Usage = .{};
+    for ([_][]const []const u8{
+        &.{"m"},
+        &.{ "m", "--learn-conversations", "--learn-dir=cache", "--prompt-cache-gib=2", "--parallel=4" },
+        &.{ "m", "--no-thinking", "--temperature=0.7", "--no-drafts" },
+    }) |argv| {
+        const plain = try parse(a, argv, &u);
+        var extended: std.ArrayList([]const u8) = .empty;
+        try extended.appendSlice(a, argv);
+        for ([_][]const []const u8{ &.{ "--profile", "stable" }, &.{"--profile=stable"} }) |suffix| {
+            extended.shrinkRetainingCapacity(argv.len);
+            try extended.appendSlice(a, suffix);
+            const explicit = try parse(a, extended.items, &u);
+            try std.testing.expectEqualDeep(plain, explicit);
+            try std.testing.expectEqualDeep(try request(a, "d", "t", plain), try request(a, "d", "t", explicit));
+        }
+    }
+    for ([_][]const []const u8{
+        &.{ "m", "--profile" },                  &.{ "m", "--profile=" },
+        &.{ "m", "--profile=fast-exact" },       &.{ "m", "--profile=fast" },
+        &.{ "m", "--profile=Stable" },           &.{ "m", "--profile=unknown" },
+        &.{ "m", "--profile", "--no-thinking" },
+    }) |argv| {
+        try std.testing.expectError(error.Usage, parse(a, argv, &u));
+        try std.testing.expect(std.mem.indexOf(u8, u.message, "--profile") != null);
+    }
+    var output: std.Io.Writer.Allocating = .init(a);
+    try capabilities(&output.writer, .{ .version = "test" });
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"--profile\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "fast-exact") == null);
+    const decoded = try std.json.parseFromSlice(std.json.Value, a, output.written(), .{});
+    const profiles = decoded.value.object.get("profiles").?.object;
+    try std.testing.expectEqualStrings("stable", profiles.get("default").?.string);
+    const available = profiles.get("available").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), available.len);
+    try std.testing.expectEqualStrings("stable", available[0].string);
+    const entries = profiles.get("registered_switches").?.array.items;
+    try std.testing.expectEqual(api.profile.entries.len, entries.len);
+    for (entries, api.profile.entries) |json_entry, row| {
+        try std.testing.expectEqualStrings(row.name(), json_entry.object.get("id").?.string);
+        try std.testing.expect(json_entry.object.get("stable").? == .null);
+    }
+}
+
+test "stable profile: capabilities describe the shared paging variable by family without changing its name" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try capabilities(&output.writer, .{ .version = "test" });
+    const decoded = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.written(), .{});
+    defer decoded.deinit();
+    const entries = decoded.value.object.get("profiles").?.object.get("registered_switches").?.array.items;
+    var policies: usize = 0;
+    for (entries) |row| {
+        const fields = row.object;
+        if (!std.mem.eql(u8, fields.get("id").?.string, "TF_KV_PAGES")) continue;
+        policies += 1;
+        try std.testing.expectEqualStrings("cuda", fields.get("backend").?.string);
+        try std.testing.expect(fields.get("stable").? == .null);
+        const families = fields.get("families").?.array.items;
+        if (fields.get("report_values").? == .null) {
+            try std.testing.expectEqualStrings("auto", fields.get("syntax").?.string);
+            try std.testing.expectEqual(@as(usize, 1), families.len);
+            try std.testing.expectEqualStrings("glm5_next", families[0].string);
+        } else {
+            const values = fields.get("report_values").?.array.items;
+            try std.testing.expectEqual(@as(usize, 2), values.len);
+            try std.testing.expectEqualStrings("0", values[0].string);
+            try std.testing.expectEqualStrings("all", values[1].string);
+            try std.testing.expectEqual(@as(usize, 2), families.len);
+            try std.testing.expectEqualStrings("nemotron_h", families[0].string);
+            try std.testing.expectEqualStrings("nemotron_h_omni", families[1].string);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), policies);
+}
 
 test "max frames CLI bounds and engine request preserve the default" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -169,7 +250,7 @@ test "parse and capabilities share the table" {
     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--kv-cache", "int4" }, &u));
     try std.testing.expectEqualStrings("int8", (try parse(a, &.{ "m", "--prompt-precision", "int8" }, &u)).prompt_precision);
     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--prompt-precision", "fp4" }, &u));
-    try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--reasoning-effort", "max" }, &u));
+    try std.testing.expectEqualStrings("max", (try parse(a, &.{ "m", "--reasoning-effort", "max" }, &u)).reasoning_effort.?);
     try std.testing.expectEqual(@as(?f64, 12.5), (try parse(a, &.{ "m", "--prompt-cache-gib", "12.5" }, &u)).prompt_cache_gib);
     try std.testing.expectEqual(@as(?f64, 0), (try parse(a, &.{ "m", "--prompt-cache-gib", "0" }, &u)).prompt_cache_gib);
     try std.testing.expect(!(try parse(a, &.{ "m", "--prompt-cache-gib", "16" }, &u)).prompt_cache_over_cap);
@@ -226,6 +307,11 @@ test "parse and capabilities share the table" {
     try std.testing.expect(urls.vision and urls.vision_urls);
     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--vision-urls" }, &u));
     try std.testing.expectEqualStrings("--vision-urls needs --vision", u.message);
+    const pdfs = try parse(a, &.{ "m", "--vision", "--vision-pdf" }, &u);
+    try std.testing.expect(pdfs.vision and pdfs.vision_pdf);
+    try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--vision-pdf" }, &u));
+    try std.testing.expectEqualStrings("--vision-pdf needs --vision", u.message);
+    try std.testing.expect(std.mem.indexOf(u8, doc, "\"--vision-pdf\": {}") != null);
 }
 
 test "learned disk floor parses once with a finite byte-safe default and is a native capability" {
@@ -285,6 +371,11 @@ test "--device and --segments: CUDA builds serve them, values checked; --speed-u
     try std.testing.expectEqual(@as(?u32, 4), (try request(a, "d", "dory", out)).loops);
     try std.testing.expectError(error.Usage, cudaFlag(a, &out, "--loops", "-1", &u));
     try std.testing.expect(parallelFixed("3") and !parallelFixed("auto") and !parallelFixed("x"));
+    // --rope-yarn: a factor that reaches the engine's request; the families and engines that lack YaRN refuse it
+    try std.testing.expect(try cudaFlag(a, &out, "--rope-yarn", "4", &u));
+    try std.testing.expectEqual(@as(?f64, 4), (try request(a, "d", "qwen3_5_moe", out)).rope_yarn);
+    try std.testing.expectError(error.Usage, cudaFlag(a, &out, "--rope-yarn", "four", &u));
+    if (cuda_build) try std.testing.expectEqual(@as(?f64, 2), (try parse(a, &.{ "m", "--rope-yarn", "2" }, &u)).rope_yarn);
 }
 
 test "the GPU engine's flags: refused and unlisted unless the backend serves them, values checked" {
@@ -293,7 +384,7 @@ test "the GPU engine's flags: refused and unlisted unless the backend serves the
     const a = arena.allocator();
     var u: Usage = .{};
     // each flag, a value, and the `serves` entry that turns it on
-    const gated = [_][3][]const u8{ .{ "--tp", "2", "--tp" }, .{ "--rank", "0", "--tp" }, .{ "--master", "node0", "--tp" }, .{ "--master-port", "29600", "--tp" }, .{ "--policy", "matrix=off", "--policy" }, .{ "--mtp-drafts", "2", "--mtp-drafts" }, .{ "--mtp-confidence", "0.5", "--mtp-confidence" }, .{ "--checkpoint-slots", "3", "--checkpoint-slots" } };
+    const gated = [_][3][]const u8{ .{ "--tp", "2", "--tp" }, .{ "--rank", "0", "--tp" }, .{ "--master", "node0", "--tp" }, .{ "--master-port", "29600", "--tp" }, .{ "--policy", "matrix=off", "--policy" }, .{ "--mtp-drafts", "2", "--mtp-drafts" }, .{ "--mtp-confidence", "0.5", "--mtp-confidence" }, .{ "--checkpoint-slots", "3", "--checkpoint-slots" }, .{ "--spill-gib", "2", "--spill-gib" } };
     var out: std.Io.Writer.Allocating = .init(a);
     try capabilities(&out.writer, .{ .version = "0" });
     for (gated) |g| {
@@ -303,7 +394,8 @@ test "the GPU engine's flags: refused and unlisted unless the backend serves the
     }
     try std.testing.expect(servedBy(&.{ "--tp", "--policy" }, "--tp") and !servedBy(&.{"--tp"}, "--policy") and !servedBy(&.{}, "--tp"));
     var args: Args = .{};
-    for ([_][2][]const u8{ .{ "--tp", "4" }, .{ "--rank", "2" }, .{ "--master", "node0" }, .{ "--master-port", "29600" }, .{ "--mtp-drafts", "2" }, .{ "--mtp-confidence", "0.5" }, .{ "--checkpoint-slots", "3" }, .{ "--policy", "matrix=off" }, .{ "--policy", "kernels=reference" } }) |g| try std.testing.expect(try gpuFlag(a, &args, g[0], g[1], &u));
+    for ([_][2][]const u8{ .{ "--tp", "4" }, .{ "--rank", "2" }, .{ "--master", "node0" }, .{ "--master-port", "29600" }, .{ "--mtp-drafts", "2" }, .{ "--mtp-confidence", "0.5" }, .{ "--checkpoint-slots", "3" }, .{ "--spill-gib", "1.5" }, .{ "--policy", "matrix=off" }, .{ "--policy", "kernels=reference" } }) |g| try std.testing.expect(try gpuFlag(a, &args, g[0], g[1], &u));
+    try std.testing.expectEqual(@as(?f64, 1.5), args.spill_gib);
     try std.testing.expectEqual(@as(u32, 4), args.tp);
     try std.testing.expectEqual(@as(u32, 2), args.rank);
     try std.testing.expectEqualStrings("node0", args.master);
@@ -315,8 +407,33 @@ test "the GPU engine's flags: refused and unlisted unless the backend serves the
     try ranks(&u, a, args);
     args.rank = 4;
     try std.testing.expectError(error.Usage, ranks(&u, a, args));
-    for ([_][2][]const u8{ .{ "--rank", "-1" }, .{ "--master-port", "70000" }, .{ "--mtp-drafts", "65" }, .{ "--mtp-confidence", "1.5" }, .{ "--checkpoint-slots", "-1" }, .{ "--policy", "matrix" } }) |g| try std.testing.expectError(error.Usage, gpuFlag(a, &args, g[0], g[1], &u));
+    for ([_][2][]const u8{ .{ "--rank", "-1" }, .{ "--master-port", "70000" }, .{ "--mtp-drafts", "65" }, .{ "--mtp-confidence", "1.5" }, .{ "--checkpoint-slots", "-1" }, .{ "--spill-gib", "-1" }, .{ "--spill-gib", "nan" }, .{ "--policy", "matrix" } }) |g| try std.testing.expectError(error.Usage, gpuFlag(a, &args, g[0], g[1], &u));
     try std.testing.expect(!try gpuFlag(a, &args, "--port", "1", &u));
+}
+
+test "--spill-gib asks the engine for the conversation store, spilling only what RAM evicts, and is off without it" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var u: Usage = .{};
+    const plain = try request(a, "d", "t", .{});
+    try std.testing.expect(plain.spill == .off and plain.learn == null and !plain.learn_conversations and plain.learn_gib == 32);
+    const zero = try request(a, "d", "t", .{ .spill_gib = 0 });
+    try std.testing.expect(zero.spill == .off and zero.learn == null and !zero.learn_conversations and zero.learn_gib == 32);
+    const alone = try request(a, "d", "t", .{ .spill_gib = 2, .checkpoint_slots = 3 });
+    try std.testing.expect(alone.spill == .evicted and alone.learn_conversations and alone.learn_gib == 2);
+    try std.testing.expectStringEndsWith(alone.learn.?, "/.cache/tensorfold/spilled");
+    try std.testing.expectEqual(@as(?i64, 3), alone.keep);
+    const both = try request(a, "d", "t", .{ .spill_gib = 8, .learn = true, .learn_conversations = true, .learn_dir = "/x" });
+    try std.testing.expect(both.spill == .finish and both.learn_conversations and both.learn_gib == 8);
+    try std.testing.expectEqualStrings("/x", both.learn.?);
+    const capped = try request(a, "d", "t", .{ .spill_gib = 64, .learn = true, .learn_conversations = true, .learn_gib = 16 });
+    try std.testing.expect(capped.spill == .finish and capped.learn_gib == 16); // the smaller cap
+    try spillWith(&u, a, .{ .spill_gib = 2 });
+    try spillWith(&u, a, .{ .spill_gib = 2, .learn = true, .learn_conversations = true });
+    try spillWith(&u, a, .{ .learn = true });
+    try std.testing.expectError(error.Usage, spillWith(&u, a, .{ .spill_gib = 2, .learn = true }));
+    try std.testing.expectStringStartsWith(u.message, "--spill-gib writes evicted states to the conversation store");
 }
 
 test "silence guard flags are opt-in and reach native open options" {
@@ -355,11 +472,24 @@ test "runtime library: capabilities serializes found and missing dependencies wi
     try std.testing.expectEqual(@as(usize, 2), values.len);
     try std.testing.expect(values[0].object.get("found").?.bool);
     try std.testing.expect(!values[1].object.get("found").?.bool);
-    try std.testing.expectEqualStrings("libnccl.so.2", values[0].object.get("soname").?.string);
+    try std.testing.expectEqualStrings(libs.spec(.nccl).names[0], values[0].object.get("soname").?.string);
     try std.testing.expectEqualStrings(rows[1].install, values[1].object.get("install").?.string);
     try std.testing.expect(values[0].object.get("usable").? == .null);
     try std.testing.expect(!values[1].object.get("usable").?.bool);
     try std.testing.expectEqualStrings(rows[1].problem.?, values[1].object.get("problem").?.string);
+}
+
+test "capabilities: a p2p summary appears only when the engine gives one, as its own object" {
+    var none: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer none.deinit();
+    try capabilities(&none.writer, .{ .version = "test" });
+    try std.testing.expect(std.mem.indexOf(u8, none.written(), "p2p") == null);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try capabilities(&out.writer, .{ .version = "test", .p2p = "{\"driver\":\"580.65.06\",\"gpus\":[],\"pairs\":[]}" });
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("580.65.06", parsed.value.object.get("p2p").?.object.get("driver").?.string);
 }
 
 test "--silence-mid-s is opt-in, needs the tail guard and reaches native open options" {
@@ -388,4 +518,97 @@ test "prompt precision: parsing and request forwarding cover defaults, explicit 
     }
     for ([_][]const []const u8{ &.{ "m", "--prompt-precision" }, &.{ "m", "--prompt-precision", "unknown" }, &.{ "m", "--prompt-precision", "fp4" } }) |argv|
         try std.testing.expectError(error.Usage, parse(a, argv, &usage));
+}
+
+test "prompt cache disk: new spellings ask the engine for exactly the legacy conversation store" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var u: Usage = .{};
+    const legacy = try parse(a, &.{ "m", "--learn-conversations", "--learn-dir", "cache with spaces" }, &u);
+    for ([_][]const []const u8{
+        &.{ "m", "--prompt-cache-disk", "cache with spaces" },
+        &.{ "m", "--prompt-cache-disk=cache with spaces" },
+        &.{ "m", "--learn", "--prompt-cache-disk=cache with spaces" },
+        &.{ "m", "--prompt-cache-disk=cache with spaces", "--learn" },
+    }) |argv| {
+        const named = try parse(a, argv, &u);
+        try std.testing.expectEqualDeep(legacy, named);
+        try std.testing.expectEqualDeep(try request(a, "d", "t", legacy), try request(a, "d", "t", named));
+    }
+    const defaults = try request(a, "d", "t", try parse(a, &.{"m"}, &u));
+    try std.testing.expect(defaults.learn == null and !defaults.learn_conversations and defaults.spill == .off);
+}
+
+test "prompt cache disk: mixed spellings refuse both flag orders and name the conflict" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var u: Usage = .{};
+    const named = [_][]const []const u8{ &.{ "--prompt-cache-disk", "cache" }, &.{"--prompt-cache-disk=cache"} };
+    const legacy = [_][]const []const u8{
+        &.{ "--learn-dir", "cache" }, &.{"--learn-dir=cache"},
+        &.{ "--learn-dir", "other" }, &.{"--learn-dir=other"},
+        &.{"--learn-conversations"},
+    };
+    for (named) |new| for (legacy) |old| {
+        for ([_]bool{ false, true }) |reverse| {
+            var argv: std.ArrayList([]const u8) = .empty;
+            try argv.append(a, "m");
+            try argv.appendSlice(a, if (reverse) old else new);
+            try argv.appendSlice(a, if (reverse) new else old);
+            try std.testing.expectError(error.Usage, parse(a, argv.items, &u));
+            try std.testing.expect(std.mem.indexOf(u8, u.message, "--prompt-cache-disk") != null);
+            const old_name = old[0][0 .. std.mem.indexOfScalar(u8, old[0], '=') orelse old[0].len];
+            try std.testing.expect(std.mem.indexOf(u8, u.message, old_name) != null);
+        }
+    };
+    for ([_][]const []const u8{
+        &.{ "m", "--learn-conversations", "--learn-dir=cache", "--prompt-cache-disk=cache" },
+        &.{ "m", "--prompt-cache-disk=cache", "--learn-conversations", "--learn-dir=cache" },
+    }) |argv| try std.testing.expectError(error.Usage, parse(a, argv, &u));
+}
+
+test "prompt cache disk: repeated same spelling keeps last-value precedence and existing disk limits" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var u: Usage = .{};
+    for ([_][]const []const u8{
+        &.{ "m", "--prompt-cache-disk=old", "--prompt-cache-disk=new" },
+        &.{ "m", "--learn-dir=old", "--learn-dir=new", "--learn-conversations" },
+        &.{ "m", "--learn-conversations", "--learn-dir=old", "--learn-dir=new" },
+    }) |argv| {
+        const opened = try request(a, "d", "t", try parse(a, argv, &u));
+        try std.testing.expectEqualStrings("new", opened.learn.?);
+        try std.testing.expect(opened.learn_conversations);
+    }
+    var named = try parse(a, &.{ "m", "--prompt-cache-disk=cache", "--prompt-cache-gib=2", "--learn-gib=16", "--learn-daily-gib=3", "--learn-min-free-gib=1" }, &u);
+    named.spill_gib = 8;
+    try spillWith(&u, a, named);
+    const opened = try request(a, "d", "t", named);
+    try std.testing.expectEqualStrings("cache", opened.learn.?);
+    try std.testing.expect(opened.learn_conversations and opened.spill == .finish and opened.learn_gib == 8);
+    try std.testing.expect(opened.prompt_cache_gib == 2 and opened.learn_daily_gib == 3 and opened.learn_min_free_gib == 1);
+}
+
+test "prompt cache disk: missing and empty directories are usage errors and the flag is advertised" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var u: Usage = .{};
+    for ([_][]const []const u8{
+        &.{ "m", "--prompt-cache-disk" },
+        &.{ "m", "--prompt-cache-disk", "--no-thinking" },
+        &.{ "m", "--prompt-cache-disk=" },
+        &.{ "m", "--prompt-cache-disk", "" },
+    }) |argv| {
+        try std.testing.expectError(error.Usage, parse(a, argv, &u));
+        try std.testing.expect(std.mem.indexOf(u8, u.message, "--prompt-cache-disk") != null);
+    }
+    const dash = try parse(a, &.{ "m", "--prompt-cache-disk=--cache" }, &u);
+    try std.testing.expectEqualStrings("--cache", dash.learn_dir.?);
+    var output: std.Io.Writer.Allocating = .init(a);
+    try capabilities(&output.writer, .{ .version = "test" });
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"--prompt-cache-disk\": {}") != null);
 }

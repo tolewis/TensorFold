@@ -8,7 +8,7 @@ const t = std.testing;
 const a = t.allocator;
 const rules: pc.Rules = .{ .min_prompt = 0, .min_gap = 1, .lookahead = 1 };
 fn options(root: []const u8) rows.Options {
-    return .{ .root = root, .identity = 169, .cap = 1 << 26, .floor = 0, .daily = 1 << 28, .lookahead = 1 };
+    return .{ .sync_writes = true, .root = root, .identity = 169, .cap = 1 << 26, .floor = 0, .daily = 1 << 28, .lookahead = 1 };
 }
 fn seed(root: []const u8, prompt: []const u32) !void {
     var f: fake.Fake = .{ .gpa = a, .prompt = prompt };
@@ -130,5 +130,5 @@ test "restore selection: a state whose directory another identity's cap removed 
     try t.expectEqual(@as(u64, 0), s.counts.evicted);
     try t.expectEqual(@as(usize, 1), s.entries.items.len);
     try t.expectEqual(@as(usize, 1), f.live);
-    try t.expectEqual(@as(u64, 1), r.counts.failed);
+    try t.expectEqual(@as(u64, 2), r.counts.failed); // both the longest file and the one shorter retry are gone
 }
