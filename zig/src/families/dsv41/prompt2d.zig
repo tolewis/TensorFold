@@ -17,7 +17,7 @@ const Config = @import("config.zig").Config;
 const plan = @import("plan.zig");
 const prompt = @import("prompt.zig");
 const weights = @import("weights.zig");
-const exl3_experts = @import("exl3_experts.zig");
+const prompt_rows = @import("prompt_rows.zig");
 const exl3_experts2d = @import("exl3_experts2d.zig");
 const ring2d = @import("ring2d.zig");
 const round2d = @import("round2d.zig");
@@ -264,7 +264,7 @@ pub const Two = struct {
     pub fn experts(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer) !void {
         const c = e.c;
         const n = ch.n;
-        if (n < exl3_experts.exact_rows) return round2d.experts(t, e, lay.experts, ch.xsd, ch.x, c.hidden, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
+        if (prompt_rows.moeInWindow(n, e.window_rows)) return round2d.experts(t, e, lay.experts, ch.xsd, ch.x, c.hidden, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
         try exl3_experts2d.gateUp(e.ex, e.s, lay.experts, ch.xs, ch.x, c.hidden, ch.pick, n, c.swiglu_limit);
         try t.catRank(e, ch.xs.xd, t.xd_full, n * ch.xs.slots, t.gu, 2);
         try exl3_experts2d.down(e.ex, e.s, lay.experts, ch.xs, t.xd_full, ch.pick, ch.wts, ch.pm, n);

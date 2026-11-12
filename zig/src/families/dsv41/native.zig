@@ -13,6 +13,12 @@
 //!                                               served ROUND_MS unless set: a four-node lane's rounds cost less)
 //!   TF_DS_ROUND_ROWS, TF_DS_STREAMS             a round's rows at most (16; the four-node lane's 48) and the pool's
 //!                                               streams (4; its 16): --parallel at most the streams
+//!   TF_DS_PROMPT_WINDOW_ROWS=<rows>             a prompt chunk under these rows (64 .. 128; 64 unset) takes the MoE decode window
+//!                                               in place of the prompt kernels; the scratch grows to these rows. Bits may differ
+//!                                               from the prompt kernels' (set alike on every rank: a mismatch ends the start)
+//!   TF_DS_PROMPT_GEMM_ROWS=<rows>               a prompt chunk over these rows (16 .. 128; 128 unset) takes the prefill GEMM for the
+//!                                               dense linears in place of the glinear group; bits may differ (set alike on every
+//!                                               rank: a mismatch ends the start)
 //!   TF_DS_PLAIN_ROWS                            the rows a mixed pack's plain (cuBLAS) linear runs over, padded to this
 //!                                               count so a token's bits do not change with the round's shape (16; 0: off)
 //!   TF_RDMA_DEVICES                             the decode gathers over the RDMA ring on these devices (else NCCL)
@@ -60,6 +66,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
 const model = @import("model.zig");
+const rows_mod = @import("prompt_rows.zig");
 const pool_mod = @import("pool.zig");
 const lanes_mod = @import("lanes.zig");
 const round = @import("round.zig");
@@ -222,6 +229,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .drafts = o.drafts,
         .arena_bytes = arena_gib << 30,
         .round_rows = if (getenv("TF_DS_ROUND_ROWS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadRoundRows else round.default_rows,
+        .window_rows = if (getenv(rows_mod.window_env)) |v| rows_mod.parseWindow(v) catch return error.BadPromptWindowRows else rows_mod.default_window,
+        .gemm_rows = if (getenv(rows_mod.gemm_env)) |v| rows_mod.parseGemm(v) catch return error.BadPromptGemmRows else rows_mod.default_gemm,
         .plain_rows = if (getenv("TF_DS_PLAIN_ROWS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadPlainRows else round.default_rows,
         .round_ms = if (getenv("TF_DS_ROUND_MS")) |v| lanes_mod.parseMs(std.heap.page_allocator, v) catch return error.BadRoundMs else null,
         .streams = if (getenv("TF_DS_STREAMS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadStreams else model.max_streams_default,
@@ -633,6 +642,9 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.NoRankCache => "set TF_DS_RANK_CACHE to the lane's per-rank weight files",
         error.NoKit => "set TF_DS_KIT to the kernel kit (cubins/, the RoPE tables, engram.json)",
         error.NoFreeSlot => "this engine serves TF_DS_STREAMS streams at once (default 4): --parallel at most that",
+        error.BadPromptWindowRows => rows_mod.window_hint,
+        error.BadPromptGemmRows => rows_mod.gemm_hint,
+        error.PromptRowsMismatch => "TF_DS_PROMPT_WINDOW_ROWS / TF_DS_PROMPT_GEMM_ROWS: the ranks run different prompt paths; set them alike on every rank (tf-dsv41-lanes reads them too)",
         error.BadRoundRows => "TF_DS_ROUND_ROWS: a round's rows at most, 16 .. 48",
         error.BadGraphCap => "TF_DS_GRAPH_CAP: the captured CUDA graphs kept at most, a count (0: all)",
         error.BadPlainRows => "TF_DS_PLAIN_ROWS: the rows a mixed pack's plain linear runs over, 0 (the round's own) or a count up to TF_DS_ROUND_ROWS",
@@ -688,6 +700,9 @@ test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoMaster).?, "TF_TP_MASTER") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.PartTooSmall).?, "TF_DS_POOL") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.KvShardMismatch).?, "--pool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.BadPromptWindowRows).?, "TF_DS_PROMPT_WINDOW_ROWS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.BadPromptGemmRows).?, "TF_DS_PROMPT_GEMM_ROWS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.PromptRowsMismatch).?, "TF_DS_PROMPT_GEMM_ROWS") != null);
     for ([_]anyerror{ error.BadPart, error.WindowTooWide, error.FetchTooLarge, error.BadFetch, error.NoKvShard, error.CrossesPart, error.ShardDiverged, error.StaleExtent, error.TransferFailed, error.TransferTimeout, error.KvShardNotStarted, error.BadPlan, error.ShardRingOrder, error.BadRingRows }) |err|
         try std.testing.expect(std.mem.indexOf(u8, explain(null, err).?, "TF_DS_KV_SHARD=0") != null);
     for ([_]anyerror{ error.KvShardSettingsMismatch, error.BadKvShardRing }) |err|

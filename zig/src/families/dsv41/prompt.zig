@@ -36,6 +36,11 @@ const prompt2d = @import("prompt2d.zig");
 const rdma = @import("rdma.zig");
 const shard = @import("shard.zig");
 const shard_ops = @import("shard_ops.zig");
+const prompt_rows = @import("prompt_rows.zig");
+
+comptime {
+    std.debug.assert(prompt_rows.default_window == exl3_experts.exact_rows and prompt_rows.max_window == exl3_experts.max_window_rows);
+}
 
 /// The indexer's [rows, n_comp] keys a row block holds at most (model.py: rb * n_comp <= 2^26 / 4 past 16 rows).
 const key_elems: usize = 1 << 24;
@@ -126,6 +131,8 @@ pub const Engine = struct {
     compressed: Rope,
     round_rows: usize = 16, // a concurrent round's rows at most (TF_DS_ROUND_ROWS; round.max_rows at most)
     plain_rows: usize = 0, // a mixed pack's plain linear runs over at least these rows (TF_DS_PLAIN_ROWS; model.zig sets it)
+    window_rows: usize = prompt_rows.default_window, // a chunk under these rows takes the MoE decode window (TF_DS_PROMPT_WINDOW_ROWS)
+    gemm_rows: usize = prompt_rows.default_gemm, // a chunk over these rows takes the prefill GEMM (TF_DS_PROMPT_GEMM_ROWS)
     two: ?*const prompt2d.Two = null, // a node of the four-node 2D split (prompt2d.zig); `world` stays TP2's
     ring: ?*rdma.Ring = null, // TP2: the decode-size all-gathers over the RDMA ring (the served lane's), else NCCL
     kv: ?*shard_ops.KvShard = null, // TF_DS_KV_SHARD: the parts, the decode mode, the fetch kernels (null: replicated)
@@ -547,9 +554,10 @@ fn addLinear(e: *const Engine, ch: *Chunk, a: *Arena, l: weights.Linear, max_gk:
 }
 
 /// Model._moe_scratch's decode scratch: experts.py Scratch(rows=max(n, 64), prompt=False), zeros but its member lists'
-/// -1 (made at the first window under 64 rows and never replaced).
+/// -1 (made at the first window under 64 rows and never replaced). TF_DS_PROMPT_WINDOW_ROWS grows it to its rows.
 pub fn decodeScratch(e: *const Engine, a: *Arena, ex: weights.Experts, slots: usize) !exl3_experts.DecodeScratch {
-    const rows = exl3_experts.exact_rows;
+    const rows = e.window_rows;
+    if (rows < exl3_experts.exact_rows or rows > exl3_experts.max_window_rows) return error.BadWindowRows;
     const sz = if (e.two != null) try exl3_experts2d.decodeSizes(rows, slots, ex) else try exl3_experts.DecodeScratch.sizes(rows, slots, ex.dims, ex.width, ex.count); // 2D: this node's widths
     var sc: exl3_experts.DecodeScratch = undefined;
     sc.rows = rows;
@@ -870,7 +878,7 @@ pub fn attnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
     }
 }
 
-/// mm(layer, x, out_dtype) of m rows: the prompt GEMM beyond 128 rows, the layer's own group (GROUPED) up to 128.
+/// mm(layer, x, out_dtype) of m rows: the prompt GEMM beyond Engine.gemm_rows (128) rows, the layer's own group (GROUPED) up to it.
 fn mmRows(e: *const Engine, ch: *const Chunk, m: usize, l: weights.Linear, x: u64, ldx: usize, out: u64, out_type: tri_markov.OutType, os: usize) !void {
     // A mixed pack's float linear: torch's nn.Linear on bf16 rows (cublas.Blas.linearBf16), then the exact
     // bf16 -> fp32 widen when the caller wants fp32 (torch's mm's out_dtype).
@@ -885,7 +893,7 @@ fn mmRows(e: *const Engine, ch: *const Chunk, m: usize, l: weights.Linear, x: u6
         }
         return;
     }
-    if (m > 128) return exl3_prefill.matmul(e.pf, e.t, ch.ws, l, x, .bf16, ldx, out, out_type, os, m);
+    if (prompt_rows.denseOnGemm(m, e.gemm_rows)) return exl3_prefill.matmul(e.pf, e.t, ch.ws, l, x, .bf16, ldx, out, out_type, os, m);
     const dt: exl3_linear.DType = switch (out_type) {
         .bf16 => .bf16,
         .fp32 => .f32,
@@ -927,8 +935,8 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     const below = floor > start -| (c.window - 1);
     const ring_mode = n <= ring_extra and !(replay_floor and below);
     const one_split = !ring_mode and n <= tri.decode_rows;
-    // attn_in: wq_a and wkv of x, one prompt GEMM each, or one group up to 128 rows
-    if (n > 128) {
+    // attn_in: wq_a and wkv of x, one prompt GEMM each, or one group up to Engine.gemm_rows rows
+    if (prompt_rows.denseOnGemm(n, e.gemm_rows)) {
         try mm(e, ch, lay.wq_a, ch.x, c.hidden, ch.qa, .bf16, lay.wq_a.n);
         try mm(e, ch, lay.wkv, ch.x, c.hidden, ch.y, .bf16, hd);
     } else {
@@ -1022,7 +1030,7 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     const gk = hl * hd / groups;
     const uw = groups * lay.wo_a[0].n;
     var col: usize = 0;
-    if (n > 128) {
+    if (prompt_rows.denseOnGemm(n, e.gemm_rows)) {
         for (lay.wo_a[0..groups], 0..) |wo, g| {
             try mm(e, ch, wo, ch.o + g * gk * 2, hl * hd, ch.u + col * 2, .bf16, uw);
             col += wo.n;
@@ -1367,8 +1375,8 @@ pub fn moe(e: *const Engine, ch: *Chunk, li: usize) !void {
     }
     try routeSpans(e, ch, lay, shared_id, sl, kc);
     if (e.two) |t| return t.experts(e, ch, lay); // 2D: gate / up here, the intermediate's exchange, down here
-    // routed(): a chunk of fewer than EXACT_ROWS rows takes the decode window's fused path and scratch
-    if (n < exl3_experts.exact_rows) return exl3_experts.decode(e.ex, e.s, lay.experts, ch.xsd, ch.x, d, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
+    // routed(): a chunk of fewer than EXACT_ROWS rows (Engine.window_rows) takes the decode window's fused path and scratch
+    if (prompt_rows.moeInWindow(n, e.window_rows)) return exl3_experts.decode(e.ex, e.s, lay.experts, ch.xsd, ch.x, d, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
     try exl3_experts.prompt(e.ex, e.s, lay.experts, ch.xs, ch.x, d, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
 }
 

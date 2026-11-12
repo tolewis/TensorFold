@@ -155,7 +155,7 @@ const Window = struct {
         const i: usize = ex.down_k;
         const ig: usize = ex.width;
         const dn: usize = ex.down_n;
-        if (r == 0 or r >= X.exact_rows or r > sc.rows) return error.NotADecodeWindow;
+        if (!X.isWindow(sc, r)) return error.NotADecodeWindow;
         const cgu = try X.config(d, i, true);
         const cd = try X.config(i, d, false);
         if (cgu[0] != 8 or cgu[1] != 4 or cd[0] != 8 or cd[1] != 4 or cd[2] != 1) return error.UnsupportedShape;
@@ -283,6 +283,11 @@ test "a 2D node's decode scratch and windows" {
     const sc: X.DecodeScratch = .{ .rows = 64, .slots = 7, .xg = 0, .xu = 0, .xd = 0, .z = 0, .y = 0, .cnt_gu = 0, .cnt_d = 0, .epoch = 0, .ready = 0, .ready_cnt = 0, .ids = 0, .count = 0, .members = 0 };
     for ([_]usize{ 0, 64, 65 }) |r| try std.testing.expectError(error.NotADecodeWindow, gateUpLaunches(ex, sc, 0, 5120, 0, 0, 0, r, 10));
     _ = try gateUpLaunches(ex, sc, 0, 5120, 0, 0, 0, 63, 10);
+    // a scratch of 100 rows (TF_DS_PROMPT_WINDOW_ROWS) serves windows up to 99
+    var wide = sc;
+    wide.rows = 100;
+    _ = try gateUpLaunches(ex, wide, 0, 5120, 0, 0, 0, 99, 10);
+    try std.testing.expectError(error.NotADecodeWindow, gateUpLaunches(ex, wide, 0, 5120, 0, 0, 0, 100, 10));
     ex.width = 512;
     try std.testing.expectEqual([13]usize{ 4587520, 4587520, 458752, 7340032, 4587520, 6160, 5120, 4, 1540, 1540, 1540, 4, 197120 }, try decodeSizes(64, 7, ex));
     // a part of whole 128-column blocks only, within the half

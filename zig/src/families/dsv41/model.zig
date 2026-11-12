@@ -32,6 +32,7 @@ const rdma_env = @import("rdma_env.zig");
 const pool_mod = @import("pool.zig");
 const shard = @import("shard.zig");
 const shard_ops = @import("shard_ops.zig");
+const prompt_rows = @import("prompt_rows.zig");
 
 /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
 pub const chunk_rows = 2048;
@@ -72,6 +73,8 @@ pub const Options = struct {
     arena_bytes: usize = 0, // the device arena's first block (0: it grows from 256 MiB blocks as the buffers ask)
     round_rows: usize = round.default_rows, // a round's rows at most (TF_DS_ROUND_ROWS; the four-node lane's 48)
     plain_rows: usize = round.default_rows, // a mixed pack's plain linear runs over at least these rows (TF_DS_PLAIN_ROWS; 0: the round's own)
+    window_rows: usize = prompt_rows.default_window, // a chunk under these rows takes the MoE decode window (TF_DS_PROMPT_WINDOW_ROWS; every rank alike)
+    gemm_rows: usize = prompt_rows.default_gemm, // a chunk over these rows takes the prefill GEMM (TF_DS_PROMPT_GEMM_ROWS; every rank alike)
     streams: usize = draft.default_streams, // the pool's streams (--parallel; the four-node lane's 16)
     round_ms: ?[]const f64 = null, // the lane core's round costs by rows (TF_DS_ROUND_MS; null: the served ROUND_MS)
     vision_bias: ?[]const u8 = null, // gate_bias_vl.safetensors (null: the kit's vision/): the image-span routing bias
@@ -87,6 +90,8 @@ pub const Model = struct {
     rank: u32,
     world: u32,
     streams: usize, // the pool's streams (Options.streams)
+    window_rows: usize, // Options.window_rows
+    gemm_rows: usize, // Options.gemm_rows
     round_ms: []const f64, // the lane core's round costs by rows (Options.round_ms, else draft.round_ms)
     pool_cap: usize,
     cache_dir: std.Io.Dir,
@@ -184,6 +189,10 @@ pub const Model = struct {
         m.world = o.world;
         if (o.streams == 0 or o.streams > max_streams) return error.BadStreams;
         m.streams = o.streams;
+        if (!prompt_rows.validWindow(o.window_rows)) return error.BadPromptWindowRows;
+        if (!prompt_rows.validGemm(o.gemm_rows)) return error.BadPromptGemmRows;
+        m.window_rows = o.window_rows;
+        m.gemm_rows = o.gemm_rows;
         m.round_ms = o.round_ms orelse &draft.round_ms;
         if (m.round_ms.len == 0) return error.BadRoundMs;
         m.pool_cap = o.pool; // (agree, below, compares it with the other rank's)
@@ -333,6 +342,8 @@ pub const Model = struct {
         }
         m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
         m.eng.round_rows = o.round_rows;
+        m.eng.window_rows = m.window_rows;
+        m.eng.gemm_rows = m.gemm_rows;
         m.eng.plain_rows = o.plain_rows;
         m.ch = try prompt.Chunk.init(&m.eng, &m.arena, chunk_rows, m.request_cap);
         errdefer if (m.kvs) |*x| x.k.unload(); // (registered before the load: nothing between them leaks it)
@@ -448,20 +459,23 @@ pub const Model = struct {
     /// What every rank serves once agree has compared them.
     const Agreed = struct { mode: shard.Mode, pool: usize, window: usize };
 
-    /// Every rank's (mode, pool, window, round rows) gathered and compared before any buffer depends on them. A rank
+    /// Every rank's (mode, pool, window, round rows, prompt window rows, prompt GEMM rows) gathered and compared before any buffer depends on them. A rank
     /// whose shard switch or pool did not parse sends a sentinel (bad_setting) instead of failing before the gather,
     /// then refuses with its own error after it; the other rank sees the sentinel and refuses too (KvShardMismatch),
     /// so neither waits on the other. A rank whose switch, pool or round rows differ from rank 0's refuses
     /// (KvShardMismatch, on both at once), a window given on both must match, and a rank without one takes rank 0's
-    /// (the follower lane has no --context).
+    /// (the follower lane has no --context). Ranks on different prompt rows refuse too (PromptRowsMismatch): they would
+    /// launch different kernels for one chunk and sum wrong partials.
     fn agree(m: *Model, o: Options, want_mode: anyerror!shard.Mode, want_pool: anyerror!usize, want_window: anyerror!?usize) !Agreed {
-        const n: usize = 4;
+        const n: usize = 6;
         const bad_setting: u64 = 0xff;
         const mine = [n]u64{
             if (want_mode) |x| @backingInt(x) else |_| bad_setting,
             if (want_pool) |x| x else |_| 0,
             if (want_window) |x| x orelse 0 else |_| bad_setting,
             o.round_rows,
+            o.window_rows,
+            o.gemm_rows,
         };
         var dev = try cuda.DeviceBuffer.alloc(m.ctx.d, (1 + o.world) * n * 8);
         defer dev.free();
@@ -478,6 +492,7 @@ pub const Model = struct {
         for (all[0..o.world]) |r| {
             if (r[0] == bad_setting or r[1] == 0 or r[2] == bad_setting) return error.KvShardMismatch;
             if (r[0] != all[0][0] or r[1] != all[0][1] or r[3] != all[0][3]) return error.KvShardMismatch;
+            if (r[4] != all[0][4] or r[5] != all[0][5]) return error.PromptRowsMismatch;
             if (r[2] != 0 and all[0][2] != 0 and r[2] != all[0][2]) return error.KvShardMismatch;
         }
         const window = if (own_window) |w| w else if (all[0][2] != 0) all[0][2] else pool;

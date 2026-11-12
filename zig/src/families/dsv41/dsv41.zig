@@ -49,6 +49,7 @@ pub const markov_tokens = @import("markov_tokens.zig");
 pub const draft = @import("draft.zig");
 pub const sampling = @import("sampling.zig");
 pub const model = @import("model.zig");
+pub const prompt_rows = @import("prompt_rows.zig");
 pub const lanes = @import("lanes.zig");
 pub const pool = @import("pool.zig");
 pub const spill_state = @import("spill_state.zig");
@@ -106,6 +107,7 @@ test {
     refAll(draft);
     refAll(sampling);
     refAll(model);
+    refAll(prompt_rows);
     refAll(lanes);
     refAll(pool);
     refAll(spill_state);

@@ -8,6 +8,7 @@
 //! the served server's) against the served reply's: the drafted, concurrent reply must be the served one. One JSON
 //! line a request, then the summary. FILE: zrec_lanereq.py's requests (prompt ids, max_tokens, sampling, expect_sha).
 //! KIT_DIR: a gate dir's aot/, cubins/, RoPE tables (as many rows as the pool) and engram.json.
+//! TF_DS_PROMPT_WINDOW_ROWS and TF_DS_PROMPT_GEMM_ROWS (64 and 128 unset) are read here as the served process reads them: set them alike on every rank.
 //! The spill tier (GPU validation of keep, evict, restore and restart without the HTTP server): every rank takes
 //! --spill-dir DIR --spill-gib G [--spill-min-free-gib F] [--spill-min-tokens T] [--spill-quota Q]
 //! [--spill-staging-mib M] (else TF_DS_SPILL_DIR, TF_DS_SPILL_GIB, ... and TF_SPILL_TURNS / TF_SPILL_FLUSH_MS; the
@@ -112,6 +113,8 @@ pub fn main(init: std.process.Init) !u8 {
         .port = try std.fmt.parseInt(u16, args[6], 10),
         .kit_dir = args[7],
     };
+    o.window_rows = try dsv41.prompt_rows.windowFromEnv();
+    o.gemm_rows = try dsv41.prompt_rows.gemmFromEnv();
     var requests_file: ?[]const u8 = null;
     var parallel: ?usize = null; // default: every stream of the pool
     var arena_gib: ?usize = null;

@@ -15,6 +15,8 @@ const weights = @import("weights.zig");
 
 /// experts.py's settings (GLM_GATEUP, GLM_DOWN by default_config; PROMPT_TILES; MMA_KB; EXACT_ROWS; DECODE_STAGES).
 pub const exact_rows = 64;
+/// The most rows a decode window holds: grouped_cp_launch refuses member lists past 32 * 4 warps rows.
+pub const max_window_rows = 128;
 pub const place_threads = 256; // experts.cu PLACE_THREADS
 pub const list_threads = 1024; // experts.cu LIST_THREADS
 pub const mma_cols = 64; // experts_grouped.cuh MMA_COLS
@@ -346,7 +348,7 @@ pub const DecodeLaunch = struct {
 };
 
 /// routed(x, pick, wts, ex, s, None, R, limit, ACT_F32, before_down=None, shared_slot=slots - 1) on a decode window
-/// (R < 64), the served Model.moe's one call a layer: out fp32 [R, D] = each row's slots' expert outputs weighted by
+/// (R < 64; isWindow), the served Model.moe's one call a layer: out fp32 [R, D] = each row's slots' expert outputs weighted by
 /// wts, summed in slot order. x bf16 [R, D] (row stride x_stride elements), pick int32 and wts fp32 [R, slots]
 /// contiguous, every pick an expert id (the shared expert, the last, in every row's last slot); out need not be
 /// initialized. shared_slot changes nothing here (only a prompt chunk's SHARED_DENSE path reads it), and without
@@ -363,6 +365,12 @@ pub fn decode(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: Decode
     for (&ls, fs) |*l, f| try cuda.launch.launch(f, l.cfg, s, &l.args);
 }
 
+/// Whether `r` rows are a decode window of `sc`: under exact_rows rows, or under the scratch's rows when it holds more
+/// (TF_DS_PROMPT_WINDOW_ROWS), and no more than the kernel's member lists take.
+pub fn isWindow(sc: DecodeScratch, r: usize) bool {
+    return r != 0 and r <= sc.rows and r <= max_window_rows and r < @max(exact_rows, sc.rows);
+}
+
 /// decode's three launches in order: experts.py _routed_fused, experts.cu exl3x_decode_prep_cuda and
 /// exl3x_grouped_decode_cuda, experts_grouped.cuh grouped_cp_launch.
 pub fn decodeLaunches(ex: weights.Experts, sc: DecodeScratch, x: u64, x_stride: usize, pick: u64, wts: u64, out: u64, r: usize, limit: f32) ![3]DecodeLaunch {
@@ -370,7 +378,7 @@ pub fn decodeLaunches(ex: weights.Experts, sc: DecodeScratch, x: u64, x_stride: 
     const i: usize = ex.width;
     const e: usize = ex.count;
     const slots = sc.slots;
-    if (r == 0 or r >= exact_rows or r > sc.rows) return error.NotADecodeWindow;
+    if (!isWindow(sc, r)) return error.NotADecodeWindow;
     // routed()'s gate of the fused path: GLM's tiles for gate / up (8 n tiles, 4 warps) and down (one split), 128-column
     // blocks, at most 32 slots; and every trellis 16-byte aligned (weights packs each at a multiple of 16 bytes)
     const cgu = try config(d, i, true);
@@ -459,4 +467,32 @@ test "a TP2 DeepSeek-V4.1 rank's decode scratch and windows" {
     small.rows = 8;
     try std.testing.expectError(error.NotADecodeWindow, decodeLaunches(ex, small, 0, 5120, 0, 0, 0, 9, 10));
     _ = try decodeLaunches(ex, small, 0, 5120, 0, 0, 0, 8, 10);
+}
+
+test "a decode window under the scratch's rows, up to the kernel's member list" {
+    const ex: weights.Experts = .{ .trellis = 0, .gate_ptr = 0, .up_ptr = 0, .down_ptr = 0, .gate_k2 = 0, .up_k2 = 0, .down_k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .count = 385, .dims = 5120, .width = 1152, .down_k = 1152, .down_n = 5120, .k2_gu = .{ 6, 10 }, .k2_d = .{ 6, 10 } };
+    var sc: DecodeScratch = .{ .rows = 100, .slots = 7, .xg = 0, .xu = 0, .xd = 0, .z = 0, .y = 0, .cnt_gu = 0, .cnt_d = 0, .epoch = 0, .ready = 0, .ready_cnt = 0, .ids = 0, .count = 0, .members = 0 };
+    for ([_]usize{ 0, 100, 101, 128 }) |r| try std.testing.expectError(error.NotADecodeWindow, decodeLaunches(ex, sc, 0, 5120, 0, 0, 0, r, 10));
+    for ([_]usize{ 1, 63, 64, 99 }) |r| {
+        const ls = try decodeLaunches(ex, sc, 0, 5120, 0, 0, 0, r, 10);
+        // a place's member tiles: gate / up's z holds 2 * splits * tiles, down's tiles
+        try std.testing.expectEqual(@as(u32, @intCast(2 * 4 * ((r + 15) / 16))), ls[1].cfg.grid.z);
+        try std.testing.expectEqual(@as(u32, @intCast((r + 15) / 16)), ls[2].cfg.grid.z);
+    }
+    // 127 rows: eight member tiles, the most the scratch of 128 rows serves
+    sc.rows = 128;
+    const wide = try decodeLaunches(ex, sc, 0, 5120, 0, 0, 0, 127, 10);
+    try std.testing.expectEqual(@as(u32, 64), wide[1].cfg.grid.z);
+    try std.testing.expectEqual(@as(u32, 8), wide[2].cfg.grid.z);
+    try std.testing.expectError(error.NotADecodeWindow, decodeLaunches(ex, sc, 0, 5120, 0, 0, 0, 128, 10));
+    // the kernel takes no more than 128 member rows whatever the scratch holds
+    sc.rows = 200;
+    try std.testing.expect(!isWindow(sc, 129));
+    try std.testing.expect(isWindow(sc, 128));
+    // the scratch's bytes grow with its rows
+    const big = try DecodeScratch.sizes(128, 7, 5120, 1152, 385);
+    const base = try DecodeScratch.sizes(64, 7, 5120, 1152, 385);
+    try std.testing.expectEqual(2 * base[0], big[0]);
+    try std.testing.expectEqual(2 * base[3], big[3]);
+    try std.testing.expectEqual(base[12], big[12]);
 }
