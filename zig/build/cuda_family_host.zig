@@ -28,6 +28,9 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, mods: anytype, step: *std.B
     const copy_match_step = b.step("test-qwen35-copy-match-host", "The dense 27B's copy match beside DSpine, DFlash2 and without a drafter");
     copy_match_step.dependOn(&copy_match.step);
     step.dependOn(&copy_match.step);
+    const late_absorb = b.addRunArtifact(b.addTest(.{ .root_module = mods.qwen35, .filters = &.{"late absorbs:"} }));
+    b.step("test-qwen35-late-absorb-host", "Late drafter prompt absorbs against eager ones without devices").dependOn(&late_absorb.step);
+    step.dependOn(&late_absorb.step);
     const arena_parts = b.addRunArtifact(b.addTest(.{ .root_module = mods.qwen35, .filters = &.{ "Qwen reuse arena:", "an arena" } }));
     b.step("test-qwen35-arena-host", "Prompt-cache arena parts: gaps, then a save and restore through a mock driver").dependOn(&arena_parts.step);
     step.dependOn(&arena_parts.step);

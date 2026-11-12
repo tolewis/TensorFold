@@ -38,6 +38,14 @@ fn check(d: anytype, ctx: anytype, s: *lanes.Stream) !void {
             if (explicit and rows > 64) {
                 try T.expectError(error.BadDraftRows, d.drafter().absorb(&.{item}));
                 try T.expect(Record.observed == null);
+            } else if (prompt and !explicit and @TypeOf(d.*) == q.draft.Draft) {
+                // held until the window is next read (cuda_draft_lazy.zig): a live absorb runs it first, as a prompt's
+                try d.drafter().absorb(&.{item});
+                try T.expect(Record.observed == null);
+                var live = item;
+                live.prompt = false;
+                try T.expectError(error.NotReady, d.drafter().absorb(&.{live}));
+                try T.expectEqual(@as(?P.Role, .prompt), Record.observed);
             } else {
                 try T.expectError(error.NotReady, d.drafter().absorb(&.{item}));
                 try T.expectEqual(@as(?P.Role, if (prompt) .prompt else .live), Record.observed);

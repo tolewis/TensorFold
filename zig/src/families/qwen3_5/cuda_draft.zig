@@ -8,6 +8,7 @@ const weights = @import("cuda_draft_weights.zig");
 pub const tree = @import("cuda_draft_tree.zig");
 const profile = @import("cuda_startup_profile.zig");
 pub const precision = @import("cuda_draft_precision.zig");
+const lazy = @import("cuda_draft_lazy.zig");
 
 const E = engine.Engine;
 const DeviceBuffer = cuda.DeviceBuffer;
@@ -44,6 +45,7 @@ pub const Ctx = struct {
     // the stream's tokens draft_frame has read, and whether one lay outside its spans (then drafts take the whole head)
     scanned: usize = 0,
     wide: bool = false,
+    late: lazy.Pending = .{}, // prompt absorbs run when the window is next read (cuda_draft_lazy.zig)
 };
 
 pub const Draft = struct {
@@ -329,24 +331,21 @@ pub const Draft = struct {
         try d.e.run(d.fns.norm_rope, .{ rows * heads, 1, 1 }, .{ 32, 1, 1 }, .{ x, w, out, @as(c_int, @intCast(heads)), @as(c_int, @intCast(heads * d.c.head_dim)), @as(c_longlong, @intCast(pos0)), d.c.eps, d.c.theta });
     }
 
+    /// The rows one absorb keeps, and the rows behind its newest that the target's tap ring holds.
+    fn limits(d: *const Draft) lazy.Limits {
+        return .{ .keep = @min(d.c.window, engine.tap_rows - engine.most_verify), .held = engine.tap_rows - engine.most_verify };
+    }
+
     /// Target rows [start, start + n) from the tap ring into the context; with `rows`, ring rows start + rows[i].
-    fn absorb(d: *Draft, ctx: *Ctx, tap_ring: u64, start_: u64, n_: usize, rows_: ?[]const u32, prompt: bool) !void {
+    pub fn absorb(d: *Draft, ctx: *Ctx, tap_ring: u64, start_: u64, n_: usize, rows_: ?[]const u32, prompt: bool) !void {
         const previous = d.projection_role;
         defer d.projection_role = previous;
         d.projection_role = if (prompt) .prompt else .live;
         const c = d.c;
-        var start = start_;
-        var n = n_;
-        if (rows_) |rs| if (rs.len != n or n > engine.most_window) return error.BadDraftRows;
-        if (start < ctx.end) ctx.end = start;
-        if (start > ctx.end) ctx.begin = start; // a gap (a prompt restored from a cache): the context starts here
-        const keep = @min(c.window, engine.tap_rows - engine.most_verify); // the target's ring holds no more behind its newest
-        if (n > keep) {
-            start += n - keep;
-            n = keep;
-            ctx.begin = start;
-        }
-        ctx.end = start;
+        if (rows_) |rs| if (rs.len != n_ or n_ > engine.most_window) return error.BadDraftRows;
+        const kept = lazy.open(ctx, start_, n_, d.limits().keep);
+        var start = kept.start;
+        var n = kept.n;
         const e = d.e;
         while (n > 0) {
             const rows = @min(n, max_rows);
@@ -372,7 +371,7 @@ pub const Draft = struct {
             n -= rows;
             ctx.end = start;
         }
-        if (ctx.end > c.window and ctx.begin < ctx.end - c.window) ctx.begin = ctx.end - c.window;
+        lazy.close(ctx, c.window);
     }
 
     /// A warmup or standalone hold goes through the same batched frame as shared lane holds.
@@ -472,9 +471,13 @@ pub const Draft = struct {
             }
             ctx.grown = 0;
             // the target's features: its ring, `offset` the first row's position (cuda_native.zig's featuresFn)
-            if (it.rows) |rs| {
-                try d.absorb(ctx, it.features.buffer, it.features.offset, rs.len, rs, it.prompt);
-            } else try d.absorb(ctx, it.features.buffer, it.features.offset, it.features.rows, null, it.prompt);
+            const f = it.features;
+            if (it.prompt and it.rows == null) {
+                try lazy.put(d, ctx, .{ .ring = f.buffer, .start = f.offset, .n = f.rows }, d.limits());
+                continue;
+            }
+            try lazy.flush(d, ctx);
+            try d.absorb(ctx, f.buffer, f.offset, if (it.rows) |rs| rs.len else f.rows, it.rows, it.prompt);
         }
     }
 
@@ -487,6 +490,7 @@ pub const Draft = struct {
         var contexts: [frame.max_streams]*Ctx = undefined;
         for (items, contexts[0..items.len]) |it, *ctx| {
             ctx.* = d.streams.get(it.stream) orelse return error.UnknownStream;
+            try lazy.flush(d, ctx.*);
             frame.scan(ctx.*, it.tokens);
         }
         try d.forward(items, contexts[0..items.len]);
@@ -561,6 +565,7 @@ pub fn timing(what: []const u8, io: std.Io, t0: std.Io.Timestamp) void {
 test {
     _ = tree;
     _ = @import("cuda_draft_copy_test.zig");
+    _ = @import("cuda_draft_lazy_test.zig");
 }
 
 test "a drafter config with a zero divisor is refused, and any admitted rank's selector rows fit the staging area" {
