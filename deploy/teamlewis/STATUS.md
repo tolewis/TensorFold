@@ -20,7 +20,7 @@ Updated by tf-unify (Cursor). Tim reads this in the morning.
 | Host | Inventory (Z) | Live binary / engine | Swap |
 |------|---------------|----------------------|------|
 | inference1 | 03:48Z | `tensorfold-native-tp2-c5acd064-W5-k1c3-rf2-p4ship7`, fork `cbd2babae` | pending |
-| jubiku-linux | 03:48Z | `690e93f6-fleetserve-tp1-skx`; lane tests `ab047651` | pending (wait for jubiku-p4 idle) |
+| jubiku-linux | 03:48Z | `c664084e-fleet-tp1-skx` | 2026-11-12T21:12Z switched to fleet c664084e by lead decision (window no-loss, judge FAIL under the +3% gain rule); K1B out; 100k sanity 65.6 tok/s, health+chat 200, xe 0 |
 | popeye | 03:50Z | upstream build 1.2.7 cuda, health 200 | pending (do not fight live agent) |
 | ascent01 | 03:48Z | Mia kit `31457d0`, container up | pending |
 
