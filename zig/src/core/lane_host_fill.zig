@@ -22,7 +22,7 @@ fn took(h: *const LaneHost, at: usize) usize {
 fn pick(h: *const LaneHost, among: enum { all, short, long }) ?usize {
     var found: ?usize = null;
     for (h.filling.items, 0..) |j, i| {
-        if (among != .all and short(j) != (among == .short)) continue;
+        if (among != .all and short(h, j) != (among == .short)) continue;
         const at = found orelse {
             found = i;
             continue;
@@ -203,7 +203,7 @@ fn policyRun(h: *LaneHost) void {
 
 /// The first long prompt in `filling`, which is in admission order: admitOne appends, removal keeps the order.
 fn oldestLong(h: *const LaneHost) ?usize {
-    for (h.filling.items, 0..) |j, i| if (!short(j)) return i;
+    for (h.filling.items, 0..) |j, i| if (!short(h, j)) return i;
     return null;
 }
 
