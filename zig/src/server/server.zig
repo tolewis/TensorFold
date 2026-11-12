@@ -18,9 +18,13 @@ const prompt = @import("prompt.zig");
 const tool_specs = @import("tool_specs.zig");
 const chunk_plan = @import("chunk_plan.zig");
 const log = @import("log.zig");
+const prepare_gate = @import("prepare_gate.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
+
+/// A kept-alive connection's arena keeps at most this much between its requests.
+const connection_keep: usize = 1 << 20;
 
 /// auto compacts near the window. fraction compacts past that share of it.
 pub const CompactAt = union(enum) { auto, fraction: f64 };
@@ -50,6 +54,9 @@ pub const Config = struct {
     /// Directory of the stored note, or null when notes are not stored.
     compact_memory: ?[]const u8 = null,
     timeouts: http_conn.Timeouts = .{},
+    /// TENSORFOLD_PREPARE_FLOOR_GIB: the MemAvailable a prompt's render and tokenization leave at least while others
+    /// are in flight (prepare_gate); 0: no gate.
+    prepare_floor_gib: f64 = prepare_gate.default_floor_gib,
 };
 
 pub const Server = struct {
@@ -78,12 +85,14 @@ pub const Server = struct {
     /// The idle keepalive on the engine's queue, armed by --keep-warm; null when off or not Metal.
     keepalive: ?*api.keepalive.Keepalive = null,
     preparing: std.atomic.Value(i64) = .init(0),
+    /// Concurrent prompt preparations held under the memory floor (prepare_gate).
+    gate: prepare_gate.Gate = .{},
     arena: std.heap.ArenaAllocator,
 
     /// Reads what the template and tokenizer decide once: late system role, think markers, efforts, the forced close.
     pub fn init(gpa: Allocator, io: std.Io, engine: api.Engine, text: model_text.Text, config: Config, keys: ?*auth.Store) !*Server {
         const srv = try gpa.create(Server);
-        srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .arena = .init(gpa) };
+        srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .gate = .init(config.prepare_floor_gib), .arena = .init(gpa) };
         if (config.keep_warm_s > 0) if (engine.keepaliveTarget()) |target| {
             srv.keepalive = api.keepalive.Keepalive.start(gpa, io, target, @as(i64, config.keep_warm_s) * std.time.ns_per_s) catch |e| blk: {
                 log.line("idle keepalive off: {s}", .{@errorName(e)});
@@ -277,7 +286,9 @@ pub const Server = struct {
         var arena: std.heap.ArenaAllocator = .init(srv.gpa);
         defer arena.deinit();
         while (true) {
-            _ = arena.reset(.retain_capacity);
+            // a kept-alive connection keeps at most this much of its last request between requests (a long prompt's
+            // text and ids are tens of MiB, and retain_capacity held them until the connection closed)
+            _ = arena.reset(.{ .retain_with_limit = connection_keep });
             const a = arena.allocator();
             const outcome = conn.readRequest(a, true) catch break;
             switch (outcome) {
@@ -289,6 +300,7 @@ pub const Server = struct {
             if (conn.header("Expect")) |expect| if (std.ascii.eqlIgnoreCase(expect, "100-continue") and std.mem.order(u8, conn.version, "HTTP/1.1") != .lt) conn.sendContinue();
             routes.dispatch(srv, &conn, a);
             if (conn.close or conn.broken) break;
+            _ = arena.reset(.{ .retain_with_limit = connection_keep }); // (before waiting for the next request)
         }
     }
 

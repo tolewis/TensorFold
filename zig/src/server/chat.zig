@@ -13,6 +13,7 @@ const ids = @import("ids.zig");
 const clock = @import("clock.zig");
 const Server = @import("server.zig").Server;
 const chunk_plan = @import("chunk_plan.zig");
+const prepare_gate = @import("prepare_gate.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
@@ -154,6 +155,10 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
     var thinking = flag(f, "enable_thinking") orelse srv.config.enable_thinking;
     if (input.prompt != null) thinking = false;
     const effort = srv.effortFor(if (f.get("reasoning_effort")) |e| (if (e == .string) e.string else null) else null);
+    // the render and tokenization take memory in proportion to the text (twice: prompt and history); under the memory
+    // floor they wait for the ones in flight (prepare_gate), and hold the reservation until prepare returns
+    const ticket = try srv.gate.enter(io, srv.gate.need(promptBytes(input)), gone);
+    defer srv.gate.leave(io, ticket);
     const rendered = try prompt_mod.prepare(srv, cx, input, thinking, effort);
     if (gone.check()) return error.Cancelled;
     if (rendered.ids.len == 0) return cx.refuse("rendered prompt is empty");
@@ -266,6 +271,17 @@ fn logEnded(id: []const u8, e: Failure, message: []const u8, prompt: usize, toke
 pub fn run(srv: *Server, cx: *Cx, input: Input, sink: ?Sink, gone: anytype) Failure!Reply {
     if (srv.config.compact_at == null) return generate(srv, cx, try prepare(srv, cx, input, gone), sink, gone);
     return @import("compact.zig").run(srv, cx, input, sink, gone);
+}
+
+/// The text a request's prepare renders and tokenizes, in bytes (its reservation's measure).
+fn promptBytes(input: Input) usize {
+    var n = prepare_gate.textBytes(input.messages);
+    for (input.tools) |t| n +|= prepare_gate.textBytes(t);
+    if (input.prompt) |p| switch (p) {
+        .text => |t| n +|= t.len,
+        .ids => |toks| n +|= 4 * toks.len,
+    };
+    return n;
 }
 
 /// Give back a foreground request's preparing count: at its submit, or when it is never generated.

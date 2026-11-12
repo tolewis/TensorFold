@@ -9,6 +9,7 @@ const live = @import("live.zig");
 const listener_mod = @import("listener.zig");
 const model_text = @import("model_text.zig");
 const server_mod = @import("server.zig");
+const prepare_gate = @import("prepare_gate.zig");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
 
@@ -118,6 +119,10 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .compact_at = if (args.compact_auto) .{ .auto = {} } else if (args.compact_fraction) |f| .{ .fraction = f } else null,
         .compact_keep = args.compact_keep,
         .compact_memory = args.compact_memory,
+        .prepare_floor_gib = prepare_gate.floorGib(env(s, "TENSORFOLD_PREPARE_FLOOR_GIB")) catch {
+            std.debug.print("tensorfold: TENSORFOLD_PREPARE_FLOOR_GIB={s}: a number of GiB, 0 for no gate\n", .{env(s, "TENSORFOLD_PREPARE_FLOOR_GIB").?});
+            return 1;
+        },
     };
     const srv = server_mod.Server.init(gpa, io, s.engine, s.text, config, if (store.enabled()) &store else null) catch {
         std.debug.print("tensorfold: the server could not start\n", .{});
