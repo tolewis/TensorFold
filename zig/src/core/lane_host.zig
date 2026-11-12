@@ -918,6 +918,9 @@ pub const LaneHost = struct {
     fn fillOne(h: *LaneHost) void {
         const job = h.filling orelse return;
         // a piece is a pass's collectives too: under the stall monitor, and a broken pair ends it as addStream's does
+        // the job in its pass for Stream.between, as addStream's pass has it (its restore reported after a chunk)
+        h.passing = job;
+        defer h.passing = null;
         h.busyEnter();
         const stepped = h.core.fillStep();
         h.busyLeave();
