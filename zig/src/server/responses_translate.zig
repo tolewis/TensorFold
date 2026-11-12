@@ -257,12 +257,17 @@ pub fn translate(cx: *Cx, body: Value, history: anytype) errors.Refused!Request 
     if (body.get("include")) |inc| if (inc.truthy()) {
         var parts: std.ArrayList([]const u8) = .empty;
         switch (inc) {
-            .array => |items| for (items) |i| try parts.append(a, try tool_specs.pyStr(a, i)),
+            // reasoning.encrypted_content asks for nothing left out: reasoning comes as text in its reasoning item, and
+            // nothing is encrypted. Clients built on the Responses API (Pi and others) send it with every reasoning request.
+            .array => |items| for (items) |i| {
+                if (i == .string and std.mem.eql(u8, i.string, "reasoning.encrypted_content")) continue;
+                try parts.append(a, try tool_specs.pyStr(a, i));
+            },
             .object => |o| for (o.keys()) |k| try parts.append(a, k),
             .string => |s| for (0..s.len) |i| try parts.append(a, s[i .. i + 1]),
             else => try parts.append(a, try tool_specs.pyStr(a, inc)),
         }
-        return cx.fail(.request, "include is not supported ({s}): reasoning comes as text in its reasoning item, and nothing is encrypted", .{try std.mem.join(a, ", ", parts.items)});
+        if (parts.items.len > 0) return cx.fail(.request, "include is not supported ({s}): reasoning comes as text in its reasoning item, and nothing is encrypted", .{try std.mem.join(a, ", ", parts.items)});
     };
     if (body.field("truncation")) |t| if (!(t == .string and std.mem.eql(u8, t.string, "disabled"))) return cx.refuse("truncation must be \"disabled\": a prompt too long for the context is refused");
     if (json.truthyField(body, "top_logprobs")) return cx.refuse("top_logprobs is not supported");
