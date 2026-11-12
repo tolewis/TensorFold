@@ -154,13 +154,13 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     }
     const module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/qwen27_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     module.addImport("xpu_qwen27_kernels", embedded);
-    // the device runners' own `core` at `optimize` (Qwen27's FP64 references and headers, Nemotron's binaries)
-    const runner_core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
-    runner_core.addImport("gpu_memory", @import("gpu_memory.zig").module(b, target));
-    module.addImport("core", runner_core);
+    // the FP64 references of the weight formats (core/quant), for XPU_FP64_REF and XPU_FIDELITY
+    const core27 = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    core27.addImport("gpu_memory", @import("gpu_memory.zig").module(b, target));
+    module.addImport("core", core27);
     module.addImport("ze", ze_mod);
     const lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = optimize, .link_libc = true });
-    const nem = nemotronModules(b, target, optimize, ocloc, device, dpas, ze_mod, runner_core, lanes);
+    const nem = nemotronModules(b, target, optimize, ocloc, device, dpas, ze_mod, core, lanes);
     module.addImport("xpu", nem.xpu);
     const exe = b.addExecutable(.{ .name = "xpu-qwen27", .root_module = module });
     const install = b.addInstallArtifact(exe, .{});
@@ -185,7 +185,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         m.addImport("xpu_qwen27_kernels", embedded);
         m.addImport("ze", ze_mod);
         m.addImport("xpu", nem.xpu);
-        m.addImport("core", runner_core); // the drafter's EXL3 head (core/exl3_format.zig)
+        m.addImport("core", core27); // the drafter's EXL3 head (core/exl3_format.zig)
         tests_step.dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = t[0], .root_module = m }), .{}).step);
     }
 
@@ -196,7 +196,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     qwen27.addImport("xpu", nem.xpu);
     qwen27.addImport("sage_config", sage_mod.import_table.get("sage_config").?);
     qwen27.addImport("sage_load", sage_mod.import_table.get("sage_load").?);
-    qwen27.addImport("core", runner_core);
+    qwen27.addImport("core", core); // one core module in the xpu-native binary (Zig 0.17)
     // the runner's open rules (one runner at a time, every option back to the process's own), run on this host
     const host = b.graph.host.result;
     if (target.result.cpu.arch == host.cpu.arch and target.result.os.tag == host.os.tag) tests_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = qwen27 })).step);
@@ -252,7 +252,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const install_server = b.addInstallArtifact(server, .{ .dest_dir = .{ .override = .{ .custom = "xpu/bin" } } });
     b.step("xpu-native", "tensorfold-native with the XPU engines into zig-out/xpu/bin").dependOn(&install_server.step);
     // Nemotron's device binaries: the same modules over the runners' `core`, the SPIR-V images shared
-    var runners = family(b, target, optimize, runtime(b, target, optimize, &nem.images, ze_mod, runner_core, dpas), runner_core, lanes);
+    var runners = family(b, target, optimize, runtime(b, target, optimize, &nem.images, ze_mod, core27, dpas), core27, lanes);
     runners.images = nem.images;
     nemotronSteps(b, target, optimize, runners);
     const with_contract = b.option(bool, "xpu-contract", "Build the XPU kernel contract's limits audit (needs ocloc for the objects)") orelse false;
