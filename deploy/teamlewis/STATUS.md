@@ -13,7 +13,7 @@ Updated by tf-unify (Cursor). Tim reads this in the morning.
 | 5 Production swaps | | | not started (earliest 07:00Z; inference1 09:00Z) |
 | 6 inference1 gate | | | blocked until 09:00Z and kernel lane idle |
 | 7 Catalog update | | | pending after swaps |
-| 8 Push branches | 2026-11-12T03:56Z | | in progress |
+| 8 Push branches | 2026-11-12T03:57Z | `62635d1e5` | done |
 
 ## Hosts
 
