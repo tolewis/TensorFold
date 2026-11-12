@@ -28,6 +28,11 @@ pub var r16 = true;
 /// attn_k1_k16 (k1.cl), which reads and converts each K/V row once for the 16 rows. Chain and shared windows keep
 /// 8-row groups, as XPU_K1_R16=0. The values differ from the 8-row groups by f16 and fp32 rounding (k1.cl).
 pub var k16t = false;
+/// XPU_K1B (lane p4-kernel, K1B): attn_k1_decode with the reads of a tile ahead, the same bits (k1.cl). Bits 1 and 2
+/// pick the kernel: 1 attn_k1_b1 (K ahead), 2 attn_k1_b2 (V ahead at the start of PV), 3 attn_k1_b3 (V ahead right
+/// after the QK DPAS). Bit 4: the load check against attn_k1_decode (k1b_check.zig). Default 0: attn_k1_decode.
+pub var k1b: u32 = 0;
+pub const k1b_names = [_][:0]const u8{ "attn_k1_b1", "attn_k1_b2", "attn_k1_b3" };
 /// Set when the k1 image carries attn_k1_decode16 (k1.load); groups() only picks it when it does.
 pub var have16 = false;
 /// XPU_K1_TREE: the single-stream tree verify's prefix goes through K1, its draft keys through attn_k1_draft
@@ -48,6 +53,7 @@ pub fn readEnv() void {
         k16t = v[0] == '2';
         r16 = v[0] != '0' and !k16t;
     }
+    if (std.c.getenv("XPU_K1B")) |v| k1b = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0;
     if (std.c.getenv("XPU_K1_TREE")) |v| tree = v[0] != '0';
     multi_tree = tree; // the shared tree round follows the lone tree unless XPU_MULTI_TREE says
     if (std.c.getenv("XPU_MULTI_TREE")) |v| multi_tree = v[0] != '0';
