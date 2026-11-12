@@ -20,6 +20,7 @@ pub const few_tokens = 32;
 /// Token rows from which a pass's expert calls take the prompt kernels, over plans of `prompt_tile` pairs an item.
 pub const prompt_tokens = 128;
 const prompt4w_shared: u32 = 4 * 13824; // tf_ck4_prompt2: QSTAGES * sizeof(Step2)
+const lane_w_shared: u32 = 3 * 24576; // tf_ck8_256r: WSTAGES * sizeof(Step)
 
 /// Pairs a prompt plan item holds: ck_experts.cu's prompt tile rows (decode plans hold 16).
 pub const prompt_tile = 128;
@@ -59,6 +60,7 @@ pub const Ck = struct {
     experts_mod: Module,
     lane: [10]Function, // row tiles 16, 32, 64, 64 skipping, 128 skipping (128 x 128 clustered); plain then clustered
     lane_r: [2]Function, // the 128-row prompt tile with the checkpoint's own per-row scales: plain, clustered
+    lane_w_fn: Function, // the plain one on a 128 x 256 tile, for a column count that 256 divides
     quant8_rows_fn: Function, // per-row activation scale, then e4m3 rows
     quant4_rows_fn: Function, // NVFP4 rows under the checkpoint's input scale: codes then block scales
     prompt4_fn: Function, // the NVFP4 prompt GEMM (block-scaled FP4 mma)
@@ -96,6 +98,8 @@ pub const Ck = struct {
         try c.prompt4w_fn.allowDynamicShared(prompt4w_shared);
         for ([_][:0]const u8{ "tf_ck8_128r", "tf_ck8_128rc" }, &c.lane_r) |name, *f| f.* = try lane_mod.function(name);
         try c.lane_r[1].allowDynamicShared(65536);
+        c.lane_w_fn = try lane_mod.function("tf_ck8_256r");
+        try c.lane_w_fn.allowDynamicShared(lane_w_shared);
         c.quant4_fn = try experts_mod.function("tf_ck_quant4");
         c.pack4_fn = try experts_mod.function("tf_ck_pack4");
         c.pack4_scales_fn = try experts_mod.function("tf_ck_pack4_scales");
@@ -195,10 +199,14 @@ pub const Ck = struct {
         const sk: u32 = 1;
         const cluster = sk > 1 and sk <= 8 and c.clusters;
         if (sk > 1 and !cluster) return error.NeedsPartials;
-        const bn: usize = if (cluster) 128 else 64;
-        const stage = (128 * 64 + bn * 64 + 127) / 128 * 128;
-        const smem: u32 = @intCast(@max(4 * stage, if (cluster) 128 * bn * 4 else 0));
         const rows_t = (m + 127) / 128;
+        // Both tiles give a row the same bits. The wide one holds an SM a block: it wins when its grid fills three
+        // quarters or more of each pass over the SMs.
+        const wide_grid = rows_t * (w.n / 256);
+        const wide = !cluster and w.n % 256 == 0 and 4 * wide_grid >= 3 * c.sms * ((wide_grid + c.sms - 1) / c.sms);
+        const bn: usize = if (wide) 256 else if (cluster) 128 else 64;
+        const stage = (128 * 64 + bn * 64 + 127) / 128 * 128;
+        const smem: u32 = if (wide) lane_w_shared else @intCast(@max(4 * stage, if (cluster) 128 * bn * 4 else 0));
         const group = @max(1, @min(rows_t, (12 << 20) / (128 * w.k)));
         var a: launch_.Args = .{};
         a.add(x8);
@@ -209,7 +217,7 @@ pub const Ck = struct {
         for ([_]usize{ m, w.n, w.k, sk, group }) |v| a.add(@as(i32, @intCast(v)));
         a.add(sa);
         a.add(w.scales);
-        try launch_.launch(c.lane_r[@intFromBool(cluster)], .{
+        try launch_.launch(if (wide) c.lane_w_fn else c.lane_r[@intFromBool(cluster)], .{
             .grid = .{ .x = @intCast(rows_t * ((w.n + bn - 1) / bn)), .y = 1, .z = sk },
             .block = .{ .x = 256, .y = 1, .z = 1 },
             .shared = smem,

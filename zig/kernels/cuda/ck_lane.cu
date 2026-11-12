@@ -422,3 +422,4 @@ extern "C" __global__ void __launch_bounds__(256)
 }
 
 #include "ck4_prompt2.cuh"
+#include "ck8_wide.cuh"
