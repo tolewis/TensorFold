@@ -1447,6 +1447,15 @@ pub const EngramHost = struct {
         const hi = (rank + 1) * cols / world;
         const k = hi - lo;
         const t = tables.layers.get(@intCast(c.engram_layers.slice()[0])) orelse return error.MissingEngramTable;
+        // a table short of any column's ids would fail one rank's reads and not the other's (the ranks split the
+        // columns): both refuse it here, before any collective, from the same tables and the same hasher
+        for (c.engram_layers.slice(), 0..) |id, l| {
+            const tl = tables.layers.get(@intCast(id)) orelse return error.MissingEngramTable;
+            if (tl.rows < hasher.rowsNeeded(l)) {
+                std.log.warn("dsv41: Engram layer {d}'s table has {d} rows; its hashes reach {d}", .{ id, tl.rows, hasher.rowsNeeded(l) });
+                return error.BadEngramTable;
+            }
+        }
         var aw: [2][]u8 = .{ &.{}, &.{} };
         var as: [2][]u8 = .{ &.{}, &.{} };
         var ar: [2][]u16 = .{ &.{}, &.{} };
@@ -1489,7 +1498,7 @@ pub const EngramHost = struct {
 /// as engramApply would at the layer. Errors land in ahead_err.
 pub fn engramReadAhead(eh: *EngramHost, c: *const Config, seq: []const i32, start: usize, n: usize, j: usize) void {
     engramAhead1(eh, c, seq, start, n, j) catch |err| {
-        eh.ahead_err = err;
+        eh.ahead_err = rankFault(err);
     };
 }
 
@@ -1497,7 +1506,7 @@ pub fn engramReadAhead(eh: *EngramHost, c: *const Config, seq: []const i32, star
 pub fn engramReadAheadAll(eh: *EngramHost, c: *const Config, seq: []const i32, start: usize, n: usize) void {
     for (0..@min(2, c.engram_layers.slice().len)) |j| {
         engramAhead1(eh, c, seq, start, n, j) catch |err| {
-            eh.ahead_err = err;
+            eh.ahead_err = rankFault(err);
             return;
         };
     }
@@ -1517,6 +1526,21 @@ fn engramAhead1(eh: *EngramHost, c: *const Config, seq: []const i32, start: usiz
     if (eh.paio) |aio| try aioGather(aio, t, eh.ahead_flat[j][0..m], eh.ahead_w[j][0 .. m * t.row_w], eh.ahead_s[j][0 .. m * t.row_s]) else try eh.pool.gather(t, eh.ahead_flat[j][0..m], eh.ahead_w[j][0 .. m * t.row_w], eh.ahead_s[j][0 .. m * t.row_s]);
     engram.decodeRows(eh.ahead_w[j][0 .. m * t.row_w], eh.ahead_s[j][0 .. m * t.row_s], eh.ahead_rows[j][0 .. m * t.row_w], m, t.row_w, t.row_s, 8);
     eh.ahead_ready[j] = true;
+}
+
+/// An Engram row read that failed on this rank alone (a disk or memory fault; the peer's own read went through) leaves
+/// this rank without its part of the layer's allGather while the peer waits in it, so the ranks cannot go on together:
+/// the error becomes EngramRankFault, which ends the pair (round.pair_ending) instead of failing one request. It is
+/// applied where a read's error is made or stored (engramRows, the read-ahead, TF_DS_ENGRAM_LEAD's reader). Any other
+/// error passes through unchanged.
+pub fn rankFault(err: anyerror) anyerror {
+    switch (err) {
+        error.ReadFailed, error.EndOfFile, error.OutOfMemory, error.RowOutOfRange => {
+            std.log.warn("dsv41: an Engram row read failed on this rank ({s}); the ranks end", .{@errorName(err)});
+            return error.EngramRankFault;
+        },
+        else => return err,
+    }
 }
 
 /// Layer slot l's decoded rows of chunk [start, start + n) (engramApply's host part): read ahead if ready, else here.
@@ -1540,7 +1564,8 @@ pub fn engramRows(eh: *EngramHost, l: usize, t: engram_io.Table, seq: []const i3
     }
     // (TF_DS_ENGRAM_LEAD: on this layer's ring, its reader joined; the other layer's may be reading on its own)
     const ring = if (lead) eh.lead_ring[l] else eh.paio;
-    if (ring) |aio| try aioGather(aio, t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]) else try eh.pool.gather(t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]);
+    const read = if (ring) |aio| aioGather(aio, t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]) else eh.pool.gather(t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]);
+    read catch |err| return rankFault(err);
     engram.decodeRows(eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s], eh.rows[0 .. m * t.row_w], m, t.row_w, t.row_s, 8); // the rows on 8 threads
     return eh.rows[0 .. m * t.row_w];
 }
@@ -1721,4 +1746,11 @@ test "hd ** -0.5 as the served build passes it" {
 fn notPorted(src: std.builtin.SourceLocation) error{NotPortedYet} {
     std.debug.print("{{\"not_ported\": \"{s}:{d}\"}}\n", .{ src.file, src.line });
     return error.NotPortedYet;
+}
+
+test "rankFault: a read this rank could not make ends the pair; other errors pass through" {
+    for ([_]anyerror{ error.ReadFailed, error.EndOfFile, error.OutOfMemory, error.RowOutOfRange }) |err|
+        try std.testing.expectEqual(@as(anyerror, error.EngramRankFault), rankFault(err));
+    for ([_]anyerror{ error.EngramRankFault, error.TooManyRows, error.MissingEngramTable, error.BadSize, error.CommAborted, error.PairBroken, error.RingFailed }) |err|
+        try std.testing.expectEqual(err, rankFault(err));
 }

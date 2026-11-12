@@ -49,15 +49,16 @@ pub const Tables = struct {
                 const layer = try layerOf(name);
                 const en = try entry(kv.value_ptr.*);
                 if (opened == null) {
+                    try t.fds.ensureUnusedCapacity(gpa, 2); // (an fd opened below always has its slot: none leaks)
                     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
                     if (fd < 0) return error.FileNotFound;
-                    try t.fds.append(gpa, fd);
+                    t.fds.appendAssumeCapacity(fd);
                     opened = fd;
                     // and through O_DIRECT where the file system allows it
                     var df = dio.File.open(path) catch null;
                     if (df) |*f| {
                         if (f.direct) {
-                            try t.fds.append(gpa, f.fd);
+                            t.fds.appendAssumeCapacity(f.fd);
                             direct = f.fd;
                         } else f.close();
                     }
@@ -162,14 +163,13 @@ pub const Pool = struct {
     };
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, n: usize) !*Pool {
+        const threads = try gpa.alloc(std.Thread, n);
+        errdefer gpa.free(threads);
         const p = try gpa.create(Pool);
-        p.* = .{ .io = io, .threads = try gpa.alloc(std.Thread, n) };
+        errdefer gpa.destroy(p);
+        p.* = .{ .io = io, .threads = threads };
         var started: usize = 0;
-        errdefer {
-            p.shutdown(started);
-            gpa.free(p.threads);
-            gpa.destroy(p);
-        }
+        errdefer p.shutdown(started);
         for (p.threads) |*th| {
             th.* = try std.Thread.spawn(.{}, loop, .{p});
             started += 1;

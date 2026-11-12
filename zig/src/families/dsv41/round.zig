@@ -1461,10 +1461,11 @@ pub const Graphs = struct {
 
 /// A round's errors after which the ranks cannot go on together: the ring or the communicator dead (RingFailed,
 /// CommAborted), a decode round's ring transfers out of their fixed order or row lists (RingOrder, ShardRingOrder,
-/// BadRingRows: a sized send may be in flight with no receive, or the peer waits in a collect). Rank 0 ends the pair
+/// BadRingRows: a sized send may be in flight with no receive, or the peer waits in a collect), a prompt chunk's Engram
+/// rows that one rank could not read (EngramRankFault: the peer waits in the layer's allGather). Rank 0 ends the pair
 /// on each (native.pair_fatal: TF_DS_PAIR_BROKEN=exit exits 75, both ranks restart); a follower stops following
 /// (lanes.followPair) instead of taking the next frame.
-pub const pair_ending = [_]anyerror{ error.RingFailed, error.CommAborted, error.RingOrder, error.ShardRingOrder, error.BadRingRows };
+pub const pair_ending = [_]anyerror{ error.RingFailed, error.CommAborted, error.RingOrder, error.ShardRingOrder, error.BadRingRows, error.EngramRankFault };
 
 pub fn endsPair(err: anyerror) bool {
     for (pair_ending) |x| if (x == err) return true;

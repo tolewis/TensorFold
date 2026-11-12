@@ -1544,13 +1544,20 @@ fn refused(err: anyerror) void {
     std.debug.print("{{\"follow_refused\": \"{s}\"}}\n", .{@errorName(err)});
 }
 
-/// A round this rank could not finish: refused as above, unless the error means the ranks cannot go on together
+/// A round or a prompt chunk this rank could not finish: refused as above, unless the error means the ranks cannot go on together
 /// (round.pair_ending: the ring's order or rows broken, a sized send or the peer's collect pending, the ring or the
 /// communicator dead). Then the follower ends with it (rank 0 ends the pair for the same error, native.pair_fatal, or
 /// sees this rank's link go down) instead of taking the next frame.
 fn roundRefused(err: anyerror) !void {
     refused(err);
     if (round.endsPair(err)) return err;
+}
+
+test "a follower ends on an error that parts the ranks, and refuses the rest" {
+    try roundRefused(error.NoFreeSlot);
+    try roundRefused(error.ReadFailed); // (a raw read error is made EngramRankFault where it is raised)
+    try std.testing.expectError(error.EngramRankFault, roundRefused(error.EngramRankFault));
+    try std.testing.expectError(error.CommAborted, roundRefused(error.CommAborted));
 }
 
 /// A follower's verify times with Model.prof (a profile on ranks 1-3: rounds, issue and wall ns summed).
@@ -1780,6 +1787,12 @@ pub fn followPair(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower, fx:
     defer for (&seqs) |*q| q.deinit(gpa);
     var win_ids: [max_streams]std.ArrayList(i32) = @splat(.empty);
     defer for (&win_ids) |*q| q.deinit(gpa);
+    // on every exit, before `seqs` goes: the Engram readers (the read-ahead, TF_DS_ENGRAM_LEAD's) may still be reading
+    // a prompt's ids, and an exit from a bad frame comes before the join the loop does for the next frame
+    defer {
+        m.joinAhead();
+        m.fill_seq = &.{};
+    }
     var built: Built = .{};
     var step: u64 = 0;
     var slot: usize = 0;
@@ -1871,7 +1884,8 @@ pub fn followPair(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower, fx:
                 if (start + n > seqs[slot].items.len) return error.BadChunk;
                 if (m.fill_seq.len == 0) m.fill_seq = seqs[slot].items; // a piece after a round: the read-ahead again
                 if (spill) |sd| sd.bump(fill_base + start, fill_base + start + n);
-                _ = m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay) catch |err| refused(err);
+                // an error that parts the ranks (an Engram read this rank could not make) ends the follower; rank 0 ends the pair
+                if (m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay)) |_| {} else |err| try roundRefused(err);
             },
             .verify => {
                 const nw = try r.int(u32);

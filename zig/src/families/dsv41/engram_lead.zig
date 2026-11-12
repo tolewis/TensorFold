@@ -83,7 +83,7 @@ pub const Lead = struct {
 /// Lead's reader of layer j: the chunk's rows into ahead_rows[j] as engramRows reads them; errors land in lead_err[j].
 fn read(eh: *EngramHost, c: *const Config, seq: []const i32, start: usize, n: usize, j: usize) void {
     read1(eh, c, seq, start, n, j) catch |err| {
-        eh.lead_err[j] = err;
+        eh.lead_err[j] = prompt.rankFault(err);
     };
 }
 
@@ -244,4 +244,143 @@ test "TF_DS_ENGRAM_LEAD: each layer's rows of the next chunk are read while this
     ld.reset(&eh);
     try std.testing.expectEqual(@as(usize, 6), try Pass.run(a, &ld, &eh, &c, tabs, &p2, 2, 5, null));
     try std.testing.expectEqual(@as(u64, 8), eh.lead_late);
+}
+
+test "an Engram read this rank could not make ends the pair at the layer, on every path" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var why: @import("config.zig").Why = .{};
+    var c = try @import("config.zig").parse(a, @import("config.zig").test_config, &why);
+    c.engram_vocab = 10;
+    c.engram_heads = 1;
+    c.engram_pad = 0;
+    var map: [40]i32 = undefined;
+    for (&map, 0..) |*x, i| x.* = @intCast((i * 7 + 3) % 31);
+    const hasher = engram.Hasher.init(c, &map, .{ .{ 3, 5, 7, 9 }, .{ 11, 13, 15, 17 } });
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // the header of the toy tables, and a single byte of their data: every row read runs past the end of the file
+    const whole = try leadToyFile(a, .{ 41, 71 });
+    const header = 8 + std.mem.readInt(u64, whole[0..8], .little);
+    try tmp.dir.writeFile(io, .{ .sub_path = "engram.safetensors", .data = whole[0 .. header + 1] });
+    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    var tables = try engram_io.Tables.open(gpa, io, dir);
+    defer tables.close();
+    const pool = try engram_io.Pool.init(gpa, io, 2);
+    defer pool.deinit(gpa);
+    const cap = 8;
+    var eh = try EngramHost.init(a, &c, hasher, &tables, pool, 1, 2, cap);
+    var rings: [2]*engram_aio.Aio = undefined;
+    for (&rings, 0..) |*r, i| r.* = engram_aio.Aio.init(gpa, io, 64) catch |err| {
+        for (rings[0..i]) |x| x.deinit();
+        return if (err == error.AioUnavailable) error.SkipZigTest else err;
+    };
+    defer for (rings) |r| r.deinit();
+    const tabs = [2]engram_io.Table{ tables.layers.get(1).?, tables.layers.get(14).? };
+    var seq: [cap]i32 = undefined;
+    for (&seq, 0..) |*x, i| x.* = @intCast((i * 13 + 5) % 40);
+    const round_mod = @import("round.zig");
+    const fault: anyerror = error.EngramRankFault;
+
+    // read at the layer, by the pool's preads and by the prompt's ring
+    try std.testing.expectError(error.EngramRankFault, prompt.engramRows(&eh, 0, tabs[0], &seq, 0, cap));
+    eh.paio = rings[0];
+    try std.testing.expectError(error.EngramRankFault, prompt.engramRows(&eh, 0, tabs[0], &seq, 0, cap));
+    // the read-ahead
+    eh.ahead_err = null;
+    prompt.engramReadAhead(&eh, &c, &seq, 0, cap, 0);
+    try std.testing.expectEqual(fault, eh.ahead_err.?);
+    eh.ahead_err = null;
+    prompt.engramReadAheadAll(&eh, &c, &seq, 0, cap);
+    try std.testing.expectEqual(fault, eh.ahead_err.?);
+    // TF_DS_ENGRAM_LEAD's readers: the layer's wait returns the fault, for each layer
+    try eh.useLead(a, cap, rings);
+    var ld: Lead = .{};
+    defer ld.joinAll();
+    ld.reset(&eh);
+    ld.begin(&eh, &c, &seq, 0, cap);
+    for (0..2) |j| {
+        const err = ld.before(&eh, j, 0, cap);
+        try std.testing.expectError(error.EngramRankFault, err);
+        if (j == 0) ld.after(&eh, &c, &seq, 0, cap, 0, null, 0); // (layer 1's reader starts after layer 0)
+    }
+    // and all of them end the pair
+    try std.testing.expect(round_mod.endsPair(fault));
+}
+
+test "a table short of any column's ids is refused at start on both ranks, before a read can part them" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var why: @import("config.zig").Why = .{};
+    var c = try @import("config.zig").parse(a, @import("config.zig").test_config, &why);
+    c.engram_vocab = 10;
+    c.engram_heads = 1;
+    c.engram_pad = 0;
+    var map: [40]i32 = undefined;
+    for (&map, 0..) |*x, i| x.* = @intCast((i * 7 + 3) % 31);
+    const hasher = engram.Hasher.init(c, &map, .{ .{ 3, 5, 7, 9 }, .{ 11, 13, 15, 17 } });
+    try std.testing.expectEqual(@as(u64, 41), hasher.rowsNeeded(0));
+    try std.testing.expectEqual(@as(u64, 71), hasher.rowsNeeded(1));
+    const pool = try engram_io.Pool.init(gpa, io, 2);
+    defer pool.deinit(gpa);
+    // rank 0 reads column 0 (rows < 11), rank 1 columns 1 and 2 (up to 41): 40 rows serve rank 0 and fail rank 1
+    for ([_][2]usize{ .{ 40, 71 }, .{ 41, 70 } }) |rows| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(io, .{ .sub_path = "engram.safetensors", .data = try leadToyFile(a, rows) });
+        const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+        var tables = try engram_io.Tables.open(gpa, io, dir);
+        defer tables.close();
+        for (0..2) |rank| try std.testing.expectError(error.BadEngramTable, EngramHost.init(a, &c, hasher, &tables, pool, rank, 2, 8));
+    }
+    // whole tables open on both
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "engram.safetensors", .data = try leadToyFile(a, .{ 41, 71 }) });
+    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    var tables = try engram_io.Tables.open(gpa, io, dir);
+    defer tables.close();
+    for (0..2) |rank| _ = try EngramHost.init(a, &c, hasher, &tables, pool, rank, 2, 8);
+}
+
+fn openFds() !usize {
+    var d = try std.Io.Dir.cwd().openDir(std.testing.io, "/proc/self/fd", .{ .iterate = true });
+    defer d.close(std.testing.io);
+    var n: usize = 0;
+    var it = d.iterate();
+    while (try it.next(std.testing.io)) |_| n += 1;
+    return n;
+}
+
+fn openTables(gpa: std.mem.Allocator, dir: []const u8) !void {
+    var t = try engram_io.Tables.open(gpa, std.testing.io, dir);
+    t.close();
+}
+
+fn openPool(gpa: std.mem.Allocator) !void {
+    const p = try engram_io.Pool.init(gpa, std.testing.io, 2);
+    p.deinit(gpa);
+}
+
+test "the Engram tables and the read pool, failing at any allocation, leave no memory and no descriptor behind" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "engram.safetensors", .data = try leadToyFile(a, .{ 41, 71 }) });
+    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const before = try openFds();
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, openTables, .{dir});
+    try std.testing.expectEqual(before, try openFds());
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, openPool, .{});
 }

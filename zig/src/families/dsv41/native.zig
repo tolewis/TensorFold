@@ -307,6 +307,7 @@ pub const pair_fatal = [_]api.LaneHost.Fatal{
     .{ .err = error.RingOrder, .drain = false },
     .{ .err = error.ShardRingOrder, .drain = false },
     .{ .err = error.BadRingRows, .drain = false },
+    .{ .err = error.EngramRankFault, .drain = false },
 };
 
 /// Loaded.pair: the hooks the server wires to its lane host (native/cuda.zig).
@@ -673,6 +674,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.BadPairBroken => "TF_DS_PAIR_BROKEN: exit (the default: a broken rank pair ends the server with status 75 for its supervisor to restart both ranks) or degrade (requests fail one by one, the server stays up)",
         error.CommAborted => "the ranks' NCCL communicator was aborted after a broken pair (a transfer that never completed): the server restarts both ranks",
         error.RingFailed => "the ranks' RDMA ring failed (the peer stopped answering, or the ring was aborted after a broken pair): the server restarts both ranks",
+        error.EngramRankFault => "a prompt chunk's Engram rows could not be read on one rank (its disk or memory failed; the other rank waits for it in the layer's collective, so the pair ends): the server restarts both ranks; if it recurs, check the Engram tables' disk",
         else => null,
     };
 }
@@ -730,6 +732,11 @@ test "a round's pair-ending errors end the pair on rank 0 (none drains) and are 
         try std.testing.expect(explain(null, err) != null);
     }
     for ([_]anyerror{ error.RingOrder, error.ShardRingOrder, error.BadRingRows, error.RingFailed }) |err| try std.testing.expect(round.endsPair(err));
+    // a prompt chunk's Engram rows that one rank could not read: the peer waits in the layer's allGather
+    try std.testing.expect(round.endsPair(error.EngramRankFault));
+    try std.testing.expect(!round.endsPair(error.ReadFailed));
+    try std.testing.expect(!round.endsPair(error.OutOfMemory));
+    try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.ReadFailed));
     try std.testing.expect(!round.endsPair(error.NoFreeSlot));
     try std.testing.expect(!round.endsPair(error.ContextFull));
 }

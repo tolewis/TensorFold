@@ -365,6 +365,13 @@ pub const Model = struct {
         try m.stream.synchronize();
         try d.check(d.api.cuCtxSynchronize(), "cuCtxSynchronize"); // the setup's legacy-stream copies too
 
+        // whatever the Engram setup below has made goes if the open fails after it (close() only runs for an open model);
+        // registered here, not inside the block, so a later failure runs them too
+        errdefer if (m.tables) |*t| t.close();
+        errdefer if (m.epool) |p| p.deinit(gpa);
+        errdefer if (m.aio) |x| x.deinit();
+        errdefer if (m.paio) |x| x.deinit();
+        errdefer if (m.paio2) |x| x.deinit();
         // Engram on the host: the compressed token map, the multipliers, the tables and 64 readers
         if (o.engram_dir) |edir| {
             const map_text = try std.Io.Dir.cwd().readFileAlloc(io, o.token_map orelse return error.NoTokenMap, a, .limited(1 << 26));

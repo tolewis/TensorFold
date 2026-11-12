@@ -156,21 +156,22 @@ pub const Aio = struct {
             if (!busy) break;
             a.reap();
         }
-        const id = a.next_id;
-        a.next_id += 1;
-        var b: Batch = .{
-            .first = a.head,
-            .n = reads,
-            .left = reads,
-            .touch = out_w == null,
-            .dst = try a.gpa.alloc(?[*]u8, reads),
-            .skew = try a.gpa.alloc(usize, reads),
-            .bytes = try a.gpa.alloc(usize, reads),
-        };
+        // everything that can fail comes before anything is committed: a failure here leaves `head`, the map and the
+        // list as they were, so no batch is recorded that was never submitted (deinit would wait on it forever)
+        try a.batches.ensureUnusedCapacity(a.gpa, 1);
+        try a.live.ensureUnusedCapacity(a.gpa, 1);
+        const dst = try a.gpa.alloc(?[*]u8, reads);
+        errdefer a.gpa.free(dst);
+        const skew = try a.gpa.alloc(usize, reads);
+        errdefer a.gpa.free(skew);
+        const bytes = try a.gpa.alloc(usize, reads);
+        errdefer a.gpa.free(bytes);
         const cbs = try a.gpa.alloc(Iocb, reads);
         defer a.gpa.free(cbs);
         const ptrs = try a.gpa.alloc(*Iocb, reads);
         defer a.gpa.free(ptrs);
+        const id = a.next_id;
+        var b: Batch = .{ .first = a.head, .n = reads, .left = reads, .touch = out_w == null, .dst = dst, .skew = skew, .bytes = bytes };
         for (0..reads) |j| {
             const i = j >> 1;
             const sc = j & 1 == 1;
@@ -191,9 +192,10 @@ pub const Aio = struct {
             };
             ptrs[j] = &cbs[j];
         }
+        a.next_id += 1;
         a.head += reads;
-        try a.batches.put(a.gpa, id, b);
-        try a.live.append(a.gpa, .{ id, b.first });
+        a.batches.putAssumeCapacity(id, b);
+        a.live.appendAssumeCapacity(.{ id, b.first });
         var sent: usize = 0;
         while (sent < reads) {
             const r = ioSubmit(a.ctx, reads - sent, ptrs[sent..].ptr);
@@ -348,4 +350,73 @@ test "a refused row id leaves the ring and its allocations as they were" {
     try aio.wait(id);
     try std.testing.expectEqualSlices(u8, &want_w, &w);
     try std.testing.expectEqualSlices(u8, &want_s, &sc);
+}
+
+test "an allocation failure while submitting commits nothing and leaks nothing" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const rows = 40;
+    var json_buf: [256]u8 = undefined;
+    const json = try std.fmt.bufPrint(&json_buf, "{{\"layers.1.engram.embed.weight\":{{\"dtype\":\"U8\",\"shape\":[{d},100],\"data_offsets\":[0,{d}]}},\"layers.1.engram.embed.scale\":{{\"dtype\":\"U8\",\"shape\":[{d},3],\"data_offsets\":[{d},{d}]}}}}", .{ rows, rows * 100, rows, rows * 100, rows * 103 });
+    var file: std.ArrayList(u8) = .empty;
+    defer file.deinit(a);
+    var len: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len, json.len, .little);
+    try file.appendSlice(a, &len);
+    try file.appendSlice(a, json);
+    for (0..rows * 103) |i| try file.append(a, @intCast((i * 7 + 3) % 251));
+    try tmp.dir.writeFile(io, .{ .sub_path = "engram.safetensors", .data = file.items });
+    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer a.free(dir);
+    var t = try engram_io.Tables.open(a, io, dir);
+    defer t.close();
+    const tab = t.layers.get(1).?;
+    const pool = try engram_io.Pool.init(a, io, 2);
+    defer pool.deinit(a);
+    var want_w: [3 * 100]u8 = undefined;
+    var want_s: [3 * 3]u8 = undefined;
+    const ids = [_]i64{ 5, 17, rows - 1 };
+    try pool.gather(tab, &ids, &want_w, &want_s);
+
+    // fail the k-th allocation of one submission, for every k until the submission goes through
+    inline for (.{ false, true }) |touch| {
+        var k: usize = 0;
+        while (true) : (k += 1) {
+            var failing = std.testing.FailingAllocator.init(a, .{});
+            const aio = Aio.init(failing.allocator(), io, 16) catch |e| switch (e) {
+                error.AioUnavailable => return error.SkipZigTest,
+                else => return e,
+            };
+            failing.fail_index = failing.alloc_index + k;
+            var got_w: [3 * 100]u8 = @splat(0);
+            var got_s: [3 * 3]u8 = @splat(0);
+            const sub = if (touch) aio.touch(tab, &ids) else aio.start(tab, &ids, &got_w, &got_s);
+            if (sub) |id| {
+                if (!touch) {
+                    try aio.wait(id);
+                    try std.testing.expectEqualSlices(u8, &want_w, &got_w);
+                    try std.testing.expectEqualSlices(u8, &want_s, &got_s);
+                }
+                aio.deinit();
+                try std.testing.expect(k >= 5); // every allocation of the submission was tried
+                break;
+            } else |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                // nothing was recorded or issued: no read to wait for, and the ring starts where it did
+                try std.testing.expect(!aio.inFlight());
+                try std.testing.expectEqual(@as(usize, 0), aio.batches.count());
+                try std.testing.expectEqual(@as(u64, 0), aio.head);
+                // the next submission works
+                failing.fail_index = std.math.maxInt(usize);
+                const id = try aio.start(tab, &ids, &got_w, &got_s);
+                try aio.wait(id);
+                try std.testing.expectEqualSlices(u8, &want_w, &got_w);
+                try std.testing.expectEqualSlices(u8, &want_s, &got_s);
+                aio.deinit();
+            }
+        }
+    }
 }

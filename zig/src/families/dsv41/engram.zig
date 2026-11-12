@@ -92,6 +92,12 @@ pub const Hasher = struct {
         return (h.ngram - 1) * h.heads;
     }
 
+    /// The rows layer slot l's table needs: every column's ids, on every rank (the last column's offset + prime).
+    pub fn rowsNeeded(h: Hasher, l: usize) u64 {
+        const c = h.cols() - 1;
+        return @intCast(h.offsets[l][c] + h.primes[l][c]);
+    }
+
     /// `ids`: the whole sequence so far (negative at image positions, which no n-gram reaches across); `out`:
     /// [n][layers][cols] row ids, each offset into its layer's table.
     pub fn hashes(h: Hasher, ids: []const i32, start: usize, n: usize, out: []i64) void {
