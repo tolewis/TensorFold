@@ -677,8 +677,8 @@ pub const Runner = struct {
             const mk1 = try d.g.module(&kb.k1);
             const kk = try k1mod.load(d, md, mk1);
             d.k.attn_k1 = kk.decode;
-            if (k1mod.k1b & 3 != 0) { // K1B (lane p4-kernel, XPU_K1B): attn_k1_decode with a tile's reads ahead, the same bits
-                const name = k1mod.k1b_names[(k1mod.k1b & 3) - 1];
+            if (k1mod.k1bPick()) |pick| { // K1B (lane p4-kernel, XPU_K1B): attn_k1_decode's values, other read order
+                const name = k1mod.k1b_names[pick];
                 const k1b = try d.kernel(mk1, name, 256);
                 try d.g.indirect(k1b);
                 std.debug.print("k1b: XPU_K1B={d} ({s} in place of attn_k1_decode, check {s})\n", .{ k1mod.k1b, name, if (k1mod.k1b & 4 != 0) "on" else "off" });

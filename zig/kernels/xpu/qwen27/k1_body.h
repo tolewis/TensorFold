@@ -28,6 +28,14 @@
 #ifndef K1_VAHEAD
 #define K1_VAHEAD 0
 #endif
+// K1_PFSPREAD (K1B b5 to b7): the prefetches of the next tile go out one a DPAS step, not 8 at once. Bit 1: the next
+// tile's V prefetches, one in each QK step. Bit 2: the next tile's K prefetches, one in each PV step. The same
+// addresses, rows and guards. A prefetch writes no register, so the values and the bits do not change. When a step
+// does not run (the QK of a sub-group past the slice end, the PV steps past it), the next tile is past the slice end
+// too, so the base prefetches nothing there either.
+#ifndef K1_PFSPREAD
+#define K1_PFSPREAD 0
+#endif
 // K1_VREADS: the tile's page table words first, then its V block reads, so neither read waits for the one before.
 #define K1_VREADS()                                                                                             \
   {                                                                                                             \
@@ -121,6 +129,12 @@ KERNEL(256) void K1_FN(global const ushort *Q, global const char *KC, global con
     const long kpb = kin ? (long)PT[kpg] * Q27_PAGE8 : 0;
     const int krows = kin ? min(Q27_PAGE, nkeys - kpg * Q27_PAGE) : 0;
     global const char *kpage = KC + kpb + hk * 256;
+#if K1_PFSPREAD & 1
+    const int vfb = k0 + K1_T + sg * 16;           // the next tile's V rows, one prefetch in each QK step
+    const bool vpf = !(K1_PROBE & 4) && sg < K1_G && vfb < j1;
+    global const char *vfp = VC + (vpf ? (long)PT[vfb / Q27_PAGE] * Q27_PAGE8 : 0) + hk * 256;
+    const int vfrows = vpf ? min(Q27_PAGE, nkeys - (vfb / Q27_PAGE) * Q27_PAGE) : 0;
+#else
     { // the next tile's V rows: this sub-group's 16 keys of it
       const int vb = k0 + K1_T + sg * 16;
       if (!(K1_PROBE & 4) && sg < K1_G && vb < j1) {
@@ -131,6 +145,7 @@ KERNEL(256) void K1_FN(global const ushort *Q, global const char *KC, global con
           intel_sub_group_2d_block_prefetch_16b_16r16x1c((global void *)vp, 256, rows, Q27_KVROW, (int2)(ds * 16, vb % Q27_PAGE));
       }
     }
+#endif
     int8 si[K1_P][2];
     for (int p = 0; p < K1_P; p++) si[p][0] = si[p][1] = 0;
     if (kin && !(K1_PROBE & 8)) {
@@ -151,6 +166,9 @@ KERNEL(256) void K1_FN(global const ushort *Q, global const char *KC, global con
         intel_sub_group_2d_block_read_16b_16r16x1c((global void *)kpage, 256, krows, Q27_KVROW, (int2)(ds * 16, kb % Q27_PAGE), ka);
         for (int b = 0; b < 2; b++)
           for (int r = 0; r < 8; r++) a[b][r] = (short)ka[b * 8 + r];
+#endif
+#if K1_PFSPREAD & 1
+        if (vpf) intel_sub_group_2d_block_prefetch_16b_16r16x1c((global void *)vfp, 256, vfrows, Q27_KVROW, (int2)(ds * 16, vfb % Q27_PAGE));
 #endif
         for (int p = 0; p < npass; p++) {
           const int8 qb = (K1_PROBE & 32) ? (int8)(0x01010101) : as_int8(intel_sub_group_block_read8(QI + (p * 64 + ds * 8) * 16));
@@ -211,6 +229,12 @@ KERNEL(256) void K1_FN(global const ushort *Q, global const char *KC, global con
     for (int q = 0; q < K1_C / 8; q++)
       __attribute__((opencl_unroll_hint))
       for (int r = 0; r < 8; r++) o[q][r] *= AL[q * 8 + r];
+#if K1_PFSPREAD & 2
+    const int kfb = k0 + K1_T + sg * 16;           // the next tile's K rows, one prefetch in each PV step
+    const bool kpf = !(K1_PROBE & 8) && sg < K1_G && kfb < j1;
+    global const char *kfp = KC + (kpf ? (long)PT[kfb / Q27_PAGE] * Q27_PAGE8 : 0) + hk * 256;
+    const int kfrows = kpf ? min(Q27_PAGE, nkeys - (kfb / Q27_PAGE) * Q27_PAGE) : 0;
+#else
     { // the next tile's K rows: this sub-group's 16 keys of it
       const int nb = k0 + K1_T + sg * 16;
       if (!(K1_PROBE & 8) && sg < K1_G && nb < j1) {
@@ -221,6 +245,7 @@ KERNEL(256) void K1_FN(global const ushort *Q, global const char *KC, global con
           intel_sub_group_2d_block_prefetch_16b_16r16x1c((global void *)np, 256, rows, Q27_KVROW, (int2)(ds * 16, nb % Q27_PAGE));
       }
     }
+#endif
 #if K1_VAHEAD
 #if K1_VAHEAD == 1
     if (!(K1_PROBE & 4)) K1_VREADS();
@@ -239,6 +264,9 @@ KERNEL(256) void K1_FN(global const ushort *Q, global const char *KC, global con
       const int vrows = min(Q27_PAGE, nkeys - pg * Q27_PAGE);
       uint w8[8];
       intel_sub_group_2d_block_read_transform_8b_32r16x1c((global void *)vpage, 256, vrows, Q27_KVROW, (int2)(sg * 16, y0 % Q27_PAGE), w8);
+#if K1_PFSPREAD & 2
+      if (kpf) intel_sub_group_2d_block_prefetch_16b_16r16x1c((global void *)kfp, 256, kfrows, Q27_KVROW, (int2)(c2 * 16, kfb % Q27_PAGE));
+#endif
 #endif
       __attribute__((opencl_unroll_hint))
       for (int hc = 0; hc < 2; hc++) {             // 16 keys: 8 fp16 pairs, int8 to fp16 exact
@@ -282,3 +310,4 @@ KERNEL(256) void K1_FN(global const ushort *Q, global const char *KC, global con
 #undef K1_VREADS
 #undef K1_KAHEAD
 #undef K1_VAHEAD
+#undef K1_PFSPREAD

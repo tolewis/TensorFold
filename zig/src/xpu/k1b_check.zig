@@ -1,8 +1,9 @@
 //! XPU_K1B bit 4 (lane p4-kernel, K1B): the picked attn_k1_b kernel against attn_k1_decode on this card, at the load.
 //! Both kernels get the same random int8 K/V pages (shuffled page table), the same Q and the same row groups, and
-//! write their own partials (PM, PL, PO). K1B only moves the reads of a tile, so every written partial must have
-//! the same bits. One value that differs fails the open. Cases: the lone tree verify of forward.zig (the MT table,
-//! POS p0 - 1, two 8-row groups or a short one) and a chain window (no MT table, the keys up to p0 + row).
+//! write their own partials (PM, PL, PO). K1B only moves the reads and prefetches of a tile, so every written
+//! partial must have the same bits. One value that differs fails the open. Cases: the lone tree verify of
+//! forward.zig (the MT table, POS p0 - 1, two 8-row groups or a short one) and a chain window (no MT table, the keys
+//! up to p0 + row).
 const std = @import("std");
 const ze = @import("ze");
 const dev = @import("dev.zig");
