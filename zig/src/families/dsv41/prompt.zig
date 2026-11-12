@@ -715,6 +715,11 @@ pub fn mm(e: *const Engine, ch: *const Chunk, l: weights.Linear, x: u64, ldx: us
 /// by the gather path (off: ring mode, as the served lane reads, the slot's previous request's keys below the floor).
 pub var replay_floor = false;
 
+/// TP2 splits prompt_keys row blocks and all-gathers their selections. TF_DS_IDX_SPLIT unset enables this at 65,536
+/// compressed keys; "1" enables every eligible width, other values disable it. Both ranks must agree (model.zig).
+pub var idx_split = true;
+pub var idx_split_min_comp: usize = 65536;
+
 /// attention_k: the partial pa [n, D] fp32 of this rank's heads; the chunk's keys go into the layer's window ring
 /// (bf16 [window + RING_EXTRA, head_dim]). A compressed layer also attends to its kv source's latents the indexer picks
 /// (a kv source first compresses the chunk into them). `floor`: no window key before this position.
@@ -965,8 +970,21 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
     const pooled = !keyed and nbk > c.candidate_blocks;
     if (pooled and (ch.pool == 0 or nbk > ch.pool_ms)) return error.ChunkTooLong;
     const pk = @min(c.candidate_blocks, nbk);
-    var r0: usize = 0;
-    while (r0 < n) : (r0 += rb) {
+    // TP2 (idx_split): the prompt_keys layers' row blocks split between the ranks at a block boundary, rank 0 the
+    // first blocks (rows [0, h0)), rank 1 the rest (rows [h0, n)), the boundary the one that evens their rows most.
+    // Every block keeps the replicated loop's rows, offsets and launches, so each row's selection has the same bits;
+    // the gather below gives both ranks every row's.
+    const nb = (n + rb - 1) / rb;
+    var h0: usize = n;
+    for (1..@max(nb, 1)) |s| {
+        if (@max(s * rb, n - s * rb) < @max(h0, n - h0)) h0 = s * rb;
+    }
+    const big = @max(h0, n - h0); // the larger part's rows: the gather's rows a rank
+    const ke = @min(ch.cap * ch.max_comp, key_elems);
+    const split = idx_split and n_comp_end >= idx_split_min_comp and keyed and e.two == null and e.world == 2 and e.comm.world == 2 and nb >= 2 and 2 * big * kk <= ke;
+    const mine: [2]usize = if (!split) .{ 0, n } else if (e.comm.rank == 0) .{ 0, h0 } else .{ h0, n };
+    var r0: usize = mine[0];
+    while (r0 < mine[1]) : (r0 += rb) {
         // the block's rows: iq[r0:r1] and wts[r0:r1] as views (their offsets the served pointers'), vis[r0:r1] at a
         // 16-byte-aligned address (visBlock), its selection into cidx[r0:r1]
         const m = @min(n, r0 + rb) - r0;
@@ -989,6 +1007,21 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
                 try e.ops.applyPool(e.s, ch.score, n_comp_end, n_comp_end, cb, mrows, ch.pool_ms, m);
             }
             try e.ops.topkIndices(e.s, ch.score, n_comp_end, m, n_comp_end, kk, vr, out);
+        }
+    }
+    if (split) {
+        // `big` rows a rank into keys [2, big, kk] (free now: the blocks' launches before it on the stream are done
+        // with it): rank 0 the rows [0, big) (its own [0, h0) first), rank 1 the rows [n - big, n) (its own [h0, n)
+        // last); the rest of each part is the other rank's rows, dropped. Each rank then copies the other's rows into
+        // cidx: int64 ids moved, no arithmetic.
+        std.debug.assert(0 < h0 and h0 < n and big <= n);
+        const row = kk * 8;
+        const send = if (e.comm.rank == 0) ch.cidx else ch.cidx + (n - big) * row;
+        try e.comm.allGather(send, ch.keys, big * kk, .i64, e.s);
+        if (e.comm.rank == 0) {
+            try e.ops.copyRows(e.s, ch.keys + (big + h0 + big - n) * row, row, ch.cidx + h0 * row, row, row, n - h0);
+        } else {
+            try e.ops.copyRows(e.s, ch.keys, row, ch.cidx, row, row, h0);
         }
     }
     if (pooled and li == c.candidate_source) sh.pool = true;

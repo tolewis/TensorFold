@@ -154,6 +154,9 @@ pub const Model = struct {
         m.* = undefined;
         m.gpa = gpa;
         if (std.c.getenv("TF_DS_REPLAY_FLOOR")) |v| prompt.replay_floor = std.mem.eql(u8, std.mem.span(v), "1"); // every rank alike
+        const idx_split_env = std.c.getenv("TF_DS_IDX_SPLIT"); // every rank alike
+        prompt.idx_split = if (idx_split_env) |v| std.mem.eql(u8, std.mem.span(v), "1") else true;
+        prompt.idx_split_min_comp = if (idx_split_env != null) 0 else 65536;
         m.spans = .empty;
         m.img_buf = null;
         m.host = std.heap.ArenaAllocator.init(gpa);
