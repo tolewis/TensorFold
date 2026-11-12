@@ -50,7 +50,7 @@ static inline float bf2f(ushort h) { return as_float((uint)h << 16); }
 
 // K1B (lane p4-kernel, XPU_K1B): attn_k1_decode with the reads of a tile ahead (k1_body.h, K1_KAHEAD and
 // K1_VAHEAD). b1: K ahead. b2: V ahead at the start of PV. b3: V ahead right after the QK DPAS. b5 to b7 (K1_PFSPREAD): the next
-// tile's prefetches one a DPAS step, b5 V, b6 K, b7 both. Arguments, grid,
+// tile's prefetches one a DPAS step, b5 V, b6 K, b7 both. b8: b7 with two blocks a prefetch, every second step. Arguments, grid,
 // values and bits are those of attn_k1_decode. K and V ahead together spill 3520 bytes (IGC asm), so no variant has both.
 #define K1_R 8
 #define K1_C (8 * Q27_GQA)
@@ -80,6 +80,10 @@ static inline float bf2f(ushort h) { return as_float((uint)h << 16); }
 #undef K1_FN
 #define K1_FN attn_k1_b7
 #define K1_PFSPREAD 3
+#include "k1_body.h"
+#undef K1_FN
+#define K1_FN attn_k1_b8
+#define K1_PFSPREAD 7
 #include "k1_body.h"
 #undef K1_FN
 #undef K1_PROBE

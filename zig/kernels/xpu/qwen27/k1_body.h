@@ -32,7 +32,8 @@
 // tile's V prefetches, one in each QK step. Bit 2: the next tile's K prefetches, one in each PV step. The same
 // addresses, rows and guards. A prefetch writes no register, so the values and the bits do not change. When a step
 // does not run (the QK of a sub-group past the slice end, the PV steps past it), the next tile is past the slice end
-// too, so the base prefetches nothing there either.
+// too, so the base prefetches nothing there either. Bit 4: each prefetch takes two blocks (16 rows x 64 bytes), in the
+// even steps only, so 4 messages a tile for K and 4 for V, not 8. The same bytes.
 #ifndef K1_PFSPREAD
 #define K1_PFSPREAD 0
 #endif
@@ -167,7 +168,9 @@ KERNEL(256) void K1_FN(global const ushort *Q, global const char *KC, global con
         for (int b = 0; b < 2; b++)
           for (int r = 0; r < 8; r++) a[b][r] = (short)ka[b * 8 + r];
 #endif
-#if K1_PFSPREAD & 1
+#if (K1_PFSPREAD & 5) == 5
+        if (vpf && !(ds & 1)) intel_sub_group_2d_block_prefetch_16b_16r16x2c((global void *)vfp, 256, vfrows, Q27_KVROW, (int2)(ds * 16, vfb % Q27_PAGE));
+#elif K1_PFSPREAD & 1
         if (vpf) intel_sub_group_2d_block_prefetch_16b_16r16x1c((global void *)vfp, 256, vfrows, Q27_KVROW, (int2)(ds * 16, vfb % Q27_PAGE));
 #endif
         for (int p = 0; p < npass; p++) {
@@ -264,7 +267,9 @@ KERNEL(256) void K1_FN(global const ushort *Q, global const char *KC, global con
       const int vrows = min(Q27_PAGE, nkeys - pg * Q27_PAGE);
       uint w8[8];
       intel_sub_group_2d_block_read_transform_8b_32r16x1c((global void *)vpage, 256, vrows, Q27_KVROW, (int2)(sg * 16, y0 % Q27_PAGE), w8);
-#if K1_PFSPREAD & 2
+#if (K1_PFSPREAD & 6) == 6
+      if (kpf && !(c2 & 1)) intel_sub_group_2d_block_prefetch_16b_16r16x2c((global void *)kfp, 256, kfrows, Q27_KVROW, (int2)(c2 * 16, kfb % Q27_PAGE));
+#elif K1_PFSPREAD & 2
       if (kpf) intel_sub_group_2d_block_prefetch_16b_16r16x1c((global void *)kfp, 256, kfrows, Q27_KVROW, (int2)(c2 * 16, kfb % Q27_PAGE));
 #endif
 #endif
