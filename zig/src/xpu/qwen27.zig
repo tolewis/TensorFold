@@ -56,6 +56,22 @@ pub var RANK: u32 = 0;
 /// XPU_HSPLIT (WP6, lane p4-headsplit, default off): each TP 2 rank holds half of the head's vocab rows and the ranks
 /// merge their winners (`tp.Group.headExchange`). On only with TP 2, the EX exchange (TF_TP_DEVFLAG=3 or 4) and MLX.
 pub var hsplit = false;
+/// XPU_GAPTEST (lane p4-kernel, measure only): extra commands in each layer of a decode forward that change no value.
+/// k: N launches of gap_nop. c: N 256-byte card copies. x: N EX exchanges of 16-row zeros (a push, the flag, the wait
+/// and tp_add). The round grows by N x 64 times the cost of one such command. Off (0) by default.
+pub var gap_kind: u8 = 0;
+pub var gap_n: u32 = 0;
+
+fn gapEnv() void {
+    gap_kind = 0;
+    gap_n = 0;
+    const v = std.mem.span(std.c.getenv("XPU_GAPTEST") orelse return);
+    if (v.len < 2 or (v[0] != 'k' and v[0] != 'c' and v[0] != 'x')) return;
+    const n = std.fmt.parseInt(u32, v[1..], 10) catch return;
+    if (n == 0 or n > 64) return;
+    gap_kind = v[0];
+    gap_n = n;
+}
 pub const GDN_K_HEADS = 16 / TP; // GDN query and key heads of 128
 pub const GDN_V_HEADS = 48 / TP; // GDN value heads of 128 (and the z gate, a and b)
 pub const ATT_Q_HEADS = 24 / TP; // attention query heads of 256, each with a gate of 256
@@ -563,6 +579,7 @@ pub const Runner = struct {
         errdefer alloc.destroy(r);
         r.* = .{ .d = .{ .g = try ze.Gpu.open(0xe223), .list = undefined, .k = undefined }, .model = undefined, .acts = undefined, .context = context, .ckpt = ckpt, .keep_shared = keep_shared };
         fmt_mlx = !ckpt.has("layers.0.linear_attn.in_proj_qkv.trellis") and !ckpt.has("in_proj_qkv.qweight") and ckpt.has("lm_head.scales");
+        gapEnv(); // before the mode word: both ranks must add the same commands
         tp.group = try tp.Group.open(&r.d); // null at TP 1
         if (tp.group) |*g| {
             if (g.rank != 0 and g.readMode() != modeWord()) {
@@ -577,6 +594,11 @@ pub const Runner = struct {
             if (tp.group) |*g| hsplit = TP == 2 and g.ex != 0 and fmt_mlx;
             if (hsplit) std.debug.print("hsplit: XPU_HSPLIT=1 (rank {d}: the head holds vocab rows {d} to {d}, the winners and rank 1's halves go through the EX exchange)\n", .{ RANK, RANK * (VOCAB / 2), (RANK + 1) * (VOCAB / 2) - 1 }) else std.log.warn("qwen27-xpu: rank {d}: XPU_HSPLIT needs TP 2, TF_TP_DEVFLAG=3 or 4 and the MLX weights: the head stays whole", .{RANK});
         }
+        if (gap_n > 0) std.debug.print("gaptest: XPU_GAPTEST={c}{d} (rank {d}: {d} {s} in each layer of a decode forward, {d} a forward, measure only)\n", .{ gap_kind, gap_n, RANK, gap_n, switch (gap_kind) {
+            'k' => "no-op launches",
+            'c' => "256-byte card copies",
+            else => if (tp.group != null) "EX exchanges of zeros" else "exchanges (none at TP 1)",
+        }, gap_n * LAYERS });
         const d = &r.d;
         errdefer d.g.close();
         d.list = try d.g.immediate(0, 0);
@@ -619,6 +641,7 @@ pub const Runner = struct {
             .tp_consume = try d.kernel(mg, "tp_consume", 16),
             .tp_probe = try d.kernel(mg, "tp_probe", 16),
             .argmax_tp = try d.kernel(mg, "argmax_tp", 16),
+            .gap_nop = try d.kernel(mg, "gap_nop", 16),
             .attn_prompt = try d.kernel(md, "attn_prompt", 128),
             .attn_prompt8 = try d.kernel(md, "attn_prompt8", 128),
             .embed_dense = try d.kernel(mg, "embed_dense", 256),
@@ -1437,6 +1460,7 @@ pub fn modeWord() u64 {
     w |= @as(u64, @intFromBool(fuse & 1 != 0)) << 14; // XPU_FUSE bit 1: both ranks fuse the exchange into the norm
     w |= @as(u64, @intFromBool(draft_tp)) << 24; // XPU_DRAFT_TP: both ranks run half the drafter, or neither
     w |= @as(u64, @intFromBool(tp.hsplit_env)) << 25; // XPU_HSPLIT: both ranks split the head, or neither
+    w |= (@as(u64, gap_kind) << 26) | (@as(u64, gap_n) << 34); // XPU_GAPTEST: both ranks add the same commands
     return w;
 }
 

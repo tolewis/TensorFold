@@ -275,6 +275,12 @@ KERNEL(16) void argmax_tp(global const int *OWNI, global const float *OWNV, glob
   else { OUT[row] = pi; OUTV[row] = pv; }
 }
 
+// XPU_GAPTEST=kN (lane p4-kernel, measure only): one work-group that writes nothing (N is 0 at every call). Its cost
+// in the round is the card's cost of one launch in the in-order list.
+KERNEL(16) void gap_nop(global int *P, int N) {
+  if (N != 0 && get_global_id(0) == 0) P[0] = N;
+}
+
 // Taps for the drafter: TAPS[t][slot·D + e] = bf16(x + r) (the full hidden state after the layer), [T, 5 D].
 KERNEL(256) void tap(global const float *X, global const half *R, global ushort *TAPS, int D, int slot) {
   const int t = get_group_id(1), e = get_global_id(0);

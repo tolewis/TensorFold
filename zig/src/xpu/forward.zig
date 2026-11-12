@@ -73,6 +73,7 @@ pub const Acts = struct {
     lfull: ?*anyopaque = null, // XPU_HSPLIT: fp16 [16, VOCAB], the full rows the masked argmax reads (both halves, rank 0)
     taps: *anyopaque, // bf16 [maxRows, 5 D]: hidden states after TAP_LAYERS, when Mode.taps
     tok: *anyopaque, // i32 [16]
+    gap: ?*anyopaque = null, // XPU_GAPTEST: zeros, 16 rows of D (the x exchanges), then 8 KB (the c copies)
     tokv: *anyopaque, // f32 [16] at tok + 64: the winner's value (XPU_HSPLIT, argmax_v's OUTV)
     pv: *anyopaque, // argmax partials: f32 [256], i32 [256]
     pi: *anyopaque,
@@ -135,6 +136,7 @@ pub const Acts = struct {
             .lfull = if (head < VOCAB) try d.alloc_(16 * VOCAB * 2) else null,
             .tok = tok,
             .tokv = off(tok, 64),
+            .gap = if (q.gap_n > 0) try gapBuf(d) else null,
             .pv = try d.alloc_(16 * 1024),
             .pi = try d.alloc_(16 * 1024),
             .mrows = try d.alloc_(16 * 4),
@@ -169,6 +171,28 @@ pub fn chainTable() [16 * 17]i32 {
         for (0..r + 1) |dd| t[r * 17 + 1 + dd] = @intCast(dd);
     }
     return t;
+}
+
+const gap_bytes = 16 * D * 2 + 8192;
+
+fn gapBuf(d: *Dev) !*anyopaque {
+    const p = try d.alloc_(gap_bytes);
+    try d.fill(p, @as(u8, 0), gap_bytes);
+    return p;
+}
+
+/// XPU_GAPTEST (lane p4-kernel, measure only): the extra commands of one layer. Each writes only the zero buffer
+/// `a.gap`: gap_nop writes nothing, a copy moves zeros within it, an exchange adds the peer's zeros to it. So no value
+/// of the forward changes. Both ranks run the same layers, so the x exchanges pair up as the real ones do.
+fn gapOps(d: *Dev, a: *Acts, T: u32) !void {
+    const g = a.gap orelse return;
+    var k: u32 = 0;
+    while (k < q.gap_n) : (k += 1) switch (q.gap_kind) {
+        'k' => try d.launch(d.k.gap_nop, .{ .x = 1 }, .{ g, @as(i32, 0) }),
+        'c' => try copy(d, off(g, 16 * D * 2), off(g, 16 * D * 2 + 4096), 256),
+        'x' => if (ranks.group) |*grp| try grp.allReduce(d, g, T),
+        else => {},
+    };
 }
 
 /// gate|up and SwiGLU: the activation and its row sums; prompt rows via the GEMM epilogue, decode rows via `swiglu`.
@@ -461,6 +485,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
             pend = null;
         } else try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.in_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, if (i == 0) 0 else 1), gs, q8a, q8s, q8ms, q.rot_on });
         q.prof.site = .none;
+        if (!wide and q.gap_n > 0) try gapOps(d, a, T); // after the norm: the exchange it consumed is done
         const probe = p0 == 0 and i == 0;
         if (probe) try dumpBuf(d, "h0", a.h, T * D, .f16);
         // W4A8 study: the GEMM reads a quantized copy (in r, free until mixer_out); the dense a/b gates read h as is
