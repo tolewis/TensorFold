@@ -29,6 +29,7 @@ const link = @import("link.zig");
 const ring2d = @import("ring2d.zig");
 const rdma = @import("rdma.zig");
 const rdma_env = @import("rdma_env.zig");
+const pool_mod = @import("pool.zig");
 
 /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
 pub const chunk_rows = 2048;
@@ -247,9 +248,10 @@ pub const Model = struct {
         m.ex = try exact.Exact.load(d, cuda.kernels.dsv41_torch);
         errdefer m.ex.unload();
 
-        // the RoPE tables (the served build's bits: torch CPU pow and polar), every position of the pool
+        // the RoPE tables (the served build's bits: torch CPU pow and polar), every position a stream can reach (the window, not the pool)
         const half = c.rope_dim / 2;
-        const rope_rows = o.pool + round.max_rows + 1;
+        const win = try pool_mod.window(o.pool, if (std.c.getenv("TF_DS_WINDOW")) |v| std.mem.span(v) else null);
+        const rope_rows = pool_mod.ropeRows(win, round.max_rows);
         m.rope_buf = try cuda.DeviceBuffer.alloc(d, 4 * rope_rows * half * 4);
         errdefer m.rope_buf.free();
         {
@@ -258,7 +260,7 @@ pub const Model = struct {
             for ([_][]const u8{ "rope-plain-cos.f32", "rope-plain-sin.f32", "rope-compressed-cos.f32", "rope-compressed-sin.f32" }, 0..) |name, j| {
                 var f = try std.Io.Dir.cwd().openFile(io, try std.fs.path.join(a, &.{ o.kit_dir, name }), .{});
                 defer f.close(io);
-                if (try f.readPositionalAll(io, part, 0) != part.len) return error.ShortRopeTable; // a table of fewer rows than the pool
+                if (try f.readPositionalAll(io, part, 0) != part.len) return error.ShortRopeTable; // a table of fewer rows than the window
                 try m.rope_buf.upload(j * part.len, part);
             }
         }
