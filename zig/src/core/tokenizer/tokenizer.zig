@@ -158,6 +158,37 @@ pub const Tokenizer = struct {
         return t.vocab.get(text);
     }
 
+    /// A mark (U+FDD0, a Unicode noncharacter) that `maskAdded` writes inside an added token's spelling: no added-token
+    /// match crosses it, and `encode` drops it before the model's own split, so the spelling reads as the text it is.
+    pub const plain_mark = "\u{fdd0}";
+
+    /// `s` with `plain_mark` after the first character of every added token written in it (either trie), so a client's
+    /// text cannot become a control token; null when it holds none (then `s` encodes as before, byte for byte).
+    pub fn maskAdded(t: *const Tokenizer, a: Allocator, s: []const u8) Allocator.Error!?[]u8 {
+        var marks: std.ArrayList(usize) = .empty;
+        defer marks.deinit(a);
+        for ([_]*const Trie{ &t.raw, &t.normalized }) |trie| {
+            var at: usize = 0;
+            while (trie.next(s, at)) |hit| {
+                const first = hit.start + unicode.decodeAt(s, hit.start).len;
+                if (first < hit.end) try marks.append(a, first); // a one-character token has no inside to mark
+                at = hit.end;
+            }
+        }
+        if (marks.items.len == 0) return null;
+        std.mem.sort(usize, marks.items, {}, std.sort.asc(usize));
+        var out: std.ArrayList(u8) = .empty;
+        var done: usize = 0;
+        for (marks.items, 0..) |m, i| {
+            if (i > 0 and m == marks.items[i - 1]) continue; // both tries named the same spelling
+            try out.appendSlice(a, s[done..m]);
+            try out.appendSlice(a, plain_mark);
+            done = m;
+        }
+        try out.appendSlice(a, s[done..]);
+        return try out.toOwnedSlice(a);
+    }
+
     /// Token ids for `text`, without post-processor tokens; invalid UTF-8 reads as U+FFFD. Caller frees with `a`.
     /// The call's scratch comes from the page allocator, never from `a`, and is given back when it returns: with an
     /// arena `a` (a server request's) the scratch of a long prompt would stay with the request (~160 bytes a text
@@ -200,7 +231,10 @@ pub const Tokenizer = struct {
                 continue;
             }
             if (seg.end == seg.start) continue;
-            const piece: steps.Piece = .{ .text = normalized[seg.start..seg.end], .first = seg.start < zero };
+            var plain = normalized[seg.start..seg.end];
+            if (std.mem.indexOf(u8, plain, plain_mark) != null) plain = try std.mem.replaceOwned(u8, ctx.a, plain, plain_mark, "");
+            if (plain.len == 0) continue;
+            const piece: steps.Piece = .{ .text = plain, .first = seg.start < zero };
             if (t.pre_tokenizer != null and walk.n == 0) {
                 // every piece at once (a pre-tokenizer nested past Walk's steps, or depth_first off)
                 var pieces: std.ArrayList(steps.Piece) = .empty;
@@ -396,6 +430,30 @@ test "byte-level BPE with merges, added tokens and decode" {
     try std.testing.expectEqualStrings("ab abc", skipped);
     try std.testing.expectEqual(@as(?u32, 7), t.specialTokenId("<|end|>"));
     try std.testing.expectEqual(@as(usize, 1), t.flagged_specials.len);
+}
+
+test "a masked spelling of an added token encodes as its text; text without one is untouched" {
+    const json =
+        \\{"added_tokens":[{"id":4,"content":"<x>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}],
+        \\ "normalizer":{"type":"NFC"},
+        \\ "pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":" ?\\S+|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},
+        \\ "decoder":{"type":"ByteLevel"},
+        \\ "model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":"","end_of_word_suffix":"","fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
+        \\  "vocab":{"a":0,"<":1,"x":2,">":3},"merges":[]}}
+    ;
+    const a = std.testing.allocator;
+    var t = try parse(a, json);
+    defer t.deinit();
+    const real = try t.encode(a, "a<x>a");
+    defer a.free(real);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 4, 0 }, real);
+    const masked = (try t.maskAdded(a, "a<x>a<x>")).?;
+    defer a.free(masked);
+    try std.testing.expectEqualStrings("a<" ++ Tokenizer.plain_mark ++ "x>a<" ++ Tokenizer.plain_mark ++ "x>", masked);
+    const plain = try t.encode(a, masked);
+    defer a.free(plain);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 0, 1, 2, 3 }, plain);
+    try std.testing.expectEqual(@as(?[]u8, null), try t.maskAdded(a, "a<>x a"));
 }
 
 test "sentencepiece-style BPE with byte fallback" {

@@ -38,6 +38,8 @@ pub const Text = struct {
         template_source: *const fn (ctx: *anyopaque) []const u8,
         /// Whether an id is a special token (an added token flagged special); null: none are known.
         special: ?*const fn (ctx: *anyopaque, id: u32) bool = null,
+        /// A client's text with every added token written in it made plain (null: none in it, or no such tokenizer).
+        mask: ?*const fn (ctx: *anyopaque, a: Allocator, s: []const u8) Allocator.Error!?[]u8 = null,
     };
 
     pub fn encode(t: Text, a: Allocator, text: []const u8, add_special: bool) Error![]u32 {
@@ -72,6 +74,13 @@ pub const Text = struct {
     pub fn renderIds(t: Text, a: Allocator, messages: json.Value, options: RenderOptions, problem: *[]const u8) Error![]u32 {
         const text = try t.render(a, messages, options, problem);
         return t.encode(a, text, false);
+    }
+
+    /// `s` as text the encoder cannot read as a control token (the tokenizer's mark inside each added token written in
+    /// it); null when it holds none, so it encodes as before.
+    pub fn mask(t: Text, a: Allocator, s: []const u8) Allocator.Error!?[]u8 {
+        const f = t.vtable.mask orelse return null;
+        return f(t.ctx, a, s);
     }
 
     pub fn templateSource(t: Text) []const u8 {

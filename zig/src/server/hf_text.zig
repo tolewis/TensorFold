@@ -201,7 +201,12 @@ pub const HfText = struct {
             .render = renderFn,
             .template_source = sourceFn,
             .special = specialFn,
+            .mask = maskFn,
         } };
+    }
+
+    fn maskFn(ctx: *anyopaque, a: Allocator, s: []const u8) Allocator.Error!?[]u8 {
+        return self(ctx).tok.maskAdded(a, s);
     }
 
     fn specialFn(ctx: *anyopaque, id: u32) bool {

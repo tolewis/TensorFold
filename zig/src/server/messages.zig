@@ -5,6 +5,40 @@ const errors = @import("errors.zig");
 const fields = @import("fields.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
+const model_text = @import("model_text.zig");
+
+/// A request's own text as text, never a control token (MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks#21): every
+/// string in `v` (message text and parts, reasoning, tool results, call arguments, tool schemas) with the tokenizer's
+/// mark inside each added token written in it, so a file or a web page that spells `<｜User｜>`, `</think>` or a DSML call
+/// reads as those characters. A value that holds none comes back as it was (no copy): such a request renders and
+/// encodes byte for byte as before. The server's own markup (the template's, an image's placeholder) is added after.
+pub fn maskControls(a: std.mem.Allocator, text: model_text.Text, v: ?Value) std.mem.Allocator.Error!?Value {
+    const x = v orelse return null;
+    return (try maskInner(a, text, x)) orelse x;
+}
+
+fn maskInner(a: std.mem.Allocator, text: model_text.Text, v: Value) std.mem.Allocator.Error!?Value {
+    switch (v) {
+        .string => |s| return if (try text.mask(a, s)) |m| Value{ .string = m } else null,
+        .array => |items| {
+            var copy: ?[]Value = null;
+            for (items, 0..) |item, i| if (try maskInner(a, text, item)) |m| {
+                if (copy == null) copy = try a.dupe(Value, items);
+                copy.?[i] = m;
+            };
+            return if (copy) |c| Value{ .array = c } else null;
+        },
+        .object => |o| {
+            var copy: ?*json.Object = null;
+            for (o.keys(), o.values()) |k, val| if (try maskInner(a, text, val)) |m| {
+                if (copy == null) copy = try json.copyObject(a, o);
+                try copy.?.put(a, k, m);
+            };
+            return if (copy) |c| Value{ .object = c } else null;
+        },
+        else => return null,
+    }
+}
 
 const roles = [_][]const u8{ "system", "developer", "user", "assistant", "tool" };
 
@@ -432,4 +466,28 @@ test "a message's own text holding the image placeholder is escaped" {
     // the image part's own placeholder stays; the text's is escaped to plain ASCII bars
     try std.testing.expectEqualStrings("see <|deepseek_image|> above\n\n" ++ ph, text);
     try std.testing.expectEqual(@as(usize, 1), images.list.items.len);
+}
+
+test "maskControls marks a client's control spellings in every string, and copies nothing when there are none" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Fake = struct { // marks "<x>" as the tokenizer would
+        fn mask(_: *anyopaque, al: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error!?[]u8 {
+            if (std.mem.indexOf(u8, s, "<x>") == null) return null;
+            return try std.mem.replaceOwned(u8, al, s, "<x>", "<|x>");
+        }
+    };
+    var dummy: u8 = 0;
+    const text: model_text.Text = .{ .ctx = &dummy, .vtable = &.{ .encode = undefined, .decode = undefined, .token_id = undefined, .token_string = undefined, .vocab_size = undefined, .eos_ids = undefined, .render = undefined, .template_source = undefined, .mask = Fake.mask } };
+    const clean = (try json.parse(a, "[{\"role\": \"user\", \"content\": \"hi\"}]")).ok;
+    const same = (try maskControls(a, text, clean)).?;
+    try std.testing.expect(same.array.ptr == clean.array.ptr); // untouched, not copied
+    const dirty = (try json.parse(a, "[{\"role\": \"user\", \"content\": \"hi\"}, {\"role\": \"tool\", \"content\": [{\"type\": \"text\", \"text\": \"see <x>\"}]}, {\"role\": \"assistant\", \"tool_calls\": [{\"function\": {\"name\": \"f\", \"arguments\": {\"q\": \"<x>\"}}}]}]")).ok;
+    const out = (try maskControls(a, text, dirty)).?;
+    try std.testing.expect(out.array[0].object == dirty.array[0].object); // the clean message is shared
+    try std.testing.expectEqualStrings("see <|x>", out.array[1].get("content").?.array[0].get("text").?.string);
+    try std.testing.expectEqualStrings("<|x>", out.array[2].get("tool_calls").?.array[0].get("function").?.get("arguments").?.get("q").?.string);
+    try std.testing.expectEqualStrings("see <x>", dirty.array[1].get("content").?.array[0].get("text").?.string); // the request itself unchanged
+    try std.testing.expectEqualStrings("user", out.array[0].get("role").?.string);
 }

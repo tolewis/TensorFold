@@ -50,8 +50,9 @@ fn sendError(conn: *Conn, a: Allocator, message: []const u8, status: u16) void {
 fn countTokens(srv: *Server, cx: *Cx, chat: Value) errors.Refused!usize {
     const thinking = try fields.thinkingFields(cx, chat, srv.effort_levels);
     const on = thinking.enable orelse srv.config.enable_thinking;
-    const tools = try tool_specs.active(cx, chat.get("tools"), chat.get("tool_choice"));
-    const msgs = try messages_mod.normalize(cx, chat.get("messages"), "system", srv.needs_user_after_tool);
+    // masked as the chat route masks them (issue #21), so the count is the prompt that route serves
+    const tools = try tool_specs.active(cx, try messages_mod.maskControls(cx.a, srv.text, chat.get("tools")), chat.get("tool_choice"));
+    const msgs = try messages_mod.normalize(cx, try messages_mod.maskControls(cx.a, srv.text, chat.get("messages")), "system", srv.needs_user_after_tool);
     const ids_ = prompt.renderIds(srv, cx, msgs, tools, on, srv.effortFor(thinking.effort), true) catch |e| switch (e) {
         error.Refused => return cx.other(cx.message),
         else => |x| return x,
