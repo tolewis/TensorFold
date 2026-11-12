@@ -349,7 +349,6 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     const template, const server_tests = @import("cuda_server_host.zig").steps(b, host, cuda, mods, native_modules, build_options, windows_port, step, server_steps);
     b.step("test-reply-floor-host", "TF_REPLY_FLOOR: a max_tokens above the room is fitted or refused, and the refusals with the floor off").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{ "reply floor", "over the window" } })).step);
     b.step("test-idle-unload-host", "Idle unload and reload: the timer, the parked stub, a wake during the close, without a GPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{ "idle ", "the wake reloads", "the parked stub", "the manager stays off" } })).step);
-    b.step("test-done-times-host", "Request-local done line times and lane admission on the CPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"done times:"} })).step);
     b.step("test-keep-pages-metrics", "Prompt-cache page gauges and eviction counters").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"keep pages:"} })).step);
     b.step("test-request-seeds-host", "Fresh and explicit request seeds and completion logs without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"request seed:"} })).step);
     // the tokenizer's own tests (memo, steps, regex, unicode) run here: no other test binary reaches them
