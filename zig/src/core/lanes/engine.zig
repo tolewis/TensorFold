@@ -441,6 +441,11 @@ pub const Engine = struct {
                         s.copy_width = if (kept == rows - 1) @min(e.cfg.max_copy, 2 * width + 1) else e.cfg.first_copy;
                     }
                 } else if (p.kind == .head) {
+                    if (e.cfg.draft_cal > 0.0) {
+                        s.observeCal(e.cfg.draft_cal, @floatFromInt(kept));
+                        s.logCal(e.cfg.cal_log, rows, kept, path.len);
+                        s.cal_n = 0;
+                    }
                     if (p.lanes) |l| if (s.odds != null) observeLanes(s, l, path);
                     const ds = try accept.depths(a, parents);
                     const chain = if (p.branch_from > 0) ds[0..p.branch_from] else ds;

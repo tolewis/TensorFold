@@ -25,6 +25,9 @@ pub const Mode = enum { pipe, drain, verify, exit };
 pub const loop_max_period: usize = 8;
 pub const loop_min_run: usize = 256;
 pub const loop_warm_in: usize = 64;
+pub const cal_floor: f64 = 0.2; // the lowest survival scale a stream's calibration applies
+pub const cal_max: usize = 32; // the granted drafts a round keeps for its calibration
+const cal_steps = 24; // bisections of a round's per-draft survival
 
 /// Return the shortest exact cycle at the end of a combined token prefix.
 fn cycleAt(head: []const u32, tail: []const u32, n: usize) ?u32 {
@@ -215,6 +218,13 @@ pub const Stream = struct {
     inflight: ?u64 = null,
     served: ?u64 = null,
     granted: ?u32 = null,
+    cal: f64 = 1.0, // realised over predicted drafts, a moving average (TF_DS_T25_DRAFT_CAL)
+    cal_raw: [cal_max]f64 = @splat(0.0), // the granted drafts' cumulative chances this round, before calibration
+    cal_n: usize = 0, // and how many (0: none)
+    cal_kept: f64 = 0.0, // moving averages of the drafts kept and of the drafts the chances expected, over verified rounds
+    cal_sum: f64 = 0.0, // (0: no round yet)
+    cal_c: f64 = 1.0, // the per-draft survival the last verified round solved for
+    cal_rounds: u64 = 0, // calibrated verifies, for the log
     copy_width: ?u32 = null,
     gate: ?call_gate.Gate = null,
 
@@ -261,6 +271,7 @@ pub const Stream = struct {
         s.inflight = null;
         s.served = null;
         s.granted = null;
+        s.cal_n = 0;
         s.copy_width = null;
     }
 
@@ -329,6 +340,90 @@ pub const Stream = struct {
 
     pub fn isEos(s: *const Stream, token: u32) bool {
         return std.mem.indexOfScalar(u32, s.eos, token) != null;
+    }
+
+    /// The survival scale the allocation uses: a cold or noisy stream cannot collapse its depth to nothing.
+    pub fn calScale(s: *const Stream) f64 {
+        return std.math.clamp(s.cal, cal_floor, 1.0);
+    }
+
+    /// Remember the granted drafts' raw cumulative chances for the round's verify.
+    pub fn predict(s: *Stream, chances: []const f64) void {
+        s.cal_n = @min(chances.len, cal_max);
+        @memcpy(s.cal_raw[0..s.cal_n], chances[0..s.cal_n]);
+    }
+
+    /// The drafts the allocation expected to land this round.
+    pub fn predicted(s: *const Stream) f64 {
+        var sum: f64 = 0.0;
+        for (s.cal_raw[0..s.cal_n]) |p| sum += p;
+        return sum;
+    }
+
+    /// Fold the round into the averages of kept and expected drafts, weight `w`, and set `cal` to the per-draft
+    /// survival whose expected drafts are the average's share of this round's chances. A per-round ratio would bias
+    /// `cal` low: its noise is clipped at 1 on one side only.
+    pub fn observeCal(s: *Stream, w: f64, kept: f64) void {
+        const n = s.cal_n;
+        if (n == 0) return;
+        const expected = s.predicted();
+        if (!(expected > 0.0)) return;
+        const realised = std.math.clamp(kept, 0.0, @as(f64, @floatFromInt(n)));
+        if (s.cal_sum > 0.0) {
+            s.cal_kept = (1.0 - w) * s.cal_kept + w * realised;
+            s.cal_sum = (1.0 - w) * s.cal_sum + w * expected;
+        } else {
+            s.cal_kept = realised;
+            s.cal_sum = expected;
+        }
+        s.cal_c = survival(s.cal_raw[0..n], s.cal_kept / s.cal_sum * expected);
+        s.cal = s.cal_c;
+    }
+
+    /// One line on stderr for the probe: the round, what it predicted, and what the next allocation will see.
+    pub fn logCal(s: *Stream, every: u32, rows: usize, kept: usize, tokens: usize) void {
+        s.cal_rounds += 1;
+        if (every == 0 or s.cal_rounds % every != 0) return;
+        var buf: [1024]u8 = undefined;
+        var at: usize = 0;
+        const n = s.cal_n;
+        at += (std.fmt.bufPrint(buf[at..], "tf-cal {{\"stream\": \"{s}\", \"rows\": {d}, \"granted\": {d}, \"kept\": {d}, \"pred_sum\": {d:.3}, \"chances\": [", .{ s.id, rows, n, kept, s.predicted() }) catch return).len;
+        for (s.cal_raw[0..n], 0..) |p, i| at += (std.fmt.bufPrint(buf[at..], "{s}{d:.3}", .{ if (i > 0) ", " else "", p }) catch return).len;
+        at += (std.fmt.bufPrint(buf[at..], "], \"c\": {d:.3}, \"cal\": {d:.3}, \"next\": [", .{ s.cal_c, s.cal }) catch return).len;
+        const scale = s.calScale();
+        var factor: f64 = 1.0;
+        for (s.cal_raw[0..n], 0..) |p, i| {
+            factor *= scale;
+            at += (std.fmt.bufPrint(buf[at..], "{s}{d:.3}", .{ if (i > 0) ", " else "", p * factor }) catch return).len;
+        }
+        at += (std.fmt.bufPrint(buf[at..], "], \"tokens\": {d}}}\n", .{tokens}) catch return).len;
+        std.debug.print("{s}", .{buf[0..at]});
+    }
+
+    /// The per-draft survival c in [cal_floor, 1] with sum_i c^i * chances[i-1] = kept (kept clamped to the drafts).
+    pub fn survival(chances: []const f64, kept: f64) f64 {
+        var total: f64 = 0.0;
+        for (chances) |p| total += p;
+        const want = std.math.clamp(kept, 0.0, @as(f64, @floatFromInt(chances.len)));
+        if (want >= total) return 1.0;
+        if (expectedKept(chances, cal_floor) >= want) return cal_floor;
+        var lo: f64 = cal_floor;
+        var hi: f64 = 1.0;
+        for (0..cal_steps) |_| {
+            const mid = 0.5 * (lo + hi);
+            if (expectedKept(chances, mid) < want) lo = mid else hi = mid;
+        }
+        return 0.5 * (lo + hi);
+    }
+
+    fn expectedKept(chances: []const f64, c: f64) f64 {
+        var sum: f64 = 0.0;
+        var factor: f64 = 1.0;
+        for (chances) |p| {
+            factor *= c;
+            sum += factor * p;
+        }
+        return sum;
     }
 
     /// Append tokens until the stream finishes; how many landed (a prefix of `tokens`).

@@ -160,7 +160,9 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
     const a = e.arena.allocator();
     const fixed = try a.alloc(u32, plans.len);
     const probs = try a.alloc([]const f64, plans.len);
-    for (plans, fixed, probs) |p, *fx, *pr| {
+    const raw = try a.alloc([]const f64, plans.len);
+    @memset(raw, &.{});
+    for (plans, fixed, probs, raw) |p, *fx, *pr, *rw| {
         const n = p.count();
         if (p.kind == .forced or n == 0) {
             fx.* = 1 + @as(u32, @intCast(if (p.kind == .forced) n else 0));
@@ -170,13 +172,15 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
             pr.* = try alloc.chainProbabilities(a, &.{e.cfg.copy_rate}, n);
         } else {
             fx.* = 1;
-            pr.* = try nodeChances(e, p.stream, n);
+            rw.* = try nodeChances(e, p.stream, n);
+            pr.* = if (e.cfg.draft_cal > 0.0) try calibrated(a, rw.*, p.stream.calScale()) else rw.*;
         }
     }
     const overhead = soloHeadOverhead(e.cfg.solo_head_overhead_ms, e.rule.overheadMs(plans.len), e.alone, plans.len, if (plans.len > 0) plans[0].kind else .none);
     const counts = try alloc.allocate(a, fixed, probs, &e.cfg.shared_costs, overhead, @max(plans.len, e.cfg.batch_rows));
-    for (plans, probs, counts) |*p, chances, c| {
+    for (plans, probs, counts, raw) |*p, chances, c, rw| {
         if (p.kind == .head) p.stream.granted = c;
+        if (e.cfg.draft_cal > 0.0) p.stream.predict(if (p.kind == .head) rw[0..c] else &.{});
         if (chances.len == 0 or c == chances.len) continue;
         if (c == 0) {
             p.kind = .none;
@@ -211,6 +215,17 @@ pub fn nodeChances(e: *Engine, s: *Stream, n: usize) ![]const f64 {
         }
     }
     return alloc.chainProbabilities(a, try e.rule.rates(who(s)), n);
+}
+
+/// Cumulative chances scaled by a survival: the i-th (1-based) lands only if i drafts each survive.
+pub fn calibrated(a: std.mem.Allocator, chances: []const f64, scale: f64) ![]const f64 {
+    const out = try a.alloc(f64, chances.len);
+    var factor: f64 = 1.0;
+    for (out, chances) |*o, c| {
+        factor *= scale;
+        o.* = c * factor;
+    }
+    return out;
 }
 
 /// The window's rows, parents and keyed positions, ready for the backend.
