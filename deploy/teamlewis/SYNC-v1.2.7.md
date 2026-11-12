@@ -2,9 +2,10 @@
 
 ## State
 
-- Time: 2026-11-12 22:55:00Z
+- Time: 2026-11-12 22:00:00Z
 - Head: `bfc8f297e` on `origin/sync/v1.2.7`
-- Step: TP1 `xpu-native` on jubiku **blocked** (host unreachable after compile-fix loop); server TP2 done
+- Step: TP1 `xpu-native` on jubiku **stopped** (Tim's workstation offline ~21:50Z, no lease); server TP2 done
+- TP1 build resumes in a daytime window under a capacity lease of at most **16 cores** and **24 GB** (no overnight jubiku work).
 
 ## Jubiku TP1 (2026-11-12)
 
