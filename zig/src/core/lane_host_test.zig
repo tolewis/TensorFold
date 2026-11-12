@@ -440,14 +440,14 @@ const CutIn = struct {
     const long = [_]u32{ 2, 7, 1, 8, 2, 8, 1, 8, 2, 8 };
 
     /// The long request, then `second`: the chunk order (caller frees), each reply checked as the fake's.
-    fn run(second: []const u32, opts: struct { cut_in: u32 = 4, refuse_full: usize = 0 }) ![][2]usize {
+    fn run(second: []const u32, opts: struct { cut_in: u32 = 4, refuse_full: usize = 0, refuse_busy: usize = 0 }) ![][2]usize {
         const gpa = std.testing.allocator;
         var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
         defer cfg.deinit(gpa);
         var w: CutIn = .{};
         defer w.a.deinit(gpa);
         defer w.b.deinit(gpa);
-        var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 6, .prefill_hook = hook, .prefill_hook_ctx = &w, .refuse_full = opts.refuse_full };
+        var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 6, .prefill_hook = hook, .prefill_hook_ctx = &w, .refuse_full = opts.refuse_full, .refuse_busy = opts.refuse_busy };
         defer target.deinit();
         var clock: lanes.fake.FixedClock = .{};
         var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
@@ -467,6 +467,7 @@ const CutIn = struct {
         w.mutex.unlock(std.testing.io);
         try w.until(.done);
         try std.testing.expectEqual(@as(usize, 0), target.refuse_full);
+        try std.testing.expectEqual(@as(usize, 0), target.refuse_busy);
         for ([_][]const u32{ &long, second }, [_][]const u32{ w.a.items, w.b.items }) |prompt, reply| {
             var history: std.ArrayList(u32) = .empty;
             defer history.deinit(gpa);
@@ -506,4 +507,13 @@ test "a short prompt refused for room as it cuts in waits in the queue and then 
         defer std.testing.allocator.free(order);
         try std.testing.expectEqual(@as(usize, 12), order.len);
     }
+}
+
+test "a cut-in its backend refuses as its pass opens (its kept state gone) waits for the pass in pieces, not tried again" {
+    // a retry between the long pass's pieces would cut in (refuse_busy is spent): the order shows it never was
+    const order = try CutIn.run(&.{ 3, 1, 4 }, .{ .refuse_busy = 1 });
+    defer std.testing.allocator.free(order);
+    try std.testing.expectEqual(@as(usize, 12), order.len);
+    for (order[0..6], 0..) |o, i| try std.testing.expectEqual([2]usize{ CutIn.long.len, i }, o);
+    for (order[6..12], 0..) |o, i| try std.testing.expectEqual([2]usize{ 3, i }, o);
 }

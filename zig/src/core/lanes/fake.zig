@@ -41,6 +41,7 @@ pub const Fake = struct {
     prefill_hook_ctx: ?*anyopaque = null,
     refuse_sampled: bool = false, // prefill refuses a sampled stream with error.SamplingRefused
     refuse_full: usize = 0, // prefill refuses this many times with error.ContextFull while another lane is live
+    refuse_busy: usize = 0, // a cut-in (Stream.cut_in) is refused this many times with error.FillBusy (its state gone)
 
     pub fn deinit(x: *Fake) void {
         var it = x.lanes.valueIterator();
@@ -116,6 +117,10 @@ pub const Fake = struct {
         if (x.refuse_full > 0 and x.lanes.count() > 0 and !x.lanes.contains(s)) {
             x.refuse_full -= 1;
             return error.ContextFull;
+        }
+        if (x.refuse_busy > 0 and s.cut_in > 0) {
+            x.refuse_busy -= 1;
+            return error.FillBusy;
         }
         const got = try x.lanes.getOrPut(x.gpa, s);
         if (got.found_existing) freeLane(x.gpa, got.value_ptr);

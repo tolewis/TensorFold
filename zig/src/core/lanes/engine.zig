@@ -42,7 +42,7 @@ pub const Engine = struct {
     fill_chunks: u32 = 0, // a piece's chunks (backend prefill_part; 0: a prompt pass runs whole inside addStream)
     fill_rounds: u32 = 4, // the live streams' rounds between two pieces
     fill_first: u32 = 0, // the first piece's chunks (0: fill_chunks): a short prompt then runs whole
-    cut_in: u32 = 0, // prompts of at most this many tokens cut in between pieces; set, every pass runs in pieces
+    cut_in: u32 = 0, // prompts that compute at most this many tokens (past a kept state) cut in between pieces; set, every pass runs in pieces
     rounds_since: u32 = 0,
 
     pub fn init(gpa: Allocator, cfg: *const Config, backend: be.Backend, clock: be.Clock) Engine {
@@ -95,7 +95,9 @@ pub const Engine = struct {
         _ = e.arena.reset(.retain_capacity);
         try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
         if (e.filling != null) {
-            if (!e.cutsIn(s.prompt_len, s.images.len > 0)) return error.FillBusy;
+            const at = @min(@as(usize, s.reuse.at), s.prompt_len);
+            if (!e.cutsIn(s.prompt_len - at, picturesPast(s.images, at))) return error.FillBusy;
+            s.cut_in = e.cut_in; // the backend holds it to the bound once it knows where the pass really resumes
             e.backend.prefill(s) catch |err| {
                 if (err == error.Cancelled) e.backend.release(s);
                 return err;
@@ -115,10 +117,19 @@ pub const Engine = struct {
         try e.started(s);
     }
 
-    /// Whether a prompt of `len` tokens runs whole between the filling stream's pieces (no images: one at a time).
-    pub fn cutsIn(e: *const Engine, len: usize, images: bool) bool {
+    /// Whether a prompt that computes `tokens` tokens (past the kept state it resumes, all of it without one) runs whole
+    /// between the filling stream's pieces. `rows`: it needs picture rows (a picture past that state); such a prompt,
+    /// like any while the filling pass has pictures of its own, does not cut in (one at a time).
+    pub fn cutsIn(e: *const Engine, tokens: usize, rows: bool) bool {
         const filling = e.filling orelse return false;
-        return e.cut_in > 0 and len <= e.cut_in and !images and filling.images.len == 0;
+        return e.cut_in > 0 and tokens <= e.cut_in and !rows and filling.images.len == 0;
+    }
+
+    /// Whether a prompt resuming at `at` needs rows for any of its pictures: one that ends past the resume point (a
+    /// picture wholly before it is in the kept state, and the pass runs no tower for it: dsv41's pictureNeedsRows).
+    pub fn picturesPast(images: []const sm.Image, at: usize) bool {
+        for (images) |img| if (@as(usize, img.at) + img.tokens > at) return true;
+        return false;
     }
 
     fn piece(e: *Engine, s: *Stream, chunks: u32) !bool {

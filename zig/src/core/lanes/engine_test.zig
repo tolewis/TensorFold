@@ -181,3 +181,12 @@ test "a cycle in the answer does not refire or reclose" {
     for (plain[0].emitted) |token| close_count += @intFromBool(token == 90);
     try std.testing.expectEqual(@as(usize, 1), close_count);
 }
+
+test "a cut-in needs picture rows only for a picture ending past its resume point, as dsv41's pictureNeedsRows" {
+    const img = [_]sm.Image{.{ .at = 4, .tokens = 6, .bytes = "" }};
+    try std.testing.expect(!Engine.picturesPast(&img, 10)); // ends exactly at the resume point: in the kept state
+    try std.testing.expect(!Engine.picturesPast(&img, 12)); // wholly before
+    try std.testing.expect(Engine.picturesPast(&img, 9)); // straddles it
+    try std.testing.expect(Engine.picturesPast(&img, 0)); // a fresh pass
+    try std.testing.expect(!Engine.picturesPast(&.{}, 0));
+}

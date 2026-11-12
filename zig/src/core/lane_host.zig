@@ -226,6 +226,7 @@ pub const LaneHost = struct {
         parent: ?u64 = null, // the durable point its pass resumes from, and where
         fork: u32 = 0,
         lineage: []pc.Fork = &.{}, // the computation its pass's rows belong to (gpa-owned; Store.passLineage)
+        whole: bool = false, // refused as a cut-in (error.FillBusy: its kept state gone): it waits for the pass in pieces
 
         /// The backend's prompt pass stands at a mark: the cache keeps the stream's state there.
         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
@@ -266,6 +267,15 @@ pub const LaneHost = struct {
     /// hold the same placeholder). Upstream's server always keys them; TF_DS_IMAGE_CACHE=0 leaves the key empty.
     fn cacheable(r: *const Request) bool {
         return r.images.len == 0 or r.cache_key.len == r.prompt.len;
+    }
+
+    /// Where a queued request would resume from memory, for the cut-in test (Store.find changes nothing; a state only on
+    /// disk counts as none: such a prompt does not cut in). Its pass may still run from 0 if the state is gone by then.
+    fn resumable(h: *LaneHost, r: *const Request) usize {
+        if (!cacheable(r)) return 0;
+        const store = h.cache orelse return 0;
+        const e = store.find(r.cacheKey(), r.chunks) orelse return 0;
+        return @min(@as(usize, e.at), r.prompt.len);
     }
 
     /// The pictures' identities the durable tier gets for a request: its `cache_media` only when they name exactly the
@@ -572,7 +582,10 @@ pub const LaneHost = struct {
         var at: usize = 0;
         if (h.filling != null) {
             at = for (h.queued.items, 0..) |j, i| {
-                if (h.core.cutsIn(j.request.prompt.len, j.request.images.len > 0)) break i;
+                if (j.whole) continue;
+                const r = j.request;
+                const from = h.resumable(r);
+                if (h.core.cutsIn(r.prompt.len - from, lanes.Engine.picturesPast(r.images, from))) break i;
             } else {
                 h.unlock();
                 return false;
@@ -670,6 +683,12 @@ pub const LaneHost = struct {
             if (e == error.Cancelled) return h.cancel(job);
             // refused for room: while other streams run or a pass fills (this one cut in), it waits in the queue
             if (e == error.ContextFull and (h.core.activeCount() > 0 or h.filling != null)) return h.requeue(job);
+            // refused as a cut-in (its kept state gone as its pass opened): it waits for the pass in pieces, not
+            // tried again between that pass's pieces
+            if (e == error.FillBusy and h.filling != null) {
+                job.whole = true;
+                return h.requeue(job);
+            }
             h.checkFatal(e);
             return h.drop(job, h.words(e));
         };

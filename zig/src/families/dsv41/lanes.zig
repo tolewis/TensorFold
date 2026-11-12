@@ -784,8 +784,9 @@ pub const Lanes = struct {
             p.prefill += m.now() - t0;
         };
         if (self.fill) |f| if (f.s != s) {
-            // a prompt cuts in between this pass's pieces: it waits (one at most, no images), its next piece resumes it
-            if (self.paused != null or f.s.images.len > 0 or s.images.len > 0) return error.FillBusy;
+            // a prompt cuts in between this pass's pieces: it waits (one at most; neither pass needs picture rows: a cut-in's
+            // pictures wholly before the state it resumes run no tower and set no spans), its next piece resumes it
+            if (self.paused != null or f.s.images.len > 0 or lanes.Engine.picturesPast(s.images, s.reuse.at)) return error.FillBusy;
             self.paused = f;
             self.fill = null;
         };
@@ -912,6 +913,18 @@ pub const Lanes = struct {
             } else s.reuse_failed = true;
         };
         const base = if (parted) |pp| pp.base else if (kept != null and !moved) kept.?.base else try self.placeKept(taken[0..nt], size, kept);
+        // a cut-in (Stream.cut_in) runs whole between another pass's pieces: where it really resumes is known only
+        // now (the state may have gone stale, or found no room to move to), and if it would compute more than its
+        // bound, or rows for a picture, it is refused before its extent, the kept state's end, other states' rows, its
+        // sequence, rank 1's fill or a chunk change (the placement's own moves and evictions stand, as for any pass
+        // that fails past it; a part goes back by the errdefer above)
+        if (s.cut_in > 0) {
+            const resume_at: usize = if (kept) |sn| (if (moved and sn.stale) 0 else sn.at) else 0;
+            if (len - resume_at > s.cut_in or lanes.Engine.picturesPast(s.images, resume_at)) {
+                std.log.info("dsv41: a cut-in of {d} tokens resumes at {d}, not at {d} as admitted; it waits for the pass in pieces", .{ len, resume_at, s.reuse.at });
+                return error.FillBusy;
+            }
+        }
         if (kept) |sn| {
             sn.wanted = 0;
             if (!moved) sn.end = @max(sn.end, base + size); // its extent now: the next resume in place finds it held
@@ -2101,18 +2114,26 @@ test "a prefix two conversations share: the second one resuming it in place woul
     try std.testing.expect(!ln.keptOver(later.base + later.at, later.base + 432128, &later)); // the first one's next turn stays
 }
 
-test "a prompt with images does not cut in between another pass's pieces" {
+test "a prompt that needs picture rows does not cut in between another pass's pieces, nor any into a pass with pictures" {
     var m: Model = undefined;
     m.io = std.testing.io;
     var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
     var long: lanes.Stream = undefined;
     long.images = &.{};
     var short: lanes.Stream = undefined;
-    const image = [_]lanes.stream.Image{.{ .at = 0, .tokens = 1, .bytes = "" }};
+    const image = [_]lanes.stream.Image{.{ .at = 4, .tokens = 6, .bytes = "" }};
     short.images = &image;
+    // resuming at 8, the picture [4, 10) straddles the cut: its rows are needed
+    short.reuse = .{ .at = 8 };
     ln.fill = .{ .s = &long, .slot = 0, .len = 16, .replay = 0, .last_end = 0, .start = 8 };
     try std.testing.expectError(error.FillBusy, ln.prefillPart(&short, 1));
     try std.testing.expect(ln.paused == null and ln.fill.?.s == &long); // the pass in pieces stays as it was
+    // the filling pass has pictures: nothing cuts in, a text prompt neither
+    long.images = &image;
+    short.images = &.{};
+    short.reuse = .{};
+    try std.testing.expectError(error.FillBusy, ln.prefillPart(&short, 1));
+    try std.testing.expect(ln.paused == null and ln.fill.?.s == &long);
 }
 
 test "a restore's destination is held back from placement, never a victim and never usable until installed" {
