@@ -299,9 +299,8 @@ constexpr int PM = 128, PN = 128, PSTAGES = 4;  // rows, columns, staged 64-inpu
 struct Stage {
     uint4 a[PM][2];
     uint32_t sa[PM];
-    uint2 b[2][256];   // as packed: the dense packer's bf16 m16n8k16 order
+    uint2 b[2][256];  // as packed: the dense packer's bf16 m16n8k16 order
     uint32_t sb[2][64];
-    uint2 bt[2][256];  // the same words in the mxf4nvf4 order the block-scaled mma reads
 };
 
 }  // namespace tf_ck4p
@@ -335,6 +334,7 @@ extern "C" __global__ void __launch_bounds__(256)
                   int npad, int group) {
     using namespace tf_ck4p;
     __shared__ __align__(128) Stage st[PSTAGES];
+    __shared__ __align__(128) uint2 btx[2][256];  // one stage's words in the mxf4nvf4 order (the barrier guards reuse)
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
     const int wm = warp >> 2, wn = warp & 3;
     const int NB = npad / 64, KG = K / 64;
@@ -381,7 +381,7 @@ extern "C" __global__ void __launch_bounds__(256)
                 v1 |= ((src.y >> (4 * dt)) & 0xFu) << (8 * j);
                 v1 |= ((src.y >> (4 * dt + 16)) & 0xFu) << (8 * j + 4);
             }
-            p.bt[tile][wd] = make_uint2(v0, v1);
+            btx[tile][wd] = make_uint2(v0, v1);
         }
         __syncthreads();
         uint2 b[4];
@@ -389,7 +389,7 @@ extern "C" __global__ void __launch_bounds__(256)
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const int nt = (wn & 1) * 4 + j;
-            b[j] = p.bt[wn >> 1][nt * 32 + lane];
+            b[j] = btx[wn >> 1][nt * 32 + lane];
             sb[j] = p.sb[wn >> 1][nt * 8 + g];
         }
 #pragma unroll
