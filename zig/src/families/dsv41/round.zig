@@ -29,6 +29,7 @@ const exact = @import("exact.zig");
 const ops_mod = @import("ops.zig");
 const shard = @import("shard.zig");
 const shard_ops = @import("shard_ops.zig");
+const shard_ring = @import("shard_ring.zig");
 
 const Engine = prompt.Engine;
 const Chunk = prompt.Chunk;
@@ -207,6 +208,7 @@ pub const Round = struct {
     launch_mark: u64 = 0,
     clk_layers: bool = false, // a clock at each layer's end alone (tag 64 + the layer), TF_DS_CLOCK_MARKS=2
     clk_marks: bool = false,
+    clk_shard: bool = false, // clocks only at the sharded attention's marks (and a_q, a_idx, a_core), TF_DS_CLOCK_MARKS=4
     clk_ratio: ?u8 = null, // phase clocks only in the layers of this compress ratio (TF_DS_CLOCK_MARKS=3: ratio 2)
     cur_ratio: u8 = 0, // the layer a stretch is on (its compress ratio) // clocks at every phase mark too (Model.useClock(true)), not only around the stretches
     clk: u64 = 0, // [1 + 2 * max_clocks] u64: the count, then each clock and its phase (PhaseTimer.Phase or clock_*)
@@ -225,6 +227,28 @@ pub const Round = struct {
     xh_recv: u64 = 0,
     peer_sink: []u64 = &.{},
     peer_suh: []u64 = &.{},
+    // the round's decode mode (forward: the switch's, or auto's choice from the rows each rank holds; off unsharded)
+    // and whether its exchanges ride the RDMA ring (KvShard.use_ring and every exchange of R rows fits a slot)
+    smode: shard.Mode = .off,
+    sring: bool = false,
+    // on the ring (KvShard.use_ring, useShard): the round's row lists (shard_ring.Lists, i32, uploaded each ring
+    // round by shardRound), the most rows whose every exchange fits a slot in each mode (the model's sizes: every
+    // compressed layer's), and the check of each layer's ring order
+    rlist: u64 = 0,
+    fit_fetch: usize = 0,
+    fit_owner: usize = 0,
+    rcur: shard_ring.Cursor = .{},
+    // owner decode's own-head pass (and its early query stage) on a stream of their own (KvShard.overlap): the pass's
+    // split partials, the fork and the two joins (the query stage's, before its collect; the pass's, before the outputs'
+    // collect, as the pass writes every xhwo row)
+    ss: ?cuda.Stream = null,
+    ss_fork: ?cuda.Event = null,
+    ss_jq: ?cuda.Event = null,
+    ss_jo: ?cuda.Event = null,
+    ss_q_out: bool = false,
+    pm2: u64 = 0,
+    pl2: u64 = 0,
+    po2: u64 = 0,
 
     pub fn init(e: *const Engine, a: *prompt.Arena, gpa: std.mem.Allocator, pool_cap: usize) !Round {
         const c = e.c;
@@ -244,6 +268,7 @@ pub const Round = struct {
         rd.launch_mark = 0;
         rd.clk_layers = false;
         rd.clk_marks = false;
+        rd.clk_shard = false;
         rd.clk_ratio = null;
         rd.cur_ratio = 0;
         rd.clk = 0;
@@ -260,6 +285,20 @@ pub const Round = struct {
         rd.xh_recv = 0;
         rd.peer_sink = &.{};
         rd.peer_suh = &.{};
+        rd.smode = .off;
+        rd.sring = false;
+        rd.rlist = 0;
+        rd.fit_fetch = 0;
+        rd.fit_owner = 0;
+        rd.rcur = .{};
+        rd.ss = null;
+        rd.ss_fork = null;
+        rd.ss_jq = null;
+        rd.ss_jo = null;
+        rd.ss_q_out = false;
+        rd.pm2 = 0;
+        rd.pl2 = 0;
+        rd.po2 = 0;
         rd.glue = try a.take(glue_n * max_rows * 8); // glue rows at max_rows apart
         rd.inputs = try a.take(5 * R * 8);
         rd.ids = rd.inputs;
@@ -374,47 +413,158 @@ pub const Round = struct {
 
     /// TF_DS_KV_SHARD (e.kv): the sharded decode's buffers, every one allocated here, before any graph capture (a
     /// round's rows change their contents, never their addresses); owner decode also gathers the other rank's sinks and
-    /// wo_a suh of every layer once (an all-gather of each: both ranks call this at the same point of open).
+    /// wo_a suh of every layer once (an all-gather of each: both ranks call this at the same point of open). Every
+    /// rank-local step (the kernels' presence, the buffers, the overlap stream and events) comes first, and its outcome
+    /// rides the exchanges' settings gather (agreeExchanges: the RDMA ring or NCCL, auto's cost model): a rank that cannot
+    /// set up refuses with its own error and every other rank with KvShardSettingsMismatch at the same point, so no rank
+    /// waits in the sinks' gather for one that left.
     pub fn useShard(rd: *Round, e: *const Engine, a: *prompt.Arena, gpa: std.mem.Allocator) !void {
         const kv = e.kv orelse return error.NoKvShard;
+        errdefer rd.dropShard();
+        const want = exchangeSettings(e, kv);
+        const ready = rd.shardLocal(e, a, gpa, kv, want.ring);
+        try agreeExchanges(e, a, kv, want, ready);
+        if (kv.mode != .owner and kv.mode != .auto) return;
+        const hl = e.heads();
+        const wo_k = woK(e.w.layers[0]);
+        const peer = kv.sh.peer();
+        for (e.w.layers, 0..) |lay, li| {
+            // the other rank's slice of each, gathered in rank order (shardLocal took both buffers: rd.peer_* hold
+            // their bases until here): its own heads' sinks, its groups' suh
+            const sinks = rd.peer_sink[li];
+            try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(sinks + kv.sh.rank * hl * 4, lay.sink, hl * 4, e.s.handle), "cuMemcpyDtoDAsync");
+            try e.comm.allGatherInPlace(sinks, hl * 4, e.s);
+            rd.peer_sink[li] = sinks + peer * hl * 4;
+            const suh = rd.peer_suh[li];
+            try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(suh + kv.sh.rank * wo_k * 2, rd.wo_suh[li], wo_k * 2, e.s.handle), "cuMemcpyDtoDAsync");
+            try e.comm.allGatherInPlace(suh, wo_k * 2, e.s);
+            rd.peer_suh[li] = suh + peer * wo_k * 2;
+        }
+        try e.s.synchronize();
+    }
+
+    fn woK(lay: weights.Layer) usize {
+        var k: usize = 0;
+        for (lay.wo_a[0..lay.groups]) |wo| k += wo.k;
+        return k;
+    }
+
+    /// useShard's rank-local half (no collective): what this rank's sharded decode needs, checked and allocated.
+    /// `ring`: this rank's own wish for the ring (exchangeSettings), which the gather then makes every rank's.
+    fn shardLocal(rd: *Round, e: *const Engine, a: *prompt.Arena, gpa: std.mem.Allocator, kv: *shard_ops.KvShard, ring: bool) !void {
         const c = e.c;
         const R = e.round_rows;
         const K = c.index_topk;
         const world: usize = kv.sh.world;
+        if (world > 2) return error.KvShardNeedsTwoRanks;
         rd.sglue = try a.take(sglue_n * max_rows * 8);
         rd.fidx = try a.take(R * (K + 16) * 8);
-        if (kv.mode == .fetch) {
+        if (ring) try rd.useShardRing(e, a, kv);
+        if (kv.mode == .fetch or kv.mode == .auto) {
             rd.fc = try a.take(world * R * K * c.head_dim / 2);
             rd.fs = try a.take(world * R * K * c.head_dim / 16);
         }
-        if (kv.mode != .owner) return;
+        if (kv.mode != .owner and kv.mode != .auto) return;
         const hl = e.heads();
         const hd = c.head_dim;
-        const l0 = e.w.layers[0];
-        var wo_k: usize = 0;
-        for (l0.wo_a[0..l0.groups]) |wo| wo_k += wo.k;
+        const wo_k = woK(e.w.layers[0]);
+        for (e.w.layers) |lay| if (woK(lay) != wo_k) return error.UnevenWoA; // (the exchange's rows: every layer's wo_a alike)
         rd.qall = try a.take(world * R * hl * hd * 2);
         rd.o_peer = try a.take(R * hl * hd * 2);
         rd.xh_peer = try a.take(R * wo_k * 2);
         rd.xh_recv = try a.take(R * wo_k * 2);
         rd.peer_sink = try gpa.alloc(u64, e.w.layers.len);
         rd.peer_suh = try gpa.alloc(u64, e.w.layers.len);
-        const peer = kv.sh.peer();
-        for (e.w.layers, 0..) |lay, li| {
-            var k: usize = 0;
-            for (lay.wo_a[0..lay.groups]) |wo| k += wo.k;
-            if (k != wo_k) return error.UnevenWoA; // (the exchange's rows: every layer's wo_a alike)
-            // the other rank's slice of each, gathered in rank order: its own heads' sinks, its groups' suh
-            const sinks = try a.take(world * hl * 4);
-            try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(sinks + kv.sh.rank * hl * 4, lay.sink, hl * 4, e.s.handle), "cuMemcpyDtoDAsync");
-            try e.comm.allGatherInPlace(sinks, hl * 4, e.s);
-            rd.peer_sink[li] = sinks + peer * hl * 4;
-            const suh = try a.take(world * wo_k * 2);
-            try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(suh + kv.sh.rank * wo_k * 2, rd.wo_suh[li], wo_k * 2, e.s.handle), "cuMemcpyDtoDAsync");
-            try e.comm.allGatherInPlace(suh, wo_k * 2, e.s);
-            rd.peer_suh[li] = suh + peer * wo_k * 2;
+        for (rd.peer_sink, rd.peer_suh) |*sk, *su| {
+            sk.* = try a.take(world * hl * 4);
+            su.* = try a.take(world * wo_k * 2);
         }
+    }
+
+    /// The ring path's buffers and limits: the row lists' block, each mode's most rows whose every exchange fits a slot
+    /// (from the model's sizes, every compressed layer's outputs: the same on both ranks), and, for owner decode with
+    /// TF_DS_KV_SHARD_OVERLAP not "0", the own-head pass's stream, events and split partials (per rank: it moves where
+    /// kernels run, never the ring order or a byte).
+    fn useShardRing(rd: *Round, e: *const Engine, a: *prompt.Arena, kv: *shard_ops.KvShard) !void {
+        const c = e.c;
+        const R = e.round_rows;
+        const hd = c.head_dim;
+        const max = (e.ring orelse return error.NoKvShard).s.max_bytes;
+        rd.rlist = try a.take(shard_ring.Lists.bytes);
+        try prompt.fill(e, rd.rlist, 0, shard_ring.Lists.bytes);
+        const K = c.index_topk;
+        rd.fit_fetch = shard_ring.fitRows(shard_ring.fetchXfer(0, 0, kv.sh.rank, 1, K, K, hd / 2, hd / 16).rowBytes(), max);
+        var fit = shard_ring.fitRows(shard_ring.qXfer(0, 0, kv.sh.rank, 1, e.heads(), hd).rowBytes(), max);
+        for (e.w.layers) |lay| {
+            if (lay.ratio == 0) continue;
+            const o = shard_ring.outXfer(0, 0, 1, lay.groups, lay.wo_a[0].k) catch {
+                fit = 0;
+                break;
+            };
+            fit = @min(fit, shard_ring.fitRows(o.rowBytes(), max));
+        }
+        rd.fit_owner = fit;
+        if (kv.mode != .owner and kv.mode != .auto) return;
+        const ov = getenv("TF_DS_KV_SHARD_OVERLAP");
+        kv.overlap = if (ov) |v| !std.mem.eql(u8, v, "0") else true;
+        if (!kv.overlap) return;
+        const hl = e.heads();
+        rd.pm2 = try a.take(R * hl * tri_attn.attn_splits * 4);
+        rd.pl2 = try a.take(R * hl * tri_attn.attn_splits * 4);
+        rd.po2 = try a.take(R * hl * tri_attn.attn_splits * hd * 4);
+        var s = try cuda.Stream.init(e.d, true);
+        errdefer s.deinit();
+        rd.ss_fork = try cuda.Event.init(e.d, false);
+        rd.ss_jq = try cuda.Event.init(e.d, false);
+        rd.ss_jo = try cuda.Event.init(e.d, false);
+        rd.ss = s;
+    }
+
+    pub fn dropShard(rd: *Round) void {
+        inline for (.{ &rd.ss_fork, &rd.ss_jq, &rd.ss_jo }) |ev| {
+            if (ev.*) |*x| x.deinit();
+            ev.* = null;
+        }
+        if (rd.ss) |*s| s.deinit();
+        rd.ss = null;
+    }
+
+    /// This rank's own exchange settings, before any agreement: the RDMA ring when this rank has one, its image has the
+    /// ring kernels (shard_ops.Kernels.ringRows) and TF_DS_KV_SHARD_RING is not "0"; TF_DS_KV_SHARD_COST (auto's cost
+    /// model), or the parse error.
+    const Want = struct { ring: bool, cost: anyerror!shard_ring.Cost };
+
+    fn exchangeSettings(e: *const Engine, kv: *const shard_ops.KvShard) Want {
+        const ring_env = getenv("TF_DS_KV_SHARD_RING");
+        const ring_ok: anyerror!bool = if (ring_env) |v| (if (v.len == 0 or std.mem.eql(u8, v, "1")) true else if (std.mem.eql(u8, v, "0")) false else error.BadKvShardRing) else true;
+        const kernels = kv.k.hasRingRows();
+        const on = ring_ok catch false;
+        if (e.ring != null and on and !kernels) std.log.warn("dsv41: TF_DS_KV_SHARD: this dsv41_shard image has no ring kernels (tf_ds_ring_stage_rows, tf_ds_ring_collect_rows): the decode exchanges take NCCL (rebuild the image for the ring)", .{});
+        return .{ .ring = e.ring != null and on and kernels, .cost = if (ring_ok) |_| shard_ring.Cost.parse(getenv("TF_DS_KV_SHARD_COST")) else |err| err };
+    }
+
+    /// The exchanges' settings on every rank alike (shard_ring.Agreed): this rank's (exchangeSettings), gathered and
+    /// compared. A rank whose own settings do not parse, or whose rank-local setup failed (`ready`: shardLocal), sends
+    /// the sentinel and refuses with its own error after the gather (as Model.agree does), so no rank waits in a
+    /// collective the other never joins; a difference is KvShardSettingsMismatch on every other rank.
+    fn agreeExchanges(e: *const Engine, a: *prompt.Arena, kv: *shard_ops.KvShard, want: Want, ready: anyerror!void) !void {
+        const mine = shard_ring.Agreed.of(want.ring, if (ready) |_| want.cost else |err| err);
+        const per = @sizeOf(shard_ring.Agreed);
+        const world: usize = kv.sh.world;
+        if (world > 2) return error.KvShardNeedsTwoRanks;
+        const buf = try a.take(world * per);
+        try prompt.upload(e, buf + kv.sh.rank * per, &mine, per);
+        try e.comm.allGatherInPlace(buf, per, e.s);
         try e.s.synchronize();
+        var all: [2]shard_ring.Agreed = undefined;
+        try e.d.check(e.d.api.cuMemcpyDtoH_v2(&all, buf, world * per), "cuMemcpyDtoH");
+        if (!mine.same(all[0..world])) {
+            try ready; // this rank's own refusal first
+            _ = try want.cost;
+            return error.KvShardSettingsMismatch;
+        }
+        kv.use_ring = want.ring;
+        kv.cost = want.cost catch unreachable;
     }
 
     fn sgl(rd: *const Round, k: SGlue) u64 {
@@ -504,7 +654,8 @@ pub const Round = struct {
     }
 
     fn mark(rd: *Round, e: *const Engine, p: PhaseTimer.Phase) !void {
-        if (rd.clk != 0 and rd.clk_marks and (rd.clk_ratio == null or rd.clk_ratio.? == rd.cur_ratio)) {
+        const all = rd.clk_marks and (rd.clk_ratio == null or rd.clk_ratio.? == rd.cur_ratio);
+        if (rd.clk != 0 and (all or (rd.clk_shard and PhaseTimer.shardMark(p)))) {
             const now = cuda.launch.count;
             rd.launches[@intFromEnum(p)] += now -% rd.launch_mark;
             rd.launch_mark = now;
@@ -592,6 +743,56 @@ fn setShardGlue(e: *const Engine, rd: *Round, rows: Rows, sh: shard.Shard) !void
     var hg: [sglue_n * max_rows]i64 = undefined;
     try shard.glueRows(sh, rows.pos[0..R], bases[0..R], ends[0..R], if (rows.parts) |v| v[0..R] else null, e.c.index_topk, max_rows, &hg);
     try prompt.upload(e, rd.sglue, &hg, hg.len * 8);
+}
+
+/// TF_DS_KV_SHARD: the round's decode (shard_ring.decide, a pure function of what every rank holds alike, tested
+/// there for both ranks): its mode (the switch's, or auto's choice from the round's row counts), whether its exchanges
+/// ride the RDMA ring (the round's rows fit a slot: Round.fit_*), its row lists uploaded for the ring kernels, and
+/// the counters. A round must start with no sized ring send pending (RowPairing) and the layer cursor reset.
+fn shardRound(e: *const Engine, rd: *Round, rows: Rows, kv: *shard_ops.KvShard) !void {
+    const R = rows.ids.len;
+    if (e.ring) |r| if (r.rowsOpen()) return error.ShardRingOrder;
+    if (!rd.rcur.done() or rd.ss_q_out) return error.ShardRingOrder;
+    rd.rcur.reset();
+    var owners: [max_rows]u32 = undefined;
+    for (0..R) |i| owners[i] = try rows.ownerOf(i, kv.sh);
+    const view: shard_ring.View = .{ .owners = owners[0..R] };
+    const d = try shard_ring.decide(.{
+        .view = view,
+        .mode = kv.mode,
+        .cost = kv.cost,
+        .sizes = ringSizes(e),
+        .decode_rows = tri.decode_rows,
+        .ring = kv.use_ring and rd.rlist != 0,
+        .fit_fetch = rd.fit_fetch,
+        .fit_owner = rd.fit_owner,
+    });
+    rd.smode = d.mode;
+    rd.sring = d.ring;
+    switch (d.mode) {
+        .fetch => kv.stats.fetch_rounds += 1,
+        .owner => kv.stats.owner_rounds += 1,
+        .off, .auto => unreachable,
+    }
+    if (kv.mode == .auto) {
+        if (d.mode == .fetch) kv.stats.auto_fetch += 1 else kv.stats.auto_owner += 1;
+    }
+    const ls = (try shard_ring.roundLists(d, view, kv.sh.rank)) orelse return;
+    kv.stats.ring_rounds += 1;
+    kv.stats.sent_rows += if (d.mode == .fetch) ls.get(.fetch, .send).n else ls.get(.q, .send).n + ls.get(.out, .send).n;
+    var dev: [shard_ring.Lists.words]i32 = undefined;
+    ls.encode(&dev);
+    try prompt.upload(e, rd.rlist, &dev, shard_ring.Lists.bytes);
+}
+
+/// A listed row's bytes in each decode exchange (auto's cost model): every pick of a fetched row, a row's queries, a
+/// row's rotated wo_a inputs.
+fn ringSizes(e: *const Engine) shard_ring.Sizes {
+    const c = e.c;
+    const l0 = e.w.layers[0];
+    var wo_k: usize = 0;
+    for (l0.wo_a[0..l0.groups]) |wo| wo_k += wo.k;
+    return .{ .fetch_row = c.index_topk * (c.head_dim / 2 + c.head_dim / 16), .q_row = e.heads() * c.head_dim * 2, .out_row = wo_k * 2 };
 }
 
 /// The layer's RoPE table rows (model.py _cs: the compressed table for a compressed layer).
@@ -684,6 +885,16 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
         try rd.prefetch(e, &r, prefetch_budget);
     }
     try rd.mark(e, .a_q);
+    // TF_DS_KV_SHARD owner decode on the RDMA ring: q is final here, so this rank's queries of the rows the peer holds
+    // go out now and travel behind the compressor and the indexer (ownerDecode takes the peer's). Whether this layer's
+    // attention is sharded is known already: the picks it will have (the indexer's min(index_topk, nb), or the
+    // selection an indexless layer reuses)
+    const q_sent = ratio != 0 and e.kv != null and rd.smode == .owner and rd.sring and (if (lay.idx_wq_b != null) @min(c.index_topk, rd.bucket / ratio) else rd.kk) > 0;
+    if (q_sent) {
+        try rd.rcur.begin(.owner);
+        try sendQueries(e, rd, rd.q, true);
+        try rd.mark(e, .sh_q);
+    }
     // _kv_idx: the compressor's caches (a kv source) and the indexer's selection
     var comp: tri_attn.Comp = .none;
     var cbase: ?u64 = null;
@@ -813,13 +1024,17 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
         .rot = .{ .cos = rope.cos, .sin = rope.sin, .rd = rd_dim, .suh = rd.wo_suh[li], .xh = rd.xhwo, .gh = gk / hd },
         .parts = .{ .pm = rd.pm_, .pl = rd.pl_, .po = rd.po_ },
     };
-    // TF_DS_KV_SHARD: a compressed layer's picked rows are on each row's owner only
-    const mode: shard.Mode = if (e.kv) |kv| (if (ratio != 0 and attn.n_idx > 0) kv.mode else .off) else .off;
+    // TF_DS_KV_SHARD: a compressed layer's picked rows are on each row's owner only; the round's mode (rd.smode: the
+    // switch's, or auto's choice; shardRound)
+    const mode: shard.Mode = if (e.kv != null and ratio != 0 and attn.n_idx > 0) rd.smode else .off;
+    if (q_sent and mode != .owner) return error.ShardRingOrder; // (a sent query no pass takes: the ranks would part)
     switch (mode) {
         .off => try tri_attn.sparseAttn(t, attn),
         .fetch => try fetchDecode(e, rd, attn, ratio),
-        .owner => try ownerDecode(e, rd, attn, ratio, li),
+        .owner => try ownerDecode(e, rd, attn, ratio, li, q_sent),
+        .auto => return error.NoKvShard, // (forward resolves auto a round)
     }
+    if (!rd.rcur.done()) return error.ShardRingOrder; // (every stage of the layer collected)
     try rd.mark(e, .a_core);
     var calls: [exl3_linear.gmax]exl3_linear.Call = undefined;
     const uw = lay.groups * lay.wo_a[0].n;
@@ -843,10 +1058,14 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
 
 /// TF_DS_KV_SHARD's decode attention by sparse fetch (the reference): each rank packs the picks of the rows it holds
 /// (codes and scales from its plane at the row's local base, pick order) into its slot of the gathered buffer
-/// ([world][R][index_topk] rows), renumbers every row's picks to its row there (relative: j), the slots all-gathered in
-/// place; then both ranks attend every row for their own heads over the gathered rows at the row's fetch base. The
-/// same schedule on both ranks whoever holds the rows (an all-gather of fixed size a round's rows), every buffer the
-/// round's own (graph-safe); each row reads the replicated bytes in the replicated order (shard.zig's tests).
+/// ([world][R][index_topk] rows), renumbers every row's picks to its row there (relative: j), and the other rank gets
+/// them; then both ranks attend every row for their own heads over the gathered rows at the row's fetch base. On the
+/// RDMA ring (rd.sring) a rank sends only its send list's rows (the rows only it holds), kk picks each, and the peer
+/// puts them at its receive list's rows of the sender's slot (shard_ring.fetchXfer: one sized transfer for codes and
+/// scales); on NCCL the slots are all-gathered in
+/// place at their fixed size (one NCCL group). The same schedule on both ranks whoever holds the rows, every buffer
+/// the round's own (graph-safe); each row reads the replicated bytes in the replicated order (shard.zig's and
+/// shard_ring.zig's tests).
 fn fetchDecode(e: *const Engine, rd: *Round, a: tri_attn.Attn, ratio: usize) !void {
     const c = e.c;
     const R = rd.r;
@@ -877,13 +1096,43 @@ fn fetchDecode(e: *const Engine, rd: *Round, a: tri_attn.Attn, ratio: usize) !vo
         .kos = kos,
         .how = .relative,
     });
-    try e.comm.allGatherInPlace(rd.fc, sl.slot_c, e.s);
-    try e.comm.allGatherInPlace(rd.fs, sl.slot_s, e.s);
+    try rd.mark(e, .sh_fetch);
+    const kv = e.kv.?;
+    if (rd.sring) {
+        const x = shard_ring.fetchXfer(rd.fc, rd.fs, kv.sh.rank, R, K, kk, cb, sb);
+        try rd.rcur.begin(.fetch);
+        try rd.rcur.take(.stage_fetch);
+        try shard_ops.ringSend(&kv.k, e.ring.?, e.s, x, rd.rlist + shard_ring.Lists.offset(.fetch, .send), R, true);
+        try rd.rcur.take(.collect_fetch);
+        try shard_ops.ringRecv(&kv.k, e.ring.?, e.s, x, rd.rlist + shard_ring.Lists.offset(.fetch, .recv), R, kv.sh.peer(), true);
+    } else try e.comm.allGatherInPlace2(rd.fc, sl.slot_c, rd.fs, sl.slot_s, e.s);
+    try rd.mark(e, .sh_rows);
     var b = a;
     b.comp = .{ .fp4 = .{ .codes = rd.fc, .scales = rd.fs } };
     b.idx = rd.fidx;
     b.cbase = rd.sgl(.fbase);
     try tri_attn.sparseAttn(e.t, b);
+}
+
+/// Owner decode on the RDMA ring: this rank's queries q [R][hl][hd] of the rows only the peer holds to the peer's
+/// gathered queries (shard_ring.qXfer, its q send list); ownerRing's receive takes the peer's. No other ring transfer
+/// runs between the two (Ring's RowPairing). Sent early (at q, behind the compressor and the indexer) on the shard
+/// side stream when there is one, so its copy overlaps them too (joined before the collect), and kept out of the ring
+/// probes (its doorbell-to-flag time would include the compressor and the indexer).
+fn sendQueries(e: *const Engine, rd: *Round, q: u64, early: bool) !void {
+    const kv = e.kv.?;
+    const x = shard_ring.qXfer(q, rd.qall, kv.sh.rank, rd.r, e.heads(), e.c.head_dim);
+    const list = rd.rlist + shard_ring.Lists.offset(.q, .send);
+    try rd.rcur.take(.stage_q);
+    if (early) if (rd.ss) |ss| {
+        try rd.ss_fork.?.record(e.s);
+        try ss.wait(rd.ss_fork.?);
+        try shard_ops.ringSend(&kv.k, e.ring.?, ss, x, list, rd.r, false);
+        try rd.ss_jq.?.record(ss);
+        rd.ss_q_out = true;
+        return;
+    };
+    try shard_ops.ringSend(&kv.k, e.ring.?, e.s, x, list, rd.r, !early);
 }
 
 /// TF_DS_KV_SHARD's owner-computed decode: the ranks' queries gathered; each rank attends the rows it holds (the
@@ -893,9 +1142,10 @@ fn fetchDecode(e: *const Engine, rd: *Round, a: tri_attn.Attn, ratio: usize) !vo
 /// takes the returned rows for the rows it does not hold. Every head of a row is computed by the kernel, keys and
 /// order its own rank would use, so the bits are the replicated ones (GPU validation: docs/port/shard-attn.md).
 /// Rounds of the split path only (the merge applies the rotation; tri.decode_rows is the round's bound).
+/// On the RDMA ring (rd.sring) the exchanges are sized by the round's row lists and overlapped: ownerRing.
 /// PORT(kit): a 64-head variant of _sparse_attn_part and its merge with per-head sinks and both ranks' suh (an
 /// explicitly audited kit; the recorded one has none) would make the two 32-head passes one.
-fn ownerDecode(e: *const Engine, rd: *Round, a: tri_attn.Attn, ratio: usize, li: usize) !void {
+fn ownerDecode(e: *const Engine, rd: *Round, a: tri_attn.Attn, ratio: usize, li: usize, q_sent: bool) !void {
     const c = e.c;
     const kv = e.kv.?;
     const R = rd.r;
@@ -909,27 +1159,108 @@ fn ownerDecode(e: *const Engine, rd: *Round, a: tri_attn.Attn, ratio: usize, li:
     const gk = lay.wo_a[0].k;
     const wo_k = lay.groups * gk;
     const peer = kv.sh.peer();
+    const own = rd.sgl(.own);
+    if (q_sent and !rd.sring) return error.ShardRingOrder;
+    if (rd.sring) return ownerRing(e, rd, a, ratio, li, q_sent);
     // both ranks' queries, rank after rank: [world][R][hl][hd]
     try e.comm.allGather(a.q, rd.qall, R * hl * hd, .bf16, e.s);
+    try rd.mark(e, .sh_q);
     // the picks of the rows this rank holds, none for the others'
-    try shard_ops.fetch(&kv.k, e.s, .{ .cb = hd / 2, .sb = hd / 16, .idx = a.idx, .ks = kk, .kk = kk, .rows = R, .own = rd.sgl(.own), .copy = false, .dk = 0, .out = rd.fidx, .kos = kk, .how = .mask });
+    try shard_ops.fetch(&kv.k, e.s, .{ .cb = hd / 2, .sb = hd / 16, .idx = a.idx, .ks = kk, .kk = kk, .rows = R, .own = own, .copy = false, .dk = 0, .out = rd.fidx, .kos = kk, .how = .mask });
+    try rd.mark(e, .sh_fetch);
     var mine = a;
     mine.idx = rd.fidx;
     mine.cbase = rd.sgl(if (ratio == 1) .lbase1 else .lbase2);
     try tri_attn.sparseAttn(e.t, mine);
+    try rd.mark(e, .sh_own);
+    try tri_attn.sparseAttn(e.t, peerPass(e, rd, mine, rot, li));
+    try rd.mark(e, .sh_peer);
+    // the other rank's heads of my rows to it, mine of its rows from it; then its rows' inputs in place
+    try e.comm.exchange(rd.xh_peer, R * wo_k, rd.xh_recv, R * wo_k, .f16, peer, e.s);
+    try rd.mark(e, .sh_out);
+    const x = shard.xhPlanes(R, lay.groups, gk);
+    try shard_ops.select(&kv.k, e.s, rd.xh_recv, rot.xh, own, 0, R, x.row_bytes, x.planes, x.plane_bytes);
+    try rd.mark(e, .sh_sel);
+}
+
+/// The peer-head pass's call: `mine` with the other rank's queries, sinks and wo_a suh, into o_peer / xh_peer.
+fn peerPass(e: *const Engine, rd: *const Round, mine: tri_attn.Attn, rot: tri_attn.Rot, li: usize) tri_attn.Attn {
+    const kv = e.kv.?;
     var theirs = mine;
-    theirs.q = rd.qall + peer * R * hl * hd * 2;
+    theirs.q = rd.qall + kv.sh.peer() * rd.r * e.heads() * e.c.head_dim * 2;
     theirs.out = rd.o_peer;
     theirs.sink = rd.peer_sink[li];
     var prot = rot;
     prot.suh = rd.peer_suh[li];
     prot.xh = rd.xh_peer;
     theirs.rot = prot;
-    try tri_attn.sparseAttn(e.t, theirs);
-    // the other rank's heads of my rows to it, mine of its rows from it; then its rows' inputs in place
-    try e.comm.exchange(rd.xh_peer, R * wo_k, rd.xh_recv, R * wo_k, .f16, peer, e.s);
-    const x = shard.xhPlanes(R, lay.groups, gk);
-    try shard_ops.select(&kv.k, e.s, rd.xh_recv, rot.xh, rd.sgl(.own), 0, R, x.row_bytes, x.planes, x.plane_bytes);
+    return theirs;
+}
+
+/// Owner decode on the RDMA ring (rd.sring, shard_ring.zig): the exchanges sized by the round's lists (the rows only
+/// one rank holds) and overlapped. In ring order: the queries' stage (at q, `q_sent`, on the side stream when there is
+/// one; else here) and collect, then the outputs' stage and collect, nothing else of the ring between a stage and its
+/// collect (rd.rcur, Ring's RowPairing). Around them, on this rank:
+/// 1. the mask of the picks (the rows this rank holds keep theirs);
+/// 2. with the side stream (KvShard.overlap): the own-head pass forked onto it, its own split partials (pm2, pl2,
+///    po2), so it runs while the queries are collected and the peer-head pass runs; without: it runs at step 5;
+/// 3. the peer's queries of this rank's rows collected (the early stage joined first);
+/// 4. the peer-head pass, and its outputs of the rows only this rank holds staged at once, straight for the peer's xhwo;
+/// 5. the own-head pass joined (or run: it hides the outputs' flight) before
+/// 6. the peer's outputs of the rows only it holds are collected into xhwo (the own pass writes every xhwo row first).
+/// The passes are the same launches over the same inputs as on NCCL, each with its own outputs and partials, so each
+/// pass's eight-split reduction and every bit are unchanged; only which stream and when they run differ.
+fn ownerRing(e: *const Engine, rd: *Round, a: tri_attn.Attn, ratio: usize, li: usize, q_sent: bool) !void {
+    const c = e.c;
+    const kv = e.kv.?;
+    const ring = e.ring.?;
+    const R = rd.r;
+    const kk = a.n_idx;
+    const hl = e.heads();
+    const hd = c.head_dim;
+    const rot = a.rot orelse return error.NoRotation;
+    const lay = e.w.layers[li];
+    const peer = kv.sh.peer();
+    const L = shard_ring.Lists;
+    if (!q_sent) {
+        try rd.rcur.begin(.owner);
+        try sendQueries(e, rd, a.q, false);
+        try rd.mark(e, .sh_q);
+    }
+    try shard_ops.fetch(&kv.k, e.s, .{ .cb = hd / 2, .sb = hd / 16, .idx = a.idx, .ks = kk, .kk = kk, .rows = R, .own = rd.sgl(.own), .copy = false, .dk = 0, .out = rd.fidx, .kos = kk, .how = .mask });
+    try rd.mark(e, .sh_fetch);
+    var mine = a;
+    mine.idx = rd.fidx;
+    mine.cbase = rd.sgl(if (ratio == 1) .lbase1 else .lbase2);
+    if (rd.ss) |ss| {
+        var side = mine;
+        side.parts = .{ .pm = rd.pm2, .pl = rd.pl2, .po = rd.po2 };
+        var t2 = e.t;
+        t2.stream = ss;
+        try rd.ss_fork.?.record(e.s);
+        try ss.wait(rd.ss_fork.?);
+        try tri_attn.sparseAttn(t2, side);
+        try rd.ss_jo.?.record(ss);
+    }
+    if (rd.ss_q_out) {
+        try e.s.wait(rd.ss_jq.?);
+        rd.ss_q_out = false;
+    }
+    const qx = shard_ring.qXfer(a.q, rd.qall, kv.sh.rank, R, hl, hd);
+    try rd.rcur.take(.collect_q);
+    try shard_ops.ringRecv(&kv.k, ring, e.s, qx, rd.rlist + L.offset(.q, .recv), R, peer, !q_sent);
+    try rd.mark(e, .sh_qwait);
+    try tri_attn.sparseAttn(e.t, peerPass(e, rd, mine, rot, li));
+    try rd.mark(e, .sh_peer);
+    const ox = try shard_ring.outXfer(rd.xh_peer, rot.xh, R, lay.groups, lay.wo_a[0].k);
+    try rd.rcur.take(.stage_out);
+    try shard_ops.ringSend(&kv.k, ring, e.s, ox, rd.rlist + L.offset(.out, .send), R, true);
+    try rd.mark(e, .sh_out);
+    if (rd.ss != null) try e.s.wait(rd.ss_jo.?) else try tri_attn.sparseAttn(e.t, mine);
+    try rd.mark(e, .sh_own);
+    try rd.rcur.take(.collect_out);
+    try shard_ops.ringRecv(&kv.k, ring, e.s, ox, rd.rlist + L.offset(.out, .recv), R, peer, true);
+    try rd.mark(e, .sh_owait);
 }
 
 /// Model.moe of a decode window (shared_side off: SHARED_OVERLAP unset in the served lane): the gate's chunk sums
@@ -979,8 +1310,20 @@ fn hcFnBytes(c: anytype) u64 {
 /// A round's GPU time by phase (tf-dsv41-lanes --profile 2): a timing event on the main stream at each phase's end,
 /// the elapsed times read after the round. Eager rounds only (in a graph the events would be captured).
 pub const PhaseTimer = struct {
-    pub const Phase = enum(u8) { start, embed, engram, mix_attn, attn, gather_a, mix_ffn, moe, gather_m, post, head, a_in, a_q, a_idx, a_core, a_woa, a_x, m_rt, m_gu, m_x };
+    // (sh_*: the sharded attention's parts, TF_DS_KV_SHARD: the fetch or mask kernel, the fetch's row exchange, owner
+    // decode's query send (on the ring: at q, before the indexer), own-head pass, query wait, peer-head pass, output
+    // send (NCCL: the exchange), output wait (the ring), the NCCL path's select)
+    pub const Phase = enum(u8) { start, embed, engram, mix_attn, attn, gather_a, mix_ffn, moe, gather_m, post, head, a_in, a_q, a_idx, a_core, a_woa, a_x, m_rt, m_gu, m_x, sh_fetch, sh_rows, sh_q, sh_own, sh_qwait, sh_peer, sh_out, sh_owait, sh_sel };
     pub const phases = @typeInfo(Phase).@"enum".field_names;
+    comptime {
+        std.debug.assert(phases.len <= 32); // Round.launches
+    }
+
+    /// The marks TF_DS_CLOCK_MARKS=4 clocks: q's end (the rest of the layer before it), the compressor and indexer's
+    /// end, the attention core's end and the sharded parts between (the early query send sits between a_q and a_idx).
+    pub fn shardMark(p: Phase) bool {
+        return @intFromEnum(p) >= @intFromEnum(Phase.sh_fetch) or p == .a_q or p == .a_idx or p == .a_core;
+    }
     const max_marks = 1024;
     events: []cuda.Event,
     phase: [max_marks]Phase = undefined,
@@ -1048,7 +1391,7 @@ pub const Graphs = struct {
     gpa: std.mem.Allocator,
     map: std.AutoHashMapUnmanaged(Key, Entry) = .empty,
 
-    pub const Key = struct { rows: u32, bucket: u64, stretch: u32 };
+    pub const Key = struct { rows: u32, bucket: u64, stretch: u32, mode: u8 = 0 }; // mode: the round's shard.Mode (auto's choice)
     const Entry = struct { exec: cuda.graph.Exec, start: Carry, end: Carry };
 
     pub fn init(gpa: std.mem.Allocator) Graphs {
@@ -1095,6 +1438,18 @@ pub const Graphs = struct {
     }
 };
 
+/// A round's errors after which the ranks cannot go on together: the ring or the communicator dead (RingFailed,
+/// CommAborted), a decode round's ring transfers out of their fixed order or row lists (RingOrder, ShardRingOrder,
+/// BadRingRows: a sized send may be in flight with no receive, or the peer waits in a collect). Rank 0 ends the pair
+/// on each (native.pair_fatal: TF_DS_PAIR_BROKEN=exit exits 75, both ranks restart); a follower stops following
+/// (lanes.followPair) instead of taking the next frame.
+pub const pair_ending = [_]anyerror{ error.RingFailed, error.CommAborted, error.RingOrder, error.ShardRingOrder, error.BadRingRows };
+
+pub fn endsPair(err: anyerror) bool {
+    for (pair_ending) |x| if (x == err) return true;
+    return false;
+}
+
 /// A round of these rows through every layer and the head: rd.logits [R, vocab] and rd.taps. The caches (ring, the
 /// compressed rows, the positional store) are the prompt's, extended by the rows; eh: the Engram host (the rows' n-grams
 /// hashed from `seq`, the whole sequence's ids through the rows'). With `graphs` each stretch runs as its graph and a
@@ -1115,11 +1470,16 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
     rd.has_cblk = false;
     rd.kk = 0;
     try setGlue(e, rd, rows);
-    if (e.kv) |kv| switch (kv.mode) {
-        .off => {},
-        .fetch => kv.stats.fetch_rounds += 1,
-        .owner => kv.stats.owner_rounds += 1,
-    };
+    rd.smode = .off;
+    rd.sring = false;
+    // a round that fails part way leaves the layer cursor and the early-q flag clean for the next (a ring send still
+    // awaiting its receive is left open on purpose: every later ring transfer refuses, RingOrder, and the round's
+    // error ends the pair, native.pair_fatal)
+    errdefer {
+        rd.rcur.reset();
+        rd.ss_q_out = false;
+    }
+    if (e.kv) |kv| try shardRound(e, rd, rows, kv);
     var cy: Carry = .{ .h = rd.h, .spare = rd.h_alt, .pre = rd.pre, .pre_f = rd.pre_f };
     // the round's Engram reads, every layer's at once (AIO): hashed and submitted once the first stretch is issued
     // (its GPU time covers the reads), landed on the host before each Engram layer's stretch
@@ -1140,7 +1500,7 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
         }
         try rd.clock(e, Round.clock_wait);
         if (graphs) |g| {
-            try g.run(.{ .rows = @intCast(R), .bucket = rd.bucket, .stretch = sn }, e, rd, ch, cs, rings, &cy, li, end);
+            try g.run(.{ .rows = @intCast(R), .bucket = rd.bucket, .stretch = sn, .mode = @intFromEnum(rd.smode) }, e, rd, ch, cs, rings, &cy, li, end);
         } else try stretch(e, rd, ch, cs, rings, &cy, li, end, probe);
         try rd.clock(e, Round.clock_tail);
         if (!ahead) try engramAhead(e, eh orelse return error.NoEngramTables, seq, rows, &ah);
@@ -1335,6 +1695,10 @@ test "context buckets as graph.py makes them" {
     try std.testing.expectEqual(@as(usize, 4096), bucketFor(4096, 1 << 20));
     try std.testing.expectEqual(@as(usize, 8192), bucketFor(4097, 1 << 20));
     try std.testing.expectEqual(@as(usize, 4096), bucketFor(5000, 4096));
+}
+
+fn getenv(name: [*:0]const u8) ?[]const u8 {
+    return std.mem.span(std.c.getenv(name) orelse return null);
 }
 
 /// error.NotPortedYet with its site on stderr (a request that reaches a path the port lacks names it in the log).

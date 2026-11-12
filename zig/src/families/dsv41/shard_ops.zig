@@ -6,6 +6,8 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const shard = @import("shard.zig");
+const shard_ring = @import("shard_ring.zig");
+const rdma = @import("rdma.zig");
 
 pub const Kernels = struct {
     module: cuda.Module,
@@ -17,6 +19,11 @@ pub const Kernels = struct {
     scan_fn: cuda.Function,
     compact_fn: cuda.Function,
     renumber_fn: cuda.Function,
+    /// The decode exchanges on the RDMA ring (shard_ring.zig): its sized stage and collect. An image built before
+    /// them has neither: that rank then asks for NCCL (round.Round.exchangeSettings), which the ranks' settings
+    /// gather makes every rank's or refuses (KvShardSettingsMismatch) when another rank has them.
+    ring_stage_fn: ?cuda.Function = null,
+    ring_collect_fn: ?cuda.Function = null,
 
     /// dsv41_shard.cu's image (cuda.kernels.dsv41_shard, or a fatbin's bytes).
     pub fn load(d: *const cuda.Driver, image: []const u8) !Kernels {
@@ -33,7 +40,18 @@ pub const Kernels = struct {
             .scan_fn = try m.function("tf_ds_union_scan_kernel"),
             .compact_fn = try m.function("tf_ds_union_compact_kernel"),
             .renumber_fn = try m.function("tf_ds_union_renumber_kernel"),
+            .ring_stage_fn = m.function("tf_ds_ring_stage_rows") catch null,
+            .ring_collect_fn = m.function("tf_ds_ring_collect_rows") catch null,
         };
+    }
+
+    /// The sized ring transfer's kernel pair, as rdma.Ring.sendRows / recvRows take it.
+    pub fn ringRows(k: *const Kernels) !rdma.Ring.RowKernels {
+        return .{ .stage = k.ring_stage_fn orelse return error.NoKvShard, .collect = k.ring_collect_fn orelse return error.NoKvShard };
+    }
+
+    pub fn hasRingRows(k: *const Kernels) bool {
+        return k.ring_stage_fn != null and k.ring_collect_fn != null;
     }
 
     pub fn unload(k: *Kernels) void {
@@ -164,11 +182,44 @@ pub fn unionRenumber(k: *const Kernels, s: cuda.Stream, idx: u64, ks: usize, kk:
     try cuda.launch.launch(k.renumber_fn, .{ .grid = .{ .x = @intCast(rows), .y = @intCast((kos + 255) / 256) }, .block = .{ .x = 256 } }, s, &a);
 }
 
+/// An exchange's segments in the ring kernels' form (16-byte words; shard_ring.Xfer.check has refused anything else).
+pub fn rowSegs(x: shard_ring.Xfer) rdma.Ring.RowSegs {
+    var o: rdma.Ring.RowSegs = .{};
+    for (x.slice(), 0..) |g, i| {
+        o.src[i] = g.src;
+        o.dst[i] = g.dst;
+        o.src16[i] = @intCast(g.src_stride / 16);
+        o.dst16[i] = @intCast(g.dst_stride / 16);
+        o.row16[i] = @intCast(g.row_bytes / 16);
+    }
+    return o;
+}
+
+/// One exchange of a decode round on the RDMA ring: this rank's listed rows sent (`list`: the device address of its
+/// send list, shard_ring.Lists.offset(.., .send) into Round.rlist), or the peer's received at the rows of its receive
+/// list. `cap` the round's rows (the slot and grid bound); `probing` false keeps an early send out of the ring probes.
+pub fn ringSend(k: *const Kernels, ring: *rdma.Ring, s: cuda.Stream, x: shard_ring.Xfer, list: u64, cap: usize, probing: bool) !void {
+    try x.check(cap, ring.s.max_bytes);
+    try ring.sendRows(try k.ringRows(), s, rowSegs(x), @intCast(x.n), list, @intCast(cap), probing);
+}
+
+pub fn ringRecv(k: *const Kernels, ring: *rdma.Ring, s: cuda.Stream, x: shard_ring.Xfer, list: u64, cap: usize, from: u32, probing: bool) !void {
+    try x.check(cap, ring.s.max_bytes);
+    try ring.recvRows(try k.ringRows(), s, rowSegs(x), @intCast(x.n), list, @intCast(cap), from, probing);
+}
+
 /// What one rank's sharded attention carries (prompt.Engine.kv): the parts, the decode mode and the kernels.
 pub const KvShard = struct {
     sh: shard.Shard,
     mode: shard.Mode,
     k: Kernels,
+    // the decode exchanges' transport and auto's cost model (round.Round.useShard: agreed by every rank before the
+    // first round): the RDMA ring when the engine has one and TF_DS_KV_SHARD_RING is not 0, else NCCL
+    use_ring: bool = false,
+    cost: shard_ring.Cost = .{},
+    // owner decode's two 32-head passes on two streams on the ring path (Round.useShard: TF_DS_KV_SHARD_OVERLAP, not
+    // "0"; per rank, it changes no ring order and no byte)
+    overlap: bool = false,
     // counters (the health/metrics a status line reads; round 2 exports them): prompt fetches (a layer's) and their
     // rows and bytes, rounds by fetch and by owner decode (each of a round's compressed layers fetches or exchanges once;
     // counted when the round is issued, graphs or not), carried extents (copyExtent across parts) and their bytes
@@ -185,5 +236,13 @@ pub const KvShard = struct {
         owner_rounds: u64 = 0,
         carries: u64 = 0,
         carry_bytes: u64 = 0,
+        // the decode exchanges (shard_ring.zig): rounds whose exchanges rode the RDMA ring (the rest NCCL), auto's
+        // choices, and the rows this rank sent a compressed layer on the ring, summed over the rounds (its send lists:
+        // fetch, the rows only it holds; owner decode, the queries of the rows only the peer holds and the outputs of
+        // the rows only it holds)
+        ring_rounds: u64 = 0,
+        auto_fetch: u64 = 0,
+        auto_owner: u64 = 0,
+        sent_rows: u64 = 0,
     };
 };

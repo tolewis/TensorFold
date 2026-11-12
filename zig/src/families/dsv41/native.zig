@@ -286,8 +286,9 @@ pub fn pairMode(env: *const fn ([:0]const u8) ?[]const u8) !PairMode {
 
 /// The errors from a prompt pass or a round that mean the pair broke (rank_wire's PairBroken; kv_lanes' transfers;
 /// a follower's StaleExtent/ShardDiverged reach rank 0 as its link going down; an aborted communicator; an RDMA ring
-/// that saw a dead peer or was aborted, RingFailed). None of them drains: the next round's collective would wait on
-/// the peer.
+/// that saw a dead peer or was aborted, RingFailed; a decode round's ring order or row lists broken,
+/// round.pair_ending: a sized send may be in flight with no receive, the peer spinning in its collect). None of them
+/// drains: the next round's collective would wait on the peer.
 pub const pair_fatal = [_]api.LaneHost.Fatal{
     .{ .err = error.PairBroken, .drain = false },
     .{ .err = error.TransferTimeout, .drain = false },
@@ -296,6 +297,9 @@ pub const pair_fatal = [_]api.LaneHost.Fatal{
     .{ .err = error.PeerDown, .drain = false },
     .{ .err = error.CommAborted, .drain = false },
     .{ .err = error.RingFailed, .drain = false },
+    .{ .err = error.RingOrder, .drain = false },
+    .{ .err = error.ShardRingOrder, .drain = false },
+    .{ .err = error.BadRingRows, .drain = false },
 };
 
 /// Loaded.pair: the hooks the server wires to its lane host (native/cuda.zig).
@@ -624,7 +628,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.BadPool => "TF_DS_POOL (rank 1: --pool): the pool's positions, a whole number of at least the context (unset: the context)",
         error.BadWindow => "TF_DS_WINDOW: the positions one request may use, a whole number; on rank 0 it must be --context (start.sh sets both from CONTEXT)",
         error.BadKvShard => "TF_DS_KV_SHARD: 1 (on) or 0 (off)",
-        error.BadKvShardDecode => "TF_DS_KV_SHARD_DECODE: fetch (the default) or owner",
+        error.BadKvShardDecode => "TF_DS_KV_SHARD_DECODE: fetch (the default), owner or auto (per round by TF_DS_KV_SHARD_COST)",
         error.KvShardNeedsTwoRanks => "TF_DS_KV_SHARD=1 shards the compressed latents over the two TP2 ranks: TF_TP_WORLD=2",
         error.KvShardMismatch => "the ranks disagree on TF_DS_KV_SHARD, the pool (TF_DS_POOL, else rank 1's --pool), TF_DS_ROUND_ROWS or the window, or the other rank could not read one of them: give every rank the same TF_DS_* environment (start.sh's ENGINE_ENV) and settings",
         error.BadPart => "TF_DS_KV_SHARD=1: a round row whose part is not its extent's (a placement bug): restart with TF_DS_KV_SHARD=0",
@@ -648,6 +652,10 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.StagingTooSmall => "the spill staging cap (TF_DS_SPILL_STAGING_MIB) holds too few slots for this model's blocks and small state: raise it",
         error.BadKvShardSetting => "TF_DS_KV_SHARD_CARRY and TF_DS_KV_SHARD_TWINS: 1 (on, the default) or 0; TF_DS_KV_SHARD_CHECK: decode rounds between the ranks' planner checks (0: at start only); TF_DS_KV_SHARD_STATS_MS: 0 (the default, rank 0's own kv_shard row only) up to 3600000 ms between asks for the followers' rows (only while /health or /metrics read them)",
         error.ShardLayoutMismatch => "TF_DS_KV_SHARD=1: the ranks cut the pool into different parts or plan with other switches (another TF_DS_POOL, --pool, TF_DS_KV_SHARD_CARRY, TF_DS_KV_SHARD_TWINS or build on rank 1): give every rank the same TF_DS_* environment and build",
+        error.KvShardSettingsMismatch => "TF_DS_KV_SHARD=1: the ranks disagree on the decode exchanges' transport or cost model (TF_DS_KV_SHARD_RING, TF_DS_KV_SHARD_COST, or one rank has the RDMA ring, or the ring kernels in its dsv41_shard image, and the other not), or the other rank could not read one of them or set its decode buffers up (its log names why): give every rank the same TF_DS_* environment, RDMA setting and image",
+        error.BadKvShardRing => "TF_DS_KV_SHARD_RING must be 1 (the decode exchanges ride the RDMA ring when there is one; the default) or 0 (NCCL)",
+        error.BadKvShardCost => "TF_DS_KV_SHARD_COST must be nine non-negative integers, fetch_fixed,fetch_row,owner_fixed,owner_row,pass_fixed,pass_row,mask_row,copy_fixed,copy_kib (ns; docs/port/shard-ring.md), or unset",
+        error.ShardRingOrder, error.BadRingRows, error.RingOrder => "TF_DS_KV_SHARD=1: a decode round's ring transfers left their fixed order or row lists (an engine bug; the ranks would part, so the pair ends): restart with TF_DS_KV_SHARD_RING=0 (NCCL), or TF_DS_KV_SHARD=0",
         error.ShardDiverged, error.StaleExtent => "TF_DS_KV_SHARD=1: the ranks' KV-part planners disagree (an engine bug; the pair stops rather than read the wrong rows): restart with TF_DS_KV_SHARD=0",
         error.TransferFailed => "TF_DS_KV_SHARD=1: a KV transfer between the ranks failed on one rank only: restart; if it recurs, TF_DS_KV_SHARD_CARRY=0 or TF_DS_KV_SHARD=0",
         error.TransferTimeout => "TF_DS_KV_SHARD=1: a KV transfer did not complete in time (a rank's half never ran, or a device fault; the GPU stream holds the unmatched call): restart; if it recurs, TF_DS_KV_SHARD_CARRY=0 or TF_DS_KV_SHARD=0",
@@ -664,8 +672,14 @@ test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoMaster).?, "TF_TP_MASTER") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.PartTooSmall).?, "TF_DS_POOL") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.KvShardMismatch).?, "--pool") != null);
-    for ([_]anyerror{ error.BadPart, error.WindowTooWide, error.FetchTooLarge, error.BadFetch, error.NoKvShard, error.CrossesPart, error.ShardDiverged, error.StaleExtent, error.TransferFailed, error.TransferTimeout, error.KvShardNotStarted, error.BadPlan }) |err|
+    for ([_]anyerror{ error.BadPart, error.WindowTooWide, error.FetchTooLarge, error.BadFetch, error.NoKvShard, error.CrossesPart, error.ShardDiverged, error.StaleExtent, error.TransferFailed, error.TransferTimeout, error.KvShardNotStarted, error.BadPlan, error.ShardRingOrder, error.BadRingRows }) |err|
         try std.testing.expect(std.mem.indexOf(u8, explain(null, err).?, "TF_DS_KV_SHARD=0") != null);
+    for ([_]anyerror{ error.KvShardSettingsMismatch, error.BadKvShardRing }) |err|
+        try std.testing.expect(std.mem.indexOf(u8, explain(null, err).?, "TF_DS_KV_SHARD_RING") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.BadKvShardCost).?, "TF_DS_KV_SHARD_COST") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.BadKvShardDecode).?, "auto") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.BadKvShardDecode).?, "owner") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.RingOrder).?, "TF_DS_KV_SHARD_RING") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoFreeSlot).?, "TF_DS_STREAMS") != null);
     try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));
 }
@@ -692,6 +706,23 @@ test "TF_DS_PAIR_BROKEN: exit by default (spill and KV sharding off), degrade th
     }
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.BadPairBroken).?, "degrade") != null);
     for (pair_fatal) |f| try std.testing.expect(!f.drain);
+}
+
+test "a round's pair-ending errors end the pair on rank 0 (none drains) and are named" {
+    // the ring-order refusals and BadRingRows leave a sized send or a peer's collect pending: a refusal that
+    // only failed the request would stop every later sharded round (RowPairing open) with the server still up
+    for (round.pair_ending) |err| {
+        var found = false;
+        for (pair_fatal) |f| if (f.err == err) {
+            found = true;
+            try std.testing.expect(!f.drain);
+        };
+        try std.testing.expect(found);
+        try std.testing.expect(explain(null, err) != null);
+    }
+    for ([_]anyerror{ error.RingOrder, error.ShardRingOrder, error.BadRingRows, error.RingFailed }) |err| try std.testing.expect(round.endsPair(err));
+    try std.testing.expect(!round.endsPair(error.NoFreeSlot));
+    try std.testing.expect(!round.endsPair(error.ContextFull));
 }
 
 test "the spill tier's refusals from the environment come before anything loads, and each says what to set" {

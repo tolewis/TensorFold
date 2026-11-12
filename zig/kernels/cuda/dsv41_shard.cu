@@ -142,3 +142,215 @@ extern "C" __global__ void __launch_bounds__(256) tf_ds_union_renumber_kernel(co
     const long long v = j < kk ? idx[r * ks + j] : -1;
     out[r * kos + j] = v >= 0 && v < limit ? (long long)cum[v] - 1 : -1;
 }
+
+// ---- TF_DS_KV_SHARD's decode exchanges on the family's RDMA ring (shard_ring.zig; rdma.zig Ring.sendRows/recvRows) --
+// A sized one-hop transfer of a round's listed rows, each row one run of row16 16-byte words in every one of nseg
+// segments. The host lists the rows (shard_ring.lists, from the replicated owners: rank r's send list
+// is rank 1-r's receive list) and uploads them each round to a fixed block (int [1 + TF_DS_RING_ROWS]: the count, then
+// the rows in slot order), so a captured launch serves every round. The stage kernel packs segment s of the n listed
+// rows after the segments before it into this rank's ring slot and publishes the slot's size (n x the row words) with
+// the doorbell, as dsv41/rdma_gather.cu's stage does (the same slot, sequence, sent, staged, abort and probe words);
+// the proxy writes exactly those bytes to the peer; the collect kernel waits for the peer's flag at the sequence and
+// puts each received row at its listed row in the destinations. shard_ring.zig's stageRef / collectRef are the host
+// models; tools/dsv41_shard_emulate runs the packing below against them.
+// PORT(kit): written without nvcc (never compiled or run); compile with the image, then docs/port/shard-ring.md's
+// GPU checks.
+#define TF_DS_RING_SEGS 8
+#define TF_DS_RING_ROWS 64
+#define TF_DS_STAGE_THREADS 512
+#define TF_DS_COLLECT_THREADS 256
+
+// rdma.zig RowSegs (extern struct, the same layout): a segment's source and destination, their row strides and a
+// row's words (16-byte units). The stage reads src, the collect writes dst.
+struct TfDsRingRows {
+    const uint4* src[TF_DS_RING_SEGS];
+    uint4* dst[TF_DS_RING_SEGS];
+    long long src16[TF_DS_RING_SEGS];
+    long long dst16[TF_DS_RING_SEGS];
+    int row16[TF_DS_RING_SEGS];
+};
+
+#ifdef TF_DS_EMULATE
+#define TF_DS_HD static inline
+#define TF_DS_LDCV(p) (*(p))
+#else
+#define TF_DS_HD __device__ __forceinline__
+#define TF_DS_LDCV(p) __ldcv(p)
+#endif
+
+// A list's count (the host writes 0 .. TF_DS_RING_ROWS; clamped so a bad block can never index past the list).
+TF_DS_HD int tf_ds_ring_count(const int* list) {
+    const int n = list[0];
+    return n < 0 ? 0 : (n > TF_DS_RING_ROWS ? TF_DS_RING_ROWS : n);
+}
+
+// The slot's words for n listed rows (every segment's).
+TF_DS_HD long long tf_ds_ring_words(const TfDsRingRows& s, int nseg, int n) {
+    long long t = 0;
+    for (int g = 0; g < nseg; ++g) t += (long long)n * s.row16[g];
+    return t;
+}
+
+// This thread's share (word tid, tid + step, ...) of packing the listed rows (rows[0 .. n)) into the slot. 32-bit word
+// indices: a slot is at most the ring's max_bytes (4.25 MiB, 2^18 words).
+TF_DS_HD void tf_ds_ring_pack(const TfDsRingRows& s, int nseg, const int* rows, int n, uint4* slot, unsigned tid, unsigned step) {
+    size_t off = 0;
+    for (int g = 0; g < nseg; ++g) {
+        const unsigned r16 = (unsigned)s.row16[g], words = (unsigned)n * r16;
+        const uint4* src = s.src[g];
+        const long long st = s.src16[g];
+        for (unsigned i = tid; i < words; i += step) {
+            const unsigned c = i / r16;
+            slot[off + i] = src[(long long)rows[c] * st + (i - c * r16)];
+        }
+        off += words;
+    }
+}
+
+// This thread's share of putting a received slot's rows at their listed rows: up to four slot loads in flight before
+// their stores (as rdma_gather.cu's collect: the first reads after the flag wait out the pinned memory's latency).
+TF_DS_HD void tf_ds_ring_unpack(const TfDsRingRows& s, int nseg, const int* rows, int n, const uint4* slot, unsigned tid, unsigned step) {
+    size_t off = 0;
+    for (int g = 0; g < nseg; ++g) {
+        const unsigned r16 = (unsigned)s.row16[g], words = (unsigned)n * r16;
+        uint4* dst = s.dst[g];
+        const long long st = s.dst16[g];
+        for (unsigned b = tid; b < words; b += 4 * step) {
+            uint4 v[4];
+            for (unsigned u = 0; u < 4; ++u)
+                if (b + u * step < words) v[u] = TF_DS_LDCV(slot + off + b + u * step);
+            for (unsigned u = 0; u < 4; ++u) {
+                const unsigned i = b + u * step;
+                if (i < words) {
+                    const unsigned c = i / r16;
+                    dst[(long long)rows[c] * st + (i - c * r16)] = v[u];
+                }
+            }
+        }
+        off += words;
+    }
+}
+
+#ifndef TF_DS_EMULATE
+namespace {
+__device__ __forceinline__ uint64_t tf_ds_load_sys(const uint64_t* p) {
+    uint64_t v;
+    asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(v) : "l"(p) : "memory");
+    return v;
+}
+
+__device__ __forceinline__ void tf_ds_store_sys(uint64_t* p, uint64_t v) {
+    asm volatile("st.release.sys.global.u64 [%0], %1;" ::"l"(p), "l"(v) : "memory");
+}
+
+__device__ __forceinline__ void tf_ds_store_relaxed_sys(uint64_t* p, uint64_t v) {
+    asm volatile("st.relaxed.sys.global.u64 [%0], %1;" ::"l"(p), "l"(v) : "memory");
+}
+
+__device__ __forceinline__ uint64_t tf_ds_now_ns() {
+    uint64_t t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+
+// rdma_gather.cu's v7 PDL entry: wait for the kernel before (its memory visible), then let the next one launch.
+__device__ __forceinline__ void tf_ds_pdl_enter(int pdl) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if (pdl) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    }
+#endif
+}
+
+// The block's copy of a row list (the count then the rows), every thread loading a part of it.
+__device__ __forceinline__ void tf_ds_ring_load_list(const int* list, int* s_list) {
+    for (int i = threadIdx.x; i <= TF_DS_RING_ROWS; i += blockDim.x) s_list[i] = list[i];
+}
+}  // namespace
+
+// dsv41_rdma_stage's protocol over the listed rows: every block waits until the slot's previous writes are sent,
+// copies its share in, counts itself in; the last block advances the sequence and rings the doorbell. Block 0 writes
+// the slot's size (fence_mode 1: before the blocks' releases, as dsv41_rdma_stage). The list loads overlap the slot
+// wait (thread 0 waits, the others load).
+extern "C" __global__ void __launch_bounds__(TF_DS_STAGE_THREADS) tf_ds_ring_stage_rows(TfDsRingRows s, int nseg,
+        const int* list, char* send_ring, uint64_t* sizes, uint64_t* doorbell, const uint64_t* sent, uint64_t* seq,
+        int slots, uint64_t max_bytes, uint64_t* probe, const uint64_t* abort_word, unsigned* staged, int fence_mode,
+        int pdl) {
+    __shared__ uint64_t s_seq;
+    __shared__ int s_last;
+    __shared__ int s_list[TF_DS_RING_ROWS + 1];
+    tf_ds_pdl_enter(pdl);                        // before anything reads the rows, their list or the sequence
+    const uint64_t t0 = tf_ds_now_ns();
+    tf_ds_ring_load_list(list, s_list);
+    if (threadIdx.x == 0) {
+        const uint64_t q = *seq + 1;
+        const int slot = (int)(q % slots);
+        if (q > (uint64_t)slots)
+            for (uint32_t i = 1; tf_ds_load_sys(sent + slot) + slots < q; ++i)
+                if ((i & 1023) == 0 && tf_ds_load_sys(abort_word)) break;
+        s_seq = q;
+    }
+    __syncthreads();
+    const int n = tf_ds_ring_count(s_list);
+    const uint64_t q = s_seq;
+    const int slot = (int)(q % slots);
+    if (fence_mode && blockIdx.x == 0 && threadIdx.x == 0) tf_ds_store_relaxed_sys(sizes + slot, (uint64_t)tf_ds_ring_words(s, nseg, n) * 16);
+    uint4* dst = reinterpret_cast<uint4*>(send_ring + (size_t)slot * max_bytes);
+    tf_ds_ring_pack(s, nseg, s_list + 1, n, dst, blockIdx.x * blockDim.x + threadIdx.x, gridDim.x * blockDim.x);
+    if (fence_mode) {
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+            s_last = atomicAdd(staged, 1u) == gridDim.x - 1;
+        }
+    } else {
+        __threadfence_system();
+        __syncthreads();
+        if (threadIdx.x == 0) s_last = atomicAdd(staged, 1u) == gridDim.x - 1;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0 && s_last) {
+        __threadfence_system();
+        *staged = 0;
+        *seq = q;
+        if (fence_mode) {
+            tf_ds_store_relaxed_sys(doorbell, q);
+        } else {
+            tf_ds_store_sys(sizes + slot, (uint64_t)tf_ds_ring_words(s, nseg, n) * 16);
+            tf_ds_store_sys(doorbell, q);
+        }
+        if (probe) {
+            probe[0] += tf_ds_now_ns() - t0;
+            probe[4] = tf_ds_now_ns();
+        }
+    }
+}
+
+// dsv41_rdma_collect_into's wait (rank `from`'s flag at this rank's latest sequence), then the slot's rows put at
+// their listed rows (the rows `from` sent, in its send list's order). The list loads overlap the flag wait.
+extern "C" __global__ void __launch_bounds__(TF_DS_COLLECT_THREADS) tf_ds_ring_collect_rows(TfDsRingRows s, int nseg,
+        const int* list, const char* recv_ring, const uint64_t* flags, const uint64_t* seq, int from, int world,
+        int slots, uint64_t max_bytes, uint64_t* probe, const uint64_t* abort_word, int pdl) {
+    __shared__ int s_list[TF_DS_RING_ROWS + 1];
+    tf_ds_pdl_enter(pdl);                        // the stage kernel's sequence is written
+    const uint64_t q = *seq;
+    const int slot = (int)(q % slots);
+    tf_ds_ring_load_list(list, s_list);
+    if (threadIdx.x == 0)
+        for (uint32_t i = 1; tf_ds_load_sys(flags + (size_t)slot * world + from) < q; ++i)
+            if ((i & 1023) == 0 && tf_ds_load_sys(abort_word)) break;
+    __syncthreads();
+    const uint64_t t2 = tf_ds_now_ns();
+    const uint4* in = reinterpret_cast<const uint4*>(recv_ring + ((size_t)slot * world + from) * max_bytes);
+    tf_ds_ring_unpack(s, nseg, s_list + 1, tf_ds_ring_count(s_list), in, blockIdx.x * blockDim.x + threadIdx.x, gridDim.x * blockDim.x);
+    if (probe && blockIdx.x == 0) {
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            probe[1] += t2 - probe[4];
+            probe[2] += tf_ds_now_ns() - t2;
+            probe[3] += 1;
+        }
+    }
+}
+#endif  // TF_DS_EMULATE

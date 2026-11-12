@@ -20,13 +20,16 @@ const std = @import("std");
 /// The switch: off (the replicated planes, byte for byte today's engine), or sharded with the decode rounds' attention
 /// by sparse fetch (the reference: the owner sends each row's picked latents, both ranks attend their own heads) or
 /// owner-computed (queries gathered, the owner attends both ranks' heads, the other rank's rotated wo_a inputs sent
-/// back). Prompt chunks always fetch.
+/// back), or chosen a round between the two (auto: shard_ring.Cost, from the rows each rank holds). Prompt chunks
+/// always fetch.
 pub const Mode = enum(u8) {
     off = 0,
     fetch = 1,
     owner = 2,
+    auto = 3,
 
-    /// TF_DS_KV_SHARD ("1": on) and TF_DS_KV_SHARD_DECODE ("owner", else the fetch reference), as every rank reads them.
+    /// TF_DS_KV_SHARD ("1": on) and TF_DS_KV_SHARD_DECODE ("owner", "auto", else the fetch reference), as every rank
+    /// reads them.
     pub fn parse(on: ?[]const u8, decode: ?[]const u8) !Mode {
         const v = on orelse return .off;
         if (v.len == 0 or std.mem.eql(u8, v, "0")) return .off;
@@ -34,6 +37,7 @@ pub const Mode = enum(u8) {
         const d = decode orelse return .fetch;
         if (d.len == 0 or std.mem.eql(u8, d, "fetch")) return .fetch;
         if (std.mem.eql(u8, d, "owner")) return .owner;
+        if (std.mem.eql(u8, d, "auto")) return .auto;
         return error.BadKvShardDecode;
     }
 };
@@ -546,6 +550,8 @@ test "Mode: TF_DS_KV_SHARD and TF_DS_KV_SHARD_DECODE" {
     try testing.expectEqual(Mode.fetch, try Mode.parse("1", null));
     try testing.expectEqual(Mode.fetch, try Mode.parse("1", "fetch"));
     try testing.expectEqual(Mode.owner, try Mode.parse("1", "owner"));
+    try testing.expectEqual(Mode.auto, try Mode.parse("1", "auto"));
+    try testing.expectEqual(Mode.off, try Mode.parse("0", "auto"));
     try testing.expectError(error.BadKvShard, Mode.parse("yes", null));
     try testing.expectError(error.BadKvShardDecode, Mode.parse("1", "both"));
 }

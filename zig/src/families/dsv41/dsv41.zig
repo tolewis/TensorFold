@@ -57,6 +57,7 @@ pub const kv_lanes = @import("kv_lanes.zig");
 pub const rank_wire = @import("rank_wire.zig");
 pub const fingerprint = @import("fingerprint.zig");
 pub const rank_identity = @import("rank_identity.zig");
+pub const shard_ring = @import("shard_ring.zig");
 
 test {
     // every declaration of every file, so functions no test calls are still compiled
@@ -111,6 +112,7 @@ test {
     refAll(rank_wire);
     refAll(fingerprint);
     refAll(rank_identity);
+    refAll(shard_ring);
     // rank_identity.gather over the real Options and Model (it takes them as anytype to stay host-testable alone)
     _ = &struct {
         fn f(gpa: @import("std").mem.Allocator, io: @import("std").Io, o: model.Options, m: *model.Model, x: rank_identity.Extra) !rank_identity.Gathered {

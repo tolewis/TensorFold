@@ -165,6 +165,20 @@ pub const Comm = struct {
     pub fn allGatherInPlace(c: *const Comm, buf: u64, count: usize, stream: cuda.Stream) !void {
         try c.allGather(buf + c.rank * count, buf, count, .u8, stream);
     }
+
+    /// Two in-place all-gathers (allGatherInPlace of `a` then of `b`, `a_count` and `b_count` bytes a rank) in one NCCL
+    /// group: one launch, the same bytes (TF_DS_KV_SHARD's NCCL fetch of codes and scales). Holds the enqueue gate
+    /// against `abort` like every collective here.
+    pub fn allGatherInPlace2(c: *const Comm, a: u64, a_count: usize, b: u64, b_count: usize, stream: cuda.Stream) !void {
+        try c.enter();
+        defer leave();
+        try c.lib.check(c.lib.api.ncclGroupStart(), "ncclGroupStart");
+        const x = c.lib.api.ncclAllGather(a + c.rank * a_count, a, a_count, .u8, c.comm, stream.handle);
+        const y = c.lib.api.ncclAllGather(b + c.rank * b_count, b, b_count, .u8, c.comm, stream.handle);
+        try c.lib.check(c.lib.api.ncclGroupEnd(), "ncclGroupEnd");
+        try c.lib.check(x, "ncclAllGather");
+        try c.lib.check(y, "ncclAllGather");
+    }
 };
 
 /// The gate every collective's NCCL calls hold against `Comm.abort` (process-wide: one engine thread enqueues, the

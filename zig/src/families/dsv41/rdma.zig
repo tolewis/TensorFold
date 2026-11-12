@@ -31,7 +31,7 @@ const default_nap_ns: u64 = 100 * std.time.ns_per_us;
 
 extern "c" fn prctl(option: c_int, arg2: c_ulong, arg3: c_ulong, arg4: c_ulong, arg5: c_ulong) c_int;
 
-pub const Error = error{ VerbsFailed, PostFailed, BadMtu, BadInfo, TooLarge, RingFailed, NoHostRegister, BadRdmaIdle, BadRdmaNap } || cuda.Error || fabric.verbs.Error || std.posix.MMapError || std.Thread.SpawnError;
+pub const Error = error{ VerbsFailed, PostFailed, BadMtu, BadInfo, TooLarge, RingFailed, NoHostRegister, RingOrder, BadRdmaIdle, BadRdmaNap } || cuda.Error || fabric.verbs.Error || std.posix.MMapError || std.Thread.SpawnError;
 
 /// TF_RDMA_IDLE_S: seconds with nothing posted or reaped before the proxy naps (0: never nap; default 2).
 fn parseIdleNs(text: []const u8) Error!u64 {
@@ -181,6 +181,29 @@ const Peer = struct {
     recv: u64 = 0,
 };
 
+/// The host's check that every sized send (Ring.sendRows) is the ring transfer directly before its receive
+/// (Ring.recvRows): the collect kernel waits on the latest sequence this rank staged, so a gather, a gatherInto or
+/// another sendRows slipped in between would pair the receive with the wrong slot (silently, on both ranks). Host
+/// order is the order the launches are issued in (and captured in), so the check holds for graphs too.
+pub const RowPairing = struct {
+    open: bool = false,
+
+    /// Before any ring transfer but a recvRows: none may be pending.
+    pub fn idle(p: *const RowPairing) error{RingOrder}!void {
+        if (p.open) return error.RingOrder;
+    }
+
+    pub fn send(p: *RowPairing) error{RingOrder}!void {
+        try p.idle();
+        p.open = true;
+    }
+
+    pub fn recv(p: *RowPairing) error{RingOrder}!void {
+        if (!p.open) return error.RingOrder;
+        p.open = false;
+    }
+};
+
 pub const Ring = struct {
     d: *const cuda.Driver,
     verbs: Verbs,
@@ -204,6 +227,9 @@ pub const Ring = struct {
     /// The proxy's idle back-off: quiet for `idle_ns` (0: never nap), then sleep `nap_ns` between looks.
     idle_ns: u64 = default_idle_ns,
     nap_ns: u64 = default_nap_ns,
+    // TF_DS_KV_SHARD's sized transfers (sendRows / recvRows): a sendRows not yet paired with its recvRows. Their
+    // collect waits on the latest sequence this rank staged, so no other ring transfer may be issued in between.
+    rows: RowPairing = .{},
 
     // the metadata block: flags [slots][world], doorbell, sizes [slots], sent [slots], abort word
     fn flags(r: *const Ring) [*]u64 {
@@ -485,6 +511,7 @@ pub const Ring = struct {
     /// recv [world x n4 float4] <- every rank's send [n4 float4] (fp32, 16-byte aligned), on `stream`.
     pub fn gather(r: *Ring, stream: cuda.Stream, send: DevicePtr, n4: u32, recv: DevicePtr) Error!void {
         if (r.failure() != null) return error.RingFailed; // (a dead peer, or an abort: rank pair broken)
+        try r.rows.idle();
         if (@as(usize, n4) * 16 > r.s.max_bytes) return error.TooLarge;
         const own: DevicePtr = if (r.s.own_early) recv + @as(u64, r.rank) * n4 * 16 else 0;
         try r.stage(stream, send, n4, own, n4, n4);
@@ -514,6 +541,7 @@ pub const Ring = struct {
     /// names the same widths, so each peer's ring slot holds rows x w_p floats.
     pub fn gatherInto(r: *Ring, stream: cuda.Stream, send: DevicePtr, rows: u32, own_row4: u32, dsts: []const Dst) Error!void {
         if (r.failure() != null) return error.RingFailed; // (a dead peer, or an abort: rank pair broken)
+        try r.rows.idle();
         if (dsts.len != r.world) return error.BadInfo;
         const n4 = rows * own_row4;
         if (@as(usize, n4) * 16 > r.s.max_bytes) return error.TooLarge;
@@ -546,6 +574,102 @@ pub const Ring = struct {
         const per = collect_threads * r.s.collect_grain;
         const blocks = std.math.clamp((copy4 + per - 1) / per, 1, r.s.collect_blocks);
         try cuda.launch.launch(r.k.collect_into, .{ .grid = .{ .x = @intCast(blocks), .y = 1, .z = 1 }, .block = .{ .x = collect_threads, .y = 1, .z = 1 }, .pdl = r.s.pdl }, stream, &a);
+    }
+    /// A sized row transfer's segments (dsv41_shard.cu's TfDsRingRows, the same layout): each selected row's run of
+    /// row16 16-byte words from src[s] + row * src16[s] words (the sender's) to dst[s] + row * dst16[s] (the
+    /// receiver's), segment after segment in the slot.
+    pub const RowSegs = extern struct {
+        src: [max_row_segs]u64 = @splat(0),
+        dst: [max_row_segs]u64 = @splat(0),
+        src16: [max_row_segs]i64 = @splat(0),
+        dst16: [max_row_segs]i64 = @splat(0),
+        row16: [max_row_segs]c_int = @splat(0),
+
+        /// The slot's most bytes: every one of `rows` rows selected.
+        pub fn capacity(s: RowSegs, nseg: u32, rows: u32) u64 {
+            var t: u64 = 0;
+            for (s.row16[0..@min(nseg, max_row_segs)]) |w| t += @intCast(@max(w, 0));
+            return t * 16 * rows;
+        }
+    };
+    pub const max_row_segs = 8; // TF_DS_RING_SEGS
+    pub const max_sel_rows = 64; // TF_DS_RING_ROWS
+    /// The sized transfer's kernel pair (dsv41_shard.cu: tf_ds_ring_stage_rows, tf_ds_ring_collect_rows), which speak
+    /// this ring's protocol: its slots, sequence, sent words, staged counter, abort word and probes.
+    pub const RowKernels = struct { stage: cuda.Function, collect: cuda.Function };
+
+    /// Whether a sized transfer of `nseg` segments over `rows` rows always fits a slot.
+    pub fn rowsFit(r: *const Ring, segs: RowSegs, nseg: u32, rows: u32) bool {
+        return nseg >= 1 and nseg <= max_row_segs and rows >= 1 and rows <= max_sel_rows and segs.capacity(nseg, rows) <= r.s.max_bytes;
+    }
+
+    /// TF_DS_KV_SHARD's sized one-hop send: the rows of `list` (int32 [1 + max_sel_rows] on the device: the count, then
+    /// the rows in slot order; shard_ring.Lists, uploaded each round, so a captured launch serves every round), each
+    /// segment's run of them one after another into this rank's next slot, its size the listed rows' (read on the
+    /// device), published with the doorbell as `stage` does. `cap` rows at most (the grid and the slot bound). TP2: the
+    /// peer's `recvRows` of the same exchange, whose list is this one, takes them, and this rank's next ring transfer
+    /// must be that recvRows (RingOrder otherwise). `probing` false leaves the probe words alone (a send issued early,
+    /// e.g. owner decode's queries at q, would count the compressor's time as flight).
+    pub fn sendRows(r: *Ring, k: RowKernels, stream: cuda.Stream, segs: RowSegs, nseg: u32, list: DevicePtr, cap: u32, probing: bool) Error!void {
+        if (r.failure() != null) return error.RingFailed; // (a dead peer, or an abort: rank pair broken)
+        if (r.world != 2 or list == 0) return error.BadInfo;
+        if (!r.rowsFit(segs, nseg, cap)) return error.TooLarge;
+        try r.rows.idle();
+        var a: cuda.Args = .{};
+        a.add(segs);
+        a.add(@as(c_int, @intCast(nseg)));
+        a.add(list);
+        a.add(r.send.dev);
+        a.add(r.metaDev(r.sizes()));
+        a.add(r.metaDev(r.doorbell()));
+        a.add(r.metaDev(r.sent()));
+        a.add(r.scalar(0));
+        a.add(@as(c_int, @intCast(r.s.slots)));
+        a.add(@as(u64, r.s.max_bytes));
+        a.add(if (probing) r.probe() else 0);
+        a.add(r.metaDev(r.abortWord()));
+        a.add(r.scalar(8));
+        a.add(@as(c_int, @intFromBool(r.s.fence)));
+        a.add(@as(c_int, @intFromBool(r.s.pdl)));
+        const words = segs.capacity(nseg, cap) / 16;
+        const blocks = std.math.clamp((words + 1023) / 1024, 1, r.s.stage_blocks);
+        try cuda.launch.launch(k.stage, .{ .grid = .{ .x = @intCast(blocks), .y = 1, .z = 1 }, .block = .{ .x = stage_threads, .y = 1, .z = 1 }, .pdl = r.s.pdl }, stream, &a);
+        try r.rows.send();
+    }
+
+    /// The receive of a `sendRows` from rank `from`: waits for its slot at this rank's latest sequence (the sendRows
+    /// this rank staged just before, the pair's), then puts the received rows at the rows of `list` (this rank's
+    /// receive list: the sender's send list). Between this rank's sendRows and this call other kernels may run (owner
+    /// decode's compressor and indexer while the queries travel); no other ring transfer may (RowPairing).
+    pub fn recvRows(r: *Ring, k: RowKernels, stream: cuda.Stream, segs: RowSegs, nseg: u32, list: DevicePtr, cap: u32, from: u32, probing: bool) Error!void {
+        if (r.failure() != null) return error.RingFailed; // (a dead peer, or an abort: rank pair broken)
+        if (r.world != 2 or list == 0 or from >= r.world or from == r.rank) return error.BadInfo;
+        if (!r.rowsFit(segs, nseg, cap)) return error.TooLarge;
+        if (!r.rows.open) return error.RingOrder;
+        var a: cuda.Args = .{};
+        a.add(segs);
+        a.add(@as(c_int, @intCast(nseg)));
+        a.add(list);
+        a.add(r.recv.dev);
+        a.add(r.metaDev(r.flags()));
+        a.add(r.scalar(0));
+        a.add(@as(c_int, @intCast(from)));
+        a.add(@as(c_int, @intCast(r.world)));
+        a.add(@as(c_int, @intCast(r.s.slots)));
+        a.add(@as(u64, r.s.max_bytes));
+        a.add(if (probing) r.probe() else 0);
+        a.add(r.metaDev(r.abortWord()));
+        a.add(@as(c_int, @intFromBool(r.s.pdl)));
+        const per = collect_threads * r.s.collect_grain;
+        const words = segs.capacity(nseg, cap) / 16;
+        const blocks = std.math.clamp((words + per - 1) / per, 1, r.s.collect_blocks);
+        try cuda.launch.launch(k.collect, .{ .grid = .{ .x = @intCast(blocks), .y = 1, .z = 1 }, .block = .{ .x = collect_threads, .y = 1, .z = 1 }, .pdl = r.s.pdl }, stream, &a);
+        try r.rows.recv();
+    }
+
+    /// Whether a sendRows awaits its recvRows (a round starting with one open is refused: round.shardRound).
+    pub fn rowsOpen(r: *const Ring) bool {
+        return r.rows.open;
     }
     fn probe(r: *const Ring) DevicePtr {
         return if (r.s.probing) r.scalar(16) else 0;
@@ -682,4 +806,35 @@ test "RDMA idle nap bounds keep requests and shutdown responsive" {
     try std.testing.expectEqual(@as(u64, 1000000 * std.time.ns_per_us), try parseNapNs("1000000"));
     try std.testing.expectEqual(@as(u64, 3600 * std.time.ns_per_s), try parseIdleNs("3600"));
     try std.testing.expectError(error.BadRdmaIdle, parseIdleNs("3600.1"));
+}
+
+test "RowPairing: a sized send must be followed by its receive before any other ring transfer" {
+    var p: RowPairing = .{};
+    try p.idle();
+    try std.testing.expectError(error.RingOrder, p.recv()); // a receive with no send
+    try p.send();
+    try std.testing.expectError(error.RingOrder, p.idle()); // a gather / gatherInto between the pair
+    try std.testing.expectError(error.RingOrder, p.send()); // a second send before the first's receive
+    try p.recv();
+    try p.idle();
+    try p.send();
+    try p.recv();
+    try std.testing.expectError(error.RingOrder, p.recv());
+}
+test "a sized transfer's segments are dsv41_shard.cu's TfDsRingRows (passed by value) and bound the slot" {
+    try std.testing.expectEqual(@as(usize, 8 * 8 * 4 + 8 * 4), @sizeOf(Ring.RowSegs));
+    try std.testing.expectEqual(@as(usize, 64), @offsetOf(Ring.RowSegs, "dst"));
+    try std.testing.expectEqual(@as(usize, 128), @offsetOf(Ring.RowSegs, "src16"));
+    try std.testing.expectEqual(@as(usize, 192), @offsetOf(Ring.RowSegs, "dst16"));
+    try std.testing.expectEqual(@as(usize, 256), @offsetOf(Ring.RowSegs, "row16"));
+    var s: Ring.RowSegs = .{};
+    s.row16[0] = 8192; // a fetch row's codes (512 picks x 256 bytes)
+    s.row16[1] = 1024; // and scales
+    try std.testing.expectEqual(@as(u64, 16 * 512 * 288), s.capacity(2, 16));
+    var r: Ring = undefined;
+    r.s = .{ .max_bytes = 4456448 };
+    try std.testing.expect(r.rowsFit(s, 2, 16));
+    try std.testing.expect(!r.rowsFit(s, 2, 48));
+    try std.testing.expect(!r.rowsFit(s, 0, 1));
+    try std.testing.expect(!r.rowsFit(s, 2, 65));
 }

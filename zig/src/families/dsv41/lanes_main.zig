@@ -117,7 +117,8 @@ pub fn main(init: std.process.Init) !u8 {
     var arena_gib: ?usize = null;
     var profile = false;
     // TF_DS_CLOCK_MARKS=1 with --profile: a GPU clock at every round phase mark (in the graphs too; it splits their
-    // PDL chains, so the stretch totals run long), else only around the stretches
+    // PDL chains, so the stretch totals run long), else only around the stretches; 4: only a_q, a_idx, a_core
+    // and TF_DS_KV_SHARD's parts between them (round.PhaseTimer.shardMark: sh_* per compressed layer)
     const clock_marks: u8 = if (std.c.getenv("TF_DS_CLOCK_MARKS")) |v| std.fmt.parseInt(u8, std.mem.span(v), 10) catch 0 else 0;
     var phases = false; // --profile 2: also the rounds' GPU time by phase (eager rounds)
     var serial = false; // --serial 1: every stream without drafts (one row a round)
@@ -233,6 +234,7 @@ pub fn main(init: std.process.Init) !u8 {
             if (m.eh) |eh| w.print(", \"engram_read_ms\": {d:.3}, \"engram_hash_ms\": {d:.3}", .{ @as(f64, @floatFromInt(eh.t_read)) / r / 1e6, @as(f64, @floatFromInt(eh.t_hash)) / r / 1e6 }) catch {};
             w.print("}}}}\n", .{}) catch {};
             printClock(w, o.rank, m) catch {};
+            printKvShard(w, o.rank, m) catch {};
             if (m.ptimer) |tm| {
                 w.print("{{\"rank\": {d}, \"prefill_phases_ms\": {{", .{o.rank}) catch {};
                 for (dsv41.round.PhaseTimer.phases, 0..) |name, i| w.print("{s}\"{s}\": {d:.3}", .{ if (i == 0) "" else ", ", name, if (tm.rounds == 0) 0 else tm.ms[i] / @as(f64, @floatFromInt(tm.rounds)) }) catch {};
@@ -411,6 +413,7 @@ pub fn main(init: std.process.Init) !u8 {
         try w.print("{{\"rank\": 0, \"profile\": {{\"rounds\": {d}, \"rows_a_round\": {d:.2}, \"step_ms\": {d:.2}, \"send_ms\": {d:.3}, \"enqueue_ms\": {d:.2}, \"forward_ms\": {d:.2}, \"absorb_ms\": {d:.2}, \"logits_ms\": {d:.2}, \"sample_ms\": {d:.2}, \"passes\": {d}, \"streams_a_pass\": {d:.2}, \"pass_ms\": {d:.2}, \"prefills\": {d}, \"prefill_ms\": {d:.1}}}}}\n", .{ p.rounds, ms(p.rows * 1000000, p.rounds), ms(step_ns, core.steps), ms(p.send, p.rounds), ms(p.enqueue, p.rounds), ms(p.forward, p.rounds), ms(p.absorb, p.rounds), ms(p.logits, p.rounds), ms(p.sample, p.rounds), p.passes, ms(p.pass_streams * 1000000, p.passes), ms(p.pass, p.passes), p.prefills, ms(p.prefill, p.prefills) });
         try w.flush();
         try printClock(w, 0, m);
+        try printKvShard(w, 0, m);
         if (m.eh) |eh| if (eh.p_calls > 0) {
             const pc: f64 = @floatFromInt(eh.p_calls);
             try w.print("{{\"rank\": 0, \"prefill_engram_ms\": {{\"calls\": {d}, \"rows\": {d:.2}, \"upload\": {d:.2}, \"mm\": {d:.2}, \"exchange\": {d:.2}, \"gate\": {d:.2}}}}}\n", .{ eh.p_calls, @as(f64, @floatFromInt(eh.p_rows)) / pc / 1e6, @as(f64, @floatFromInt(eh.p_upload)) / pc / 1e6, @as(f64, @floatFromInt(eh.p_mm)) / pc / 1e6, @as(f64, @floatFromInt(eh.p_x)) / pc / 1e6, @as(f64, @floatFromInt(eh.p_gate)) / pc / 1e6 });
@@ -487,6 +490,16 @@ fn tokenSha(a: std.mem.Allocator, ids: []const u32) ![]const u8 {
     std.crypto.hash.sha2.Sha256.hash(text.items, &h, .{});
     const hex = try std.fmt.allocPrint(a, "{x}", .{&h});
     return hex[0..12];
+}
+
+/// TF_DS_KV_SHARD's counters on this rank (a profile): the rounds by decode mode, auto's choices, the rounds whose
+/// exchanges rode the RDMA ring, the rows sent, the prompt fetches and carries.
+fn printKvShard(w: *std.Io.Writer, rank: u32, m: *const dsv41.model.Model) !void {
+    const kv = m.kvs orelse return;
+    try w.print("{{\"rank\": {d}, \"kv_shard\": {{\"mode\": \"{s}\", \"ring\": {}, \"overlap\": {}", .{ rank, @tagName(kv.mode), kv.use_ring, kv.overlap });
+    inline for (@typeInfo(@TypeOf(kv.stats)).@"struct".field_names) |f| try w.print(", \"{s}\": {d}", .{ f, @field(kv.stats, f) });
+    try w.print("}}}}\n", .{});
+    try w.flush();
 }
 
 /// A profile's round GPU clock gaps (us a round): start to the first stretch, then each stretch and the wait after it.

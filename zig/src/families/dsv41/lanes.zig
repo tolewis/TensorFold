@@ -462,6 +462,8 @@ pub const Lanes = struct {
     paused: ?Fill = null, // the pass a short prompt cut into (lanes' cut_in), resumed by its next piece
     spill: ?*SpillTier = null, // --spill-dir/--spill-gib: the spill tier (native.zig opens it; null: off, nothing changes)
     kv: ?*kv_lanes.Kv = null, // TF_DS_KV_SHARD: the parts' planner (startKv, at open; null: the switch off)
+    kv_stats: lanes.kv_parts.Stats = .{}, // the last parts' stats kvPartsFn built (the engine loop reads them every
+    kv_stats_at: u64 = 0, //   iteration: rebuilt at most each kv_stats_ns, Model.now; 0: never built)
     /// The pair's one rank_wire Leader (native.openPair: agreed with rank_identity's full fingerprint before anything
     /// spill- or shard-related crosses), shared by the spill tier and the KV parts; owned here (null: neither is on).
     rw: ?*rank_wire.Leader = null,
@@ -725,10 +727,18 @@ pub const Lanes = struct {
         try k.round(vs[0..windows.len]);
     }
 
-    /// The parts' stats for /health and /metrics (native.Loaded.kv_parts: the host reads them on its engine thread).
+    /// The parts' stats for /health and /metrics (native.Loaded.kv_parts: the host reads them on its engine thread,
+    /// in noteLive, every engine-loop iteration). Rebuilt at most each kv_stats_ns: a rebuild scans the planner and
+    /// sorts every part's spans (allocating), which base rounds never pay and a round should not wait for.
     pub fn kvPartsFn(ptr: *anyopaque, out: *lanes.kv_parts.Stats) void {
         const self = of(ptr);
         const k = self.kv orelse return;
+        const now = self.m.now();
+        if (self.kv_stats_at != 0 and now -| self.kv_stats_at < kv_stats_ns) {
+            out.* = self.kv_stats;
+            return;
+        }
+        self.kv_stats_at = now;
         k.stats(out);
         k.wantStats(); // (the followers' rows are asked for again at the next round, at most each stats_ms)
         if (self.m.kvs) |x| {
@@ -744,7 +754,11 @@ pub const Lanes = struct {
             out.copy_bytes = st.carry_bytes;
             shardRank(self.m, &out.rank[0]); // (rank 0's own row; the followers' ride their stats replies)
         }
+        self.kv_stats = out.*;
     }
+
+    /// How stale /health's parts' stats may be (kvPartsFn).
+    const kv_stats_ns: u64 = 250 * std.time.ns_per_ms;
 
     // -- the vtable ---------------------------------------------------------------------------------------------
 
@@ -1530,6 +1544,15 @@ fn refused(err: anyerror) void {
     std.debug.print("{{\"follow_refused\": \"{s}\"}}\n", .{@errorName(err)});
 }
 
+/// A round this rank could not finish: refused as above, unless the error means the ranks cannot go on together
+/// (round.pair_ending: the ring's order or rows broken, a sized send or the peer's collect pending, the ring or the
+/// communicator dead). Then the follower ends with it (rank 0 ends the pair for the same error, native.pair_fatal, or
+/// sees this rank's link go down) instead of taking the next frame.
+fn roundRefused(err: anyerror) !void {
+    refused(err);
+    if (round.endsPair(err)) return err;
+}
+
 /// A follower's verify times with Model.prof (a profile on ranks 1-3: rounds, issue and wall ns summed).
 pub var follow_prof: struct { rounds: u64 = 0, enqueue: u64 = 0, forward: u64 = 0 } = .{};
 
@@ -1861,7 +1884,7 @@ pub fn followPair(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower, fx:
                 }
                 const rows = try built.build(gpa, &seqs, wins[0..nw]);
                 if (spill) |sd| for (wins[0..nw]) |w| sd.bump(w.base + w.start, w.base + w.start + w.ids.len);
-                m.verify(rows, built.absorb[0..nw]) catch |err| refused(err);
+                m.verify(rows, built.absorb[0..nw]) catch |err| try roundRefused(err);
                 if (m.prof) {
                     follow_prof.rounds += 1;
                     follow_prof.enqueue += m.t_enqueue;
@@ -1880,7 +1903,7 @@ pub fn followPair(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower, fx:
                     q0[i] = try r.int(i64);
                     slots[i] = try r.int(i64);
                 }
-                m.pass(tokens[0..n], q0[0..n], slots[0..n], steps) catch |err| refused(err);
+                m.pass(tokens[0..n], q0[0..n], slots[0..n], steps) catch |err| try roundRefused(err);
             },
             .fill_images => {
                 const count = try r.int(u32);

@@ -513,6 +513,7 @@ pub const Model = struct {
         }
         m.rd.dropSide(&m.eng);
         m.rd.dropPrefetch();
+        m.rd.dropShard();
         if (m.aio) |x| x.deinit();
         if (m.paio) |x| x.deinit();
         if (m.paio2) |x| x.deinit();
@@ -1282,6 +1283,7 @@ pub const Model = struct {
     /// The rounds' GPU clocks (a profile): the forward's start and each stretch's ends, for its gaps.
     pub fn useClock(m: *Model, marks: u8) !void {
         m.rd.clk_marks = marks == 1 or marks == 3;
+        m.rd.clk_shard = marks == 4; // the sharded attention's parts alone (round.PhaseTimer.shardMark)
         m.rd.clk_ratio = if (marks == 3) 2 else null;
         m.rd.clk_layers = marks == 2 or marks == 3;
         if (m.rd.clk == 0) m.rd.clk = try m.arena.take((1 + 2 * round.Round.max_clocks) * 8);

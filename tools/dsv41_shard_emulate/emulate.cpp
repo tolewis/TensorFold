@@ -5,6 +5,7 @@
 #include <cstring>
 #include <vector>
 #include <random>
+#define TF_DS_EMULATE 1 // the ring kernels' protocol needs a GPU; their row packing runs here
 #include "../../zig/kernels/cuda/dsv41_shard.cu"
 static void launch_fetch(int rows, long long kos, const uint8_t* c, const uint8_t* s, long long cb, long long sb, const long long* idx, long long ks, int kk, const long long* sbase, const long long* own, int copy, uint8_t* dc, uint8_t* ds, long long dk, long long* out, int how) {
   gridDim = {(unsigned)rows, (unsigned)((kos + 15) / 16), 1}; blockDim = {256, 1, 1};
@@ -79,6 +80,41 @@ int main() {
     for (int r = 0; r < rows; r++) for (int j = 0; j < kk; j++) { long long v = idx[r * kk + j]; if (v < 0 || v >= limit) continue; long long o = out[r * kos + j];
       if (memcmp(&dc[o * cb], &pc[v * cb], cb) || memcmp(&ds[o * sb], &ps[v * sb], sb)) { fails++; printf("union reads trial %d differ\n", trial); r = rows; break; } }
   }
+  // the ring exchanges' row packing (tf_ds_ring_pack / unpack, the stage and collect kernels' copies): any grid's
+  // threads together give shard_ring.zig's stageRef / collectRef slot and rows
+  for (int trial = 0; trial < 200; trial++) {
+    TfDsRingRows s{}; int nseg = 1 + g() % TF_DS_RING_SEGS; int rows = 1 + g() % 48;
+    // a host-made list (shard_ring.lists: the count, then rows in slot order; any order the host gives is kept)
+    int list[TF_DS_RING_ROWS + 1] = {0}; int n = 0;
+    for (int r = 0; r < rows; r++) if (g() % 3 == 0) list[1 + n++] = r;
+    if (g() % 4 == 0) for (int i = n - 1; i > 0; i--) { int j = g() % (i + 1); int t = list[1 + i]; list[1 + i] = list[1 + j]; list[1 + j] = t; }
+    list[0] = n;
+    std::vector<std::vector<uint4>> src(nseg), dst(nseg), exp(nseg);
+    long long row_total = 0;
+    for (int k = 0; k < nseg; k++) {
+      s.row16[k] = 1 + g() % 40; s.src16[k] = s.row16[k] + g() % 3; s.dst16[k] = s.row16[k] + g() % 3; row_total += s.row16[k];
+      src[k].resize(rows * s.src16[k]); dst[k].resize(rows * s.dst16[k]);
+      for (auto& w : src[k]) w = {(unsigned)g(), (unsigned)g(), (unsigned)g(), (unsigned)g()};
+      for (auto& w : dst[k]) w = {(unsigned)g(), (unsigned)g(), (unsigned)g(), (unsigned)g()};
+      exp[k] = dst[k]; s.src[k] = src[k].data(); s.dst[k] = dst[k].data();
+    }
+    const int* lr = list + 1;
+    if (tf_ds_ring_count(list) != n || tf_ds_ring_words(s, nseg, n) != n * row_total) { fails++; printf("ring count trial %d differs\n", trial); continue; }
+    std::vector<uint4> slot(rows * row_total + 1), ref(rows * row_total + 1);
+    long long off = 0;
+    for (int k = 0; k < nseg; k++) { for (int c = 0; c < n; c++) for (int w = 0; w < s.row16[k]; w++) ref[off + c * s.row16[k] + w] = src[k][lr[c] * s.src16[k] + w]; off += (long long)n * s.row16[k]; }
+    const unsigned T = 1 + g() % 3000; // a grid's threads
+    for (unsigned t = 0; t < T; t++) tf_ds_ring_pack(s, nseg, lr, n, slot.data(), t, T);
+    if (memcmp(slot.data(), ref.data(), n * row_total * 16)) { fails++; printf("ring pack trial %d differs\n", trial); continue; }
+    off = 0;
+    for (int k = 0; k < nseg; k++) { for (int c = 0; c < n; c++) for (int w = 0; w < s.row16[k]; w++) exp[k][lr[c] * s.dst16[k] + w] = ref[off + c * s.row16[k] + w]; off += (long long)n * s.row16[k]; }
+    const unsigned U = 1 + g() % 3000;
+    for (unsigned t = 0; t < U; t++) tf_ds_ring_unpack(s, nseg, lr, n, ref.data(), t, U);
+    for (int k = 0; k < nseg; k++) if (memcmp(dst[k].data(), exp[k].data(), dst[k].size() * 16)) { fails++; printf("ring unpack trial %d seg %d differs\n", trial, k); break; }
+  }
+  // a list count out of range is clamped (never indexes past the list)
+  { int bad[TF_DS_RING_ROWS + 1] = {0}; bad[0] = -3; int a = tf_ds_ring_count(bad); bad[0] = 1000; int b = tf_ds_ring_count(bad);
+    if (a != 0 || b != TF_DS_RING_ROWS) { fails++; printf("ring count clamp differs\n"); } }
   printf("%s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
   return fails != 0;
 }
