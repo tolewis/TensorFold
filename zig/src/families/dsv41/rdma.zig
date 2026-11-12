@@ -25,8 +25,52 @@ const collect_threads = 256;
 const wc_recv_rdma_with_imm = 129;
 const host_register_portable = 0x01;
 const host_register_devicemap = 0x02;
+const pr_set_timerslack: c_int = 29;
+const default_idle_ns: u64 = 2 * std.time.ns_per_s;
+const default_nap_ns: u64 = 100 * std.time.ns_per_us;
 
-pub const Error = error{ VerbsFailed, PostFailed, BadMtu, BadInfo, TooLarge, Failed, NoHostRegister } || cuda.Error || fabric.verbs.Error || std.posix.MMapError || std.Thread.SpawnError;
+extern "c" fn prctl(option: c_int, arg2: c_ulong, arg3: c_ulong, arg4: c_ulong, arg5: c_ulong) c_int;
+
+pub const Error = error{ VerbsFailed, PostFailed, BadMtu, BadInfo, TooLarge, Failed, NoHostRegister, BadRdmaIdle, BadRdmaNap } || cuda.Error || fabric.verbs.Error || std.posix.MMapError || std.Thread.SpawnError;
+
+/// TF_RDMA_IDLE_S: seconds with nothing posted or reaped before the proxy naps (0: never nap; default 2).
+fn parseIdleNs(text: []const u8) Error!u64 {
+    const seconds = std.fmt.parseFloat(f64, text) catch return error.BadRdmaIdle;
+    if (!std.math.isFinite(seconds) or seconds < 0) return error.BadRdmaIdle;
+    const ns = seconds * @as(f64, @floatFromInt(std.time.ns_per_s));
+    if (ns > @as(f64, @floatFromInt(3600 * std.time.ns_per_s))) return error.BadRdmaIdle;
+    return @intFromFloat(ns);
+}
+
+fn envIdleNs() Error!u64 {
+    const raw = std.c.getenv("TF_RDMA_IDLE_S") orelse return default_idle_ns;
+    const text = std.mem.span(raw);
+    return if (text.len == 0) default_idle_ns else parseIdleNs(text);
+}
+
+/// TF_RDMA_NAP_US: the proxy's sleep between looks once it is idle (default 100; at least 1).
+fn parseNapNs(text: []const u8) Error!u64 {
+    const us = std.fmt.parseInt(u64, text, 10) catch return error.BadRdmaNap;
+    if (us < 1 or us > 1_000_000) return error.BadRdmaNap;
+    return us * std.time.ns_per_us;
+}
+
+fn envNapNs() Error!u64 {
+    const raw = std.c.getenv("TF_RDMA_NAP_US") orelse return default_nap_ns;
+    const text = std.mem.span(raw);
+    return if (text.len == 0) default_nap_ns else parseNapNs(text);
+}
+
+fn monotonicNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+fn nap(ns: u64) void {
+    const ts: std.c.timespec = .{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
+    _ = std.c.nanosleep(&ts, null);
+}
 
 /// ibv_mtu is an ordered enum, 1=256 through 5=4096. Both ends use the smaller active MTU.
 fn pathMtu(local: c_int, remote: c_int) error{BadMtu}!c_int {
@@ -157,6 +201,9 @@ pub const Ring = struct {
     running: std.atomic.Value(bool) = .init(false),
     failed: std.atomic.Value(bool) = .init(false),
     why: [128]u8 = @splat(0),
+    /// The proxy's idle back-off: quiet for `idle_ns` (0: never nap), then sleep `nap_ns` between looks.
+    idle_ns: u64 = default_idle_ns,
+    nap_ns: u64 = default_nap_ns,
 
     // the metadata block: flags [slots][world], doorbell, sizes [slots], sent [slots], abort word
     fn flags(r: *const Ring) [*]u64 {
@@ -182,6 +229,8 @@ pub const Ring = struct {
     pub fn create(gpa: std.mem.Allocator, d: *const cuda.Driver, k: Kernels, devices: []const []const u8, rank: u32, world: u32, s: Settings) Error!*Ring {
         if (world < 2 or world > max_ranks or rank >= world or devices.len == 0 or devices.len > max_devices) return error.BadInfo;
         if (s.slots < 2 or s.slots > seqs.max_slots or s.max_bytes == 0 or s.max_bytes % 64 != 0) return error.BadInfo;
+        const idle_ns = try envIdleNs();
+        const nap_ns = try envNapNs();
         const r = try gpa.create(Ring);
         errdefer gpa.destroy(r);
         var verbs = try Verbs.open(null);
@@ -197,7 +246,7 @@ pub const Ring = struct {
         var scalars = try cuda.DeviceBuffer.alloc(d, 80);
         errdefer scalars.free();
         try scalars.fill8(0, null);
-        r.* = .{ .d = d, .verbs = verbs, .k = k, .s = s, .rank = rank, .world = world, .hr = hr, .send = send, .recv = recv, .meta = meta, .scalars = scalars };
+        r.* = .{ .d = d, .verbs = verbs, .k = k, .s = s, .rank = rank, .world = world, .hr = hr, .send = send, .recv = recv, .meta = meta, .scalars = scalars, .idle_ns = idle_ns, .nap_ns = nap_ns };
         r.v = &r.verbs;
         errdefer for (r.nics[0..r.nd]) |*n| r.closeNic(n);
         for (devices) |name| {
@@ -343,8 +392,16 @@ pub const Ring = struct {
         var arrivals: seqs.Arrivals = .{ .nd = nd };
         var posted: u64 = 0;
         var wc: [64]vabi.Wc = undefined;
+        // A decode round's gathers come microseconds apart; only a long quiet spell naps. The first gather after one
+        // waits out at most one nap, and the next doorbell or completion spins again.
+        const naps = r.idle_ns > 0;
+        if (naps) _ = prctl(pr_set_timerslack, 1000, 0, 0, 0); // 1 us, so a nap is about TF_RDMA_NAP_US
+        var quiet: u64 = 0; // passes with nothing posted or reaped
+        var quiet_since: u64 = monotonicNs();
+        var drowsy = false;
         while (r.running.load(.monotonic)) {
             const ring = @atomicLoad(u64, r.doorbell(), .acquire);
+            var busy = posted < ring;
             while (posted < ring) {
                 const q = posted + 1;
                 const slot: usize = @intCast(q % r.s.slots);
@@ -371,6 +428,7 @@ pub const Ring = struct {
                     r.fail("ibv_poll_cq failed");
                     return;
                 }
+                busy = busy or k > 0;
                 for (wc[0..@intCast(k)]) |w| {
                     if (w.status != vabi.wc_success) {
                         r.fail(r.v.statusText(w.status));
@@ -392,6 +450,22 @@ pub const Ring = struct {
                         @atomicStore(u64, &r.sent()[@as(usize, @intCast(q % r.s.slots))], q, .release);
                     }
                 }
+            }
+            if (!naps) continue;
+            if (busy) {
+                drowsy = false;
+                quiet = 0;
+                continue;
+            }
+            if (drowsy) {
+                nap(r.nap_ns);
+                continue;
+            }
+            quiet += 1;
+            if (quiet == 1) {
+                quiet_since = monotonicNs();
+            } else if ((quiet & 1023) == 0 and monotonicNs() -% quiet_since > r.idle_ns) {
+                drowsy = true;
             }
         }
     }
@@ -527,6 +601,18 @@ test "the info a peer reads is a plain extern struct (it crosses the link as byt
     try std.testing.expectEqual(@as(usize, 116), @offsetOf(Info, "active_mtu"));
     try std.testing.expectEqual(@as(usize, 136), @offsetOf(Info, "recv"));
 }
+test "the RDMA proxy's idle back-off parses its settings" {
+    try std.testing.expectEqual(default_idle_ns, try parseIdleNs("2"));
+    try std.testing.expectEqual(@as(u64, 0), try parseIdleNs("0"));
+    try std.testing.expectEqual(@as(u64, 1500 * std.time.ns_per_ms), try parseIdleNs("1.5"));
+    for ([_][]const u8{ "", "-1", "nan", "inf", "3601", "x" }) |bad|
+        try std.testing.expectError(error.BadRdmaIdle, parseIdleNs(bad));
+    try std.testing.expectEqual(default_nap_ns, try parseNapNs("100"));
+    try std.testing.expectError(error.BadRdmaNap, parseNapNs("0"));
+    for ([_][]const u8{ "", "-1", "x", "18446744073709551615" }) |bad|
+        try std.testing.expectError(error.BadRdmaNap, parseNapNs(bad));
+}
+
 test "RDMA MTU negotiation is symmetric for every supported port MTU and rejects invalid metadata" {
     for (1..6) |a| for (1..6) |b| {
         try std.testing.expectEqual(@as(c_int, @intCast(@min(a, b))), try pathMtu(@intCast(a), @intCast(b)));
@@ -587,4 +673,12 @@ test "connect programs the negotiated MTU and configured GID and rejects bad pee
     peers[1].active_mtu[0] = 0;
     try std.testing.expectError(error.BadMtu, r.connect(&peers));
     try std.testing.expectEqual(@as(usize, 0), Probe.calls);
+}
+
+test "RDMA idle nap bounds keep requests and shutdown responsive" {
+    try std.testing.expectError(error.BadRdmaNap, parseNapNs("1000001"));
+    try std.testing.expectError(error.BadRdmaNap, parseNapNs("0"));
+    try std.testing.expectEqual(@as(u64, 1000000 * std.time.ns_per_us), try parseNapNs("1000000"));
+    try std.testing.expectEqual(@as(u64, 3600 * std.time.ns_per_s), try parseIdleNs("3600"));
+    try std.testing.expectError(error.BadRdmaIdle, parseIdleNs("3600.1"));
 }
