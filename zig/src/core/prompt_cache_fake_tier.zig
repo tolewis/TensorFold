@@ -32,6 +32,10 @@ pub const FakeTier = struct {
     refuse_if: ?Check = null,
     refused: u64 = 0,
     begins: u64 = 0,
+    /// Asked at each begin, on the thread that begins it (the lane host's): a false answer counts in `begins_unbound`
+    /// (the lane thread's enter hook had not run there: a device context would not be current).
+    on_begin: ?Check = null,
+    begins_unbound: u64 = 0,
     /// The next `full` asks of Tier.VTable.full answer true (the tier at its cap before any room is made; `fulls`
     /// counts the asks).
     full: u32 = 0,
@@ -152,6 +156,9 @@ pub const FakeTier = struct {
         t.lock();
         defer t.unlock();
         t.begins += 1;
+        if (t.on_begin) |c| if (!c.check(c.ctx)) {
+            t.begins_unbound += 1;
+        };
         if (t.refuse > 0 and (if (t.refuse_if) |c| c.check(c.ctx) else true)) {
             t.refuse -= 1;
             t.refused += 1;

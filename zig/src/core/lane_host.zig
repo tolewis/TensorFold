@@ -110,6 +110,10 @@ pub const LaneHost = struct {
     /// The backend's word that its device is between launches it may interleave with (dsv41: no CUDA graph capture
     /// on its stream); null: always.
     quiet: ?Quiet = null,
+    /// Runs first on the lane thread, before anything else there: the backend makes its device context current (CUDA
+    /// binds a context per thread, and admission can reach the device through the prompt cache's tier, a restore,
+    /// before any backend call has bound it). null: nothing to do.
+    enter: ?Enter = null,
     rounds_open: u32 = 0, // engine thread: inside the lane core's step (a round's launches)
     in_between: bool = false, // engine thread: inside Stream.between (the filling pass stands between two chunks)
     /// A service asked for where it must not run panics (debug builds), else is skipped and counted.
@@ -136,6 +140,9 @@ pub const LaneHost = struct {
 
     /// The backend's device state for the service fence.
     pub const Quiet = struct { ctx: *anyopaque, check: *const fn (ctx: *anyopaque) bool };
+
+    /// The backend's hook for the lane thread's start.
+    pub const Enter = struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque) void };
 
     /// A backend error that means the rank pair broke, wherever it surfaces (a prompt pass, a round, the lone
     /// driver); `drain`: rounds can still run, so decoding streams may finish first.
@@ -978,6 +985,7 @@ pub const LaneHost = struct {
     }
 
     fn run(h: *LaneHost) void {
+        if (h.enter) |e| e.run(e.ctx);
         while (true) {
             if (h.isBroken()) {
                 if (h.brokenStep()) return;

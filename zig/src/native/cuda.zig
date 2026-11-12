@@ -219,7 +219,16 @@ const Host = struct {
         h.host.quiet = h.quiet;
         if (h.pair_watch) |w| w(h.family, &h.host, api.LaneHost.pairBrokenFn); // (the family's breaks reach the host)
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
+        // the context current on the lane thread from its start: admission reaches the device through the prompt
+        // cache's tier (a restore's begin) before any backend call binds it, and the first restore after a start
+        // failed with CUDA_ERROR_INVALID_CONTEXT and prefilled from 0
+        if (h.gpu != null) h.host.enter = .{ .ctx = h, .run = enterLane };
         try h.host.start();
+    }
+
+    /// The lane thread's first step: its context current (LaneHost.enter).
+    fn enterLane(p: *anyopaque) void {
+        _ = bind(p);
     }
 
     /// The family's lone driver with the context current on the lane thread.
