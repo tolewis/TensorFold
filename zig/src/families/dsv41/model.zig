@@ -522,6 +522,23 @@ pub const Model = struct {
         try d.check(d.api.cuMemcpyDtoDAsync_v2(dst, src, bytes, m.stream.handle), "cuMemcpyDtoDAsync");
     }
 
+    /// The Engram read-ahead joined and its rows dropped, so the next chunk reads its own rows from its prompt's ids.
+    /// Baseline hazard (also without spill): fillChunk takes a joined read-ahead whose (ahead_start, ahead_n) match its
+    /// chunk, and a pass that ends between chunks (cancel, error) leaves one standing; a later prompt resuming a kept
+    /// point at that position (in memory or restored) would consume rows hashed from the other prompt's ids. The fix
+    /// is one call at the start of every pass, in fillBegin after its joinAhead (outside this block: routed to the
+    /// coordinator, docs/port/dsv41-state.md); until it lands, a restore calls this right before the resumed pass.
+    pub fn resetEngramAhead(m: *Model) void {
+        m.joinAhead();
+        if (m.eh) |*eh| { // rows read ahead for another prompt are not this one's, even at the same positions
+            eh.ahead_start = std.math.maxInt(usize);
+            eh.ahead_ready = .{ false, false };
+            eh.ahead_n = 0;
+            eh.ahead_err = null;
+            if (eh.lead_on) m.lead.reset(eh);
+        }
+    }
+
     /// Each layer's gate_bias_vl (f32 [experts], the checkpoint's extra file) on the device: Gate.forward's bias at
     /// image-span positions.
     fn loadVisionBias(m: *Model, path: []const u8) !void {
@@ -561,11 +578,9 @@ pub const Model = struct {
 
     pub fn fillBegin(m: *Model, slot: usize, base: usize) !void {
         if (slot >= m.streams) return error.BadSlot;
-        if (m.eh) |*eh| { // rows read ahead for another prompt are not this one's, even at the same positions
-            eh.ahead_start = std.math.maxInt(usize);
-            eh.ahead_ready = .{ false, false };
-            if (eh.lead_on) m.lead.reset(eh);
-        }
+        // a read-ahead an earlier pass left (cancelled between chunks) never feeds this one: a resume at that pass's
+        // next chunk start would otherwise take its rows, hashed from the other prompt's ids
+        m.resetEngramAhead();
         m.spans.clearRetainingCapacity();
         m.ch.spans = &.{};
         m.view = try m.caches.view(&m.eng, slot, base);

@@ -395,7 +395,8 @@ pub const Ring = struct {
         // A decode round's gathers come microseconds apart; only a long quiet spell naps. The first gather after one
         // waits out at most one nap, and the next doorbell or completion spins again.
         const naps = r.idle_ns > 0;
-        if (naps) _ = prctl(pr_set_timerslack, 1000, 0, 0, 0); // 1 us, so a nap is about TF_RDMA_NAP_US
+        // 1 us, so a nap is about TF_RDMA_NAP_US (Linux only: the host tests build this file for macOS too)
+        if (naps and @import("builtin").os.tag == .linux) _ = prctl(pr_set_timerslack, 1000, 0, 0, 0);
         var quiet: u64 = 0; // passes with nothing posted or reaped
         var quiet_since: u64 = monotonicNs();
         var drowsy = false;
