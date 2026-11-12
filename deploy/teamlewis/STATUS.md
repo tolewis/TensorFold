@@ -9,7 +9,7 @@ Updated by tf-unify (Cursor). Tim reads this in the morning.
 | 1 Inventory four hosts | 2026-11-12T03:48Z | | done |
 | 2 Branch `lane/fleet-unified` | 2026-11-12T03:52Z | `097e87cc6` | merged p4-ship7 + fleet-serve + jubiku-p4 |
 | 3 Config tree `deploy/teamlewis/` | 2026-11-12T03:55Z | same | done |
-| 4 Per-host builds | | | not started (wait for 07:00Z window) |
+| 4 Per-host builds | 2026-11-12T04:02Z | `c2aa037a` tp2 sha `ee72db142833`, tp1-skx `ec7ab9f77527` | done on inference1 (no card) |
 | 5 Production swaps | | | not started (earliest 07:00Z; inference1 09:00Z) |
 | 6 inference1 gate | | | blocked until 09:00Z and kernel lane idle |
 | 7 Catalog update | | | pending after swaps |
