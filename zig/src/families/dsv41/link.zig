@@ -1,5 +1,7 @@
 //! Rank 0 to rank 1 over TCP (the fabric addresses): length-prefixed frames for each round's step and NCCL's id, as
 //! multi.py's Link sends them. One connection, TCP_NODELAY, SO_BUSY_POLL, blocking reads (recvSpin polls first).
+//! The other direction carries only the followers' replies to rank 0's asking rank_wire frames (recvWithin,
+//! readableAny: bounded waits; see rank_wire.zig and docs/port/rank-wire.md for the rules that keep it deadlock-free).
 const std = @import("std");
 const c = std.c;
 
@@ -20,7 +22,8 @@ pub const Link = struct {
         const one: c_int = 1;
         const busy_us: c_int = 50;
         _ = c.setsockopt(fd, c.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one), @sizeOf(c_int));
-        _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.BUSY_POLL, std.mem.asBytes(&busy_us), @sizeOf(c_int));
+        // (Linux's; a host without it, where only the host tests run, keeps the plain socket)
+        if (@hasDecl(c.SO, "BUSY_POLL")) _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.BUSY_POLL, std.mem.asBytes(&busy_us), @sizeOf(c_int));
     }
 
     fn addr(ip: [4]u8, port: u16) c.sockaddr.in {
@@ -130,6 +133,46 @@ pub const Link = struct {
         return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
     }
 
+    /// Whether a byte can be read within `timeout_ns` (poll(2); a hang-up or socket error counts as readable, so the
+    /// read that follows reports it). Never consumes anything.
+    pub fn readable(l: Link, timeout_ns: u64) !bool {
+        var one = [_]Link{l};
+        var ready = [_]bool{false};
+        return try readableAny(&one, &ready, timeout_ns) > 0;
+    }
+
+    /// recv with a deadline over the whole frame (rank-to-rank replies, rank_wire.zig): error.Timeout when the frame
+    /// does not arrive in full within `timeout_ns`. After a timeout the link may hold part of a frame and is no longer
+    /// usable: the caller ends the pair (there is no resynchronizing a byte stream).
+    pub fn recvWithin(l: Link, buf: []u8, timeout_ns: u64) ![]u8 {
+        const deadline = monotonicNs() +| timeout_ns;
+        var len: [4]u8 = undefined;
+        try l.readAllBy(&len, deadline);
+        const n = std.mem.readInt(u32, &len, .little);
+        if (n > buf.len) return error.FrameTooLong;
+        try l.readAllBy(buf[0..n], deadline);
+        return buf[0..n];
+    }
+
+    fn readAllBy(l: Link, out: []u8, deadline: u64) !void {
+        var done: usize = 0;
+        while (done < out.len) {
+            const now = monotonicNs();
+            if (now >= deadline) return error.Timeout;
+            if (!try l.readable(deadline - now)) return error.Timeout;
+            const n = c.recv(l.fd, out.ptr + done, out.len - done, c.MSG.DONTWAIT);
+            if (n > 0) {
+                done += @intCast(n);
+                continue;
+            }
+            if (n == 0) return error.PeerDown;
+            switch (c.errno(n)) {
+                .AGAIN, .INTR => {},
+                else => return error.PeerDown,
+            }
+        }
+    }
+
     /// The next frame into `buf` (a frame longer than `buf` is refused); its bytes.
     pub fn recv(l: Link, buf: []u8) ![]u8 {
         var len: [4]u8 = undefined;
@@ -140,6 +183,32 @@ pub const Link = struct {
         return buf[0..n];
     }
 };
+
+/// Which of `links` have a byte to read (or a hang-up/error to report) within `timeout_ns`: their flags in `ready`
+/// (one per link), the count. 0 when none did in time. A timeout of 0 only polls.
+pub fn readableAny(links: []const Link, ready: []bool, timeout_ns: u64) !usize {
+    std.debug.assert(ready.len == links.len and links.len <= 8);
+    var fds: [8]c.pollfd = undefined;
+    for (links, 0..) |l, i| fds[i] = .{ .fd = l.fd, .events = c.POLL.IN, .revents = 0 };
+    const deadline = Link.monotonicNs() +| timeout_ns;
+    while (true) {
+        const now = Link.monotonicNs();
+        const left = if (deadline > now) deadline - now else 0;
+        // poll's milliseconds, rounded up so a short wait still waits; capped well inside c_int
+        const ms: c_int = @intCast(@min((left + std.time.ns_per_ms - 1) / std.time.ns_per_ms, 1 << 30));
+        const n = c.poll(&fds, @intCast(links.len), ms);
+        if (n < 0) {
+            if (c.errno(n) == .INTR) continue;
+            return error.PollFailed;
+        }
+        var count: usize = 0;
+        for (ready, 0..) |*r, i| {
+            r.* = fds[i].revents != 0;
+            if (r.*) count += 1;
+        }
+        if (count > 0 or Link.monotonicNs() >= deadline) return count;
+    }
+}
 
 /// "192.0.2.7" as four bytes.
 pub fn parseIp(text: []const u8) ![4]u8 {
@@ -177,4 +246,40 @@ test "frames cross a loopback link in order" {
     try std.testing.expectEqualStrings("polled", try l.recvSpin(&buf, 1000 * std.time.ns_per_ms));
     try std.testing.expectEqualStrings("late", try l.recvSpin(&buf, 0));
     t.join();
+}
+
+test "a reply that does not come in time is a timeout, a readable link says so" {
+    const io = std.testing.io;
+    const port: u16 = 29500 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 400)));
+    const Peer = struct {
+        fn run(p: u16) void {
+            var l = Link.connect(std.testing.io, .{ 127, 0, 0, 1 }, p, 10) catch return;
+            defer l.close();
+            var buf: [8]u8 = undefined;
+            _ = l.recv(&buf) catch return; // the go-ahead
+            // half a frame, then nothing for a while, then the rest
+            l.writeAll(&.{ 5, 0, 0, 0, 'h' }) catch return;
+            std.Io.sleep(std.testing.io, .fromMilliseconds(300), .awake) catch {};
+            l.writeAll("ello") catch return;
+            _ = l.recv(&buf) catch return;
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Peer.run, .{port});
+    var l = try Link.listen(.{ 127, 0, 0, 1 }, port);
+    defer l.close();
+    var buf: [16]u8 = undefined;
+    try std.testing.expect(!try l.readable(20 * std.time.ns_per_ms));
+    var ready = [_]bool{true};
+    try std.testing.expectEqual(@as(usize, 0), try readableAny(&.{l}, &ready, 0));
+    try std.testing.expect(!ready[0]);
+    try l.send("go");
+    try std.testing.expectError(error.Timeout, l.recvWithin(&buf, 100 * std.time.ns_per_ms));
+    try std.testing.expect(try l.readable(2 * std.time.ns_per_s)); // the rest arrives
+    try l.send("end");
+    t.join();
+    // the peer is gone: readable (a hang-up), then the read says so
+    try std.testing.expect(try l.readable(std.time.ns_per_s));
+    var rest: [8]u8 = undefined;
+    _ = c.recv(l.fd, &rest, rest.len, 0); // "ello"
+    try std.testing.expectError(error.PeerDown, l.recvWithin(&buf, std.time.ns_per_s));
 }

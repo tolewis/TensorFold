@@ -2440,6 +2440,7 @@ pub const Store = struct {
                     r.state[i] = .ready;
                 } else |e| {
                     r.state[i] = .failed;
+                    s.giveRead(r, t.slot); // (never handed: its slot comes back now, or the job could never end)
                     s.readFailed(r, b.name, e);
                 }
             } else {

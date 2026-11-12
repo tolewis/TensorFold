@@ -51,6 +51,11 @@ pub const sampling = @import("sampling.zig");
 pub const model = @import("model.zig");
 pub const lanes = @import("lanes.zig");
 pub const pool = @import("pool.zig");
+pub const spill_state = @import("spill_state.zig");
+pub const spill_tier = @import("spill_tier.zig");
+pub const rank_wire = @import("rank_wire.zig");
+pub const fingerprint = @import("fingerprint.zig");
+pub const rank_identity = @import("rank_identity.zig");
 
 test {
     // every declaration of every file, so functions no test calls are still compiled
@@ -100,4 +105,31 @@ test {
     refAll(model);
     refAll(lanes);
     refAll(pool);
+    refAll(spill_state);
+    refAll(rank_wire);
+    refAll(fingerprint);
+    refAll(rank_identity);
+    // rank_identity.gather over the real Options and Model (it takes them as anytype to stay host-testable alone)
+    _ = &struct {
+        fn f(gpa: @import("std").mem.Allocator, io: @import("std").Io, o: model.Options, m: *model.Model, x: rank_identity.Extra) !rank_identity.Gathered {
+            return rank_identity.gather(gpa, io, o, m, x);
+        }
+    }.f;
+    // the spill state's model side (its methods and the packer over the device planes; nothing calls them yet)
+    refAll(model.Model.SpillDev);
+    refAll(spill_state.Packer(model.Model.SpillDev));
+    _ = &model.Model.spillLayout;
+    _ = &model.Model.spillGenerations;
+    _ = &model.Model.spillPacker;
+    _ = &model.Model.resetEngramAhead;
+    _ = &model.Model.spillCheckResumed;
+    _ = &model.Model.spillSelfCheck;
+    // the spill tier (spill_tier.zig and its host tests), its protocol and identity, and its GPU glue
+    refAll(spill_tier);
+    refAll(lanes.SpillTier);
+    refAll(lanes.SpillFollower);
+    refAll(lanes.SpillTier.S);
+    _ = &lanes.followWith;
+    _ = &native.openSpill;
+    _ = &native.followerSpill;
 }

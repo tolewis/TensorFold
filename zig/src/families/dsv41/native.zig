@@ -35,6 +35,16 @@
 //!                                               limit is reported (Loaded.window, the log), never silently halved
 //! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). The pool holds --context
 //! positions for every stream together (each takes an extent: its prompt, its max_tokens and a round's rows).
+//! The spill tier (wojo's GLM 0088/0110 port, spill_tier.zig; off unless the server's --spill-dir and --spill-gib):
+//! rank 0's switches come through the server (api.Spill: --spill-dir, --spill-gib, --spill-min-free-gib,
+//! --spill-min-tokens, --spill-quota, TF_SPILL_TURNS, TF_SPILL_FLUSH_MS), its staging cap from
+//! TF_DS_SPILL_STAGING_MIB (128). Each follower runs its own store on its own disk with its own switches
+//! (tf-dsv41-lanes --spill-dir/--spill-gib/..., or TF_DS_SPILL_DIR, TF_DS_SPILL_GIB, TF_DS_SPILL_MIN_FREE_GIB,
+//! TF_DS_SPILL_MIN_TOKENS, TF_DS_SPILL_QUOTA, TF_DS_SPILL_STAGING_MIB through ENGINE_ENV); the ranks' fingerprints
+//! (rank_identity.zig, which needs TF_DS_ENGINE_ID, TF_DS_RECIPE_PATCHES and TF_DS_RANK_CACHE_SHA or
+//! TF_DS_MODEL_REVISION on every rank, and TF_DS_ENGRAM_REVISION with Engram) must agree at startup, a difference
+//! naming the field. Not with TF_DS_KV_SHARD=1 yet (its owner_sharded layout is round 3); both refusals, and a
+//! missing identity, come before the weights load (spillPreflight).
 //! TF_TP_WORLD=4: the four nodes of the exact 2D split (prompt2d.zig), ranks 1-3 `tf-dsv41-lanes` following on the
 //! other nodes; TF_RDMA_DEVICES (and TF_DS_RDMA_KERNELS: rdma_gather.cu's fatbin, unset: the embedded one) put its
 //! decode-size exchanges on the RDMA rings, as the four-node Python lane's TF_RDMA_DEVICES does.
@@ -48,6 +58,12 @@ const round = @import("round.zig");
 const link = @import("link.zig");
 const rank_cache = @import("rank_cache.zig");
 const vision_mod = @import("vision.zig");
+const spill_tier = @import("spill_tier.zig");
+const rank_wire = @import("rank_wire.zig");
+const rank_identity = @import("rank_identity.zig");
+const prompt = @import("prompt.zig");
+const core = @import("core");
+const shard = @import("shard.zig");
 
 pub const model_type = "deepseek_v41";
 pub const formats: []const []const u8 = &.{"exl3-mul1"};
@@ -59,7 +75,13 @@ pub const prompt_rows: u32 = 2048;
 /// The served lane's reasoning effort numbers (text.zig): the server passes each name and the template hears its number.
 pub const efforts = @import("text.zig").efforts;
 
-pub const Options = struct { context: usize, drafts: bool, segments: usize = 1 };
+pub const Options = struct {
+    context: usize,
+    drafts: bool,
+    segments: usize = 1,
+    /// The spill tier (null: off; the served path and its bytes unchanged).
+    spill: ?spill_tier.Settings = null,
+};
 
 /// A lone drafted stream's own driver: decodes it until it finishes (false) or `yield` hands it over (true).
 pub const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool) anyerror!bool;
@@ -81,6 +103,12 @@ pub const Loaded = struct {
     /// The single-conversation limit (prompt + reply tokens) when it is not the context asked for: TF_DS_POOL or
     /// TF_DS_KV_SHARD (a part may hold less than the window); null: the context, as ever.
     window: ?usize = null,
+    /// The spill tier (the prompt cache's Tier), when Options.spill asked for it.
+    tier: ?spill_tier.prompt_cache.Tier = null,
+    /// The prompt cache's native rules with the tier (Rules.grid: the chunk; Rules.window: the
+    /// replay window, Lanes.usable's).
+    grid: u32 = 0,
+    replay: u32 = 0,
 };
 
 pub const Snaps = struct {
@@ -91,6 +119,8 @@ pub const Snaps = struct {
     drop: *const fn (*anyopaque, *anyopaque) void,
     /// Rows a resumed prompt pass must still run past a kept state (core/prompt_cache Rules.tail).
     tail: u32 = 0,
+    /// Whether a kept state still restores (Lanes.usable): given with the spill tier only.
+    usable: ?*const fn (*anyopaque, *anyopaque, u32) bool = null,
 };
 
 /// The rank's model and the backend over it (what `open` hands the server, freed by `deinit`).
@@ -99,6 +129,8 @@ const State = struct {
     m: *model.Model,
     lanes: lanes_mod.Lanes,
     vision: ?*vision_mod.Vision = null,
+    staging: ?cuda.HostBuffer = null, // the spill tier's pinned staging (allocated before the pool)
+    events: []cuda.Event = &.{}, // one a staging slot
 };
 
 fn getenv(name: [:0]const u8) ?[]const u8 {
@@ -133,10 +165,16 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const master = link.parseIp(getenv("TF_TP_MASTER") orelse return error.NoMaster) catch return error.BadMaster;
     const port = std.fmt.parseInt(u16, getenv("TF_TP_PORT") orelse "29620", 10) catch return error.BadPort;
     const arena_gib = if (getenv("TF_DS_ARENA_GIB")) |t| std.fmt.parseInt(usize, t, 10) catch return error.BadArena else 0;
+    if (o.spill != null) try spillPreflight(getenvFn); // (before the staging, the weights and the pool)
     const st = try gpa.create(State);
     errdefer gpa.destroy(st);
     st.gpa = gpa;
-    st.m = try model.Model.open(gpa, io, ctx, .{
+    st.staging = null;
+    st.events = &.{};
+    // the spill tier's staging comes out of memory before the pool is sized (PORT-SPILL-V2: budgeted first)
+    if (o.spill) |sp| st.staging = try spillStaging(ctx, sp);
+    errdefer if (st.staging) |*b| b.free();
+    const mo: model.Options = .{
         .model_dir = dir,
         .cache_dir = getenv("TF_DS_RANK_CACHE") orelse return error.NoRankCache,
         .kit_dir = getenv("TF_DS_KIT") orelse return error.NoKit,
@@ -160,9 +198,13 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .round_rows = if (getenv("TF_DS_ROUND_ROWS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadRoundRows else round.default_rows,
         .round_ms = if (getenv("TF_DS_ROUND_MS")) |v| lanes_mod.parseMs(std.heap.page_allocator, v) catch return error.BadRoundMs else null,
         .streams = if (getenv("TF_DS_STREAMS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadStreams else model.max_streams_default,
-    });
+    };
+    st.m = try model.Model.open(gpa, io, ctx, mo);
     errdefer st.m.close();
     st.lanes = lanes_mod.Lanes.init(gpa, st.m);
+    // a start refused past here (a fingerprint mismatch at openPair, a store that does not open) frees the frames the
+    // agreement wrote through the lanes (the hello: leaked on the mismatch path before); rank 1 ends on its own
+    errdefer st.lanes.wire.deinit(gpa);
     if (getenv("TF_DS_FIX_K")) |t| st.lanes.fix_k = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
     st.lanes.solo_overhead = if (getenv("TF_DS_SOLO_OVERHEAD")) |v| !std.mem.eql(u8, v, "0") else false;
     st.lanes.no_copies = if (getenv("TF_DS_NO_COPIES")) |v| !std.mem.eql(u8, v, "0") else false;
@@ -173,21 +215,196 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     st.lanes.vision = st.vision;
     // the pool is the model's (preallocated): a stream takes no device memory of its own
     const L = lanes_mod.Lanes;
-    const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .tail = @intCast(st.m.cfg.window) };
+    var snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .tail = @intCast(st.m.cfg.window) };
     const window: ?usize = if (st.m.kvs != null or st.m.pool_cap != o.context) st.m.window_cap else null;
-    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null, .window = window };
+    var tier: ?spill_tier.prompt_cache.Tier = null;
+    if (o.spill) |sp| {
+        st.events = try openSpill(gpa, io, st.m, &st.lanes, mo, sp, st.staging.?);
+        snaps.usable = L.usableFn;
+        tier = st.lanes.spill.?.tier();
+    }
+    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null, .window = window, .tier = tier, .grid = model.chunk_rows, .replay = @intCast(st.m.cfg.window) };
 }
 
 fn deinitFn(ptr: *anyopaque) void {
     const st: *State = @ptrCast(@alignCast(ptr));
+    // the tier after the prompt cache's store (cuda.zig frees it first) and before the family: its store closes
+    if (st.lanes.spill) |t| t.destroy();
+    st.lanes.spill = null;
+    for (st.events) |*e| e.deinit();
+    if (st.events.len > 0) st.gpa.free(st.events);
+    if (st.staging) |*b| b.free();
     st.lanes.deinit(); // rank 1 hears done
     if (st.vision) |v| v.close();
     st.m.close();
     st.gpa.destroy(st);
 }
 
+// -- the spill tier's startup (rank 0 here, the followers in tf-dsv41-lanes) --------------------------------------
+
+/// What refuses the spill tier from the environment alone, checked on every rank before anything loads (minutes on
+/// the Sparks): the pair (TF_TP_WORLD=2), TF_DS_KV_SHARD off (owner_sharded points are round 3) and the identity
+/// the fingerprint needs (rank_identity.Extra.env: TF_DS_ENGINE_ID, TF_DS_RECIPE_PATCHES, TF_DS_RANK_CACHE_SHA or
+/// TF_DS_MODEL_REVISION; TF_DS_ENGRAM_REVISION with TF_DS_ENGRAM).
+pub fn spillPreflight(env: *const fn ([:0]const u8) ?[]const u8) !void {
+    const world = std.fmt.parseInt(u32, env("TF_TP_WORLD") orelse "2", 10) catch return error.BadWorld;
+    if (world != 2) return error.SpillNeedsTwoRanks;
+    if ((shard.Mode.parse(env("TF_DS_KV_SHARD"), env("TF_DS_KV_SHARD_DECODE")) catch return error.BadKvShard) != .off) return error.SpillWithKvShard;
+    _ = try rank_identity.Extra.env(env);
+    if (nonEmpty(env("TF_DS_ENGRAM")) != null and (env("TF_DS_ENGRAM_REVISION") orelse @as([]const u8, "")).len == 0) return error.NoEngramId;
+}
+
+/// The spill tier's switches from the server's (rank 0; api.Spill's fields) and TF_DS_SPILL_STAGING_MIB.
+pub fn spillSettings(dir: []const u8, gib: f64, min_free_gib: f64, quota: f64, min_tokens: u32, turns: u32, flush_ms: u32) !spill_tier.Settings {
+    var s: spill_tier.Settings = .{ .dir = dir, .gib = gib, .min_free_gib = min_free_gib, .quota = quota, .min_tokens = min_tokens, .turns = turns, .flush_ms = flush_ms };
+    if (getenv("TF_DS_SPILL_STAGING_MIB")) |v| s.staging_mib = std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch return error.BadSpillSetting;
+    if (s.staging_mib < spill_tier.min_staging_mib) return error.BadSpillSetting;
+    return s;
+}
+
+/// The pinned staging a rank's spill tier works in (its cap; allocated before the model's pool).
+pub fn spillStaging(ctx: *const cuda.Context, s: spill_tier.Settings) !cuda.HostBuffer {
+    var b = try cuda.HostBuffer.alloc(ctx.d, @intCast(s.stagingBytes()));
+    if (@intFromPtr(b.bytes.ptr) % 4096 != 0) {
+        b.free();
+        return error.UnalignedStaging;
+    }
+    return b;
+}
+
+fn stagingSlice(b: cuda.HostBuffer) []align(4096) u8 {
+    return @alignCast(b.bytes);
+}
+
+pub fn getenvFn(name: [:0]const u8) ?[]const u8 {
+    return getenv(name);
+}
+
+/// This rank's fingerprint exchange (rank_identity's inputs: the model options it opened with, the opened model, the
+/// recipe's identity from the environment, its switches and its state layout).
+pub fn rankExchange(gpa: std.mem.Allocator, io: std.Io, mo: model.Options, m: *model.Model, s: ?spill_tier.Settings, layout: *const model.Model.spill.StateLayout) !@import("fingerprint.zig").Exchange {
+    const envp = try rank_identity.Extra.env(getenvFn);
+    var fbuf: [256]u8 = undefined;
+    const image_cache = if (getenv("TF_DS_IMAGE_CACHE")) |v| !std.mem.eql(u8, v, "0") else true;
+    const features = try rank_identity.featureString(&fbuf, .{ .spill = s != null, .spill_min_tokens = if (s) |x| x.min_tokens else 0, .kv_shard = m.kvs != null, .image_cache = image_cache, .streams = @intCast(m.streams), .round_rows = @intCast(m.eng.round_rows), .pool = m.pool_cap, .drafts = m.drafting() });
+    var pbuf: [model.Model.spill.StateLayout.max_encoded]u8 = undefined;
+    const lp = try rank_identity.layoutPart(layout, &pbuf);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const rc_name = try rank_cache.find(arena.allocator(), io, m.cache_dir, m.rank, m.world);
+    const x: rank_identity.Extra = .{
+        .engine_id = envp.engine_id,
+        .recipe_patches = envp.recipe_patches,
+        .build_flags = envp.build_flags,
+        .model_revision = envp.model_revision,
+        .ablation = envp.ablation,
+        .rank_cache_sha = envp.rank_cache_sha,
+        .engram_revision = envp.engram_revision,
+        .features = features,
+        .native_format = core.spill.format.version,
+        .chunk_rows = model.chunk_rows,
+        .replay_floor = prompt.replay_floor,
+        .idx_split = prompt.idx_split,
+        .planes = lp.planes,
+        .rank_layout = lp.rank_layout,
+        .owner_layout = lp.owner_layout,
+        .gpu_capability = try m.ctx.capability(),
+        .cuda_driver = try m.ctx.d.version(),
+        .rank_cache_name = rc_name,
+    };
+    var g = try rank_identity.gather(gpa, io, mo, m, x);
+    defer g.deinit();
+    const fp = try g.build(gpa);
+    return fp.exchange();
+}
+
+/// One reusable event a staging slot (spill_tier.eventCount).
+pub fn spillEvents(gpa: std.mem.Allocator, m: *model.Model, n: usize) ![]cuda.Event {
+    const evs = try gpa.alloc(cuda.Event, n);
+    var made: usize = 0;
+    errdefer {
+        for (evs[0..made]) |*e| e.deinit();
+        gpa.free(evs);
+    }
+    for (evs) |*e| {
+        e.* = try cuda.Event.init(m.ctx.d, false);
+        made += 1;
+    }
+    return evs;
+}
+
+fn agreeSink(ctx: *anyopaque, sub: []const u8) anyerror!void {
+    return lanes_mod.Lanes.spillFrame(ctx, rank_wire.lanes_kind, sub);
+}
+
+/// Rank 0: the fingerprint agreement with every follower (before anything spill-related crosses), then this rank's
+/// store under <spill-dir>/native-spill-<compat>/rank0 and the tier on `ln` (ln.spill). The events it returns are
+/// the caller's (freed after the tier).
+pub fn openSpill(gpa: std.mem.Allocator, io: std.Io, m: *model.Model, ln: *lanes_mod.Lanes, mo: model.Options, s: spill_tier.Settings, staging: cuda.HostBuffer) ![]cuda.Event {
+    if (m.kvs != null) return error.SpillWithKvShard; // PORT(round3): owner_sharded points (part salt, owner planes)
+    if (m.world != 2) return error.SpillNeedsTwoRanks;
+    const layout = try m.spillLayout();
+    const plan = try spill_tier.stagingPlan(s, &layout);
+    const fx = try rankExchange(gpa, io, mo, m, s, &layout);
+    const lead = try gpa.create(rank_wire.Leader);
+    var lead_owned = true;
+    defer if (lead_owned) gpa.destroy(lead);
+    lead.* = rank_wire.Leader.init(@intCast(m.world), rank_wire.freshEpoch(io), fx);
+    const wire = ln.spillWire();
+    const a = lead.agree(.{ .ctx = ln, .send = agreeSink }, wire.links) catch |e| {
+        var buf: [192]u8 = undefined;
+        if (lead.broken) |b| std.log.err("dsv41 spill: {s}", .{rank_wire.describeBroken(b, &buf)});
+        // a follower without the tier ends at the hello (SpillNotStarted on its side): rank 0 sees its link go down
+        if (e != error.FingerprintMismatch) std.log.err("dsv41 spill: no agreement with rank 1; if it printed \"follow\": \"SpillNotStarted\", start it with the spill tier too (TF_DS_SPILL_DIR and TF_DS_SPILL_GIB)", .{});
+        return if (e == error.FingerprintMismatch) error.SpillFingerprintMismatch else e;
+    };
+    const events = try spillEvents(gpa, m, spill_tier.eventCount(plan));
+    errdefer {
+        for (events) |*e| e.deinit();
+        gpa.free(events);
+    }
+    var gens = try m.spillGenerations(gpa);
+    const compat = core.spill.format.compatDigest(a.storeCommon(0), .replicated, model.chunk_rows, layout.block_bytes);
+    const max_tokens: u32 = @intCast(if (m.request_cap > 0) m.request_cap else m.pool_cap);
+    const side = lanes_mod.SpillTier.S.create(gpa, io, .{ .m = m }, layout, gens, s, 0, compat, max_tokens, stagingSlice(staging), events, .{}) catch |e| {
+        gens.deinit(gpa);
+        return e;
+    };
+    var boot: [16]u8 = undefined;
+    io.random(&boot);
+    const t = lanes_mod.SpillTier.create(gpa, side, ln.spillFamily(), wire, lead, s, boot) catch |e| {
+        side.destroy();
+        return e;
+    };
+    lead_owned = false;
+    ln.spill = t;
+    std.log.info("dsv41 spill: rank 0's store under {s} ({d:.1} GiB, staging {d} MiB); the ranks agreed", .{ s.dir, s.gib, s.stagingBytes() >> 20 });
+    return events;
+}
+
+/// A follower's spill side, made before its model's pool (staging) is sized and opened at rank 0's agreement. The
+/// staging and events stay the caller's.
+pub fn followerSpill(gpa: std.mem.Allocator, io: std.Io, m: *model.Model, mo: model.Options, s: spill_tier.Settings, staging: cuda.HostBuffer, events: *[]cuda.Event) !*lanes_mod.SpillFollower {
+    if (m.kvs != null) return error.SpillWithKvShard;
+    const layout = try m.spillLayout();
+    const plan = try spill_tier.stagingPlan(s, &layout);
+    const fx = try rankExchange(gpa, io, mo, m, s, &layout);
+    events.* = try spillEvents(gpa, m, spill_tier.eventCount(plan));
+    errdefer {
+        for (events.*) |*e| e.deinit();
+        gpa.free(events.*);
+        events.* = &.{};
+    }
+    var gens = try m.spillGenerations(gpa);
+    errdefer gens.deinit(gpa);
+    const max_tokens: u32 = @intCast(if (m.request_cap > 0) m.request_cap else m.pool_cap);
+    // (no family yet: lanes.followWith attaches its kept states)
+    return lanes_mod.SpillFollower.create(gpa, io, @intCast(m.rank), fx, null, .{ .dev = .{ .m = m }, .layout = layout, .gens = gens, .settings = s, .max_tokens = max_tokens, .staging = stagingSlice(staging), .events = events.* });
+}
+
 /// A request or a start this engine refuses, in words; null: none of its own.
 pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+    if (rank_wire.explain(err)) |t| return t;
     return switch (err) {
         error.NotPortedYet => "the native DeepSeek-V4.1 engine runs tensor parallel over two GPUs or the four nodes of the 2D split: set TF_TP_WORLD=2 or 4",
         error.NoMaster, error.BadMaster => "set TF_TP_MASTER to rank 0's fabric address (rank 1: tf-dsv41-lanes MODEL CACHE 1 2 MASTER PORT KIT; ranks 1-3 of four: ... G 4 ...)",
@@ -215,6 +432,12 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.PoolNotWholeParts => "TF_DS_KV_SHARD=1: the pool (TF_DS_POOL, else the context) must be whole 4,096-position parts (two parts of 2,048-position blocks)",
         error.PartTooSmall => "TF_DS_KV_SHARD=1 cuts the pool (TF_DS_POOL) into one part a rank, and a conversation fits one part: each part must hold the window and a round's rows and two, in whole 2,048-position blocks (2,101,248 at the 1M window): raise TF_DS_POOL or lower --context",
         error.CrossesPart => "TF_DS_KV_SHARD=1: an extent that crosses a part (a placement bug): restart with TF_DS_KV_SHARD=0",
+        error.SpillWithKvShard => "the spill tier (--spill-dir/--spill-gib) does not run with TF_DS_KV_SHARD=1 yet (its owner-sharded layout is not ported): unset one of them",
+        error.SpillNeedsTwoRanks => "the spill tier runs on the TP2 pair (TF_TP_WORLD=2)",
+        error.SpillFingerprintMismatch => "the ranks' configurations differ (the log names the rank and field): start every rank from the same image, model, kit and TF_DS_* settings, with the spill tier on both (rank 1: TF_DS_SPILL_DIR/TF_DS_SPILL_GIB)",
+        error.SpillNotStarted => "rank 0 runs the spill tier (--spill-dir/--spill-gib): start this rank with it too (TF_DS_SPILL_DIR and TF_DS_SPILL_GIB, or tf-dsv41-lanes --spill-dir/--spill-gib)",
+        error.BadSpillSetting => "TF_DS_SPILL_STAGING_MIB: the spill staging cap in MiB, at least 16 (default 128)",
+        error.StagingTooSmall => "the spill staging cap (TF_DS_SPILL_STAGING_MIB) holds too few slots for this model's blocks and small state: raise it",
         else => null,
     };
 }
@@ -227,4 +450,38 @@ test "refusals name what to set" {
         try std.testing.expect(std.mem.indexOf(u8, explain(null, err).?, "TF_DS_KV_SHARD=0") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoFreeSlot).?, "TF_DS_STREAMS") != null);
     try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));
+}
+
+test "the spill tier's refusals from the environment come before anything loads, and each says what to set" {
+    const E = struct {
+        var kv: ?[]const u8 = null;
+        var world: ?[]const u8 = null;
+        var weights: ?[]const u8 = "rev-1";
+        var engram: ?[]const u8 = null;
+        fn get(name: [:0]const u8) ?[]const u8 {
+            if (std.mem.eql(u8, name, "TF_DS_ENGINE_ID")) return "engine";
+            if (std.mem.eql(u8, name, "TF_DS_RECIPE_PATCHES")) return "patches";
+            if (std.mem.eql(u8, name, "TF_DS_MODEL_REVISION")) return weights;
+            if (std.mem.eql(u8, name, "TF_DS_KV_SHARD")) return kv;
+            if (std.mem.eql(u8, name, "TF_TP_WORLD")) return world;
+            if (std.mem.eql(u8, name, "TF_DS_ENGRAM")) return engram;
+            return null;
+        }
+    };
+    try spillPreflight(E.get);
+    E.kv = "1";
+    try std.testing.expectError(error.SpillWithKvShard, spillPreflight(E.get));
+    E.kv = "0";
+    E.world = "4";
+    try std.testing.expectError(error.SpillNeedsTwoRanks, spillPreflight(E.get));
+    E.world = null;
+    E.weights = null;
+    try std.testing.expectError(error.NoWeightsId, spillPreflight(E.get));
+    E.weights = "rev-1";
+    E.engram = "/engram";
+    try std.testing.expectError(error.NoEngramId, spillPreflight(E.get));
+    for ([_]anyerror{ error.SpillWithKvShard, error.SpillNeedsTwoRanks, error.NoWeightsId, error.NoEngramId, error.SpillNotStarted, error.NoEngineId }) |err|
+        try std.testing.expect(explain(null, err) != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SpillNotStarted).?, "TF_DS_SPILL_DIR") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoWeightsId).?, "TF_DS_RANK_CACHE_SHA") != null);
 }

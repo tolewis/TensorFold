@@ -21,11 +21,16 @@ const draft = @import("draft.zig");
 const sampling = @import("sampling.zig");
 const link = @import("link.zig");
 const cuda = @import("cuda");
+const spill_tier = @import("spill_tier.zig");
 
 const be = lanes.backend;
 const Model = model.Model;
 const max_streams = model.max_streams;
 const max_rows = round.max_rows;
+
+/// The spill tier on rank 0 (the prompt cache's Tier) and on a follower, over this rank's planes (spill_tier.zig).
+pub const SpillTier = spill_tier.Leader(Model.SpillDev);
+pub const SpillFollower = spill_tier.Follower(Model.SpillDev);
 
 /// A window of the pending row and the drafter's block: the widest one the gates checked row for row.
 pub const window_rows = 6;
@@ -37,7 +42,15 @@ pub const image_piece = 32 << 10;
 pub var logits_sha = false;
 
 /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_resume = 10 };
+/// fill_resume (TF_FILL_CHUNKS' pieces) is 12, after spill's two (both ranks run one build).
+/// With the spill tier on (only then): rank_wire's frames (spill_tier: restores' agreement, guards) and the spill notes
+/// (rank 0's write-at-keep and metadata).
+pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, rank_wire = 10, spill = 11, fill_resume = 12 };
+
+comptime {
+    std.debug.assert(@intFromEnum(Kind.rank_wire) == @import("rank_wire.zig").lanes_kind);
+    std.debug.assert(@intFromEnum(Kind.spill) == spill_tier.note_kind);
+}
 
 /// A frame being written.
 pub const Wire = struct {
@@ -289,6 +302,9 @@ pub const Snap = struct {
     stale: bool = false,
     wanted: u64 = 0, // when a request first waited for the live stream that holds these rows (placeKept; 0: none)
     end: usize = 0, // the extent end of the stream that kept it (placement holds [base, end) back while room allows)
+    slot: u32 = 0, // the slot it was kept from (the spill tier's keep note: a follower reads the prompt's ids there)
+    loading: bool = false, // a restore's destination: its rows held back, not usable until every rank installed it
+    restored: bool = false, // read back from the spill tier
 };
 
 /// Kept states this long or longer say so in the log when they go stale (their prompts then run again from 0).
@@ -299,7 +315,7 @@ fn noteStale(sn: *const Snap, why: []const u8) void {
 }
 
 /// A prompt pass between its pieces: the chunk it runs next and what its chunk loop reads.
-const Fill = struct { s: *const lanes.Stream, slot: usize, len: usize, replay: usize, last_end: usize, start: usize, head: bool = false };
+const Fill = struct { s: *const lanes.Stream, slot: usize, len: usize, replay: usize, last_end: usize, start: usize, head: bool = false, base: usize = 0, restored: bool = false };
 
 /// How long a request waits for the live stream that holds the kept state it resumes from to end (then it resumes
 /// in place and every kept state stays) before other kept states give their room for a copy of it.
@@ -331,6 +347,7 @@ pub const Lanes = struct {
     next_snap: u64 = 1,
     fill: ?Fill = null, // the prompt pass that runs in pieces between rounds, from its next chunk
     paused: ?Fill = null, // the pass a short prompt cut into (lanes' cut_in), resumed by its next piece
+    spill: ?*SpillTier = null, // --spill-dir/--spill-gib: the spill tier (native.zig opens it; null: off, nothing changes)
 
     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
@@ -478,6 +495,7 @@ pub const Lanes = struct {
                 try self.wire.int(self.gpa, u64, f.replay);
                 try self.flush();
             }
+            if (self.spill) |t| t.bump(f.base + start, f.base + start + n);
             f.head = try m.fillChunk(seq[0 .. start + n], start, n, f.replay);
             f.start += n;
             if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
@@ -496,6 +514,8 @@ pub const Lanes = struct {
         self.fill = null;
         if (self.prof) |*p| p.prefills += 1;
         if (!done.head) return error.NoPromptLogits;
+        // a state read back from disk: the drafter's rings were rebuilt by the replay before the first draft
+        if (self.spill != null and m.drafting() and done.restored) try m.spillCheckResumed(done.slot, done.len);
         const logits = try m.promptLogitsHost();
         if (logits_sha) {
             var dg: [32]u8 = undefined;
@@ -535,6 +555,7 @@ pub const Lanes = struct {
         // refused where it is used (prompt.kvSourceUpdate, round.Rows.ownerOf: CrossesPart), never written past.
         if (self.streams.fetchRemove(s)) |old| self.used[old.value.slot] = false;
         const slot = std.mem.indexOfScalar(bool, self.used[0..self.m.streams], false) orelse return error.NoFreeSlot;
+        if (self.spill) |t| t.bumpSlot(slot);
         var taken: [max_streams][2]usize = undefined;
         var nt: usize = 0;
         var it = self.streams.valueIterator();
@@ -645,7 +666,10 @@ pub const Lanes = struct {
                 try self.wire.int(gpa, u64, sn.at);
                 try self.flush();
             }
-            if (base != sn.base) try m.copyExtent(sn.base, base, sn.at);
+            if (base != sn.base) {
+                if (self.spill) |t| t.bump(base, base + sn.at);
+                try m.copyExtent(sn.base, base, sn.at);
+            }
             try m.snapCopy(slot, sn.buf.ptr, false);
             start = sn.at;
             s.cached = @intCast(sn.at);
@@ -653,7 +677,7 @@ pub const Lanes = struct {
         // where this pass keeps states: the cache's marks and its last chunk end before the replay (the served lane's
         // kept prompt), each at the chunk end at or before it
         const last_end = @min(replay, len - 1) / model.chunk_rows * model.chunk_rows;
-        self.fill = .{ .s = s, .slot = slot, .len = len, .replay = replay, .last_end = last_end, .start = start };
+        self.fill = .{ .s = s, .slot = slot, .len = len, .replay = replay, .last_end = last_end, .start = start, .base = base, .restored = if (kept) |sn| sn.restored else false };
     }
 
     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
@@ -710,6 +734,7 @@ pub const Lanes = struct {
             try self.flush();
         }
         const t1 = m.now();
+        if (self.spill) |t| for (wins[0..windows.len]) |w| t.bump(w.base + w.start, w.base + w.start + w.ids.len);
         const rows = try self.built.build(gpa, &self.seqs, wins[0..windows.len]);
         try m.verify(rows, self.built.absorb[0..windows.len]);
         const t2 = m.now();
@@ -830,7 +855,7 @@ pub const Lanes = struct {
     /// prompt's replay (the rows before it ran the encoder layers alone, as a fresh pass of this prompt runs them).
     fn usable(self: *const Lanes, sn: *const Snap, len: usize) bool {
         if (std.mem.indexOfScalar(*Snap, self.snaps.items, @constCast(sn)) == null) return false;
-        return !sn.stale and sn.at > 0 and sn.at < len and sn.at % model.chunk_rows == 0 and sn.at <= len -| self.m.cfg.window;
+        return !sn.stale and !sn.loading and sn.at > 0 and sn.at < len and sn.at % model.chunk_rows == 0 and sn.at <= len -| self.m.cfg.window;
     }
 
     /// The first extent that fits around the live streams and the kept states. Kept states give their room oldest
@@ -864,9 +889,10 @@ pub const Lanes = struct {
             }
             if (got) |b| return b;
             const victim = for (self.snaps.items) |sn| {
-                if (!sn.stale and sn != source and !clashes(live, sn.base, sn.base + sn.at)) break sn;
+                if (!sn.stale and !sn.loading and sn != source and !clashes(live, sn.base, sn.base + sn.at)) break sn;
             } else if (source) |sn| (if (!sn.stale and !clashes(live, sn.base, sn.base + sn.at)) sn else return error.ContextFull) else return error.ContextFull;
             noteStale(victim, "a placement needed its room (oldest first)");
+            if (self.spill) |t| t.guardSnap(victim.id, 0); // its unpublished write stages or cancels before the rows go
             victim.stale = true;
         }
     }
@@ -887,9 +913,18 @@ pub const Lanes = struct {
     /// Kept states with rows in [lo, hi) go stale (a stream writes there), `except` aside.
     fn staleOver(self: *Lanes, lo: usize, hi: usize, except: ?*Snap) void {
         for (self.snaps.items) |sn| if (sn != except and sn.base < hi and lo < sn.base + sn.at) {
-            if (!sn.stale) noteStale(sn, "a stream writes over its rows");
+            if (!sn.stale) {
+                noteStale(sn, "a stream writes over its rows");
+                if (self.spill) |t| t.guardSnap(sn.id, @intCast(@max(lo, sn.base) - sn.base));
+            }
             sn.stale = true;
         };
+    }
+
+    /// The prompt cache's Snapshots.usable (with the spill tier): a stale, loading or ineligible state is passed over
+    /// before lengths are compared, so it never shadows a usable state or a durable point.
+    pub fn usableFn(ptr: *anyopaque, saved: *anyopaque, len: u32) bool {
+        return of(ptr).usable(@ptrCast(@alignCast(saved)), len);
     }
 
     /// The prompt cache's Snapshots functions (native.zig hands them to the CUDA host).
@@ -906,7 +941,7 @@ pub const Lanes = struct {
         if (at == 0 or at % model.chunk_rows != 0 or at > s.prompt_len -| self.m.cfg.window) return error.NotAChunkEnd;
         const sn = try self.gpa.create(Snap);
         errdefer self.gpa.destroy(sn);
-        sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .end = l.end, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()) };
+        sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .end = l.end, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()), .slot = @intCast(l.slot) };
         errdefer sn.buf.free();
         try self.snaps.append(self.gpa, sn);
         self.next_snap += 1;
@@ -928,12 +963,92 @@ pub const Lanes = struct {
         const sn: *Snap = @ptrCast(@alignCast(saved));
         const i = std.mem.indexOfScalar(*Snap, self.snaps.items, sn) orelse return;
         _ = self.snaps.orderedRemove(i);
+        if (self.spill) |t| t.dropSnap(sn.id); // (rule b: a pending small-state capture of its buffer done first)
         if (self.begin(.snap_drop) catch false) {
             self.wire.int(self.gpa, u64, sn.id) catch {};
             self.flush() catch |err| std.log.err("dsv41: rank 1 kept a dropped prompt state: {s}", .{@errorName(err)});
         }
         sn.buf.free();
         self.gpa.destroy(sn);
+    }
+
+    // -- the spill tier's family and wire (spill_tier.Family, spill_tier.Wire) ---------------------------------------
+
+    pub fn spillFamily(self: *Lanes) spill_tier.Family {
+        return .{ .ptr = self, .reserve = spillReserve, .install = spillInstall, .discard = spillDiscard, .info = spillInfo };
+    }
+
+    pub fn spillWire(self: *Lanes) spill_tier.Wire {
+        return .{ .ctx = self, .frame = spillFrame, .links = self.m.followers() };
+    }
+
+    /// A restore's destination: an extent placed like a stream's (kept states give their room oldest first, guarded),
+    /// a fresh Snap holding it back (loading: not usable until every rank installed it) and its buffer. `room`: the
+    /// waiting prompt's length; when an extent of it and a growth margin fits without taking any kept state's room,
+    /// the Snap's extent (`end`) holds that much, so the resume runs in place (no copyExtent of the restored rows).
+    fn spillReserve(ptr: *anyopaque, at: usize, room: usize) anyerror!spill_tier.Dest {
+        const self = of(ptr);
+        var taken: [max_streams][2]usize = undefined;
+        var nt: usize = 0;
+        var it = self.streams.valueIterator();
+        while (it.next()) |l| {
+            taken[nt] = .{ l.base, l.end };
+            nt += 1;
+        }
+        const want = @min(std.mem.alignForward(usize, @max(room, at) + growth_rows, model.chunk_rows), self.m.pool_cap);
+        const roomy = if (want > at) try self.placeFree(taken[0..nt], want) else null;
+        const base = roomy orelse try self.placeKept(taken[0..nt], at, null);
+        self.staleOver(base, base + at, null);
+        const sn = try self.gpa.create(Snap);
+        errdefer self.gpa.destroy(sn);
+        sn.* = .{ .id = self.next_snap, .at = at, .base = base, .end = base + (if (roomy != null) want else at), .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()), .loading = true };
+        errdefer sn.buf.free();
+        try self.snaps.append(self.gpa, sn);
+        self.next_snap += 1;
+        return .{ .saved = sn, .id = sn.id, .base = base, .buf = sn.buf.ptr };
+    }
+
+    /// An extent of `size` around the live streams and the kept states' rows (placeSoft's rules: their held extents
+    /// first), staling nobody: null when none.
+    fn placeFree(self: *Lanes, live: []const [2]usize, size: usize) !?usize {
+        var kept: std.ArrayList([3]usize) = .empty;
+        defer kept.deinit(self.gpa);
+        for (self.snaps.items) |sn| if (!sn.stale) try kept.append(self.gpa, .{ sn.base, sn.at, sn.end });
+        return placeSoft(self.gpa, live, kept.items, size, self.m.pool_cap);
+    }
+
+    fn spillInstall(_: *anyopaque, saved: *anyopaque) void {
+        const sn: *Snap = @ptrCast(@alignCast(saved));
+        sn.loading = false;
+        sn.restored = true;
+    }
+
+    /// A restore that did not commit: its Snap goes (the followers drop theirs with the abort, no snap_drop).
+    fn spillDiscard(ptr: *anyopaque, saved: *anyopaque) void {
+        const self = of(ptr);
+        const sn: *Snap = @ptrCast(@alignCast(saved));
+        if (std.mem.indexOfScalar(*Snap, self.snaps.items, sn)) |i| _ = self.snaps.orderedRemove(i);
+        sn.buf.free();
+        self.gpa.destroy(sn);
+    }
+
+    fn spillInfo(_: *anyopaque, saved: *anyopaque) spill_tier.SnapInfo {
+        const sn: *Snap = @ptrCast(@alignCast(saved));
+        return .{ .id = sn.id, .base = sn.base, .at = sn.at, .buf = sn.buf.ptr, .slot = sn.slot };
+    }
+
+    /// A spill frame (Kind rank_wire or spill) to every follower, in the ordered stream.
+    pub fn spillFrame(ctx: *anyopaque, kind: u8, sub: []const u8) anyerror!void {
+        const self = of(ctx);
+        const k: Kind = switch (kind) {
+            10 => .rank_wire,
+            11 => .spill,
+            else => return error.BadFrame,
+        };
+        if (try self.begin(k)) {
+            try self.wire.buf.appendSlice(self.gpa, sub);
+            try self.flush();
+        }
     }
 
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
@@ -971,6 +1086,69 @@ pub var follow_prof: struct { rounds: u64 = 0, enqueue: u64 = 0, forward: u64 = 
 
 /// Rank 1 (each of ranks 1-3 on the four-node split): the primitives rank 0 sends, run in order until it says done.
 pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+    return followWith(gpa, m, null);
+}
+
+/// A follower's kept states as its spill side sees them (spill_tier.FollowerFamily).
+const FollowKept = struct {
+    gpa: std.mem.Allocator,
+    m: *Model,
+    kept: *std.AutoHashMapUnmanaged(u64, cuda.DeviceBuffer),
+    loading: std.AutoHashMapUnmanaged(u64, cuda.DeviceBuffer) = .empty, // restores' destinations, not yet installed
+    seqs: *[max_streams]std.ArrayList(i32),
+
+    fn family(f: *FollowKept) spill_tier.FollowerFamily {
+        return .{ .ptr = f, .reserve = reserve, .install = install, .discard = discard, .buf = buf, .ids = ids };
+    }
+
+    fn of(p: *anyopaque) *FollowKept {
+        return @ptrCast(@alignCast(p));
+    }
+
+    fn reserve(p: *anyopaque, id: u64) anyerror!u64 {
+        const f = of(p);
+        if (f.kept.contains(id) or f.loading.contains(id)) return error.SnapshotExists;
+        try f.loading.ensureUnusedCapacity(f.gpa, 1);
+        const b = try cuda.DeviceBuffer.alloc(f.m.ctx.d, f.m.snapBytes());
+        f.loading.putAssumeCapacity(id, b);
+        return b.ptr;
+    }
+
+    fn install(p: *anyopaque, id: u64) anyerror!void {
+        const f = of(p);
+        const kv = f.loading.fetchRemove(id) orelse return error.UnknownSnapshot;
+        f.kept.put(f.gpa, id, kv.value) catch |e| {
+            var b = kv.value;
+            b.free();
+            return e;
+        };
+    }
+
+    fn discard(p: *anyopaque, id: u64) void {
+        const f = of(p);
+        var kv = f.loading.fetchRemove(id) orelse return;
+        kv.value.free();
+    }
+
+    fn buf(p: *anyopaque, id: u64) ?u64 {
+        return if (of(p).kept.get(id)) |b| b.ptr else null;
+    }
+
+    fn ids(p: *anyopaque, slot: u32) []const i32 {
+        const f = of(p);
+        return if (slot < max_streams) f.seqs[slot].items else &.{};
+    }
+
+    fn deinit(f: *FollowKept) void {
+        var it = f.loading.valueIterator();
+        while (it.next()) |b| b.free();
+        f.loading.deinit(f.gpa);
+    }
+};
+
+/// follow, with this rank's spill side when the tier is on (`spill`: made before the model's pool, its store opened at
+/// the startup agreement rank 0 starts; the caller destroys it after this returns).
+pub fn followWith(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower) !void {
     const peer = m.peer();
     const buf = try gpa.alloc(u8, (m.pool_cap + 1) * 4 + (1 << 16));
     defer gpa.free(buf);
@@ -989,7 +1167,19 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
         while (ki.next()) |b| b.free();
         kept.deinit(gpa);
     }
+    var fk: FollowKept = .{ .gpa = gpa, .m = m, .kept = &kept, .seqs = &seqs };
+    defer fk.deinit();
+    if (spill) |sd| sd.attach(fk.family());
+    // on every exit, while fk and kept are alive: open restores ended (their buffers discarded through fk), the
+    // family let go, then every copy still on the device waited for (no copy may read a buffer the defers above free)
+    defer if (spill) |sd| {
+        sd.detach();
+        sd.quiesce();
+    };
+    var fill_base: usize = 0;
     while (true) {
+        // with spill writes or restores pending, they progress while rank 0 sends nothing (2 ms polls)
+        if (spill) |sd| while (sd.busy() and !try peer.readable(2 * std.time.ns_per_ms)) sd.service(std.time.ns_per_ms);
         // the next primitive, polled for 20 ms before the read blocks (rank 0 sends it a fraction of a millisecond
         // after this rank's GPU goes idle in a decode; a sleeping thread would add its core's wake-up to every frame)
         var r: Reader = .{ .b = try peer.recvSpin(buf, 20 * std.time.ns_per_ms) };
@@ -1003,13 +1193,16 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
             7 => .snap_drop,
             8 => .fill_images,
             9 => .done,
-            10 => .fill_resume,
+            10 => .rank_wire,
+            11 => .spill,
+            12 => .fill_resume,
             else => return error.BadFrame,
         };
         if (try r.int(u64) != step) return error.OutOfStep;
         step += 1;
+        if (spill) |sd| sd.service(std.time.ns_per_ms); // (rank 0 pumps between its primitives alike)
         // a chunk's read-ahead of the next is done before anything but that chunk (a prompt's ids may change)
-        if (kind != .fill_chunk and kind != .snap_save and kind != .snap_restore and kind != .fill_images) {
+        if (kind != .fill_chunk and kind != .snap_save and kind != .snap_restore and kind != .fill_images and kind != .rank_wire and kind != .spill) {
             m.joinAhead();
             m.fill_seq = &.{};
         }
@@ -1020,6 +1213,8 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 if (slot >= max_streams) return error.BadSlot;
                 img_rows.clearRetainingCapacity();
                 try r.ids(gpa, &seqs[slot]);
+                fill_base = @intCast(base);
+                if (spill) |sd| sd.bumpSlot(slot);
                 m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
                 m.fill_seq = seqs[slot].items;
             },
@@ -1027,6 +1222,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 slot = try r.int(u32);
                 const base = try r.int(u64);
                 if (slot >= max_streams) return error.BadSlot;
+                fill_base = @intCast(base); // the paused pass's extent, for the spill tier's bumps (not a new prompt: no bumpSlot)
                 m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
                 m.fill_seq = seqs[slot].items;
             },
@@ -1036,6 +1232,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 const replay: usize = @intCast(try r.int(u64));
                 if (start + n > seqs[slot].items.len) return error.BadChunk;
                 if (m.fill_seq.len == 0) m.fill_seq = seqs[slot].items; // a piece after a round: the read-ahead again
+                if (spill) |sd| sd.bump(fill_base + start, fill_base + start + n);
                 _ = m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay) catch |err| refused(err);
             },
             .verify => {
@@ -1052,6 +1249,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                     wins[k] = .{ .slot = s, .base = base, .end = end, .start = start, .absorb = absorb, .ids = win_ids[k].items };
                 }
                 const rows = try built.build(gpa, &seqs, wins[0..nw]);
+                if (spill) |sd| for (wins[0..nw]) |w| sd.bump(w.base + w.start, w.base + w.start + w.ids.len);
                 m.verify(rows, built.absorb[0..nw]) catch |err| refused(err);
                 if (m.prof) {
                     follow_prof.rounds += 1;
@@ -1114,17 +1312,29 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 const to: usize = @intCast(try r.int(u64));
                 const at: usize = @intCast(try r.int(u64));
                 const b = kept.get(id) orelse return error.UnknownSnapshot; // rank 0 restores only states both ranks keep
-                if (from != to) m.copyExtent(from, to, at) catch |err| refused(err);
+                if (from != to) {
+                    if (spill) |sd| sd.bump(to, to + at);
+                    m.copyExtent(from, to, at) catch |err| refused(err);
+                }
                 m.snapCopy(s, b.ptr, false) catch |err| refused(err);
             },
             .snap_drop => {
                 const id = try r.int(u64);
+                if (spill) |sd| sd.dropSnap(id); // its write guarded, its small-state capture done, before the free
                 if (kept.fetchRemove(id)) |kv| {
                     var b = kv.value;
                     b.free();
                 }
             },
-            .done => return,
+            .rank_wire => try (spill orelse return error.SpillNotStarted).wireFrame(peer, r.rest()),
+            .spill => try (spill orelse return error.SpillNotStarted).note(r.rest()),
+            .done => {
+                if (spill) |sd| {
+                    const left = sd.flush(sd.flush_ns);
+                    if (left > 0) std.log.info("dsv41 spill: {d} kept states were still unpublished at the flush deadline", .{left});
+                }
+                return;
+            },
         }
     }
 }
@@ -1247,4 +1457,55 @@ test "a prompt with images does not cut in between another pass's pieces" {
     ln.fill = .{ .s = &long, .slot = 0, .len = 16, .replay = 0, .last_end = 0, .start = 8 };
     try std.testing.expectError(error.FillBusy, ln.prefillPart(&short, 1));
     try std.testing.expect(ln.paused == null and ln.fill.?.s == &long); // the pass in pieces stays as it was
+}
+
+test "a restore's destination is held back from placement, never a victim and never usable until installed" {
+    const c = model.chunk_rows;
+    var m: Model = undefined;
+    m.pool_cap = 16 * c;
+    m.cfg.window = 128;
+    const gpa = std.testing.allocator;
+    var ln: Lanes = .{ .gpa = gpa, .m = &m, .peer = null };
+    defer ln.snaps.deinit(gpa);
+    // a restore reading into [0, 4c), an ordinary kept state at [4c, 8c)
+    var loading: Snap = .{ .id = 1, .at = 4 * c, .base = 0, .end = 4 * c, .buf = undefined, .loading = true };
+    var kept: Snap = .{ .id = 2, .at = 4 * c, .base = 4 * c, .end = 8 * c, .buf = undefined };
+    try ln.snaps.append(gpa, &loading);
+    try ln.snaps.append(gpa, &kept);
+    try std.testing.expect(!ln.usable(&loading, 8 * c)); // not until every rank installed it
+    try std.testing.expect(ln.usable(&kept, 9 * c));
+    // a placement that needs room past the free 8 chunks takes the ordinary kept state's, not the destination's
+    const base = try ln.placeKept(&.{}, 12 * c, null);
+    try std.testing.expect(kept.stale and !loading.stale);
+    try std.testing.expectEqual(4 * c, base);
+    // with nothing else to give, the destination still holds: the pool is full for this request
+    kept.stale = false;
+    kept.base = 4 * c;
+    try std.testing.expectError(error.ContextFull, ln.placeKept(&.{.{ 4 * c, 16 * c }}, 4 * c, null));
+    loading.loading = false;
+    loading.restored = true;
+    try std.testing.expect(ln.usable(&loading, 8 * c));
+    // with the tier off nothing spill-related runs: the frame kinds before it keep their values
+    try std.testing.expectEqual(@as(u8, 9), @intFromEnum(Kind.done));
+    try std.testing.expectEqual(@as(u8, 10), @intFromEnum(Kind.rank_wire));
+    try std.testing.expectEqual(@as(u8, 11), @intFromEnum(Kind.spill));
+    try std.testing.expect(ln.spill == null);
+}
+
+test "a restore's destination holds the waiting prompt's room past its rows while that fits clear of the others" {
+    const c = model.chunk_rows;
+    var m: Model = undefined;
+    m.pool_cap = 64 * c;
+    m.cfg.window = 128;
+    const gpa = std.testing.allocator;
+    var ln: Lanes = .{ .gpa = gpa, .m = &m, .peer = null };
+    defer ln.snaps.deinit(gpa);
+    var kept: Snap = .{ .id = 1, .at = 4 * c, .base = 0, .end = 5 * c, .buf = undefined };
+    try ln.snaps.append(gpa, &kept);
+    // clear of the kept state's held extent and its growth: placed past it, nothing staled
+    try std.testing.expectEqual(@as(?usize, 5 * c + growth_rows), try ln.placeFree(&.{}, 8 * c));
+    try std.testing.expect(!kept.stale);
+    // no room for the hint anywhere: null (spillReserve then places the rows alone, as placeKept does)
+    try std.testing.expectEqual(@as(?usize, null), try ln.placeFree(&.{.{ 4 * c, 64 * c }}, 8 * c));
+    try std.testing.expect(!kept.stale);
 }

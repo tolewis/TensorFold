@@ -8,12 +8,35 @@
 //! the served server's) against the served reply's: the drafted, concurrent reply must be the served one. One JSON
 //! line a request, then the summary. FILE: zrec_lanereq.py's requests (prompt ids, max_tokens, sampling, expect_sha).
 //! KIT_DIR: a gate dir's aot/, cubins/, RoPE tables (as many rows as the pool) and engram.json.
+//! The spill tier (GPU validation of keep, evict, restore and restart without the HTTP server): every rank takes
+//! --spill-dir DIR --spill-gib G [--spill-min-free-gib F] [--spill-min-tokens T] [--spill-quota Q]
+//! [--spill-staging-mib M] (else TF_DS_SPILL_DIR, TF_DS_SPILL_GIB, ... and TF_SPILL_TURNS / TF_SPILL_FLUSH_MS; the
+//! recipe's TF_DS_ENGINE_ID and TF_DS_RECIPE_PATCHES must be set on every rank). Rank 0 then runs the prompt cache
+//! (--prompt-cache-gib G, default 4) with the tier as the server's lane host would: each request probes it, restores
+//! a durable point longer than memory, resumes and keeps at its chunk ends (written at keep). A request's
+//! "drop_memory": true first waits for the tier's writes, then drops every memory state, so its hit must come from
+//! disk; a second run over the same --spill-dir after a restart restores what the first one published.
 const std = @import("std");
 const cuda = @import("cuda");
 const dsv41 = @import("dsv41");
 const lanes = @import("lanes");
 
-const usage = "usage: tf-dsv41-lanes MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT KIT_DIR --requests FILE [--parallel N] [--pool P] [--drafts 0|1] [--arena-gib G] [--engram DIR --token-map FILE] [--rdma DEVICES --rdma-kernels FATBIN] [--fix-k K] [--round-rows R] [--streams S]\n";
+const usage = "usage: tf-dsv41-lanes MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT KIT_DIR --requests FILE [--parallel N] [--pool P] [--drafts 0|1] [--arena-gib G] [--engram DIR --token-map FILE] [--rdma DEVICES --rdma-kernels FATBIN] [--fix-k K] [--round-rows R] [--streams S] [--spill-dir DIR --spill-gib G [--spill-min-free-gib F] [--spill-min-tokens T] [--spill-quota Q] [--spill-staging-mib M] [--prompt-cache-gib G]]\n";
+
+const pcache = dsv41.spill_tier.prompt_cache;
+
+/// The spill switches given as flags (Settings.follower reads them, else the environment).
+var spill_flags: [6]?[]const u8 = @splat(null);
+const spill_names = [_][]const u8{ "--spill-dir", "--spill-gib", "--spill-min-free-gib", "--spill-min-tokens", "--spill-quota", "--spill-staging-mib" };
+
+fn spillFlag(name: []const u8) ?[]const u8 {
+    for (spill_names, spill_flags) |n, v| if (std.mem.eql(u8, n, name)) return v;
+    return null;
+}
+
+fn spillEnv(name: [:0]const u8) ?[]const u8 {
+    return std.mem.span(std.c.getenv(name) orelse return null);
+}
 
 const Request = struct {
     name: []const u8 = "",
@@ -25,6 +48,7 @@ const Request = struct {
     top_p: f64 = 0.95,
     expect_sha: ?[]const u8 = null,
     images: []const ImageRows = &.{}, // a vision request: its spans' rows ready (zrec_v3req.py from a recording)
+    drop_memory: bool = false, // with the spill tier: its writes drained, then every memory state dropped first
 };
 
 /// An image span of a request's prompt and its rows: bf16 [tokens, hidden] from row `row` of `rows_file`.
@@ -37,7 +61,33 @@ const Job = struct {
     stream: lanes.Stream,
     began: std.Io.Timestamp,
     done: bool = false,
+    // with the prompt cache (the spill tier on): the state it resumed, the pass's lineage, where it keeps
+    store: ?*pcache.Store = null,
+    entry: ?*pcache.Entry = null,
+    lineage: []pcache.Fork = &.{},
+    restored: u32 = 0,
 };
+
+/// The prompt cache's keep at a chunk end the pass reached (Stream.reuse.hook), with the lane host's lineage rule.
+fn keepHook(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
+    const j: *Job = @ptrCast(@alignCast(ptr));
+    const st = j.store orelse return;
+    const e = if (s.reuse_failed) null else j.entry;
+    _ = st.keepWith(j.req.prompt, at, s, &.{}, .{ .lineage = j.lineage, .parent = if (e) |x| x.point else null, .fork = if (e) |x| x.at else 0 });
+}
+
+/// The tier's writes drained (bounded), then every memory state forgotten: the next hit comes from disk.
+fn dropMemory(io: std.Io, st: *pcache.Store) void {
+    var k: usize = 0;
+    while (st.busy() and k < 60_000) : (k += 1) {
+        st.pump(5 * std.time.ns_per_ms);
+        std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
+    }
+    while (st.entries.items.len > 0) {
+        const e = st.entries.items[0];
+        st.forget(e.tokens, e.at);
+    }
+}
 
 pub fn main(init: std.process.Init) !u8 {
     const a = init.arena.allocator();
@@ -67,6 +117,7 @@ pub fn main(init: std.process.Init) !u8 {
     var phases = false; // --profile 2: also the rounds' GPU time by phase (eager rounds)
     var serial = false; // --serial 1: every stream without drafts (one row a round)
     var fix_k: ?usize = null; // --fix-k K: every drafted stream verifies K drafts a round (a cost measurement)
+    var cache_gib: f64 = 4; // --prompt-cache-gib: rank 0's prompt cache with the spill tier
     var ai: usize = 8;
     while (ai + 1 < args.len) : (ai += 2) {
         const key = args[ai];
@@ -114,7 +165,29 @@ pub fn main(init: std.process.Init) !u8 {
             o.vision_bias = val;
         } else if (std.mem.eql(u8, key, "--logits-sha")) {
             dsv41.lanes.logits_sha = !std.mem.eql(u8, val, "0");
-        } else return error.BadArgument;
+        } else if (std.mem.eql(u8, key, "--prompt-cache-gib")) {
+            cache_gib = try std.fmt.parseFloat(f64, val);
+        } else blk: {
+            for (spill_names, &spill_flags) |n, *v| if (std.mem.eql(u8, n, key)) {
+                v.* = val;
+                break :blk;
+            };
+            return error.BadArgument;
+        }
+    }
+    const spill = try dsv41.spill_tier.Settings.follower(spillFlag, spillEnv);
+    // the spill tier's refusals from the arguments and environment alone, before the weights load
+    if (spill != null) {
+        const pre: anyerror!void = if (o.world != 2)
+            error.SpillNeedsTwoRanks
+        else if (o.engram_dir != null and (spillEnv("TF_DS_ENGRAM_REVISION") orelse @as([]const u8, "")).len == 0)
+            error.NoEngramId // (--engram)
+        else
+            dsv41.native.spillPreflight(spillEnv);
+        pre catch |e| {
+            if (dsv41.native.explain(null, e)) |t| std.log.err("{s}", .{t});
+            return e;
+        };
     }
     const par = parallel orelse o.streams;
     if (par == 0 or par > o.streams or o.streams > dsv41.model.max_streams) return error.BadArgument;
@@ -128,6 +201,9 @@ pub fn main(init: std.process.Init) !u8 {
     defer driver.close();
     var ctx = try cuda.Context.init(&driver, 0);
     defer ctx.deinit();
+    // the spill tier's staging, before the pool
+    var staging: ?cuda.HostBuffer = if (spill) |sp| try dsv41.native.spillStaging(&ctx, sp) else null;
+    defer if (staging) |*b| b.free();
     const t0 = std.Io.Timestamp.now(io, .awake);
     const m = try dsv41.model.Model.open(gpa, io, &ctx, o);
     defer m.close();
@@ -159,10 +235,24 @@ pub fn main(init: std.process.Init) !u8 {
             }
             w.flush() catch {};
         };
-        dsv41.lanes.follow(gpa, m) catch |err| {
+        var events: []cuda.Event = &.{};
+        defer {
+            for (events) |*e| e.deinit();
+            if (events.len > 0) gpa.free(events);
+        }
+        const side: ?*dsv41.lanes.SpillFollower = if (spill) |sp| try dsv41.native.followerSpill(gpa, io, m, o, sp, staging.?, &events) else null;
+        defer if (side) |sd| sd.destroy();
+        dsv41.lanes.followWith(gpa, m, side) catch |err| {
             try w.print("{{\"rank\": {d}, \"follow\": \"{s}\"}}\n", .{ o.rank, @errorName(err) });
             try w.flush();
+            if (dsv41.native.explain(null, err)) |t| std.log.err("{s}", .{t});
             return 1;
+        };
+        if (side) |sd| if (sd.side == null) std.log.warn("dsv41 spill: this rank was started with the spill tier but rank 0 never agreed one (rank 0 runs without --spill-dir/--spill-gib?): its staging went unused", .{});
+        if (side) |sd| if (sd.side) |s| {
+            s.refresh();
+            const c = s.cached;
+            try w.print("{{\"rank\": {d}, \"spill\": {{\"points\": {d}, \"committed\": {d}, \"cancelled\": {d}, \"failed\": {d}, \"reads\": {d}, \"read_failed\": {d}, \"skipped\": {d}}}}}\n", .{ o.rank, c.points, c.writes_committed, c.writes_cancelled, c.writes_failed, c.reads, c.read_failed, sd.skipped });
         };
         try w.print("{{\"rank\": {d}, \"followed\": true}}\n", .{o.rank});
         try w.flush();
@@ -176,6 +266,31 @@ pub fn main(init: std.process.Init) !u8 {
     var ln = dsv41.lanes.Lanes.init(gpa, m);
     defer ln.deinit();
     ln.fix_k = fix_k;
+    // the spill tier and the prompt cache over it (the server's wiring: native/cuda.zig openWith)
+    var events: []cuda.Event = &.{};
+    defer {
+        for (events) |*e| e.deinit();
+        if (events.len > 0) gpa.free(events);
+    }
+    var snap_vt: pcache.Snapshots.VTable = undefined;
+    var store_v: pcache.Store = undefined;
+    var store: ?*pcache.Store = null;
+    defer if (store) |st| {
+        _ = st.flush(@as(u64, spill.?.flush_ms) * std.time.ns_per_ms);
+        st.deinit();
+        if (ln.spill) |t| t.destroy();
+        ln.spill = null;
+    };
+    if (spill) |sp| {
+        events = try dsv41.native.openSpill(gpa, io, m, &ln, o, sp, staging.?);
+        const L = dsv41.lanes.Lanes;
+        snap_vt = .{ .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .usable = L.usableFn };
+        store_v = pcache.Store.init(gpa, .{ .ptr = &ln, .vtable = &snap_vt }, .{ .grid = dsv41.model.chunk_rows, .window = @intCast(m.cfg.window) }, @intFromFloat(cache_gib * (1 << 30)));
+        var seed: [4]u8 = undefined;
+        io.random(&seed);
+        store_v.setTier(ln.spill.?.tier(), std.mem.readInt(u32, &seed, .little));
+        store = &store_v;
+    }
     if (profile) {
         ln.prof = .{};
         m.prof = true;
@@ -203,7 +318,25 @@ pub fn main(init: std.process.Init) !u8 {
         while (admitted < reqs.len and core.activeCount() < par) {
             const r = &reqs[admitted];
             const j = &jobs[admitted];
-            j.* = .{ .req = r, .index = admitted, .proposer = try lanes.SuffixLookup.init(gpa, .{ .min_match = 4 }), .stream = undefined, .began = std.Io.Timestamp.now(io, .awake) };
+            j.* = .{ .req = r, .index = admitted, .proposer = try lanes.SuffixLookup.init(gpa, .{ .min_match = 4 }), .stream = undefined, .began = std.Io.Timestamp.now(io, .awake), .store = store };
+            var reuse: lanes.stream.Reuse = .{};
+            if (store) |st| {
+                if (r.drop_memory) dropMemory(io, st);
+                // a durable point longer than memory: restored first (the lane host parks the request meanwhile)
+                const pr = st.probe(r.prompt, &.{});
+                if (pr.durable) |p| if (st.restoreBegin(p, r.prompt)) |rs| {
+                    var got = st.restorePoll(rs, 40 * std.time.ns_per_ms);
+                    while (got == .pending) : (got = st.restorePoll(rs, 40 * std.time.ns_per_ms)) {
+                        if (core.live.items.len > 0) try core.step();
+                    }
+                    if (got == .adopted) j.restored = p.at;
+                    try w.print("{{\"rank\": 0, \"request\": {d}, \"restore\": \"{s}\", \"at\": {d}}}\n", .{ admitted, @tagName(got), p.at });
+                } else |err| try w.print("{{\"rank\": 0, \"request\": {d}, \"restore_refused\": \"{s}\"}}\n", .{ admitted, @errorName(err) });
+                const look = try st.lookup(a, r.prompt, @intCast(r.prompt.len), &.{}, &.{});
+                j.entry = look.entry;
+                j.lineage = try st.passLineage(look.entry);
+                reuse = .{ .saved = if (look.entry) |e| e.saved else null, .at = if (look.entry) |e| e.at else 0, .marks = look.marks, .hook = .{ .ptr = j, .at = keepHook } };
+            }
             j.stream = try lanes.Stream.init(gpa, .{
                 .id = r.name,
                 .prompt = r.prompt,
@@ -213,6 +346,7 @@ pub fn main(init: std.process.Init) !u8 {
                 .sampling = if (r.temperature > 0) .{ .seed = r.seed orelse 0, .temperature = r.temperature, .top_k = r.top_k, .top_p = r.top_p } else null,
                 .drafts = !serial,
                 .proposer = j.proposer.proposer(),
+                .reuse = reuse,
             });
             admitted += 1;
             core.addStream(&j.stream) catch |err| {
@@ -220,7 +354,8 @@ pub fn main(init: std.process.Init) !u8 {
                 try w.flush();
                 return 1;
             };
-            try w.print("{{\"rank\": 0, \"request\": {d}, \"name\": \"{s}\", \"prompt_tokens\": {d}, \"prefill_s\": {d:.2}}}\n", .{ j.index, r.name, r.prompt.len, seconds(j.began, io) });
+            if (store) |st| if (j.entry) |e| st.resumed(e, r.prompt, !j.stream.reuse_failed);
+            try w.print("{{\"rank\": 0, \"request\": {d}, \"name\": \"{s}\", \"prompt_tokens\": {d}, \"cached\": {d}, \"restored\": {d}, \"prefill_s\": {d:.2}}}\n", .{ j.index, r.name, r.prompt.len, j.stream.cached, j.restored, seconds(j.began, io) });
             try w.flush();
         }
         const s0 = m.now();
@@ -230,6 +365,7 @@ pub fn main(init: std.process.Init) !u8 {
             return 1;
         };
         step_ns += m.now() - s0;
+        if (store) |st| st.pump(2 * std.time.ns_per_ms); // staged writes between rounds, as the lane host's service
         // the finished streams' replies
         for (jobs[0..admitted]) |*j| {
             if (j.done or !j.stream.finished) continue;
@@ -246,6 +382,7 @@ pub fn main(init: std.process.Init) !u8 {
             try w.flush();
             j.stream.deinit(gpa);
             j.proposer.deinit();
+            if (j.lineage.len > 0) gpa.free(j.lineage);
         }
     }
     const total_s = seconds(started, io);
@@ -277,6 +414,12 @@ pub fn main(init: std.process.Init) !u8 {
             try w.print("{{\"rank\": 0, \"engram\": {{\"calls_a_round\": {d:.2}, \"hash_ms\": {d:.3}, \"read_ms\": {d:.3}, \"decode_ms\": {d:.3}, \"upload_ms\": {d:.3}}}}}\n", .{ ms(eh.calls * 1000000, p.rounds), ms(eh.t_hash, p.rounds), ms(eh.t_read, p.rounds), ms(eh.t_decode, p.rounds), ms(eh.t_upload, p.rounds) });
             try w.flush();
         }
+    }
+    if (store) |st| {
+        const x = st.stats;
+        const c = (st.tierCounts() orelse pcache.RankCounts{}).slice();
+        const t: pcache.TierCounts = if (c.len > 0) c[0] else .{};
+        try w.print("{{\"rank\": 0, \"spill\": {{\"disk_lookups\": {d}, \"disk_hits\": {d}, \"disk_hits_committed\": {d}, \"restores_failed\": {d}, \"restored_tokens\": {d}, \"writes_enqueued\": {d}, \"points\": {d}, \"committed\": {d}, \"cancelled\": {d}, \"failed\": {d}, \"presence_refused\": {d}, \"memory_hits\": {d}}}}}\n", .{ x.disk_lookups, x.disk_hits, x.disk_hits_committed, x.restores_failed, x.restored_tokens, x.writes_enqueued, t.points, t.writes_committed, t.writes_cancelled, t.writes_failed, t.presence_refused, st.counts.hits });
     }
     try w.print("{{\"rank\": 0, \"requests\": {d}, \"tokens\": {d}, \"steps\": {d}, \"shared_rounds\": {d}, \"drafted\": {d}, \"accepted\": {d}, \"seconds\": {d:.2}, \"all_equal\": {}}}\n", .{ reqs.len, tokens_out, core.steps, core.shared_rounds, core.drafted, core.accepted, total_s, all_equal });
     try w.flush();

@@ -158,13 +158,15 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
 /// The CUDA engines a native server opens (native/cuda.zig), over the given runtime and families.
 fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, core: *std.Build.Module) struct { api: *std.Build.Module, engines: *std.Build.Module, dsv41: *std.Build.Module } {
     // DeepSeek-V4.1-Flash (our port): its module reads the runtime and the lane core, as Nemotron's does
+    const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
     const dsv41 = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/dsv41.zig"), .target = target, .optimize = optimize, .link_libc = true });
     dsv41.addImport("cuda", cuda);
     dsv41.addImport("lanes", lanes);
     dsv41.addImport("core", core);
+    // the prompt cache's Tier the spill tier implements (spill_tier.zig)
+    dsv41.addImport("engine_api", api);
     // the RDMA ring's verbs (rdma.zig)
     dsv41.addImport("fabric", b.createModule(.{ .root_source_file = b.path("zig/src/fabric/fabric.zig"), .target = target, .optimize = optimize, .link_libc = true }));
-    const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
     const mod = b.createModule(.{
         .root_source_file = b.path("zig/src/native/cuda.zig"),
         .target = target,

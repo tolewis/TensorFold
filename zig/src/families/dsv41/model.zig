@@ -696,6 +696,119 @@ pub const Model = struct {
         try d.check(d.api.cuMemcpyDtoDAsync_v2(dst, src, bytes, m.stream.handle), "cuMemcpyDtoDAsync");
     }
 
+    // -- spill v2's checkpoint state (port of wojo's GLM 0110, PR #124: spill_state.zig) ------------------------------
+    // A kept point's state on this rank as the spill tier stores it: the descriptor derived from the loaded weights and
+    // the live allocation, and the planes' addresses and copies for spill.Packer. Nothing here runs unless the tier
+    // calls it (round 2's lanes wiring); the served path is unchanged.
+
+    pub const spill = @import("spill_state.zig");
+
+    comptime {
+        std.debug.assert(draft.max_streams <= spill.max_slots);
+    }
+
+    /// This rank's state planes as spill.Packer reads and writes them: their device addresses (the whole pool's
+    /// compressed planes, a slot's rings and raw stores) and copies in the model's stream's order.
+    pub const SpillDev = struct {
+        m: *Model,
+
+        pub const Event = cuda.Event;
+
+        /// Row 0 of a block plane over the whole pool (the extent at base b starts b / ratio rows in, as view() puts it).
+        pub fn blockPlane(dv: SpillDev, p: spill.Plane) u64 {
+            const cs = &dv.m.caches;
+            return switch (p.kind) {
+                .comp_codes => cs.comp_codes[p.layer],
+                .comp_scales => cs.comp_scales[p.layer],
+                .idx_codes => cs.idx_codes[p.layer],
+                .idx_scales => cs.idx_scales[p.layer],
+                .ring, .raw_kv, .raw_score => 0,
+            };
+        }
+
+        /// Slot `slot`'s rows of a small plane (snapCopy's addresses).
+        pub fn slotPlane(dv: SpillDev, p: spill.Plane, slot: usize) u64 {
+            const m = dv.m;
+            const base: u64 = switch (p.kind) {
+                .ring => m.rings[p.layer],
+                .raw_kv => m.caches.raw_kv[p.layer],
+                .raw_score => m.caches.raw_score[p.layer],
+                .comp_codes, .comp_scales, .idx_codes, .idx_scales => 0,
+            };
+            return if (base == 0) 0 else base + slot * p.slotBytes();
+        }
+
+        pub fn capacity(dv: SpillDev) usize {
+            return dv.m.caches.cap;
+        }
+
+        pub fn slots(dv: SpillDev) usize {
+            return dv.m.streams;
+        }
+
+        pub fn d2h(dv: SpillDev, dst: []u8, src: u64) !void {
+            const d = dv.m.ctx.d;
+            try d.check(d.api.cuMemcpyDtoHAsync_v2(dst.ptr, src, dst.len, dv.m.stream.handle), "cuMemcpyDtoHAsync");
+        }
+
+        pub fn h2d(dv: SpillDev, dst: u64, src: []const u8) !void {
+            const d = dv.m.ctx.d;
+            try d.check(d.api.cuMemcpyHtoDAsync_v2(dst, src.ptr, src.len, dv.m.stream.handle), "cuMemcpyHtoDAsync");
+        }
+
+        pub fn fill(dv: SpillDev, dst: u64, value: u8, bytes: usize) !void {
+            const d = dv.m.ctx.d;
+            try d.check(d.api.cuMemsetD8Async(dst, value, bytes, dv.m.stream.handle), "cuMemsetD8Async");
+        }
+
+        pub fn record(dv: SpillDev, ev: cuda.Event) !void {
+            try ev.record(dv.m.stream);
+        }
+
+        /// Whether the copies before `ev` completed (spill_tier polls it; a device error reads as done, and the next
+        /// copy on the stream reports it).
+        pub fn done(_: SpillDev, ev: cuda.Event) bool {
+            return ev.done() catch true;
+        }
+
+        /// The copies before `ev` completed (a cancel, a drop, a shutdown: bounded by what was enqueued).
+        pub fn wait(_: SpillDev, ev: cuda.Event) void {
+            ev.synchronize() catch {};
+        }
+    };
+
+    /// The spill state descriptor of this rank, derived from the loaded layers (Caches.init's reading of them) and
+    /// checked against the live allocation: snapCopy's bytes, a ring per layer, every plane present.
+    pub fn spillLayout(m: *const Model) !spill.StateLayout {
+        const layers = m.eng.w.layers;
+        if (layers.len > spill.max_layers) return error.SpillLayoutMismatch;
+        var shapes: [spill.max_layers]spill.LayerShape = undefined;
+        for (layers, shapes[0..layers.len]) |lay, *s| {
+            const kv = lay.comp_wkv != null;
+            s.* = .{ .ratio = if (kv) lay.ratio else 0, .kv = kv, .idx = kv and lay.idx_wk != null, .raw = kv and lay.ratio > 1 };
+        }
+        const l = try spill.StateLayout.init(shapes[0..layers.len], spill.Geometry.of(m.eng.c, chunk_rows, prompt.ring_extra, prompt.raw_rows), .replicated);
+        if (l.small_bytes != m.snapBytes() or m.rings.len != layers.len) return error.SpillLayoutMismatch;
+        const dv: SpillDev = .{ .m = @constCast(m) };
+        for (l.blockPlanes()) |p| if (dv.blockPlane(p) == 0) return error.SpillLayoutMismatch;
+        for (l.smallPlanes()) |p| {
+            if (dv.slotPlane(p, 0) == 0) return error.SpillLayoutMismatch;
+            if (p.kind == .ring and p.slotBytes() != m.eng.ringBytes()) return error.SpillLayoutMismatch;
+        }
+        return l;
+    }
+
+    /// The pool's extent and slot generations (one counter a chunk of positions), sized once at setup.
+    pub fn spillGenerations(m: *const Model, gpa: std.mem.Allocator) !spill.Generations {
+        return spill.Generations.init(gpa, m.caches.cap, chunk_rows);
+    }
+
+    /// A packer over this rank's planes, `l` from spillLayout and `g` from spillGenerations (both the caller's, alive
+    /// while it is used). Its calls enqueue on the model's stream and record the caller's event: no allocation, no wait.
+    pub fn spillPacker(m: *Model, l: *const spill.StateLayout, g: *spill.Generations) spill.Packer(SpillDev) {
+        return .{ .dev = .{ .m = m }, .layout = l, .gens = g };
+    }
+
     /// The Engram read-ahead joined and its rows dropped, so the next chunk reads its own rows from its prompt's ids.
     /// Baseline hazard (also without spill): fillChunk takes a joined read-ahead whose (ahead_start, ahead_n) match its
     /// chunk, and a pass that ends between chunks (cancel, error) leaves one standing; a later prompt resuming a kept
@@ -711,6 +824,131 @@ pub const Model = struct {
             eh.ahead_err = null;
             if (eh.lead_on) m.lead.reset(eh);
         }
+    }
+
+    /// After a restored prompt's fill: the drafter's rings were rebuilt by its replay through the prompt's end
+    /// (spill.checkReplayRebuilds' rule, here as the pool records it), so the first draft reads no unwritten row.
+    pub fn spillCheckResumed(m: *const Model, slot: usize, len: usize) !void {
+        if (slot >= m.streams) return error.BadSlot;
+        if (m.dpool) |*p| if (p.absorbed[slot] != len) return error.DraftNotRebuilt;
+    }
+
+    /// A compressed plane as copyExtent copies it: its address, row bytes (copyExtent's own widths from the config)
+    /// and ratio.
+    const SpillRefPlane = struct { plane: u64, row: usize, ratio: usize };
+
+    /// copyExtent's planes in its order (every kv layer: codes, scales, then the index keys' codes and scales), read
+    /// from the loaded layers and the config, not from the spill layout.
+    fn spillRefPlanes(m: *const Model, out: *[4 * spill.max_layers]SpillRefPlane) ![]SpillRefPlane {
+        const c = m.eng.c;
+        const cs = &m.caches;
+        var k: usize = 0;
+        for (m.eng.w.layers, 0..) |lay, i| {
+            if (lay.comp_wkv == null) continue;
+            if (k + 4 > out.len) return error.SpillLayoutMismatch;
+            const r: usize = lay.ratio;
+            out[k] = .{ .plane = cs.comp_codes[i], .row = c.head_dim / 2, .ratio = r };
+            out[k + 1] = .{ .plane = cs.comp_scales[i], .row = c.head_dim / 16, .ratio = r };
+            k += 2;
+            if (lay.idx_wk != null) {
+                out[k] = .{ .plane = cs.idx_codes[i], .row = c.index_head_dim / 2, .ratio = r };
+                out[k + 1] = .{ .plane = cs.idx_scales[i], .row = c.index_head_dim / 32, .ratio = r };
+                k += 2;
+            }
+        }
+        return out[0..k];
+    }
+
+    /// Stage 2's completeness check on one instance (a GPU tool, not a serving path), against the engine's own resume
+    /// primitives rather than the layout itself. The point at `at` of slot `from_slot` and the extent at `from`:
+    ///   - reference: copyExtent(from, ref, at) into a third extent and snapCopy(from_slot) into a scratch Snap buffer;
+    ///   - packed, unpacked into slot `to_slot` and the extent at `to` (both overwritten, as is `ref`), packed again.
+    /// Then (round trip) both packs are equal; (blocks) the restored rows of `to` equal copyExtent's rows at `ref`, and
+    /// the packed blocks, cut with offsets computed from copyExtent's loop and the config's row widths, equal them;
+    /// (small) a snapCopy of the restored slot equals the reference Snap, and the packed small state equals it too.
+    /// Every argument is checked before anything is enqueued; its own pinned staging, device scratch and event, none
+    /// freed before the stream is idle.
+    pub fn spillSelfCheck(m: *Model, gpa: std.mem.Allocator, from_slot: usize, from: usize, to_slot: usize, to: usize, ref: usize, at: usize) !void {
+        if (from_slot >= m.streams or to_slot >= m.streams or from_slot == to_slot) return error.BadSlot;
+        if (at == 0) return error.BadRange;
+        for ([_]usize{ from, to, ref, at }) |v| if (v % chunk_rows != 0) return error.BadRange;
+        const cap = m.caches.cap;
+        for ([_]usize{ from, to, ref }) |b| if (b >= cap or at > cap - b) return error.BadRange;
+        for ([_][2]usize{ .{ from, to }, .{ from, ref }, .{ to, ref } }) |p| if (p[0] < p[1] + at and p[1] < p[0] + at) return error.BadRange;
+        const l = try m.spillLayout();
+        var refs_buf: [4 * spill.max_layers]SpillRefPlane = undefined;
+        const refs = try m.spillRefPlanes(&refs_buf);
+        var ref_bytes: usize = 0;
+        for (refs) |rp| ref_bytes += at / rp.ratio * rp.row;
+        const nb = try l.blocks(at);
+        const blk = try std.math.mul(usize, nb, l.block_bytes);
+        if (ref_bytes != blk) return error.SpillLayoutMismatch; // the layout's block bytes are copyExtent's
+        const small = l.small_bytes;
+        var g = try m.spillGenerations(gpa);
+        defer g.deinit(gpa);
+        var pk = m.spillPacker(&l, &g);
+
+        var a = try cuda.HostBuffer.alloc(m.ctx.d, blk + small);
+        defer a.free();
+        var b = try cuda.HostBuffer.alloc(m.ctx.d, blk + small);
+        defer b.free();
+        var rows = try cuda.HostBuffer.alloc(m.ctx.d, 2 * blk); // copyExtent's rows at ref, then the restored rows at to
+        defer rows.free();
+        var snaps = try cuda.HostBuffer.alloc(m.ctx.d, 2 * small); // the reference Snap, then the restored slot's
+        defer snaps.free();
+        var sa = try cuda.DeviceBuffer.alloc(m.ctx.d, m.snapBytes());
+        defer sa.free();
+        var sb = try cuda.DeviceBuffer.alloc(m.ctx.d, m.snapBytes());
+        defer sb.free();
+        var ev = try cuda.Event.init(m.ctx.d, false);
+        defer ev.deinit();
+        defer m.stream.synchronize() catch {}; // (runs first: nothing above is freed under an enqueued copy)
+
+        // the engine's own copies of the point
+        try m.snapCopy(from_slot, sa.ptr, true);
+        try m.copyExtent(from, ref, at);
+        // pack, restore elsewhere, pack again
+        _ = try pk.packBlocks(try g.pin(from, from + at), 0, nb, a.bytes[0..blk], ev);
+        _ = try pk.packSmall(try g.pinSlot(from_slot), a.bytes[blk..][0..small], ev);
+        try ev.synchronize();
+        const dst = try g.reserve(to, to + at);
+        const ds = try g.reserveSlot(to_slot);
+        const ub = try pk.unpackBlocks(dst, 0, nb, a.bytes[0..blk], ev);
+        const us = try pk.unpackSmall(ds, a.bytes[blk..][0..small], ev);
+        _ = try pk.packBlocks(dst, 0, nb, b.bytes[0..blk], ev);
+        _ = try pk.packSmall(ds, b.bytes[blk..][0..small], ev);
+        try m.snapCopy(to_slot, sb.ptr, true);
+        // plain copies of each plane's rows [ref / r, (ref + at) / r) and [to / r, (to + at) / r), plane after plane
+        const d = m.ctx.d;
+        var off: usize = 0;
+        for ([_]usize{ ref, to }) |base| for (refs) |rp| {
+            const n = at / rp.ratio * rp.row;
+            try d.check(d.api.cuMemcpyDtoHAsync_v2(rows.bytes[off..].ptr, rp.plane + base / rp.ratio * rp.row, n, m.stream.handle), "cuMemcpyDtoHAsync");
+            off += n;
+        };
+        try d.check(d.api.cuMemcpyDtoHAsync_v2(snaps.bytes.ptr, sa.ptr, small, m.stream.handle), "cuMemcpyDtoHAsync");
+        try d.check(d.api.cuMemcpyDtoHAsync_v2(snaps.bytes[small..].ptr, sb.ptr, small, m.stream.handle), "cuMemcpyDtoHAsync");
+        try m.stream.synchronize();
+        if (!g.valid(ub) or !g.valid(us)) return error.StaleExtent;
+
+        if (!std.mem.eql(u8, a.bytes[0 .. blk + small], b.bytes[0 .. blk + small])) return error.SpillRoundTripMismatch;
+        const ref_rows = rows.bytes[0..blk];
+        if (!std.mem.eql(u8, ref_rows, rows.bytes[blk..][0..blk])) return error.SpillRestoreMismatch;
+        // the packed blocks against copyExtent's rows: block k's plane j is that plane's rows from k * 2048 / ratio
+        var in_block: usize = 0; // plane j's offset in a block (copyExtent's order and widths)
+        var in_rows: usize = 0; // plane j's offset in ref_rows
+        for (refs) |rp| {
+            const per = chunk_rows / rp.ratio * rp.row;
+            for (0..nb) |k| {
+                if (!std.mem.eql(u8, b.bytes[k * l.block_bytes + in_block ..][0..per], ref_rows[in_rows + k * per ..][0..per])) return error.SpillLayoutMismatch;
+            }
+            in_block += per;
+            in_rows += at / rp.ratio * rp.row;
+        }
+        if (in_block != l.block_bytes) return error.SpillLayoutMismatch;
+        const ref_snap = snaps.bytes[0..small];
+        if (!std.mem.eql(u8, ref_snap, snaps.bytes[small..][0..small])) return error.SpillRestoreMismatch;
+        if (!std.mem.eql(u8, ref_snap, b.bytes[blk..][0..small])) return error.SpillLayoutMismatch;
     }
 
     /// Each layer's gate_bias_vl (f32 [experts], the checkpoint's extra file) on the device: Gate.forward's bias at

@@ -162,6 +162,7 @@ const Host = struct {
     lone: ?LoneRun = null, // the family's driver for a lone drafted stream, called with `family`
     cache: ?api.prompt_cache.Store = null, // kept prompt states, when the family keeps them
     snap_vt: api.prompt_cache.Snapshots.VTable = undefined,
+    spill: ?api.Spill = null, // the spill tier the family bound: the lane host is configured with it
 
     fn close(p: *anyopaque) void {
         const h: *Host = @ptrCast(@alignCast(p));
@@ -207,6 +208,7 @@ const Host = struct {
         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
         h.host.explain = explain;
         if (h.cache) |*store| h.host.cache = store;
+        if (h.spill) |sp| h.host.configure(sp); // (after the cache and its tier: Spill.unbound sees Status.cache)
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
         try h.host.start();
     }
@@ -368,8 +370,17 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         problem.* = try std.fmt.allocPrint(a, "the checkpoint's {d:.1} GiB of weights do not fit the {d:.1} GiB the CUDA memory budget grants ({d:.1} GiB free less a {d:.1} GiB reserve{s}); free device memory or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB", .{ toGib(weights), toGib(before.room(held0)), toGib(before.free), toGib(before.reserve), if (before.limit != null) ", under TENSORFOLD_CUDA_MEMORY_LIMIT_GB" else "" });
         return null;
     }
-    const loaded = F.open(gpa, io, &g.ctx, o.dir, kernels, .{ .context = @intCast(window), .drafts = o.drafts, .segments = segments }) catch |e| {
-        problem.* = try std.fmt.allocPrint(a, "the native CUDA engine cannot load {s} with kernels {s} ({s})", .{ o.dir, kernels, @errorName(e) });
+    // the spill tier (--spill-dir/--spill-gib), for a family that has one; it allocates its staging before its pool
+    const spill_on = o.spill.enabled() and @hasField(F.Options, "spill");
+    var fo: F.Options = .{ .context = @intCast(window), .drafts = o.drafts, .segments = segments };
+    if (comptime @hasField(F.Options, "spill")) if (spill_on) {
+        fo.spill = F.spillSettings(o.spill.dir.?, o.spill.gib, o.spill.min_free_gib, o.spill.quota, o.spill.min_tokens, o.spill.turns, o.spill.flush_ms) catch |e| {
+            problem.* = F.explain(null, e) orelse try std.fmt.allocPrint(a, "the spill tier's settings ({s})", .{@errorName(e)});
+            return null;
+        };
+    };
+    const loaded = F.open(gpa, io, &g.ctx, o.dir, kernels, fo) catch |e| {
+        problem.* = if (spill_on and F.explain(null, e) != null) F.explain(null, e).? else try std.fmt.allocPrint(a, "the native CUDA engine cannot load {s} with kernels {s} ({s})", .{ o.dir, kernels, @errorName(e) });
         return null;
     };
     defer if (!opened) loaded.deinit(loaded.ctx);
@@ -402,6 +413,21 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         if (want > 0) {
             h.snap_vt = .{ .bytes = sn.bytes, .save = sn.save, .restore = sn.restore, .drop = sn.drop };
             h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, .{ .tail = if (@hasField(@TypeOf(sn), "tail")) sn.tail else 0 }, want);
+            // the spill tier (off by default: nothing below runs then)
+            if (@hasField(@TypeOf(loaded), "tier")) {
+                const store = &h.cache.?;
+                if (loaded.tier) |t| {
+                    if (@hasField(@TypeOf(sn), "usable")) h.snap_vt.usable = sn.usable;
+                    var seed: [4]u8 = undefined;
+                    io.random(&seed);
+                    store.setTier(t, std.mem.readInt(u32, &seed, .little));
+                }
+                if (loaded.tier != null) {
+                    store.rules.grid = loaded.grid; // the native rule: 0 < at < len, on the chunk grid, before the replay
+                    store.rules.window = loaded.replay;
+                    h.spill = o.spill;
+                }
+            }
         }
     };
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
