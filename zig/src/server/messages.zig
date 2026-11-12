@@ -343,6 +343,27 @@ fn place(cx: *Cx, out: *std.ArrayList(Value), instructions: *std.ArrayList(*json
     try out.append(cx.a, .{ .object = item });
 }
 
+/// The messages with no assistant turn carrying ``reasoning_content`` (``--drop-reasoning-history``): a client that
+/// replays each turn's reasoning (an agent harness in a tool loop; DeepSeek-V4.1's template keeps every turn's once tools
+/// are present) otherwise shows the model its own earlier thinking at every step, and a run of a few hundred thousand
+/// tokens drifted into ever flatter, then repeating reasoning. Messages without the field are returned as they are.
+pub fn dropReasoning(cx: *Cx, messages: Value) errors.Refused!Value {
+    var any = false;
+    for (messages.array) |m| if (m == .object and m.get("reasoning_content") != null) {
+        any = true;
+    };
+    if (!any) return messages;
+    const out = try cx.a.alloc(Value, messages.array.len);
+    for (messages.array, 0..) |m, k| {
+        out[k] = m;
+        if (m != .object or m.get("reasoning_content") == null) continue;
+        const copy = try json.copyObject(cx.a, m.object);
+        _ = copy.orderedRemove("reasoning_content");
+        out[k] = .{ .object = copy };
+    }
+    return .{ .array = out };
+}
+
 /// ``_normalize_tool_call_arguments``: call arguments as objects for templates; bad ones under ``_invalid_arguments``.
 pub fn toolArguments(cx: *Cx, messages: Value) errors.Refused!Value {
     if (messages != .array) return messages;
@@ -402,6 +423,32 @@ pub fn isTitleRequest(messages: Value, has_tools: bool) bool {
     const text = first.get("content") orelse return false;
     if (size >= 4096 or text != .string) return false;
     return std.ascii.findIgnoreCase(text.string, "title") != null;
+}
+
+test "dropReasoning: every assistant turn loses its reasoning_content, the rest is untouched" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var cx: Cx = .{ .a = arena.allocator() };
+    const messages = (try json.parse(cx.a,
+        \\[{"role": "user", "content": "run it"}, {"role": "assistant", "content": "", "reasoning_content": "the; the; the", "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "f", "arguments": {}}}]}, {"role": "tool", "tool_call_id": "t1", "content": "42 rows"}, {"role": "assistant", "content": "done", "reasoning_content": "fine"}]
+    )).ok;
+    const out = try dropReasoning(&cx, messages);
+    try std.testing.expectEqualStrings(
+        \\[{"role": "user", "content": "run it"}, {"role": "assistant", "content": "", "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "f", "arguments": {}}}]}, {"role": "tool", "tool_call_id": "t1", "content": "42 rows"}, {"role": "assistant", "content": "done"}]
+    , try json.stringify(cx.a, out, .{ .ascii = false }));
+    // the request's own messages keep their field (a copy was taken)
+    try std.testing.expect(messages.array[1].get("reasoning_content") != null);
+}
+
+test "dropReasoning: messages without the field come back as they are" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var cx: Cx = .{ .a = arena.allocator() };
+    const messages = (try json.parse(cx.a,
+        \\[{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+    )).ok;
+    const out = try dropReasoning(&cx, messages);
+    try std.testing.expect(out.array.ptr == messages.array.ptr);
 }
 
 test "a conversation with a user query stays byte-identical under the rule" {

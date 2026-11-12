@@ -38,6 +38,9 @@ pub const Config = struct {
     reasoning_effort: ?[]const u8 = null,
     thinking_budget: i64 = 0,
     loop_guard: bool = false,
+    /// The chat template sees no assistant turn's reasoning_content: a client that replays every turn's reasoning
+    /// (DeepSeek-V4.1's template keeps it all once tools are present) no longer feeds the model its own earlier thinking.
+    drop_reasoning_history: bool = false,
     /// Seconds the idle keepalive runs after the last request ends (0: off).
     keep_warm_s: i64 = 900,
     dashboard: bool = false,
