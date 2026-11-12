@@ -85,6 +85,12 @@ pub fn extended(s: *const pc.Store, e: *const pc.Entry) bool {
     return false;
 }
 
+fn before(s: *const pc.Store, e: *const pc.Entry, o: *const pc.Entry, prompt: []const u32) bool {
+    const e_rewind = isActiveRewind(s, e, prompt);
+    const o_rewind = isActiveRewind(s, o, prompt);
+    return if (e_rewind != o_rewind) o_rewind else e.used < o.used;
+}
+
 /// A real later turn, excluding an endpoint's equal-born reply end, can establish a branch.
 pub fn continuedLater(s: *const pc.Store, e: *const pc.Entry) bool {
     if (!s.links_lost) {
