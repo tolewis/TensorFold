@@ -34,6 +34,9 @@ pub const dsv41_ops: []const u8 = if (available) &Blob("fatbin_dsv41_ops").bytes
 pub const dsv41_torch: []const u8 = if (available) &Blob("fatbin_dsv41_torch").bytes else &.{};
 pub const dsv41_shard: []const u8 = if (available) &Blob("fatbin_dsv41_shard").bytes else &.{};
 pub const dsv41_rdma: []const u8 = if (available) &Blob("fatbin_dsv41_rdma").bytes else &.{};
+/// The GLM port's spill block staging (dsv41_port.cu; families/dsv41/port_kernels.zig). Opt in: embedded only by a
+/// build with -Dport_kernels, else empty (Port.load: error.NoPortKernels).
+pub const dsv41_port: []const u8 = if (available and options.has_dsv41_port) &Blob("fatbin_dsv41_port").bytes else &.{};
 
 /// Symbols in the gdn image as cuobjdump lists them for the built fatbin (named namespace tf_gdn).
 pub const gdn_symbols = struct {

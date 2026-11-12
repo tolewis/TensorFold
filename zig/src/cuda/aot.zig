@@ -7,9 +7,9 @@ const Stream = @import("stream.zig").Stream;
 const launch = @import("launch.zig");
 const triton = @import("triton.zig");
 
-const ParamJson = struct { name: []const u8, type: []const u8, div16: bool, nospec: bool };
-const ConstJson = struct { int: ?i64 = null, f32: ?u32 = null };
-const KernelJson = struct {
+pub const ParamJson = struct { name: []const u8, type: []const u8, div16: bool, nospec: bool };
+pub const ConstJson = struct { int: ?i64 = null, f32: ?u32 = null };
+pub const KernelJson = struct {
     @"fn": []const u8,
     hash: []const u8,
     name: []const u8,
@@ -23,7 +23,7 @@ const KernelJson = struct {
     params: []ParamJson,
     consts: std.json.ArrayHashMap(ConstJson),
 };
-const SetJson = struct { kernels: []KernelJson };
+pub const SetJson = struct { kernels: []KernelJson };
 
 /// One argument of a launch, by the kernel's parameter name.
 pub const Arg = struct {
@@ -139,6 +139,13 @@ pub const Set = struct {
         return error.MissingTritonVariant;
     }
 
+    /// Whether a launch of `function` with these arguments and constexprs resolves in this set (find's exact or
+    /// fallback answer), asked without find's logging: a caller choosing between launch shapes (tri_norm.rowmmGate).
+    pub fn has(self: *const Set, function: []const u8, args: []const Arg, consts: []const Const) bool {
+        for (self.variants) |v| if (specResolves(v.spec, function, args, consts)) return true;
+        return false;
+    }
+
     /// The smallest value of constexpr `name` at or above `at_least` among `function`'s variants.
     pub fn smallestConst(self: *const Set, function: []const u8, name: []const u8, at_least: i64) ?i64 {
         var best: ?i64 = null;
@@ -166,6 +173,18 @@ pub const Set = struct {
         try v.kernel.launchOn(.{ .x = grid[0], .y = grid[1], .z = grid[2] }, stream, &packed_args, .{}, &.{});
     }
 };
+
+/// Set.has over bare variant specs (an aot.json's `kernels`, parsed as SetJson): a host test's in-memory kit.
+pub fn specsHave(specs: []const KernelJson, function: []const u8, args: []const Arg, consts: []const Const) bool {
+    for (specs) |k| if (specResolves(k, function, args, consts)) return true;
+    return false;
+}
+
+/// Whether find could pick variant `k` for this launch: its exact one, or a fallback that fits.
+fn specResolves(k: KernelJson, function: []const u8, args: []const Arg, consts: []const Const) bool {
+    if (!std.mem.eql(u8, k.@"fn", function)) return false;
+    return matches(k, args, consts) or fits(k, args, consts) != null;
+}
 
 fn lookup(args: []const Arg, name: []const u8) ?Arg {
     for (args) |a| if (std.mem.eql(u8, a.name, name)) return a;

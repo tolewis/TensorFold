@@ -400,7 +400,8 @@ pub fn Packer(comptime Dev: type) type {
         layout: *const StateLayout,
         gens: *Generations,
 
-        fn checkBlocks(p: *const Self, r: ExtentRef, first_block: usize, count: usize, staged: usize) !void {
+        /// The block calls' range checks (also port_kernels' one-launch pack, unpack and clear).
+        pub fn checkBlocks(p: *const Self, r: ExtentRef, first_block: usize, count: usize, staged: usize) !void {
             const l = p.layout;
             if (l.owner_layout != .replicated) return error.OwnerShardedNotPorted; // PORT(round2): the owner per point
             const bt = l.geo.block_tokens;

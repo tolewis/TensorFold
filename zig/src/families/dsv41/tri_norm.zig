@@ -124,10 +124,68 @@ pub fn rowmmGate(t: Tri, x: u64, xs: usize, w: u64, out: u64, rows: usize, k: us
         try rowmm2(t, x, xs, w, out, rows, k, n);
         return 0;
     }
-    const args = [_]aot.Arg{ p("X", "*bf16", x), aot.int("xs", @intCast(xs)), p("W", "*fp16", w), p("S", "*fp32", out), aot.int("rows", @intCast(rows)) };
-    const consts = [_]aot.Const{ ci("K", k), ci("N", n), ci("BN", tile.bn), ci("BK", 256), ci("CPG", tile.cpg), ci("RB", rows), t.pdlConst() };
-    try t.run("_rowmm_parts", .{ tri.cdiv(n, tile.bn), u(kc / tile.cpg), 1 }, &args, &consts);
+    try rowmmGatePieces(t, x, xs, w, out, rows, k, n, rowmmPartsPiece(t, x, xs, w, out, rows, k, n));
     return kc;
+}
+
+/// rowmm_gate's chunk sums as _rowmm_parts launches of at most `piece` rows over consecutive rows (rowmmGate's
+/// launches past its checks; tf-dsv41-port --gate compares the piece sizes on a GPU).
+pub fn rowmmGatePieces(t: Tri, x: u64, xs: usize, w: u64, out: u64, rows: usize, k: usize, n: usize, piece: usize) !void {
+    if (piece == 0) return error.BadPiece;
+    const kc = k / 256;
+    var r0: usize = 0;
+    while (r0 < rows) : (r0 += piece) {
+        const nr = @min(piece, rows - r0);
+        // row r0 of X [R, xs] bf16 and of S [R, kc, N] fp32 (16-byte aligned: xs and kc * N are whole 16-byte rows)
+        try rowmmParts(t, x + r0 * xs * 2, xs, w, out + r0 * kc * n * 4, nr, k, n);
+    }
+}
+
+/// The most rows one _rowmm_parts launch takes when the kit cannot run the whole gate in one: RB 16, which every round
+/// of the served 16-row config launches (as RB 1..16 with the leftover piece's rows).
+pub const rowmm_parts_piece = decode_rows;
+
+/// Said once on stderr when a gate first runs as 16-row pieces.
+var told_split: std.atomic.Value(bool) = .init(false);
+
+/// Rows a _rowmm_parts launch of a `rows`-row gate takes: all of them, unless rows passes the qualified bound and that
+/// one launch would not resolve in the kit (Set.has: the exact launch rowmmParts makes, its RB, BN, PDL and the rows
+/// argument's specialization, exact or by fallback): a round of TF_DS_ROUND_ROWS > 16 rows on the published kit,
+/// which stops at RB 16 (the R32 MissingTritonVariant). Then the gate runs as launches of at most 16 rows over
+/// consecutive rows of X and S. A kit with the RB 17..32 variants (tools/dsv41-zig/build_kit.sh EXTRA_ROWS=32) keeps
+/// the single launch. Rounds of up to 16 rows are untouched (one launch, no kit check).
+///
+/// Expected, not yet shown on a GPU: the kernel is row-invariant (a row's chunk sums do not depend on the rows beside
+/// it or on RB), so each row's bytes equal one launch's. The pieces' tiles differ from a single 17..32-row launch's
+/// (a leftover of 1..6 rows takes BN 16, a 17..32-row launch BN 8), so docs/port/kit.md section 8 compares S per row,
+/// bitwise, before token hashes.
+///
+/// The check costs one scan of the set's variants per gate past 16 rows; Set.find already scans them on every launch.
+pub fn rowmmPartsPiece(t: Tri, x: u64, xs: usize, w: u64, out: u64, rows: usize, k: usize, n: usize) usize {
+    if (rows <= rowmm_parts_piece) return rows;
+    const l = partsLaunch(t, x, xs, w, out, rows, k, n);
+    const one = if (t.set) |set| set.has("_rowmm_parts", &l.args, &l.consts) else if (t.kit) |specs| aot.specsHave(specs, "_rowmm_parts", &l.args, &l.consts) else true;
+    if (one) return rows;
+    if (!told_split.swap(true, .monotonic)) std.log.info("_rowmm_parts: the kit has no variant for a {d}-row gate (N {d}); rounds past {d} rows run it as launches of at most {d} rows", .{ rows, n, rowmm_parts_piece, rowmm_parts_piece });
+    return rowmm_parts_piece;
+}
+
+/// One _rowmm_parts launch as rowmm_gate's wrapper makes it: grid, runtime arguments, constexprs.
+const PartsLaunch = struct { grid: [3]u32, args: [5]aot.Arg, consts: [7]aot.Const };
+
+fn partsLaunch(t: Tri, x: u64, xs: usize, w: u64, out: u64, rows: usize, k: usize, n: usize) PartsLaunch {
+    const tile = rpTile(rows);
+    const kc = k / 256;
+    return .{
+        .grid = .{ tri.cdiv(n, tile.bn), u(kc / tile.cpg), 1 },
+        .args = .{ p("X", "*bf16", x), aot.int("xs", @intCast(xs)), p("W", "*fp16", w), p("S", "*fp32", out), aot.int("rows", @intCast(rows)) },
+        .consts = .{ ci("K", k), ci("N", n), ci("BN", tile.bn), ci("BK", 256), ci("CPG", tile.cpg), ci("RB", rows), t.pdlConst() },
+    };
+}
+
+fn rowmmParts(t: Tri, x: u64, xs: usize, w: u64, out: u64, rows: usize, k: usize, n: usize) !void {
+    const l = partsLaunch(t, x, xs, w, out, rows, k, n);
+    try t.run("_rowmm_parts", l.grid, &l.args, &l.consts);
 }
 
 /// route: picks [R, SLOTS] i32 and weights [R, SLOTS] fp32 (shared expert last) from logits [R, NE] (kc 0) or chunk sums [R, kc, NE].
@@ -225,6 +283,93 @@ test "rowmm_gate launches _rowmm_parts as recorded" {
             try std.testing.expectEqual(c.dim("S", 1), kc);
         }
     }.call);
+}
+
+/// An in-memory kit of _rowmm_parts variants at the round's gate (K 5120, N 384), one per (RB, rows specialization,
+/// PDL): what aot.zig's Set holds as specs. rows: "one" (folded to a constexpr), "d16" or "any".
+const PartsVariant = struct { rb: usize, rows: []const u8, pdl: u1 = 1 };
+
+fn partsKit(gpa: std.mem.Allocator, variants: []const PartsVariant) !std.json.Parsed(aot.SetJson) {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    try text.appendSlice(gpa, "{\"kernels\": [");
+    for (variants, 0..) |v, i| {
+        const one = std.mem.eql(u8, v.rows, "one");
+        const rows_param = if (one) "" else try std.fmt.allocPrint(gpa, ",{{\"name\":\"rows\",\"type\":\"i32\",\"div16\":{},\"nospec\":false}}", .{std.mem.eql(u8, v.rows, "d16")});
+        defer if (!one) gpa.free(rows_param);
+        const ptr = "\"div16\":true,\"nospec\":false";
+        const entry = try std.fmt.allocPrint(gpa,
+            \\{s}{{"fn":"_rowmm_parts","hash":"h{d}","name":"k{d}","num_warps":2,"params":[
+            \\{{"name":"X","type":"*bf16",{s}}},{{"name":"xs","type":"i32",{s}}},{{"name":"W","type":"*fp16",{s}}},
+            \\{{"name":"S","type":"*fp32",{s}}}{s}],
+            \\"consts":{{"K":{{"int":5120}},"N":{{"int":384}},"BN":{{"int":{d}}},"BK":{{"int":256}},"CPG":{{"int":1}},"RB":{{"int":{d}}},"PDL":{{"int":{d}}}{s}}}}}
+        , .{ if (i == 0) "" else ",", i, i, ptr, ptr, ptr, ptr, rows_param, rpTile(v.rb).bn, v.rb, v.pdl, if (one) ",\"rows\":{\"int\":1}" else "" });
+        defer gpa.free(entry);
+        try text.appendSlice(gpa, entry);
+    }
+    try text.appendSlice(gpa, "]}");
+    return std.json.parseFromSlice(aot.SetJson, gpa, text.items, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+}
+
+test "rowmm_gate past 16 rows: one launch when the kit resolves it, else 16-row pieces over consecutive rows" {
+    const gpa = std.testing.allocator;
+    const saved = tri.decode_rows;
+    defer tri.decode_rows = saved;
+    tri.decode_rows = 32; // a TF_DS_ROUND_ROWS=32 round
+    const x: u64 = 0x1000_0000;
+    const s: u64 = 0x2000_0000;
+    // the published kit's shape: RB 1..16 (rows folded at 1, plain, div16 at 16), no RB > 16
+    const base = [_]PartsVariant{ .{ .rb = 1, .rows = "one" }, .{ .rb = 16, .rows = "d16" } };
+    const published = try partsKit(gpa, &base);
+    defer published.deinit();
+    // RB = rows present but compiled with PDL 0 while the launch passes PDL 1: a different constexpr never resolves
+    const wrong_pdl = try partsKit(gpa, &(base ++ [_]PartsVariant{ .{ .rb = 17, .rows = "any", .pdl = 0 }, .{ .rb = 32, .rows = "d16", .pdl = 0 } }));
+    defer wrong_pdl.deinit();
+    // RB = 32 compiled for rows div16 only: a 32-row launch fits it, and no 17-row one
+    const r32 = try partsKit(gpa, &(base ++ [_]PartsVariant{ .{ .rb = 17, .rows = "any" }, .{ .rb = 32, .rows = "d16" } }));
+    defer r32.deinit();
+    for ([_]usize{ 17, 32 }) |rows| {
+        // RB absent, and RB present with the wrong PDL: the split, each piece resolving in that kit
+        for ([_][]const aot.KernelJson{ published.value.kernels, wrong_pdl.value.kernels }) |kit| {
+            var log: tri.Log = .{ .gpa = gpa };
+            defer log.deinit();
+            const kc = try rowmmGate(.{ .log = &log, .kit = kit }, x, 5120, 0x3000_0000, s, rows, 5120, 384);
+            try std.testing.expectEqual(@as(usize, 20), kc);
+            try std.testing.expectEqual(@as(usize, 2), log.items.items.len);
+            const want_rows = [_]usize{ 16, rows - 16 };
+            for (log.items.items, 0..) |l, i| {
+                try std.testing.expectEqualStrings("_rowmm_parts", l.name);
+                try std.testing.expectEqual(x + i * 16 * 5120 * 2, l.args[0].value.ptr.addr);
+                try std.testing.expectEqual(s + i * 16 * 20 * 384 * 4, l.args[3].value.ptr.addr);
+                try std.testing.expectEqual(@as(i32, @intCast(want_rows[i])), l.args[4].value.i32);
+                for (l.consts) |c| if (std.mem.eql(u8, c.name, "RB")) try std.testing.expectEqual(@as(?i64, @intCast(want_rows[i])), c.int);
+                try std.testing.expectEqual(tri.cdiv(384, rpTile(want_rows[i]).bn), l.grid[0]);
+                try std.testing.expect(aot.specsHave(kit, l.name, l.args, l.consts));
+            }
+        }
+        // RB = rows present and fitting: one launch, which that kit resolves
+        var one: tri.Log = .{ .gpa = gpa };
+        defer one.deinit();
+        _ = try rowmmGate(.{ .log = &one, .kit = r32.value.kernels }, x, 5120, 0x3000_0000, s, rows, 5120, 384);
+        try std.testing.expectEqual(@as(usize, 1), one.items.items.len);
+        try std.testing.expect(aot.specsHave(r32.value.kernels, "_rowmm_parts", one.items.items[0].args, one.items.items[0].consts));
+        // PDL off in the engine (TF_DS_TRITON_PDL=0) against that PDL-1 kit: the single launch does not resolve, so the split
+        var off: tri.Log = .{ .gpa = gpa };
+        defer off.deinit();
+        _ = try rowmmGate(.{ .log = &off, .kit = r32.value.kernels, .pdl = false }, x, 5120, 0x3000_0000, s, rows, 5120, 384);
+        try std.testing.expectEqual(@as(usize, 2), off.items.items.len);
+    }
+    // an argument specialization the variant does not hold (S off 16 bytes; RB 32 assumes it aligned) is not "has":
+    // the split (whose pieces miss in this kit as well, so Set.run reports MissingTritonVariant as before)
+    var mis: tri.Log = .{ .gpa = gpa };
+    defer mis.deinit();
+    _ = try rowmmGate(.{ .log = &mis, .kit = r32.value.kernels }, x, 5120, 0x3000_0000, s + 4, 32, 5120, 384);
+    try std.testing.expectEqual(@as(usize, 2), mis.items.items.len);
+    // 16 rows and fewer: one launch whatever the kit
+    var log: tri.Log = .{ .gpa = gpa };
+    defer log.deinit();
+    _ = try rowmmGate(.{ .log = &log, .kit = published.value.kernels }, x, 5120, 0x3000_0000, s, 16, 5120, 384);
+    try std.testing.expectEqual(@as(usize, 1), log.items.items.len);
 }
 
 /// route() on a recorded case: rowmm_gate's chunk sums S [R, KC, NE] or plain logits L [R, NE].

@@ -3,7 +3,9 @@
 const std = @import("std");
 
 /// Each .cu in zig/kernels/cuda (`src`, else `name`) with the flags its Python extension passes in `extra_cuda_cflags`.
-const Kernel = struct { name: []const u8, flags: []const []const u8, src: ?[]const u8 = null, arch_specific: bool = false };
+/// opt_in: built and embedded only with -Dport_kernels (a kernel no served path calls yet, not yet through nvcc on a
+/// Spark): without it the fatbin step, -Dfatbins and the dist build neither compile nor need it, and its image is empty.
+const Kernel = struct { name: []const u8, flags: []const []const u8, src: ?[]const u8 = null, arch_specific: bool = false, opt_in: bool = false };
 
 /// The torch-op replacements' qualification flags (runs/006): no contraction, no flush to zero.
 const torch_ops = &[_][]const u8{ "-O3", "--fmad=false", "--ftz=false" };
@@ -31,6 +33,7 @@ const kernels = [_]Kernel{
     .{ .name = "dsv41_torch", .flags = torch_ops }, // ours: DeepSeek-V4.1 torch arithmetic at torch's rounding points
     .{ .name = "dsv41_shard", .flags = torch_ops }, // ours: TF_DS_KV_SHARD's fetch and select byte movers (GLM 0118 port)
     .{ .name = "dsv41_rdma", .src = "dsv41/rdma_gather", .flags = &.{"-O3"} }, // ours: the decode gathers' RDMA kernel pair
+    .{ .name = "dsv41_port", .flags = torch_ops, .opt_in = true }, // ours: the GLM port's spill block staging (port_kernels.zig; fetch/select/union are dsv41_shard)
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
@@ -48,16 +51,22 @@ fn stagger(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     return b.createModule(.{ .root_source_file = b.path("zig/src/core/stagger.zig"), .target = target, .optimize = optimize });
 }
 
-/// The runtime module for `target`; `with_kernels` false builds it host-only (empty images).
+/// The runtime module for `target`; `with_kernels` false builds it host-only (empty images). An opt-in kernel's image
+/// may be null (not built): `has_<name>` says whether it is embedded.
 fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, images: []const ?std.Build.LazyPath) *std.Build.Module {
     const options = b.addOptions();
     var with = images.len > 0;
-    for (images) |i| with = with and i != null;
+    if (with) for (kernels, images) |k, i| {
+        if (!k.opt_in and i == null) with = false;
+    };
     options.addOption(bool, "with_kernels", with);
+    for (kernels, 0..) |k, i| {
+        if (k.opt_in) options.addOption(bool, b.fmt("has_{s}", .{k.name}), with and images[i] != null);
+    }
     const cuda = b.createModule(.{ .root_source_file = b.path("zig/src/cuda/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
     cuda.addOptions("kernel_options", options);
     cuda.addImport("stagger", stagger(b, target, optimize));
-    if (with) for (kernels, images) |k, image| cuda.addAnonymousImport(b.fmt("fatbin_{s}", .{k.name}), .{ .root_source_file = image.? });
+    if (with) for (kernels, images) |k, image| if (image) |file| cuda.addAnonymousImport(b.fmt("fatbin_{s}", .{k.name}), .{ .root_source_file = file });
     return cuda;
 }
 
@@ -79,6 +88,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const nvcc = b.option([]const u8, "nvcc", "nvcc (or a wrapper) that builds the CUDA kernel fatbins");
     const prebuilt = b.option([]const u8, "fatbins", "absolute directory of prebuilt <name>.fatbin files to embed");
     const sms = b.option([]const u8, "sm", "SASS targets, comma separated (121; later 120,89)") orelse "121";
+    const port_kernels = b.option(bool, "port_kernels", "also build and embed the GLM port's opt-in kernels (dsv41_port.cu: tf-dsv41-port, spill v2's one-launch staging)") orelse false;
     // the compiler's version text is an input of every fatbin, so a new nvcc rebuilds them all
     const version: ?std.Build.LazyPath = if (prebuilt == null and nvcc != null) blk: {
         const run = b.addSystemCommand(&.{ nvcc.?, "--version" });
@@ -88,6 +98,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     var images: [kernels.len]?std.Build.LazyPath = @splat(null);
     const fatbin_step = b.step("fatbins", "Build and install the CUDA kernel fatbins alone");
     for (kernels, &images) |k, *image| {
+        if (k.opt_in and !port_kernels) continue;
         if (prebuilt) |dir| {
             image.* = b.graph.cwdRelativePath(b.pathJoin(&.{ dir, b.fmt("{s}.fatbin", .{k.name}) }));
         } else if (nvcc) |tool| {
@@ -152,6 +163,10 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     ds_lanes.addImport("cuda", cuda);
     ds_lanes.addImport("lanes", mods.lanes);
     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-lanes", .root_module = ds_lanes }));
+    // the GLM port's spill block staging kernel (dsv41_port.cu) against its CPU reference, one GPU
+    const ds_port = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/port_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    ds_port.addImport("cuda", cuda);
+    b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-port", .root_module = ds_port }));
     _ = nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.core, mods.tokenizer, build_options, true);
 }
 
@@ -213,6 +228,18 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     cli.addImport("lanes", mods.lanes);
     cli.addImport("nemotron", mods.nemotron);
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli })).step);
+    // port_kernels.zig's CPU references and launch geometry (the GLM port's kernels; their GPU check is tf-dsv41-port)
+    const port = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/port_kernels.zig"), .target = host, .optimize = .debug, .link_libc = true });
+    port.addImport("cuda", cuda);
+    const port_run = b.addRunArtifact(b.addTest(.{ .root_module = port }));
+    step.dependOn(&port_run.step);
+    // tri_norm.zig alone (no dsv41 module): the kit-driven _rowmm_parts split for rounds past 16 rows, every recorded launch
+    const norm = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/tri_norm.zig"), .target = host, .optimize = .debug, .link_libc = true });
+    norm.addImport("cuda", cuda);
+    const norm_run = b.addRunArtifact(b.addTest(.{ .root_module = norm }));
+    const port_step = b.step("test-dsv41-port", "The GLM port kernels' CPU references and launch geometry, and tri_norm's gate split (no GPU)");
+    port_step.dependOn(&port_run.step);
+    port_step.dependOn(&norm_run.step);
 }
 
 /// nvcc -fatbin with torch's flags, the kernel's own and one -gencode per SASS target, as the Python build passes them.
@@ -236,6 +263,7 @@ fn fatbin(b: *std.Build, nvcc: []const u8, version: std.Build.LazyPath, k: Kerne
 pub fn distServer(b: *std.Build, target: std.Build.ResolvedTarget, draft_ids: *std.Build.Module, build_options: *std.Build.Step.Options, prebuilt: ?[]const u8) *std.Build.Step.Compile {
     var images: [kernels.len]?std.Build.LazyPath = @splat(null);
     if (prebuilt) |dir| for (kernels, &images) |k, *image| {
+        if (k.opt_in) continue; // no served path calls one
         image.* = b.graph.cwdRelativePath(b.pathJoin(&.{ dir, b.fmt("{s}.fatbin", .{k.name}) }));
     };
     const cuda = runtime(b, target, .fast, if (prebuilt != null) &images else &.{});
@@ -246,6 +274,6 @@ pub fn distServer(b: *std.Build, target: std.Build.ResolvedTarget, draft_ids: *s
 /// Validate the complete named input set, including images unused by today's server.
 pub fn checkDistFatbins(b: *std.Build, dir: []const u8) *std.Build.Step {
     const check = b.addSystemCommand(&.{ "sh", "-c", "for file do [ -f \"$file\" ] && [ -s \"$file\" ] || { echo \"missing or empty CUDA fatbin: $file\" >&2; exit 1; }; done", "check-fatbins" });
-    for (kernels) |k| check.addFileArg(b.graph.cwdRelativePath(b.pathJoin(&.{ dir, b.fmt("{s}.fatbin", .{k.name}) })));
+    for (kernels) |k| if (!k.opt_in) check.addFileArg(b.graph.cwdRelativePath(b.pathJoin(&.{ dir, b.fmt("{s}.fatbin", .{k.name}) })));
     return &check.step;
 }

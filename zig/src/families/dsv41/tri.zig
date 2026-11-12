@@ -15,6 +15,9 @@ pub const Tri = struct {
     log: ?*Log = null,
     /// The "pdl" switch (TF_DS_TRITON_PDL, on in the served build): decode kernels as programmatic dependent launches.
     pdl: bool = true,
+    /// Tests with a log (no set to ask): a kit's variant specs (aot.json `kernels`) that launch-shape choices ask
+    /// instead of a set (aot.specsHave; tri_norm.rowmmPartsPiece). Null with a log: every launch resolves, as recorded.
+    kit: ?[]const aot.KernelJson = null,
 
     pub fn run(t: Tri, name: []const u8, grid: [3]u32, args: []const aot.Arg, consts: []const aot.Const) !void {
         if (t.log) |l| return l.add(name, grid, args, consts);
