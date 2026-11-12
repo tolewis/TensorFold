@@ -153,10 +153,7 @@ __device__ __forceinline__ void lane(const uint8_t* __restrict__ x, const uint8_
                 v0 = v0 + theirs[2 * pr * THREADS + tid];
                 v1 = v1 + theirs[(2 * pr + 1) * THREADS + tid];
             }
-            if (row < M) {
-                const float f = mul(row, col);
-                put(row, col, v0 * f, v1 * f);
-            }
+            if (row < M) put(row, col, v0 * mul(row, col), v1 * mul(row, col + 1));
         }
         cluster.sync();
 #endif
@@ -176,8 +173,7 @@ __device__ __forceinline__ void lane(const uint8_t* __restrict__ x, const uint8_
                         if (col + 1 < N) dst[1] = acc[i][j][2 * h + 1];
                         continue;
                     }
-                    const float f = mul(row, col);
-                    put(row, col, acc[i][j][2 * h] * f, acc[i][j][2 * h + 1] * f);
+                    put(row, col, acc[i][j][2 * h] * mul(row, col), acc[i][j][2 * h + 1] * mul(row, col + 1));
                 }
             }
     }
