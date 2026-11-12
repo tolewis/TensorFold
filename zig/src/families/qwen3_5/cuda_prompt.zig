@@ -10,6 +10,8 @@ const head_dim = geometry.head_dim;
 pub const smem: u32 = 98304;
 /// hpattn_p256_ids_kernel's page ids in shared memory past smem: 3 KiB, so the block stays within 99 KiB.
 pub const page_ids: u32 = 768;
+/// hpattn8_whole2_kernel<256, 8, 2>: 12 raw bytes a thread past smem (its whole2_shared<256, 8>), 99 KiB.
+pub const smem_whole8: u32 = smem + 256 * 12;
 /// Query heads a block (the kernels' HPC) and rows a block (16 a warp, four warp rows).
 const hpc = 2;
 const block_rows = 16 * (8 / hpc);
@@ -20,7 +22,7 @@ pub const symbols = struct {
     pub const bf16 = "_ZN20tf_prefill_attention13hpattn_kernelILi256ELi8ELi2ELi2EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiifiPKixi";
     pub const fp8 = "_ZN20tf_prefill_attention14hpattn8_kernelILi256ELi8ELi2ELi2EEEvPK13__nv_bfloat16PKhS5_PKfS7_PS1_iiiiifiPKixi";
     pub const bf16_whole = "_ZN20tf_prefill_attention19hpattn_whole_kernelILi256ELi8ELi2ELi2EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiifi";
-    pub const fp8_whole = "_ZN20tf_prefill_attention20hpattn8_whole_kernelILi256ELi8ELi2ELi2EEEvPK13__nv_bfloat16PKhS5_PKfS7_PS1_iiiiifi";
+    pub const fp8_whole = "_ZN20tf_prefill_attention21hpattn8_whole2_kernelILi256ELi8ELi2EEEvPK13__nv_bfloat16PKhS5_PKfS7_PS1_iiiiifi";
     pub const bf16_p256 = "_ZN20tf_prefill_attention18hpattn_p256_kernelILi256ELi8ELi2ELi2EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiifiPKixi";
     pub const bf16_p256_ids = "_ZN20tf_prefill_attention22hpattn_p256_ids_kernelILi256ELi8ELi2ELi2EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiifiPKixi";
     pub const chain = "_ZN14tf_gdn_prefill12chain_kernelI13__nv_bfloat16S1_Li64ELi32EEEvPKT_S4_PKS1_PKfPKT0_S8_PfPS1_iii";
@@ -33,7 +35,7 @@ pub fn resolve(attention: cuda.Module, gdn: cuda.Module) !Fns {
     try f.bf16.allowDynamicShared(smem);
     try f.fp8.allowDynamicShared(smem);
     try f.bf16_whole.allowDynamicShared(smem);
-    try f.fp8_whole.allowDynamicShared(smem);
+    try f.fp8_whole.allowDynamicShared(smem_whole8);
     try f.bf16_p256.allowDynamicShared(smem);
     try f.bf16_p256_ids.allowDynamicShared(smem + 4 * page_ids);
     return f;
@@ -94,7 +96,8 @@ pub fn runFrom(e: *E.Engine, layer: usize, from: usize, end: usize) !void {
     const paged = sg.pt != 0;
     var a = arguments(e, sg, layer, rows, from * g.q_heads * head_dim * 2);
     const ids = if (p256(e, sg)) pageIds(sg, rows) else 0;
-    const cfg: cuda.Config = .{ .grid = .{ .x = @intCast((rows + block_rows - 1) / block_rows), .y = @intCast(g.kv_heads * (group / hpc)) }, .block = .{ .x = 256 }, .shared = smem + 4 * ids };
+    const shared = if (!paged and e.kv8) smem_whole8 else smem + 4 * ids;
+    const cfg: cuda.Config = .{ .grid = .{ .x = @intCast((rows + block_rows - 1) / block_rows), .y = @intCast(g.kv_heads * (group / hpc)) }, .block = .{ .x = 256 }, .shared = shared };
     // 256-position pages: the kernel with the page size a constant, page ids in shared memory if they fit
     const f = if (paged) (if (e.kv8) e.prompt_attn.fp8 else if (sg.ptok == 256) (if (ids > 0) e.prompt_attn.bf16_p256_ids else e.prompt_attn.bf16_p256) else e.prompt_attn.bf16) else (if (e.kv8) e.prompt_attn.fp8_whole else e.prompt_attn.bf16_whole);
     try cuda.launch.launch(f, cfg, e.stream, &a);

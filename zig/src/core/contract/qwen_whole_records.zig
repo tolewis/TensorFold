@@ -39,10 +39,10 @@ pub const records = [_]reg.CudaRecord{
         .{ .regs = 255, .static = 0, .bound = 256 },
         .{ .regs = 255, .static = 0, .bound = 256 },
     }, .later_pending = true },
-    .{ .launch = .{ .name = "_ZN20tf_prefill_attention20hpattn8_whole_kernelILi256ELi8ELi2ELi2EEEvPK13__nv_bfloat16PKhS5_PKfS7_PS1_iiiiifi", .symbol = "_ZN20tf_prefill_attention20hpattn8_whole_kernelILi256ELi8ELi2ELi2EEEvPK13__nv_bfloat16PKhS5_PKfS7_PS1_iiiiifi", .image = "prefill_attention", .threads = 256, .dynamic = 98304, .opt_in = true, .min_sm = 80 }, .usage = .{
-        .{ .regs = 255, .static = 0, .bound = 256 },
-        .{ .regs = 255, .static = 0, .bound = 256 },
-        .{ .regs = 255, .static = 0, .bound = 256 },
+    .{ .launch = .{ .name = "_ZN20tf_prefill_attention21hpattn8_whole2_kernelILi256ELi8ELi2EEEvPK13__nv_bfloat16PKhS5_PKfS7_PS1_iiiiifi", .symbol = "_ZN20tf_prefill_attention21hpattn8_whole2_kernelILi256ELi8ELi2EEEvPK13__nv_bfloat16PKhS5_PKfS7_PS1_iiiiifi", .image = "prefill_attention", .threads = 256, .dynamic = 101376, .opt_in = true, .min_sm = 80 }, .usage = .{
+        .{ .regs = 247, .static = 0, .bound = 256 },
+        .{ .regs = 247, .static = 0, .bound = 256 },
+        .{ .regs = 248, .static = 0, .bound = 256 },
         .{ .regs = 255, .static = 0, .bound = 256 },
         .{ .regs = 255, .static = 0, .bound = 256 },
     }, .later_pending = true },

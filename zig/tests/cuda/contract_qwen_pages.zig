@@ -14,6 +14,7 @@ pub const kv_heads = 4;
 const group = q_heads / kv_heads;
 const attn_tiles = 4 * 32 * hd * 2; // cuda_forward.zig's dynamic shared bytes for the bf16 tensor-core tiles
 const prompt_shared = 98304; // cuda_prompt.zig's smem
+const prompt_whole8 = prompt_shared + 256 * 12; // cuda_prompt.zig's smem_whole8
 /// cuda_prompt.zig's symbols: hpattn_kernel<256, 8, 2, 2> and hpattn8_kernel<256, 8, 2, 2>
 const prompt_symbols = .{
     .bf16 = "_ZN20tf_prefill_attention13hpattn_kernelILi256ELi8ELi2ELi2EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiifiPKixi",
@@ -199,7 +200,7 @@ pub fn tailFrom(rows: usize) usize {
 
 const Fns = struct { rope: cuda.Function, partial: cuda.Function, merge: cuda.Function, compact: cuda.Function };
 /// Attention kernels: short streams in `partial`, long ones in `rows`, a chunk in `prompt` (`ids`: by page-id count).
-const Tc = struct { partial: cuda.Function, rows: cuda.Function, prompt: cuda.Function, shared: u32, whole: bool = false, ids: bool = false };
+const Tc = struct { partial: cuda.Function, rows: cuda.Function, prompt: cuda.Function, shared: u32, whole: bool = false, ids: bool = false, prompt_shared: u32 = prompt_shared };
 const page_ids = 768; // cuda_prompt.zig's ceiling on hpattn_p256_ids_kernel's ids
 
 /// rope, attention (`fns.partial`, or `tc`'s kernels), keep on layer 1 of both streams: contiguous, or `tables`' pages.
@@ -295,7 +296,7 @@ fn launch(gpu: check.Gpu, s: cuda.Stream, fns: Fns, f: Fixture, tables: ?[2][]co
             pa.add(@as(c_int, if (t.ids) @intCast(ids) else if (segs[st].pt != 0) @intCast(f.c.ptok) else 1));
         }
         const grid: cuda.launch.Dim3 = .{ .x = @intCast((f.c.rows - from + 63) / 64), .y = kv_heads * (group / 2) };
-        try cuda.launch.launch(t.prompt, .{ .grid = grid, .block = .{ .x = 256 }, .shared = prompt_shared + 4 * ids }, s, &pa);
+        try cuda.launch.launch(t.prompt, .{ .grid = grid, .block = .{ .x = 256 }, .shared = t.prompt_shared + 4 * ids }, s, &pa);
     };
     var r: Result = undefined;
     r.q = try a.dupe(u8, try rig.bytes(qn, f.q.len * 2));
@@ -411,12 +412,13 @@ pub fn run(gpu: check.Gpu) !void {
         whole.whole = true;
         whole.partial = try (if (format == .fp8) kv8 else mod).function(if (format == .fp8) "tf_q35_attn_partial8_whole" else "tf_q35_attn_partial_whole");
         whole.rows = try (if (format == .fp8) kv8 else mod).function(if (format == .fp8) "tf_q35_attn_rows8_whole" else "tf_q35_attn_rows_whole");
-        whole.prompt = try prompt.function(if (format == .fp8) "_ZN20tf_prefill_attention20hpattn8_whole_kernelILi256ELi8ELi2ELi2EEEvPK13__nv_bfloat16PKhS5_PKfS7_PS1_iiiiifi" else "_ZN20tf_prefill_attention19hpattn_whole_kernelILi256ELi8ELi2ELi2EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiifi");
+        whole.prompt = try prompt.function(if (format == .fp8) "_ZN20tf_prefill_attention21hpattn8_whole2_kernelILi256ELi8ELi2EEEvPK13__nv_bfloat16PKhS5_PKfS7_PS1_iiiiifi" else "_ZN20tf_prefill_attention19hpattn_whole_kernelILi256ELi8ELi2ELi2EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiifi");
         if (format == .bf16) {
             try whole.partial.allowDynamicShared(attn_tiles);
             try whole.rows.allowDynamicShared(attn_tiles);
         }
-        try whole.prompt.allowDynamicShared(prompt_shared);
+        if (format == .fp8) whole.prompt_shared = prompt_whole8;
+        try whole.prompt.allowDynamicShared(whole.prompt_shared);
         var p256 = tc; // cuda_prompt.zig's kernels for pages of 256 positions (bf16): page ids from the table
         p256.prompt = try prompt.function(prompt_symbols.bf16_p256);
         try p256.prompt.allowDynamicShared(prompt_shared);

@@ -308,6 +308,8 @@ vision_kernel(const __nv_bfloat16* __restrict__ qkv, __nv_bfloat16* __restrict__
     }
 }
 
+#include "prefill_attention_whole8.cuh"
+
 } // namespace tf_prefill_attention
 
 // Head dim 128, eight warps, eight query heads a block, eight staging slots (Nemotron's 16 heads a KV head).
@@ -356,6 +358,7 @@ template __global__ void tf_prefill_attention::hpattn8_kernel<256, 8, 2, 2>(cons
 template __global__ void tf_prefill_attention::hpattn_whole_kernel<256, 8, 2, 2>(const __nv_bfloat16* __restrict__,
     const __nv_bfloat16* __restrict__, const __nv_bfloat16* __restrict__, __nv_bfloat16* __restrict__, int, int, int, int,
     int, float, int);
-template __global__ void tf_prefill_attention::hpattn8_whole_kernel<256, 8, 2, 2>(const __nv_bfloat16* __restrict__,
+// The e4m3 rows with the keys' bytes staged raw: hpattn8_whole_kernel<256, 8, 2, 2>'s bits in 99 KiB of shared.
+template __global__ void tf_prefill_attention::hpattn8_whole2_kernel<256, 8, 2>(const __nv_bfloat16* __restrict__,
     const uint8_t* __restrict__, const uint8_t* __restrict__, const float* __restrict__, const float* __restrict__,
     __nv_bfloat16* __restrict__, int, int, int, int, int, float, int);
