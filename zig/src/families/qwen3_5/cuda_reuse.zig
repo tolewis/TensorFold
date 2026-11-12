@@ -4,7 +4,8 @@ const cuda = @import("cuda");
 const lanes = @import("lanes");
 const geometry = @import("cuda_geometry.zig");
 const engine = @import("cuda_engine.zig");
-const caches = @import("cuda_cache.zig");
+const hp = @import("cuda_host_pool.zig");
+const copying = @import("cuda_reuse_copies.zig");
 
 const Engine = engine.Engine;
 const Cache = engine.Cache;
@@ -33,11 +34,12 @@ pub const Copy = struct {
     format: Format,
     images: []Seen,
     reading: bool = false, // a restore's queued copies may still read `host`: a drop keeps it until they are done
-    pooled: bool = false, // `host` is a range of the engine's arena (cuda_host_pool.zig)
+    pooled: bool = false, // the bytes are `parts` of the engine's arena (cuda_host_pool.zig); `host` is the first
+    parts: hp.Parts = .{}, // when there is one part, else empty
 
     /// The bytes the copy holds room for, where they are.
     pub fn room(c: *const Copy) usize {
-        return if (c.dev) |b| b.len else c.host.bytes.len;
+        return if (c.dev) |b| b.len else if (c.pooled) c.parts.len() else c.host.bytes.len;
     }
 };
 
@@ -95,74 +97,10 @@ pub const Layout = struct {
     }
 
     /// The key/value buffer's bytes at `cap` (Geometry.kvBytes).
-    fn kvBytes(l: Layout) usize {
+    pub fn kvBytes(l: Layout) usize {
         return l.g.attentions() * 2 * l.g.kv_heads * l.cap * @as(usize, if (l.format == .fp8) head_dim + 4 else head_dim * 2);
     }
 };
-
-/// A piece's device spans: one, or with a page table a run a page (the host copy keeps the contiguous order).
-const Runs = struct {
-    base: u64,
-    pages: ?caches.Paged,
-    page_bytes: usize,
-    in_page: usize,
-    span: usize = 0, // a full page's run of the piece
-    len: usize,
-    page: usize = 0,
-    done: usize = 0,
-
-    const Run = struct { dev: u64, at: usize, len: usize };
-
-    fn of(cache: *const Cache, l: Layout, i: usize, p: Piece) Runs {
-        if (!p.kv or cache.paged == null) return .{ .base = (if (p.kv) cache.kv.ptr else cache.state.ptr) + p.off, .pages = null, .page_bytes = 0, .in_page = 0, .len = p.len };
-        const pg = cache.paged.?;
-        // the piece's offset inside a page: its layout at cap = tokens (Layout.piece), a run of tokens rows a page
-        const in_page: Layout = .{ .g = l.g, .format = l.format, .cap = pg.tokens, .at = pg.tokens };
-        const q = in_page.piece(i);
-        return .{ .base = pg.base, .pages = pg, .page_bytes = in_page.kvBytes(), .in_page = q.off, .span = q.len, .len = p.len };
-    }
-
-    fn next(r: *Runs) ?Run {
-        if (r.done >= r.len) return null;
-        const pg = r.pages orelse {
-            r.done = r.len;
-            return .{ .dev = r.base, .at = 0, .len = r.len };
-        };
-        const n = @min(r.span, r.len - r.done);
-        const run: Run = .{ .dev = r.base + pg.ids[r.page] * r.page_bytes + r.in_page, .at = r.done, .len = n };
-        r.page += 1;
-        r.done += n;
-        return run;
-    }
-};
-
-/// Whether a cache's keys and values go a page a copy: bf16 pages, whose pieces lie back to back a page's rows apart.
-fn wholePages(cache: *const Cache, l: Layout) bool {
-    return cache.paged != null and l.format == .bf16 and l.at > 0;
-}
-
-/// Every bf16 piece's rows from `at`'s pages, one 2D copy a page (`tokens` rows apart there, `at` apart in `copy`).
-fn pageCopies(e: *Engine, cache: *const Cache, l: Layout, copy: *const Copy, off: usize, way: enum { save, restore }) !void {
-    const pg = cache.paged.?;
-    const row = head_dim * 2;
-    const page_bytes = (Layout{ .g = l.g, .format = l.format, .cap = pg.tokens, .at = pg.tokens }).kvBytes();
-    const pieces = l.count() - 1;
-    var p: usize = 0;
-    while (p * pg.tokens < l.at) : (p += 1) {
-        const rows = @min(pg.tokens, l.at - p * pg.tokens);
-        const dev = pg.base + pg.ids[p] * page_bytes;
-        const o = off + p * pg.tokens * row;
-        // the kept side: device memory on an integrated GPU (copy.dev), else the pinned host copy
-        const kept: cuda.abi.DevicePtr = if (copy.dev) |b| b.ptr + o else 0;
-        const host: ?*u8 = if (copy.dev == null) &copy.host.bytes.ptr[o] else null;
-        const kind: c_int = @intCast(if (copy.dev == null) cuda.abi.memory_type_host else cuda.abi.memory_type_device);
-        const m: cuda.abi.Memcpy2D = switch (way) {
-            .save => .{ .src = dev, .src_pitch = pg.tokens * row, .dst_type = kind, .dst_host = host, .dst = kept, .dst_pitch = l.at * row, .width = rows * row, .height = pieces },
-            .restore => .{ .src_type = kind, .src_host = host, .src = kept, .src_pitch = l.at * row, .dst = dev, .dst_pitch = pg.tokens * row, .width = rows * row, .height = pieces },
-        };
-        try e.d.check(e.d.api.cuMemcpy2DAsync_v2(&m, e.stream.handle), "cuMemcpy2DAsync");
-    }
-}
 
 /// Whether a request's images match a kept state's: the same identities at the same rows, for every image before `at`.
 pub fn sameImages(kept: []const Seen, request: []const Seen, at: usize) bool {
@@ -214,10 +152,12 @@ pub fn saveCache(e: *Engine, cache: *Cache, at: usize, seen: []const Seen, devic
     const len = l.total();
     const dev = if (device) try cuda.DeviceBuffer.alloc(e.d, len) else null;
     var pooled = false;
+    var parts: hp.Parts = .{};
     var host: cuda.HostBuffer = if (dev) |_| .{ .d = e.d, .bytes = &.{} } else undefined;
-    if (dev == null) if (try poolTake(e, len)) |range| {
-        host = .{ .d = e.d, .bytes = range };
+    if (dev == null) if (try poolTake(e, len)) |taken| {
+        host = .{ .d = e.d, .bytes = if (taken.n == 1) taken.list[0] else &.{} };
         pooled = true;
+        parts = taken;
     } else {
         std.log.warn("qwen3_5: no arena range for {d} MiB: pinning this copy", .{len >> 20});
         host = try cuda.HostBuffer.alloc(e.d, len);
@@ -225,6 +165,7 @@ pub fn saveCache(e: *Engine, cache: *Cache, at: usize, seen: []const Seen, devic
     copy.* = .{
         .host = host,
         .pooled = pooled,
+        .parts = parts,
         .dev = dev,
         .len = len,
         .at = at,
@@ -236,17 +177,17 @@ pub fn saveCache(e: *Engine, cache: *Cache, at: usize, seen: []const Seen, devic
     var off: usize = 0;
     for (0..l.count()) |i| {
         const p = l.piece(i);
-        if (i == 1 and wholePages(cache, l)) {
-            try pageCopies(e, cache, l, copy, off, .save);
+        if (i == 1 and copying.wholePages(cache, l) and copy.parts.n <= 1) {
+            try copying.pageCopies(e, cache, l, copy, off, .save);
             break;
         }
-        var it = Runs.of(cache, l, i, p);
+        var it = copying.Runs.of(cache, l, i, p);
         while (it.next()) |r| {
             const s, const o = .{ e.stream.handle, off + r.at };
             if (dev) |b|
                 try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(b.ptr + o, r.dev, r.len, s), "cuMemcpyDtoDAsync")
             else
-                try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(host.bytes.ptr + o, r.dev, r.len, s), "cuMemcpyDtoHAsync");
+                try copying.hostRun(e, copy, o, r.dev, r.len, .save);
         }
         off += p.len;
     }
@@ -267,7 +208,7 @@ fn drainThenFree(e: *Engine, copy: *Copy) void {
         }
         return;
     };
-    if (copy.pooled) e.pool.?.give(copy.host.bytes) else copy.host.free();
+    if (copy.pooled) e.pool.?.giveParts(copy.parts) else copy.host.free();
 }
 
 /// Whether `cache` can take the kept state: the same cache format and bytes, a position inside it, the same images.
@@ -288,21 +229,20 @@ pub fn restoreCache(e: *Engine, cache: *Cache, saved: *anyopaque, seen: []const 
     errdefer if (e.stream.synchronize()) |_| {
         copy.reading = false;
     } else |_| std.log.warn("qwen3_5: a failed restore's stream did not drain: its kept state's copy stays", .{});
-    const host = copy.host.bytes.ptr;
     var off: usize = 0;
     for (0..l.count()) |i| {
         const p = l.piece(i);
-        if (i == 1 and wholePages(cache, l)) {
-            try pageCopies(e, cache, l, copy, off, .restore);
+        if (i == 1 and copying.wholePages(cache, l) and copy.parts.n <= 1) {
+            try copying.pageCopies(e, cache, l, copy, off, .restore);
             break;
         }
-        var it = Runs.of(cache, l, i, p);
+        var it = copying.Runs.of(cache, l, i, p);
         while (it.next()) |r| {
             const s, const o = .{ e.stream.handle, off + r.at };
             if (copy.dev) |b|
                 try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(r.dev, b.ptr + o, r.len, s), "cuMemcpyDtoDAsync")
             else
-                try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(r.dev, host + o, r.len, s), "cuMemcpyHtoDAsync");
+                try copying.hostRun(e, copy, o, r.dev, r.len, .restore);
         }
         off += p.len;
     }
@@ -327,8 +267,18 @@ pub fn drop(ptr: *anyopaque, saved: *anyopaque) void {
     const t: *Target = @ptrCast(@alignCast(ptr));
     dropCopy(t.e, @ptrCast(@alignCast(saved)));
 }
-/// A range of the prompt cache's arena (pinned by snap_ready at startup); null when there is no arena.
-fn poolTake(e: *Engine, len: usize) !?[]align(16) u8 { return (e.pool orelse return null).take(len); }
+
+/// The store's prompt-cache budget: the engine pins the arena now, on the load thread with the context current.
+pub fn ready(t: *Target, budget: u64) !u64 {
+    t.e.pool_budget = budget;
+    if (!t.device) try engine.poolPin(t.e);
+    return 0;
+}
+
+/// Ranges of the prompt cache's arena (pinned by snap_ready at startup); null when there is no arena or no room.
+fn poolTake(e: *Engine, len: usize) !?hp.Parts {
+    return (e.pool orelse return null).takeParts(len);
+}
 /// Frees a kept state's copy; after a failed restore whose copies no wait proves done, quarantine takes it.
 pub fn dropCopy(e: *Engine, copy: *Copy) void {
     if (copy.reading) if (e.stream.synchronize()) |_| {
@@ -343,7 +293,7 @@ pub fn dropCopy(e: *Engine, copy: *Copy) void {
             std.log.warn("qwen3_5: a host copy goes to the copy-source quarantine: a restore did not drain", .{});
             cuda.copy_source.retainPinned(e.d, copy.host, e.stream);
         }
-    } else if (copy.pooled) e.pool.?.give(copy.host.bytes) else copy.host.free();
+    } else if (copy.pooled) e.pool.?.giveParts(copy.parts) else copy.host.free();
     e.gpa.free(copy.images);
     e.gpa.destroy(copy);
 }

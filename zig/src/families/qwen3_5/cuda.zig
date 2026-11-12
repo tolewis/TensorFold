@@ -53,6 +53,7 @@ test {
     _ = @import("cuda_pend_test.zig");
     _ = @import("cuda_reuse_pages_test.zig");
     _ = @import("cuda_host_pool.zig");
+    _ = @import("cuda_reuse_arena_test.zig");
 }
 
 pub const slide = @import("cuda_slide.zig");

@@ -50,10 +50,7 @@ pub const snap_bytes = reuse.bytes;
 pub const snap_save = reuse.save;
 pub const snap_restore = reuse.restore;
 pub const snap_drop = reuse.drop;
-/// The store's prompt-cache budget: the engine pins the arena now, on the load thread with the context current.
-pub fn snap_ready(t: *reuse.Target, budget: u64) !u64 {
-    t.e.pool_budget = budget; if (!t.device) try @import("cuda_engine.zig").poolPin(t.e); return 0;
-}
+pub const snap_ready = reuse.ready;
 pub const snap_host = true;
 pub const snap_lookahead: u32 = 0;
 pub const snap_grid: u32 = E.max_rows;
