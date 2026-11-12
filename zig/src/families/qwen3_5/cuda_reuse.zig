@@ -33,6 +33,7 @@ pub const Copy = struct {
     format: Format,
     images: []Seen,
     reading: bool = false, // a restore's queued copies may still read `host`: a drop keeps it until they are done
+    pooled: bool = false, // `host` is a range of the engine's arena (cuda_host_pool.zig)
 
     /// The bytes the copy holds room for, where they are.
     pub fn room(c: *const Copy) usize {
@@ -212,9 +213,18 @@ pub fn saveCache(e: *Engine, cache: *Cache, at: usize, seen: []const Seen, devic
     // a cuMemAlloc takes ~4 ms where pinning the same 650 MB takes ~180: on shared memory nothing needs pinning
     const len = l.total();
     const dev = if (device) try cuda.DeviceBuffer.alloc(e.d, len) else null;
-    const host: cuda.HostBuffer = if (dev) |_| .{ .d = e.d, .bytes = &.{} } else try cuda.HostBuffer.alloc(e.d, len);
+    var pooled = false;
+    var host: cuda.HostBuffer = if (dev) |_| .{ .d = e.d, .bytes = &.{} } else undefined;
+    if (dev == null) if (try poolTake(e, len)) |range| {
+        host = .{ .d = e.d, .bytes = range };
+        pooled = true;
+    } else {
+        std.log.warn("qwen3_5: no arena range for {d} MiB: pinning this copy", .{len >> 20});
+        host = try cuda.HostBuffer.alloc(e.d, len);
+    };
     copy.* = .{
         .host = host,
+        .pooled = pooled,
         .dev = dev,
         .len = len,
         .at = at,
@@ -251,11 +261,13 @@ fn drainThenFree(e: *Engine, copy: *Copy) void {
         return b.free();
     }
     e.stream.synchronize() catch {
-        std.log.warn("qwen3_5: a failed save's host copy goes to the copy-source quarantine: its stream did not drain", .{});
-        cuda.copy_source.retainPinned(e.d, copy.host, e.stream);
+        if (copy.pooled) std.log.warn("qwen3_5: a failed save's pooled copy stays out of the arena: no drain", .{}) else {
+            std.log.warn("qwen3_5: a failed save's host copy goes to the quarantine: no drain", .{});
+            cuda.copy_source.retainPinned(e.d, copy.host, e.stream);
+        }
         return;
     };
-    copy.host.free();
+    if (copy.pooled) e.pool.?.give(copy.host.bytes) else copy.host.free();
 }
 
 /// Whether `cache` can take the kept state: the same cache format and bytes, a position inside it, the same images.
@@ -315,7 +327,8 @@ pub fn drop(ptr: *anyopaque, saved: *anyopaque) void {
     const t: *Target = @ptrCast(@alignCast(ptr));
     dropCopy(t.e, @ptrCast(@alignCast(saved)));
 }
-
+/// A range of the prompt cache's arena (pinned by snap_ready at startup); null when there is no arena.
+fn poolTake(e: *Engine, len: usize) !?[]align(16) u8 { return (e.pool orelse return null).take(len); }
 /// Frees a kept state's copy; after a failed restore whose copies no wait proves done, quarantine takes it.
 pub fn dropCopy(e: *Engine, copy: *Copy) void {
     if (copy.reading) if (e.stream.synchronize()) |_| {
@@ -325,9 +338,12 @@ pub fn dropCopy(e: *Engine, copy: *Copy) void {
         const why = "qwen3_5: a kept state's device copy stays allocated: a restore's copies did not drain";
         if (copy.reading) std.log.warn(why, .{}) else b.free();
     } else if (copy.reading) {
-        std.log.warn("qwen3_5: a kept state's host copy goes to the copy-source quarantine: a restore's copies did not drain", .{});
-        cuda.copy_source.retainPinned(e.d, copy.host, e.stream);
-    } else copy.host.free();
+        // pooled bytes stay out of the arena and out of the quarantine: a copy may still read them
+        if (copy.pooled) std.log.warn("qwen3_5: a pooled copy stays out of the arena: a restore did not drain", .{}) else {
+            std.log.warn("qwen3_5: a host copy goes to the copy-source quarantine: a restore did not drain", .{});
+            cuda.copy_source.retainPinned(e.d, copy.host, e.stream);
+        }
+    } else if (copy.pooled) e.pool.?.give(copy.host.bytes) else copy.host.free();
     e.gpa.free(copy.images);
     e.gpa.destroy(copy);
 }

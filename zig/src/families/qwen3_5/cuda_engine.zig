@@ -77,6 +77,16 @@ pub const Keep = union(enum) {
 /// A kept row's draw on the device: sample.cu's keyed rule at `position`, or greedy without one.
 pub const Draw = struct { rule: ?cuda.sample.Rule, position: u64 };
 
+/// Pin the prompt cache's arena at the store's budget now: snap_ready runs on the load thread, context current.
+pub fn poolPin(e: *Engine) !void {
+    if (e.pool_budget == 0 or e.pool != null) return;
+    const hp = @import("cuda_host_pool.zig");
+    const len: usize = @intCast(@min(e.pool_budget, std.math.maxInt(usize)));
+    const t0 = hp.monotonicMs();
+    e.pool = try hp.Pool.pinned(e.gpa, e.d, len);
+    std.debug.print("qwen3_5: prompt-cache arena: {d} MiB pinned in {d} ms\n", .{ len >> 20, hp.monotonicMs() - t0 });
+}
+
 pub const Engine = struct {
     rec_scratch: recurrent.Pool,
     startup: profile.Times = .{},
@@ -159,6 +169,9 @@ pub const Engine = struct {
     tables: DeviceBuffer,
     staged: cuda.HostBuffer,
     host_logits: cuda.HostBuffer,
+    /// One pinned arena the prompt cache's kept states come from (cuda_host_pool.zig): a save takes a range.
+    pool: ?*@import("cuda_host_pool.zig").Pool = null,
+    pool_budget: u64 = 0, // the prompt-cache budget the arena is sized to (snap_ready sets it)
     /// The kept rows' device draws, when forward was given them.
     tokens: [most_verify]u32 = undefined,
     /// presence and frequency penalties the next forward takes from its kept rows' logits (staged by the caller).
@@ -208,6 +221,8 @@ pub const Engine = struct {
         e.kv8 = kv8;
         e.rope_table = 0; // plain rope until cuda_rope.zig uploads a YaRN table (the engine starts undefined)
         e.rope_buf = null;
+        e.pool = null; // the prompt cache's arena: pinned at startup by poolPin
+        e.pool_budget = 0;
         e.window_rows = most_window;
         e.arena_at = 0;
         e.graphs = .empty;
@@ -299,6 +314,7 @@ pub const Engine = struct {
     }
 
     pub fn deinit(e: *Engine) void {
+        if (e.pool) |x| x.deinit();
         recurrent.shutdown(e);
         @import("cuda_rope_table.zig").free(e);
         if (e.kit) |k| k.deinit(e.gpa);

@@ -50,24 +50,24 @@ pub const snap_bytes = reuse.bytes;
 pub const snap_save = reuse.save;
 pub const snap_restore = reuse.restore;
 pub const snap_drop = reuse.drop;
+/// The store's prompt-cache budget: the engine pins the arena now, on the load thread with the context current.
+pub fn snap_ready(t: *reuse.Target, budget: u64) !u64 {
+    t.e.pool_budget = budget; if (!t.device) try @import("cuda_engine.zig").poolPin(t.e); return 0;
+}
 pub const snap_host = true;
 pub const snap_lookahead: u32 = 0;
 pub const snap_grid: u32 = E.max_rows;
 /// --learn-conversations: the kept states' disk image, the probe their identity hashes, the facts they depend on.
 pub const kept_disk = @import("cuda_disk.zig");
-
 /// cuda_prefill cuts a cold pass at the request's chunk starts too, so the server may send its message starts.
 pub const request_starts = true;
 pub const request_starts_switch = "TF_QWEN_REQUEST_STARTS";
-
 /// explain() words open refusals too (--vision on a checkpoint without a tower it reads).
 pub const explains_open = true;
-
 /// The server's reading of the room left now; null if unreadable.
 pub const Room = struct { ctx: *anyopaque, read: *const fn (*anyopaque) ?u64 };
 /// `room` and `drafter` size an EXL3 checkpoint's load: its embedding rows go to host memory when the card is short.
 pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, vision: ?vision.Limits = null, kv8: bool = false, prompt_int8: bool = false, precision: ?enum { full } = null, rope_yarn: ?f64 = null, room: ?Room = null, drafter: ?[]const u8 = null };
-
 /// The window --context may ask for: the config's, or the YaRN window its block or --rope-yarn makes (cuda_rope.zig).
 pub fn contextCeiling(a: std.mem.Allocator, io: std.Io, dir: []const u8, flag: ?f64) !i64 {
     return @intCast((try cuda_rope.resolveDir(a, io, dir, flag)).ceiling);

@@ -90,6 +90,10 @@ test "Qwen paged reuse: a bf16 save and restore copy a page each into the copy's
     for (0..8) |i| e.g.linear[i] = i % 4 != 3;
     e.stream = .{ .d = &d, .handle = null };
     if (comptime @hasField(engine.Engine, "kv8")) e.kv8 = false;
+    if (comptime @hasField(engine.Engine, "pool")) {
+        e.pool = null; // no arena in a fake engine: a save pins its own copy
+        e.pool_budget = 0;
+    }
     var ids = [_]u32{ 3, 0, 2, 1 };
     var cache: engine.Cache = undefined;
     cache.cap = 64;
