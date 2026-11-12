@@ -138,6 +138,7 @@ pub const Dev = struct {
         attn_gate: ze.H,
         swiglu: ze.H,
         argmax: ze.H,
+        argmax_v: ze.H,
         argmax_part: ze.H,
         argmax_part_masked: ze.H,
         tap: ze.H,
@@ -164,6 +165,7 @@ pub const Dev = struct {
         tp_probe: ze.H = null, // the flag lab spin probe (TF_TP_FLAGLAB)
         gdn_commit: ze.H = null, // XPU_GDN bit 64 (lane p4-k-sk1): every GDN layer's commit replay in one launch
         conv_commit_ml: ze.H = null, // and every GDN layer's convolution state commit in one launch
+        argmax_tp: ze.H = null, // XPU_HSPLIT (WP6): the two half-vocab winners to the global winner (the 27B only)
         attn_prompt: ze.H,
         attn_prompt8: ze.H,
         embed_dense: ze.H,

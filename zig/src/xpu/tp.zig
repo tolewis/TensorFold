@@ -58,12 +58,21 @@ const follower_dead = 30.0;
 /// The 5 s warning has fired for the current stale stretch, so a slow follower logs one line, not one a round.
 var late_warned = false;
 // the exported block a rank: the peer's pushed partials (2 slots), the flag words the peer writes (2), the peer's
-// consumed counters (2), a timeout word
+// consumed counters (2), a timeout word, then with XPU_HSPLIT (WP6) the head split: the peer's half-vocab winners, the
+// peer's halves of the head rows (rank 0's block only reads them) and the head flag the peer writes
 const blk_slots = 2 * slot_bytes;
 const blk_flag = blk_slots;
 const blk_pcons = blk_flag + 16;
 const blk_timeout = blk_pcons + 16;
-const blk_devflag_bytes = blk_timeout + 64;
+const head_half_bytes = 16 * (q.VOCAB / 2) * 2; // the head rows' halves (16 rows x VOCAB/2 fp16)
+const blk_head_win = blk_timeout + 64; // XPU_HSPLIT: the 16 half-vocab winners, f32[16] values then i32[16] idx (128 bytes)
+const blk_head_half = blk_head_win + 128;
+const blk_head_flag = blk_head_half + head_half_bytes; // one flag word
+/// XPU_HSPLIT (WP6, read at the open): the block holds the head area. Off, the block is the size of today.
+pub var hsplit_env = false;
+fn devflagBytes() usize {
+    return if (hsplit_env) blk_head_flag + 16 else blk_head_win;
+}
 const blk_legacy_bytes = 4 * slot_bytes; // the device-direct path: this rank's two slots, then its two peer copies
 const fh_ring = 512; // host staging slots for the flag value (a round queues at most 128 exchanges before a settle)
 pub const rec_words = 1024; // 4 KiB a record
@@ -421,6 +430,7 @@ pub const Group = struct {
             exmode = if (s.len > 0 and (s[0] == '3' or s[0] == '4')) s[0] - '0' else 0;
             evmode = s.len > 0 and (s[0] == '2' or exmode != 0);
         }
+        hsplit_env = if (std.c.getenv("XPU_HSPLIT")) |v| (std.mem.span(v).len > 0 and v[0] != '0') else false; // WP6
         record_wait = 180.0;
         if (std.c.getenv("TF_TP_RECORD_WAIT")) |v| {
             const want = std.fmt.parseFloat(f64, std.mem.span(v)) catch 180.0;
@@ -910,6 +920,60 @@ pub const Group = struct {
         if (g.ev) try g.consumeEv(d, par) else try g.consume(d, par);
     }
 
+    /// XPU_HSPLIT (WP6, `docs/B70-PHASE-4-WP6-head-split.md` in the Recipe), the EX exchange only (TF_TP_DEVFLAG=3 or
+    /// 4). Rank 0 holds the low half of the head's vocab rows, rank 1 the high half. On this rank's in-order list: the
+    /// push of its half-vocab winners (`tok`: i32[16] local idx, then f32[16] values, 128 bytes, one copy) into the
+    /// peer's block; on rank 1 also its halves of the `rows` head rows (only rank 0 samples, so only rank 0 reads them);
+    /// then the head flag in the peer's block (a driver store in mode 3, an 8-byte copy in mode 4); then the wait for
+    /// the peer's head flag in this rank's block, a counter based event as in exPush. The fence form of p4-lab-1 proved
+    /// the flag word only. The event's wait also makes the pushed winners and halves visible, as it does for the
+    /// all-reduce's slot. Then argmax_tp merges the two winners into the global one, in place. The head flag takes the
+    /// next `g.seq`. Reuse: the peer pushes the next forward's head only after its waits for this rank's all-reduce flags
+    /// of that forward, and this rank writes those flags after every command queued before them (argmax_tp, headSplice).
+    pub fn headExchange(g: *Group, d: *Dev, tok: *anyopaque, logits: *anyopaque, rows: u32) !void {
+        if (g.ex == 0) return error.HeadSplitNeedsEx;
+        const HALF: usize = q.VOCAB / 2;
+        g.seq += 1;
+        if (g.seq > g.ev_max) try g.resetWords(d); // as exPush: the completion value stays under the driver's maximum
+        const pb = g.peer_blk.?;
+        try dev.copy(d, off(pb, blk_head_win), tok, 128); // the winners: idx then values
+        if (g.rank != 0) try dev.copy(d, off(pb, blk_head_half), logits, @as(usize, rows) * HALF * 2); // rows back to back
+        const flag = off(pb, blk_head_flag);
+        if (g.ex == 3) {
+            const desc: ze.ZexWriteDesc = .{ .writeScope = 4 }; // host scope: the word is on the peer, outside this device
+            try ze.check(d.g.zex_write.?(d.list, &desc, flag, g.seq));
+        } else {
+            const hi: usize = @intCast(g.seq % fh_ring);
+            g.fh[hi] = g.seq;
+            try dev.copy(d, flag, @ptrCast(&g.fh[hi]), 8);
+        }
+        var wa = [1]ze.H{try g.newEvent(d, off(g.blk.?, blk_head_flag), g.seq)};
+        try ze.check(d.g.api.zeCommandListAppendWaitOnEvents(d.list, 1, &wa));
+        const own_off: i32 = if (g.rank == 0) 0 else @intCast(HALF);
+        const peer_off: i32 = if (g.rank == 0) @intCast(HALF) else 0;
+        try d.launch(d.k.argmax_tp.?, .{ .x = rows }, .{
+            tok, //                             OWN idx (this rank's half winner, in [0, HALF))
+            off(tok, 64), //                    OWN value
+            off(g.blk.?, blk_head_win), //      PEER idx (the peer's half winner, in [0, HALF))
+            off(g.blk.?, blk_head_win + 64), // PEER value
+            own_off, //
+            peer_off, //
+            tok, //                             OUT: the global winner, in place
+            off(tok, 64), //                    OUTV
+        });
+    }
+
+    /// XPU_HSPLIT: row `row` of the last forward's head as the full vocab, into `low` and `high` (VOCAB/2 fp16 each,
+    /// host or device memory): rank 0's half from `logits`, rank 1's half from this rank's block (headExchange pushed
+    /// it). Rank 0 only: only rank 1 pushes its halves.
+    pub fn headSplice(g: *Group, d: *Dev, logits: *anyopaque, row: u32, low: *anyopaque, high: *anyopaque) !void {
+        if (g.rank != 0) return error.HeadRowsOnRankZeroOnly;
+        const half2: usize = @as(usize, q.VOCAB / 2) * 2;
+        const rowoff: usize = @as(usize, row) * half2;
+        try dev.copy(d, low, off(logits, rowoff), half2);
+        try dev.copy(d, high, off(g.blk.?, blk_head_half + rowoff), half2);
+    }
+
     /// Pushes this rank's partial into the peer's slot and then the flag, both on the in-order list: the peer's
     /// kernel sees the partial complete before the flag.
     fn push(g: *Group, d: *Dev, partial: *anyopaque, n: usize, par: usize) !void {
@@ -997,6 +1061,10 @@ pub const Group = struct {
         try labCopy(d, off(g.blk.?, blk_flag), zero, 32); // this rank's block: the flags and the peer-consumed words
         try labCopy(d, g.own_cons.?, zero, 16);
         try labCopy(d, off(g.peer_blk.?, blk_flag), zero, 32); // the flags and consumed counters this rank wrote there
+        if (hsplit_env) { // XPU_HSPLIT: the head flag words take the same sequence numbers
+            try labCopy(d, off(g.blk.?, blk_head_flag), zero, 8);
+            try labCopy(d, off(g.peer_blk.?, blk_head_flag), zero, 8);
+        }
         var b: u8 = 1;
         try sendByte(g.lab_conn, b);
         try recvByte(g.lab_conn, &b); // the barrier: neither rank pushes before the other has reset
@@ -1055,7 +1123,7 @@ pub const Group = struct {
     fn openDirect(g: *Group, d: *Dev, conn: linux.fd_t) !void {
         if (g.tp != 2) return error.DirectNeedsTwoRanks;
         const want_flag = devflag;
-        const blk = try d.g.deviceAlloc(if (want_flag) blk_devflag_bytes else blk_legacy_bytes);
+        const blk = try d.g.deviceAlloc(if (want_flag) devflagBytes() else blk_legacy_bytes);
         var handle: ze.IpcHandle = undefined;
         try ze.check(d.g.api.zeMemGetIpcHandle(d.g.context, blk, &handle));
         var fds = [1]i32{std.mem.readInt(i32, handle.data[0..4], .little)};
@@ -1098,7 +1166,7 @@ pub const Group = struct {
                 g.ev_max = maxv;
                 g.ev = true;
                 // the block stays resident, so the peer's writes into it are read by the event's counter
-                const rrc = cb.zeContextMakeMemoryResident(d.g.context, d.g.device, blk, blk_devflag_bytes);
+                const rrc = cb.zeContextMakeMemoryResident(d.g.context, d.g.device, blk, devflagBytes());
                 if (rrc != 0) std.log.warn("qwen27-xpu: TP rank {d}: the block is not made resident (Level Zero 0x{x})", .{ g.rank, rrc });
                 // bounded time when the peer stops: a settle that a lost peer holds ends the process (the group's
                 // own deadline is 180 s; a round's settle is milliseconds and a prompt slice's is seconds)
@@ -1278,8 +1346,8 @@ pub const Group = struct {
             var maxv: u64 = 0;
             const mrc = cb.zeDeviceGetCounterBasedEventMaxValue(d.g.device, &maxv);
             std.debug.print(P ++ "E5 max value rc 0x{x} value {d}\n", .{ rank, mrc, maxv });
-            const rrc = cb.zeContextMakeMemoryResident(d.g.context, d.g.device, g.blk.?, blk_devflag_bytes);
-            std.debug.print(P ++ "E5 make resident rc 0x{x} bytes {d}\n", .{ rank, rrc, blk_devflag_bytes });
+            const rrc = cb.zeContextMakeMemoryResident(d.g.context, d.g.device, g.blk.?, devflagBytes());
+            std.debug.print(P ++ "E5 make resident rc 0x{x} bytes {d}\n", .{ rank, rrc, devflagBytes() });
             const hhost = try d.g.hostAlloc(64); // v2's host word: set to 0 and never changed
             @memset(@as([*]u8, @ptrCast(hhost))[0..64], 0);
             const word = off(g.blk.?, blk_flag);
@@ -1667,7 +1735,7 @@ test "the device-direct block: a rank's slot i is where its peer reads it, and t
     try std.testing.expectEqual(4 * slot_bytes, blk_legacy_bytes);
     // the device-flag block holds the same two slots and then the flags, so its slots have the same offsets
     try std.testing.expectEqual(2 * slot_bytes, blk_slots);
-    try std.testing.expect(blk_devflag_bytes > blk_slots);
+    try std.testing.expect(blk_head_win > blk_slots);
 }
 
 test "a fresh generation is never zero" {
