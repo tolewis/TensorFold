@@ -5,6 +5,10 @@ const pc = @import("prompt_cache.zig");
 /// Which states `victimButIf` may choose. `.any` is today's order. `.frees` and `.returns` skip a state the hook says frees nothing.
 pub const Gate = enum { any, frees, returns };
 
+fn isActiveRewind(s: *const pc.Store, e: *const pc.Entry, prompt: []const u32) bool {
+    return !e.expired and e.at == s.active_rewind_at and e.tokens.len <= prompt.len and std.mem.eql(u32, e.tokens, prompt[0..e.tokens.len]);
+}
+
 pub fn victimBut(s: *const pc.Store, skip: ?*pc.Entry, prompt: []const u32, born: u32) ?usize {
     return victimIn(s, skip, prompt, born, false);
 }
