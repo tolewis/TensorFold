@@ -19,6 +19,7 @@ pub const few_tokens = 32;
 
 /// Token rows from which a pass's expert calls take the prompt kernels, over plans of `prompt_tile` pairs an item.
 pub const prompt_tokens = 128;
+const prompt4w_shared: u32 = 4 * 13824; // tf_ck4_prompt2: QSTAGES * sizeof(Step2)
 
 /// Pairs a prompt plan item holds: ck_experts.cu's prompt tile rows (decode plans hold 16).
 pub const prompt_tile = 128;
@@ -61,6 +62,7 @@ pub const Ck = struct {
     quant8_rows_fn: Function, // per-row activation scale, then e4m3 rows
     quant4_rows_fn: Function, // NVFP4 rows under the checkpoint's input scale: codes then block scales
     prompt4_fn: Function, // the NVFP4 prompt GEMM (block-scaled FP4 mma)
+    prompt4w_fn: Function, // the same on a 128 x 256 tile, for a column count that 256 divides
     reduce: Function,
     quant8_fn: Function,
     quant4_fn: Function,
@@ -72,6 +74,7 @@ pub const Ck = struct {
     prompt_fns: [3]Function, // over prompt plans: relu^2 up to NVFP4 rows, fp32 down, share-summed down (256 threads)
     prompt_resident: [3]usize,
     clusters: bool,
+    sms: usize,
 
     pub fn load(d: *const Driver, capability_major: u32, sms: usize) !Ck {
         if (!kernels.available) return error.BuiltWithoutKernels;
@@ -89,6 +92,8 @@ pub const Ck = struct {
         c.quant8_rows_fn = try lane_mod.function("tf_ck_quant8_rows");
         c.quant4_rows_fn = try lane_mod.function("tf_ck_quant4_rows");
         c.prompt4_fn = try lane_mod.function("tf_ck4_prompt");
+        c.prompt4w_fn = try lane_mod.function("tf_ck4_prompt2");
+        try c.prompt4w_fn.allowDynamicShared(prompt4w_shared);
         for ([_][:0]const u8{ "tf_ck8_128r", "tf_ck8_128rc" }, &c.lane_r) |name, *f| f.* = try lane_mod.function(name);
         try c.lane_r[1].allowDynamicShared(65536);
         c.quant4_fn = try experts_mod.function("tf_ck_quant4");
@@ -104,6 +109,7 @@ pub const Ck = struct {
             n.* = @max(1, try f.occupancy(256, 0)) * sms;
         }
         c.clusters = capability_major >= 9;
+        c.sms = sms;
         return c;
     }
 
@@ -168,9 +174,14 @@ pub const Ck = struct {
         a.add(alpha(w.act, w.scale));
         a.add(y);
         for ([_]usize{ m, w.n, w.k, w.npad, group }) |v| a.add(@as(i32, @intCast(v)));
-        try launch_.launch(c.prompt4_fn, .{
-            .grid = .{ .x = @intCast(((m + 127) / 128) * ((w.n + 127) / 128)), .y = 1, .z = 1 },
+        const rows_t = (m + 127) / 128;
+        // Both tiles give a row the same bits. The wide one wins from where the 128-column grid passes one block an SM.
+        const wide = w.n % 256 == 0 and rows_t * (w.n / 128) > c.sms;
+        const bn: usize = if (wide) 256 else 128;
+        try launch_.launch(if (wide) c.prompt4w_fn else c.prompt4_fn, .{
+            .grid = .{ .x = @intCast(rows_t * ((w.n + bn - 1) / bn)), .y = 1, .z = 1 },
             .block = .{ .x = 256, .y = 1, .z = 1 },
+            .shared = if (wide) prompt4w_shared else 0,
         }, s, &a);
     }
 
