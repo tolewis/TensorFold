@@ -365,7 +365,8 @@ const Run = struct {
         if (r.is_chat) {
             const message = try json.newObject(a);
             try message.put(a, "role", .{ .string = "assistant" });
-            try message.put(a, "content", if (calls != null) .null else .{ .string = reply.content });
+            // the text before the calls is the reply's too (DeepSeek-V4.1's reference parser keeps it as the content)
+            try message.put(a, "content", if (calls != null and reply.content.len == 0) .null else .{ .string = reply.content });
             if (reply.reasoning) |t| if (t.len > 0) try message.put(a, "reasoning_content", .{ .string = t });
             if (calls) |c| try message.put(a, "tool_calls", .{ .array = c });
             try choice.put(a, "message", .{ .object = message });

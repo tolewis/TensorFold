@@ -8,11 +8,16 @@ pub const think_markers: Markers = .{ .open = "", .close = "</think>" };
 /// The opener a reply writes itself when its template leaves the think block to it (Kolibri 1's does).
 const think_open = "<think>";
 pub const channel_markers: Markers = .{ .open = "<|channel>thought", .close = "<channel|>" };
-/// (opener, closer) of a tool call's markup: Qwen's, Gemma 4's, DeepSeek-V4's DSML block, DeepSeek-V4.1's.
+/// (opener, closer) of a tool call's markup: Qwen's, Gemma 4's, DeepSeek-V4's DSML block, DeepSeek-V4.1's. DeepSeek-V4.1's
+/// reference parser (encoding.py, parse_message_from_completion_text) starts the calls at "\n\n<｜DSML｜ calls": the two
+/// newlines are the calls', not the text's, and the template writes them back in front of the block. The entry with them
+/// keeps them out of the streamed text and holds a trailing newline back until the next token says whether calls follow;
+/// the one without still reads a block the model opened without them.
 pub const calls = [_][2][]const u8{
     .{ "<tool_call>", "</tool_call>" },
     .{ "<|tool_call>", "<tool_call|>" },
     .{ "<\u{ff5c}DSML\u{ff5c}tool_calls>", "</\u{ff5c}DSML\u{ff5c}tool_calls>" },
+    .{ "\n\n<\u{ff5c}DSML\u{ff5c} calls>", "</\u{ff5c}DSML\u{ff5c} calls>" },
     .{ "<\u{ff5c}DSML\u{ff5c} calls>", "</\u{ff5c}DSML\u{ff5c} calls>" },
 };
 
@@ -340,4 +345,30 @@ test "a reply that writes its own think opener keeps the tag out of its reasonin
         try std.testing.expectEqualStrings("Plan.\n", s.reasoning);
         try std.testing.expectEqualStrings("Done.", s.answer);
     }
+}
+
+test "DeepSeek-V4.1's calls take their two newlines: text streams without them, and they wait for the next token" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const block = "<\u{ff5c}DSML\u{ff5c} calls>\n<\u{ff5c}DSML\u{ff5c} invoke name=\"t\">\n</\u{ff5c}DSML\u{ff5c} invoke>\n</\u{ff5c}DSML\u{ff5c} calls>";
+    const reply = "I will check.\n\n" ++ block;
+    // every prefix streams the text and nothing past it, and only ever grows
+    var sent: []const u8 = "";
+    for (1..reply.len + 1) |n| {
+        const shown = try hideToolCalls(a, reply[0..n], false);
+        try std.testing.expect(std.mem.startsWith(u8, "I will check.", shown) and std.mem.startsWith(u8, shown, sent));
+        sent = shown;
+    }
+    try std.testing.expectEqualStrings("I will check.", try hideToolCalls(a, reply, true));
+    // newlines that end a paragraph come out with the next token, or at the reply's end
+    try std.testing.expectEqualStrings("a", try hideToolCalls(a, "a\n\n", false));
+    try std.testing.expectEqualStrings("a\n\nb", try hideToolCalls(a, "a\n\nb", false));
+    try std.testing.expectEqualStrings("a\n\n", try hideToolCalls(a, "a\n\n", true));
+    // a block opened without them, and a third newline, which stays the text's
+    try std.testing.expectEqualStrings("a", try hideToolCalls(a, "a" ++ block, true));
+    try std.testing.expectEqualStrings("a\n", try hideToolCalls(a, "a\n\n\n" ++ block, true));
+    // a call written inside the think block: the reasoning ends where the calls start, as the reference reads it
+    const t = try splitThinking(a, "plan\n\n" ++ block, true, think_markers);
+    try std.testing.expectEqualStrings("plan", t.reasoning);
 }
