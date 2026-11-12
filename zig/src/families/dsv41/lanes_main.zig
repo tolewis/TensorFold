@@ -242,6 +242,8 @@ pub fn main(init: std.process.Init) !u8 {
         }
         const side: ?*dsv41.lanes.SpillFollower = if (spill) |sp| try dsv41.native.followerSpill(gpa, io, m, o, sp, staging.?, &events) else null;
         defer if (side) |sd| sd.destroy();
+        // the pair's one rank_wire Follower: the spill side's fingerprint, or round 2's shard-only hello for
+        // TF_DS_KV_SHARD alone (lanes.followPair)
         dsv41.lanes.followWith(gpa, m, side) catch |err| {
             try w.print("{{\"rank\": {d}, \"follow\": \"{s}\"}}\n", .{ o.rank, @errorName(err) });
             try w.flush();
@@ -265,25 +267,31 @@ pub fn main(init: std.process.Init) !u8 {
     const reqs = (try std.json.parseFromSliceLeaky(Requests, a, text, .{ .ignore_unknown_fields = true })).requests;
     var ln = dsv41.lanes.Lanes.init(gpa, m);
     defer ln.deinit();
-    try ln.startKv(); // (TF_DS_KV_SHARD: the parts agreed with the followers before the first request)
-    ln.fix_k = fix_k;
-    // the spill tier and the prompt cache over it (the server's wiring: native/cuda.zig openWith)
+    // the pair's one rank_wire Leader (the spill tier and TF_DS_KV_SHARD share it), then the parts agreed with the
+    // followers before the first request
+    try dsv41.native.openPair(gpa, io, m, &ln, o, spill);
+    // the spill tier before the parts' planner (native.zig's order: both ranks scan their stores at once), then the
+    // prompt cache over it (the server's wiring: native/cuda.zig openWith)
     var events: []cuda.Event = &.{};
     defer {
         for (events) |*e| e.deinit();
         if (events.len > 0) gpa.free(events);
     }
+    if (spill) |sp| events = try dsv41.native.openSpill(gpa, io, m, &ln, o, sp, staging.?);
+    defer if (ln.spill) |t| { // (after the prompt cache's store, before the events)
+        t.destroy();
+        ln.spill = null;
+    };
+    try ln.startKv();
+    ln.fix_k = fix_k;
     var snap_vt: pcache.Snapshots.VTable = undefined;
     var store_v: pcache.Store = undefined;
     var store: ?*pcache.Store = null;
     defer if (store) |st| {
         _ = st.flush(@as(u64, spill.?.flush_ms) * std.time.ns_per_ms);
         st.deinit();
-        if (ln.spill) |t| t.destroy();
-        ln.spill = null;
     };
-    if (spill) |sp| {
-        events = try dsv41.native.openSpill(gpa, io, m, &ln, o, sp, staging.?);
+    if (spill != null) {
         const L = dsv41.lanes.Lanes;
         snap_vt = .{ .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .usable = L.usableFn };
         store_v = pcache.Store.init(gpa, .{ .ptr = &ln, .vtable = &snap_vt }, .{ .grid = dsv41.model.chunk_rows, .window = @intCast(m.cfg.window) }, @intFromFloat(cache_gib * (1 << 30)));

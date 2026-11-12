@@ -31,8 +31,6 @@ const Allocator = std.mem.Allocator;
 
 pub const Digest = format.Digest;
 
-/// The lanes.zig Kind that carries the spill notes (rank 0's write-at-keep and metadata, not answered).
-pub const note_kind: u8 = 11;
 /// The small state's one section in a point (snapCopy's bytes, the layout's small planes in order).
 pub const section_name = "dsv41.small";
 /// Blocks a pump stages at most (GLM 0110's PUMP_BLOCKS).
@@ -118,6 +116,22 @@ pub fn eventCount(p: spill.slots.Plan) usize {
     return p.write + p.read + p.small + p.restore + 1;
 }
 
+/// The store's owner layout and the wire's for a state layout.
+pub fn storeLayout(l: *const state.StateLayout) format.OwnerLayout {
+    return if (l.owner_layout == .owner_sharded) .owner_sharded else .replicated;
+}
+
+pub fn wireLayout(l: *const state.StateLayout) rank_wire.OwnerLayout {
+    return if (l.owner_layout == .owner_sharded) .owner_sharded else .replicated;
+}
+
+/// A rank's store namespace: its own common digest (Agreement.storeCommon) and the format's fields, the owner
+/// layout among them (TF_DS_KV_SHARD's owner_sharded stores and replicated ones never share one; the part size is in
+/// the common digest's planes field).
+pub fn storeCompat(a: fingerprint.Agreement, rank: u16, l: *const state.StateLayout) Digest {
+    return format.compatDigest(a.storeCommon(rank), storeLayout(l), @intCast(l.geo.block_tokens), l.block_bytes);
+}
+
 /// The id the prompt cache knows a point by: its key's first 8 bytes (the key is a SHA-256).
 pub fn pointId(key: Digest) u64 {
     return std.mem.readInt(u64, key[0..8], .little);
@@ -191,7 +205,7 @@ pub const KeepArgs = struct {
     base: usize, // the kept state's extent
     snap: u64, // its Snap.id
     buf: u64, // its device buffer (the small state)
-    lineage: format.Lineage,
+    lineage: format.Lineage, // owner_sharded: salted with the extent's part (Lineage.inPart; refused without)
     origin: ?format.Origin = null,
     shared: bool = false,
     group: u64 = 0,
@@ -267,11 +281,14 @@ pub fn Side(comptime Dev: type) type {
             const plan = try stagingPlan(s, &layout);
             if (staging.len < plan.bytes()) return error.StagingTooSmall;
             if (events.len < eventCount(plan)) return error.TooFewEvents;
-            if (layout.owner_layout != .replicated) return error.OwnerShardedNotPorted; // PORT(round3): owner_sharded
+            // owner_sharded (TF_DS_KV_SHARD): this rank owns part `rank`; its store keeps that part's points with every
+            // plane and other parts' with their replicated planes (foreign_block_bytes)
+            const sharded = layout.owner_layout == .owner_sharded;
+            if (sharded and (layout.part_rows == 0 or layout.foreign_block_bytes == 0)) return error.NoParts;
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
             self.* = .{ .gpa = gpa, .io = io, .store = undefined, .layout = layout, .gens = gens, .pk = undefined, .dev = dev, .plan = plan, .regions = undefined, .lists = undefined, .events = events, .bt = @intCast(layout.geo.block_tokens), .reqs = &.{} };
-            self.pk = .{ .dev = dev, .layout = &self.layout, .gens = &self.gens };
+            self.pk = .{ .dev = dev, .layout = &self.layout, .gens = &self.gens, .rank = rank };
             var off: usize = 0;
             for ([_]usize{ plan.write * plan.block_slot, plan.read * plan.block_slot, plan.small * plan.small_slot, plan.restore * plan.small_slot }, 0..) |n, i| {
                 self.regions[i] = @alignCast(staging[off..][0..n]);
@@ -286,8 +303,8 @@ pub fn Side(comptime Dev: type) type {
                 .root = dir,
                 .rank = rank,
                 .compat = compat,
-                .owner_layout = .replicated,
-                .limits = .{ .max_tokens = max_tokens, .block_tokens = self.bt, .block_bytes = layout.block_bytes, .max_small_bytes = std.mem.alignForward(u64, layout.small_bytes, 256) },
+                .owner_layout = storeLayout(&layout),
+                .limits = .{ .max_tokens = max_tokens, .block_tokens = self.bt, .block_bytes = layout.block_bytes, .foreign_block_bytes = if (sharded) layout.foreign_block_bytes else 0, .own_part = rank, .max_small_bytes = std.mem.alignForward(u64, layout.small_bytes, 256) },
                 .cap_bytes = s.capBytes(),
                 .floor_bytes = s.floorBytes(),
                 .quota = s.quota,
@@ -360,6 +377,11 @@ pub fn Side(comptime Dev: type) type {
         pub fn keepPoint(self: *Self, k: KeepArgs) Kept {
             const at = k.at;
             if (at == 0 or at % self.bt != 0 or k.keyed.len < at) return .refused;
+            // owner_sharded: the lineage names the extent's part (its names, its block sizes on this rank)
+            if (self.layout.owner_layout == .owner_sharded) {
+                const part = k.lineage.part orelse return .refused;
+                if (part != self.layout.partOf(k.base) or part != self.layout.partOf(k.base + at - 1)) return .refused;
+            }
             if (self.writes.contains(k.snap)) return .stored;
             const pin = self.gens.pin(k.base, k.base + at) catch return .refused;
             self.writes.ensureUnusedCapacity(self.gpa, 1) catch return .refused;
@@ -421,6 +443,19 @@ pub fn Side(comptime Dev: type) type {
                     self.done(cp);
                 } else i += 1;
             }
+        }
+
+        /// Whether kept state `snap`'s unpublished write still reads its rows (blocks not yet staged): rank 0's
+        /// planner.setPending (a stale, move or carry of it is then preceded by a stage op).
+        pub fn writePending(self: *Self, snap: u64) bool {
+            const w = self.writes.get(snap) orelse return false;
+            return self.store.pins(.{ .id = snap, .generation = w.pin.stamp }, 0);
+        }
+
+        /// writePending for many kept states at once (one store lock: Store.pinsAny), `out[i]` for `snaps[i]`.
+        pub fn writesPending(self: *Self, snaps: []const u64, out: []bool) void {
+            self.store.pinsAny(snaps, out);
+            for (snaps, out) |id, *o| o.* = o.* and self.writes.contains(id);
         }
 
         /// Whether a write of point `key` is still queued here (not yet published, cancelled or failed).
@@ -725,145 +760,37 @@ pub fn Side(comptime Dev: type) type {
     };
 }
 
-// -- notes: rank 0's write-at-keep and metadata, in the ordered stream (lanes Kind 11, not answered) ----------------
+// -- the keep notice: rank 0's write at keep as rank_wire carries it ------------------------------------------------
 
-pub const NoteOp = enum(u8) { keep = 1, share = 2, touch = 3, forget = 4 };
-
-/// A keep note: what a follower needs to write its own copy of the point rank 0 just kept.
-pub const KeepNote = struct {
-    slot: u32,
-    snap: u64,
-    base: u64,
-    at: u32,
-    key: Digest,
-    group: u64,
-    shared: bool,
-    lineage: format.Lineage, // (decoded: forks in the caller's buffer)
-    origin: ?format.Origin,
-};
-
-const NW = struct {
-    buf: *std.ArrayList(u8),
-    gpa: Allocator,
-
-    fn bytes(w: NW, b: []const u8) !void {
-        try w.buf.appendSlice(w.gpa, b);
-    }
-
-    fn int(w: NW, comptime T: type, v: T) !void {
-        var b: [@sizeOf(T)]u8 = undefined;
-        std.mem.writeInt(T, &b, v, .little);
-        try w.bytes(&b);
-    }
-};
-
-const NR = struct {
-    b: []const u8,
-    at: usize = 0,
-
-    fn take(r: *NR, n: usize) ![]const u8 {
-        if (n > r.b.len - r.at) return error.ShortNote;
-        defer r.at += n;
-        return r.b[r.at..][0..n];
-    }
-
-    fn int(r: *NR, comptime T: type) !T {
-        return std.mem.readInt(T, (try r.take(@sizeOf(T)))[0..@sizeOf(T)], .little);
-    }
-
-    fn flag(r: *NR) !bool {
-        return switch (try r.int(u8)) {
-            0 => false,
-            1 => true,
-            else => error.BadNote,
-        };
-    }
-};
-
-pub fn encodeKeep(gpa: Allocator, out: *std.ArrayList(u8), n: KeepNote) !void {
-    out.clearRetainingCapacity();
-    const w: NW = .{ .buf = out, .gpa = gpa };
-    try w.int(u8, @intFromEnum(NoteOp.keep));
-    try w.int(u32, n.slot);
-    try w.int(u64, n.snap);
-    try w.int(u64, n.base);
-    try w.int(u32, n.at);
-    try w.bytes(&n.key);
-    try w.int(u64, n.group);
-    try w.int(u8, @intFromBool(n.shared));
-    try w.bytes(&n.lineage.root);
-    try w.int(u8, @intFromBool(n.lineage.part != null));
-    try w.int(u32, n.lineage.part orelse 0);
-    try w.int(u32, @intCast(n.lineage.forks.len));
-    for (n.lineage.forks) |f| {
-        try w.bytes(&f.name);
-        try w.int(u32, f.at);
-    }
-    try w.int(u8, @intFromBool(n.origin != null));
-    const o = n.origin orelse format.Origin{ .key = @splat(0), .at = 0 };
-    try w.bytes(&o.key);
-    try w.int(u32, o.at);
+/// rank_wire's keep for a kept state rank 0 writes (`forks` holds the lineage's forks: at most max_keep_forks).
+pub fn keepMsg(slot: u32, kept: u64, base: u64, at: u32, key: Digest, group: u64, shared: bool, lin: format.Lineage, origin: ?format.Origin, forks: []rank_wire.Fork) !rank_wire.Keep {
+    if (lin.forks.len > forks.len or lin.forks.len > rank_wire.max_keep_forks) return error.TooManyForks;
+    for (lin.forks, forks[0..lin.forks.len]) |f, *o| o.* = .{ .name = f.name, .at = f.at };
+    return .{ .slot = slot, .kept = kept, .base = base, .at = at, .point = key, .group = group, .shared = shared, .root = lin.root, .part = lin.part, .origin = if (origin) |o| .{ .key = o.key, .at = o.at } else null, .forks = forks[0..lin.forks.len] };
 }
 
-pub fn encodeKey(gpa: Allocator, out: *std.ArrayList(u8), op: NoteOp, key: Digest) !void {
-    out.clearRetainingCapacity();
-    const w: NW = .{ .buf = out, .gpa = gpa };
-    try w.int(u8, @intFromEnum(op));
-    try w.bytes(&key);
+/// A keep's lineage as core/spill takes it (`forks` holds its forks).
+pub fn keepLineage(m: rank_wire.Keep, forks: []format.Fork) !format.Lineage {
+    if (m.forks.len > forks.len) return error.TooManyForks;
+    for (m.forks, forks[0..m.forks.len]) |f, *o| o.* = .{ .name = f.name, .at = f.at };
+    return .{ .root = m.root, .part = m.part, .forks = forks[0..m.forks.len] };
 }
 
-pub const Note = union(NoteOp) { keep: KeepNote, share: Digest, touch: Digest, forget: Digest };
-
-/// A note's fields, bounded (`forks` holds the lineage's forks: more than it holds is refused), nothing after them.
-pub fn decodeNote(bytes: []const u8, forks: []format.Fork) !Note {
-    var r: NR = .{ .b = bytes };
-    const op = std.enums.fromInt(NoteOp, try r.int(u8)) orelse return error.BadNote;
-    const note: Note = switch (op) {
-        .keep => blk: {
-            var n: KeepNote = undefined;
-            n.slot = try r.int(u32);
-            n.snap = try r.int(u64);
-            n.base = try r.int(u64);
-            n.at = try r.int(u32);
-            @memcpy(&n.key, try r.take(32));
-            n.group = try r.int(u64);
-            n.shared = try r.flag();
-            var root: [16]u8 = undefined;
-            @memcpy(&root, try r.take(16));
-            const has_part = try r.flag();
-            const part = try r.int(u32);
-            const nf = try r.int(u32);
-            if (nf > forks.len) return error.BadNote;
-            for (forks[0..nf]) |*f| {
-                @memcpy(&f.name, try r.take(16));
-                f.at = try r.int(u32);
-            }
-            n.lineage = .{ .root = root, .part = if (has_part) part else null, .forks = forks[0..nf] };
-            const has_origin = try r.flag();
-            var ok: Digest = undefined;
-            @memcpy(&ok, try r.take(32));
-            const oat = try r.int(u32);
-            n.origin = if (has_origin) .{ .key = ok, .at = oat } else null;
-            if (n.at == 0 or n.snap == 0) return error.BadNote;
-            break :blk .{ .keep = n };
-        },
-        inline .share, .touch, .forget => |t| blk: {
-            var k: Digest = undefined;
-            @memcpy(&k, try r.take(32));
-            break :blk @unionInit(Note, @tagName(t), k);
-        },
-    };
-    if (r.at != bytes.len) return error.BadNote;
-    return note;
+pub fn keepOrigin(m: rank_wire.Keep) ?format.Origin {
+    const o = m.origin orelse return null;
+    return .{ .key = o.key, .at = o.at };
 }
 
 // -- rank 0 ---------------------------------------------------------------------------------------------------------
 
 /// A restore's destination as the family made it: a fresh kept state (lanes.zig: a Snap with its extent reserved, in
 /// `snaps` but not usable until installed) and its device buffer.
-pub const Dest = struct { saved: *anyopaque, id: u64, base: usize, buf: u64 };
-/// A kept state as the tier needs it.
-pub const SnapInfo = struct { id: u64, base: usize, at: usize, buf: u64, slot: u32 };
+/// `gen`: owner_sharded, the destination's parts generation (the planner's hold: rank_wire Reserve.generation).
+/// `gen` and `size`: owner_sharded, the planner hold's generation and extent (Reserve carries both; 0: unsharded).
+pub const Dest = struct { saved: *anyopaque, id: u64, base: usize, buf: u64, gen: u64 = 0, size: usize = 0 };
+/// A kept state as the tier needs it. `part`: TF_DS_KV_SHARD, its part (parts.Planner.saltOf: the salt its blocks
+/// are named by; null when unsharded, or when the planner does not hold it: then it is not written).
+pub const SnapInfo = struct { id: u64, base: usize, at: usize, buf: u64, slot: u32, part: ?u8 = null };
 
 /// Rank 0's family side (lanes.zig's Lanes).
 pub const Family = struct {
@@ -871,7 +798,8 @@ pub const Family = struct {
     /// A destination for a restore of `at` positions (placement, its buffer); an error: no room now. `room`: the
     /// positions the request waiting on it needs from the same base (its prompt; >= at), a hint: the family holds
     /// that much free past the rows while room allows, so the resume runs in place instead of copying the extent.
-    reserve: *const fn (ptr: *anyopaque, at: usize, room: usize) anyerror!Dest,
+    /// `part`: owner_sharded, the point's recorded part (its owner's codes are there): the destination lies in it.
+    reserve: *const fn (ptr: *anyopaque, at: usize, room: usize, part: ?u8) anyerror!Dest,
     /// The restored state is installed on every rank: usable from now (Lanes.usable).
     install: *const fn (ptr: *anyopaque, saved: *anyopaque) void,
     /// A restore that did not commit: its state removed and freed.
@@ -887,13 +815,20 @@ pub const Wire = struct {
     links: []const ?link.Link,
 };
 
+/// Rank 0's status asks for one restore at most this often (each a round trip answered from memory).
+pub const status_every_ns: u64 = std.time.ns_per_ms;
+/// rank 0's sleep between status asks inside one poll's budget, at most.
+pub const status_nap_ns: u64 = 200 * std.time.ns_per_us;
+
 pub fn Leader(comptime Dev: type) type {
     return struct {
         const Self = @This();
         pub const S = Side(Dev);
 
-        const Job = struct { rx: *Rx, txn: u64, point: pc.Point, saved: *anyopaque, sent: u32 = 0 };
-        const PointRef = struct { key: Digest, at: u32, room: u32 = 0 }; // room: the last lookup's prompt length
+        /// `ready_at`: when rank 0's own copies finished (its status polls begin); `asked_at`: its last status ask.
+        /// `copied`: the followers' least copied blocks at the last status.
+        const Job = struct { rx: *Rx, txn: u64, point: pc.Point, saved: *anyopaque, sent: u32 = 0, ready_at: u64 = 0, asked_at: u64 = 0, copied: u32 = 0 };
+        const PointRef = struct { key: Digest, at: u32, room: u32 = 0, part: ?u32 = null }; // room: the last lookup's prompt length; part: its salt
         const Noted = struct { key: Digest };
 
         gpa: Allocator,
@@ -901,6 +836,7 @@ pub fn Leader(comptime Dev: type) type {
         fam: Family,
         wire: ?Wire,
         lead: ?*rank_wire.Leader,
+        own_lead: bool = true, // false: the pair's one Leader (Lanes.rw), shared with the KV parts and freed by them
         min_tokens: u32,
         max_restores: u32, // restores in flight at most (Settings.restores, the store's reads; <= rank_wire.max_restores)
         flush_ms: u32,
@@ -913,7 +849,10 @@ pub fn Leader(comptime Dev: type) type {
         next_name: u64 = 0xC000_0000_0000_0000,
         boot: [16]u8,
         lin: std.ArrayList(pc.Fork) = .empty, // a ready restore's lineage (valid during its poll)
-        note_buf: std.ArrayList(u8) = .empty,
+        wire_forks: []rank_wire.Fork = &.{}, // a keep's forks as rank_wire carries them (max_keep_forks, with followers)
+        status_asks: u64 = 0, // restore status asks sent (non-blocking polls)
+        validate_asks: u64 = 0, // validates asked (each only once every follower reported complete)
+        ready_first_poll: u64 = 0, // of those, the restores every follower completed within the poll rank 0 got ready in
         presence_refused: u64 = 0,
         misses: u64 = 0,
         peers: [rank_wire.max_world - 1]pc.TierCounts = @splat(.{}), // the followers' counters (stats, at most 1/s)
@@ -943,7 +882,9 @@ pub fn Leader(comptime Dev: type) type {
         /// its `compat()`, the agreed pair) are null with one rank. `boot` salts this process's lineage names.
         pub fn create(gpa: Allocator, side: *S, fam: Family, wire: ?Wire, lead: ?*rank_wire.Leader, s: Settings, boot: [16]u8) !*Self {
             const self = try gpa.create(Self);
-            self.* = .{ .gpa = gpa, .side = side, .fam = fam, .wire = wire, .lead = lead, .min_tokens = s.min_tokens, .max_restores = @intCast(@max(1, @min(s.restores, rank_wire.max_restores))), .flush_ms = s.flush_ms, .boot = boot };
+            errdefer gpa.destroy(self);
+            const wf: []rank_wire.Fork = if (wire != null) try gpa.alloc(rank_wire.Fork, rank_wire.max_keep_forks) else &.{};
+            self.* = .{ .gpa = gpa, .side = side, .fam = fam, .wire = wire, .lead = lead, .min_tokens = s.min_tokens, .max_restores = @intCast(@max(1, @min(s.restores, rank_wire.max_restores))), .flush_ms = s.flush_ms, .boot = boot, .wire_forks = wf };
             return self;
         }
 
@@ -958,8 +899,8 @@ pub fn Leader(comptime Dev: type) type {
             self.fwd.deinit(self.gpa);
             self.rev.deinit(self.gpa);
             self.lin.deinit(self.gpa);
-            self.note_buf.deinit(self.gpa);
-            if (self.lead) |l| self.gpa.destroy(l);
+            if (self.wire_forks.len > 0) self.gpa.free(self.wire_forks);
+            if (self.own_lead) if (self.lead) |l| self.gpa.destroy(l);
             self.gpa.destroy(self);
         }
 
@@ -1017,16 +958,44 @@ pub fn Leader(comptime Dev: type) type {
             };
         }
 
-        fn note(self: *Self) void {
-            if (self.broken != null) return;
+        /// Every follower's store open (each opens it on its own thread at the agreement, rank 0's scan meanwhile):
+        /// asked with stats of set open every `poll_ns` (each ask within stats_ns), for as long as every follower
+        /// still scanning reports progress (more names read) within `idle_ns` (the Leader's hello_ns by default), so a
+        /// store of any size opens and a scan that stopped fails the start (error.FollowerScanStalled). A follower
+        /// whose open failed ends, and the ask fails with the pair (its log names the cause). Before any spill
+        /// command: a follower answers them only once its store is open.
+        pub fn awaitFollowers(self: *Self, idle_ns: ?u64, poll_ns: u64) !void {
             const w = self.wire orelse return;
-            w.frame(w.ctx, note_kind, self.note_buf.items) catch |e| self.markBroken(e);
+            const l = self.lead.?;
+            const idle = idle_ns orelse l.timeouts.hello_ns;
+            var seen: [rank_wire.max_world - 1]u64 = @splat(0);
+            var since: [rank_wire.max_world - 1]u64 = @splat(monotonicNs());
+            var replies: [rank_wire.max_world - 1]rank_wire.Frame = undefined;
+            while (true) {
+                _ = try self.ask(0, .{ .stats = .{ .set = .open } }, &replies);
+                var open = true;
+                const now = monotonicNs();
+                for (replies[0..w.links.len], 0..) |f, i| {
+                    const r = f.msg.stats_reply;
+                    if (r.n < rank_wire.open_values or r.values[0] != 0) continue; // (n = 0: no store to wait for)
+                    open = false;
+                    if (r.values[1] != seen[i]) {
+                        seen[i] = r.values[1];
+                        since[i] = now;
+                    } else if (now -| since[i] >= idle) {
+                        std.log.warn("dsv41 spill: rank {d}'s store scan made no progress for {d} ms ({d} names read): the start fails", .{ i + 1, idle / std.time.ns_per_ms, seen[i] });
+                        return error.FollowerScanStalled;
+                    }
+                }
+                if (open) return;
+                std.Io.sleep(self.side.io, .fromNanoseconds(poll_ns), .awake) catch {};
+            }
         }
 
-        fn noteKey(self: *Self, op: NoteOp, key: Digest) void {
+        /// A point's metadata to every follower (share, touch, forget: each its own rank_wire transaction).
+        fn notice(self: *Self, msg: rank_wire.Msg) void {
             if (self.wire == null) return;
-            encodeKey(self.gpa, &self.note_buf, op, key) catch return;
-            self.note();
+            _ = self.post(0, msg) catch {};
         }
 
         /// Write cancellations the followers should hear (their own copies of a point rank 0 lost).
@@ -1035,7 +1004,7 @@ pub fn Leader(comptime Dev: type) type {
             if (self.wire == null) return;
             for (self.side.lost.items) |l| {
                 if (!self.noted.contains(l.snap)) continue;
-                _ = self.post(0, .{ .write_cancelled = .{ .point = l.key, .kept = l.snap, .generation = 0, .why = l.why } }) catch return;
+                _ = self.post(0, .{ .write_cancelled = .{ .point = l.key, .kept = l.snap, .why = l.why } }) catch return;
             }
         }
 
@@ -1086,7 +1055,7 @@ pub fn Leader(comptime Dev: type) type {
             self.side.guard(snap, from);
             if (self.wire == null) return;
             const n = self.noted.get(snap) orelse return;
-            _ = self.post(0, .{ .write_staged = .{ .point = n.key, .kept = snap, .generation = 0, .upto = from / self.side.bt } }) catch {};
+            _ = self.post(0, .{ .write_staged = .{ .point = n.key, .kept = snap, .upto = from / self.side.bt } }) catch {};
         }
 
         /// Kept state `snap` is about to be freed (snapDropFn, the store's release): guarded from 0, its small-state
@@ -1105,6 +1074,15 @@ pub fn Leader(comptime Dev: type) type {
             self.side.bumpSlot(slot);
         }
 
+        /// Rank 0's own write of kept state `snap` still reads its rows (the planner's pending flag).
+        pub fn writePending(self: *Self, snap: u64) bool {
+            return self.side.writePending(snap);
+        }
+
+        pub fn writesPending(self: *Self, snaps: []const u64, out: []bool) void {
+            self.side.writesPending(snaps, out);
+        }
+
         // -- the Tier ---------------------------------------------------------------------------------------------
 
         fn lookupFn(ptr: *anyopaque, want: *const pc.Want) ?pc.Point {
@@ -1115,7 +1093,7 @@ pub fn Leader(comptime Dev: type) type {
                 return null;
             };
             const id = pointId(hit.key);
-            self.points.put(self.gpa, id, .{ .key = hit.key, .at = hit.at, .room = @intCast(@min(want.key.len, std.math.maxInt(u32))) }) catch return null;
+            self.points.put(self.gpa, id, .{ .key = hit.key, .at = hit.at, .room = @intCast(@min(want.key.len, std.math.maxInt(u32))), .part = hit.part }) catch return null;
             return .{ .id = id, .at = hit.at, .tokens = hit.at + want.lookahead, .bytes = 0, .group = hit.group, .shared = hit.shared };
         }
 
@@ -1129,7 +1107,12 @@ pub fn Leader(comptime Dev: type) type {
             if (info.at != at) return null;
             var forks: std.ArrayList(format.Fork) = .empty;
             defer forks.deinit(self.gpa);
-            const lin = self.toLineage(kept.lineage, &forks) catch return null;
+            var lin = self.toLineage(kept.lineage, &forks) catch return null;
+            // a lineage longer than one keep carries is not written at all (no rank holds a point another lacks)
+            if (self.wire != null and lin.forks.len > rank_wire.max_keep_forks) return null;
+            // TF_DS_KV_SHARD: the blocks are named for the part the rows lie in (GLM 0118 in_part: replaced, never
+            // stacked; a lineage from disk or from a resumed state has its root only, the cache's lineage carries none)
+            if (self.side.layout.owner_layout == .owner_sharded) lin = lin.inPart(info.part orelse return null);
             const origin: ?format.Origin = if (kept.parent) |p| (if (self.points.get(p)) |r| .{ .key = r.key, .at = kept.fork } else null) else null;
             const keyed = kept.key[0..at];
             const key = format.pointKey(keyed, bt, &.{});
@@ -1138,14 +1121,16 @@ pub fn Leader(comptime Dev: type) type {
             const id = pointId(key);
             const gop = self.points.getOrPut(self.gpa, id) catch return null;
             if (!gop.found_existing) gop.value_ptr.room = 0;
+            // (a dedup keeps the stored point's part: the same ids kept again from another part are the same key)
+            if (!gop.found_existing or r == .queued) gop.value_ptr.part = lin.part;
             gop.value_ptr.key = key;
             gop.value_ptr.at = at;
-            // the note for a dedup (.stored) too: a follower whose own store pruned or never wrote the point writes it
+            // the keep for a dedup (.stored) too: a follower whose own store pruned or never wrote the point writes it
             // now (its store.keep dedups when it holds it), so a point rank 0 holds is repaired on the pair
             if (self.wire != null) {
                 self.noted.put(self.gpa, info.id, .{ .key = key }) catch {};
-                encodeKeep(self.gpa, &self.note_buf, .{ .slot = info.slot, .snap = info.id, .base = info.base, .at = at, .key = key, .group = kept.group, .shared = kept.shared, .lineage = lin, .origin = origin }) catch return id;
-                self.note();
+                const m = keepMsg(info.slot, info.id, info.base, at, key, kept.group, kept.shared, lin, origin, self.wire_forks) catch return id;
+                _ = self.post(0, .{ .keep = m }) catch {};
             }
             return id;
         }
@@ -1160,21 +1145,21 @@ pub fn Leader(comptime Dev: type) type {
             const self = of(ptr);
             const r = self.points.get(point) orelse return;
             self.side.store.markShared(r.key);
-            self.noteKey(.share, r.key);
+            self.notice(.{ .share = .{ .point = r.key } });
         }
 
         fn touchFn(ptr: *anyopaque, point: u64) void {
             const self = of(ptr);
             const r = self.points.get(point) orelse return;
             self.side.store.touch(r.key);
-            self.noteKey(.touch, r.key);
+            self.notice(.{ .touch = .{ .point = r.key } });
         }
 
         fn forgetFn(ptr: *anyopaque, point: u64) void {
             const self = of(ptr);
             const r = self.points.fetchRemove(point) orelse return;
             self.side.store.forget(r.value.key, &.{}, &.{});
-            self.noteKey(.forget, r.value.key);
+            self.notice(.{ .forget = .{ .point = r.value.key } });
         }
 
         fn pumpFn(ptr: *anyopaque, budget_ns: u64) void {
@@ -1239,6 +1224,13 @@ pub fn Leader(comptime Dev: type) type {
             const ref = self.points.get(point.id) orelse return error.UnknownPoint;
             if (point.at != ref.at or point.at % side.bt != 0) return error.BadPoint;
             const blocks: u32 = point.at / side.bt;
+            // owner_sharded: back into the part the point was written from (its owner holds the codes there); the
+            // store's own record, never the lookup's alone
+            const sharded = side.layout.owner_layout == .owner_sharded;
+            const stored = side.store.partOf(ref.key);
+            const rec: ?u32 = if (stored) |x| x.part else ref.part;
+            if (sharded and (rec == null or rec.? >= rank_wire.max_parts)) return error.SpillNoPart;
+            const part: u8 = if (sharded) @intCast(rec.?) else 0;
             if (!side.store.presence(ref.key)) {
                 self.presence_refused += 1;
                 return error.SpillNotOnEveryRank;
@@ -1255,7 +1247,7 @@ pub fn Leader(comptime Dev: type) type {
             var txn: u64 = 0;
             if (self.wire) |w| {
                 var replies: [rank_wire.max_world - 1]rank_wire.Frame = undefined;
-                const head = self.ask(0, .{ .has = .{ .point = ref.key, .compat = self.lead.?.compat(), .at = point.at, .blocks = blocks, .layout = .replicated, .part = 0 } }, &replies) catch |e| {
+                const head = self.ask(0, .{ .has = .{ .point = ref.key, .compat = self.lead.?.compat(), .at = point.at, .blocks = blocks, .layout = wireLayout(&side.layout), .part = part } }, &replies) catch |e| {
                     side.rxEnd(rx, .cancel, false);
                     return e;
                 };
@@ -1280,10 +1272,20 @@ pub fn Leader(comptime Dev: type) type {
                 }
             }
             const room = @max(@as(usize, point.at), ref.room);
-            const dest = self.fam.reserve(self.fam.ptr, point.at, room) catch |e| {
+            const dest = self.fam.reserve(self.fam.ptr, point.at, room, if (sharded) part else null) catch |e| {
                 side.rxEnd(rx, .cancel, false);
                 return self.refuse(txn, .reserve, e);
             };
+            if (sharded and side.layout.partOf(dest.base) != part) {
+                side.rxEnd(rx, .cancel, false);
+                self.fam.discard(self.fam.ptr, dest.saved);
+                return self.refuse(txn, .reserve, error.CrossesPart);
+            }
+            if (sharded and dest.size < point.at) { // (the hold's extent, posted as Reserve.size: it holds the rows)
+                side.rxEnd(rx, .cancel, false);
+                self.fam.discard(self.fam.ptr, dest.saved);
+                return self.refuse(txn, .reserve, error.BadDest);
+            }
             rx.snap = .{ .id = dest.id, .buf = dest.buf };
             rx.dst = side.gens.reserve(dest.base, dest.base + point.at) catch |e| {
                 side.rxEnd(rx, .cancel, false);
@@ -1298,7 +1300,7 @@ pub fn Leader(comptime Dev: type) type {
             job.* = .{ .rx = rx, .txn = txn, .point = point.*, .saved = dest.saved };
             if (self.wire != null) {
                 const sent: ?anyerror = blk: {
-                    _ = self.post(txn, .{ .reserve = .{ .point = ref.key, .slot = 0, .base = dest.base, .size = @max(room, point.at), .at = point.at, .blocks = blocks, .generation = dest.id, .part = 0 } }) catch |e| break :blk e;
+                    _ = self.post(txn, .{ .reserve = .{ .point = ref.key, .kept = dest.id, .slot = 0, .base = dest.base, .size = if (sharded) dest.size else @max(room, point.at), .at = point.at, .blocks = blocks, .generation = if (sharded) dest.gen else 0, .part = part } }) catch |e| break :blk e;
                     _ = self.post(txn, .{ .start = .{ .point = ref.key, .blocks = blocks } }) catch |e| break :blk e;
                     break :blk null;
                 };
@@ -1342,6 +1344,7 @@ pub fn Leader(comptime Dev: type) type {
         fn pollFn(ptr: *anyopaque, id: u64, budget_ns: u64) pc.Poll {
             const self = of(ptr);
             const side = self.side;
+            const deadline = monotonicNs() +| budget_ns; // (the core's grant for this poll: status asks stay inside it)
             const job = self.jobs.get(id) orelse return .{ .failed = error.UnknownJob };
             if (self.broken) |e| {
                 _ = self.jobs.remove(id);
@@ -1359,19 +1362,46 @@ pub fn Leader(comptime Dev: type) type {
             }
             if (!S.rxReady(rx)) return .{ .pending = .{ .done = rx.copied, .total = rx.blocks } };
             if (!side.rxValid(rx)) return self.failJob(id, job, .reserve, 0);
-            if (self.wire != null) {
+            if (self.wire) |w| {
                 var replies: [rank_wire.max_world - 1]rank_wire.Frame = undefined;
+                // the followers' copies, asked without waiting for them (each answers from memory at once): validate
+                // only once every one is complete, so a slower follower disk never stalls rank 0's rounds. Their
+                // copies lag rank 0's by design (enqueued as progress arrives), so the first answer is often
+                // incomplete: asked again (at most once each status_every_ns) while this poll's budget lasts, and
+                // pending only once it is spent
+                const wait_ns = if (self.lead) |l| l.timeouts.status_wait_ns else rank_wire.status_wait_ns;
+                const first = job.ready_at == 0; // (this poll found rank 0's own copies ready)
+                if (first) job.ready_at = monotonicNs();
+                while (true) {
+                    var now = monotonicNs();
+                    while (job.asked_at != 0 and now -| job.asked_at < status_every_ns) {
+                        const open_at = job.asked_at +| status_every_ns;
+                        if (open_at > deadline) return .{ .pending = .{ .done = job.copied, .total = rx.blocks } };
+                        std.Io.sleep(side.io, .fromNanoseconds(@min(open_at - now, status_nap_ns)), .awake) catch {};
+                        now = monotonicNs();
+                    }
+                    job.asked_at = now;
+                    self.status_asks += 1;
+                    _ = self.ask(job.txn, .{ .status = .{} }, &replies) catch return self.failJob(id, job, .timeout, rank_wire.no_rank);
+                    const st = rank_wire.statusOf(replies[0..w.links.len], rx.blocks);
+                    if (st.failed) |f| return self.failJob(id, job, f.why, f.rank);
+                    if (st.complete) break;
+                    job.copied = st.copied;
+                    if (monotonicNs() -| job.ready_at > wait_ns) return self.failJob(id, job, .timeout, rank_wire.no_rank);
+                }
+                if (first) self.ready_first_poll += 1;
+                self.validate_asks += 1;
                 _ = self.ask(job.txn, .{ .validate = .{ .upto = rx.blocks, .shared = job.point.shared } }, &replies) catch return self.failJob(id, job, .timeout, rank_wire.no_rank);
-                if (rank_wire.firstFailure(replies[0..self.wire.?.links.len])) |f| return self.failJob(id, job, f.why, f.rank);
+                if (rank_wire.firstFailure(replies[0..w.links.len])) |f| return self.failJob(id, job, f.why, f.rank);
             }
-            const commit: rank_wire.Msg = .{ .commit = .{ .point = rx.key, .at = rx.at, .generation = rx.snap.id, .shared = job.point.shared } };
+            const commit: rank_wire.Msg = .{ .commit = .{ .point = rx.key, .at = rx.at, .kept = rx.snap.id, .shared = job.point.shared } };
             if (self.lead) |l| l.admissible(job.txn, commit) catch return self.failJob(id, job, .read, 0); // (before rank 0 commits)
             // rank 0's own end of the read: a failure here (out of memory for the lineage, an incomplete or failed
             // read the checks above missed) is not damage to the stored point, so nobody forgets it
             var done_ = side.rxCommit(rx) catch return self.failJob(id, job, .read, 0);
             defer done_.lineage.deinit(self.gpa);
             if (self.wire != null) {
-                _ = self.post(job.txn, .{ .commit = .{ .point = rx.key, .at = rx.at, .generation = rx.snap.id, .shared = done_.shared } }) catch |e| {
+                _ = self.post(job.txn, .{ .commit = .{ .point = rx.key, .at = rx.at, .kept = rx.snap.id, .shared = done_.shared } }) catch |e| {
                     _ = self.jobs.remove(id);
                     side.rxDrop(rx);
                     self.fam.discard(self.fam.ptr, job.saved);
@@ -1441,6 +1471,14 @@ pub fn Follower(comptime Dev: type) type {
         opening: ?Opening(Dev),
         side: ?*S = null,
         agreement: ?fingerprint.Agreement = null,
+        // the store's open (agreed: every block file scanned, every manifest read) runs on its own thread, so this
+        // rank answers rank 0's open asks (stats set open: awaitFollowers) while a large store scans
+        opener: ?std.Thread = null,
+        open_done: std.atomic.Value(bool) = .init(false),
+        open_side: ?*S = null, // the opener's result, read once open_done
+        open_err: ?anyerror = null, // the open's failure, kept: every later wait returns it
+        open_compat: Digest = undefined,
+        scan_names: std.atomic.Value(u64) = .init(0), // names the open's scan read (the store's Hooks.progress)
         restores: std.AutoHashMapUnmanaged(u64, Fx) = .empty, // by transaction
         asked: std.AutoHashMapUnmanaged(u64, Digest) = .empty, // has answered, not yet reserved (an abort's forget)
         forks: []format.Fork,
@@ -1482,6 +1520,7 @@ pub fn Follower(comptime Dev: type) type {
 
         /// At `done`: writes drained within the settings' flush bound, then everything closed.
         pub fn destroy(self: *Self) void {
+            self.settle(true) catch {}; // (the open's thread joined; a store it opened is this rank's side)
             self.endRestores();
             self.restores.deinit(self.gpa);
             self.asked.deinit(self.gpa);
@@ -1493,6 +1532,7 @@ pub fn Follower(comptime Dev: type) type {
 
         /// Every copy still on the device waited for (before the buffers they read go).
         pub fn quiesce(self: *Self) void {
+            self.settle(true) catch {};
             const s = self.side orelse return;
             for (s.copies.items) |cp| s.dev.wait(s.events[cp.ev]);
             _ = s.retire();
@@ -1500,6 +1540,7 @@ pub fn Follower(comptime Dev: type) type {
 
         /// A clean stop (rank 0's done): unpublished writes staged and drained within the flush bound.
         pub fn flush(self: *Self, budget_ns: u64) u64 {
+            self.settle(true) catch {};
             const s = self.side orelse return 0;
             return s.flush(monotonicNs() +| budget_ns);
         }
@@ -1509,31 +1550,39 @@ pub fn Follower(comptime Dev: type) type {
             try rank_wire.serve(&self.wf, l, payload, self);
         }
 
-        /// A spill note (lanes Kind 11).
-        pub fn note(self: *Self, payload: []const u8) !void {
-            const n = try decodeNote(payload, self.forks);
-            const s = self.side orelse return error.SpillNotAgreed;
-            switch (n) {
-                .keep => |k| self.keepNote(s, k),
-                .share => |k| s.store.markShared(k),
-                .touch => |k| s.store.touch(k),
-                .forget => |k| s.store.forget(k, &.{}, &.{}),
-            }
-        }
-
-        fn keepNote(self: *Self, s: *S, k: KeepNote) void {
+        /// Write at keep (rank_wire keep): this rank's own copy of the point rank 0 kept, from the ids it holds in the
+        /// slot; skipped (counted) when its ids or its state are not rank 0's. Never waits on the disk.
+        pub fn keep(self: *Self, _: Head, m: rank_wire.Keep) !void {
+            const s = try self.ready();
             if (!self.fam_live) return self.skip();
-            const ids = self.fam.ids(self.fam.ptr, k.slot);
-            const buf = self.fam.buf(self.fam.ptr, k.snap) orelse return self.skip();
-            if (ids.len < k.at) return self.skip();
-            self.keyed.resize(self.gpa, k.at) catch return self.skip();
-            for (ids[0..k.at], self.keyed.items) |q, *o| {
+            const ids = self.fam.ids(self.fam.ptr, m.slot);
+            const buf = self.fam.buf(self.fam.ptr, m.kept) orelse return self.skip();
+            if (ids.len < m.at) return self.skip();
+            if (m.media.len > 0) return self.skip(); // (pictures' points: port/spill-pictures writes them)
+            self.keyed.resize(self.gpa, m.at) catch return self.skip();
+            for (ids[0..m.at], self.keyed.items) |q, *o| {
                 if (q < 0) return self.skip();
                 o.* = @intCast(q);
             }
             // the point is rank 0's: this rank's ids must name the same one, or a restore could never agree on it
-            if (!std.mem.eql(u8, &format.pointKey(self.keyed.items, s.bt, &.{}), &k.key)) return self.skip();
-            _ = s.keepPoint(.{ .keyed = self.keyed.items, .key = k.key, .at = k.at, .base = @intCast(k.base), .snap = k.snap, .buf = buf, .lineage = k.lineage, .origin = k.origin, .shared = k.shared, .group = k.group });
+            if (!std.mem.eql(u8, &format.pointKey(self.keyed.items, s.bt, &.{}), &m.point)) return self.skip();
+            const lin = keepLineage(m, self.forks) catch return self.skip();
+            _ = s.keepPoint(.{ .keyed = self.keyed.items, .key = m.point, .at = m.at, .base = @intCast(m.base), .snap = m.kept, .buf = buf, .lineage = lin, .origin = keepOrigin(m), .shared = m.shared, .group = m.group });
+        }
+
+        pub fn share(self: *Self, _: Head, m: rank_wire.Share) !void {
+            const s = try self.ready();
+            s.store.markShared(m.point);
+        }
+
+        pub fn touch(self: *Self, _: Head, m: rank_wire.Touch) !void {
+            const s = try self.ready();
+            s.store.touch(m.point);
+        }
+
+        pub fn forget(self: *Self, _: Head, m: rank_wire.Forget) !void {
+            const s = try self.ready();
+            s.store.forget(m.point, &.{}, &.{});
         }
 
         fn skip(self: *Self) void {
@@ -1542,15 +1591,20 @@ pub fn Follower(comptime Dev: type) type {
 
         /// At every frame and while idle: copies handed on, restores copied as far as rank 0 allowed, writes staged.
         pub fn service(self: *Self, budget_ns: u64) void {
+            self.settle(false) catch {}; // (an open's failure ends this rank at rank 0's next ask)
             const s = self.side orelse return;
             _ = s.retire();
             var it = self.restores.valueIterator();
-            while (it.next()) |fx| s.rxStep(fx.rx, fx.allowed, budget_ns);
+            while (it.next()) |fx| {
+                s.rxStep(fx.rx, fx.allowed, budget_ns);
+                if (fx.allowed >= fx.rx.blocks) s.rxSmall(fx.rx); // (rank 0 holds every block: the small state too)
+            }
             _ = s.service(budget_ns, pump_blocks);
             s.lost.clearRetainingCapacity();
         }
 
         pub fn busy(self: *Self) bool {
+            self.settle(false) catch {};
             const s = self.side orelse return false;
             return s.busy() or self.restores.count() > 0;
         }
@@ -1567,23 +1621,72 @@ pub fn Follower(comptime Dev: type) type {
             if (self.side) |s| s.dropSnap(snap);
         }
 
+        /// Kept state `snap`'s rows from token `from` on are about to change on this rank (TF_DS_KV_SHARD: a stage,
+        /// stale or move op in rank 0's plan, before this rank enqueues the plan's transfers): its unpublished write
+        /// stages what it still reads now, or is cancelled.
+        pub fn guard(self: *Self, snap: u64, from: u32) void {
+            if (self.side) |s| s.guard(snap, from);
+        }
+
         // -- rank_wire.serve's handler ----------------------------------------------------------------------------
 
+        /// The ranks agreed: this rank's store opens under its own compat on the opener thread (a large store's scan
+        /// takes minutes; rank 0 waits for it with stats asks of set open, which this rank answers meanwhile).
         pub fn agreed(self: *Self, a: fingerprint.Agreement) !void {
             const o = self.opening orelse return error.SpillAgreedTwice;
-            const compat = format.compatDigest(a.storeCommon(self.rank), .replicated, @intCast(o.layout.geo.block_tokens), o.layout.block_bytes);
-            self.side = try S.create(self.gpa, self.io, o.dev, o.layout, o.gens, o.settings, self.rank, compat, o.max_tokens, o.staging, o.events, o.hooks);
-            self.opening = null;
+            if (self.opener != null or self.open_done.load(.acquire)) return error.SpillAgreedTwice;
+            self.open_compat = storeCompat(a, self.rank, &o.layout);
             self.agreement = a;
+            self.opener = try std.Thread.spawn(.{}, openThread, .{self});
+        }
+
+        fn openThread(self: *Self) void {
+            var o = self.opening.?; // (the serve thread leaves `opening` alone until the join)
+            o.hooks.progress = &self.scan_names;
+            if (S.create(self.gpa, self.io, o.dev, o.layout, o.gens, o.settings, self.rank, self.open_compat, o.max_tokens, o.staging, o.events, o.hooks)) |s| {
+                self.open_side = s;
+            } else |err| {
+                std.log.err("dsv41 spill: rank {d} could not open its store at the ranks' agreement: {s}", .{ self.rank, @errorName(err) });
+                self.open_err = err;
+            }
+            self.open_done.store(true, .release);
+        }
+
+        /// The open's thread joined once it is done (`wait`: until it is): its store becomes this rank's side, or its
+        /// error is returned (now and at every later call).
+        fn settle(self: *Self, wait: bool) !void {
+            if (self.opener) |t| {
+                if (!wait and !self.open_done.load(.acquire)) return;
+                t.join();
+                self.opener = null;
+                if (self.open_side) |sd| {
+                    self.side = sd;
+                    self.open_side = null;
+                    self.opening = null; // (its generations are the side's now)
+                }
+            }
+            if (self.open_err) |e| return e;
+        }
+
+        /// This rank's side for a command that needs its store: an open still scanning is waited for (rank 0 asks
+        /// after awaitFollowers, so this returns at once in service).
+        fn ready(self: *Self) !*S {
+            try self.settle(true);
+            return self.side orelse error.SpillNotAgreed;
         }
 
         /// serve already checked `m.compat` against the agreed pair. This rank's store holds only points under its
         /// own compat (storeCommon(rank): the manifests are parsed against it, another namespace is never indexed),
-        /// so presence is the compat check; a layout or part this rank does not keep is `incompatible`. A point whose
-        /// write this rank still has queued is `incomplete` (rank 0 keeps it; the write publishes here soon).
+        /// so presence is the compat check; a layout or part this rank does not keep is `incompatible` (owner_sharded:
+        /// its point of these ids written from another part, other bytes here). A point whose write this rank still
+        /// has queued is `incomplete` (rank 0 keeps it; the write publishes here soon).
         pub fn has(self: *Self, h: Head, m: rank_wire.Has) !rank_wire.HasReply {
+            try self.settle(true);
             const s = self.side orelse return .{ .answer = .disabled, .point = m.point, .compat = m.compat };
-            const answer: rank_wire.Absence = if (m.layout != .replicated or m.part != 0)
+            const sharded = s.layout.owner_layout == .owner_sharded;
+            const stored = s.store.partOf(m.point);
+            const other_part = if (stored) |x| sharded and (x.part == null or x.part.? != m.part) else false;
+            const answer: rank_wire.Absence = if (m.layout != wireLayout(&s.layout) or (!sharded and m.part != 0) or other_part)
                 .incompatible
             else if (s.store.presence(m.point))
                 .present
@@ -1596,16 +1699,18 @@ pub fn Follower(comptime Dev: type) type {
         }
 
         pub fn reserve(self: *Self, h: Head, m: rank_wire.Reserve) !void {
-            const s = self.side orelse return error.SpillNotAgreed;
+            const s = try self.ready();
             _ = self.asked.remove(h.txn);
             if (!self.fam_live) return error.SpillNotAttached;
             try self.restores.ensureUnusedCapacity(self.gpa, 1);
             const rx = try s.newRx(h.txn, m.point, @intCast(m.at), m.blocks);
-            var fx: Fx = .{ .rx = rx, .snap = m.generation };
-            if (self.fam.reserve(self.fam.ptr, m.generation)) |buf| {
+            var fx: Fx = .{ .rx = rx, .snap = m.kept };
+            if (self.fam.reserve(self.fam.ptr, m.kept)) |buf| {
                 fx.buf = true;
-                rx.snap = .{ .id = m.generation, .buf = buf };
+                rx.snap = .{ .id = m.kept, .buf = buf };
             } else |_| rx.fail(.reserve);
+            // owner_sharded: the destination in the point's part (rank 0 placed it there; fail closed otherwise)
+            if (rx.why == .none and s.layout.owner_layout == .owner_sharded and (s.layout.partOf(@intCast(m.base)) != m.part or s.layout.partOf(@intCast(m.base + m.at - 1)) != m.part)) rx.fail(.reserve);
             if (rx.why == .none) rx.dst = s.gens.reserve(@intCast(m.base), @intCast(m.base + m.at)) catch blk: {
                 rx.fail(.reserve);
                 break :blk null;
@@ -1614,7 +1719,7 @@ pub fn Follower(comptime Dev: type) type {
         }
 
         pub fn start(self: *Self, h: Head, _: rank_wire.Start) !void {
-            const s = self.side orelse return error.SpillNotAgreed;
+            const s = try self.ready();
             const fx = self.restores.get(h.txn) orelse return error.UnknownTxn;
             if (fx.rx.why != .none) return;
             fx.rx.rid = s.store.beginRead(fx.rx.key) catch |e| blk: {
@@ -1624,11 +1729,27 @@ pub fn Follower(comptime Dev: type) type {
         }
 
         pub fn progress(self: *Self, h: Head, m: rank_wire.Progress) !void {
-            const s = self.side orelse return error.SpillNotAgreed;
+            const s = try self.ready();
             const fx = self.restores.getPtr(h.txn) orelse return error.UnknownTxn;
             fx.allowed = m.upto;
             _ = s.retire();
             s.rxStep(fx.rx, fx.allowed, 2 * std.time.ns_per_ms); // (well inside follower_progress_ns: no disk wait)
+        }
+
+        /// Where this rank's copies of the restore are, at once (the ask's rule: from memory, no device or disk wait):
+        /// completed copies handed on, at most one block its reads already delivered enqueued, the small state
+        /// enqueued once every block is; the copying itself is the per-frame and idle service's. Rank 0 asks
+        /// validate only when every rank is complete.
+        pub fn status(self: *Self, h: Head, _: rank_wire.RestoreStatus) !rank_wire.RestoreStatusReply {
+            const s = try self.ready();
+            const fx = self.restores.getPtr(h.txn) orelse return error.UnknownTxn;
+            const rx = fx.rx;
+            _ = s.retire();
+            s.rxStep(rx, fx.allowed, 0); // (a budget of 0: one ready block at most)
+            if (fx.allowed >= rx.blocks) s.rxSmall(rx);
+            _ = s.retire();
+            if (rx.why == .none and rx.dst != null and !s.rxValid(rx)) rx.fail(.reserve);
+            return .{ .copied = rx.copied, .small_ready = rx.small == .done and rx.inflight == 0, .why = rx.why, .point = rx.key };
         }
 
         fn recycle(ctx: ?*anyopaque) void {
@@ -1639,7 +1760,7 @@ pub fn Follower(comptime Dev: type) type {
         /// Copy the rest (bounded waits that recycle slots: PR 124's follower hang), install the small state,
         /// report; a deadline passed is `timeout`, never silence.
         pub fn validate(self: *Self, h: Head, _: rank_wire.Validate) !rank_wire.ValidateReply {
-            const s = self.side orelse return error.SpillNotAgreed;
+            const s = try self.ready();
             const fx = self.restores.getPtr(h.txn) orelse return error.UnknownTxn;
             const rx = fx.rx;
             fx.allowed = rx.blocks;
@@ -1675,7 +1796,7 @@ pub fn Follower(comptime Dev: type) type {
         }
 
         pub fn commit(self: *Self, h: Head, _: rank_wire.Commit) !void {
-            const s = self.side orelse return error.SpillNotAgreed;
+            const s = try self.ready();
             const kv = self.restores.fetchRemove(h.txn) orelse return error.UnknownTxn;
             var d = try s.rxCommit(kv.value.rx);
             d.lineage.deinit(self.gpa);
@@ -1707,6 +1828,14 @@ pub fn Follower(comptime Dev: type) type {
         }
 
         pub fn stats(self: *Self, _: Head, m: rank_wire.Stats) !rank_wire.StatsReply {
+            if (m.set == .open) {
+                try self.settle(false);
+                var v: [rank_wire.max_stats]u64 = @splat(0);
+                v[0] = @intFromBool(self.side != null);
+                v[1] = self.scan_names.load(.monotonic);
+                return .{ .set = .open, .n = rank_wire.open_values, .values = v };
+            }
+            try self.settle(true);
             var c: pc.TierCounts = .{};
             if (self.side) |s| {
                 s.refresh();
@@ -1715,6 +1844,8 @@ pub fn Follower(comptime Dev: type) type {
             const v = countsValues(c);
             return switch (m.set) {
                 .tier => .{ .set = .tier, .n = v.n, .values = v.values },
+                .shard => .{ .set = .shard, .n = 0, .values = @splat(0) }, // (no KV-ownership side on this rank)
+                .open => unreachable, // (above)
             };
         }
     };

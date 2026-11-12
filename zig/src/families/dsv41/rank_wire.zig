@@ -9,7 +9,8 @@
 //! constant before it is read) and canonical (a frame decodes only if re-encoding it gives the same bytes).
 //!
 //! Who sends what: rank 0 sends commands in the lanes stream; a follower answers an asking command (hello, has,
-//! validate, shard_layout, shard_check, shard_xfer, stats) with exactly one reply frame on the same link, straight from its command loop,
+//! status, validate, shard_layout, shard_check, shard_xfer, stats) with exactly one reply frame on the same link,
+//! straight from its command loop,
 //! before it reads the next command. Rank 0 never has two asks outstanding and collects every follower's reply with a
 //! deadline (Leader.collect). Every frame names the engine epoch and a transaction; a stale epoch, a skipped or
 //! repeated sequence number, a transaction out of order or a phase out of order fails closed (the pair ends: there is
@@ -26,8 +27,9 @@ pub const OwnerLayout = fingerprint.OwnerLayout;
 pub const lanes_kind: u8 = 10;
 /// "RW", the first two bytes of every rank_wire frame.
 pub const magic: u16 = 0x5752;
-/// This protocol's version (in every header and in the fingerprint's wire_version field).
-pub const version: u16 = 1;
+/// This protocol's version (in every header and in the fingerprint's wire_version field). 2: kept ids in reserve and
+/// commit, the keep/share/touch/forget notices, the status ask, shard layout carry/twins, the shard stats set.
+pub const version: u16 = 2;
 pub const header_len = 32;
 /// A command frame at most (inside the follower's receive buffer, whose 64 KiB slack beyond the prompt ids it fits).
 pub const max_frame: usize = 60 << 10;
@@ -42,6 +44,12 @@ pub const max_blocks: u32 = 1 << 16;
 pub const max_parts = parts.max_parts;
 /// Shard ops in one shard_ops frame (a longer plan goes in several frames of one transaction).
 pub const max_shard_ops = 512;
+/// Lineage forks one keep carries at most (a lineage with more is never written while followers run: rank 0's tier
+/// refuses the keep; format.Limits.max_forks is 4096, far past any conversation's resumes in a 1M window).
+pub const max_keep_forks = 2048;
+/// Pictures one keep carries at most (spill-pictures' max_note_media: a point with more is not written while followers
+/// run). Its frame with max_keep_forks forks too still fits max_frame (checked below).
+pub const max_keep_media = 256;
 pub const no_rank: u16 = 0xffff;
 pub const no_block: u32 = 0xffff_ffff;
 
@@ -60,9 +68,15 @@ pub const Op = enum(u8) {
     validate_reply = 22,
     commit = 23, // every rank validated: publish
     abort = 24, // drop the restore (reason, failing rank), release the reservation
-    // spill writes
+    status = 25, // asks: how far this rank's copies of the restore are, answered at once from memory (never waits)
+    status_reply = 26,
+    // spill writes and point metadata (notices, each its own transaction)
     write_staged = 32, // a kept point's pending rows were staged before its source changes
     write_cancelled = 33, // a kept point's unpublished write was cancelled (reason)
+    keep = 34, // rank 0 kept a state and writes it: every follower writes its own copy (write at keep)
+    share = 35, // a point is shared (a prefix other conversations resume): kept longest at eviction
+    touch = 36, // a point was used (its LRU position)
+    forget = 37, // every rank drops a point
     // KV ownership
     shard_layout = 48, // asks: this rank's capacity and layout version (part agreement)
     shard_layout_reply = 49,
@@ -83,6 +97,7 @@ pub const Op = enum(u8) {
             .hello => .hello_reply,
             .has => .has_reply,
             .validate => .validate_reply,
+            .status => .status_reply,
             .shard_layout => .shard_layout_reply,
             .shard_check => .shard_check_reply,
             .shard_xfer => .shard_xfer_reply,
@@ -93,13 +108,16 @@ pub const Op = enum(u8) {
 
     pub fn isReply(op: Op) bool {
         return switch (op) {
-            .hello_reply, .has_reply, .validate_reply, .shard_layout_reply, .shard_check_reply, .shard_xfer_reply, .stats_reply => true,
+            .hello_reply, .has_reply, .validate_reply, .status_reply, .shard_layout_reply, .shard_check_reply, .shard_xfer_reply, .stats_reply => true,
             else => false,
         };
     }
 };
 
-/// A follower's answer to has.
+/// A follower's answer to has. `incomplete`: this rank's own write of the point is still queued (staged, not yet
+/// published): rank 0 aborts the restore without `forget`, since the write publishes there soon and the point is
+/// then restorable on every rank; `missing`, `damaged` and `incompatible` make every rank forget it (rank 0's copy
+/// could never restore on the pair); `disabled`: this rank runs without the spill tier.
 pub const Absence = enum(u8) { present = 0, missing = 1, incompatible = 2, incomplete = 3, damaged = 4, disabled = 5 };
 /// Why a restore failed or was dropped.
 pub const Failure = enum(u8) {
@@ -138,17 +156,47 @@ pub const HelloReply = struct { status: Status, differ: u16, fx: fingerprint.Exc
 pub const Agreed = struct { world: u16, common: Digest, ranks: [max_world]Digest };
 pub const Has = struct { point: Digest, compat: Digest, at: u64, blocks: u32, layout: OwnerLayout, part: u8 };
 pub const HasReply = struct { answer: Absence, point: Digest, compat: Digest };
-pub const Reserve = struct { point: Digest, slot: u32, base: u64, size: u64, at: u64, blocks: u32, generation: u64, part: u8 };
+/// `kept`: rank 0's Snap id of the destination (every rank installs the restored state under it; fixed for the
+/// transaction). `generation`: the destination extent's parts generation when the point is owner_sharded (round 3's
+/// planRestore), 0 when replicated (the Tracker refuses anything else).
+pub const Reserve = struct { point: Digest, kept: u64, slot: u32, base: u64, size: u64, at: u64, blocks: u32, generation: u64, part: u8 };
 pub const Start = struct { point: Digest, blocks: u32 };
 pub const Progress = struct { upto: u32 };
 pub const Validate = struct { upto: u32, shared: bool };
 pub const ValidateReply = struct { ok: bool, why: Failure, copied: u32, bad_block: u32, point: Digest };
-pub const Commit = struct { point: Digest, at: u64, generation: u64, shared: bool };
+/// `kept` is the reserve's (Tracker: WrongPoint otherwise).
+pub const Commit = struct { point: Digest, at: u64, kept: u64, shared: bool };
 pub const Abort = struct { why: Failure, rank: u16, forget: bool };
-pub const WriteStaged = struct { point: Digest, kept: u64, generation: u64, upto: u32 };
-pub const WriteCancelled = struct { point: Digest, kept: u64, generation: u64, why: CancelWhy };
-pub const ShardLayout = struct { version: u16, parts: u8, cap: u64, carry: bool, schema: u32 };
-pub const ShardLayoutReply = struct { version: u16, parts: u8, cap: u64, schema: u32 };
+/// The status ask names its restore by the header's txn alone.
+pub const RestoreStatus = struct {};
+/// `copied`: blocks this rank has copied into the destination, in order (enqueued); `small_ready`: the small state
+/// installed and every copy of the restore completed on the device; `why`: the restore's recorded failure (none: no
+/// failure so far). Complete = why none, copied = blocks, small_ready: validate then answers at once.
+pub const RestoreStatusReply = struct { copied: u32, small_ready: bool, why: Failure, point: Digest };
+/// `kept`: rank 0's Snap id of the kept state whose write is staged (Snap ids are never reused on a rank).
+pub const WriteStaged = struct { point: Digest, kept: u64, upto: u32 };
+pub const WriteCancelled = struct { point: Digest, kept: u64, why: CancelWhy };
+/// A lineage fork (core/spill format.Fork, field for field).
+pub const Fork = struct { name: [16]u8, at: u32 };
+/// The point a kept state forks from (core/spill format.Origin, field for field).
+pub const Origin = struct { key: Digest, at: u32 };
+/// A picture before a kept point's cut (core/spill format.Media, field for field): its prompt positions
+/// [start, start + len) and the full SHA-256 of its payload.
+pub const Media = struct { start: u32, len: u32, digest: Digest };
+/// Write at keep (lanes' Snap `kept`, kept from `slot` at `base` with `at` positions): every follower writes its own
+/// copy of point `point` from the ids it holds in that slot, under the same lineage (`root`, the part salt `part`,
+/// `forks`), `origin`, conversation `group` and `shared` flag. Sent for a dedup on rank 0 too (a follower that lost
+/// the point writes it again). `media`: the point's pictures before `at` (in order, not overlapping, each starting
+/// before `at`), and `placeholder` the model id at their raw positions: null exactly when there are none (a text
+/// point). A rank that does not keep pictures skips such a keep (counted), as for any keep it cannot write.
+pub const Keep = struct { slot: u32, kept: u64, base: u64, at: u32, point: Digest, group: u64, shared: bool, root: [16]u8, part: ?u32, origin: ?Origin, placeholder: ?u32 = null, forks: []const Fork, media: []const Media = &.{} };
+pub const Share = struct { point: Digest };
+pub const Touch = struct { point: Digest };
+pub const Forget = struct { point: Digest };
+/// `carry`, `twins`: rank 0's switches (TF_DS_KV_SHARD_CARRY / _TWINS).
+pub const ShardLayout = struct { version: u16, parts: u8, cap: u64, carry: bool, twins: bool, schema: u32 };
+/// The follower's own layout and switches (rank 0 compares them with its own: kv_lanes.Kv.start).
+pub const ShardLayoutReply = struct { version: u16, parts: u8, cap: u64, carry: bool, twins: bool, schema: u32 };
 pub const ShardSet = struct { version: u16, parts: u8, part_rows: u64, owner_epoch: u64 };
 pub const ShardOps = struct { owner_epoch: u64, index: u16, last: bool, schema: u32 = shard_schema, ops: []const ShardOp };
 pub const ShardCheck = struct { owner_epoch: u64, digest: Digest };
@@ -157,8 +205,14 @@ pub const ShardCheckReply = struct { owner_epoch: u64, digest: Digest };
 pub const ShardXfer = struct { owner_epoch: u64, stream: u64 };
 pub const ShardXferReply = struct { owner_epoch: u64, stream: u64, ok: bool };
 pub const ShardFinish = struct { owner_epoch: u64, stream: u64, ok: bool };
-/// Which counter set a stats ask wants (the reply's values are that set's fields in declaration order).
-pub const StatsSet = enum(u8) { tier = 1 };
+/// Which counter set a stats ask wants (the reply's values are that set's fields in declaration order): `tier`, core
+/// prompt_cache.TierCounts (the spill tier's); `shard`, core lanes.kv_parts.Rank (this rank's own KV-ownership
+/// counters); `open`, the follower's store open after the agreement (open_values: whether it is open, and how far its
+/// scan got, which grows while the scan works). A rank without that side answers n = 0.
+pub const StatsSet = enum(u8) { tier = 1, shard = 2, open = 3 };
+/// A stats reply of set `open`: values[0] 1 once this rank's store is open (0 while its scan runs), values[1] the
+/// names its scan read so far.
+pub const open_values: u8 = 2;
 /// Counters a stats reply carries at most (core TierCounts has 37).
 pub const max_stats = 64;
 pub const Stats = struct { set: StatsSet };
@@ -178,8 +232,14 @@ pub const Msg = union(Op) {
     validate_reply: ValidateReply,
     commit: Commit,
     abort: Abort,
+    status: RestoreStatus,
+    status_reply: RestoreStatusReply,
     write_staged: WriteStaged,
     write_cancelled: WriteCancelled,
+    keep: Keep,
+    share: Share,
+    touch: Touch,
+    forget: Forget,
     shard_layout: ShardLayout,
     shard_layout_reply: ShardLayoutReply,
     shard_set: ShardSet,
@@ -252,6 +312,10 @@ fn put(w: *W, comptime T: type, v: T) !void {
         .int => try w.int(WireInt(T), v),
         .bool => try w.int(u8, @intFromBool(v)),
         .@"enum" => |e| try put(w, e.tag_type, @intFromEnum(v)),
+        .optional => |o| if (v) |x| {
+            try w.int(u8, 1);
+            try put(w, o.child, x);
+        } else try w.int(u8, 0),
         .array => |a| {
             if (a.child == u8) return w.bytes(&v);
             for (v) |x| try put(w, a.child, x);
@@ -278,6 +342,11 @@ fn get(r: *R, comptime T: type) !T {
             else => error.BadValue,
         },
         .@"enum" => |e| return std.enums.fromInt(T, try get(r, e.tag_type)) orelse error.BadValue,
+        .optional => |o| return switch (try r.int(u8)) {
+            0 => null,
+            1 => try get(r, o.child),
+            else => error.BadValue,
+        },
         .array => |a| {
             var out: T = undefined;
             if (a.child == u8) {
@@ -303,6 +372,45 @@ fn get(r: *R, comptime T: type) !T {
     }
 }
 
+/// The most items a message's slice field `name` carries (each slice field has its bound here and its buffer in Bufs,
+/// under the same name).
+fn sliceMax(comptime name: []const u8) usize {
+    if (comptime std.mem.eql(u8, name, "forks")) return max_keep_forks;
+    if (comptime std.mem.eql(u8, name, "media")) return max_keep_media;
+    @compileError("rank_wire: no bound for the slice field " ++ name);
+}
+
+/// A message with slice fields (keep's forks and media): every field in declaration order, each slice as a u16 count
+/// and its items (at most sliceMax(its name)).
+fn putSliced(w: *W, comptime T: type, v: T) !void {
+    const s = @typeInfo(T).@"struct";
+    inline for (s.field_names, s.field_types) |n, FT| {
+        if (comptime @typeInfo(FT) == .pointer) {
+            const xs = @field(v, n);
+            if (xs.len > (comptime sliceMax(n))) return error.BadCount;
+            try w.int(u16, @intCast(xs.len));
+            for (xs) |x| try put(w, @typeInfo(FT).pointer.child, x);
+        } else try put(w, FT, @field(v, n));
+    }
+}
+
+/// putSliced's message read back, each slice's items into the Bufs field of its name (more than its bound or than
+/// that buffer holds: BadCount, before any item is read).
+fn getSliced(r: *R, comptime T: type, bufs: Bufs) !T {
+    var out: T = undefined;
+    const s = @typeInfo(T).@"struct";
+    inline for (s.field_names, s.field_types) |n, FT| {
+        if (comptime @typeInfo(FT) == .pointer) {
+            const buf = @field(bufs, n);
+            const k = try r.int(u16);
+            if (k > (comptime sliceMax(n)) or k > buf.len) return error.BadCount;
+            for (buf[0..k]) |*x| x.* = try get(r, @typeInfo(FT).pointer.child);
+            @field(out, n) = buf[0..k];
+        } else @field(out, n) = try get(r, FT);
+    }
+    return out;
+}
+
 fn fieldIndex(comptime names: []const [:0]const u8, comptime n: []const u8) u8 {
     for (names, 0..) |x, i| if (std.mem.eql(u8, x, n)) return i;
     unreachable;
@@ -315,6 +423,8 @@ fn maxSize(comptime T: type) usize {
         .int => @sizeOf(WireInt(T)),
         .bool => 1,
         .@"enum" => |e| maxSize(e.tag_type),
+        .optional => |o| 1 + maxSize(o.child),
+        .pointer => 2, // a trailing slice's count (its items are bounded separately)
         .array => |a| a.len * maxSize(a.child),
         .@"struct" => |s| blk: {
             var n: usize = 0;
@@ -365,7 +475,17 @@ comptime {
     std.debug.assert(header_len + 8 + 2 + 1 + 4 + 2 + max_shard_ops * maxSize(ShardOp) <= max_frame);
     std.debug.assert(header_len + maxSize(HelloReply) <= max_reply);
     std.debug.assert(header_len + maxSize(Hello) <= max_frame);
+    // a keep with its most forks and its most pictures fits a command frame; every reply fits a reply frame
+    std.debug.assert(header_len + maxSize(Keep) + max_keep_forks * maxSize(Fork) + max_keep_media * maxSize(Media) <= max_frame);
+    for (@typeInfo(Msg).@"union".field_names, @typeInfo(Msg).@"union".field_types) |n, FT| {
+        const op = @field(Op, n);
+        if (op.isReply()) std.debug.assert(header_len + maxSize(FT) <= max_reply);
+    }
 }
+
+/// Every message type's wire schema (field names, wire types, enum values, in declaration order): in the
+/// fingerprint's wire_version field (stampBytes), so two builds whose messages differ in any layout never agree.
+pub const msg_schema: u32 = schemaOf(Msg);
 
 /// The frame for `head` and `msg` in `buf` (max_frame for a command, max_reply for a reply); its bytes.
 pub fn encode(buf: []u8, head: Head, msg: Msg) ![]u8 {
@@ -391,14 +511,26 @@ pub fn encode(buf: []u8, head: Head, msg: Msg) ![]u8 {
             try w.int(u16, @intCast(m.ops.len));
             for (m.ops) |o| try put(&w, ShardOp, o);
         },
+        .keep => |m| try putSliced(&w, Keep, m),
         inline else => |m| try put(&w, @TypeOf(m), m),
     }
     return buf[0..w.n];
 }
 
+/// Where a decoded frame's variable parts go: a shard_ops frame's ops, a keep's forks and media (the message's
+/// slices point there; a slice field's buffer has its name). A frame with more than its buffer holds is BadCount
+/// (never an overrun).
+pub const Bufs = struct { ops: []ShardOp = &.{}, forks: []Fork = &.{}, media: []Media = &.{} };
+
 /// A frame's header and message, checked: bounds, magic, version, a known op, the op's exact schema and its values.
-/// A shard_ops frame's ops go into `ops` (the message's slice points there); other frames need none.
+/// A shard_ops frame's ops go into `ops` (the message's slice points there); a keep with forks needs decodeInto.
 pub fn decode(bytes: []const u8, ops: []ShardOp) !Frame {
+    return decodeInto(bytes, .{ .ops = ops });
+}
+
+/// decode with every variable part's buffer (Bufs).
+pub fn decodeInto(bytes: []const u8, bufs: Bufs) !Frame {
+    const ops = bufs.ops;
     if (bytes.len > max_frame) return error.FrameTooLong;
     var r: R = .{ .b = bytes };
     if (try r.int(u16) != magic) return error.BadMagic;
@@ -419,6 +551,7 @@ pub fn decode(bytes: []const u8, ops: []ShardOp) !Frame {
             for (ops[0..n]) |*o| o.* = try get(&r, ShardOp);
             break :blk .{ .shard_ops = .{ .owner_epoch = owner_epoch, .index = index_, .last = last, .schema = schema, .ops = ops[0..n] } };
         },
+        .keep => .{ .keep = try getSliced(&r, Keep, bufs) },
         inline else => |t| @unionInit(Msg, @tagName(t), try get(&r, @FieldType(Msg, @tagName(t)))),
     };
     if (r.at != bytes.len) return error.TrailingBytes;
@@ -456,12 +589,26 @@ pub fn check(msg: Msg) !void {
             if (m.copied > max_blocks or (m.bad_block != no_block and m.bad_block >= max_blocks)) return error.BadValue;
         },
         .commit => |m| if (m.at == 0) return error.BadValue,
+        .status => {},
+        .status_reply => |m| if (m.copied > max_blocks) return error.BadValue,
         .abort => |m| {
             if (m.why == .none) return error.BadValue;
             if (m.rank != no_rank and m.rank >= max_world) return error.BadValue;
         },
         .write_staged => |m| if (m.upto > max_blocks) return error.BadValue,
-        .write_cancelled => {},
+        .write_cancelled, .share, .touch, .forget => {},
+        .keep => |m| {
+            if (m.at == 0 or m.kept == 0) return error.BadValue;
+            if (m.forks.len > max_keep_forks or m.media.len > max_keep_media) return error.BadCount;
+            // pictures: a placeholder exactly when there are any; each non-empty, in order, not overlapping, starting
+            // before the cut (one canonical form for every point)
+            if ((m.placeholder != null) != (m.media.len > 0)) return error.BadValue;
+            var end: u64 = 0;
+            for (m.media) |x| {
+                if (x.len == 0 or x.start < end or x.start >= m.at) return error.BadValue;
+                end = @as(u64, x.start) + x.len;
+            }
+        },
         .shard_layout => |m| {
             if (m.parts == 0 or m.parts > max_parts or m.version == 0) return error.BadPart;
             if (m.schema != shard_schema) return error.SchemaMismatch;
@@ -485,9 +632,10 @@ pub fn check(msg: Msg) !void {
 /// A restore transaction's phase.
 pub const Phase = enum(u8) { has, reserved, started, validating };
 
-/// An open restore as every rank's tracker holds it: what has named (point, at, blocks, part) and what reserve fixed
-/// (generation), so a later frame of the transaction that names another value is refused (WrongPoint).
-const Restore = struct { txn: u64 = 0, phase: Phase = .has, point: Digest = @splat(0), at: u64 = 0, blocks: u32 = 0, part: u8 = 0, generation: u64 = 0, upto: u32 = 0 };
+/// An open restore as every rank's tracker holds it: what has named (point, at, blocks, layout, part) and what reserve
+/// fixed (the destination's kept id), so a later frame of the transaction that names another value is refused
+/// (WrongPoint).
+const Restore = struct { txn: u64 = 0, phase: Phase = .has, point: Digest = @splat(0), at: u64 = 0, blocks: u32 = 0, layout: OwnerLayout = .replicated, part: u8 = 0, kept: u64 = 0, upto: u32 = 0 };
 
 /// Streams whose copy/carry/move is in flight at once (draft.max_streams).
 pub const max_loads = 16;
@@ -507,8 +655,9 @@ pub fn loadOf(op: ShardOp) ?u64 {
 
 /// The order every rank checks the command stream against (rank 0 checks what it sends, a follower what it reads):
 /// hello first (seq 0, setting the epoch), agreed next, then every command's seq one more than the last; a command
-/// that opens a transaction (has, write_staged, write_cancelled, shard_layout, shard_set, shard_check, a plan's first
-/// shard_ops) takes the next transaction id; the rest name an open one, in its phase order. Any break fails closed.
+/// that opens a transaction (has, the spill notices write_staged/write_cancelled/keep/share/touch/forget,
+/// shard_layout, shard_set, shard_check, stats, a plan's first shard_ops) takes the next transaction id; the rest name
+/// an open one, in its phase order. Any break fails closed.
 pub const Tracker = struct {
     epoch: u64 = 0,
     hello: bool = false,
@@ -547,6 +696,13 @@ pub const Tracker = struct {
         return null;
     }
 
+    /// The blocks an open restore names, or null.
+    pub fn blocksOf(t: *const Tracker, txn: u64) ?u32 {
+        if (txn == 0) return null;
+        for (t.restores) |x| if (x.txn == txn) return x.blocks;
+        return null;
+    }
+
     /// Restores in flight.
     pub fn open(t: *const Tracker) usize {
         var n: usize = 0;
@@ -556,7 +712,7 @@ pub const Tracker = struct {
 
     fn opens(msg: Msg) bool {
         return switch (msg) {
-            .has, .write_staged, .write_cancelled, .shard_layout, .shard_set, .shard_check, .stats => true,
+            .has, .write_staged, .write_cancelled, .keep, .share, .touch, .forget, .shard_layout, .shard_set, .shard_check, .stats => true,
             .shard_ops => |m| m.index == 0,
             else => false,
         };
@@ -607,13 +763,14 @@ pub const Tracker = struct {
                 const slot = for (&t.restores) |*x| {
                     if (x.txn == 0) break x;
                 } else return error.TooManyRestores;
-                slot.* = .{ .txn = h.txn, .phase = .has, .point = m.point, .at = m.at, .blocks = m.blocks, .part = m.part };
+                slot.* = .{ .txn = h.txn, .phase = .has, .point = m.point, .at = m.at, .blocks = m.blocks, .layout = m.layout, .part = m.part };
             },
             .reserve => |m| {
                 const x = try t.find(h.txn);
                 if (x.phase != .has) return error.OutOfOrder;
                 if (!std.mem.eql(u8, &m.point, &x.point) or m.blocks != x.blocks or m.at != x.at or m.part != x.part) return error.WrongPoint;
-                x.generation = m.generation;
+                if (x.layout == .replicated and m.generation != 0) return error.BadValue; // (an owner_sharded extent's only)
+                x.kept = m.kept;
                 x.phase = .reserved;
             },
             .start => |m| {
@@ -628,6 +785,10 @@ pub const Tracker = struct {
                 if (m.upto <= x.upto or m.upto > x.blocks) return error.OutOfOrder; // strictly forward, within the point
                 x.upto = m.upto;
             },
+            .status => {
+                const x = try t.find(h.txn);
+                if (x.phase != .started) return error.OutOfOrder; // (between start and validate)
+            },
             .validate => |m| {
                 const x = try t.find(h.txn);
                 if (x.phase != .started) return error.OutOfOrder;
@@ -638,14 +799,14 @@ pub const Tracker = struct {
             .commit => |m| {
                 const x = try t.find(h.txn);
                 if (x.phase != .validating) return error.OutOfOrder;
-                if (!std.mem.eql(u8, &m.point, &x.point) or m.at != x.at or m.generation != x.generation) return error.WrongPoint;
+                if (!std.mem.eql(u8, &m.point, &x.point) or m.at != x.at or m.kept != x.kept) return error.WrongPoint;
                 x.* = .{};
             },
             .abort => {
                 const x = try t.find(h.txn);
                 x.* = .{};
             },
-            .write_staged, .write_cancelled, .shard_layout => {},
+            .write_staged, .write_cancelled, .keep, .share, .touch, .forget, .shard_layout => {},
             .shard_set => |m| {
                 if (m.owner_epoch <= t.owner_epoch) return error.StaleEpoch;
                 if (t.loading() != 0) return error.OutOfOrder; // a new layout under transfers in flight
@@ -698,7 +859,7 @@ pub const Tracker = struct {
                 if (!t.shard_set) return error.NotAgreed;
                 if (m.owner_epoch != t.owner_epoch) return error.StaleEpoch;
             },
-            .hello_reply, .has_reply, .validate_reply, .shard_layout_reply, .shard_check_reply, .shard_xfer_reply, .stats_reply => unreachable,
+            .hello_reply, .has_reply, .validate_reply, .status_reply, .shard_layout_reply, .shard_check_reply, .shard_xfer_reply, .stats_reply => unreachable,
         }
         if (opens(f.msg)) t.last_txn = h.txn;
         t.next_seq += 1;
@@ -715,12 +876,17 @@ pub const Timeouts = struct {
     shard_ns: u64 = 10 * std.time.ns_per_s, // shard_layout, shard_check
     xfer_ns: u64 = 30 * std.time.ns_per_s, // shard_xfer: the follower waits its side's transfer events first
     stats_ns: u64 = 2 * std.time.ns_per_s, // stats: from memory
+    status_ns: u64 = 2 * std.time.ns_per_s, // status: from memory (no device wait, at most one ready block enqueued)
+    /// Not an ask's deadline: how long rank 0 polls a restore's status (from when its own copies finished) before it
+    /// gives the restore up as `timeout` without asking validate (the spill tier reads it from its Leader).
+    status_wait_ns: u64 = status_wait_ns,
 
     pub fn of(t: Timeouts, op: Op) u64 {
         return switch (op) {
             .hello => t.hello_ns,
             .has => t.has_ns,
             .validate => t.validate_ns,
+            .status => t.status_ns,
             .shard_xfer => t.xfer_ns,
             .stats => t.stats_ns,
             else => t.shard_ns,
@@ -733,8 +899,14 @@ pub const Timeouts = struct {
 pub const follower_copy_ns: u64 = 60 * std.time.ns_per_s;
 
 /// A follower's budget for each command that is not an ask (reserve, start, progress; GLM's TF_GLM_SPILL_LOAD_MS
-/// default): it copies what its reads already delivered and leaves the rest to validate (serve's rule 1).
+/// default): it copies what its reads already delivered and leaves the rest to its idle service and validate (serve's
+/// rule 1). A status answer has no budget: it reports from memory.
 pub const follower_progress_ns: u64 = 40 * std.time.ns_per_ms;
+
+/// Timeouts.status_wait_ns's default: how long rank 0 polls a restore's status (from when its own copies finished)
+/// before it gives the restore up as `timeout` without asking validate: a follower's disk that slow fails the
+/// restore, never the decode rounds.
+pub const status_wait_ns: u64 = follower_copy_ns;
 
 /// How rank 0's frames reach the followers: lanes.zig begins a `rank_wire` frame, appends `sub`, and flushes it to
 /// every follower (Model.followers), in the ordered command stream.
@@ -828,9 +1000,11 @@ pub const Leader = struct {
         return p.head;
     }
 
-    /// Records why the pair ended (the first cause only) and returns error.PairBroken, the one error rank_wire
-    /// surfaces for it (explain maps it; `broken` holds the rank and the cause).
-    fn fail(l: *Leader, rank: u16, err: anyerror) anyerror {
+    /// Records why the pair ended (the first cause only: a later call keeps the first rank and cause) and returns
+    /// error.PairBroken, the one error rank_wire surfaces for it (explain maps it; `broken` holds the rank and the
+    /// cause; error.Timeout reads as ReplyTimeout). Public for rank 0's own causes the protocol cannot see (kv_lanes:
+    /// its own side of a cross-part transfer failed or timed out): nothing more is sent after it.
+    pub fn fail(l: *Leader, rank: u16, err: anyerror) anyerror {
         if (l.broken == null) l.broken = .{ .rank = rank, .err = if (err == error.Timeout) error.ReplyTimeout else err };
         return error.PairBroken;
     }
@@ -935,6 +1109,11 @@ fn echo(t: *const Tracker, asked: Head, ask_msg: *const Msg, r: Msg) !void {
             if (!std.mem.eql(u8, &x.point, &p)) return error.WrongPoint;
             if (x.ok and x.copied != ask_msg.validate.upto) return error.BadEcho; // ok: every block copied
         },
+        .status_reply => |x| {
+            const p = t.pointOf(asked.txn) orelse return error.UnknownTxn;
+            if (!std.mem.eql(u8, &x.point, &p)) return error.WrongPoint;
+            if (x.copied > t.blocksOf(asked.txn).?) return error.BadEcho; // never past the point
+        },
         .shard_layout_reply => |x| if (x.schema != ask_msg.shard_layout.schema or x.version != ask_msg.shard_layout.version) return error.BadEcho,
         .shard_check_reply => |x| if (x.owner_epoch != ask_msg.shard_check.owner_epoch) return error.BadEcho,
         .shard_xfer_reply => |x| if (x.stream != ask_msg.shard_xfer.stream or x.owner_epoch != ask_msg.shard_xfer.owner_epoch) return error.WrongStream,
@@ -983,6 +1162,22 @@ pub fn allPresent(replies: []const Frame) bool {
     return true;
 }
 
+/// Every follower's status: the first one that recorded a failure (abort with it, no validate), whether all are
+/// complete (validate answers at once), and the fewest blocks any of them copied.
+pub const StatusSummary = struct { failed: ?struct { rank: u16, why: Failure } = null, complete: bool = true, copied: u32 = no_block };
+
+pub fn statusOf(replies: []const Frame, blocks: u32) StatusSummary {
+    var out: StatusSummary = .{};
+    for (replies, 0..) |f, i| {
+        const s = f.msg.status_reply;
+        if (s.why != .none and out.failed == null) out.failed = .{ .rank = @intCast(i + 1), .why = s.why };
+        if (s.copied < blocks or !s.small_ready) out.complete = false;
+        out.copied = @min(out.copied, s.copied);
+    }
+    if (out.copied == no_block) out.copied = blocks;
+    return out;
+}
+
 /// The first follower whose validation failed (its rank and reason), or null when every one passed.
 pub fn firstFailure(replies: []const Frame) ?struct { rank: u16, why: Failure, bad_block: u32 } {
     for (replies, 0..) |f, i| {
@@ -992,12 +1187,14 @@ pub fn firstFailure(replies: []const Frame) ?struct { rank: u16, why: Failure, b
     return null;
 }
 
-/// The fingerprint's wire_version field: this protocol's version, header size and the shard-op schema.
-pub fn stampBytes() [8]u8 {
-    var b: [8]u8 = undefined;
+/// The fingerprint's wire_version field: this protocol's version, header size, the shard-op schema and every
+/// message's schema (msg_schema).
+pub fn stampBytes() [12]u8 {
+    var b: [12]u8 = undefined;
     std.mem.writeInt(u16, b[0..2], version, .little);
     std.mem.writeInt(u16, b[2..4], header_len, .little);
     std.mem.writeInt(u32, b[4..8], shard_schema, .little);
+    std.mem.writeInt(u32, b[8..12], msg_schema, .little);
     return b;
 }
 
@@ -1013,9 +1210,12 @@ pub const Follower = struct {
     pair: Digest = @splat(0), // agreement.pair(): the compat every has must carry
     mismatch: u16 = 0, // the first differing field rank 0's hello showed
     ops: [max_shard_ops]ShardOp = undefined,
+    forks: [max_keep_forks]Fork = undefined,
+    media: [max_keep_media]Media = undefined,
     rbuf: [max_reply]u8 = undefined,
 
-    /// About 40 KiB (`ops`): allocate it (gpa.create, or a field of a heap-held side), never as a stack local in follow().
+    /// About 90 KiB (`ops`, `forks`, `media`): allocate it (gpa.create, or a field of a heap-held side), never as a stack local
+    /// in follow().
     pub fn init(rank: u16, fx: fingerprint.Exchange) Follower {
         std.debug.assert(rank >= 1 and rank < max_world);
         return .{ .rank = rank, .fx = fx };
@@ -1025,7 +1225,7 @@ pub const Follower = struct {
     /// answered (reply) before the next is accepted.
     pub fn accept(f: *Follower, payload: []const u8) !Frame {
         if (f.owed != null) return error.ReplyOwed;
-        const fr = try decode(payload, &f.ops);
+        const fr = try decodeInto(payload, .{ .ops = &f.ops, .forks = &f.forks, .media = &f.media });
         try f.t.admit(&fr);
         if (fr.head.op.reply() != null) {
             f.owed = fr.head;
@@ -1054,8 +1254,12 @@ fn need(comptime H: type, comptime name_: []const u8) bool {
 /// on `l`. `h` is a pointer to the family's spill/shard side; each method it lacks fails closed (error.Unsupported:
 /// a feature this rank was not started with, which the fingerprint should already have refused). Methods:
 ///   has(Head, Has) !HasReply                validate(Head, Validate) !ValidateReply
+///   status(Head, RestoreStatus) !RestoreStatusReply   (at once, from memory: no device or disk wait; at most
+///     handing on completed copies and enqueuing one block already read)
 ///   reserve/start/progress/commit/abort(Head, <msg>) !void
 ///   writeStaged(Head, WriteStaged) !void    writeCancelled(Head, WriteCancelled) !void
+///   keep(Head, Keep) !void   share(Head, Share) !void   touch(Head, Touch) !void   forget(Head, Forget) !void
+///     (keep's `forks` and `media` point into the Follower's buffers: valid during the call only)
 ///   shardLayout(Head, ShardLayout) !ShardLayoutReply   shardSet(Head, ShardSet) !void
 ///   shardOps(Head, ShardOps) !void          shardCheck(Head, ShardCheck) !ShardCheckReply
 ///   shardXfer(Head, ShardXfer) !ShardXferReply   shardFinish(Head, ShardFinish) !void
@@ -1065,14 +1269,17 @@ fn need(comptime H: type, comptime name_: []const u8) bool {
 /// has: serve has already checked `m.compat` against the agreed pair (Agreement.pair(); a difference ends the rank:
 /// the streams diverged); the handler checks presence under its OWN store's compat (storeCommon(rank)) and echoes
 /// `point` and `compat`. Every reply's echo fields (has: point, compat; validate: the transaction's point, and
-/// copied = upto when ok; shard_layout: version, schema; shard_check: owner_epoch; shard_xfer: stream, owner_epoch;
-/// stats: set) are checked here before sending, and again on rank 0.
+/// copied = upto when ok; status: the transaction's point, copied <= blocks; shard_layout: version, schema;
+/// shard_check: owner_epoch; shard_xfer: stream, owner_epoch; stats: set) are checked here before sending, and again
+/// on rank 0.
 ///
 /// The rules the handlers keep (rank 0's round loop keeps sending while a follower works; only an ask waits):
-///   1. The commands that are not asks never wait on the disk: reserve, start and progress take at most
-///      `follower_progress_ns` each (GLM's TF_GLM_SPILL_LOAD_MS: 40 ms). progress copies only the blocks whose reads
-///      already completed (or waits within that budget) and leaves the rest to validate, which has the
-///      `follower_copy_ns` bound and its own reply.
+///   1. The commands that are not asks never wait on the disk: reserve, start, progress and the notices (keep, share,
+///      touch, forget, write_staged, write_cancelled) take at most `follower_progress_ns` each (GLM's
+///      TF_GLM_SPILL_LOAD_MS: 40 ms); a status answer takes no wait at all (from memory). progress copies only the
+///      blocks whose reads already completed (or waits within that budget) and leaves the rest to the idle service;
+///      rank 0 asks validate (which has the `follower_copy_ns` bound and its own reply) only once every status said
+///      complete.
 ///   2. A read, CRC, truncation or missing-file failure in reserve/start/progress is RECORDED (the restore's state)
 ///      and reported by validate_reply (why, bad_block), never returned as an error. The same for a transfer's
 ///      failure in shardOps (shard_xfer_reply.ok = false).
@@ -1111,10 +1318,18 @@ pub fn serve(f: *Follower, l: link.Link, payload: []const u8, h: anytype) !void 
             if (comptime !need(H, "validate")) return error.Unsupported;
             try f.reply(l, .{ .validate_reply = try h.validate(head, m) });
         },
+        .status => |m| {
+            if (comptime !need(H, "status")) return error.Unsupported;
+            try f.reply(l, .{ .status_reply = try h.status(head, m) });
+        },
         .commit => |m| if (comptime need(H, "commit")) try h.commit(head, m) else return error.Unsupported,
         .abort => |m| if (comptime need(H, "abort")) try h.abort(head, m) else return error.Unsupported,
         .write_staged => |m| if (comptime need(H, "writeStaged")) try h.writeStaged(head, m) else return error.Unsupported,
         .write_cancelled => |m| if (comptime need(H, "writeCancelled")) try h.writeCancelled(head, m) else return error.Unsupported,
+        .keep => |m| if (comptime need(H, "keep")) try h.keep(head, m) else return error.Unsupported,
+        .share => |m| if (comptime need(H, "share")) try h.share(head, m) else return error.Unsupported,
+        .touch => |m| if (comptime need(H, "touch")) try h.touch(head, m) else return error.Unsupported,
+        .forget => |m| if (comptime need(H, "forget")) try h.forget(head, m) else return error.Unsupported,
         .shard_layout => |m| {
             if (comptime !need(H, "shardLayout")) return error.Unsupported;
             try f.reply(l, .{ .shard_layout_reply = try h.shardLayout(head, m) });
@@ -1135,7 +1350,7 @@ pub fn serve(f: *Follower, l: link.Link, payload: []const u8, h: anytype) !void 
             if (comptime !need(H, "stats")) return error.Unsupported;
             try f.reply(l, .{ .stats_reply = try h.stats(head, m) });
         },
-        .hello_reply, .has_reply, .validate_reply, .shard_layout_reply, .shard_check_reply, .shard_xfer_reply, .stats_reply => unreachable, // (admit)
+        .hello_reply, .has_reply, .validate_reply, .status_reply, .shard_layout_reply, .shard_check_reply, .shard_xfer_reply, .stats_reply => unreachable, // (admit)
     }
 }
 
@@ -1161,6 +1376,14 @@ fn feed(comptime h: *std.hash.Fnv1a_32, comptime T: type) void {
     switch (@typeInfo(T)) {
         .int => h.update(@typeName(WireInt(T))),
         .bool => h.update("bool"),
+        .optional => |o| {
+            h.update("?");
+            feed(h, o.child);
+        },
+        .pointer => |p| {
+            h.update("[]");
+            feed(h, p.child);
+        },
         .@"enum" => |e| {
             h.update("enum(");
             feed(h, e.tag_type);
@@ -1183,6 +1406,8 @@ fn feed(comptime h: *std.hash.Fnv1a_32, comptime T: type) void {
         },
         .@"union" => |u| {
             h.update("union{");
+            // the tag's names and numbers (the op byte on the wire is its value: a renumbered op changes the stamp)
+            if (u.tag_type) |TT| feed(h, TT);
             for (u.field_names, u.field_types) |n, FT| {
                 h.update(n);
                 h.update(":");
@@ -1249,8 +1474,25 @@ fn randValue(comptime T: type, rnd: std.Random) T {
     }
 }
 
-/// A valid message of each op, its numbers random within what check() allows.
+/// A valid message of each op, its numbers random within what check() allows (a keep's forks in `forks_buf`, its
+/// pictures in `media_buf`).
 fn randMsg(op: Op, rnd: std.Random, ops_buf: []ShardOp) Msg {
+    return randMsgWith(op, rnd, ops_buf, &.{}, &.{});
+}
+
+/// A keep's pictures: in order, not overlapping; the cut past the last one's start.
+fn randMedia(rnd: std.Random, media_buf: []Media, at: *u32) []const Media {
+    const n = rnd.uintAtMost(usize, @min(media_buf.len, max_keep_media));
+    var cursor: u32 = 0;
+    for (media_buf[0..n]) |*m| {
+        m.* = .{ .start = cursor + rnd.uintAtMost(u32, 64), .len = rnd.intRangeAtMost(u32, 1, 600), .digest = randDigest(rnd) };
+        cursor = m.start + m.len;
+    }
+    if (n > 0) at.* = media_buf[n - 1].start + rnd.intRangeAtMost(u32, 1, 1 << 20);
+    return media_buf[0..n];
+}
+
+fn randMsgWith(op: Op, rnd: std.Random, ops_buf: []ShardOp, forks_buf: []Fork, media_buf: []Media) Msg {
     const world = rnd.intRangeAtMost(u16, 2, max_world);
     const blocks = rnd.intRangeAtMost(u32, 1, max_blocks);
     return switch (op) {
@@ -1271,7 +1513,7 @@ fn randMsg(op: Op, rnd: std.Random, ops_buf: []ShardOp) Msg {
         .has_reply => .{ .has_reply = .{ .answer = randEnum(Absence, rnd), .point = randDigest(rnd), .compat = randDigest(rnd) } },
         .reserve => blk: {
             const at = rnd.intRangeAtMost(u64, 1, 1 << 40);
-            break :blk .{ .reserve = .{ .point = randDigest(rnd), .slot = rnd.int(u32), .base = rnd.int(u64), .size = at + rnd.uintAtMost(u64, 1 << 20), .at = at, .blocks = blocks, .generation = rnd.int(u64), .part = rnd.uintLessThan(u8, max_parts) } };
+            break :blk .{ .reserve = .{ .point = randDigest(rnd), .kept = rnd.int(u64), .slot = rnd.int(u32), .base = rnd.int(u64), .size = at + rnd.uintAtMost(u64, 1 << 20), .at = at, .blocks = blocks, .generation = rnd.int(u64), .part = rnd.uintLessThan(u8, max_parts) } };
         },
         .start => .{ .start = .{ .point = randDigest(rnd), .blocks = blocks } },
         .progress => .{ .progress = .{ .upto = blocks } },
@@ -1282,16 +1524,28 @@ fn randMsg(op: Op, rnd: std.Random, ops_buf: []ShardOp) Msg {
             if (!ok and why == .none) why = .crc;
             break :blk .{ .validate_reply = .{ .ok = ok, .why = if (ok) .none else why, .copied = rnd.uintAtMost(u32, max_blocks), .bad_block = if (ok) no_block else rnd.uintLessThan(u32, max_blocks), .point = randDigest(rnd) } };
         },
-        .commit => .{ .commit = .{ .point = randDigest(rnd), .at = rnd.intRangeAtMost(u64, 1, 1 << 40), .generation = rnd.int(u64), .shared = rnd.boolean() } },
+        .commit => .{ .commit = .{ .point = randDigest(rnd), .at = rnd.intRangeAtMost(u64, 1, 1 << 40), .kept = rnd.int(u64), .shared = rnd.boolean() } },
+        .status => .{ .status = .{} },
+        .status_reply => .{ .status_reply = .{ .copied = rnd.uintAtMost(u32, max_blocks), .small_ready = rnd.boolean(), .why = randEnum(Failure, rnd), .point = randDigest(rnd) } },
         .abort => blk: {
             var why = randEnum(Failure, rnd);
             if (why == .none) why = .read;
             break :blk .{ .abort = .{ .why = why, .rank = if (rnd.boolean()) no_rank else rnd.uintLessThan(u16, max_world), .forget = rnd.boolean() } };
         },
-        .write_staged => .{ .write_staged = .{ .point = randDigest(rnd), .kept = rnd.int(u64), .generation = rnd.int(u64), .upto = rnd.uintAtMost(u32, max_blocks) } },
-        .write_cancelled => .{ .write_cancelled = .{ .point = randDigest(rnd), .kept = rnd.int(u64), .generation = rnd.int(u64), .why = randEnum(CancelWhy, rnd) } },
-        .shard_layout => .{ .shard_layout = .{ .version = rnd.intRangeAtMost(u16, 1, 9), .parts = rnd.intRangeAtMost(u8, 1, max_parts), .cap = rnd.int(u64), .carry = rnd.boolean(), .schema = shard_schema } },
-        .shard_layout_reply => .{ .shard_layout_reply = .{ .version = rnd.intRangeAtMost(u16, 1, 9), .parts = rnd.intRangeAtMost(u8, 1, max_parts), .cap = rnd.int(u64), .schema = rnd.int(u32) } },
+        .write_staged => .{ .write_staged = .{ .point = randDigest(rnd), .kept = rnd.int(u64), .upto = rnd.uintAtMost(u32, max_blocks) } },
+        .write_cancelled => .{ .write_cancelled = .{ .point = randDigest(rnd), .kept = rnd.int(u64), .why = randEnum(CancelWhy, rnd) } },
+        .keep => blk: {
+            const n = rnd.uintAtMost(usize, @min(forks_buf.len, max_keep_forks));
+            for (forks_buf[0..n]) |*f| f.* = randValue(Fork, rnd);
+            var at = rnd.intRangeAtMost(u32, 1, std.math.maxInt(u32));
+            const media = randMedia(rnd, media_buf, &at);
+            break :blk .{ .keep = .{ .slot = rnd.int(u32), .kept = rnd.intRangeAtMost(u64, 1, std.math.maxInt(u64)), .base = rnd.int(u64), .at = at, .point = randDigest(rnd), .group = rnd.int(u64), .shared = rnd.boolean(), .root = randValue([16]u8, rnd), .part = if (rnd.boolean()) rnd.int(u32) else null, .origin = if (rnd.boolean()) randValue(Origin, rnd) else null, .placeholder = if (media.len > 0) rnd.int(u32) else null, .forks = forks_buf[0..n], .media = media } };
+        },
+        .share => .{ .share = .{ .point = randDigest(rnd) } },
+        .touch => .{ .touch = .{ .point = randDigest(rnd) } },
+        .forget => .{ .forget = .{ .point = randDigest(rnd) } },
+        .shard_layout => .{ .shard_layout = .{ .version = rnd.intRangeAtMost(u16, 1, 9), .parts = rnd.intRangeAtMost(u8, 1, max_parts), .cap = rnd.int(u64), .carry = rnd.boolean(), .twins = rnd.boolean(), .schema = shard_schema } },
+        .shard_layout_reply => .{ .shard_layout_reply = .{ .version = rnd.intRangeAtMost(u16, 1, 9), .parts = rnd.intRangeAtMost(u8, 1, max_parts), .cap = rnd.int(u64), .carry = rnd.boolean(), .twins = rnd.boolean(), .schema = rnd.int(u32) } },
         .shard_set => .{ .shard_set = .{ .version = 1, .parts = rnd.intRangeAtMost(u8, 1, max_parts), .part_rows = rnd.intRangeAtMost(u64, 1, 1 << 40), .owner_epoch = rnd.int(u64) } },
         .shard_ops => blk: {
             const n = rnd.uintAtMost(usize, @min(ops_buf.len, max_shard_ops));
@@ -1303,12 +1557,12 @@ fn randMsg(op: Op, rnd: std.Random, ops_buf: []ShardOp) Msg {
         .shard_xfer => .{ .shard_xfer = .{ .owner_epoch = rnd.int(u64), .stream = rnd.int(u64) } },
         .shard_xfer_reply => .{ .shard_xfer_reply = .{ .owner_epoch = rnd.int(u64), .stream = rnd.int(u64), .ok = rnd.boolean() } },
         .shard_finish => .{ .shard_finish = .{ .owner_epoch = rnd.int(u64), .stream = rnd.int(u64), .ok = rnd.boolean() } },
-        .stats => .{ .stats = .{ .set = .tier } },
+        .stats => .{ .stats = .{ .set = randEnum(StatsSet, rnd) } },
         .stats_reply => blk: {
             var v: [max_stats]u64 = @splat(0);
             const n = rnd.uintAtMost(u8, max_stats);
             for (v[0..n]) |*x| x.* = rnd.int(u64);
-            break :blk .{ .stats_reply = .{ .set = .tier, .n = n, .values = v } };
+            break :blk .{ .stats_reply = .{ .set = randEnum(StatsSet, rnd), .n = n, .values = v } };
         },
     };
 }
@@ -1332,15 +1586,24 @@ test "every message round-trips, and nothing but its exact bytes decodes" {
     defer gpa.free(src_ops);
     const dst_ops = try gpa.alloc(ShardOp, max_shard_ops);
     defer gpa.free(dst_ops);
+    const src_forks = try gpa.alloc(Fork, max_keep_forks);
+    defer gpa.free(src_forks);
+    const dst_forks = try gpa.alloc(Fork, max_keep_forks);
+    defer gpa.free(dst_forks);
+    const src_media = try gpa.alloc(Media, max_keep_media);
+    defer gpa.free(src_media);
+    const dst_media = try gpa.alloc(Media, max_keep_media);
+    defer gpa.free(dst_media);
     const buf = try gpa.alloc(u8, max_frame + 64);
     defer gpa.free(buf);
     const again = try gpa.alloc(u8, max_frame);
     defer gpa.free(again);
+    const bufs: Bufs = .{ .ops = dst_ops, .forks = dst_forks, .media = dst_media };
     for (0..40) |_| for (all_ops) |op| {
         const head = randHead(op, rnd);
-        const msg = randMsg(op, rnd, src_ops);
+        const msg = randMsgWith(op, rnd, src_ops, src_forks, src_media);
         const bytes = try encode(buf, head, msg);
-        const f = try decode(bytes, dst_ops);
+        const f = try decodeInto(bytes, bufs);
         try testing.expectEqualDeep(head, f.head);
         try testing.expectEqualDeep(msg, f.msg);
         // canonical: the decoded frame encodes to the same bytes
@@ -1348,10 +1611,10 @@ test "every message round-trips, and nothing but its exact bytes decodes" {
         // every truncation fails, one more byte fails
         var cut: usize = 0;
         while (cut < bytes.len) : (cut += 1 + rnd.uintLessThan(usize, 1 + bytes.len / 64)) {
-            if (decode(bytes[0..cut], dst_ops)) |_| return error.TruncatedFrameDecoded else |_| {}
+            if (decodeInto(bytes[0..cut], bufs)) |_| return error.TruncatedFrameDecoded else |_| {}
         }
         buf[bytes.len] = 0;
-        try testing.expectError(error.TrailingBytes, decode(buf[0 .. bytes.len + 1], dst_ops));
+        try testing.expectError(error.TrailingBytes, decodeInto(buf[0 .. bytes.len + 1], bufs));
     };
 }
 
@@ -1361,6 +1624,11 @@ test "garbled frames never decode to something else, random bytes never crash th
     const gpa = testing.allocator;
     var src_ops: [64]ShardOp = undefined;
     var dst_ops: [64]ShardOp = undefined;
+    var src_forks: [64]Fork = undefined;
+    var dst_forks: [64]Fork = undefined;
+    var src_media: [32]Media = undefined;
+    var dst_media: [32]Media = undefined;
+    const bufs: Bufs = .{ .ops = &dst_ops, .forks = &dst_forks, .media = &dst_media };
     const buf = try gpa.alloc(u8, max_frame);
     defer gpa.free(buf);
     const again = try gpa.alloc(u8, max_frame);
@@ -1369,11 +1637,11 @@ test "garbled frames never decode to something else, random bytes never crash th
     var refused: usize = 0;
     for (0..3000) |_| {
         const op = all_ops[rnd.uintLessThan(usize, all_ops.len)];
-        const bytes = try encode(buf, randHead(op, rnd), randMsg(op, rnd, &src_ops));
+        const bytes = try encode(buf, randHead(op, rnd), randMsgWith(op, rnd, &src_ops, &src_forks, &src_media));
         // flip 1-3 random bytes: either refused, or a frame whose canonical bytes are exactly the garbled ones
         const flips = 1 + rnd.uintLessThan(usize, 3);
         for (0..flips) |_| bytes[rnd.uintLessThan(usize, bytes.len)] ^= @as(u8, 1) << rnd.int(u3);
-        if (decode(bytes, &dst_ops)) |f| {
+        if (decodeInto(bytes, bufs)) |f| {
             decoded += 1;
             try testing.expectEqualSlices(u8, bytes, try encode(again, f.head, f.msg));
         } else |_| refused += 1;
@@ -1389,7 +1657,7 @@ test "garbled frames never decode to something else, random bytes never crash th
             buf[4] = @intFromEnum(all_ops[rnd.uintLessThan(usize, all_ops.len)]);
             buf[5] = 0;
         }
-        if (decode(buf[0..n], &dst_ops)) |f| {
+        if (decodeInto(buf[0..n], bufs)) |f| {
             try testing.expectEqualSlices(u8, buf[0..n], try encode(again, f.head, f.msg));
         } else |_| {}
     }
@@ -1489,7 +1757,7 @@ test "the tracker admits a restore in order and refuses it out of order" {
     try testing.expectError(error.StaleTxn, t.admit(&cmd(&t, has, 1)));
     // a stale epoch, a skipped seq, a repeated seq
     {
-        var f = cmd(&t, .{ .reserve = .{ .point = p, .slot = 0, .base = 0, .size = 8192, .at = 6144, .blocks = 3, .generation = 1, .part = 0 } }, 1);
+        var f = cmd(&t, .{ .reserve = .{ .point = p, .kept = 1, .slot = 0, .base = 0, .size = 8192, .at = 6144, .blocks = 3, .generation = 0, .part = 0 } }, 1);
         f.head.epoch = 76;
         try testing.expectError(error.StaleEpoch, t.admit(&f));
         f.head.epoch = t.epoch;
@@ -1505,19 +1773,19 @@ test "the tracker admits a restore in order and refuses it out of order" {
     try testing.expectError(error.OutOfOrder, t.admit(&cmd(&t, .{ .start = .{ .point = p, .blocks = 3 } }, 1)));
     try testing.expectError(error.OutOfOrder, t.admit(&cmd(&t, .{ .validate = .{ .upto = 3, .shared = false } }, 1)));
     try testing.expectError(error.UnknownTxn, t.admit(&cmd(&t, .{ .start = .{ .point = p, .blocks = 3 } }, 9)));
-    try testing.expectError(error.WrongPoint, t.admit(&cmd(&t, .{ .reserve = .{ .point = @splat(8), .slot = 0, .base = 0, .size = 8192, .at = 6144, .blocks = 3, .generation = 1, .part = 0 } }, 1)));
-    try t.admit(&cmd(&t, .{ .reserve = .{ .point = p, .slot = 0, .base = 0, .size = 8192, .at = 6144, .blocks = 3, .generation = 1, .part = 0 } }, 1));
+    try testing.expectError(error.WrongPoint, t.admit(&cmd(&t, .{ .reserve = .{ .point = @splat(8), .kept = 1, .slot = 0, .base = 0, .size = 8192, .at = 6144, .blocks = 3, .generation = 0, .part = 0 } }, 1)));
+    try t.admit(&cmd(&t, .{ .reserve = .{ .point = p, .kept = 1, .slot = 0, .base = 0, .size = 8192, .at = 6144, .blocks = 3, .generation = 0, .part = 0 } }, 1));
     try testing.expectError(error.OutOfOrder, t.admit(&cmd(&t, .{ .progress = .{ .upto = 1 } }, 1))); // before start
     try t.admit(&cmd(&t, .{ .start = .{ .point = p, .blocks = 3 } }, 1));
     try t.admit(&cmd(&t, .{ .progress = .{ .upto = 1 } }, 1));
     try testing.expectError(error.OutOfOrder, t.admit(&cmd(&t, .{ .progress = .{ .upto = 1 } }, 1))); // not forward
     try testing.expectError(error.OutOfOrder, t.admit(&cmd(&t, .{ .progress = .{ .upto = 4 } }, 1))); // past the point
     try t.admit(&cmd(&t, .{ .progress = .{ .upto = 2 } }, 1));
-    try testing.expectError(error.OutOfOrder, t.admit(&cmd(&t, .{ .commit = .{ .point = p, .at = 6144, .generation = 1, .shared = false } }, 1)));
+    try testing.expectError(error.OutOfOrder, t.admit(&cmd(&t, .{ .commit = .{ .point = p, .at = 6144, .kept = 1, .shared = false } }, 1)));
     try testing.expectError(error.OutOfOrder, t.admit(&cmd(&t, .{ .validate = .{ .upto = 2, .shared = false } }, 1))); // not through the end
     try t.admit(&cmd(&t, .{ .validate = .{ .upto = 3, .shared = true } }, 1));
     try testing.expectError(error.OutOfOrder, t.admit(&cmd(&t, .{ .progress = .{ .upto = 3 } }, 1)));
-    try t.admit(&cmd(&t, .{ .commit = .{ .point = p, .at = 6144, .generation = 1, .shared = true } }, 1));
+    try t.admit(&cmd(&t, .{ .commit = .{ .point = p, .at = 6144, .kept = 1, .shared = true } }, 1));
     try testing.expectError(error.UnknownTxn, t.admit(&cmd(&t, .{ .abort = .{ .why = .read, .rank = 1, .forget = true } }, 1))); // closed
     try testing.expectEqual(@as(usize, 0), t.open());
     // abort from any phase; at most max_restores open
@@ -1537,20 +1805,20 @@ test "the tracker keeps a plan's frames together and owner epochs forward" {
     var t = try agreedTracker();
     const ops = [_]ShardOp{.{ .drop = .{ .kept = 1, .gen = 1 } }};
     try testing.expectError(error.NotAgreed, t.admit(&cmd(&t, .{ .shard_ops = .{ .owner_epoch = 1, .index = 0, .last = true, .ops = &ops } }, 1)));
-    try t.admit(&cmd(&t, .{ .shard_layout = .{ .version = 1, .parts = 2, .cap = 1 << 20, .carry = true, .schema = shard_schema } }, 1));
+    try t.admit(&cmd(&t, .{ .shard_layout = .{ .version = 1, .parts = 2, .cap = 1 << 20, .carry = true, .twins = true, .schema = shard_schema } }, 1));
     try t.admit(&cmd(&t, .{ .shard_set = .{ .version = 1, .parts = 2, .part_rows = 1 << 19, .owner_epoch = 10 } }, 2));
     try testing.expectError(error.StaleEpoch, t.admit(&cmd(&t, .{ .shard_ops = .{ .owner_epoch = 10, .index = 0, .last = true, .ops = &ops } }, 3)));
     try testing.expectError(error.OutOfOrder, t.admit(&cmd(&t, .{ .shard_ops = .{ .owner_epoch = 12, .index = 0, .last = true, .ops = &ops } }, 3)));
     try t.admit(&cmd(&t, .{ .shard_ops = .{ .owner_epoch = 11, .index = 0, .last = false, .ops = &ops } }, 3));
     // nothing between a plan's frames
-    try testing.expectError(error.OutOfOrder, t.admit(&cmd(&t, .{ .write_cancelled = .{ .point = @splat(1), .kept = 1, .generation = 1, .why = .carry } }, 4)));
+    try testing.expectError(error.OutOfOrder, t.admit(&cmd(&t, .{ .write_cancelled = .{ .point = @splat(1), .kept = 1, .why = .carry } }, 4)));
     try testing.expectError(error.OutOfOrder, t.admit(&cmd(&t, .{ .shard_ops = .{ .owner_epoch = 11, .index = 2, .last = true, .ops = &ops } }, 3)));
     try testing.expectError(error.StaleEpoch, t.admit(&cmd(&t, .{ .shard_ops = .{ .owner_epoch = 12, .index = 1, .last = false, .ops = &ops } }, 3)));
     try t.admit(&cmd(&t, .{ .shard_ops = .{ .owner_epoch = 11, .index = 1, .last = false, .ops = &ops } }, 3));
     try t.admit(&cmd(&t, .{ .shard_ops = .{ .owner_epoch = 11, .index = 2, .last = true, .ops = &ops } }, 3));
     try testing.expectError(error.StaleEpoch, t.admit(&cmd(&t, .{ .shard_check = .{ .owner_epoch = 10, .digest = @splat(0) } }, 4)));
     try t.admit(&cmd(&t, .{ .shard_check = .{ .owner_epoch = 11, .digest = @splat(0) } }, 4));
-    try t.admit(&cmd(&t, .{ .write_staged = .{ .point = @splat(1), .kept = 3, .generation = 2, .upto = 1 } }, 5));
+    try t.admit(&cmd(&t, .{ .write_staged = .{ .point = @splat(1), .kept = 3, .upto = 1 } }, 5));
     try testing.expectError(error.StaleEpoch, t.admit(&cmd(&t, .{ .shard_set = .{ .version = 1, .parts = 2, .part_rows = 1 << 19, .owner_epoch = 11 } }, 6)));
 }
 
@@ -1585,6 +1853,19 @@ const FakeSide = struct {
     cap: u64 = 32 * parts.chunk_rows,
     xfer_fail: bool = false,
     finished: u32 = 0,
+    // the restore's copies as status reports them: complete once the clock passes `ready_at` (a slow disk)
+    ready_at: u64 = 0,
+    status_why: Failure = .none,
+    statuses: u32 = 0,
+    validates: u32 = 0,
+    blocks: u32 = 0,
+    // the notices
+    keeps: u32 = 0,
+    keep_forks: u32 = 0,
+    keep_origin: bool = false,
+    shares: u32 = 0,
+    touches: u32 = 0,
+    forgets: u32 = 0,
 
     rank: u16 = 1,
 
@@ -1604,12 +1885,35 @@ const FakeSide = struct {
             .present;
         return .{ .answer = answer, .point = m.point, .compat = m.compat };
     }
-    pub fn reserve(_: *FakeSide, _: Head, _: Reserve) !void {}
+    pub fn reserve(s: *FakeSide, _: Head, m: Reserve) !void {
+        s.blocks = m.blocks;
+    }
+    /// From memory, at once: how far the "disk" got by now.
+    pub fn status(s: *FakeSide, _: Head, _: RestoreStatus) !RestoreStatusReply {
+        s.statuses += 1;
+        const done = monotonicNs() >= s.ready_at;
+        return .{ .copied = if (done) s.blocks else s.blocks / 2, .small_ready = done, .why = s.status_why, .point = s.held };
+    }
+    pub fn keep(s: *FakeSide, _: Head, m: Keep) !void {
+        s.keeps += 1;
+        s.keep_forks = @intCast(m.forks.len);
+        s.keep_origin = m.origin != null;
+    }
+    pub fn share(s: *FakeSide, _: Head, _: Share) !void {
+        s.shares += 1;
+    }
+    pub fn touch(s: *FakeSide, _: Head, _: Touch) !void {
+        s.touches += 1;
+    }
+    pub fn forget(s: *FakeSide, _: Head, _: Forget) !void {
+        s.forgets += 1;
+    }
     pub fn start(_: *FakeSide, _: Head, _: Start) !void {}
     pub fn progress(s: *FakeSide, _: Head, m: Progress) !void {
         s.copied = m.upto;
     }
     pub fn validate(s: *FakeSide, _: Head, m: Validate) !ValidateReply {
+        s.validates += 1;
         s.copied = m.upto;
         if (s.bad) |b| return .{ .ok = false, .why = .crc, .copied = b, .bad_block = b, .point = s.held };
         return .{ .ok = true, .why = .none, .copied = m.upto, .bad_block = no_block, .point = s.held };
@@ -1622,7 +1926,7 @@ const FakeSide = struct {
     }
 
     pub fn shardLayout(s: *FakeSide, _: Head, m: ShardLayout) !ShardLayoutReply {
-        return .{ .version = parts.layout_version, .parts = m.parts, .cap = s.cap, .schema = shard_schema };
+        return .{ .version = parts.layout_version, .parts = m.parts, .cap = s.cap, .carry = m.carry, .twins = m.twins, .schema = shard_schema };
     }
     pub fn shardSet(s: *FakeSide, _: Head, m: ShardSet) !void {
         if (m.version != parts.layout_version) return error.LayoutVersion;
@@ -1763,13 +2067,13 @@ test "rank 0 and a follower agree, restore, and fail closed over a loopback link
         try testing.expect(allPresent(&replies));
         try testing.expectEqualSlices(u8, &a.pair(), &replies[0].msg.has_reply.compat);
         // no command while an ask is outstanding, no second ask
-        _ = try leader.post(ts.sink(), has.txn, .{ .reserve = .{ .point = p, .slot = 1, .base = 0, .size = 8192, .at = 6144, .blocks = 3, .generation = 4, .part = 0 } });
+        _ = try leader.post(ts.sink(), has.txn, .{ .reserve = .{ .point = p, .kept = 4, .slot = 1, .base = 0, .size = 8192, .at = 6144, .blocks = 3, .generation = 0, .part = 0 } });
         _ = try leader.post(ts.sink(), has.txn, .{ .start = .{ .point = p, .blocks = 3 } });
         _ = try leader.post(ts.sink(), has.txn, .{ .progress = .{ .upto = 2 } });
         try testing.expectError(error.OutOfOrder, leader.admissible(has.txn, .{ .progress = .{ .upto = 2 } })); // checked, nothing sent
         _ = try leader.ask(ts.sink(), &links, has.txn, .{ .validate = .{ .upto = 3, .shared = false } }, &replies);
         try testing.expect(firstFailure(&replies) == null);
-        _ = try leader.post(ts.sink(), has.txn, .{ .commit = .{ .point = p, .at = 6144, .generation = 4, .shared = false } });
+        _ = try leader.post(ts.sink(), has.txn, .{ .commit = .{ .point = p, .at = 6144, .kept = 4, .shared = false } });
         // an absent point: has says missing, rank 0 aborts the transaction everywhere
         const q: Digest = @splat(3);
         const h2 = try leader.ask(ts.sink(), &links, 0, .{ .has = .{ .point = q, .compat = leader.compat(), .at = 2048, .blocks = 1, .layout = .replicated, .part = 0 } }, &replies);
@@ -1816,7 +2120,7 @@ test "rank 0 and a follower agree, restore, and fail closed over a loopback link
         try testing.expectEqual(@as(?anyerror, error.FingerprintMismatch), peer.err);
         var buf: [128]u8 = undefined;
         try testing.expectEqualStrings("rank 1's configuration differs from rank 0's in engine_commit", describeBroken(leader.broken.?, &buf));
-        try testing.expectError(error.PairBroken, leader.post(ts.sink(), 0, .{ .write_staged = .{ .point = @splat(0), .kept = 1, .generation = 1, .upto = 0 } }));
+        try testing.expectError(error.PairBroken, leader.post(ts.sink(), 0, .{ .write_staged = .{ .point = @splat(0), .kept = 1, .upto = 0 } }));
     }
     // 3. a follower that never answers: rank 0's wait is bounded and ends the pair
     // 4. a garbled reply ends the pair
@@ -1960,7 +2264,7 @@ test "two ranks' planners stay equal over the wire: layout agreement, plans, tra
     _ = try leader.agree(ts.sink(), &links);
     // part agreement: every rank's capacity, the pool every rank can hold, the parts and the first owner epoch
     var replies: [1]Frame = undefined;
-    _ = try leader.ask(ts.sink(), &links, 0, .{ .shard_layout = .{ .version = parts.layout_version, .parts = 2, .cap = 64 * C, .carry = true, .schema = shard_schema } }, &replies);
+    _ = try leader.ask(ts.sink(), &links, 0, .{ .shard_layout = .{ .version = parts.layout_version, .parts = 2, .cap = 64 * C, .carry = true, .twins = true, .schema = shard_schema } }, &replies);
     const lr = replies[0].msg.shard_layout_reply;
     try testing.expectEqual(parts.layout_version, lr.version);
     try testing.expectEqual(shard_schema, lr.schema);
@@ -2006,11 +2310,11 @@ test "two ranks' planners stay equal over the wire: layout agreement, plans, tra
     try testing.expectEqualSlices(u8, &pl.digest(), &peer.side.pl.?.digest());
 }
 
-test "the tracker refuses a reserve or commit that names another at, part or generation" {
+test "the tracker refuses a reserve or commit that names another at, part or kept state" {
     const p: Digest = @splat(9);
     var t = try agreedTracker();
     try t.admit(&cmd(&t, .{ .has = .{ .point = p, .compat = p, .at = 6144, .blocks = 3, .layout = .owner_sharded, .part = 1 } }, 1));
-    const res: Reserve = .{ .point = p, .slot = 0, .base = 0, .size = 8192, .at = 6144, .blocks = 3, .generation = 7, .part = 1 };
+    const res: Reserve = .{ .point = p, .kept = 7, .slot = 0, .base = 0, .size = 8192, .at = 6144, .blocks = 3, .generation = 0, .part = 1 };
     var r = res;
     r.at = 4096;
     try testing.expectError(error.WrongPoint, t.admit(&cmd(&t, .{ .reserve = r }, 1)));
@@ -2020,9 +2324,9 @@ test "the tracker refuses a reserve or commit that names another at, part or gen
     try t.admit(&cmd(&t, .{ .reserve = res }, 1));
     try t.admit(&cmd(&t, .{ .start = .{ .point = p, .blocks = 3 } }, 1));
     try t.admit(&cmd(&t, .{ .validate = .{ .upto = 3, .shared = false } }, 1));
-    try testing.expectError(error.WrongPoint, t.admit(&cmd(&t, .{ .commit = .{ .point = p, .at = 6144, .generation = 8, .shared = false } }, 1)));
-    try testing.expectError(error.WrongPoint, t.admit(&cmd(&t, .{ .commit = .{ .point = p, .at = 2048, .generation = 7, .shared = false } }, 1)));
-    try t.admit(&cmd(&t, .{ .commit = .{ .point = p, .at = 6144, .generation = 7, .shared = false } }, 1));
+    try testing.expectError(error.WrongPoint, t.admit(&cmd(&t, .{ .commit = .{ .point = p, .at = 6144, .kept = 8, .shared = false } }, 1)));
+    try testing.expectError(error.WrongPoint, t.admit(&cmd(&t, .{ .commit = .{ .point = p, .at = 2048, .kept = 7, .shared = false } }, 1)));
+    try t.admit(&cmd(&t, .{ .commit = .{ .point = p, .at = 6144, .kept = 7, .shared = false } }, 1));
 }
 
 /// A loopback pair: one Peer thread per follower (ranks 1..world-1), rank 0's links and a Leader agreed with them.
@@ -2159,7 +2463,7 @@ test "a refused post ends the pair (rank 0 already acted); admissible refuses wi
     const l = s.leader;
     _ = try l.agree(s.sink(), s.ls());
     var replies: [1]Frame = undefined;
-    _ = try l.ask(s.sink(), s.ls(), 0, .{ .shard_layout = .{ .version = parts.layout_version, .parts = 2, .cap = 32 * C, .carry = true, .schema = shard_schema } }, &replies);
+    _ = try l.ask(s.sink(), s.ls(), 0, .{ .shard_layout = .{ .version = parts.layout_version, .parts = 2, .cap = 32 * C, .carry = true, .twins = true, .schema = shard_schema } }, &replies);
     _ = try l.post(s.sink(), 0, .{ .shard_set = .{ .version = parts.layout_version, .parts = 2, .part_rows = 16 * C, .owner_epoch = 1 } });
     defer if (s.peers[0].side.pl) |*x| x.deinit(gpa);
     var pl = try parts.Planner.init(.{ .cap = 32 * C, .parts = 2, .carry_bytes = 720 });
@@ -2202,4 +2506,315 @@ test "rank 0 collects three ranks' replies in rank order and names the late one"
     try testing.expectError(error.PairBroken, l.ask(s.sink(), s.ls(), 0, has, &replies));
     try testing.expectEqual(@as(anyerror, error.ReplyTimeout), l.broken.?.err);
     try testing.expectEqual(@as(u16, 2), l.broken.?.rank);
+}
+
+test "the notices open their own transactions; status asks only a started restore; a replicated reserve has no generation" {
+    var t = try agreedTracker();
+    const p: Digest = @splat(4);
+    const forks = [_]Fork{.{ .name = @splat(1), .at = 2048 }};
+    const keep: Msg = .{ .keep = .{ .slot = 1, .kept = 9, .base = 0, .at = 4096, .point = p, .group = 3, .shared = false, .root = @splat(2), .part = null, .origin = null, .forks = &forks } };
+    try testing.expectError(error.OutOfOrder, t.admit(&cmd(&t, keep, 2))); // a skipped transaction
+    try t.admit(&cmd(&t, keep, 1));
+    try testing.expectError(error.StaleTxn, t.admit(&cmd(&t, .{ .touch = .{ .point = p } }, 1)));
+    {
+        var f = cmd(&t, .{ .share = .{ .point = p } }, 2);
+        f.head.epoch +%= 1;
+        try testing.expectError(error.StaleEpoch, t.admit(&f));
+        f.head.epoch = t.epoch;
+        f.head.seq += 1;
+        try testing.expectError(error.OutOfOrder, t.admit(&f));
+    }
+    try t.admit(&cmd(&t, .{ .share = .{ .point = p } }, 2));
+    try t.admit(&cmd(&t, .{ .touch = .{ .point = p } }, 3));
+    try t.admit(&cmd(&t, .{ .forget = .{ .point = p } }, 4));
+    try t.admit(&cmd(&t, .{ .write_staged = .{ .point = p, .kept = 9, .upto = 1 } }, 5));
+    try t.admit(&cmd(&t, .{ .write_cancelled = .{ .point = p, .kept = 9, .why = .drop } }, 6));
+    // a restore: status only between start and validate, and only of an open restore
+    const has: Msg = .{ .has = .{ .point = p, .compat = p, .at = 4096, .blocks = 2, .layout = .replicated, .part = 0 } };
+    try t.admit(&cmd(&t, has, 7));
+    try testing.expectError(error.UnknownTxn, t.admit(&cmd(&t, .{ .status = .{} }, 99)));
+    try testing.expectError(error.OutOfOrder, t.admit(&cmd(&t, .{ .status = .{} }, 7)));
+    try testing.expectError(error.BadValue, t.admit(&cmd(&t, .{ .reserve = .{ .point = p, .kept = 12, .slot = 0, .base = 0, .size = 4096, .at = 4096, .blocks = 2, .generation = 5, .part = 0 } }, 7)));
+    try t.admit(&cmd(&t, .{ .reserve = .{ .point = p, .kept = 12, .slot = 0, .base = 0, .size = 4096, .at = 4096, .blocks = 2, .generation = 0, .part = 0 } }, 7));
+    try testing.expectError(error.OutOfOrder, t.admit(&cmd(&t, .{ .status = .{} }, 7))); // before start
+    try t.admit(&cmd(&t, .{ .start = .{ .point = p, .blocks = 2 } }, 7));
+    try t.admit(&cmd(&t, .{ .status = .{} }, 7));
+    try t.admit(&cmd(&t, .{ .keep = keep.keep }, 8)); // notices interleave with a restore
+    try t.admit(&cmd(&t, .{ .status = .{} }, 7));
+    try t.admit(&cmd(&t, .{ .validate = .{ .upto = 2, .shared = false } }, 7));
+    try testing.expectError(error.OutOfOrder, t.admit(&cmd(&t, .{ .status = .{} }, 7))); // after validate
+    try testing.expectError(error.WrongPoint, t.admit(&cmd(&t, .{ .commit = .{ .point = p, .at = 4096, .kept = 13, .shared = false } }, 7)));
+    try t.admit(&cmd(&t, .{ .commit = .{ .point = p, .at = 4096, .kept = 12, .shared = false } }, 7));
+    // an owner_sharded point's reserve names its extent's generation
+    try t.admit(&cmd(&t, .{ .has = .{ .point = p, .compat = p, .at = 4096, .blocks = 2, .layout = .owner_sharded, .part = 1 } }, 9));
+    try t.admit(&cmd(&t, .{ .reserve = .{ .point = p, .kept = 14, .slot = 0, .base = 0, .size = 4096, .at = 4096, .blocks = 2, .generation = 5, .part = 1 } }, 9));
+    // nothing between a plan's frames, notices included
+    try t.admit(&cmd(&t, .{ .shard_set = .{ .version = 1, .parts = 2, .part_rows = 1 << 19, .owner_epoch = 1 } }, 10));
+    const ops = [_]ShardOp{.{ .drop = .{ .kept = 1, .gen = 1 } }};
+    try t.admit(&cmd(&t, .{ .shard_ops = .{ .owner_epoch = 2, .index = 0, .last = false, .ops = &ops } }, 11));
+    try testing.expectError(error.OutOfOrder, t.admit(&cmd(&t, .{ .touch = .{ .point = p } }, 12)));
+    try testing.expectError(error.OutOfOrder, t.admit(&cmd(&t, .{ .status = .{} }, 9)));
+}
+
+test "a keep's forks are bounded both ways and its optionals have one canonical form" {
+    const gpa = testing.allocator;
+    const forks = try gpa.alloc(Fork, max_keep_forks + 1);
+    defer gpa.free(forks);
+    for (forks, 0..) |*f, i| f.* = .{ .name = @splat(@truncate(i)), .at = @intCast(i * 2048) };
+    const buf = try gpa.alloc(u8, max_frame);
+    defer gpa.free(buf);
+    const head: Head = .{ .op = .keep, .from = 0, .epoch = 1, .txn = 1, .seq = 2 };
+    var k: Keep = .{ .slot = 0, .kept = 1, .base = 0, .at = 2048, .point = @splat(1), .group = 0, .shared = false, .root = @splat(0), .part = 7, .origin = .{ .key = @splat(3), .at = 1024 }, .forks = forks };
+    try testing.expectError(error.BadCount, encode(buf, head, .{ .keep = k }));
+    k.forks = forks[0..max_keep_forks];
+    const full = try encode(buf, head, .{ .keep = k });
+    try testing.expect(full.len <= max_frame);
+    var few: [8]Fork = undefined;
+    try testing.expectError(error.BadCount, decodeInto(full, .{ .forks = &few })); // less room: refused, never overrun
+    try testing.expectError(error.BadCount, decode(full, &.{})); // (decode has no forks buffer)
+    const back = try gpa.alloc(Fork, max_keep_forks);
+    defer gpa.free(back);
+    const f = try decodeInto(full, .{ .forks = back });
+    try testing.expectEqual(@as(?u32, 7), f.msg.keep.part);
+    try testing.expectEqualSlices(u8, &k.origin.?.key, &f.msg.keep.origin.?.key);
+    try testing.expectEqual(@as(usize, max_keep_forks), f.msg.keep.forks.len);
+    try testing.expectEqualDeep(forks[max_keep_forks - 1], f.msg.keep.forks[max_keep_forks - 1]);
+    // no forks, no part, no origin: decode needs no buffer; the absent optionals are one zero byte each
+    var b2: [256]u8 = undefined;
+    k.forks = &.{};
+    k.part = null;
+    k.origin = null;
+    const small = try encode(&b2, head, .{ .keep = k });
+    const g = try decode(small, &.{});
+    try testing.expect(g.msg.keep.part == null and g.msg.keep.origin == null);
+    // part's flag sits after root: neither 0 nor 1 is refused
+    const flag_at = header_len + 4 + 8 + 8 + 4 + 32 + 8 + 1 + 16;
+    try testing.expectEqual(@as(u8, 0), small[flag_at]);
+    small[flag_at] = 2;
+    try testing.expectError(error.BadValue, decode(small, &.{}));
+    small[flag_at] = 1; // present, but its payload is missing
+    try testing.expectError(error.ShortFrame, decode(small, &.{}));
+    // values check() forbids
+    k.at = 0;
+    try testing.expectError(error.BadValue, encode(&b2, head, .{ .keep = k }));
+    k.at = 2048;
+    k.kept = 0;
+    try testing.expectError(error.BadValue, encode(&b2, head, .{ .keep = k }));
+}
+
+test "Leader.fail keeps the first cause and every later call is PairBroken" {
+    var l = Leader.init(2, 3, testFx(1));
+    try testing.expectEqual(@as(anyerror, error.PairBroken), l.fail(1, error.Timeout));
+    try testing.expectEqual(@as(anyerror, error.ReplyTimeout), l.broken.?.err); // (a Timeout reads as ReplyTimeout)
+    try testing.expectEqual(@as(u16, 1), l.broken.?.rank);
+    try testing.expectEqual(@as(anyerror, error.PairBroken), l.fail(0, error.TransferFailed));
+    try testing.expectEqual(@as(anyerror, error.ReplyTimeout), l.broken.?.err); // the first cause stays
+    try testing.expectEqual(@as(u16, 1), l.broken.?.rank);
+    try testing.expectError(error.PairBroken, l.admissible(0, .{ .stats = .{ .set = .tier } }));
+    var nothing: [1]u8 = undefined;
+    const sink: Sink = .{ .ctx = &nothing, .send = struct {
+        fn f(_: *anyopaque, _: []const u8) anyerror!void {
+            return error.MustNotSend;
+        }
+    }.f };
+    try testing.expectError(error.PairBroken, l.post(sink, 0, .{ .touch = .{ .point = @splat(0) } }));
+    var m = Leader.init(2, 4, testFx(1));
+    try testing.expectEqual(@as(anyerror, error.PairBroken), m.fail(0, error.TransferTimeout));
+    try testing.expectEqual(@as(anyerror, error.TransferTimeout), m.broken.?.err);
+    try testing.expectEqual(@as(u16, 0), m.broken.?.rank);
+}
+
+test "a keep's pictures: the most forks and pictures fit one frame, bounds and order refused both ways" {
+    const gpa = testing.allocator;
+    const forks = try gpa.alloc(Fork, max_keep_forks + 1);
+    defer gpa.free(forks);
+    for (forks, 0..) |*f, i| f.* = .{ .name = @splat(@truncate(i)), .at = @intCast(i) };
+    const media = try gpa.alloc(Media, max_keep_media + 1);
+    defer gpa.free(media);
+    for (media, 0..) |*m, i| m.* = .{ .start = @intCast(i * 600), .len = 576, .digest = @splat(@truncate(i)) };
+    const at: u32 = (max_keep_media + 1) * 600;
+    const buf = try gpa.alloc(u8, max_frame);
+    defer gpa.free(buf);
+    const head: Head = .{ .op = .keep, .from = 0, .epoch = 1, .txn = 3, .seq = 4 };
+    const base: Keep = .{ .slot = 1, .kept = 9, .base = 0, .at = at, .point = @splat(7), .group = 2, .shared = false, .root = @splat(1), .part = null, .origin = null, .placeholder = 129264, .forks = forks[0..max_keep_forks], .media = media[0..max_keep_media] };
+    const full = try encode(buf, head, .{ .keep = base });
+    try testing.expect(full.len <= max_frame);
+    const got_f = try gpa.alloc(Fork, max_keep_forks);
+    defer gpa.free(got_f);
+    const got_m = try gpa.alloc(Media, max_keep_media);
+    defer gpa.free(got_m);
+    const f = try decodeInto(full, .{ .forks = got_f, .media = got_m });
+    try testing.expectEqualDeep(Msg{ .keep = base }, f.msg);
+    // a receiver with room for fewer pictures (or none) refuses, never overruns
+    try testing.expectError(error.BadCount, decodeInto(full, .{ .forks = got_f, .media = got_m[0..10] }));
+    try testing.expectError(error.BadCount, decodeInto(full, .{ .forks = got_f }));
+    // more than a keep carries, either slice
+    var k = base;
+    k.media = media;
+    try testing.expectError(error.BadCount, encode(buf, head, .{ .keep = k }));
+    k = base;
+    k.forks = forks;
+    try testing.expectError(error.BadCount, encode(buf, head, .{ .keep = k }));
+    // a text point: no pictures, no placeholder (the bytes of a v2 keep without pictures carry two empty fields)
+    k = base;
+    k.media = &.{};
+    k.placeholder = null;
+    const text = try encode(buf, head, .{ .keep = k });
+    try testing.expectEqual(@as(usize, 0), (try decodeInto(text, .{ .forks = got_f })).msg.keep.media.len);
+    // one canonical form: a placeholder without pictures, pictures without one, out of order, overlapping, empty,
+    // or starting at or past the cut
+    k.placeholder = 5;
+    try testing.expectError(error.BadValue, encode(buf, head, .{ .keep = k }));
+    const two = [_]Media{ .{ .start = 10, .len = 4, .digest = @splat(1) }, .{ .start = 20, .len = 4, .digest = @splat(2) } };
+    k = base;
+    k.at = 100;
+    k.media = &two;
+    k.placeholder = null;
+    try testing.expectError(error.BadValue, encode(buf, head, .{ .keep = k }));
+    k.placeholder = 5;
+    _ = try encode(buf, head, .{ .keep = k });
+    const bad = [_][2]Media{
+        .{ two[1], two[0] }, // out of order
+        .{ two[0], .{ .start = 12, .len = 4, .digest = @splat(2) } }, // overlapping
+        .{ two[0], .{ .start = 20, .len = 0, .digest = @splat(2) } }, // empty
+        .{ two[0], .{ .start = 100, .len = 4, .digest = @splat(2) } }, // at the cut
+    };
+    for (&bad) |*b| {
+        k.media = b;
+        try testing.expectError(error.BadValue, encode(buf, head, .{ .keep = k }));
+    }
+    // the same refusal on decode: a valid frame with its second picture's start moved past the cut
+    k.media = &two;
+    const ok = try encode(buf, head, .{ .keep = k });
+    const off = ok.len - 40; // (the last picture's start: the frame's trailing item)
+    std.mem.writeInt(u32, ok[off..][0..4], 200, .little);
+    try testing.expectError(error.BadValue, decodeInto(ok, .{ .forks = got_f, .media = got_m }));
+}
+
+test "the union tag's numbers are in the schema: a renumbered op changes the stamp" {
+    const T1 = enum(u8) { a = 1, b = 2 };
+    const T2 = enum(u8) { a = 1, b = 3 };
+    const U1 = union(T1) { a: u32, b: u64 };
+    const U2 = union(T2) { a: u32, b: u64 };
+    try testing.expect(schemaOf(U1) != schemaOf(U2));
+    const U3 = union(T1) { a: u32, b: u64 };
+    try testing.expectEqual(schemaOf(U1), schemaOf(U3));
+}
+
+test "every message's layout is in the wire stamp" {
+    const A = struct { x: u32, y: ?u32 };
+    const B = struct { x: u32, y: u32 };
+    const C = struct { x: u32, y: []const u32 };
+    try testing.expect(schemaOf(A) != schemaOf(B));
+    try testing.expect(schemaOf(B) != schemaOf(C));
+    const st = stampBytes();
+    try testing.expectEqual(version, std.mem.readInt(u16, st[0..2], .little));
+    try testing.expectEqual(shard_schema, std.mem.readInt(u32, st[4..8], .little));
+    try testing.expectEqual(msg_schema, std.mem.readInt(u32, st[8..12], .little));
+}
+
+/// Rank 0's half of a restore over the status asks: has, reserve, start, progress, then status polls between
+/// "rounds" (a touch notice each, as lanes frames go on) until every follower is complete, validate, commit. Each
+/// status ask's time is recorded; the longest is returned.
+fn restoreByStatus(l: *Leader, sink: Sink, links: []const ?link.Link, point: Digest, blocks: u32, rounds: *u32) !struct { ok: bool, longest_ns: u64, failed: ?Failure = null } {
+    var replies: [max_world - 1]Frame = undefined;
+    const rs = replies[0..links.len];
+    const h = try l.ask(sink, links, 0, .{ .has = .{ .point = point, .compat = l.compat(), .at = @as(u64, blocks) * 2048, .blocks = blocks, .layout = .replicated, .part = 0 } }, rs);
+    if (!allPresent(rs)) return error.NotPresent;
+    _ = try l.post(sink, h.txn, .{ .reserve = .{ .point = point, .kept = 77, .slot = 0, .base = 0, .size = @as(u64, blocks) * 2048, .at = @as(u64, blocks) * 2048, .blocks = blocks, .generation = 0, .part = 0 } });
+    _ = try l.post(sink, h.txn, .{ .start = .{ .point = point, .blocks = blocks } });
+    _ = try l.post(sink, h.txn, .{ .progress = .{ .upto = blocks } }); // (rank 0's own copies are done)
+    var longest: u64 = 0;
+    const give_up = monotonicNs() + 5 * std.time.ns_per_s;
+    while (true) {
+        const t0 = monotonicNs();
+        _ = try l.ask(sink, links, h.txn, .{ .status = .{} }, rs);
+        longest = @max(longest, monotonicNs() - t0);
+        const st = statusOf(rs, blocks);
+        if (st.failed) |f| {
+            _ = try l.post(sink, h.txn, .{ .abort = .{ .why = f.why, .rank = f.rank, .forget = false } });
+            return .{ .ok = false, .longest_ns = longest, .failed = f.why };
+        }
+        if (st.complete) break;
+        if (monotonicNs() > give_up) return error.TestTimedOut;
+        // a decode round goes on meanwhile: the ordered stream keeps flowing
+        _ = try l.post(sink, 0, .{ .touch = .{ .point = point } });
+        rounds.* += 1;
+        std.Io.sleep(testing.io, .fromMilliseconds(5), .awake) catch {};
+    }
+    _ = try l.ask(sink, links, h.txn, .{ .validate = .{ .upto = blocks, .shared = false } }, rs);
+    if (firstFailure(rs) != null) return .{ .ok = false, .longest_ns = longest };
+    _ = try l.post(sink, h.txn, .{ .commit = .{ .point = point, .at = @as(u64, blocks) * 2048, .kept = 77, .shared = false } });
+    return .{ .ok = true, .longest_ns = longest };
+}
+
+test "a slow follower's restore: status answers at once, rank 0 keeps its rounds, validate only when complete" {
+    var s = try newPair();
+    defer s.finish();
+    const Setup = struct {
+        fn f(p: *Peer) void {
+            p.side.ready_at = monotonicNs() + 400 * std.time.ns_per_ms; // its "disk" needs 400 ms for the point
+        }
+    };
+    try s.start(2, Setup);
+    const l = s.leader;
+    _ = try l.agree(s.sink(), s.ls());
+    var rounds: u32 = 0;
+    const r = try restoreByStatus(l, s.sink(), s.ls(), @splat(9), 3, &rounds);
+    try testing.expect(r.ok);
+    try testing.expect(rounds >= 10); // rank 0 went on while the follower copied (~400 ms / 5 ms polls)
+    try testing.expect(r.longest_ns < 200 * std.time.ns_per_ms); // never a stall for the follower's disk
+    // a keep with forks and an origin reaches the follower's handler; the other notices too
+    const forks = [_]Fork{ .{ .name = @splat(1), .at = 2048 }, .{ .name = @splat(2), .at = 4096 } };
+    _ = try l.post(s.sink(), 0, .{ .keep = .{ .slot = 0, .kept = 5, .base = 0, .at = 6144, .point = @splat(9), .group = 1, .shared = true, .root = @splat(3), .part = null, .origin = .{ .key = @splat(8), .at = 2048 }, .forks = &forks } });
+    _ = try l.post(s.sink(), 0, .{ .share = .{ .point = @splat(9) } });
+    _ = try l.post(s.sink(), 0, .{ .forget = .{ .point = @splat(9) } });
+    var replies: [1]Frame = undefined;
+    _ = try l.ask(s.sink(), s.ls(), 0, .{ .stats = .{ .set = .tier } }, &replies); // (the follower read everything before)
+    const side = &s.peers[0].side;
+    try testing.expectEqual(@as(u32, 1), side.validates);
+    try testing.expect(side.statuses >= rounds);
+    try testing.expectEqual(@as(u32, 1), side.committed);
+    try testing.expectEqual(rounds, side.touches);
+    try testing.expectEqual(@as(u32, 1), side.keeps);
+    try testing.expectEqual(@as(u32, 2), side.keep_forks);
+    try testing.expect(side.keep_origin);
+    try testing.expectEqual(@as(u32, 1), side.shares);
+    try testing.expectEqual(@as(u32, 1), side.forgets);
+}
+
+test "a follower's status that records a failure aborts the restore without validate" {
+    var s = try newPair();
+    defer s.finish();
+    const Setup = struct {
+        fn f(p: *Peer) void {
+            p.side.status_why = .crc;
+            p.side.ready_at = std.math.maxInt(u64);
+        }
+    };
+    try s.start(2, Setup);
+    const l = s.leader;
+    _ = try l.agree(s.sink(), s.ls());
+    var rounds: u32 = 0;
+    const r = try restoreByStatus(l, s.sink(), s.ls(), @splat(9), 2, &rounds);
+    try testing.expect(!r.ok);
+    try testing.expectEqual(@as(?Failure, .crc), r.failed);
+    var replies: [1]Frame = undefined;
+    _ = try l.ask(s.sink(), s.ls(), 0, .{ .stats = .{ .set = .tier } }, &replies);
+    try testing.expectEqual(@as(u32, 0), s.peers[0].side.validates);
+    try testing.expectEqual(@as(u32, 1), s.peers[0].side.aborted);
+    try testing.expect(l.broken == null);
+}
+
+test "a status reply naming another point or past the point ends the pair" {
+    var t = try agreedTracker();
+    const p: Digest = @splat(5);
+    try t.admit(&cmd(&t, .{ .has = .{ .point = p, .compat = p, .at = 4096, .blocks = 2, .layout = .replicated, .part = 0 } }, 1));
+    try t.admit(&cmd(&t, .{ .reserve = .{ .point = p, .kept = 3, .slot = 0, .base = 0, .size = 4096, .at = 4096, .blocks = 2, .generation = 0, .part = 0 } }, 1));
+    try t.admit(&cmd(&t, .{ .start = .{ .point = p, .blocks = 2 } }, 1));
+    const asked: Head = .{ .op = .status, .from = 0, .epoch = t.epoch, .txn = 1, .seq = t.next_seq };
+    const am: Msg = .{ .status = .{} };
+    try echo(&t, asked, &am, .{ .status_reply = .{ .copied = 2, .small_ready = true, .why = .none, .point = p } });
+    try testing.expectError(error.WrongPoint, echo(&t, asked, &am, .{ .status_reply = .{ .copied = 1, .small_ready = false, .why = .none, .point = @splat(6) } }));
+    try testing.expectError(error.BadEcho, echo(&t, asked, &am, .{ .status_reply = .{ .copied = 3, .small_ready = false, .why = .none, .point = p } }));
 }

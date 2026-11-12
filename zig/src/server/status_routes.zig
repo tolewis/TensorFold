@@ -59,7 +59,8 @@ pub fn putCache(a: Allocator, o: *json.Object, c: api.CacheStats) Allocator.Erro
 }
 
 /// KV ownership's counters under `kv_shard` (a backend that shards its pool over the ranks: wojo's GLM 0118), every
-/// part's rows under kv_shard.per_part (an array, one object per part, part 0 first).
+/// part's rows under kv_shard.per_part (an array, one object per part, part 0 first), and every rank's own counters
+/// under kv_shard.per_rank (one object per rank that reported, rank 0 first; empty when none did).
 pub fn putKvParts(a: Allocator, o: *json.Object, k: api.KvParts) Allocator.Error!void {
     const ks = try json.newObject(a);
     const info = @typeInfo(api.KvParts).@"struct";
@@ -73,6 +74,15 @@ pub fn putKvParts(a: Allocator, o: *json.Object, k: api.KvParts) Allocator.Error
         v.* = .{ .object = po };
     }
     try ks.put(a, "per_part", .{ .array = arr });
+    const nr: usize = @intCast(@min(k.ranks, k.rank.len));
+    const rows = try a.alloc(json.Value, nr);
+    for (k.rank[0..nr], rows, 0..) |r, *v, i| {
+        const ro = try json.newObject(a);
+        try ro.put(a, "rank", try json.intValue(a, i));
+        inline for (@typeInfo(@TypeOf(r)).@"struct".field_names) |name| try ro.put(a, name, try json.intValue(a, @field(r, name)));
+        v.* = .{ .object = ro };
+    }
+    try ks.put(a, "per_rank", .{ .array = rows });
     try o.put(a, "kv_shard", .{ .object = ks });
 }
 
@@ -203,4 +213,17 @@ test "health's kv shard counters: every counter under kv_shard, each part's rows
     try std.testing.expectEqualStrings("1", pp[1].object.get("part").?.int);
     try std.testing.expectEqualStrings("7", pp[1].object.get("free").?.int);
     try std.testing.expectEqualStrings("2", pp[1].object.get("live").?.int);
+    try std.testing.expectEqual(@as(usize, 0), ks.get("per_rank").?.array.len); // (no rank reported)
+    // every rank's own counters under per_rank, rank 0 first
+    k.ranks = 2;
+    k.rank[0] = .{ .owner_rounds = 11, .plans = 3 };
+    k.rank[1] = .{ .owner_rounds = 12, .plans = 3, .transfers_failed = 1 };
+    const o2 = try json.newObject(a);
+    try putKvParts(a, o2, k);
+    const pr = o2.get("kv_shard").?.object.get("per_rank").?.array;
+    try std.testing.expectEqual(@as(usize, 2), pr.len);
+    try std.testing.expectEqualStrings("1", pr[1].object.get("rank").?.int);
+    try std.testing.expectEqualStrings("12", pr[1].object.get("owner_rounds").?.int);
+    try std.testing.expectEqualStrings("1", pr[1].object.get("transfers_failed").?.int);
+    try std.testing.expectEqualStrings("11", pr[0].object.get("owner_rounds").?.int);
 }

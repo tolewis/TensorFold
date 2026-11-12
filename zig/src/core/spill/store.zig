@@ -164,7 +164,9 @@ pub const Query = struct {
     grid: u32 = 0,
 };
 
-pub const Hit = struct { key: Digest, at: u32, shared: bool, group: u64 };
+/// A lookup's point: `part` is its lineage's part salt (owner-sharded stores: the part its rows were written from,
+/// where a restore must put them back; null in a replicated store).
+pub const Hit = struct { key: Digest, at: u32, shared: bool, group: u64, part: ?u32 = null };
 
 pub const ReadyBlock = struct { index: u32, first: u32, tokens: u32, data: []const u8, slot: Slot };
 
@@ -404,6 +406,7 @@ pub const Store = struct {
     pub fn open(gpa: Allocator, io: std.Io, cfg: Config) !*Store {
         const l = cfg.limits;
         if (l.block_tokens == 0 or l.block_bytes == 0 or l.max_tokens == 0 or cfg.cap_bytes == 0) return error.BadConfig;
+        if (l.foreign_block_bytes > l.block_bytes or (l.foreign_block_bytes != 0 and cfg.owner_layout != .owner_sharded)) return error.BadConfig;
         if (!std.math.isFinite(cfg.quota) or cfg.quota < 0 or cfg.quota > 1) return error.BadConfig;
         const s = try gpa.create(Store);
         s.* = .{
@@ -616,6 +619,7 @@ pub const Store = struct {
             var names = try fsio.list(gpa, s.blocks_fd);
             defer fsio.freeList(gpa, &names);
             for (names.items) |n| {
+                s.scanned(n);
                 const d = if (std.mem.endsWith(u8, n, ".blk")) format.parseHex(n[0 .. n.len - 4]) else null;
                 if (d == null) {
                     fsio.unlinkAt(s.blocks_fd, n);
@@ -632,6 +636,7 @@ pub const Store = struct {
         var names = try fsio.list(gpa, s.points_fd);
         defer fsio.freeList(gpa, &names);
         for (names.items) |n| {
+            s.scanned(n);
             if (!std.mem.endsWith(u8, n, ".man")) continue;
             const key = format.parseHex(n[0 .. n.len - 4]) orelse continue;
             const p = s.recover(key, &present, &unsure) catch |e| switch (e) {
@@ -689,6 +694,12 @@ pub const Store = struct {
         for (order.items) |p| try s.parent.put(gpa, p.key, s.parentOf(p));
         s.clock = 0;
         for (order.items) |p| s.clock = @max(s.clock, p.used);
+    }
+
+    /// One name the scan read: counted for a watcher on another thread (Hooks.progress), and the test's hook.
+    fn scanned(s: *Store, name: []const u8) void {
+        if (s.hooks.progress) |p| _ = p.fetchAdd(1, .monotonic);
+        if (s.hooks.scanned) |f| f(s.hooks.ctx, name);
     }
 
     fn recover(s: *Store, key: Digest, present: *const std.AutoHashMapUnmanaged(Digest, fsio.Stat), unsure: *const std.AutoHashMapUnmanaged(Digest, void)) !*Point {
@@ -1277,7 +1288,8 @@ pub const Store = struct {
         p.small_bytes = off;
         p.ids_bytes = @as(u64, at) * 4 * (if (k.raw != null) @as(u64, 2) else 1);
         const has_tail = at % l.block_tokens != 0;
-        for (p.blocks, 0..) |*b, i| b.bytes = if (has_tail and i + 1 == p.blocks.len) k.tail_bytes else l.block_bytes;
+        const full = l.fullBlockBytes(k.lineage.part).?; // (validKeep: a part where the store needs one)
+        for (p.blocks, 0..) |*b, i| b.bytes = if (has_tail and i + 1 == p.blocks.len) k.tail_bytes else full;
         const ids = format.encodeIds(gpa, k.keyed, k.raw) catch return s.refuse(.no_staging);
         var ids_owned = true;
         defer if (ids_owned) gpa.free(ids);
@@ -1427,6 +1439,7 @@ pub const Store = struct {
         if (k.keyed.len > l.max_tokens) return false;
         if (k.raw) |r| if (r.len != k.keyed.len) return false;
         if (k.media.len > l.max_media or k.sections.len > l.max_sections or k.lineage.forks.len > l.max_forks) return false;
+        if (l.fullBlockBytes(k.lineage.part) == null) return false; // (owner-sharded: every point names its part)
         for (k.media) |m| if (m.len == 0 or m.start >= k.keyed.len) return false;
         var total: u64 = 0;
         for (k.sections) |sec| {
@@ -1831,6 +1844,25 @@ pub const Store = struct {
             for (j.new.items[j.next..]) |idx| if (idx * s.cfg.limits.block_tokens + j.point.blocks[idx].tokens > from) return true;
         }
         return false;
+    }
+
+    /// pins(.{ .id = ids[i] }, 0) for every id under one lock and one walk of the write fifo: `out[i]` whether an
+    /// unpublished point still reads source `ids[i]`'s rows (any unstaged block). `out.len == ids.len`.
+    pub fn pinsAny(s: *Store, ids: []const u64, out: []bool) void {
+        std.debug.assert(out.len == ids.len);
+        @memset(out, false);
+        if (ids.len == 0) return;
+        s.lockS();
+        defer s.unlockS();
+        for (s.fifo.items) |j| {
+            if (j.state != .open) continue;
+            const i = std.mem.indexOfScalar(u64, ids, j.source.id) orelse continue;
+            if (out[i]) continue;
+            for (j.new.items[j.next..]) |idx| if (idx * s.cfg.limits.block_tokens + j.point.blocks[idx].tokens > 0) {
+                out[i] = true;
+                break;
+            };
+        }
     }
 
     // -- the writer thread ---------------------------------------------------------------------------------------
@@ -2250,7 +2282,7 @@ pub const Store = struct {
         }
         const b = best orelse return null;
         s.counters.disk_hits += 1;
-        return .{ .key = b.key, .at = b.at, .shared = b.shared, .group = b.group };
+        return .{ .key = b.key, .at = b.at, .shared = b.shared, .group = b.group, .part = b.lineage.part };
     }
 
     fn eligible(p: *const Point, q: Query) bool {
@@ -2282,6 +2314,16 @@ pub const Store = struct {
         defer s.unlockS();
         const p = s.points.get(key) orelse return false;
         return s.complete_(p);
+    }
+
+    /// The part salt of the point `key` this rank holds (null inside: a part-less point), or null when it holds none.
+    /// An owner-sharded rank checks it against the part a restore names: the same ids kept from another part are
+    /// other bytes here.
+    pub fn partOf(s: *Store, key: Digest) ?struct { part: ?u32 } {
+        s.lockS();
+        defer s.unlockS();
+        const p = s.points.get(key) orelse return null;
+        return .{ .part = p.lineage.part };
     }
 
     /// `key` was used now (its manifest's time follows, on the writer).

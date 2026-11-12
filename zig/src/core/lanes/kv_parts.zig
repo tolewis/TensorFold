@@ -5,6 +5,8 @@
 const std = @import("std");
 
 pub const max_parts = 8;
+/// Ranks whose own counters a Stats carries at most.
+pub const max_ranks = 8;
 
 /// One part's rows now (gauges).
 pub const Part = struct {
@@ -22,6 +24,38 @@ pub const Part = struct {
         .twin_rows = "Rows of this part borrowed twins hold.",
         .hold_rows = "Rows of this part reserved for a restore or a live move in flight.",
         .live = "Live streams whose extent lies in this part.",
+    };
+};
+
+/// One rank's own counters (rank 0's, and each follower's as its last stats reply carried them): the parts' planners
+/// are replicas (equal by digest), but every rank fetches, attends and sends its own rows.
+pub const Rank = struct {
+    prompt_fetches: u64 = 0,
+    prompt_rows: u64 = 0,
+    prompt_picks: u64 = 0,
+    prompt_bytes: u64 = 0,
+    prompt_syncs: u64 = 0,
+    fetch_rounds: u64 = 0,
+    owner_rounds: u64 = 0,
+    copies: u64 = 0,
+    copy_bytes: u64 = 0,
+    plans: u64 = 0, // op lists this rank applied
+    checks: u64 = 0, // planner digest checks this rank took part in
+    transfers_failed: u64 = 0, // this rank's own sides of copies, carries or moves that failed
+
+    pub const help = .{
+        .prompt_fetches = "Prompt-chunk layers on this rank that fetched the owner's compressed rows.",
+        .prompt_rows = "Compressed rows this rank's prompt fetches moved.",
+        .prompt_picks = "Rows this rank's prompt fetches would have moved unfolded.",
+        .prompt_bytes = "Bytes this rank's prompt fetches moved.",
+        .prompt_syncs = "Host reads this rank's prompt fetches waited on.",
+        .fetch_rounds = "Decode rounds on this rank that fetched the owners' picked rows.",
+        .owner_rounds = "Decode rounds this rank attended as an owner.",
+        .copies = "Cross-part extent transfers this rank took part in.",
+        .copy_bytes = "Bytes of cross-part extent transfers this rank took part in.",
+        .plans = "Ownership op lists this rank applied.",
+        .checks = "Planner digest checks this rank took part in.",
+        .transfers_failed = "This rank's own sides of copies, carries or moves that failed.",
     };
 };
 
@@ -59,9 +93,11 @@ pub const Stats = struct {
     owner_rounds: u64 = 0,
     copies: u64 = 0, // cross-part extent transfers the attention side ran
     copy_bytes: u64 = 0,
+    ranks: u64 = 0, // gauge: the ranks whose own counters `rank` holds (0: none reported)
     part: [max_parts]Part = @splat(.{}),
+    rank: [max_ranks]Rank = @splat(.{}),
 
-    pub const gauges = [_][]const u8{ "parts", "part_rows" };
+    pub const gauges = [_][]const u8{ "parts", "part_rows", "ranks" };
 
     /// Each counter's /metrics help (a missing one fails the build).
     pub const help = .{
@@ -98,6 +134,7 @@ pub const Stats = struct {
         .owner_rounds = "Decode rounds the owners attended.",
         .copies = "Cross-part extent transfers sent.",
         .copy_bytes = "Bytes the cross-part extent transfers sent.",
+        .ranks = "Ranks whose own KV-ownership counters are reported (kv_shard_rank_*).",
     };
 };
 
@@ -109,8 +146,9 @@ pub const Source = struct {
 
 test "every counter has its help" {
     inline for (@typeInfo(Stats).@"struct".field_names) |n| {
-        if (comptime std.mem.eql(u8, n, "part")) continue;
+        if (comptime std.mem.eql(u8, n, "part") or std.mem.eql(u8, n, "rank")) continue;
         try std.testing.expect(@field(Stats.help, n).len > 0);
     }
     inline for (@typeInfo(Part).@"struct".field_names) |n| try std.testing.expect(@field(Part.help, n).len > 0);
+    inline for (@typeInfo(Rank).@"struct".field_names) |n| try std.testing.expect(@field(Rank.help, n).len > 0);
 }

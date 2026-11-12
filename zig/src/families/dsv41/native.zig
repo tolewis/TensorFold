@@ -64,6 +64,7 @@ const rank_identity = @import("rank_identity.zig");
 const prompt = @import("prompt.zig");
 const core = @import("core");
 const shard = @import("shard.zig");
+const kv_lanes = @import("kv_lanes.zig");
 
 pub const model_type = "deepseek_v41";
 pub const formats: []const []const u8 = &.{"exl3-mul1"};
@@ -207,7 +208,23 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     // a start refused past here (a fingerprint mismatch at openPair, a store that does not open) frees the frames the
     // agreement wrote through the lanes (the hello: leaked on the mismatch path before); rank 1 ends on its own
     errdefer st.lanes.wire.deinit(gpa);
-    // TF_DS_KV_SHARD: the parts' planner agreed with rank 1 now (its other switches or pool fail the start, named)
+    // the pair's one rank_wire Leader, agreed with the full fingerprint when the spill tier or TF_DS_KV_SHARD is on
+    // (a follower with another build, kit, model or switches fails the start, named); then the parts' planner over it
+    try openPair(gpa, io, st.m, &st.lanes, mo, o.spill);
+    errdefer if (st.lanes.rw) |l| {
+        gpa.destroy(l);
+        st.lanes.rw = null;
+    };
+    // the spill tier before the parts' planner: rank 0 scans its store while each follower scans its own (opened at
+    // the agreement), and startKv's first ask then waits the hello's bound for them (Lanes.startKv)
+    if (o.spill) |sp| st.events = try openSpill(gpa, io, st.m, &st.lanes, mo, sp, st.staging.?);
+    errdefer if (st.lanes.spill) |t| {
+        t.destroy();
+        st.lanes.spill = null;
+        for (st.events) |*e| e.deinit();
+        if (st.events.len > 0) gpa.free(st.events);
+        st.events = &.{};
+    };
     try st.lanes.startKv();
     errdefer st.lanes.stopKv();
     if (getenv("TF_DS_FIX_K")) |t| st.lanes.fix_k = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
@@ -223,8 +240,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     var snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .tail = @intCast(st.m.cfg.window) };
     const window: ?usize = if (st.m.kvs != null or st.m.pool_cap != o.context) st.m.window_cap else null;
     var tier: ?spill_tier.prompt_cache.Tier = null;
-    if (o.spill) |sp| {
-        st.events = try openSpill(gpa, io, st.m, &st.lanes, mo, sp, st.staging.?);
+    if (o.spill != null) {
         snaps.usable = L.usableFn;
         tier = st.lanes.spill.?.tier();
     }
@@ -249,13 +265,14 @@ fn deinitFn(ptr: *anyopaque) void {
 // -- the spill tier's startup (rank 0 here, the followers in tf-dsv41-lanes) --------------------------------------
 
 /// What refuses the spill tier from the environment alone, checked on every rank before anything loads (minutes on
-/// the Sparks): the pair (TF_TP_WORLD=2), TF_DS_KV_SHARD off (owner_sharded points are round 3) and the identity
-/// the fingerprint needs (rank_identity.Extra.env: TF_DS_ENGINE_ID, TF_DS_RECIPE_PATCHES, TF_DS_RANK_CACHE_SHA or
-/// TF_DS_MODEL_REVISION; TF_DS_ENGRAM_REVISION with TF_DS_ENGRAM).
+/// the Sparks): the pair (TF_TP_WORLD=2), a TF_DS_KV_SHARD setting it cannot read, and the identity the fingerprint
+/// needs (rank_identity.Extra.env: TF_DS_ENGINE_ID, TF_DS_RECIPE_PATCHES, TF_DS_RANK_CACHE_SHA or
+/// TF_DS_MODEL_REVISION; TF_DS_ENGRAM_REVISION with TF_DS_ENGRAM). TF_DS_KV_SHARD=1 runs with it (round 3: the
+/// owner_sharded layout, part-salted lineage, restores into the recorded part, one Leader for the pair).
 pub fn spillPreflight(env: *const fn ([:0]const u8) ?[]const u8) !void {
     const world = std.fmt.parseInt(u32, env("TF_TP_WORLD") orelse "2", 10) catch return error.BadWorld;
     if (world != 2) return error.SpillNeedsTwoRanks;
-    if ((shard.Mode.parse(env("TF_DS_KV_SHARD"), env("TF_DS_KV_SHARD_DECODE")) catch return error.BadKvShard) != .off) return error.SpillWithKvShard;
+    _ = shard.Mode.parse(env("TF_DS_KV_SHARD"), env("TF_DS_KV_SHARD_DECODE")) catch return error.BadKvShard;
     _ = try rank_identity.Extra.env(env);
     if (nonEmpty(env("TF_DS_ENGRAM")) != null and (env("TF_DS_ENGRAM_REVISION") orelse @as([]const u8, "")).len == 0) return error.NoEngramId;
 }
@@ -287,14 +304,18 @@ pub fn getenvFn(name: [:0]const u8) ?[]const u8 {
 }
 
 /// This rank's fingerprint exchange (rank_identity's inputs: the model options it opened with, the opened model, the
-/// recipe's identity from the environment, its switches and its state layout).
+/// recipe's identity from the environment, its switches and its state layout). Without the spill tier (`s` null:
+/// TF_DS_KV_SHARD alone) nothing persists, so a missing recipe identity reads "unset" (Extra.envFor).
 pub fn rankExchange(gpa: std.mem.Allocator, io: std.Io, mo: model.Options, m: *model.Model, s: ?spill_tier.Settings, layout: *const model.Model.spill.StateLayout) !@import("fingerprint.zig").Exchange {
-    const envp = try rank_identity.Extra.env(getenvFn);
+    const envp = try rank_identity.Extra.envFor(getenvFn, s != null);
     var fbuf: [256]u8 = undefined;
     const image_cache = if (getenv("TF_DS_IMAGE_CACHE")) |v| !std.mem.eql(u8, v, "0") else true;
-    const features = try rank_identity.featureString(&fbuf, .{ .spill = s != null, .spill_min_tokens = if (s) |x| x.min_tokens else 0, .kv_shard = m.kvs != null, .image_cache = image_cache, .streams = @intCast(m.streams), .round_rows = @intCast(m.eng.round_rows), .pool = m.pool_cap, .drafts = m.drafting() });
+    // TF_DS_KV_SHARD's switches every rank's planner takes (carry, twins) and its part size: agreed in `features`
+    const kvs: kv_lanes.Settings = if (m.kvs != null) try kv_lanes.Settings.fromEnv(getenvFn) else .{ .carry = false, .twins = false };
+    const part_rows: u64 = if (m.caches.shard) |x| x.part else 0;
+    const features = try rank_identity.featureString(&fbuf, .{ .spill = s != null, .spill_min_tokens = if (s) |x| x.min_tokens else 0, .kv_shard = m.kvs != null, .kv_carry = kvs.carry, .twins = kvs.twins, .part_rows = part_rows, .image_cache = image_cache, .streams = @intCast(m.streams), .round_rows = @intCast(m.eng.round_rows), .pool = m.pool_cap, .drafts = m.drafting() });
     var pbuf: [model.Model.spill.StateLayout.max_encoded]u8 = undefined;
-    const lp = try rank_identity.layoutPart(layout, &pbuf);
+    const lp = try rank_identity.layoutPart(layout, m.world, &pbuf);
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const rc_name = try rank_cache.find(arena.allocator(), io, m.cache_dir, m.rank, m.world);
@@ -314,6 +335,9 @@ pub fn rankExchange(gpa: std.mem.Allocator, io: std.Io, mo: model.Options, m: *m
         .planes = lp.planes,
         .rank_layout = lp.rank_layout,
         .owner_layout = lp.owner_layout,
+        .owner_version = lp.owner_version,
+        .parts = lp.parts,
+        .persist = s != null,
         .gpu_capability = try m.ctx.capability(),
         .cuda_driver = try m.ctx.d.version(),
         .rank_cache_name = rc_name,
@@ -343,34 +367,65 @@ fn agreeSink(ctx: *anyopaque, sub: []const u8) anyerror!void {
     return lanes_mod.Lanes.spillFrame(ctx, rank_wire.lanes_kind, sub);
 }
 
-/// Rank 0: the fingerprint agreement with every follower (before anything spill-related crosses), then this rank's
-/// store under <spill-dir>/native-spill-<compat>/rank0 and the tier on `ln` (ln.spill). The events it returns are
+/// Rank 0: the pair's one rank_wire Leader (Lanes.rw) when the spill tier (`s`) or TF_DS_KV_SHARD is on, agreed with
+/// every follower before anything spill- or shard-related crosses. With the spill tier the hello carries this rank's
+/// full fingerprint (rankExchange: build, kit, model, tokenizer, geometry, the owner layout with its parts and part
+/// size, the switches); TF_DS_KV_SHARD alone keeps round 2's shard-only hello (kv_lanes.shardExchange: nothing it did
+/// not need before, no spill layout, no recipe identity). The spill tier (openSpill) and the KV parts
+/// (Lanes.startKv) both post through it, so one Tracker orders every frame of the pair. Nothing with both off (no
+/// frame, no fingerprint: the served bytes unchanged) or one rank.
+pub fn openPair(gpa: std.mem.Allocator, io: std.Io, m: *model.Model, ln: *lanes_mod.Lanes, mo: model.Options, s: ?spill_tier.Settings) !void {
+    if (ln.rw != null or m.world < 2 or (s == null and m.kvs == null)) return;
+    if (s != null and m.world != 2) return error.SpillNeedsTwoRanks;
+    const fx = if (s != null) blk: {
+        const layout = try m.spillLayout();
+        // the planner's carried bytes a token are the layout's owner-only bytes (spill_state, from the loaded
+        // weights), the rows each rank stores of a point in its own part
+        if (m.kvs != null and layout.owner_token_bytes != lanes_mod.kvConfig(m).carry_bytes) return error.SpillCarryMismatch;
+        break :blk try rankExchange(gpa, io, mo, m, s, &layout);
+    } else try shardOnlyExchange(m);
+    const lead = try gpa.create(rank_wire.Leader);
+    errdefer gpa.destroy(lead);
+    lead.* = rank_wire.Leader.init(@intCast(m.world), rank_wire.freshEpoch(io), fx);
+    _ = lead.agree(.{ .ctx = ln, .send = agreeSink }, m.followers()) catch |e| {
+        var buf: [192]u8 = undefined;
+        if (lead.broken) |b| std.log.err("dsv41: {s}", .{rank_wire.describeBroken(b, &buf)});
+        // a follower without the tier ends at the hello (SpillNotStarted on its side): rank 0 sees its link go down
+        if (s != null and e != error.FingerprintMismatch) std.log.err("dsv41 spill: no agreement with rank 1; if it printed \"follow\": \"SpillNotStarted\", start it with the spill tier too (TF_DS_SPILL_DIR and TF_DS_SPILL_GIB)", .{});
+        return if (e == error.FingerprintMismatch and s != null) error.SpillFingerprintMismatch else e;
+    };
+    ln.rw = lead;
+}
+
+/// Rank 0's hello for TF_DS_KV_SHARD alone: round 2's (kv_lanes.shardExchange over the planner's config with this
+/// environment's switches, as Kv.init and the follower's kv_lanes.Follower.exchange take them).
+fn shardOnlyExchange(m: *model.Model) !@import("fingerprint.zig").Exchange {
+    const settings = try kv_lanes.Settings.fromEnv(getenvFn);
+    var c = lanes_mod.kvConfig(m);
+    c.carry = settings.carry;
+    c.twins = settings.twins;
+    return kv_lanes.shardExchange(0, m.world, c, settings);
+}
+
+/// Rank 0: this rank's store under <spill-dir>/native-spill-<compat>/rank0 and the tier on `ln` (ln.spill), over the
+/// pair's agreed Leader (openPair: made here when it has not run). TF_DS_KV_SHARD: an owner_sharded store (its parts'
+/// block sizes, part-salted names, restores into the recorded part through the planner). The events it returns are
 /// the caller's (freed after the tier).
 pub fn openSpill(gpa: std.mem.Allocator, io: std.Io, m: *model.Model, ln: *lanes_mod.Lanes, mo: model.Options, s: spill_tier.Settings, staging: cuda.HostBuffer) ![]cuda.Event {
-    if (m.kvs != null) return error.SpillWithKvShard; // PORT(round3): owner_sharded points (part salt, owner planes)
     if (m.world != 2) return error.SpillNeedsTwoRanks;
+    try openPair(gpa, io, m, ln, mo, s);
+    const lead = ln.rw orelse return error.PairNotAgreed;
+    const a = lead.agreement orelse return error.PairNotAgreed;
     const layout = try m.spillLayout();
     const plan = try spill_tier.stagingPlan(s, &layout);
-    const fx = try rankExchange(gpa, io, mo, m, s, &layout);
-    const lead = try gpa.create(rank_wire.Leader);
-    var lead_owned = true;
-    defer if (lead_owned) gpa.destroy(lead);
-    lead.* = rank_wire.Leader.init(@intCast(m.world), rank_wire.freshEpoch(io), fx);
     const wire = ln.spillWire();
-    const a = lead.agree(.{ .ctx = ln, .send = agreeSink }, wire.links) catch |e| {
-        var buf: [192]u8 = undefined;
-        if (lead.broken) |b| std.log.err("dsv41 spill: {s}", .{rank_wire.describeBroken(b, &buf)});
-        // a follower without the tier ends at the hello (SpillNotStarted on its side): rank 0 sees its link go down
-        if (e != error.FingerprintMismatch) std.log.err("dsv41 spill: no agreement with rank 1; if it printed \"follow\": \"SpillNotStarted\", start it with the spill tier too (TF_DS_SPILL_DIR and TF_DS_SPILL_GIB)", .{});
-        return if (e == error.FingerprintMismatch) error.SpillFingerprintMismatch else e;
-    };
     const events = try spillEvents(gpa, m, spill_tier.eventCount(plan));
     errdefer {
         for (events) |*e| e.deinit();
         gpa.free(events);
     }
     var gens = try m.spillGenerations(gpa);
-    const compat = core.spill.format.compatDigest(a.storeCommon(0), .replicated, model.chunk_rows, layout.block_bytes);
+    const compat = spill_tier.storeCompat(a, 0, &layout);
     const max_tokens: u32 = @intCast(if (m.request_cap > 0) m.request_cap else m.pool_cap);
     const side = lanes_mod.SpillTier.S.create(gpa, io, .{ .m = m }, layout, gens, s, 0, compat, max_tokens, stagingSlice(staging), events, .{}) catch |e| {
         gens.deinit(gpa);
@@ -382,7 +437,13 @@ pub fn openSpill(gpa: std.mem.Allocator, io: std.Io, m: *model.Model, ln: *lanes
         side.destroy();
         return e;
     };
-    lead_owned = false;
+    t.own_lead = false; // (Lanes.rw, shared with the KV parts)
+    // rank 1 scans its store on its own thread since the agreement (rank 0's scan above ran meanwhile): waited for
+    // while its scan makes progress, before any spill command or the KV parts' start
+    t.awaitFollowers(null, 50 * std.time.ns_per_ms) catch |e| {
+        t.destroy();
+        return e;
+    };
     ln.spill = t;
     std.log.info("dsv41 spill: rank 0's store under {s} ({d:.1} GiB, staging {d} MiB); the ranks agreed", .{ s.dir, s.gib, s.stagingBytes() >> 20 });
     return events;
@@ -391,8 +452,8 @@ pub fn openSpill(gpa: std.mem.Allocator, io: std.Io, m: *model.Model, ln: *lanes
 /// A follower's spill side, made before its model's pool (staging) is sized and opened at rank 0's agreement. The
 /// staging and events stay the caller's.
 pub fn followerSpill(gpa: std.mem.Allocator, io: std.Io, m: *model.Model, mo: model.Options, s: spill_tier.Settings, staging: cuda.HostBuffer, events: *[]cuda.Event) !*lanes_mod.SpillFollower {
-    if (m.kvs != null) return error.SpillWithKvShard;
-    const layout = try m.spillLayout();
+    const layout = try m.spillLayout(); // (TF_DS_KV_SHARD: owner_sharded, this rank's part its own)
+    if (m.kvs != null and layout.owner_token_bytes != lanes_mod.kvConfig(m).carry_bytes) return error.SpillCarryMismatch;
     const plan = try spill_tier.stagingPlan(s, &layout);
     const fx = try rankExchange(gpa, io, mo, m, s, &layout);
     events.* = try spillEvents(gpa, m, spill_tier.eventCount(plan));
@@ -438,18 +499,23 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.PoolNotWholeParts => "TF_DS_KV_SHARD=1: the pool (TF_DS_POOL, else the context) must be whole 4,096-position parts (two parts of 2,048-position blocks)",
         error.PartTooSmall => "TF_DS_KV_SHARD=1 cuts the pool (TF_DS_POOL) into one part a rank, and a conversation fits one part: each part must hold the window and a round's rows and two, in whole 2,048-position blocks (2,101,248 at the 1M window): raise TF_DS_POOL or lower --context",
         error.CrossesPart => "TF_DS_KV_SHARD=1: an extent that crosses a part (a placement bug): restart with TF_DS_KV_SHARD=0",
-        error.SpillWithKvShard => "the spill tier (--spill-dir/--spill-gib) does not run with TF_DS_KV_SHARD=1 yet (its owner-sharded layout is not ported): unset one of them",
+        error.PairNotAgreed => "the spill tier or TF_DS_KV_SHARD=1 started without the ranks' agreement (an engine bug): restart with both off",
+        error.SpillNoPart => "the spill tier with TF_DS_KV_SHARD=1 found a point without its part (an engine bug, or a store written by another build): restart with --spill-dir unset or TF_DS_KV_SHARD=0",
+        error.SpillCarryMismatch => "the spill tier with TF_DS_KV_SHARD=1: the KV planner's carried bytes a token differ from the spill layout's owner-only rows (an engine bug): restart with --spill-dir unset or TF_DS_KV_SHARD=0",
+        error.SpillLayoutMismatch => "the spill state layout does not match the loaded model or its allocation (an engine bug)",
+        error.SpillSelfCheckSharded => "the spill self-check reads the replicated planes: run it with TF_DS_KV_SHARD=0 (sharded packing is checked by the restored token_sha)",
         error.SpillNeedsTwoRanks => "the spill tier runs on the TP2 pair (TF_TP_WORLD=2)",
         error.SpillFingerprintMismatch => "the ranks' configurations differ (the log names the rank and field): start every rank from the same image, model, kit and TF_DS_* settings, with the spill tier on both (rank 1: TF_DS_SPILL_DIR/TF_DS_SPILL_GIB)",
         error.SpillNotStarted => "rank 0 runs the spill tier (--spill-dir/--spill-gib): start this rank with it too (TF_DS_SPILL_DIR and TF_DS_SPILL_GIB, or tf-dsv41-lanes --spill-dir/--spill-gib)",
         error.BadSpillSetting => "TF_DS_SPILL_STAGING_MIB: the spill staging cap in MiB, at least 16 (default 128)",
         error.StagingTooSmall => "the spill staging cap (TF_DS_SPILL_STAGING_MIB) holds too few slots for this model's blocks and small state: raise it",
-        error.BadKvShardSetting => "TF_DS_KV_SHARD_CARRY and TF_DS_KV_SHARD_TWINS: 1 (on, the default) or 0; TF_DS_KV_SHARD_CHECK: decode rounds between the ranks' planner checks (0: at start only)",
-        error.ShardLayoutMismatch => "TF_DS_KV_SHARD=1: the ranks cut the pool into different parts (another TF_DS_POOL, --pool or build on rank 1): give every rank the same TF_DS_* environment and build",
+        error.BadKvShardSetting => "TF_DS_KV_SHARD_CARRY and TF_DS_KV_SHARD_TWINS: 1 (on, the default) or 0; TF_DS_KV_SHARD_CHECK: decode rounds between the ranks' planner checks (0: at start only); TF_DS_KV_SHARD_STATS_MS: 0 (the default, rank 0's own kv_shard row only) up to 3600000 ms between asks for the followers' rows (only while /health or /metrics read them)",
+        error.ShardLayoutMismatch => "TF_DS_KV_SHARD=1: the ranks cut the pool into different parts or plan with other switches (another TF_DS_POOL, --pool, TF_DS_KV_SHARD_CARRY, TF_DS_KV_SHARD_TWINS or build on rank 1): give every rank the same TF_DS_* environment and build",
         error.ShardDiverged, error.StaleExtent => "TF_DS_KV_SHARD=1: the ranks' KV-part planners disagree (an engine bug; the pair stops rather than read the wrong rows): restart with TF_DS_KV_SHARD=0",
         error.TransferFailed => "TF_DS_KV_SHARD=1: a KV transfer between the ranks failed on one rank only: restart; if it recurs, TF_DS_KV_SHARD_CARRY=0 or TF_DS_KV_SHARD=0",
         error.TransferTimeout => "TF_DS_KV_SHARD=1: a KV transfer did not complete in time (a rank's half never ran, or a device fault; the GPU stream holds the unmatched call): restart; if it recurs, TF_DS_KV_SHARD_CARRY=0 or TF_DS_KV_SHARD=0",
         error.KvShardNotStarted, error.BadPlan => "TF_DS_KV_SHARD=1: the KV-part planner was not set up as the lanes need (an engine bug): restart with TF_DS_KV_SHARD=0",
+        error.FollowerScanStalled => "rank 1's spill store scan stopped making progress (its log names the store): check its spill disk (TF_DS_SPILL_DIR), or start it with a fresh directory",
         else => null,
     };
 }
@@ -481,8 +547,10 @@ test "the spill tier's refusals from the environment come before anything loads,
         }
     };
     try spillPreflight(E.get);
-    E.kv = "1";
-    try std.testing.expectError(error.SpillWithKvShard, spillPreflight(E.get));
+    E.kv = "1"; // (round 3: the spill tier runs with TF_DS_KV_SHARD)
+    try spillPreflight(E.get);
+    E.kv = "maybe";
+    try std.testing.expectError(error.BadKvShard, spillPreflight(E.get));
     E.kv = "0";
     E.world = "4";
     try std.testing.expectError(error.SpillNeedsTwoRanks, spillPreflight(E.get));
@@ -492,7 +560,7 @@ test "the spill tier's refusals from the environment come before anything loads,
     E.weights = "rev-1";
     E.engram = "/engram";
     try std.testing.expectError(error.NoEngramId, spillPreflight(E.get));
-    for ([_]anyerror{ error.SpillWithKvShard, error.SpillNeedsTwoRanks, error.NoWeightsId, error.NoEngramId, error.SpillNotStarted, error.NoEngineId }) |err|
+    for ([_]anyerror{ error.SpillNeedsTwoRanks, error.NoWeightsId, error.NoEngramId, error.SpillNotStarted, error.NoEngineId, error.PairNotAgreed, error.SpillNoPart, error.SpillCarryMismatch, error.SpillLayoutMismatch, error.SpillSelfCheckSharded }) |err|
         try std.testing.expect(explain(null, err) != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SpillNotStarted).?, "TF_DS_SPILL_DIR") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoWeightsId).?, "TF_DS_RANK_CACHE_SHA") != null);

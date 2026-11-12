@@ -166,7 +166,8 @@ pub fn cacheFamilies(w: *std.Io.Writer, c: api.CacheStats) !void {
 }
 
 /// KV ownership's counters (a backend that shards its pool: tensorfold:kv_shard_*), then every part's rows
-/// (tensorfold:kv_shard_part_*{part="N"}, gauges).
+/// (tensorfold:kv_shard_part_*{part="N"}, gauges), then every reporting rank's own counters
+/// (tensorfold:kv_shard_rank_*{rank="N"}, counters; none when no rank reported).
 pub fn kvPartFamilies(w: *std.Io.Writer, k: api.KvParts) !void {
     const H = api.KvParts.help;
     const info = @typeInfo(api.KvParts).@"struct";
@@ -178,6 +179,13 @@ pub fn kvPartFamilies(w: *std.Io.Writer, k: api.KvParts) !void {
     inline for (@typeInfo(P).@"struct".field_names) |name| {
         try family(w, "kv_shard_part_" ++ name, "gauge", @field(P.help, name));
         for (k.part[0..n], 0..) |p, i| try w.print("{s}kv_shard_part_{s}{{part=\"{d}\"}} {d}\n", .{ prefix, name, i, @field(p, name) });
+    }
+    const nr: usize = @intCast(@min(k.ranks, k.rank.len));
+    if (nr == 0) return;
+    const R = @TypeOf(k.rank[0]);
+    inline for (@typeInfo(R).@"struct".field_names) |name| {
+        try family(w, "kv_shard_rank_" ++ name, "counter", @field(R.help, name));
+        for (k.rank[0..nr], 0..) |r, i| try w.print("{s}kv_shard_rank_{s}{{rank=\"{d}\"}} {d}\n", .{ prefix, name, i, @field(r, name) });
     }
 }
 
@@ -424,4 +432,19 @@ test "kv shard families: present only with a sharded backend's stats, its counte
         "tensorfold:kv_shard_part_live{part=\"0\"} 1\n",
     }) |line| try std.testing.expect(std.mem.indexOf(u8, body, line) != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "part=\"2\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:kv_shard_rank_") == null); // (no rank reported; the ranks gauge's help names the family)
+    // every rank's own counters, labelled by rank
+    k.ranks = 2;
+    k.rank[1] = .{ .owner_rounds = 7, .copy_bytes = 4096 };
+    stub.status_value.kv_parts = k;
+    var out2: std.Io.Writer.Allocating = .init(gpa);
+    defer out2.deinit();
+    try m.render(std.testing.io, &out2.writer, stub.engine(), 4096);
+    for ([_][]const u8{
+        "tensorfold:kv_shard_ranks 2\n",
+        "# TYPE tensorfold:kv_shard_rank_owner_rounds counter\n",
+        "tensorfold:kv_shard_rank_owner_rounds{rank=\"0\"} 0\n",
+        "tensorfold:kv_shard_rank_owner_rounds{rank=\"1\"} 7\n",
+        "tensorfold:kv_shard_rank_copy_bytes{rank=\"1\"} 4096\n",
+    }) |line| try std.testing.expect(std.mem.indexOf(u8, out2.written(), line) != null);
 }

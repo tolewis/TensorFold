@@ -1055,9 +1055,14 @@ fn checkGuard(gpa: Allocator) !void {
     defer gpa.free(kept);
     try ensure(keepIds(h, ids, .{ .lineage = lin(7), .source = 5 }) == .queued, @src());
     try ensure(h.s.pins(.{ .id = 5, .generation = 1 }, 0), @src());
+    var any: [3]bool = undefined;
+    h.s.pinsAny(&.{ 6, 5, 9 }, &any); // (pins for many sources, one lock)
+    try ensure(!any[0] and any[1] and !any[2], @src());
     var out: [8]store.StageReq = undefined;
     const g = h.s.guard(.{ .id = 5, .generation = 1 }, 0, &out);
     try ensure(g.staged == 4 and g.cancelled == 0, @src());
+    h.s.pinsAny(&.{ 6, 5, 9 }, &any); // (every block staged: nothing left to pin, as pins says)
+    try ensure(!any[1] and any[1] == h.s.pins(.{ .id = 5, .generation = 1 }, 0), @src());
     for (out[0..g.staged]) |r| @memcpy(r.dst, h.src(5)[r.first * bpt ..][0..r.dst.len]); // queued before the change
     @memset(h.src(5)[0 .. 4 * block_tokens * bpt], 0xee); // the change
     for (out[0..g.staged]) |r| h.s.staged(r.ticket, true);
@@ -1453,6 +1458,59 @@ fn checkLayout(gpa: Allocator) !void {
     try ensure(!h.s.presence(key) and h.s.counts().recovered_dropped == 1, @src());
 }
 
+/// 0118's owner-sharded store: a rank keeps a point of its own part with full blocks of every plane and a point of
+/// another part with only the replicated planes (foreign_block_bytes); every point names its part (a part-less keep is
+/// invalid), the sizes survive a restart, a lookup and partOf say the part, the same ids under two parts are two
+/// block names (the salt), and a rank that owns another part reads the first rank's manifests as damaged.
+fn checkOwnerParts(gpa: Allocator) !void {
+    const h = try H.init(gpa, .{ .tag = "parts" });
+    defer h.deinit();
+    const foreign = block_bytes / 4;
+    h.cfg.owner_layout = .owner_sharded;
+    h.cfg.limits.foreign_block_bytes = foreign;
+    h.cfg.limits.own_part = 0;
+    try h.reopen();
+    const ids = try idsOf(gpa, 2 * block_tokens, 2500);
+    defer gpa.free(ids);
+    try ensure(keepIds(h, ids, .{ .lineage = lin(25), .source = 25 }) == .invalid, @src()); // (no part)
+    const own = try write(h, ids, .{ .lineage = lin(25).inPart(0), .source = 25 });
+    const other_ids = try idsOf(gpa, 3 * block_tokens, 2501);
+    defer gpa.free(other_ids);
+    const other = try write(h, other_ids, .{ .lineage = lin(26).inPart(1), .source = 26 });
+    for (h.s.points.get(own).?.blocks) |b| try ensure(b.bytes == block_bytes, @src());
+    for (h.s.points.get(other).?.blocks) |b| try ensure(b.bytes == foreign, @src());
+    // the same ids from another part: other names (never the first point's blocks by name)
+    const pa = h.s.points.get(own).?;
+    var spans: [4]format.Span = undefined;
+    var ch: std.ArrayList(Digest) = .empty;
+    defer ch.deinit(gpa);
+    try format.chain(gpa, ids, block_tokens, &ch);
+    format.blockNames(lin(25).inPart(1), ch.items, ids, block_tokens, spans[0..2]);
+    for (pa.blocks, spans[0..2]) |b, sp| try ensure(!std.mem.eql(u8, &b.name, &sp.name), @src());
+    format.blockNames(lin(25).inPart(1).inPart(0), ch.items, ids, block_tokens, spans[0..2]); // (re-salted: replaced)
+    for (pa.blocks, spans[0..2]) |b, sp| try ensure(std.mem.eql(u8, &b.name, &sp.name), @src());
+    // the restored rows are the stored sizes: a foreign block is its source's first bytes of the block's rows
+    const got = (try restore(h, other)) orelse return CheckFailed;
+    defer gpa.free(got);
+    for (0..3) |k| try ensure(std.mem.eql(u8, got[k * block_tokens * bpt ..][0..foreign], h.src(26)[k * block_tokens * bpt ..][0..foreign]), @src());
+    try h.reopen();
+    try ensure(h.s.presence(own) and h.s.presence(other), @src());
+    try ensure(h.s.partOf(own).?.part == 0 and h.s.partOf(other).?.part == 1 and h.s.partOf(@splat(9)) == null, @src());
+    const hit = h.s.lookup(.{ .keyed = other_ids, .max_at = max_tokens }) orelse return CheckFailed;
+    try ensure(hit.part == 1 and std.mem.eql(u8, &hit.key, &other), @src());
+    // a rank owning part 1 with these files: the sizes are not its own, both points damaged
+    h.cfg.limits.own_part = 1;
+    try h.reopen();
+    try ensure(!h.s.presence(own) and !h.s.presence(other) and h.s.counts().recovered_dropped == 2, @src());
+    // a foreign size past the block's, or one on a replicated store, is no configuration
+    h.closeStore();
+    h.cfg.limits.foreign_block_bytes = block_bytes + 1;
+    try ensure(if (Store.open(gpa, io, h.cfg)) |_| false else |e| e == error.BadConfig, @src());
+    h.cfg.limits.foreign_block_bytes = foreign;
+    h.cfg.owner_layout = .replicated;
+    try ensure(if (Store.open(gpa, io, h.cfg)) |_| false else |e| e == error.BadConfig, @src());
+}
+
 /// GLM 0110's pin (review of the native port): a resumed conversation that is the least recently used one, kept
 /// under cap pressure, makes room without evicting the blocks it reuses. Its old turn goes (room), its blocks stay
 /// (the new turn names them), the new turn stages only its new block, publishes and restores.
@@ -1594,6 +1652,7 @@ const checks = [_]Check{
     .{ .name = "recover transient", .f = checkRecoverTransient },
     .{ .name = "hand over", .f = checkHandOver },
     .{ .name = "bad config", .f = checkBadConfig },
+    .{ .name = "owner parts", .f = checkOwnerParts },
     .{ .name = "staging cap", .f = checkStagingCap },
 };
 

@@ -49,9 +49,24 @@ pub const Limits = struct {
     block_bytes: u64,
     /// Most small-state bytes a point carries.
     max_small_bytes: u64,
+    /// `owner_sharded` (0118): a full block's bytes on this rank for a point whose part (`Lineage.part`) another rank
+    /// owns: that part's owner alone holds (and stores) the sharded planes, the other ranks only the replicated ones.
+    /// 0: every full block is `block_bytes` (a replicated store).
+    foreign_block_bytes: u64 = 0,
+    /// `owner_sharded`: the part this rank owns (a point of that part has full blocks of `block_bytes`).
+    own_part: u32 = 0,
     max_media: u32 = 4096,
     max_sections: u32 = 256,
     max_forks: u32 = 4096,
+
+    /// A full block's exact bytes for a point of part `part` (its lineage's salt): `block_bytes`, or on an
+    /// owner-sharded store `block_bytes` in this rank's own part and `foreign_block_bytes` in another; null for a
+    /// part-less point there (every owner-sharded point names its part).
+    pub fn fullBlockBytes(l: Limits, part: ?u32) ?u64 {
+        if (l.foreign_block_bytes == 0) return l.block_bytes;
+        const p = part orelse return null;
+        return if (p == l.own_part) l.block_bytes else l.foreign_block_bytes;
+    }
 
     pub fn maxBlocks(l: Limits) u32 {
         return std.math.divCeil(u32, l.max_tokens, l.block_tokens) catch 0;
@@ -479,6 +494,9 @@ pub const Manifest = struct {
             x.digest = r.take(32)[0..32].*;
             if (x.len == 0 or x.start >= m.at or @as(u64, x.start) + x.len > limits.max_tokens) return error.Corrupt;
         }
+        // (a part-less point in an owner-sharded store, or a foreign block size where none is kept: damaged)
+        const full = limits.fullBlockBytes(m.lineage.part) orelse return error.Corrupt;
+        if (full > limits.block_bytes) return error.Corrupt;
         const blocks = try gpa.alloc(BlockRef, n_blocks);
         errdefer gpa.free(blocks);
         for (blocks, 0..) |*b, i| {
@@ -491,7 +509,7 @@ pub const Manifest = struct {
             const want = if (!last) m.block_tokens else m.at - @as(u32, @intCast(i)) * m.block_tokens;
             if (b.tokens != want) return error.Corrupt;
             if (b.tokens == m.block_tokens) {
-                if (b.bytes != limits.block_bytes) return error.Corrupt;
+                if (b.bytes != full) return error.Corrupt;
             } else if (b.bytes == 0 or b.bytes > limits.block_bytes) return error.Corrupt;
         }
         const sections = try gpa.alloc(Section, n_sections);
@@ -602,6 +620,17 @@ test "block names: shared prefixes of one computation share names, forks diverge
     var o: [4]Span = undefined;
     try testNames(.{ .root = @splat(8) }, ids, &o);
     for (0..4) |i| try testing.expect(!std.mem.eql(u8, &a[i].name, &o[i].name));
+}
+
+test "full block sizes: a replicated store's every point block_bytes; an owner-sharded one's by its part" {
+    const rep: Limits = .{ .max_tokens = 1024, .block_tokens = 16, .block_bytes = 4096, .max_small_bytes = 1 << 20 };
+    for ([_]?u32{ null, 0, 3 }) |p| try std.testing.expectEqual(@as(?u64, 4096), rep.fullBlockBytes(p));
+    var sh = rep;
+    sh.foreign_block_bytes = 1024;
+    sh.own_part = 1;
+    try std.testing.expectEqual(@as(?u64, 4096), sh.fullBlockBytes(1));
+    try std.testing.expectEqual(@as(?u64, 1024), sh.fullBlockBytes(0));
+    try std.testing.expectEqual(@as(?u64, null), sh.fullBlockBytes(null));
 }
 
 test "part salt: replaced, never stacked; forks untouched" {

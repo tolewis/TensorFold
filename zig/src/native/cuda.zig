@@ -386,11 +386,15 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         return null;
     };
     defer if (!opened) loaded.deinit(loaded.ctx);
-    // a family's KV parts and the disk tier together need the part-salted spill identity (dsv41: round 3), refused
-    // until then rather than storing a sharded plane's local rows as pool rows
+    // a family's KV parts with the disk tier: the family's own tier stores each rank's part (dsv41: owner_sharded,
+    // part-salted names, restores into the recorded part). A family that shards its pool without binding a tier for
+    // it would leave --spill-dir silently unused: refused
     if (@hasField(@TypeOf(loaded), "kv_parts")) if (loaded.kv_parts != null and o.spill.enabled()) {
-        problem.* = "TF_DS_KV_SHARD=1 with --spill-dir: the disk tier does not store sharded KV yet; drop --spill-dir or set TF_DS_KV_SHARD=0";
-        return null;
+        const tier_bound = if (@hasField(@TypeOf(loaded), "tier")) loaded.tier != null else false;
+        if (!tier_bound) {
+            problem.* = "TF_DS_KV_SHARD=1 with --spill-dir: this family does not store sharded KV on disk; drop --spill-dir or set TF_DS_KV_SHARD=0";
+            return null;
+        }
     };
     const model = cuda.usage(false).device - held0;
     const after = try pool(a, io, &g.ctx, problem) orelse return null;

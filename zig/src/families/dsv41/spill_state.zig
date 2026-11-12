@@ -4,7 +4,8 @@
 //!
 //!   - blocks: every kv-source layer's compressed rows of positions [0, at) of the stream's extent, as copyExtent
 //!     copies them (packed FP4 codes and E8M0 scales, then the index keys' codes and scales), cut into shared
-//!     2048-token blocks, each block plane after plane in layer order;
+//!     2048-token blocks, each block plane after plane in layer order (TF_DS_KV_SHARD's owner_sharded layout: the
+//!     codes and scales on their part's owner only, so a rank's block of another part's point is its index rows);
 //!   - small state: the slot's own part, byte for byte as Model.snapCopy keeps it (every layer's BF16 window ring of
 //!     window + RING_EXTRA rows, then each ratio-2 source's FP32 raw kv and raw score stores of RAW rows).
 //!
@@ -25,11 +26,17 @@ pub const max_layers = 64;
 /// Pool slots the generations track (draft.max_streams; model.zig checks it).
 pub const max_slots = 16;
 
-/// Whose rows a rank's planes hold. `replicated`: every rank holds every row (the served layout, the only one packed
-/// here). `owner_sharded` (0118): the owner rank alone holds a conversation's compressed codes and scales (those planes
-/// are `owner_only`), the index planes, rings and raw stores stay replicated; laid out and digested (a TF_DS_KV_SHARD=1
-/// store fingerprints apart from a replicated one), refused by the Packer until the owner per point is wired.
+/// Whose rows a rank's planes hold. `replicated`: every rank holds every row. `owner_sharded` (0118, TF_DS_KV_SHARD=1):
+/// the pool is cut into parts of `part_rows` positions, part p's compressed codes and scales live on rank p alone (those
+/// planes are `owner_only`, in that rank's part-local plane: shard.Shard.planeBase), the index planes, rings and raw
+/// stores stay replicated. Each rank then packs only what it holds: a point in its own part as every plane (block_bytes
+/// a block), a point in another part as the replicated planes alone (foreign_block_bytes), the replicated planes once
+/// (spill-shard round 3; GLM 0118's spill_blocks `_present`). The digest covers the layout and the part size, so the
+/// two layouts (and two part sizes) never share a store.
 pub const OwnerLayout = enum(u8) { replicated = 0, owner_sharded = 1 };
+
+/// A block plane a rank does not hold for a point (an owner_only plane of another part's point): no staging offset.
+pub const absent = std.math.maxInt(usize);
 
 pub const Kind = enum(u8) { comp_codes = 0, comp_scales = 1, idx_codes = 2, idx_scales = 3, ring = 4, raw_kv = 5, raw_score = 6 };
 
@@ -108,12 +115,21 @@ pub const StateLayout = struct {
     n_small: usize = 0,
     offsets: [max_planes]usize = undefined, // a block plane's offset in a block; a small plane's in the small state
     token_bytes: usize = 0, // block bytes a position (890 for the served checkpoint)
-    block_bytes: usize = 0, // a block's bytes (block_tokens positions)
+    block_bytes: usize = 0, // a block's bytes (block_tokens positions; owner_sharded: a point of the rank's own part)
     small_bytes: usize = 0, // the small state's bytes (Model.snapBytes)
+    /// owner_sharded: positions a part (withParts; 0: not yet cut, the Packer refuses). Replicated: 0.
+    part_rows: usize = 0,
+    /// A block plane's offset in a block of a point another rank owns (`absent` for its owner_only planes).
+    foreign_offsets: [max_planes]usize = undefined,
+    /// A block's bytes for a point another rank owns (its replicated planes; block_bytes when replicated).
+    foreign_block_bytes: usize = 0,
+    /// The owner_only bytes a position (the compressed codes and scales a carry sends: 720 for the served checkpoint;
+    /// 0 when replicated).
+    owner_token_bytes: usize = 0,
 
     pub fn init(shapes: []const LayerShape, g: Geometry, owner: OwnerLayout) !StateLayout {
         // owner_sharded: the same planes, the compressed codes/scales marked owner_only (0118); packing it needs the
-        // point's owner, which the lanes wiring supplies (Packer refuses it, PORT(round2))
+        // part size (withParts) and the packing rank (Packer.rank)
         const own = owner == .owner_sharded;
         if (shapes.len == 0 or shapes.len > max_layers) return error.BadLayout;
         if (g.block_tokens == 0 or g.head_dim == 0 or g.head_dim % 16 != 0 or g.index_head_dim % 32 != 0 or g.raw_rows == 0) return error.BadLayout;
@@ -149,12 +165,48 @@ pub const StateLayout = struct {
         if (at % g.block_tokens != 0) return error.BadLayout;
         l.token_bytes = at / g.block_tokens;
         at = 0;
+        for (l.blockPlanes(), 0..) |p, i| {
+            if (p.owner_only) {
+                l.foreign_offsets[i] = absent;
+                continue;
+            }
+            l.foreign_offsets[i] = at;
+            at += p.spanBytes(g.block_tokens);
+        }
+        l.foreign_block_bytes = at;
+        l.owner_token_bytes = (l.block_bytes - at) / g.block_tokens; // (every span a multiple of the block's rows)
+        at = 0;
         for (l.smallPlanes(), l.n_block..) |p, i| {
             l.offsets[i] = at;
             at += p.slotBytes();
         }
         l.small_bytes = at;
         return l;
+    }
+
+    /// An owner_sharded layout cut into parts of `part_rows` positions (shard.Shard.part: the pool / world, whole
+    /// blocks): what the Packer needs to find a point's owner and its part-local rows.
+    pub fn withParts(l: StateLayout, part_rows: usize) !StateLayout {
+        if (l.owner_layout != .owner_sharded or part_rows == 0 or part_rows % l.geo.block_tokens != 0) return error.BadLayout;
+        var o = l;
+        o.part_rows = part_rows;
+        return o;
+    }
+
+    /// The part holding pool position `pos` (owner_sharded; 0 when replicated).
+    pub fn partOf(l: *const StateLayout, pos: usize) u32 {
+        if (l.owner_layout == .replicated or l.part_rows == 0) return 0;
+        return @intCast(pos / l.part_rows);
+    }
+
+    /// A block's bytes on a rank that owns the point (`own`; always when replicated) or does not.
+    pub fn blockBytesOf(l: *const StateLayout, own: bool) usize {
+        return if (own or l.owner_layout == .replicated) l.block_bytes else l.foreign_block_bytes;
+    }
+
+    /// Block plane i's offset in a block on a rank that owns the point or does not (`absent`: that rank has none).
+    pub fn blockOffsetOf(l: *const StateLayout, i: usize, own: bool) usize {
+        return if (own or l.owner_layout == .replicated) l.offsets[i] else l.foreign_offsets[i];
     }
 
     /// The layout of a config.json (host checks; the server derives it from the loaded weights, Model.spillLayout).
@@ -205,15 +257,21 @@ pub const StateLayout = struct {
     /// A point's bytes on one rank (its blocks, shared or not, and its small state; the owner's under owner_sharded).
     /// error.Overflow for an `at` no pool holds (a parsed manifest's).
     pub fn pointBytes(l: *const StateLayout, at: usize) !usize {
-        return std.math.add(usize, try std.math.mul(usize, try l.blocks(at), l.block_bytes), l.small_bytes);
+        return l.pointBytesOf(at, true);
+    }
+
+    /// pointBytes on a rank that owns the point or does not (owner_sharded).
+    pub fn pointBytesOf(l: *const StateLayout, at: usize, own: bool) !usize {
+        return std.math.add(usize, try std.math.mul(usize, try l.blocks(at), l.blockBytesOf(own)), l.small_bytes);
     }
 
     /// The bytes encode() writes at most.
-    pub const max_encoded = 16 + 4 + 1 + 6 * 4 + 2 * 4 + 3 * 8 + max_planes * 16;
+    pub const max_encoded = 16 + 4 + 1 + 6 * 4 + 2 * 4 + 3 * 8 + max_planes * 16 + 8;
 
     /// The layout's canonical bytes (the digest's input; the compatibility fingerprint takes the digest): magic,
     /// format version, owner layout, geometry, plane counts and sizes, then every plane's kind, dtype, ratio,
-    /// sentinel, layer, flags (bit 0: owner_only), row bytes and slot rows (16 bytes a plane), all little-endian.
+    /// sentinel, layer, flags (bit 0: owner_only), row bytes and slot rows (16 bytes a plane), all little-endian;
+    /// owner_sharded adds the part size (u64) last, so a replicated layout's bytes are what they always were.
     pub fn encode(l: *const StateLayout, buf: []u8) ![]u8 {
         var w: std.Io.Writer = .fixed(buf);
         w.writeAll("tf-dsv41-state\x00\x00") catch return error.NoSpace;
@@ -234,6 +292,7 @@ pub const StateLayout = struct {
             put(&w, u32, p.row) catch return error.NoSpace;
             put(&w, u32, p.rows) catch return error.NoSpace; // (0 for block planes: their rows follow the point's `at`)
         }
+        if (l.owner_layout == .owner_sharded) put(&w, u64, l.part_rows) catch return error.NoSpace;
         return w.buffered();
     }
 
@@ -399,14 +458,38 @@ pub fn Packer(comptime Dev: type) type {
         dev: Dev,
         layout: *const StateLayout,
         gens: *Generations,
+        /// owner_sharded: this rank (it owns part `rank`: its owner_only planes hold that part's rows, from row 0).
+        rank: u32 = 0,
 
-        /// The block calls' range checks (also port_kernels' one-launch pack, unpack and clear).
+        /// Whether this rank holds every plane of the extent at `base` (always when replicated).
+        pub fn owns(p: *const Self, base: usize) bool {
+            return p.layout.owner_layout == .replicated or p.layout.partOf(base) == p.rank;
+        }
+
+        /// owner_sharded: [lo, hi) inside one part (an extent never crosses one: Model.request_cap, parts.zig).
+        fn checkPart(p: *const Self, lo: usize, hi: usize) !void {
+            const l = p.layout;
+            if (l.owner_layout == .replicated) return;
+            if (l.part_rows == 0) return error.NoParts;
+            if (l.partOf(lo) != l.partOf(hi - 1)) return error.CrossesPart;
+        }
+
+        /// The device address of plane `pl`'s row holding position `pos` (a ratio multiple): the pool-wide row, or for
+        /// an owner_only plane of a sharded layout the row of its part's local plane (shard.Shard.planeBase's).
+        fn rowAddr(p: *const Self, pl: Plane, pos: usize) u64 {
+            const l = p.layout;
+            const at = if (pl.owner_only and l.owner_layout == .owner_sharded) pos - @as(usize, l.partOf(pos)) * l.part_rows else pos;
+            return p.dev.blockPlane(pl) + at / pl.ratio * pl.row;
+        }
+
+        /// The block calls' range checks (also port_kernels' one-launch pack, unpack and clear): owner_sharded, the
+        /// extent inside one part and `staged` this rank's bytes for it (blockBytesOf: its own part's or another's).
         pub fn checkBlocks(p: *const Self, r: ExtentRef, first_block: usize, count: usize, staged: usize) !void {
             const l = p.layout;
-            if (l.owner_layout != .replicated) return error.OwnerShardedNotPorted; // PORT(round2): the owner per point
             const bt = l.geo.block_tokens;
-            if (count == 0 or staged != try std.math.mul(usize, count, l.block_bytes)) return error.BadStaging;
             if (r.hi <= r.lo or r.hi > p.dev.capacity()) return error.BadRange;
+            try p.checkPart(r.lo, r.hi);
+            if (count == 0 or staged != try std.math.mul(usize, count, l.blockBytesOf(p.owns(r.lo)))) return error.BadStaging;
             if (r.lo % bt != 0) return error.BadView; // extents start at chunk ends (placeSoft's sizes); ratio-aligned
             if (try std.math.mul(usize, try std.math.add(usize, first_block, count), bt) > r.hi - r.lo) return error.BadRange;
         }
@@ -436,12 +519,16 @@ pub fn Packer(comptime Dev: type) type {
         fn blockCopies(p: *Self, base: usize, first_block: usize, count: usize, out: ?[]u8, in: ?[]const u8) !void {
             const l = p.layout;
             const bt = l.geo.block_tokens;
+            const own = p.owns(base);
+            const bb = l.blockBytesOf(own);
             for (0..count) |k| {
                 const pos = base + (first_block + k) * bt; // < r.hi (checkBlocks)
                 for (l.blockPlanes(), 0..) |pl, i| {
-                    const dev = p.dev.blockPlane(pl) + pos / pl.ratio * pl.row;
+                    const in_block = l.blockOffsetOf(i, own);
+                    if (in_block == absent) continue; // (another rank's owner_only rows: not here)
+                    const dev = p.rowAddr(pl, pos);
                     const len = pl.spanBytes(bt);
-                    const off = k * l.block_bytes + l.blockOffset(i); // < staged (checkBlocks)
+                    const off = k * bb + in_block; // < staged (checkBlocks)
                     if (out) |o| try p.dev.d2h(o[off..][0..len], dev) else try p.dev.h2d(dev, in.?[off..][0..len]);
                 }
             }
@@ -513,11 +600,16 @@ pub fn Packer(comptime Dev: type) type {
         pub fn clearExtent(p: *Self, dst: ExtentRef, done: Dev.Event) !Ticket {
             const l = p.layout;
             if (dst.hi <= dst.lo or dst.hi > p.dev.capacity()) return error.BadRange;
+            try p.checkPart(dst.lo, dst.hi);
             for (l.blockPlanes()) |pl| if (dst.lo % pl.ratio != 0 or dst.hi % pl.ratio != 0) return error.BadView;
             if (!p.gens.current(dst)) return error.StaleExtent;
             p.gens.bump(dst.lo, dst.hi);
             errdefer p.dev.record(done) catch {};
-            for (l.blockPlanes()) |pl| try p.dev.fill(p.dev.blockPlane(pl) + dst.lo / pl.ratio * pl.row, pl.sentinel, pl.spanBytes(dst.hi - dst.lo));
+            // (owner_sharded: another rank's owner_only rows are not here; this rank's local rows at the same offsets
+            // are another extent of its own part, never touched)
+            const own = p.owns(dst.lo);
+            for (l.blockPlanes(), 0..) |pl, i| if (l.blockOffsetOf(i, own) != absent)
+                try p.dev.fill(p.rowAddr(pl, dst.lo), pl.sentinel, pl.spanBytes(dst.hi - dst.lo));
             try p.dev.record(done);
             return .{ .op = .clear_extent, .extent = try p.gens.pin(dst.lo, dst.hi), .bytes = 0 };
         }
@@ -726,6 +818,12 @@ const FakeDev = struct {
     const origin: u64 = 4096; // device address of mem[0] (0 stays "no plane")
 
     fn make(gpa: std.mem.Allocator, c: *const config.Config, cap: usize, nslots: usize, n: *Counts) !FakeDev {
+        return makeParts(gpa, c, cap, nslots, 0, n);
+    }
+
+    /// TF_DS_KV_SHARD's planes (prompt.Caches.initShard): each kv source's codes and scales only `part / ratio + 2`
+    /// rows (this rank's part), the index keys over the whole pool. `part` 0: replicated (make).
+    fn makeParts(gpa: std.mem.Allocator, c: *const config.Config, cap: usize, nslots: usize, part: usize, n: *Counts) !FakeDev {
         const hd = c.head_dim;
         const ihd = c.index_head_dim;
         var d: FakeDev = .{ .mem = &.{}, .cap = cap, .nslots = nslots, .n = n, .ring_stride = (c.window + 16) * hd * 2, .raw_stride = 64 * hd * 4 };
@@ -739,8 +837,9 @@ const FakeDev = struct {
         for (0..c.layers) |i| {
             if (!c.kv_sources.has(i)) continue;
             const rows = cap / c.ratios[i] + 2;
-            d.comp_codes[i] = take(&at, rows * hd / 2);
-            d.comp_scales[i] = take(&at, rows * hd / 16);
+            const crows = if (part > 0) part / c.ratios[i] + 2 else rows;
+            d.comp_codes[i] = take(&at, crows * hd / 2);
+            d.comp_scales[i] = take(&at, crows * hd / 16);
             if (c.index_sources.has(i)) {
                 d.idx_codes[i] = take(&at, rows * ihd / 2);
                 d.idx_scales[i] = take(&at, rows * ihd / 32);
@@ -827,6 +926,26 @@ const FakeDev = struct {
         for (first..first + count) |k| for (d.extentPlanes(c, &buf)) |pl| {
             const lo = (base + k * bt) / pl[2];
             try out.appendSlice(gpa, d.bytes(pl[0] + lo * pl[1], bt / pl[2] * pl[1]));
+        };
+    }
+
+    /// expectBlocks for an owner-sharded rank: the codes and scales of a point in its own part (`own`) from the part's
+    /// local rows ((base - part_start) / ratio, prompt.Caches.view's planeBase), none of another part's point; the
+    /// index keys from the pool rows either way. Built from the config, not from the layout under test.
+    fn expectBlocksSharded(d: FakeDev, c: *const config.Config, out: *std.ArrayList(u8), gpa: std.mem.Allocator, base: usize, first: usize, count: usize, bt: usize, part: usize, own: bool) !void {
+        const start = base / part * part;
+        for (first..first + count) |k| for (0..c.layers) |i| {
+            if (d.comp_codes[i] == 0) continue;
+            const r: usize = c.ratios[i];
+            const pos = base + k * bt;
+            if (own) {
+                try out.appendSlice(gpa, d.bytes(d.comp_codes[i] + (pos - start) / r * (c.head_dim / 2), bt / r * (c.head_dim / 2)));
+                try out.appendSlice(gpa, d.bytes(d.comp_scales[i] + (pos - start) / r * (c.head_dim / 16), bt / r * (c.head_dim / 16)));
+            }
+            if (d.idx_codes[i] != 0) {
+                try out.appendSlice(gpa, d.bytes(d.idx_codes[i] + pos / r * (c.index_head_dim / 2), bt / r * (c.index_head_dim / 2)));
+                try out.appendSlice(gpa, d.bytes(d.idx_scales[i] + pos / r * (c.index_head_dim / 32), bt / r * (c.index_head_dim / 32)));
+            }
         };
     }
 
@@ -960,22 +1079,130 @@ test "a manifest's sizes cannot overflow the checks" {
     try std.testing.expect(g.current(src));
 }
 
-test "an owner-sharded layout is refused by the packer until its owner is wired" {
-    const gpa = std.testing.allocator;
-    const c = try fixtureConfig();
-    const l = try fixtureLayout(.owner_sharded);
-    const bt = l.geo.block_tokens;
-    var n: Counts = .{};
-    const dev = try FakeDev.make(gpa, &c, 4 * bt, 2, &n);
-    defer gpa.free(dev.mem);
-    var g = try Generations.init(gpa, 4 * bt, bt);
-    defer g.deinit(gpa);
-    var pk: Packer(FakeDev) = .{ .dev = dev, .layout = &l, .gens = &g };
-    const staged = try gpa.alloc(u8, l.block_bytes);
-    defer gpa.free(staged);
-    try std.testing.expectError(error.OwnerShardedNotPorted, pk.packBlocks(try g.pin(0, bt), 0, 1, staged, 0));
+test "an owner-sharded layout: 720 owner-only bytes a token (a carry's), 170 replicated, the part size in its digest" {
+    const rep = try fixtureLayout(.replicated);
+    const raw = try fixtureLayout(.owner_sharded);
+    try std.testing.expectError(error.BadLayout, rep.withParts(1 << 20));
+    try std.testing.expectError(error.BadLayout, raw.withParts(1000));
+    const sh = try raw.withParts(1 << 20);
+    // the owner's block is the replicated one (every plane), another part's point only its index rows
+    try std.testing.expectEqual(rep.block_bytes, sh.blockBytesOf(true));
+    try std.testing.expectEqual(@as(usize, 170 * 2048), sh.blockBytesOf(false));
+    try std.testing.expectEqual(@as(usize, 720), sh.owner_token_bytes);
+    try std.testing.expectEqual(@as(usize, 0), rep.owner_token_bytes);
+    try std.testing.expectEqual(rep.block_bytes, rep.blockBytesOf(false)); // (replicated: every rank every plane)
+    try std.testing.expectEqual(sh.owner_token_bytes + sh.foreign_block_bytes / 2048, sh.token_bytes);
+    try std.testing.expectEqual(@as(usize, 511 * 170 * 2048 + 6_684_672), try sh.pointBytesOf(1_046_528, false));
+    // a foreign block keeps the replicated planes in order, densely
+    var at: usize = 0;
+    for (sh.blockPlanes(), 0..) |p, i| {
+        if (p.owner_only) {
+            try std.testing.expectEqual(absent, sh.blockOffsetOf(i, false));
+            continue;
+        }
+        try std.testing.expectEqual(at, sh.blockOffsetOf(i, false));
+        at += p.spanBytes(2048);
+    }
+    try std.testing.expectEqual(sh.foreign_block_bytes, at);
+    // the part size is in the digest (another TF_DS_POOL is another store); unset parts and the replicated layout differ
+    const sh2 = try raw.withParts(1 << 19);
+    try std.testing.expect(!std.mem.eql(u8, &sh.digest(), &sh2.digest()));
+    try std.testing.expect(!std.mem.eql(u8, &sh.digest(), &raw.digest()));
+    try std.testing.expect(!std.mem.eql(u8, &sh.digest(), &rep.digest()));
+    var b1: [StateLayout.max_encoded]u8 = undefined;
+    var b2: [StateLayout.max_encoded]u8 = undefined;
+    try std.testing.expectEqual((try rep.encode(&b1)).len + 8, (try sh.encode(&b2)).len); // (the replicated bytes unchanged)
+    try std.testing.expectEqual(@as(u32, 1), sh.partOf(1 << 20));
+    try std.testing.expectEqual(@as(u32, 0), rep.partOf(1 << 20));
 }
 
+test "owner-sharded packing: each rank packs only what it holds (its part's codes from local rows, the index keys once), round trips, clears only its own" {
+    const gpa = std.testing.allocator;
+    const c = try fixtureConfig();
+    const raw = try fixtureLayout(.owner_sharded);
+    const bt = raw.geo.block_tokens;
+    const part = 2 * bt;
+    const cap = 2 * part;
+    const l = try raw.withParts(part);
+    var n: Counts = .{};
+    var devs: [2]FakeDev = undefined;
+    var gens: [2]Generations = undefined;
+    var pks: [2]Packer(FakeDev) = undefined;
+    for (0..2) |r| {
+        devs[r] = try FakeDev.makeParts(gpa, &c, cap, 2, part, &n);
+        gens[r] = try Generations.init(gpa, cap, bt);
+    }
+    defer for (0..2) |r| {
+        gpa.free(devs[r].mem);
+        gens[r].deinit(gpa);
+    };
+    for (0..2) |r| pks[r] = .{ .dev = devs[r], .layout = &l, .gens = &gens[r], .rank = @intCast(r) };
+    // the fake's planes: per source a part's codes and scales (part / ratio + 2 rows), the index keys pool-wide
+    var want_mem: usize = 0;
+    for (l.blockPlanes()) |p| want_mem += (if (p.owner_only) part else cap) / p.ratio * p.row + 2 * p.row;
+    for (l.smallPlanes()) |p| want_mem += 2 * p.slotBytes();
+    try std.testing.expectEqual(want_mem, devs[0].mem.len);
+    const before = [2][]u8{ try gpa.dupe(u8, devs[0].mem), try gpa.dupe(u8, devs[1].mem) };
+    defer for (before) |b| gpa.free(b);
+
+    // a point of one block at base 2048 in part 0 (rank 0 owns it) and one at base 4096 + 2048 in part 1
+    for ([_]usize{ bt, part + bt }) |base| for (0..2) |r| {
+        const own = base / part == r;
+        try std.testing.expectEqual(own, pks[r].owns(base));
+        const src = try gens[r].pin(base, base + bt);
+        const staged = try gpa.alloc(u8, l.blockBytesOf(own));
+        defer gpa.free(staged);
+        try std.testing.expectError(error.BadStaging, pks[r].packBlocks(src, 0, 1, staged[0 .. staged.len - 1], 0));
+        _ = try pks[r].packBlocks(src, 0, 1, staged, 0);
+        var want: std.ArrayList(u8) = .empty;
+        defer want.deinit(gpa);
+        try devs[r].expectBlocksSharded(&c, &want, gpa, base, 0, 1, bt, part, own);
+        try std.testing.expectEqualSlices(u8, want.items, staged);
+        // back into the other free extent of the same part (a restore into the recorded part): the same rows there
+        const to = base / part * part + (if (base % part == 0) bt else 0);
+        const dst = try gens[r].reserve(to, to + bt);
+        const t = try pks[r].unpackBlocks(dst, 0, 1, staged, 0);
+        try std.testing.expect(gens[r].valid(t));
+        var again: std.ArrayList(u8) = .empty;
+        defer again.deinit(gpa);
+        try devs[r].expectBlocksSharded(&c, &again, gpa, to, 0, 1, bt, part, own);
+        try std.testing.expectEqualSlices(u8, want.items, again.items);
+        // a clear of that destination: the index rows to fresh bytes on both ranks, the codes on the owner only (the
+        // other rank's local rows at the same offsets are an extent of its own part)
+        const mem0 = try gpa.dupe(u8, devs[r].mem);
+        defer gpa.free(mem0);
+        _ = try pks[r].clearExtent(try gens[r].reserve(to, to + bt), 0);
+        const start = to / part * part;
+        for (0..c.layers) |i| {
+            if (devs[r].comp_codes[i] == 0) continue;
+            const ratio: usize = c.ratios[i];
+            const rows = bt / ratio;
+            const lr = (to - start) / ratio;
+            for ([_][2]usize{ .{ devs[r].comp_codes[i], c.head_dim / 2 }, .{ devs[r].comp_scales[i], c.head_dim / 16 } }) |pl| {
+                const got = devs[r].bytes(pl[0] + lr * pl[1], rows * pl[1]);
+                if (own) {
+                    for (got) |b| try std.testing.expectEqual(@as(u8, 0), b);
+                } else try std.testing.expectEqualSlices(u8, mem0[pl[0] - FakeDev.origin + lr * pl[1] ..][0 .. rows * pl[1]], got);
+            }
+            for (devs[r].bytes(devs[r].idx_scales[i] + to / ratio * (c.index_head_dim / 32), rows * (c.index_head_dim / 32))) |b| try std.testing.expectEqual(@as(u8, 127), b);
+        }
+    };
+    // an extent across the parts is refused before any copy, and so is a layout never cut into parts
+    const copies = n.copies;
+    const staged = try gpa.alloc(u8, l.block_bytes);
+    defer gpa.free(staged);
+    try std.testing.expectError(error.CrossesPart, pks[0].packBlocks(try gens[0].pin(bt, part + bt), 0, 1, staged, 0));
+    try std.testing.expectError(error.CrossesPart, pks[0].clearExtent(try gens[0].reserve(bt, part + bt), 0));
+    var uncut: Packer(FakeDev) = .{ .dev = devs[0], .layout = &raw, .gens = &gens[0] };
+    try std.testing.expectError(error.NoParts, uncut.packBlocks(try gens[0].pin(0, bt), 0, 1, staged, 0));
+    try std.testing.expectEqual(copies, n.copies);
+    // nothing outside the touched extents moved (the guard rows past a part's rows included)
+    for (0..2) |r| for (l.blockPlanes()) |pl| {
+        const rows_total = (if (pl.owner_only) part else cap) / pl.ratio;
+        const a = pks[r].dev.blockPlane(pl) - FakeDev.origin;
+        try std.testing.expectEqualSlices(u8, before[r][a + rows_total * pl.row ..][0 .. 2 * pl.row], devs[r].mem[a + rows_total * pl.row ..][0 .. 2 * pl.row]);
+    };
+}
 test "a pin goes stale when its rows or slot are given away; a delayed completion never attaches to the new occupant" {
     const gpa = std.testing.allocator;
     const c = try fixtureConfig();
@@ -1133,4 +1360,13 @@ test "the Engram sequence is the request's raw ids with image spans dead" {
     try std.testing.expectError(error.EngramSeqMismatch, checkEngramSeq(&.{ 5, 6, 129264, 129264, 7 }, &ids, &.{.{ 2, 2 }}));
     try std.testing.expectError(error.EngramSeqMismatch, checkEngramSeq(&.{ 5, 6, -1, -1, 8 }, &ids, &.{.{ 2, 2 }}));
     try std.testing.expectError(error.EngramSeqMismatch, checkEngramSeq(&.{ 5, 6, -1 }, &ids, &.{.{ 2, 2 }}));
+}
+
+test "switch off: the replicated layout's digest is round 2's (no store namespace moved); a replicated packer packs as before" {
+    // pinned from port/integration 98370ef's spill_state (before owner_sharded packing existed)
+    const l = try fixtureLayout(.replicated);
+    try std.testing.expectEqualStrings("7d85b94781dcb47b8c5aa7ac0cf676c09e77629f9d1259d83714ae075a5d6873", &std.fmt.bytesToHex(l.digest(), .lower));
+    try std.testing.expectEqual(l.block_bytes, l.foreign_block_bytes);
+    try std.testing.expectEqual(@as(usize, 0), l.owner_token_bytes);
+    for (0..l.n_block) |i| try std.testing.expectEqual(l.blockOffset(i), l.blockOffsetOf(i, false));
 }

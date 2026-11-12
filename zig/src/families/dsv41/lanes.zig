@@ -25,6 +25,8 @@ const spill_tier = @import("spill_tier.zig");
 const parts = @import("parts.zig");
 const kv_lanes = @import("kv_lanes.zig");
 const shard = @import("shard.zig");
+const rank_wire = @import("rank_wire.zig");
+const fingerprint = @import("fingerprint.zig");
 
 const be = lanes.backend;
 const Model = model.Model;
@@ -50,16 +52,17 @@ pub const image_piece = 32 << 10;
 pub var logits_sha = false;
 
 /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
-/// fill_resume (TF_FILL_CHUNKS' pieces) is 12, after spill's two (both ranks run one build).
-/// With the spill tier on: rank_wire's frames (spill_tier: restores' agreement, guards) and the spill notes (rank 0's
-/// write-at-keep and metadata). TF_DS_KV_SHARD adds rank_wire too (rank_wire.zig's frames: the parts' agreement, each
-/// plan's ops, each transfer's shard_xfer/shard_finish, the digest checks). The two are never on together
-/// (SpillWithKvShard), so one rank_wire Leader/Follower a rank serves either.
-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, rank_wire = 10, spill = 11, fill_resume = 12 };
+/// fill_resume (TF_FILL_CHUNKS' pieces) is 12: 11 stays unused (a frame of it is BadFrame), both ranks run one build.
+/// With the spill tier on: rank_wire's frames (spill_tier: restores' agreement, guards, and the notices of rank 0's
+/// write at keep and point metadata: keep/share/touch/forget, tracked like every other command). TF_DS_KV_SHARD adds
+/// rank_wire too (rank_wire.zig's frames: the parts' agreement, each plan's ops, each transfer's
+/// shard_xfer/shard_finish, the digest checks). Both on together share one rank_wire Leader (Lanes.rw, rank 0) and
+/// one Follower a follower (PairFollower): one Tracker sees every frame of the pair. (Kind 11, the untracked spill
+/// notes of round 2, is gone: a frame of it is BadFrame.)
+pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, rank_wire = 10, fill_resume = 12 };
 
 comptime {
     std.debug.assert(@intFromEnum(Kind.rank_wire) == @import("rank_wire.zig").lanes_kind);
-    std.debug.assert(@intFromEnum(Kind.spill) == spill_tier.note_kind);
 }
 
 /// A frame being written.
@@ -398,6 +401,9 @@ pub const Lanes = struct {
     paused: ?Fill = null, // the pass a short prompt cut into (lanes' cut_in), resumed by its next piece
     spill: ?*SpillTier = null, // --spill-dir/--spill-gib: the spill tier (native.zig opens it; null: off, nothing changes)
     kv: ?*kv_lanes.Kv = null, // TF_DS_KV_SHARD: the parts' planner (startKv, at open; null: the switch off)
+    /// The pair's one rank_wire Leader (native.openPair: agreed with rank_identity's full fingerprint before anything
+    /// spill- or shard-related crosses), shared by the spill tier and the KV parts; owned here (null: neither is on).
+    rw: ?*rank_wire.Leader = null,
 
     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
@@ -417,6 +423,8 @@ pub const Lanes = struct {
         }
         self.snaps.deinit(self.gpa);
         if (self.peer != null) self.send(.done) catch {};
+        if (self.rw) |l| self.gpa.destroy(l); // (after the tier and the planner that borrowed it)
+        self.rw = null;
         self.streams.deinit(self.gpa);
         for (&self.seqs) |*q| q.deinit(self.gpa);
         self.wire.deinit(self.gpa);
@@ -508,13 +516,26 @@ pub const Lanes = struct {
         const settings = try kv_lanes.Settings.fromEnv(getenv);
         const k = try self.gpa.create(kv_lanes.Kv);
         errdefer self.gpa.destroy(k);
-        k.* = try kv_lanes.Kv.init(self.gpa, kvConfig(m), settings, modelDev(m), .{ .ctx = self, .stale = kvStale, .moved = kvMoved });
+        k.* = try kv_lanes.Kv.init(self.gpa, kvConfig(m), settings, modelDev(m), .{ .ctx = self, .stale = kvStale, .moved = kvMoved, .stage = kvStage, .bump = kvBump });
         errdefer k.deinit();
-        // the shard's own leader agrees on the shard's fields (the spill tier is refused with TF_DS_KV_SHARD:
-        // SpillWithKvShard). PORT(round3): with both on, pass the spill side's Leader (its full fingerprint,
-        // rank_identity.zig) here so the followers hear one hello and one Tracker sees every frame
-        if (self.peer != null) try k.lead(.{ .ctx = self, .rw = kvSendRw }, m.followers(), null, m.now() | 1, kv_lanes.shardExchange(0, m.world, k.planner.cfg, settings));
-        try k.start();
+        // the pair's one Leader (native.openPair agreed it with the full fingerprint: the spill tier, when on, posts
+        // through the same one), so the followers heard one hello and one Tracker sees every frame
+        if (self.peer != null) try k.lead(.{ .ctx = self, .rw = kvSendRw }, m.followers(), self.rw orelse return error.PairNotAgreed, 0, undefined);
+        // with the spill tier each follower opens its store (every block file scanned, every manifest read) on its own
+        // thread from the agreement, and native.openSpill waited for it (awaitFollowers) before this; start's asks
+        // keep the hello's bound as a margin, not shard_ns' 10 s
+        const l = self.rw;
+        const shard_ns = if (l) |x| x.timeouts.shard_ns else 0;
+        if (self.spill != null) if (l) |x| {
+            x.timeouts.shard_ns = @max(shard_ns, x.timeouts.hello_ns);
+        };
+        defer if (l) |x| {
+            x.timeouts.shard_ns = shard_ns;
+        };
+        k.start() catch |err| {
+            if (self.spill != null) std.log.err("dsv41: the KV parts' start with the spill tier failed ({s}); a follower that logged \"dsv41 spill: rank N could not open its store\" names the cause", .{@errorName(err)});
+            return err;
+        };
         self.kv = k;
     }
 
@@ -534,13 +555,47 @@ pub const Lanes = struct {
         }
     }
 
-    /// A kept state the planner gave up (a stale op): its Snap too.
+    /// A kept state the planner gave up (a stale op): its Snap too; with the spill tier, its unpublished write stages
+    /// or cancels here and on every follower (write_staged) before any row changes, as staleOver guards.
     fn kvStale(ctx: *anyopaque, kept: u64) void {
         const self = of(ctx);
         for (self.snaps.items) |sn| if (sn.id == kept) {
-            if (!sn.stale) noteStale(sn, "a placement needed its room (its part's oldest first)");
+            if (!sn.stale) {
+                noteStale(sn, "a placement needed its room (its part's oldest first)");
+                if (self.spill) |t| t.guardSnap(sn.id, 0);
+            }
             sn.stale = true;
         };
+    }
+
+    /// A stage op (TF_DS_KV_SHARD with the spill tier): kept state `kept`'s pending write stages its remaining rows
+    /// now (or is cancelled) before the stale or move after it in the plan; followers stage their own at the same op.
+    fn kvStage(ctx: *anyopaque, kept: u64) void {
+        if (of(ctx).spill) |t| t.guardSnap(kept, 0);
+    }
+
+    /// A transfer's destination rows are about to change (copy, carry, move): the spill pins over them go stale.
+    fn kvBump(ctx: *anyopaque, lo: usize, hi: usize) void {
+        if (of(ctx).spill) |t| t.bump(lo, hi);
+    }
+
+    /// The planner's pending flags from the spill tier, before a plan (parts.Kept.pending: rank 0's own writes that
+    /// still read a kept state's rows; a plan that stales or moves one stages it first).
+    fn kvPending(self: *Lanes) void {
+        const t = self.spill orelse return;
+        const k = self.kv orelse return;
+        // (one store lock a batch, not one a kept state: this runs before every plan, beside the store's writer)
+        const batch = 64;
+        var ids: [batch]u64 = undefined;
+        var out: [batch]bool = undefined;
+        const kept = k.planner.kept.items;
+        var i: usize = 0;
+        while (i < kept.len) : (i += batch) {
+            const n = @min(batch, kept.len - i);
+            for (kept[i..][0..n], ids[0..n]) |x, *id| id.* = x.id;
+            t.writesPending(ids[0..n], out[0..n]);
+            for (kept[i..][0..n], out[0..n]) |*x, o| x.pending = o;
+        }
     }
 
     /// A live stream moved with its kept states: every Snap's and Lane's rows from the planner again (copyExtent,
@@ -579,6 +634,7 @@ pub const Lanes = struct {
         }
         // (lanes owns the clock: patient only when a live stream holds the state, as placeKept asks)
         const waits = if (src) |sn| k.planner.held(sn.id) and self.patient(sn) else false;
+        self.kvPending();
         const a = try k.admit(@intFromPtr(s), std.hash.Wyhash.hash(0, s.id), @intCast(slot), size, if (src) |sn| sn.id else null, waits);
         if (src) |sn| {
             sn.wanted = 0;
@@ -613,6 +669,7 @@ pub const Lanes = struct {
         const self = of(ptr);
         const k = self.kv orelse return;
         k.stats(out);
+        k.wantStats(); // (the followers' rows are asked for again at the next round, at most each stats_ms)
         if (self.m.kvs) |x| {
             const st = x.stats;
             out.prompt_fetches = st.prompt_fetches;
@@ -624,6 +681,7 @@ pub const Lanes = struct {
             out.owner_rounds = st.owner_rounds;
             out.copies = st.carries;
             out.copy_bytes = st.carry_bytes;
+            shardRank(self.m, &out.rank[0]); // (rank 0's own row; the followers' ride their stats replies)
         }
     }
 
@@ -1152,8 +1210,8 @@ pub const Lanes = struct {
         // TF_DS_KV_SHARD: the planner keeps it too (its rows held in its part); a refused keep leaves the state unusable
         // (usable asks the planner), never one whose rows a placement may take
         if (self.kv) |k| k.keep(sn.id, l.id, at) catch |err| std.log.err("dsv41: the parts' planner did not keep a prompt state: {s}", .{@errorName(err)});
-        // PORT(round3): the spill tier's writes of this point mark it pending (planner.setPending) and salt its block
-        // lineage with its part (planner.saltOf, parts.Root.inPart); spill with TF_DS_KV_SHARD is refused until then
+        // (the spill tier's keep follows: spillInfo gives it the planner's part salt, saltOf, for its block lineage;
+        // its write's pending flag reaches the planner before each plan, kvPending)
         return sn;
     }
 
@@ -1191,8 +1249,9 @@ pub const Lanes = struct {
     /// a fresh Snap holding it back (loading: not usable until every rank installed it) and its buffer. `room`: the
     /// waiting prompt's length; when an extent of it and a growth margin fits without taking any kept state's room,
     /// the Snap's extent (`end`) holds that much, so the resume runs in place (no copyExtent of the restored rows).
-    fn spillReserve(ptr: *anyopaque, at: usize, room: usize) anyerror!spill_tier.Dest {
+    fn spillReserve(ptr: *anyopaque, at: usize, room: usize, part: ?u8) anyerror!spill_tier.Dest {
         const self = of(ptr);
+        if (self.kv) |k| return self.spillReserveParts(k, at, room, part orelse return error.SpillNoPart);
         var taken: [max_streams][2]usize = undefined;
         var nt: usize = 0;
         var it = self.streams.valueIterator();
@@ -1213,6 +1272,29 @@ pub const Lanes = struct {
         return .{ .saved = sn, .id = sn.id, .base = base, .buf = sn.buf.ptr };
     }
 
+    /// TF_DS_KV_SHARD: the destination is a planner hold in the point's recorded part (its owner holds the codes
+    /// there: Kv.restore over planRestore, on every rank alike), the waiting prompt's room with a growth margin when
+    /// that stales nobody, else the point's rows; the hold becomes a kept state at install (restoredOp) or goes at
+    /// discard (unholdOp).
+    fn spillReserveParts(self: *Lanes, k: *kv_lanes.Kv, at: usize, room: usize, part: u8) !spill_tier.Dest {
+        self.kvPending();
+        const want = std.mem.alignForward(usize, @max(room, at) + growth_rows, model.chunk_rows);
+        const id = self.next_snap;
+        const r = try k.restore(id, want, at, part);
+        errdefer k.unhold(id) catch |err| std.log.warn("dsv41: a refused restore kept its part's hold: {s}", .{@errorName(err)});
+        // (its generation: rank_wire Reserve.generation, each follower checks its own planner's hold against it)
+        const gen = for (k.planner.holds.items) |x| {
+            if (x.why == .restore and x.id == id) break x.gen;
+        } else return error.UnknownHold;
+        const sn = try self.gpa.create(Snap);
+        errdefer self.gpa.destroy(sn);
+        sn.* = .{ .id = id, .at = at, .base = r.base, .end = r.base + r.size, .part = part, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()), .loading = true };
+        errdefer sn.buf.free();
+        try self.snaps.append(self.gpa, sn);
+        self.next_snap += 1;
+        return .{ .saved = sn, .id = sn.id, .base = sn.base, .buf = sn.buf.ptr, .gen = gen, .size = r.size };
+    }
+
     /// An extent of `size` around the live streams and the kept states' rows (placeSoft's rules: their held extents
     /// first), staling nobody: null when none.
     fn placeFree(self: *Lanes, live: []const [2]usize, size: usize) !?usize {
@@ -1222,32 +1304,44 @@ pub const Lanes = struct {
         return placeSoft(self.gpa, live, kept.items, size, self.m.pool_cap);
     }
 
-    fn spillInstall(_: *anyopaque, saved: *anyopaque) void {
+    fn spillInstall(ptr: *anyopaque, saved: *anyopaque) void {
+        const self = of(ptr);
         const sn: *Snap = @ptrCast(@alignCast(saved));
         sn.loading = false;
         sn.restored = true;
+        // TF_DS_KV_SHARD: the hold a kept state of the planner too (every rank's at this op); refused, its hold goes
+        // and the Snap is stale (no room of its own in placement, never usable; the prompt cache drops it later, and
+        // Kv.drop ignores an id the planner never kept)
+        if (self.kv) |k| k.restored(sn.id, sn.id, sn.at) catch |err| {
+            std.log.err("dsv41: the parts' planner did not keep a restored prompt state: {s}", .{@errorName(err)});
+            k.unhold(sn.id) catch {};
+            sn.stale = true;
+        };
     }
 
     /// A restore that did not commit: its Snap goes (the followers drop theirs with the abort, no snap_drop).
     fn spillDiscard(ptr: *anyopaque, saved: *anyopaque) void {
         const self = of(ptr);
         const sn: *Snap = @ptrCast(@alignCast(saved));
+        if (self.kv) |k| k.unhold(sn.id) catch |err| std.log.warn("dsv41: a discarded restore kept its part's hold: {s}", .{@errorName(err)});
         if (std.mem.indexOfScalar(*Snap, self.snaps.items, sn)) |i| _ = self.snaps.orderedRemove(i);
         sn.buf.free();
         self.gpa.destroy(sn);
     }
 
-    fn spillInfo(_: *anyopaque, saved: *anyopaque) spill_tier.SnapInfo {
+    fn spillInfo(ptr: *anyopaque, saved: *anyopaque) spill_tier.SnapInfo {
+        const self = of(ptr);
         const sn: *Snap = @ptrCast(@alignCast(saved));
-        return .{ .id = sn.id, .base = sn.base, .at = sn.at, .buf = sn.buf.ptr, .slot = sn.slot };
+        // TF_DS_KV_SHARD: the part its rows lie in now, as the planner holds it (its block lineage's salt)
+        const part: ?u8 = if (self.kv) |k| k.planner.saltOf(sn.id) else null;
+        return .{ .id = sn.id, .base = sn.base, .at = sn.at, .buf = sn.buf.ptr, .slot = sn.slot, .part = part };
     }
 
-    /// A spill frame (Kind rank_wire or spill) to every follower, in the ordered stream.
+    /// A spill frame (Kind rank_wire) to every follower, in the ordered stream.
     pub fn spillFrame(ctx: *anyopaque, kind: u8, sub: []const u8) anyerror!void {
         const self = of(ctx);
         const k: Kind = switch (kind) {
             10 => .rank_wire,
-            11 => .spill,
             else => return error.BadFrame,
         };
         if (try self.begin(k)) {
@@ -1311,6 +1405,25 @@ pub fn carryBytes(sources: []const shard.Source) usize {
 }
 
 /// The device side of the planner's ops on this rank (Model.copyExtent, Model.bindTwin).
+/// A rank's attention-side counters (Model.kvs' stats) as its kv_shard row has them.
+fn shardRank(m: *Model, out: *lanes.kv_parts.Rank) void {
+    const x = m.kvs orelse return;
+    const st = x.stats;
+    out.prompt_fetches = st.prompt_fetches;
+    out.prompt_rows = st.prompt_rows;
+    out.prompt_picks = st.prompt_picks;
+    out.prompt_bytes = st.prompt_bytes;
+    out.prompt_syncs = st.prompt_syncs;
+    out.fetch_rounds = st.fetch_rounds;
+    out.owner_rounds = st.owner_rounds;
+    out.copies = st.carries;
+    out.copy_bytes = st.carry_bytes;
+}
+
+fn readShardRank(ctx: *anyopaque, out: *lanes.kv_parts.Rank) void {
+    shardRank(@ptrCast(@alignCast(ctx)), out);
+}
+
 fn modelDev(m: *Model) kv_lanes.Dev {
     return .{ .ctx = m, .check = devCheck, .copy = devCopy, .twin = devTwin, .wait = devWait };
 }
@@ -1415,9 +1528,161 @@ const FollowKept = struct {
     }
 };
 
+/// A follower's one rank_wire Follower (spill-shard round 3): rank 0's Leader (Lanes.rw) sends the spill tier's and
+/// the KV parts' commands in one ordered stream, so one Tracker admits every frame here too; the spill methods go to
+/// the spill side, shard* to the planner's Follower, each failing closed (error.Unsupported) when that side is off on
+/// this rank (the fingerprint's features should have refused the start already). Heap only (rank_wire.Follower is
+/// about 40 KiB).
+pub const PairFollower = PairFollowerOf(SpillFollower);
+
+/// PairFollower over a spill follower type `SF` (spill_tier.Follower of the Model's device; the tests' byte array).
+pub fn PairFollowerOf(comptime SF: type) type {
+    return struct {
+        const Self = @This();
+        wf: rank_wire.Follower,
+        spill: ?*SF,
+        kv: ?*kv_lanes.Follower,
+
+        /// `fx`: this rank's full fingerprint (native.rankExchange; the spill side's own when it has one).
+        pub fn create(gpa: std.mem.Allocator, rank: u16, fx: fingerprint.Exchange, spill: ?*SF, kv: ?*kv_lanes.Follower) !*Self {
+            const p = try gpa.create(Self);
+            p.* = .{ .wf = rank_wire.Follower.init(rank, fx), .spill = spill, .kv = kv };
+            return p;
+        }
+
+        /// A lanes Kind.rank_wire frame: decoded, admitted in order, dispatched; an ask answered on `l`.
+        pub fn onFrame(p: *Self, l: link.Link, payload: []const u8) !void {
+            try rank_wire.serve(&p.wf, l, payload, p);
+            if (p.kv) |k| if (k.diverged) return error.ShardDiverged;
+        }
+
+        fn sp(p: *Self) !*SF {
+            return p.spill orelse error.Unsupported;
+        }
+
+        fn kf(p: *Self) !*kv_lanes.Follower {
+            return p.kv orelse error.Unsupported;
+        }
+
+        const H = rank_wire.Head;
+
+        pub fn agreed(p: *Self, a: fingerprint.Agreement) !void {
+            // (its store opens under its own compat on its own thread: every block file scanned, every manifest read;
+            // rank 0's awaitFollowers waits for it)
+            if (p.spill) |s| s.agreed(a) catch |err| {
+                std.log.err("dsv41 spill: rank {d} could not open its store at the ranks' agreement: {s}", .{ p.wf.rank, @errorName(err) });
+                return err;
+            };
+        }
+        pub fn has(p: *Self, h: H, m: rank_wire.Has) !rank_wire.HasReply {
+            return (try p.sp()).has(h, m);
+        }
+        /// owner_sharded (a nonzero generation): the destination must be this rank's planner hold for the kept id, at
+        /// that base, size and generation (planRestore's, applied from rank 0's plan just before): a restore never lands
+        /// outside the part and the rows the planner reserved for it (a mismatch is a diverged pair: this rank ends).
+        pub fn reserve(p: *Self, h: H, m: rank_wire.Reserve) !void {
+            const s = try p.sp();
+            if (m.generation != 0) {
+                const k = try p.kf();
+                const pl = &(k.planner orelse return error.NotAgreed);
+                const hold = for (pl.holds.items) |x| {
+                    if (x.why == .restore and x.id == m.kept) break x;
+                } else return error.UnknownHold;
+                if (hold.gen != m.generation or hold.base != m.base or hold.part != m.part or hold.size != m.size or hold.size < m.at) return error.StaleExtent;
+            }
+            return s.reserve(h, m);
+        }
+        pub fn status(p: *Self, h: H, m: rank_wire.RestoreStatus) !rank_wire.RestoreStatusReply {
+            return (try p.sp()).status(h, m);
+        }
+        pub fn keep(p: *Self, h: H, m: rank_wire.Keep) !void {
+            return (try p.sp()).keep(h, m);
+        }
+        pub fn share(p: *Self, h: H, m: rank_wire.Share) !void {
+            return (try p.sp()).share(h, m);
+        }
+        pub fn touch(p: *Self, h: H, m: rank_wire.Touch) !void {
+            return (try p.sp()).touch(h, m);
+        }
+        pub fn forget(p: *Self, h: H, m: rank_wire.Forget) !void {
+            return (try p.sp()).forget(h, m);
+        }
+        pub fn start(p: *Self, h: H, m: rank_wire.Start) !void {
+            return (try p.sp()).start(h, m);
+        }
+        pub fn progress(p: *Self, h: H, m: rank_wire.Progress) !void {
+            return (try p.sp()).progress(h, m);
+        }
+        pub fn validate(p: *Self, h: H, m: rank_wire.Validate) !rank_wire.ValidateReply {
+            return (try p.sp()).validate(h, m);
+        }
+        pub fn commit(p: *Self, h: H, m: rank_wire.Commit) !void {
+            return (try p.sp()).commit(h, m);
+        }
+        pub fn abort(p: *Self, h: H, m: rank_wire.Abort) !void {
+            return (try p.sp()).abort(h, m);
+        }
+        pub fn writeStaged(p: *Self, h: H, m: rank_wire.WriteStaged) !void {
+            return (try p.sp()).writeStaged(h, m);
+        }
+        pub fn writeCancelled(p: *Self, h: H, m: rank_wire.WriteCancelled) !void {
+            return (try p.sp()).writeCancelled(h, m);
+        }
+        /// Each set to its side: `tier` the spill side's counters, `shard` the planner side's (a side this rank does not
+        /// run answers its set empty, as each side alone does for the other's).
+        pub fn stats(p: *Self, h: H, m: rank_wire.Stats) !rank_wire.StatsReply {
+            return switch (m.set) {
+                .tier => if (p.spill) |x| x.stats(h, m) else .{ .set = .tier, .n = 0, .values = @splat(0) },
+                .shard => if (p.kv) |x| x.stats(h, m) else .{ .set = .shard, .n = 0, .values = @splat(0) },
+                .open => if (p.spill) |x| x.stats(h, m) else .{ .set = .open, .n = 0, .values = @splat(0) },
+            };
+        }
+        pub fn shardLayout(p: *Self, h: H, m: rank_wire.ShardLayout) !rank_wire.ShardLayoutReply {
+            return (try p.kf()).shardLayout(h, m);
+        }
+        pub fn shardSet(p: *Self, h: H, m: rank_wire.ShardSet) !void {
+            return (try p.kf()).shardSet(h, m);
+        }
+        pub fn shardOps(p: *Self, h: H, m: rank_wire.ShardOps) !void {
+            return (try p.kf()).shardOps(h, m);
+        }
+        pub fn shardCheck(p: *Self, h: H, m: rank_wire.ShardCheck) !rank_wire.ShardCheckReply {
+            return (try p.kf()).shardCheck(h, m);
+        }
+        pub fn shardXfer(p: *Self, h: H, m: rank_wire.ShardXfer) !rank_wire.ShardXferReply {
+            return (try p.kf()).shardXfer(h, m);
+        }
+        pub fn shardFinish(p: *Self, h: H, m: rank_wire.ShardFinish) !void {
+            return (try p.kf()).shardFinish(h, m);
+        }
+    };
+}
+
+/// The follower's spill side as its planner's ops reach it (kv_lanes.SpillHooks over a spill follower `sd`).
+pub fn followerSpillHooks(sd: anytype) kv_lanes.SpillHooks {
+    const SF = @typeInfo(@TypeOf(sd)).pointer.child;
+    return .{ .ctx = sd, .guard = struct {
+        fn f(ctx: *anyopaque, kept: u64, from: u32) void {
+            const x: *SF = @ptrCast(@alignCast(ctx));
+            x.guard(kept, from);
+        }
+    }.f, .bump = struct {
+        fn f(ctx: *anyopaque, lo: usize, hi: usize) void {
+            const x: *SF = @ptrCast(@alignCast(ctx));
+            x.bump(lo, hi);
+        }
+    }.f };
+}
+
 /// follow, with this rank's spill side when the tier is on (`spill`: made before the model's pool, its store opened at
 /// the startup agreement rank 0 starts; the caller destroys it after this returns).
 pub fn followWith(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower) !void {
+    return followPair(gpa, m, spill, null);
+}
+
+/// followWith, with `fx` for the pair's one rank_wire Follower's hello instead of its default: the spill side's full
+/// fingerprint when the tier is on, else (TF_DS_KV_SHARD alone) round 2's shard-only hello (kv_lanes.Follower.exchange).
+pub fn followPair(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower, fx: ?fingerprint.Exchange) !void {
     const peer = m.peer();
     const buf = try gpa.alloc(u8, (m.pool_cap + 1) * 4 + (1 << 16));
     defer gpa.free(buf);
@@ -1446,10 +1711,19 @@ pub fn followWith(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower) !vo
         sd.quiesce();
     };
     var fill_base: usize = 0;
-    // TF_DS_KV_SHARD: this rank's copy of the parts' planner, fed rank 0's ops (never with the spill tier on:
-    // SpillWithKvShard, so the rank_wire frames go to one of the two)
+    // TF_DS_KV_SHARD: this rank's copy of the parts' planner, fed rank 0's ops; with the spill tier its stage, stale
+    // and move ops guard this rank's own writes and its transfers bump their destinations (kv_lanes.SpillHooks)
     const kvf: ?*kv_lanes.Follower = if (m.kvs != null) try kv_lanes.Follower.init(gpa, m.rank, kvConfig(m), try kv_lanes.Settings.fromEnv(getenv), modelDev(m)) else null;
     defer if (kvf) |k| k.deinit();
+    if (kvf) |k| k.counters = .{ .ctx = m, .read = readShardRank }; // (its own row on rank 0's /health)
+    if (kvf) |k| if (spill) |sd| {
+        k.spill = followerSpillHooks(sd);
+    };
+    // one rank_wire Follower for both (rank 0's one Leader): the caller's fingerprint, else the spill side's, else
+    // the planner's shard-only one (native.openPair's hello for TF_DS_KV_SHARD alone)
+    const pair_fx: ?fingerprint.Exchange = fx orelse if (spill) |sd| sd.wf.fx else if (kvf) |k| k.exchange() else null;
+    const pf: ?*PairFollower = if (pair_fx) |x| try PairFollower.create(gpa, @intCast(m.rank), x, spill, kvf) else null;
+    defer if (pf) |p| gpa.destroy(p);
     while (true) {
         // with spill writes or restores pending, they progress while rank 0 sends nothing (2 ms polls)
         if (spill) |sd| while (sd.busy() and !try peer.readable(2 * std.time.ns_per_ms)) sd.service(std.time.ns_per_ms);
@@ -1467,7 +1741,6 @@ pub fn followWith(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower) !vo
             8 => .fill_images,
             9 => .done,
             10 => .rank_wire,
-            11 => .spill,
             12 => .fill_resume,
             else => return error.BadFrame,
         };
@@ -1475,7 +1748,7 @@ pub fn followWith(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower) !vo
         step += 1;
         if (spill) |sd| sd.service(std.time.ns_per_ms); // (rank 0 pumps between its primitives alike)
         // a chunk's read-ahead of the next is done before anything but that chunk (a prompt's ids may change)
-        if (kind != .fill_chunk and kind != .snap_save and kind != .snap_restore and kind != .fill_images and kind != .rank_wire and kind != .spill) {
+        if (kind != .fill_chunk and kind != .snap_save and kind != .snap_restore and kind != .fill_images and kind != .rank_wire) {
             m.joinAhead();
             m.fill_seq = &.{};
         }
@@ -1597,9 +1870,8 @@ pub fn followWith(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower) !vo
                     b.free();
                 }
             },
-            // one rank_wire Follower a rank: the spill tier's or the KV parts' (never both: SpillWithKvShard)
-            .rank_wire => if (spill) |sd| try sd.wireFrame(peer, r.rest()) else if (kvf) |k| try k.onFrame(peer, r.rest()) else return error.Unsupported,
-            .spill => try (spill orelse return error.SpillNotStarted).note(r.rest()),
+            // one rank_wire Follower a rank, for the spill tier's and the KV parts' frames alike
+            .rank_wire => try (pf orelse return error.SpillNotStarted).onFrame(peer, r.rest()), // (rank 0 runs the spill tier)
             .done => {
                 if (spill) |sd| {
                     const left = sd.flush(sd.flush_ns);
@@ -1760,7 +2032,7 @@ test "a restore's destination is held back from placement, never a victim and ne
     // with the tier off nothing spill-related runs: the frame kinds before it keep their values
     try std.testing.expectEqual(@as(u8, 9), @intFromEnum(Kind.done));
     try std.testing.expectEqual(@as(u8, 10), @intFromEnum(Kind.rank_wire));
-    try std.testing.expectEqual(@as(u8, 11), @intFromEnum(Kind.spill));
+    try std.testing.expect(std.enums.fromInt(Kind, 11) == null); // (round 2's spill notes are rank_wire ops now)
     try std.testing.expect(ln.spill == null);
 }
 
@@ -2059,4 +2331,233 @@ test "TF_DS_KV_SHARD lanes: a carried token's bytes are the owners' rows over wh
     try std.testing.expectEqual(@as(usize, 720), carryBytes(&.{ .{ .ratio = 2, .comp_row = row, .idx_row = idx }, .{ .ratio = 2, .comp_row = row, .idx_row = idx }, .{ .ratio = 2, .comp_row = row, .idx_row = idx }, .{ .ratio = 1, .comp_row = row, .idx_row = idx } }));
     // ratios that do not divide the row: 72 + 2.25 a token rounds up to 75 (per-layer integer division said 74)
     try std.testing.expectEqual(@as(usize, 75), carryBytes(&.{ .{ .ratio = 4, .comp_row = row, .idx_row = idx }, .{ .ratio = 128, .comp_row = row, .idx_row = 0 } }));
+    // the spill tier's owner_sharded layout of the checkpoint stores the same bytes a token for its part's points
+    // (native.openPair refuses a start where the two differ)
+    const config = @import("config.zig");
+    var why: config.Why = .{};
+    const cfg = try config.parse(std.testing.allocator, config.test_config, &why);
+    const lay = try spill_tier_state.StateLayout.fromConfig(&cfg, spill_tier_state.Geometry.of(&cfg, model.chunk_rows, 16, 64), .owner_sharded);
+    try std.testing.expectEqual(@as(usize, 720), lay.owner_token_bytes);
+}
+
+/// A byte-array device for a follower's spill side in the composite's tests (no copy is made there: only the store
+/// opens at the agreement and the handlers answer).
+const MiniDev = struct {
+    pub const Event = u32;
+    pub fn blockPlane(_: MiniDev, _: spill_tier_state.Plane) u64 {
+        return 4096;
+    }
+    pub fn slotPlane(_: MiniDev, _: spill_tier_state.Plane, _: usize) u64 {
+        return 4096;
+    }
+    pub fn capacity(_: MiniDev) usize {
+        return 64 * model.chunk_rows;
+    }
+    pub fn slots(_: MiniDev) usize {
+        return 4;
+    }
+    pub fn d2h(_: MiniDev, _: []u8, _: u64) !void {}
+    pub fn h2d(_: MiniDev, _: u64, _: []const u8) !void {}
+    pub fn fill(_: MiniDev, _: u64, _: u8, _: usize) !void {}
+    pub fn record(_: MiniDev, _: u32) !void {}
+    pub fn done(_: MiniDev, _: u32) bool {
+        return true;
+    }
+    pub fn wait(_: MiniDev, _: u32) void {}
+};
+const spill_tier_state = @import("spill_state.zig");
+const MiniSpill = spill_tier.Follower(MiniDev);
+
+fn miniFx(rank: u8) fingerprint.Exchange {
+    var x: fingerprint.Exchange = .{ .common = @splat(3), .rank = @splat(20 + rank) };
+    @memset(&x.fields, .{ .id = 0, .scope = .common, .digest = @splat(0) });
+    return x;
+}
+
+/// The follower side of the composite test: its spill side (an owner-sharded store on TF_SPILL_TEST_DIR, opened at the
+/// agreement), its planner's Follower and the one rank_wire Follower over both, on its own thread.
+const CompositePeer = struct {
+    port: u16,
+    cfg: parts.Config,
+    root: [:0]const u8,
+    err: ?anyerror = null,
+    spill_opened: bool = false,
+    has_answered: bool = false,
+    digest: [32]u8 = undefined,
+
+    fn run(p: *CompositePeer) void {
+        p.loop() catch |e| {
+            p.err = e;
+        };
+    }
+
+    fn loop(p: *CompositePeer) !void {
+        const gpa = std.testing.allocator;
+        var l = try link.Link.connect(std.testing.io, .{ 127, 0, 0, 1 }, p.port, 10);
+        defer l.close();
+        const shapes = [_]spill_tier_state.LayerShape{ .{ .ratio = 2, .kv = true, .idx = true, .raw = true }, .{ .ratio = 1, .kv = true, .idx = true } };
+        const raw = try spill_tier_state.StateLayout.init(&shapes, .{ .block_tokens = model.chunk_rows, .window = 8, .ring_extra = 4, .raw_rows = 4, .head_dim = 64, .index_head_dim = 64 }, .owner_sharded);
+        const layout = try raw.withParts(p.cfg.cap / 2);
+        const settings: spill_tier.Settings = .{ .dir = p.root, .gib = 1, .min_free_gib = 0, .min_tokens = model.chunk_rows, .staging_bytes = 64 << 20, .readers = 1 };
+        const plan = try spill_tier.stagingPlan(settings, &layout);
+        const staging = try gpa.alignedAlloc(u8, .fromByteUnits(4096), plan.bytes());
+        defer gpa.free(staging);
+        const events = try gpa.alloc(u32, spill_tier.eventCount(plan));
+        defer gpa.free(events);
+        for (events, 0..) |*e, i| e.* = @intCast(i);
+        const sf = try MiniSpill.create(gpa, std.testing.io, 1, miniFx(1), null, .{ .dev = .{}, .layout = layout, .gens = try spill_tier_state.Generations.init(gpa, p.cfg.cap, model.chunk_rows), .settings = settings, .max_tokens = @intCast(p.cfg.cap / 2), .staging = staging, .events = events });
+        defer sf.destroy();
+        var dev: kv_lanes.FakeDev = .{ .gpa = gpa };
+        defer dev.deinit();
+        const kf = try kv_lanes.Follower.init(gpa, 1, p.cfg, .{ .twins = false }, dev.dev());
+        defer kf.deinit();
+        kf.spill = followerSpillHooks(sf);
+        const pf = try PairFollowerOf(MiniSpill).create(gpa, 1, miniFx(1), sf, kf);
+        defer gpa.destroy(pf);
+        const buf = try gpa.alloc(u8, rank_wire.max_frame);
+        defer gpa.free(buf);
+        while (true) {
+            const bytes = try l.recv(buf);
+            if (bytes.len == 0) break;
+            try pf.onFrame(l, bytes);
+            p.spill_opened = sf.side != null;
+        }
+        p.digest = kf.planner.?.digest();
+    }
+};
+
+test "spill + shard: one rank_wire Follower serves both sides over loopback (agreement opens the spill store, shard ops reach the planner, spill asks the store)" {
+    const gpa = std.testing.allocator;
+    const c = model.chunk_rows;
+    const core = @import("core");
+    var path: [256]u8 = undefined;
+    const root = try core.spill.fsio.testRoot(&path, "lanes-composite");
+    const fd = try core.spill.fsio.freshDir(gpa, root);
+    _ = std.c.close(fd);
+    defer core.spill.fsio.dropDir(gpa, root);
+    var b: [2]u8 = undefined;
+    std.testing.io.random(&b);
+    const port = 30000 + std.mem.readInt(u16, &b, .little) % 20000;
+    const cfg: parts.Config = .{ .cap = 64 * c, .parts = 2, .carry_bytes = 720 };
+    var peer: CompositePeer = .{ .port = port, .cfg = cfg, .root = root };
+    const th = try std.Thread.spawn(.{}, CompositePeer.run, .{&peer});
+    var joined = false;
+    var l = try link.Link.listen(.{ 127, 0, 0, 1 }, port);
+    defer {
+        if (!joined) {
+            l.send(&.{}) catch {};
+            th.join();
+        }
+        l.close();
+    }
+    const Out = struct {
+        l: link.Link,
+        fn rw(ctx: *anyopaque, sub: []const u8) anyerror!void {
+            const o: *@This() = @ptrCast(@alignCast(ctx));
+            try o.l.send(sub);
+        }
+        fn sink(o: *@This()) rank_wire.Sink {
+            return .{ .ctx = o, .send = rw };
+        }
+    };
+    var out: Out = .{ .l = l };
+    const links = [_]?link.Link{l};
+    // rank 0: the pair's one Leader, agreed once, then the planner over it (Lanes.startKv's order)
+    const lead = try gpa.create(rank_wire.Leader);
+    defer gpa.destroy(lead);
+    lead.* = rank_wire.Leader.init(2, 91, miniFx(0));
+    _ = try lead.agree(out.sink(), &links);
+    var dev0: kv_lanes.FakeDev = .{ .gpa = gpa };
+    defer dev0.deinit();
+    const Rec = struct {
+        fn stale(_: *anyopaque, _: u64) void {}
+        fn moved(_: *anyopaque, _: u64) void {}
+    };
+    var k = try kv_lanes.Kv.init(gpa, cfg, .{ .twins = false }, dev0.dev(), .{ .ctx = &dev0, .stale = Rec.stale, .moved = Rec.moved });
+    defer k.deinit();
+    try k.lead(.{ .ctx = &out, .rw = Out.rw }, &links, lead, 0, undefined);
+    try k.start(); // shard_layout (answered by the planner side), shard_set, shard_check over the same Tracker
+    // a spill ask between plans: the follower's spill side answers from its own store (opened at the agreement)
+    var replies: [1]rank_wire.Frame = undefined;
+    _ = try lead.ask(out.sink(), &links, 0, .{ .has = .{ .point = @splat(7), .compat = lead.compat(), .at = 2 * c, .blocks = 2, .layout = .owner_sharded, .part = 1 } }, &replies);
+    try std.testing.expectEqual(rank_wire.Absence.missing, replies[0].msg.has_reply.answer);
+    _ = try lead.post(out.sink(), replies[0].head.txn, .{ .abort = .{ .why = .presence, .rank = 1, .forget = false } });
+    // a plan with a stage and a stale op (rank 0's pending write), interleaved with a spill post: one stream
+    const a = try k.admit(1, 1, 0, 10 * c, null, false);
+    try k.keep(500, a.id, 8 * c);
+    try k.release(a.id);
+    _ = try lead.post(out.sink(), 0, .{ .write_staged = .{ .point = @splat(9), .kept = 500, .upto = 0 } });
+    const f1 = try k.admit(2, 2, 1, 32 * c, null, false);
+    k.planner.setPending(500, true);
+    const f2 = try k.admit(3, 3, 2, 30 * c, null, false);
+    try std.testing.expect(k.planner.keptAt(500).?.stale);
+    _ = try lead.ask(out.sink(), &links, 0, .{ .stats = .{ .set = .tier } }, &replies);
+    try std.testing.expectEqual(rank_wire.StatsSet.tier, replies[0].msg.stats_reply.set);
+    for ([_]u64{ f1.id, f2.id }) |id| try k.release(id);
+    try k.check();
+    try l.send(&.{});
+    th.join();
+    joined = true;
+    try std.testing.expectEqual(@as(?anyerror, null), peer.err);
+    try std.testing.expect(peer.spill_opened);
+    try std.testing.expectEqualSlices(u8, &k.planner.digest(), &peer.digest);
+}
+
+test "spill + shard: the composite fails closed for a side this rank does not run" {
+    const gpa = std.testing.allocator;
+    var dev: kv_lanes.FakeDev = .{ .gpa = gpa };
+    defer dev.deinit();
+    const kf = try kv_lanes.Follower.init(gpa, 1, .{ .cap = 64 * model.chunk_rows, .parts = 2, .carry_bytes = 720 }, .{}, dev.dev());
+    defer kf.deinit();
+    const only_kv = try PairFollowerOf(MiniSpill).create(gpa, 1, miniFx(1), null, kf);
+    defer gpa.destroy(only_kv);
+    const h: rank_wire.Head = .{ .op = .has, .from = 0, .epoch = 1, .txn = 1, .seq = 2 };
+    try std.testing.expectError(error.Unsupported, only_kv.has(h, .{ .point = @splat(1), .compat = @splat(0), .at = 2048, .blocks = 1, .layout = .owner_sharded, .part = 0 }));
+    try std.testing.expectError(error.Unsupported, only_kv.writeStaged(h, .{ .point = @splat(1), .kept = 1, .upto = 0 }));
+    try only_kv.agreed(.{ .common = @splat(0), .world = 2 }); // (no spill side: nothing to open)
+    const none = try PairFollowerOf(MiniSpill).create(gpa, 1, miniFx(1), null, null);
+    defer gpa.destroy(none);
+    try std.testing.expectError(error.Unsupported, none.shardSet(h, .{ .version = parts.layout_version, .parts = 2, .part_rows = 32 * model.chunk_rows, .owner_epoch = 1 }));
+}
+
+test "spill + shard: an owner-sharded reserve lands only on the follower planner's own hold (base, part, generation)" {
+    const gpa = std.testing.allocator;
+    const c = model.chunk_rows;
+    const cfg: parts.Config = .{ .cap = 64 * c, .parts = 2, .carry_bytes = 720 };
+    var dev: kv_lanes.FakeDev = .{ .gpa = gpa };
+    defer dev.deinit();
+    const kf = try kv_lanes.Follower.init(gpa, 1, cfg, .{ .twins = false }, dev.dev());
+    defer kf.deinit();
+    const h: rank_wire.Head = .{ .op = .shard_set, .from = 0, .epoch = 1, .txn = 1, .seq = 2 };
+    try kf.shardSet(h, .{ .version = parts.layout_version, .parts = 2, .part_rows = kf.cfg.partRows(), .owner_epoch = 1 });
+    // rank 0's restore plan as the follower applies it: a hold of 8 blocks in part 1 for kept id 77
+    const gen = kf.planner.?.next_gen;
+    const hold: kv_lanes.WireOp = .{ .hold = .{ .id = 77, .part = 1, .base = 40 * c, .size = 8 * c, .gen = gen } };
+    try kf.shardOps(h, .{ .owner_epoch = 2, .index = 0, .last = true, .ops = &.{hold} });
+    // a spill side not yet agreed (no store): what passes the hold check reaches it and is refused there
+    const shapes = [_]spill_tier_state.LayerShape{ .{ .ratio = 1, .kv = true, .idx = true } };
+    const raw = try spill_tier_state.StateLayout.init(&shapes, .{ .block_tokens = c, .window = 8, .ring_extra = 4, .raw_rows = 4, .head_dim = 64, .index_head_dim = 64 }, .owner_sharded);
+    const layout = try raw.withParts(32 * c);
+    const sf = try MiniSpill.create(gpa, std.testing.io, 1, miniFx(1), null, .{ .dev = .{}, .layout = layout, .gens = try spill_tier_state.Generations.init(gpa, cfg.cap, c), .settings = .{ .dir = "/nonexistent", .gib = 1 }, .max_tokens = @intCast(32 * c), .staging = &.{}, .events = &.{} });
+    defer sf.destroy();
+    const pf = try PairFollowerOf(MiniSpill).create(gpa, 1, miniFx(1), sf, kf);
+    defer gpa.destroy(pf);
+    const want: rank_wire.Reserve = .{ .point = @splat(5), .kept = 77, .slot = 0, .base = 40 * c, .size = 8 * c, .at = 6 * c, .blocks = 6, .generation = gen, .part = 1 };
+    try std.testing.expectError(error.SpillNotAgreed, pf.reserve(h, want)); // (the hold matched)
+    var other = want;
+    other.generation = gen + 1;
+    try std.testing.expectError(error.StaleExtent, pf.reserve(h, other));
+    other = want;
+    other.base = 48 * c;
+    try std.testing.expectError(error.StaleExtent, pf.reserve(h, other));
+    other = want;
+    other.size = 9 * c; // (an extent rank 0 never held: the hold's size is the Reserve's)
+    try std.testing.expectError(error.StaleExtent, pf.reserve(h, other));
+    other = want;
+    other.kept = 78;
+    try std.testing.expectError(error.UnknownHold, pf.reserve(h, other));
+    // a replicated reserve (generation 0) asks no planner
+    other = want;
+    other.generation = 0;
+    try std.testing.expectError(error.SpillNotAgreed, pf.reserve(h, other));
 }

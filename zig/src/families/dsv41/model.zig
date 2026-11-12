@@ -251,9 +251,8 @@ pub const Model = struct {
         m.pool_cap = pool;
         if (mode != .off and (o.world != 2 or sp.pair != null)) return error.KvShardNeedsTwoRanks;
         const pl = try shard.plan(pool, window, o.round_rows, o.world, mode != .off);
-        // PORT(round2): the spill store's compat digest carries the owner layout (dsv41-state's StateLayout.owner_layout:
-        // owner_sharded with the part size) and its block lineage the part salt; until then the spill tier must stay off
-        // with TF_DS_KV_SHARD=1 (a replicated pack reads a sharded plane's local rows as pool rows)
+        // (with the spill tier: spillLayout is owner_sharded with the part size, so its compat digest and block lineage
+        // carry the owner layout and the part salt; spill_state packs a sharded plane's part-local rows)
         m.request_cap = pl.extent;
         m.window_cap = pl.window;
         // TP2: the decode gathers' RDMA ring (both ranks connect before either returns)
@@ -735,7 +734,8 @@ pub const Model = struct {
 
         pub const Event = cuda.Event;
 
-        /// Row 0 of a block plane over the whole pool (the extent at base b starts b / ratio rows in, as view() puts it).
+        /// Row 0 of a block plane over the whole pool (the extent at base b starts b / ratio rows in, as view() puts it);
+        /// TF_DS_KV_SHARD: an owner-only plane's is row 0 of this rank's part (spill_state's rowAddr adds the local row).
         pub fn blockPlane(dv: SpillDev, p: spill.Plane) u64 {
             const cs = &dv.m.caches;
             return switch (p.kind) {
@@ -799,7 +799,8 @@ pub const Model = struct {
     };
 
     /// The spill state descriptor of this rank, derived from the loaded layers (Caches.init's reading of them) and
-    /// checked against the live allocation: snapCopy's bytes, a ring per layer, every plane present.
+    /// checked against the live allocation: snapCopy's bytes, a ring per layer, every plane present. TF_DS_KV_SHARD:
+    /// owner_sharded, cut into the shard's parts (its codes and scales owner-only, at their part-local rows).
     pub fn spillLayout(m: *const Model) !spill.StateLayout {
         const layers = m.eng.w.layers;
         if (layers.len > spill.max_layers) return error.SpillLayoutMismatch;
@@ -808,7 +809,9 @@ pub const Model = struct {
             const kv = lay.comp_wkv != null;
             s.* = .{ .ratio = if (kv) lay.ratio else 0, .kv = kv, .idx = kv and lay.idx_wk != null, .raw = kv and lay.ratio > 1 };
         }
-        const l = try spill.StateLayout.init(shapes[0..layers.len], spill.Geometry.of(m.eng.c, chunk_rows, prompt.ring_extra, prompt.raw_rows), .replicated);
+        const sh = m.caches.shard;
+        const raw = try spill.StateLayout.init(shapes[0..layers.len], spill.Geometry.of(m.eng.c, chunk_rows, prompt.ring_extra, prompt.raw_rows), if (sh != null) .owner_sharded else .replicated);
+        const l = if (sh) |x| try raw.withParts(x.part) else raw;
         if (l.small_bytes != m.snapBytes() or m.rings.len != layers.len) return error.SpillLayoutMismatch;
         const dv: SpillDev = .{ .m = @constCast(m) };
         for (l.blockPlanes()) |p| if (dv.blockPlane(p) == 0) return error.SpillLayoutMismatch;
@@ -827,7 +830,7 @@ pub const Model = struct {
     /// A packer over this rank's planes, `l` from spillLayout and `g` from spillGenerations (both the caller's, alive
     /// while it is used). Its calls enqueue on the model's stream and record the caller's event: no allocation, no wait.
     pub fn spillPacker(m: *Model, l: *const spill.StateLayout, g: *spill.Generations) spill.Packer(SpillDev) {
-        return .{ .dev = .{ .m = m }, .layout = l, .gens = g };
+        return .{ .dev = .{ .m = m }, .layout = l, .gens = g, .rank = m.rank };
     }
 
     /// The Engram read-ahead joined and its rows dropped, so the next chunk reads its own rows from its prompt's ids.
@@ -890,6 +893,9 @@ pub const Model = struct {
     /// Every argument is checked before anything is enqueued; its own pinned staging, device scratch and event, none
     /// freed before the stream is idle.
     pub fn spillSelfCheck(m: *Model, gpa: std.mem.Allocator, from_slot: usize, from: usize, to_slot: usize, to: usize, ref: usize, at: usize) !void {
+        // (its reference reads the pool-wide planes copyExtent's replicated loop addresses; TF_DS_KV_SHARD's packing is
+        // checked by spill_state's two-rank host tests and on the GPU by the restored token_sha)
+        if (m.caches.shard != null) return error.SpillSelfCheckSharded;
         if (from_slot >= m.streams or to_slot >= m.streams or from_slot == to_slot) return error.BadSlot;
         if (at == 0) return error.BadRange;
         for ([_]usize{ from, to, ref, at }) |v| if (v % chunk_rows != 0) return error.BadRange;

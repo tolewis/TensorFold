@@ -8,6 +8,7 @@ const std = @import("std");
 const fingerprint = @import("fingerprint.zig");
 const rank_wire = @import("rank_wire.zig");
 const spill_state = @import("spill_state.zig");
+const parts = @import("parts.zig");
 const rank_cache = @import("rank_cache.zig");
 
 const Io = std.Io;
@@ -34,6 +35,10 @@ pub const Extra = struct {
     gpu_capability: u32, // cuda Context.capability()
     cuda_driver: i32, // cuda Driver.version()
     rank_cache_name: []const u8, // rank_cache.find's name for this rank
+    /// Whether the agreement guards state on disk (the spill tier): the recipe's identity is then required (envFor).
+    /// TF_DS_KV_SHARD alone agrees the pair's configuration with the same fingerprint, but persists nothing, so an
+    /// identity the recipe did not export reads "unset" there instead of refusing the start.
+    persist: bool = true,
 
     /// The env half of Extra (the rest is passed by the caller): error.NoEngineId / error.NoRecipePatches when the
     /// recipe did not export them, error.NoWeightsId when neither TF_DS_RANK_CACHE_SHA nor TF_DS_MODEL_REVISION is
@@ -41,6 +46,21 @@ pub const Extra = struct {
     /// stored state; the rank cache's header alone does not tell two checkpoints or quants of one shape apart).
     /// TF_DS_ENGRAM_REVISION is read here and required by gather when the model runs with Engram tables.
     pub fn env(get: *const fn ([:0]const u8) ?[]const u8) !EnvPart {
+        return envFor(get, true);
+    }
+
+    /// env, or with `persist` false (TF_DS_KV_SHARD without the spill tier: nothing on disk to guard) every missing
+    /// identity "unset" instead of a refusal; both ranks still must agree on what they hold.
+    pub fn envFor(get: *const fn ([:0]const u8) ?[]const u8, persist: bool) !EnvPart {
+        if (!persist) return .{
+            .engine_id = nonEmpty(get("TF_DS_ENGINE_ID")) orelse "unset",
+            .recipe_patches = nonEmpty(get("TF_DS_RECIPE_PATCHES")) orelse "unset",
+            .build_flags = get("TF_DS_BUILD_FLAGS") orelse "",
+            .model_revision = get("TF_DS_MODEL_REVISION") orelse "",
+            .ablation = nonEmpty(get("TF_DS_ABLATION_ID")) orelse "off",
+            .rank_cache_sha = get("TF_DS_RANK_CACHE_SHA") orelse "",
+            .engram_revision = get("TF_DS_ENGRAM_REVISION") orelse "",
+        };
         const e: EnvPart = .{
             .engine_id = nonEmpty(get("TF_DS_ENGINE_ID")) orelse return error.NoEngineId,
             .recipe_patches = nonEmpty(get("TF_DS_RECIPE_PATCHES")) orelse return error.NoRecipePatches,
@@ -84,12 +104,20 @@ pub fn ownerLayout(o: spill_state.OwnerLayout) fingerprint.OwnerLayout {
 }
 
 /// The state layout's part of Extra: `planes` (its canonical bytes, in `buf`: the common field, since the ranks of a
-/// TP pair hold the same planes) and `rank_layout` (its digest: this rank's own field), with its owner layout.
-pub const LayoutPart = struct { planes: []const u8, rank_layout: fingerprint.Digest, owner_layout: fingerprint.OwnerLayout };
+/// TP pair hold the same planes; owner_sharded, its part size too) and `rank_layout` (its digest: this rank's own
+/// field), with its owner layout, the owner mapping's version and its parts (1 and 0 when replicated).
+pub const LayoutPart = struct { planes: []const u8, rank_layout: fingerprint.Digest, owner_layout: fingerprint.OwnerLayout, owner_version: u16 = 0, parts: u8 = 1 };
 
-/// `l` from Model.spillLayout (or its owner_sharded form under TF_DS_KV_SHARD=1); `buf` must outlive the build.
-pub fn layoutPart(l: *const spill_state.StateLayout, buf: *[spill_state.StateLayout.max_encoded]u8) !LayoutPart {
-    return .{ .planes = try l.encode(buf), .rank_layout = l.digest(), .owner_layout = ownerLayout(l.owner_layout) };
+/// `l` from Model.spillLayout (owner_sharded and cut into its parts under TF_DS_KV_SHARD=1: then `world` parts, one a
+/// rank); `buf` must outlive the build. A sharded layout without its part size is refused (it could not pack).
+pub fn layoutPart(l: *const spill_state.StateLayout, world: u32, buf: *[spill_state.StateLayout.max_encoded]u8) !LayoutPart {
+    var lp: LayoutPart = .{ .planes = try l.encode(buf), .rank_layout = l.digest(), .owner_layout = ownerLayout(l.owner_layout) };
+    if (l.owner_layout == .owner_sharded) {
+        if (l.part_rows == 0 or world < 2 or world > parts.max_parts) return error.BadOwnerLayout;
+        lp.owner_version = parts.layout_version;
+        lp.parts = @intCast(world);
+    }
+    return lp;
 }
 
 /// The switches that change state or protocol, canonical ("name=value;" in this order): every rank must hold the same.
@@ -99,6 +127,7 @@ pub const Features = struct {
     kv_shard: bool = false,
     kv_carry: bool = false,
     twins: bool = false,
+    part_rows: u64 = 0, // TF_DS_KV_SHARD: positions a part (the pool / world)
     engram_lanes: u8 = 1,
     image_cache: bool = true,
     streams: u32,
@@ -107,11 +136,16 @@ pub const Features = struct {
     drafts: bool,
 };
 
+/// TF_DS_KV_SHARD adds "part=N;" (the part size: the owner layout's, also in the planes field); off, the bytes are
+/// what they always were.
 pub fn featureString(buf: []u8, f: Features) ![]const u8 {
-    return std.fmt.bufPrint(buf, "spill={d};spill_min={d};kv_shard={d};kv_carry={d};twins={d};engram_lanes={d};image_cache={d};streams={d};round_rows={d};pool={d};drafts={d};", .{
+    const head = try std.fmt.bufPrint(buf, "spill={d};spill_min={d};kv_shard={d};kv_carry={d};twins={d};engram_lanes={d};image_cache={d};streams={d};round_rows={d};pool={d};drafts={d};", .{
         @intFromBool(f.spill), f.spill_min_tokens, @intFromBool(f.kv_shard), @intFromBool(f.kv_carry), @intFromBool(f.twins),
         f.engram_lanes, @intFromBool(f.image_cache), f.streams, f.round_rows, f.pool, @intFromBool(f.drafts),
     });
+    if (!f.kv_shard) return head;
+    const tail = try std.fmt.bufPrint(buf[head.len..], "part={d};", .{f.part_rows});
+    return buf[0 .. head.len + tail.len];
 }
 
 /// The split of every rank (prompt2d.split's rule: world 2 is plain TP2; world 4 is two TP2 pairs).
@@ -223,9 +257,11 @@ pub const Gathered = struct {
 /// The inputs from model.Options `o`, the opened model `m` (its cfg: window, KV sources, ratios, vision; drafting())
 /// and `x`.
 pub fn gather(gpa: std.mem.Allocator, io: Io, o: anytype, m: anytype, x: Extra) !Gathered {
-    try weightsIdentified(x.model_revision, x.rank_cache_sha);
-    // the Engram tables (hundreds of GB) are identified by their recorded revision, not read
-    if (o.engram_dir != null and x.engram_revision.len == 0) return error.NoEngramId;
+    if (x.persist) {
+        try weightsIdentified(x.model_revision, x.rank_cache_sha);
+        // the Engram tables (hundreds of GB) are identified by their recorded revision, not read
+        if (o.engram_dir != null and x.engram_revision.len == 0) return error.NoEngramId;
+    }
     var g: Gathered = .{ .in = undefined, .arena = .init(gpa), .io = io };
     errdefer g.deinit();
     const a = g.arena.allocator();
@@ -539,11 +575,39 @@ test "the state layout feeds planes, rank_layout and owner_layout; the two owner
     const sh = try spill_state.StateLayout.fromConfig(&c, g, .owner_sharded);
     var b1: [spill_state.StateLayout.max_encoded]u8 = undefined;
     var b2: [spill_state.StateLayout.max_encoded]u8 = undefined;
-    const p1 = try layoutPart(&rep, &b1);
-    const p2 = try layoutPart(&sh, &b2);
+    const p1 = try layoutPart(&rep, 2, &b1);
+    try testing.expectError(error.BadOwnerLayout, layoutPart(&sh, 2, &b2)); // (not cut into parts: it could not pack)
+    const cut = try sh.withParts(1 << 20);
+    const p2 = try layoutPart(&cut, 2, &b2);
     try testing.expectEqual(fingerprint.OwnerLayout.replicated, p1.owner_layout);
     try testing.expectEqual(fingerprint.OwnerLayout.owner_sharded, p2.owner_layout);
+    try testing.expectEqual(@as(u8, 1), p1.parts);
+    try testing.expectEqual(@as(u16, 0), p1.owner_version);
+    try testing.expectEqual(@as(u8, 2), p2.parts);
+    try testing.expectEqual(parts.layout_version, p2.owner_version);
     try testing.expectEqualSlices(u8, &rep.digest(), &p1.rank_layout);
     try testing.expect(!std.mem.eql(u8, p1.planes, p2.planes));
     try testing.expect(!std.mem.eql(u8, &p1.rank_layout, &p2.rank_layout));
+    // another part size: other planes (the common field), so a pool change is a mismatch at the hello
+    var b3: [spill_state.StateLayout.max_encoded]u8 = undefined;
+    const p3 = try layoutPart(&(try sh.withParts(1 << 19)), 2, &b3);
+    try testing.expect(!std.mem.eql(u8, p2.planes, p3.planes));
+}
+
+test "the features: off as they always were; TF_DS_KV_SHARD adds its switches and the part size" {
+    var b1: [256]u8 = undefined;
+    var b2: [256]u8 = undefined;
+    const off = try featureString(&b1, .{ .spill = true, .spill_min_tokens = 8192, .streams = 8, .round_rows = 16, .pool = 1 << 20, .drafts = true });
+    try testing.expectEqualStrings("spill=1;spill_min=8192;kv_shard=0;kv_carry=0;twins=0;engram_lanes=1;image_cache=1;streams=8;round_rows=16;pool=1048576;drafts=1;", off);
+    const on = try featureString(&b2, .{ .spill = true, .spill_min_tokens = 8192, .kv_shard = true, .kv_carry = true, .twins = false, .part_rows = 1050624, .streams = 8, .round_rows = 16, .pool = 2101248, .drafts = true });
+    try testing.expectEqualStrings("spill=1;spill_min=8192;kv_shard=1;kv_carry=1;twins=0;engram_lanes=1;image_cache=1;streams=8;round_rows=16;pool=2101248;drafts=1;part=1050624;", on);
+}
+
+test "TF_DS_KV_SHARD alone: a missing recipe identity reads unset, never a refusal; with the spill tier it is refused" {
+    const e = try Extra.envFor(noEnv, false);
+    try testing.expectEqualStrings("unset", e.engine_id);
+    try testing.expectEqualStrings("unset", e.recipe_patches);
+    try testing.expectError(error.NoEngineId, Extra.envFor(noEnv, true));
+    const k = try Extra.envFor(testEnv, false);
+    try testing.expectEqualStrings("629c524", k.engine_id);
 }

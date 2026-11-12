@@ -28,6 +28,14 @@ fn testLayout() !state.StateLayout {
     return state.StateLayout.init(&shapes, .{ .block_tokens = bt, .window = 8, .ring_extra = 4, .raw_rows = 4, .head_dim = 64, .index_head_dim = 64 }, .replicated);
 }
 
+/// The owner-sharded twin: two parts of half the pool, each rank's codes and scales its own part's only.
+const part_rows = cap / 2;
+fn shardedLayout() !state.StateLayout {
+    const shapes = [_]state.LayerShape{ .{ .ratio = 2, .kv = true, .idx = true, .raw = true }, .{ .ratio = 1, .kv = true, .idx = true } };
+    const l = try state.StateLayout.init(&shapes, .{ .block_tokens = bt, .window = 8, .ring_extra = 4, .raw_rows = 4, .head_dim = 64, .index_head_dim = 64 }, .owner_sharded);
+    return l.withParts(part_rows);
+}
+
 /// The device: block planes over the pool, then Snap buffers; copies immediate, events complete after `delay` polls.
 const Sim = struct {
     mem: []u8,
@@ -43,12 +51,18 @@ const Sim = struct {
     const origin: u64 = 4096;
 
     fn init(rank: u8) !*Sim {
+        return initWith(rank, try testLayout());
+    }
+
+    /// `layout` owner_sharded: an owner_only plane holds this rank's part's rows only (part_rows / ratio + 2), from its
+    /// part's first position (prompt.Caches.initShard).
+    fn initWith(rank: u8, layout: state.StateLayout) !*Sim {
         const s = try gpa.create(Sim);
-        s.* = .{ .mem = &.{}, .layout = try testLayout(), .rank = rank };
+        s.* = .{ .mem = &.{}, .layout = layout, .rank = rank };
         var at: u64 = origin;
         for (s.layout.blockPlanes(), 0..) |p, i| {
             s.planes[i] = at;
-            at += (@as(usize, cap) / p.ratio + 2) * p.row;
+            at += (@as(usize, if (s.sharded(p)) part_rows else cap) / p.ratio + 2) * p.row;
         }
         s.snap_base = at;
         at += max_snaps * s.layout.small_bytes;
@@ -78,23 +92,36 @@ const Sim = struct {
         s.snap_used[(buf - s.snap_base) / s.layout.small_bytes] = false;
     }
 
-    /// A block plane's rows of pool positions [lo, hi).
+    fn sharded(s: *const Sim, p: state.Plane) bool {
+        return p.owner_only and s.layout.owner_layout == .owner_sharded;
+    }
+
+    /// Whether this rank holds plane i's rows at pool position `pos` (an owner_only plane: its own part's only).
+    fn holds(s: *const Sim, i: usize, pos: usize) bool {
+        const p = s.layout.blockPlanes()[i];
+        return !s.sharded(p) or pos / part_rows == s.rank;
+    }
+
+    /// A block plane's rows of pool positions [lo, hi) (an owner_only plane's: its part's local rows).
     fn rows(s: *Sim, i: usize, lo: usize, hi: usize) []u8 {
         const p = s.layout.blockPlanes()[i];
-        return s.bytes(s.planes[i] + lo / p.ratio * p.row, (hi - lo) / p.ratio * p.row);
+        const at = if (s.sharded(p)) lo - lo / part_rows * part_rows else lo;
+        return s.bytes(s.planes[i] + at / p.ratio * p.row, (hi - lo) / p.ratio * p.row);
     }
 
     fn sameRows(s: *Sim, a: usize, b: usize, n: usize) bool {
-        for (0..s.layout.n_block) |i| if (!std.mem.eql(u8, s.rows(i, a, a + n), s.rows(i, b, b + n))) return false;
+        for (0..s.layout.n_block) |i| if (s.holds(i, a) and s.holds(i, b)) {
+            if (!std.mem.eql(u8, s.rows(i, a, a + n), s.rows(i, b, b + n))) return false;
+        };
         return true;
     }
 
     fn clobber(s: *Sim, lo: usize, hi: usize) void {
-        for (0..s.layout.n_block) |i| @memset(s.rows(i, lo, hi), 0xA5);
+        for (0..s.layout.n_block) |i| if (s.holds(i, lo)) @memset(s.rows(i, lo, hi), 0xA5);
     }
 
     fn cleared(s: *Sim, lo: usize, hi: usize) bool {
-        for (s.layout.blockPlanes(), 0..) |p, i| for (s.rows(i, lo, hi)) |b| if (b != p.sentinel) return false;
+        for (s.layout.blockPlanes(), 0..) |p, i| if (s.holds(i, lo)) for (s.rows(i, lo, hi)) |b| if (b != p.sentinel) return false;
         return true;
     }
 };
@@ -155,10 +182,17 @@ const Rank = struct {
     path: [256]u8 = undefined,
     root: [:0]const u8 = undefined,
     settings: tier.Settings,
+    scan_ns: u64 = 0, // the follower's store scan: this long a name (a slow disk)
+    stall_ns: u64 = 0, // ... and this long once, at its first name (a scan that stops)
+    stalled: bool = false,
 
     fn init(rank: u8, tag: []const u8, staging_bytes: u64) !*Rank {
+        return initWith(rank, tag, staging_bytes, try testLayout());
+    }
+
+    fn initWith(rank: u8, tag: []const u8, staging_bytes: u64, layout: state.StateLayout) !*Rank {
         const r = try gpa.create(Rank);
-        r.* = .{ .sim = try Sim.init(rank), .staging = &.{}, .events = &.{}, .settings = undefined };
+        r.* = .{ .sim = try Sim.initWith(rank, layout), .staging = &.{}, .events = &.{}, .settings = undefined };
         var tb: [64]u8 = undefined;
         r.root = try spill.fsio.testRoot(&r.path, try std.fmt.bufPrint(&tb, "tier-{s}-r{d}", .{ tag, rank }));
         const fd = try spill.fsio.freshDir(gpa, r.root);
@@ -180,7 +214,7 @@ const Rank = struct {
     }
 
     fn compat(r: *Rank, a: fingerprint.Agreement, rank: u16) format.Digest {
-        return format.compatDigest(a.storeCommon(rank), .replicated, bt, r.sim.layout.block_bytes);
+        return tier.storeCompat(a, rank, &r.sim.layout);
     }
 
     fn side(r: *Rank, rank: u16, a: fingerprint.Agreement) !*L.S {
@@ -189,7 +223,30 @@ const Rank = struct {
     }
 
     fn opening(r: *Rank) !tier.Opening(Dev) {
-        return .{ .dev = .{ .sim = r.sim }, .layout = r.sim.layout, .gens = try state.Generations.init(gpa, cap, bt), .settings = r.settings, .max_tokens = cap, .staging = r.staging, .events = r.events, .hooks = .{ .free = bigFree } };
+        return .{ .dev = .{ .sim = r.sim }, .layout = r.sim.layout, .gens = try state.Generations.init(gpa, cap, bt), .settings = r.settings, .max_tokens = cap, .staging = r.staging, .events = r.events, .hooks = .{ .ctx = r, .free = bigFree, .scanned = slowScan } };
+    }
+
+    fn slowScan(ctx: ?*anyopaque, _: []const u8) void {
+        const r: *Rank = @ptrCast(@alignCast(ctx.?));
+        if (r.stall_ns > 0 and !r.stalled) {
+            r.stalled = true;
+            std.Io.sleep(io, .fromNanoseconds(r.stall_ns), .awake) catch {};
+        }
+        if (r.scan_ns > 0) std.Io.sleep(io, .fromNanoseconds(r.scan_ns), .awake) catch {};
+    }
+
+    /// `n` stray names in this rank's store under the test agreement's compat (its open scans each, then removes
+    /// it as an orphan).
+    fn strays(r: *Rank, rank: u16, n: usize) !void {
+        const s = try r.side(rank, agreement());
+        defer s.destroy();
+        for (0..n) |i| {
+            var nb: [32]u8 = undefined;
+            const name = try std.fmt.bufPrintSentinel(&nb, "stray{d}", .{i}, 0);
+            const fd = std.c.openat(s.store.blocks_fd, name, .{ .ACCMODE = .WRONLY, .CREAT = true }, @as(std.c.mode_t, 0o600));
+            if (fd < 0) return error.Unexpected;
+            _ = std.c.close(fd);
+        }
     }
 
     /// Flips a byte in every block file of this rank's store (damage CRC catches on the next read).
@@ -218,7 +275,7 @@ const Rank = struct {
 };
 
 /// A kept state as the test's family holds it (lanes.zig's Snap stands in).
-const Snap = struct { id: u64, base: usize, at: usize, buf: u64, slot: u32 = 0, installed: bool = false };
+const Snap = struct { id: u64, base: usize, at: usize, buf: u64, slot: u32 = 0, installed: bool = false, part: ?u8 = null };
 
 /// Rank 0's family: restores get a fresh Snap at the next free base the test sets.
 const Fam0 = struct {
@@ -229,6 +286,7 @@ const Fam0 = struct {
     discarded: u32 = 0,
     reserved: u32 = 0,
     last_room: usize = 0,
+    last_part: ?u8 = null,
     live: std.ArrayList(*Snap) = .empty,
 
     fn family(f: *Fam0) tier.Family {
@@ -237,15 +295,17 @@ const Fam0 = struct {
     fn of(p: *anyopaque) *Fam0 {
         return @ptrCast(@alignCast(p));
     }
-    fn reserve(p: *anyopaque, at: usize, room: usize) anyerror!tier.Dest {
+    fn reserve(p: *anyopaque, at: usize, room: usize, part: ?u8) anyerror!tier.Dest {
         const f = of(p);
         f.reserved += 1;
         f.last_room = room;
+        f.last_part = part;
         const sn = try gpa.create(Snap);
-        sn.* = .{ .id = f.next_id, .base = f.next_base, .at = at, .buf = try f.sim.allocSnap() };
+        sn.* = .{ .id = f.next_id, .base = f.next_base, .at = at, .buf = try f.sim.allocSnap(), .part = part };
         f.next_id += 1;
         try f.live.append(gpa, sn);
-        return .{ .saved = sn, .id = sn.id, .base = sn.base, .buf = sn.buf };
+        // (owner_sharded: the extent a planner hold would have, as Lanes.spillReserveParts reports it)
+        return .{ .saved = sn, .id = sn.id, .base = sn.base, .buf = sn.buf, .size = if (part != null) @max(room, at) else 0 };
     }
     fn install(p: *anyopaque, saved: *anyopaque) void {
         const sn: *Snap = @ptrCast(@alignCast(saved));
@@ -265,7 +325,7 @@ const Fam0 = struct {
     }
     fn info(_: *anyopaque, saved: *anyopaque) tier.SnapInfo {
         const sn: *Snap = @ptrCast(@alignCast(saved));
-        return .{ .id = sn.id, .base = sn.base, .at = sn.at, .buf = sn.buf, .slot = sn.slot };
+        return .{ .id = sn.id, .base = sn.base, .at = sn.at, .buf = sn.buf, .slot = sn.slot, .part = sn.part };
     }
     fn deinit(f: *Fam0) void {
         for (f.live.items) |sn| gpa.destroy(sn);
@@ -536,24 +596,27 @@ test "one rank: the shutdown flush stages and publishes every queued write" {
     try testing.expect(!t.vtable.busy.?(t.ptr));
 }
 
-test "notes round-trip, and a note with trailing or missing bytes is refused" {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(gpa);
+test "a keep crosses rank_wire with its lineage and origin intact; a lineage past one keep's forks is refused" {
     const forks = [_]format.Fork{ .{ .name = @splat(4), .at = 32 }, .{ .name = @splat(5), .at = 48 } };
-    try tier.encodeKeep(gpa, &buf, .{ .slot = 3, .snap = 77, .base = 4096, .at = 64, .key = @splat(9), .group = 5, .shared = true, .lineage = .{ .root = @splat(1), .part = 2, .forks = &forks }, .origin = .{ .key = @splat(8), .at = 32 } });
+    const lin: format.Lineage = .{ .root = @splat(1), .part = 2, .forks = &forks };
+    var wf: [4]rank_wire.Fork = undefined;
+    const m = try tier.keepMsg(3, 77, 4096, 64, @splat(9), 5, true, lin, .{ .key = @splat(8), .at = 32 }, &wf);
+    var buf: [rank_wire.max_frame]u8 = undefined;
+    const bytes = try rank_wire.encode(&buf, .{ .op = .keep, .from = 0, .epoch = 1, .txn = 1, .seq = 2 }, .{ .keep = m });
+    var back: [4]rank_wire.Fork = undefined;
+    const f = try rank_wire.decodeInto(bytes, .{ .forks = &back });
+    const k = f.msg.keep;
+    try testing.expectEqual(@as(u64, 77), k.kept);
+    try testing.expectEqual(@as(u32, 3), k.slot);
     var out: [4]format.Fork = undefined;
-    const n = try tier.decodeNote(buf.items, &out);
-    try testing.expectEqual(@as(u64, 77), n.keep.snap);
-    try testing.expectEqual(@as(?u32, 2), n.keep.lineage.part);
-    try testing.expect(n.keep.lineage.eql(.{ .root = @splat(1), .part = 2, .forks = &forks }));
-    try testing.expectEqual(@as(u32, 32), n.keep.origin.?.at);
-    try buf.append(gpa, 0);
-    try testing.expectError(error.BadNote, tier.decodeNote(buf.items, &out));
-    try testing.expectError(error.ShortNote, tier.decodeNote(buf.items[0 .. buf.items.len - 3], &out));
+    try testing.expect((try tier.keepLineage(k, &out)).eql(lin));
+    try testing.expectEqual(@as(u32, 32), tier.keepOrigin(k).?.at);
     var one: [1]format.Fork = undefined;
-    try testing.expectError(error.BadNote, tier.decodeNote(buf.items[0 .. buf.items.len - 1], &one)); // more forks than room
-    try tier.encodeKey(gpa, &buf, .forget, @splat(6));
-    try testing.expectEqualSlices(u8, &@as(format.Digest, @splat(6)), &(try tier.decodeNote(buf.items, &out)).forget);
+    try testing.expectError(error.TooManyForks, tier.keepLineage(k, &one));
+    var wf1: [1]rank_wire.Fork = undefined;
+    try testing.expectError(error.TooManyForks, tier.keepMsg(3, 77, 4096, 64, @splat(9), 5, true, lin, null, &wf1));
+    const none = try tier.keepMsg(3, 77, 4096, 64, @splat(9), 5, false, .{ .root = @splat(1) }, null, &wf);
+    try testing.expect(none.part == null and none.origin == null and none.forks.len == 0);
 }
 
 test "follower settings: flags over the environment, off without a directory or a cap" {
@@ -602,6 +665,7 @@ const T = struct {
     const clobber: u8 = 28; // lo u64, hi u64: the follower keeps a copy of its rows there, bumps them and overwrites them
     const saved: u8 = 29; // dst u64: the follower answers [its rows at dst equal the copy clobber kept u8]
     const forget: u8 = 30; // key [32]: the follower's own store drops the point (as its cap or floor would)
+    const hold: u8 = 31; // on u8: the follower's device holds every copy (a slow rank: its events never complete) or lets them go
     const done: u8 = 0xff;
 };
 
@@ -688,7 +752,6 @@ const Peer = struct {
             var r: Reader = .{ .b = body };
             switch (bytes[0]) {
                 rank_wire.lanes_kind => try f.wireFrame(l, body),
-                tier.note_kind => try f.note(body),
                 T.snap => {
                     const id = try r.int(u64);
                     _ = try r.int(u32);
@@ -750,6 +813,14 @@ const Peer = struct {
                         off += rows.len;
                     }
                     try l.send(&.{@intFromBool(ok)});
+                },
+                T.hold => {
+                    if ((try r.int(u8)) != 0) {
+                        fam.sim.delay = std.math.maxInt(u32);
+                    } else {
+                        fam.sim.delay = 0;
+                        @memset(&fam.sim.pending, 0);
+                    }
                 },
                 T.forget => {
                     var key: format.Digest = undefined;
@@ -838,7 +909,14 @@ fn testPort() u16 {
 
 /// A kept state on both ranks (the follower's own bytes at the same base, the same prompt in its slot), then keep.
 fn keepBoth(w: *Rank0Wire, t: pc.Tier, sim: *Sim, id: u64, base: usize, ids: []const u32, follower_ids: []const u32) !*Snap {
+    return keepBothIn(w, t, sim, id, base, ids, follower_ids, null);
+}
+
+/// keepBoth with the kept state's part (owner_sharded: the planner's salt).
+fn keepBothIn(w: *Rank0Wire, t: pc.Tier, sim: *Sim, id: u64, base: usize, ids: []const u32, follower_ids: []const u32, part: ?u8) !*Snap {
     const sn = try keptSnap(sim, id, base, ids.len);
+    sn.part = part;
+    errdefer gpa.destroy(sn);
     try w.send(T.snap, &.{ &le(u64, id), &le(u32, 0), &le(u64, base), &le(u32, @intCast(ids.len)) });
     var raw: std.ArrayList(u8) = .empty;
     defer raw.deinit(gpa);
@@ -863,14 +941,25 @@ const Pair = struct {
     lead: ?*rank_wire.Leader = null, // until the tier takes it
     a: fingerprint.Agreement = undefined,
 
+    /// How the follower's store scans at the agreement (tests of rank 0's awaitFollowers), and rank 0's hello bound.
+    const Scan = struct { strays: usize = 0, scan_ns: u64 = 0, stall_ns: u64 = 0, hello_ns: ?u64 = null };
+
     fn start(tag: []const u8, staging_bytes: u64, epoch: u64) !*Pair {
+        return startWith(tag, staging_bytes, epoch, try testLayout());
+    }
+
+    fn startWith(tag: []const u8, staging_bytes: u64, epoch: u64, layout: state.StateLayout) !*Pair {
+        return startScan(tag, staging_bytes, epoch, layout, .{});
+    }
+
+    fn startScan(tag: []const u8, staging_bytes: u64, epoch: u64, layout: state.StateLayout, scan: Scan) !*Pair {
         const p = try gpa.create(Pair);
         p.* = .{ .r0 = undefined, .r1 = undefined, .peer = undefined };
-        p.r0 = Rank.init(0, tag, staging_bytes) catch |e| {
+        p.r0 = Rank.initWith(0, tag, staging_bytes, layout) catch |e| {
             gpa.destroy(p);
             return e;
         };
-        p.r1 = Rank.init(1, tag, staging_bytes) catch |e| {
+        p.r1 = Rank.initWith(1, tag, staging_bytes, layout) catch |e| {
             p.r0.deinit();
             gpa.destroy(p);
             return e;
@@ -884,6 +973,9 @@ const Pair = struct {
         const port = testPort();
         p.peer.* = .{ .port = port, .rank = p.r1 };
         errdefer p.deinit();
+        if (scan.strays > 0) try p.r1.strays(1, scan.strays);
+        p.r1.scan_ns = scan.scan_ns;
+        p.r1.stall_ns = scan.stall_ns;
         p.th = try std.Thread.spawn(.{}, Peer.run, .{p.peer});
         p.l = try link.Link.listen(.{ 127, 0, 0, 1 }, port);
         p.listening = true;
@@ -892,6 +984,7 @@ const Pair = struct {
         const lead = try gpa.create(rank_wire.Leader);
         p.lead = lead;
         lead.* = rank_wire.Leader.init(2, epoch, testFx(0));
+        if (scan.hello_ns) |h| lead.timeouts.hello_ns = h;
         p.a = try lead.agree(.{ .ctx = &p.w, .send = struct {
             fn f(ctx: *anyopaque, sub: []const u8) anyerror!void {
                 return Rank0Wire.frame(ctx, rank_wire.lanes_kind, sub);
@@ -908,6 +1001,8 @@ const Pair = struct {
     fn leader(p: *Pair, fam: *Fam0, boot: u8) !*L {
         const ld = try L.create(gpa, try p.r0.side(0, p.a), fam.family(), p.wire(), p.lead, p.r0.settings, @splat(boot));
         p.lead = null;
+        errdefer ld.destroy();
+        try ld.awaitFollowers(null, std.time.ns_per_ms); // (native.openSpill's order)
         return ld;
     }
 
@@ -1203,4 +1298,307 @@ test "one rank: a restore past the cap is refused before anything is placed or r
     for (jobs) |j| t.vtable.cancel(t.ptr, j);
     try stagingDrains(ld.side.store);
     try testing.expect(t.vtable.lookup(t.ptr, &want(&ids[2])) != null); // still there for later
+}
+
+test "owner-sharded and replicated stores never share a namespace; a part size is part of the layout" {
+    const a = agreement();
+    const rep = try testLayout();
+    const sh = try shardedLayout();
+    try testing.expect(!std.mem.eql(u8, &tier.storeCompat(a, 0, &rep), &tier.storeCompat(a, 0, &sh)));
+    try testing.expectEqual(format.OwnerLayout.owner_sharded, tier.storeLayout(&sh));
+    try testing.expectEqual(rank_wire.OwnerLayout.replicated, tier.wireLayout(&rep));
+    try testing.expect(!std.mem.eql(u8, &rep.digest(), &sh.digest()));
+    try testing.expect(sh.foreign_block_bytes < sh.block_bytes and sh.owner_token_bytes > 0);
+    // a sharded side needs its parts: an uncut layout is refused before the store opens
+    const r = try Rank.initWith(0, "uncut", 0, try shardedLayout());
+    defer r.deinit();
+    var uncut = r.sim.layout;
+    uncut.part_rows = 0;
+    const gens = try state.Generations.init(gpa, cap, bt);
+    var g2 = gens;
+    try testing.expectError(error.NoParts, L.S.create(gpa, io, .{ .sim = r.sim }, uncut, gens, r.settings, 0, r.compat(a, 0), cap, r.staging, r.events, .{ .free = bigFree }));
+    g2.deinit(gpa);
+}
+
+test "two ranks, owner-sharded: each rank writes what it holds, restores go back into the recorded part on both, another part's point is never read as this one" {
+    const pr = try Pair.startWith("sharded", 0, 79, try shardedLayout());
+    defer pr.deinit();
+    const r0 = pr.r0;
+    const w = &pr.w;
+    var fam: Fam0 = .{ .sim = r0.sim };
+    defer fam.deinit();
+    const ld = try pr.leader(&fam, 5);
+    defer ld.destroy();
+    const t = ld.tier();
+    const l = &r0.sim.layout;
+
+    // a point in part 0 (rank 0 holds its codes) and one in part 1 (rank 1 does), salted with their parts
+    var ids_a: [4 * bt]u32 = undefined;
+    testIds(&ids_a, 41);
+    const a = try keepBothIn(w, t, r0.sim, 1, 0, &ids_a, &ids_a, 0);
+    defer gpa.destroy(a);
+    var ids_b: [3 * bt]u32 = undefined;
+    testIds(&ids_b, 42);
+    const b = try keepBothIn(w, t, r0.sim, 2, part_rows, &ids_b, &ids_b, 1);
+    defer gpa.destroy(b);
+    try pumpUntil(ld, 2);
+    const ka = format.pointKey(&ids_a, bt, &.{});
+    const kb = format.pointKey(&ids_b, bt, &.{});
+    try w.waitPresent(ka, true);
+    try w.waitPresent(kb, true);
+    for (ld.side.store.points.get(ka).?.blocks) |blk| try testing.expectEqual(@as(u64, l.block_bytes), blk.bytes);
+    for (ld.side.store.points.get(kb).?.blocks) |blk| try testing.expectEqual(@as(u64, l.foreign_block_bytes), blk.bytes);
+    try testing.expectEqual(@as(?u32, 1), ld.side.store.partOf(kb).?.part);
+
+    // a kept state whose part is not its extent's, or that names none, is not written
+    var ids_c: [2 * bt]u32 = undefined;
+    testIds(&ids_c, 43);
+    const bad = try keptSnap(r0.sim, 3, 4 * bt, 2 * bt);
+    defer gpa.destroy(bad);
+    bad.part = 1;
+    try testing.expect(keep(t, bad, &ids_c, &.{.{ .name = 3, .at = 0 }}) == null);
+    bad.part = null;
+    try testing.expect(keep(t, bad, &ids_c, &.{.{ .name = 3, .at = 0 }}) == null);
+
+    // each restored into a free extent of its own part, rows (what each rank holds) and small state on both
+    for ([_]struct { ids: []const u32, key: format.Digest, src: usize, snap: u64, part: u8, to: usize }{
+        .{ .ids = &ids_a, .key = ka, .src = 0, .snap = 1, .part = 0, .to = 4 * bt },
+        .{ .ids = &ids_b, .key = kb, .src = part_rows, .snap = 2, .part = 1, .to = part_rows + 4 * bt },
+    }) |x| {
+        fam.next_base = x.to;
+        const p = t.vtable.lookup(t.ptr, &want(x.ids)) orelse return error.NotFound;
+        const done = pollUntilDone(t, try t.vtable.begin(t.ptr, &p));
+        try testing.expect(done == .ready);
+        const got: *Snap = @ptrCast(@alignCast(done.ready.saved));
+        defer r0.sim.freeSnap(got.buf);
+        try testing.expectEqual(@as(?u8, x.part), fam.last_part);
+        try testing.expect(r0.sim.sameRows(x.src, got.base, x.ids.len));
+        try testing.expect(try w.yes(T.verify, &.{ &le(u64, x.src), &le(u64, got.base), &le(u32, @intCast(x.ids.len)), &le(u64, x.snap), &le(u64, got.id) }));
+    }
+
+    // a destination the family placed in another part is refused before any copy, and the follower's transaction
+    // ends with it
+    fam.next_base = 4 * bt;
+    const pb = t.vtable.lookup(t.ptr, &want(&ids_b)) orelse return error.NotFound;
+    try testing.expectError(error.CrossesPart, t.vtable.begin(t.ptr, &pb));
+    try testing.expectEqual(@as(u8, 0), (try w.query(kb))[1]);
+    try testing.expect(ld.side.store.presence(kb)); // (not damage: kept)
+
+    // rank 1 loses its copy of A, then A's ids are kept again from part 1: rank 0 keeps its part-0 point (the same
+    // key: a dedup), rank 1 writes the ids under part 1 (other bytes there). A restore names part 0, rank 1 answers
+    // incompatible, and every rank forgets the point instead of reading part-1 bytes as part 0's
+    try w.send(T.forget, &.{&ka});
+    try w.waitPresent(ka, false);
+    const a2 = try keepBothIn(w, t, r0.sim, 4, part_rows, &ids_a, &ids_a, 1);
+    defer gpa.destroy(a2);
+    try w.waitPresent(ka, true);
+    try testing.expectEqual(@as(?u32, 0), ld.side.store.partOf(ka).?.part);
+    const refused = ld.presence_refused;
+    const pa = t.vtable.lookup(t.ptr, &want(&ids_a)) orelse return error.NotFound;
+    try testing.expectError(error.SpillNotOnEveryRank, t.vtable.begin(t.ptr, &pa));
+    try testing.expectEqual(refused + 1, ld.presence_refused);
+    try testing.expect(!ld.side.store.presence(ka));
+    try w.waitPresent(ka, false);
+    try pr.finish();
+}
+
+test "two ranks: a slow follower never stalls rank 0's polls; validate is asked once, when every rank is complete" {
+    const pr = try Pair.start("pslow", 0, 81);
+    defer pr.deinit();
+    const r0 = pr.r0;
+    const w = &pr.w;
+    var fam: Fam0 = .{ .sim = r0.sim };
+    defer fam.deinit();
+    const ld = try pr.leader(&fam, 8);
+    var ld_alive = true;
+    defer if (ld_alive) ld.destroy();
+    const t = ld.tier();
+    var ids: [4 * bt]u32 = undefined;
+    testIds(&ids, 71);
+    const sn = try keepBoth(w, t, r0.sim, 1, 0, &ids, &ids);
+    defer gpa.destroy(sn);
+    try pumpUntil(ld, 1);
+    const key = format.pointKey(&ids, bt, &.{});
+    try w.waitPresent(key, true);
+    // rank 1's device now holds every copy it enqueues: its restore cannot complete until released
+    try w.send(T.hold, &.{&[_]u8{1}});
+    const p = t.vtable.lookup(t.ptr, &want(&ids)) orelse return error.NotFound;
+    const job = try t.vtable.begin(t.ptr, &p);
+    var polls: usize = 0;
+    var longest: u64 = 0;
+    const t_end = monotonic() + 300 * std.time.ns_per_ms;
+    while (monotonic() < t_end) : (polls += 1) {
+        const t0 = monotonic();
+        const r = t.vtable.poll(t.ptr, job, std.time.ns_per_ms);
+        longest = @max(longest, monotonic() - t0);
+        try testing.expect(r == .pending);
+        // a decode round's frames go on meanwhile (the ordered stream: a test frame the follower answers)
+        _ = try w.query(key);
+        std.Io.sleep(io, .fromMilliseconds(2), .awake) catch {};
+    }
+    try testing.expect(polls >= 20);
+    try testing.expect(longest < 100 * std.time.ns_per_ms); // a status ask, never the follower's copy time
+    try testing.expect(ld.status_asks >= 10);
+    try testing.expectEqual(@as(u64, 0), ld.validate_asks);
+    try testing.expectEqual(@as(u8, 1), (try w.query(key))[1]); // its restore is still open there
+    // released: the follower completes, status says so, validate once, committed on both
+    try w.send(T.hold, &.{&[_]u8{0}});
+    const done = pollUntilDone(t, job);
+    try testing.expect(done == .ready);
+    const got: *Snap = @ptrCast(@alignCast(done.ready.saved));
+    defer r0.sim.freeSnap(got.buf);
+    try testing.expectEqual(@as(u64, 1), ld.validate_asks);
+    try testing.expect(r0.sim.sameRows(0, got.base, 4 * bt));
+    try testing.expect(try w.yes(T.verify, &.{ &le(u64, 0), &le(u64, got.base), &le(u32, 4 * bt), &le(u64, 1), &le(u64, got.id) }));
+    const q = try w.query(key);
+    try testing.expectEqual(@as(u8, 0), q[1]);
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, q[2..6], .little));
+    ld.destroy();
+    ld_alive = false;
+    try pr.finish();
+}
+
+test "two ranks: a follower still incomplete past status_wait gives the restore up as timeout, never validate; the point restores again" {
+    const pr = try Pair.start("pwait", 0, 83);
+    defer pr.deinit();
+    const r0 = pr.r0;
+    const w = &pr.w;
+    var fam: Fam0 = .{ .sim = r0.sim };
+    defer fam.deinit();
+    pr.lead.?.timeouts.status_wait_ns = 50 * std.time.ns_per_ms; // (Timeouts: the tier reads its Leader's)
+    const ld = try pr.leader(&fam, 9);
+    var ld_alive = true;
+    defer if (ld_alive) ld.destroy();
+    const t = ld.tier();
+    var ids: [4 * bt]u32 = undefined;
+    testIds(&ids, 73);
+    const sn = try keepBoth(w, t, r0.sim, 1, 0, &ids, &ids);
+    defer gpa.destroy(sn);
+    try pumpUntil(ld, 1);
+    const key = format.pointKey(&ids, bt, &.{});
+    try w.waitPresent(key, true);
+    // rank 1's copies never complete while held: past 50 ms of status polls, rank 0 gives the restore up itself
+    try w.send(T.hold, &.{&[_]u8{1}});
+    const p = t.vtable.lookup(t.ptr, &want(&ids)) orelse return error.NotFound;
+    const job = try t.vtable.begin(t.ptr, &p);
+    const t0 = monotonic();
+    const r = pollUntilDone(t, job);
+    try testing.expect(r == .failed);
+    try testing.expectEqual(@as(anyerror, error.SpillTimeout), r.failed);
+    try testing.expect(monotonic() - t0 >= 50 * std.time.ns_per_ms);
+    try testing.expect(ld.status_asks >= 2);
+    try testing.expectEqual(@as(u64, 0), ld.validate_asks); // never asked: the restore was given up, not validated
+    try testing.expectEqual(@as(?rank_wire.Broken, null), ld.lead.?.broken); // the pair goes on
+    try testing.expectEqual(@as(?anyerror, null), ld.broken);
+    // the follower's abort ran (its copies waited for before the destination went): nothing open there, the point
+    // kept (a timeout is not damage)
+    const q = try w.query(key);
+    try testing.expectEqual(@as(u8, 1), q[0]);
+    try testing.expectEqual(@as(u8, 0), q[1]);
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, q[6..10], .little));
+    // released: the same point restores on both ranks
+    try w.send(T.hold, &.{&[_]u8{0}});
+    const p2 = t.vtable.lookup(t.ptr, &want(&ids)) orelse return error.NotFound;
+    fam.next_base = 8 * bt;
+    const job2 = try t.vtable.begin(t.ptr, &p2);
+    const done = pollUntilDone(t, job2);
+    try testing.expect(done == .ready);
+    const got: *Snap = @ptrCast(@alignCast(done.ready.saved));
+    defer r0.sim.freeSnap(got.buf);
+    try testing.expectEqual(@as(u64, 1), ld.validate_asks);
+    try testing.expect(r0.sim.sameRows(0, got.base, 4 * bt));
+    try testing.expect(try w.yes(T.verify, &.{ &le(u64, 0), &le(u64, got.base), &le(u32, 4 * bt), &le(u64, 1), &le(u64, got.id) }));
+    ld.destroy();
+    ld_alive = false;
+    try pr.finish();
+}
+
+test "two ranks: a follower that completes within the poll rank 0 got ready in commits in that same poll" {
+    const pr = try Pair.start("pfirst", 0, 85);
+    defer pr.deinit();
+    const r0 = pr.r0;
+    const w = &pr.w;
+    var fam: Fam0 = .{ .sim = r0.sim };
+    defer fam.deinit();
+    const ld = try pr.leader(&fam, 10);
+    var ld_alive = true;
+    defer if (ld_alive) ld.destroy();
+    const t = ld.tier();
+    var ids: [4 * bt]u32 = undefined;
+    testIds(&ids, 75);
+    const sn = try keepBoth(w, t, r0.sim, 1, 0, &ids, &ids);
+    defer gpa.destroy(sn);
+    try pumpUntil(ld, 1);
+    const key = format.pointKey(&ids, bt, &.{});
+    try w.waitPresent(key, true);
+    const p = t.vtable.lookup(t.ptr, &want(&ids)) orelse return error.NotFound;
+    const job = try t.vtable.begin(t.ptr, &p);
+    // a poll with the core's usual budget: the follower's copies lag rank 0's by its reads and a frame, and the
+    // repeated status asks inside the budget see it complete without leaving the poll
+    var r: pc.Poll = undefined;
+    var k: usize = 0;
+    while (k < 2000) : (k += 1) {
+        r = t.vtable.poll(t.ptr, job, 40 * std.time.ns_per_ms);
+        if (r != .pending) break;
+        try testing.expectEqual(@as(u64, 0), ld.status_asks); // (pending only while rank 0's own copies run)
+        std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
+    }
+    try testing.expect(r == .ready);
+    const got: *Snap = @ptrCast(@alignCast(r.ready.saved));
+    defer r0.sim.freeSnap(got.buf);
+    try testing.expectEqual(@as(u64, 1), ld.ready_first_poll);
+    try testing.expectEqual(@as(u64, 1), ld.validate_asks);
+    ld.destroy();
+    ld_alive = false;
+    try pr.finish();
+}
+
+test "two ranks: a follower store scan far longer than the hello bound opens; rank 0 waits while it progresses" {
+    // 40 names at 25 ms each: a one-second scan against a 150 ms hello bound (a large store on the Sparks: minutes
+    // against 120 s), which used to fail the start at rank 0's first ask after the agreement
+    const hello_ns = 150 * std.time.ns_per_ms;
+    const pr = try Pair.startScan("scanslow", 0, 81, try testLayout(), .{ .strays = 40, .scan_ns = 25 * std.time.ns_per_ms, .hello_ns = hello_ns });
+    defer pr.deinit();
+    const r0 = pr.r0;
+    var fam: Fam0 = .{ .sim = r0.sim };
+    defer fam.deinit();
+    const t0 = monotonic();
+    const ld = try pr.leader(&fam, 5); // (awaitFollowers: the hello bound without progress, not in all)
+    defer ld.destroy();
+    try testing.expect(monotonic() - t0 > 4 * hello_ns);
+    // the follower's store is open and serves: a point written on both ranks restores on both
+    const t = ld.tier();
+    var ids: [2 * bt]u32 = undefined;
+    testIds(&ids, 61);
+    const sn = try keepBoth(&pr.w, t, r0.sim, 1, 0, &ids, &ids);
+    defer gpa.destroy(sn);
+    try pumpUntil(ld, 1);
+    const key = format.pointKey(&ids, bt, &.{});
+    try pr.w.waitPresent(key, true);
+    const p = t.vtable.lookup(t.ptr, &want(&ids)) orelse return error.NotFound;
+    const done = pollUntilDone(t, try t.vtable.begin(t.ptr, &p));
+    try testing.expect(done == .ready);
+    const got: *Snap = @ptrCast(@alignCast(done.ready.saved));
+    defer r0.sim.freeSnap(got.buf);
+    try testing.expect(r0.sim.sameRows(0, got.base, 2 * bt));
+    try pr.finish();
+}
+
+test "two ranks: a follower store scan that stops making progress fails the start, named" {
+    const pr = try Pair.startScan("scanstall", 0, 82, try testLayout(), .{ .strays = 2, .stall_ns = 700 * std.time.ns_per_ms });
+    defer pr.deinit();
+    var fam: Fam0 = .{ .sim = pr.r0.sim };
+    defer fam.deinit();
+    const ld = try L.create(gpa, try pr.r0.side(0, pr.a), fam.family(), pr.wire(), pr.lead, pr.r0.settings, @splat(6));
+    pr.lead = null;
+    defer ld.destroy();
+    try testing.expectError(error.FollowerScanStalled, ld.awaitFollowers(150 * std.time.ns_per_ms, std.time.ns_per_ms));
+    // the follower's open still finishes (its scan was only slow): it ends cleanly at done
+    try pr.finish();
+}
+
+fn monotonic() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
