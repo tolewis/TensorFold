@@ -174,6 +174,7 @@ pub const Chunk = struct {
     ids: u64, // int64 [cap]
     pos: u64, // int64 [n]: start .. start + n (after a replay cut a view into pos0, pos[first:])
     pos0: u64, // int64 [cap]: the chunk's positions as begin() wrote them
+    pos1: u64 = 0, // int64 [cap]: a replay cut's positions moved to a 16-byte boundary (replayCut)
     h: u64, // bf16 [cap, hc, D]: the streams
     h_alt: u64, // their second buffer (hc_pre_pf writes the posted streams there)
     x: u64, // bf16 [cap, D]: a block's input rows
@@ -307,6 +308,7 @@ pub const Chunk = struct {
         ch.pending = false;
         ch.ids = try a.take(cap * 8);
         ch.pos0 = try a.take(cap * 8);
+        ch.pos1 = try a.take(cap * 8);
         ch.pos = ch.pos0;
         ch.h = try a.take(cap * hc * d * 2);
         ch.h_alt = try a.take(cap * hc * d * 2);
@@ -1241,8 +1243,8 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
     }
     try e.exact.bf16Scale(e.s, ch.wl, ch.iw, n * ih, exact.indexScale(id, ih));
     const kk = @min(c.index_topk, n_comp_end);
-    // rows in blocks so the [rows, n_comp] keys stay bounded at long contexts
-    const rb = @max(16, @min(n, (@as(usize, 1) << 26) / (4 * @max(n_comp_end, 1))));
+    // rows in blocks so the [rows, n_comp] keys stay bounded at long contexts, each a multiple of 16 rows
+    const rb = indexRowBlock(n, n_comp_end);
     if (rb * n_comp_end > key_elems) return error.ChunkTooLong;
     const keyed = li != c.candidate_source and !(c.candidate_source < li) and kk & (kk - 1) == 0;
     const k: tri_index.IndexK = .{ .fp4 = .{ .codes = cs.idx_codes[src], .scales = cs.idx_scales[src] } };
@@ -1662,6 +1664,15 @@ pub fn aioGather(aio: *engram_aio.Aio, t: engram_io.Table, ids: []const i64, out
     nb = 0;
 }
 
+/// The rows of one block of the indexer's scores for a chunk of `n` rows over `n_comp_end` compressed keys: as many as
+/// keep the [rows, n_comp] keys within 2^26 / 4 elements, a multiple of 16 unless one block holds the whole chunk, so
+/// every later block's views (vis + r0 * 8 and the rest) start on a 16-byte boundary, the alignment the kit's index
+/// kernels were captured for (137,612 compressed keys gave 121-row blocks: MissingTritonVariant at the second). A row's
+/// scores and picks are its own, so the block size changes no bits.
+fn indexRowBlock(n: usize, n_comp_end: usize) usize {
+    return @max(16, @min(n, (@as(usize, 1) << 26) / (4 * @max(n_comp_end, 1)) / 16 * 16));
+}
+
 /// The decoder's bounded replay at its first layer (_forward_k's `replay`, CED's prefill): the layer's attention mixes
 /// (the pending MoE post fused in) and its kv-source update over every row of the chunk, then the chunk cut to its rows
 /// at positions >= replay, the streams and their pre copied down (h[first:], pre[first:]). The decoder layers then run
@@ -1684,9 +1695,15 @@ pub fn replayCut(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     std.mem.swap(u64, &ch.pre, &ch.pre_f);
     ch.start += first;
     ch.n = n;
-    // pos[first:]: a view, first * 8 bytes in (its alignment is the one the served kernels were specialized for)
+    // pos[first:]: a view, first * 8 bytes in (its alignment is the one the served kernels were specialized for). An odd
+    // `first` leaves it off a 16-byte boundary, and the kit has no variant for some launches with such a view (a short
+    // chunk's split attention: _sparse_attn_part with SPLITS > 1 and no row bases); the same positions copied, in the
+    // stream's order, to a 16-byte boundary then: the kernels read the same values from an address they were captured for.
     _ = host_pos;
-    ch.pos += first * 8;
+    if ((first * 8) % 16 != 0) {
+        try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(ch.pos1, ch.pos + first * 8, n * 8, e.s.handle), "cuMemcpyDtoDAsync");
+        ch.pos = ch.pos1;
+    } else ch.pos += first * 8;
     return true;
 }
 
@@ -1753,4 +1770,19 @@ test "rankFault: a read this rank could not make ends the pair; other errors pas
         try std.testing.expectEqual(@as(anyerror, error.EngramRankFault), rankFault(err));
     for ([_]anyerror{ error.EngramRankFault, error.TooManyRows, error.MissingEngramTable, error.BadSize, error.CommAborted, error.PairBroken, error.RingFailed }) |err|
         try std.testing.expectEqual(err, rankFault(err));
+}
+
+test "the indexer's row blocks are whole 16-row multiples, so every block's views stay 16-byte aligned" {
+    // 137,612 compressed keys gave 121-row blocks before: the second block's views began at row 121 (968 bytes), off
+    // the 16-byte boundary the kit's kernels were captured for
+    try std.testing.expectEqual(@as(usize, 112), indexRowBlock(2048, 137_612));
+    var n_comp: usize = 1;
+    while (n_comp < 600_000) : (n_comp += 997) {
+        const rb = indexRowBlock(2048, n_comp);
+        try std.testing.expect(rb >= 16);
+        if (rb < 2048) try std.testing.expectEqual(@as(usize, 0), rb % 16); // several blocks: each starts on a 16-row multiple
+        try std.testing.expect(rb == 16 or rb * n_comp * 4 <= (@as(usize, 1) << 26)); // the keys stay within their bound
+    }
+    // a chunk that fits in one block is one block, whatever its size
+    try std.testing.expectEqual(@as(usize, 100), indexRowBlock(100, 10));
 }
