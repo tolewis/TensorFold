@@ -66,6 +66,10 @@ const Job = struct {
     entry: ?*pcache.Entry = null,
     lineage: []pcache.Fork = &.{},
     restored: u32 = 0,
+    // the ids the cache keys it by (the prompt; with pictures each one's positions made from its rows' SHA-256, as the
+    // server makes them from its payload: recipe 0006) and each picture's identity for the tier
+    key: []const u32 = &.{},
+    media: []const pcache.Media = &.{},
 };
 
 /// The prompt cache's keep at a chunk end the pass reached (Stream.reuse.hook), with the lane host's lineage rule.
@@ -73,7 +77,8 @@ fn keepHook(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
     const j: *Job = @ptrCast(@alignCast(ptr));
     const st = j.store orelse return;
     const e = if (s.reuse_failed) null else j.entry;
-    _ = st.keepWith(j.req.prompt, at, s, &.{}, .{ .lineage = j.lineage, .parent = if (e) |x| x.point else null, .fork = if (e) |x| x.at else 0 });
+    const pics = j.media.len > 0;
+    _ = st.keepWith(j.key, at, s, &.{}, .{ .lineage = j.lineage, .parent = if (e) |x| x.point else null, .fork = if (e) |x| x.at else 0, .images = pics, .media = j.media, .raw = if (pics) j.req.prompt else &.{} });
 }
 
 /// The tier's writes drained (bounded), then every memory state forgotten: the next hit comes from disk.
@@ -329,11 +334,13 @@ pub fn main(init: std.process.Init) !u8 {
             const j = &jobs[admitted];
             j.* = .{ .req = r, .index = admitted, .proposer = try lanes.SuffixLookup.init(gpa, .{ .min_match = 4 }), .stream = undefined, .began = std.Io.Timestamp.now(io, .awake), .store = store };
             var reuse: lanes.stream.Reuse = .{};
+            const images = try imageRows(a, io, r.images, m.cfg.hidden);
             if (store) |st| {
+                try cacheKey(a, r.prompt, images, j);
                 if (r.drop_memory) dropMemory(io, st);
                 // a durable point longer than memory: restored first (the lane host parks the request meanwhile)
-                const pr = st.probe(r.prompt, &.{});
-                if (pr.durable) |p| if (st.restoreBegin(p, r.prompt)) |rs| {
+                const pr = st.probeMedia(j.key, &.{}, images.len > 0, j.media);
+                if (pr.durable) |p| if (st.restoreBegin(p, j.key)) |rs| {
                     var got = st.restorePoll(rs, 40 * std.time.ns_per_ms);
                     while (got == .pending) : (got = st.restorePoll(rs, 40 * std.time.ns_per_ms)) {
                         if (core.live.items.len > 0) try core.step();
@@ -341,7 +348,7 @@ pub fn main(init: std.process.Init) !u8 {
                     if (got == .adopted) j.restored = p.at;
                     try w.print("{{\"rank\": 0, \"request\": {d}, \"restore\": \"{s}\", \"at\": {d}}}\n", .{ admitted, @tagName(got), p.at });
                 } else |err| try w.print("{{\"rank\": 0, \"request\": {d}, \"restore_refused\": \"{s}\"}}\n", .{ admitted, @errorName(err) });
-                const look = try st.lookup(a, r.prompt, @intCast(r.prompt.len), &.{}, &.{});
+                const look = try st.lookup(a, j.key, @intCast(r.prompt.len), &.{}, &.{});
                 j.entry = look.entry;
                 j.lineage = try st.passLineage(look.entry);
                 reuse = .{ .saved = if (look.entry) |e| e.saved else null, .at = if (look.entry) |e| e.at else 0, .marks = look.marks, .hook = .{ .ptr = j, .at = keepHook } };
@@ -349,7 +356,7 @@ pub fn main(init: std.process.Init) !u8 {
             j.stream = try lanes.Stream.init(gpa, .{
                 .id = r.name,
                 .prompt = r.prompt,
-                .images = try imageRows(a, io, r.images, m.cfg.hidden),
+                .images = images,
                 .max_new = r.max_tokens,
                 .eos = &eos,
                 .sampling = if (r.temperature > 0) .{ .seed = r.seed orelse 0, .temperature = r.temperature, .top_k = r.top_k, .top_p = r.top_p } else null,
@@ -363,7 +370,7 @@ pub fn main(init: std.process.Init) !u8 {
                 try w.flush();
                 return 1;
             };
-            if (store) |st| if (j.entry) |e| st.resumed(e, r.prompt, !j.stream.reuse_failed);
+            if (store) |st| if (j.entry) |e| st.resumed(e, j.key, !j.stream.reuse_failed);
             try w.print("{{\"rank\": 0, \"request\": {d}, \"name\": \"{s}\", \"prompt_tokens\": {d}, \"cached\": {d}, \"restored\": {d}, \"prefill_s\": {d:.2}}}\n", .{ j.index, r.name, r.prompt.len, j.stream.cached, j.restored, seconds(j.began, io) });
             try w.flush();
         }
@@ -428,7 +435,7 @@ pub fn main(init: std.process.Init) !u8 {
         const x = st.stats;
         const c = (st.tierCounts() orelse pcache.RankCounts{}).slice();
         const t: pcache.TierCounts = if (c.len > 0) c[0] else .{};
-        try w.print("{{\"rank\": 0, \"spill\": {{\"disk_lookups\": {d}, \"disk_hits\": {d}, \"disk_hits_committed\": {d}, \"restores_failed\": {d}, \"restored_tokens\": {d}, \"writes_enqueued\": {d}, \"points\": {d}, \"committed\": {d}, \"cancelled\": {d}, \"failed\": {d}, \"presence_refused\": {d}, \"memory_hits\": {d}}}}}\n", .{ x.disk_lookups, x.disk_hits, x.disk_hits_committed, x.restores_failed, x.restored_tokens, x.writes_enqueued, t.points, t.writes_committed, t.writes_cancelled, t.writes_failed, t.presence_refused, st.counts.hits });
+        try w.print("{{\"rank\": 0, \"spill\": {{\"disk_lookups\": {d}, \"disk_hits\": {d}, \"disk_hits_committed\": {d}, \"restores_failed\": {d}, \"restored_tokens\": {d}, \"writes_enqueued\": {d}, \"points\": {d}, \"committed\": {d}, \"cancelled\": {d}, \"failed\": {d}, \"presence_refused\": {d}, \"memory_hits\": {d}, \"pictures_kept\": {d}, \"pictures_refused\": {d}}}}}\n", .{ x.disk_lookups, x.disk_hits, x.disk_hits_committed, x.restores_failed, x.restored_tokens, x.writes_enqueued, t.points, t.writes_committed, t.writes_cancelled, t.writes_failed, t.presence_refused, st.counts.hits, t.pictures_kept, t.pictures_refused });
     }
     try w.print("{{\"rank\": 0, \"requests\": {d}, \"tokens\": {d}, \"steps\": {d}, \"shared_rounds\": {d}, \"drafted\": {d}, \"accepted\": {d}, \"seconds\": {d:.2}, \"all_equal\": {}}}\n", .{ reqs.len, tokens_out, core.steps, core.shared_rounds, core.drafted, core.accepted, total_s, all_equal });
     try w.flush();
@@ -437,6 +444,23 @@ pub fn main(init: std.process.Init) !u8 {
 
 fn seconds(t: std.Io.Timestamp, io: std.Io) f64 {
     return @as(f64, @floatFromInt(t.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds)) / 1e9;
+}
+
+/// The cache key of a request with pictures (recipe 0006, the server's rule with the rows as the payload): each
+/// picture's positions the ids made from the SHA-256 of its rows, and its identity for the tier; the prompt without.
+fn cacheKey(a: std.mem.Allocator, prompt: []const u32, images: []const lanes.stream.Image, j: *Job) !void {
+    j.key = prompt;
+    if (images.len == 0) return;
+    const key = try a.dupe(u32, prompt);
+    const media = try a.alloc(pcache.Media, images.len);
+    for (images, media) |img, *md| {
+        if (img.tokens == 0 or @as(usize, img.at) + img.tokens > key.len) return error.BadImageSpan;
+        md.* = .{ .start = img.at, .len = img.tokens, .digest = undefined };
+        std.crypto.hash.sha2.Sha256.hash(img.bytes, &md.digest, .{});
+        for (key[img.at..][0..img.tokens], 0..) |*id, k| id.* = pcache.pictureId(&md.digest, @intCast(k));
+    }
+    j.key = key;
+    j.media = media;
 }
 
 /// A request's image spans with their rows read (the files kept for the run).

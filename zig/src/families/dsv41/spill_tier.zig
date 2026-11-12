@@ -58,6 +58,9 @@ pub const Settings = struct {
     restores: u32 = 2,
     readers: u32 = 4,
     direct: bool = true,
+    /// Pictures' points kept and found (TF_DS_IMAGE_CACHE, on unless "0"; the fingerprint's features carry it, so
+    /// every rank agrees). Off: a prompt with pictures keeps nothing on disk and finds nothing there.
+    image_cache: bool = true,
 
     pub fn enabled(s: Settings) bool {
         return s.dir.len > 0 and s.gib > 0;
@@ -90,10 +93,16 @@ pub const Settings = struct {
         s.quota = try num(f64, flag("--spill-quota") orelse env("TF_DS_SPILL_QUOTA"), s.quota);
         s.staging_mib = try num(u32, flag("--spill-staging-mib") orelse env("TF_DS_SPILL_STAGING_MIB"), s.staging_mib);
         s.turns = try num(u32, env("TF_SPILL_TURNS"), s.turns);
+        s.image_cache = imageCache(env("TF_DS_IMAGE_CACHE"));
         s.flush_ms = try num(u32, env("TF_SPILL_FLUSH_MS"), s.flush_ms);
         if (!std.math.isFinite(s.gib) or !std.math.isFinite(s.quota) or s.quota < 0 or s.quota > 1) return error.BadSpillSetting;
         if (s.staging_mib < min_staging_mib) return error.BadSpillSetting;
         return s;
+    }
+
+    /// TF_DS_IMAGE_CACHE's value: on unless "0" (the server's and the fingerprint's reading).
+    pub fn imageCache(v: ?[]const u8) bool {
+        return pc.imageCacheOn(v); // (the server's reading too: exactly "0" is off)
     }
 
     fn num(comptime T: type, text: ?[]const u8, default: T) !T {
@@ -195,12 +204,83 @@ pub fn valuesCounts(n: u8, values: *const [rank_wire.max_stats]u64) pc.TierCount
     return c;
 }
 
+// -- pictures (recipe 0006's content keys, recorded with their full digests) -----------------------------------------
+
+comptime {
+    // the prompt cache's media are the store's, byte for byte (Want.media and Kept.media go to the store as they are)
+    std.debug.assert(@sizeOf(pc.Media) == @sizeOf(format.Media) and @alignOf(pc.Media) == @alignOf(format.Media));
+    std.debug.assert(@offsetOf(pc.Media, "start") == @offsetOf(format.Media, "start"));
+    std.debug.assert(@offsetOf(pc.Media, "len") == @offsetOf(format.Media, "len"));
+    std.debug.assert(@offsetOf(pc.Media, "digest") == @offsetOf(format.Media, "digest"));
+    std.debug.assert(pc.picture_ids == format.picture_ids);
+}
+
+/// The store's view of the prompt cache's media (the same bytes: checked above).
+pub fn asFormat(m: []const pc.Media) []const format.Media {
+    return @ptrCast(m);
+}
+
+/// Pictures a keep carries at most (rank_wire.max_keep_media: a keep with the most forks and pictures fits a frame); a
+/// point with more is not written.
+pub const max_note_media = rank_wire.max_keep_media;
+
+/// A point's pictures as the store records them: the prompt's media that start before the cut (a prefix of them),
+/// and the model id their raw positions hold (the placeholder, the same for every picture).
+pub const Pictures = struct { media: []const format.Media = &.{}, placeholder: u32 = 0 };
+
+/// The pictures of the point `keyed[0..at]` of a prompt whose pictures are `media` (all of them, in order) and whose
+/// model ids are `raw`: null when the ids do not agree with the media (a picture `media` does not name, ids not made
+/// from its digest, a raw id that is not the placeholder: the point is then not written), or past max_note_media.
+/// A point no picture reaches is a text point (`media` empty).
+pub fn pointPictures(keyed: []const u32, raw: []const u32, media: []const pc.Media, at: u32) ?Pictures {
+    if (keyed.len < at or !pc.mediaKeys(keyed, at, media)) return null;
+    var n: usize = 0;
+    while (n < media.len and media[n].start < at) n += 1;
+    if (n == 0) return .{};
+    if (n > max_note_media or raw.len < at) return null;
+    const placeholder = raw[media[0].start];
+    if (placeholder >= pc.picture_ids) return null;
+    var i: usize = 0;
+    for (media[0..n]) |m| {
+        if (!std.mem.eql(u32, keyed[i..m.start], raw[i..m.start])) return null;
+        const stop = @min(@as(usize, m.start) + m.len, at);
+        for (raw[m.start..stop]) |x| if (x != placeholder) return null;
+        i = stop;
+    }
+    if (!std.mem.eql(u32, keyed[i..at], raw[i..at])) return null;
+    return .{ .media = asFormat(media[0..n]), .placeholder = placeholder };
+}
+
+/// A follower's ids for the point rank 0 noted: from its own runtime sequence `seq` (Lanes.seqs: the model's ids,
+/// picture positions negative), each picture position's keyed id made from the noted digest (format.pictureId) and
+/// its raw id the noted placeholder. False when the negative positions are not exactly the noted pictures' before
+/// `at` (this rank's prompt is not rank 0's).
+pub fn followerIds(seq: []const i32, at: u32, media: []const format.Media, placeholder: u32, keyed: []u32, raw: ?[]u32) bool {
+    if (seq.len < at or keyed.len != at) return false;
+    if (raw) |r| if (r.len != at) return false;
+    var mi: usize = 0;
+    for (seq[0..at], 0..) |q, i| {
+        while (mi < media.len and i >= @as(u64, media[mi].start) + media[mi].len) mi += 1;
+        const in = mi < media.len and i >= media[mi].start;
+        if (in) {
+            if (q >= 0) return false;
+            keyed[i] = format.pictureId(&media[mi].digest, @intCast(i - media[mi].start));
+            if (raw) |r| r[i] = placeholder;
+        } else {
+            if (q < 0) return false;
+            keyed[i] = @intCast(q);
+            if (raw) |r| r[i] = @intCast(q);
+        }
+    }
+    return true;
+}
+
 // -- one rank's side: its store, packing, staging events, writes and restores ----------------------------------------
 
 /// What a keep stores on a rank.
 pub const KeepArgs = struct {
     keyed: []const u32, // [0, at)
-    key: Digest, // format.pointKey(keyed[0..at], block tokens, no media): the caller's, hashed once
+    key: Digest, // format.pointKey(keyed[0..at], block tokens, media): the caller's, hashed once
     at: u32,
     base: usize, // the kept state's extent
     snap: u64, // its Snap.id
@@ -209,6 +289,9 @@ pub const KeepArgs = struct {
     origin: ?format.Origin = null,
     shared: bool = false,
     group: u64 = 0,
+    /// With pictures before `at`: the prompt's model ids [0, at) and the pictures (a point's media, in order).
+    raw: ?[]const u32 = null,
+    media: []const format.Media = &.{},
 };
 
 pub const Kept = enum { queued, stored, refused };
@@ -387,7 +470,7 @@ pub fn Side(comptime Dev: type) type {
             self.writes.ensureUnusedCapacity(self.gpa, 1) catch return .refused;
             self.copies.ensureUnusedCapacity(self.gpa, 1) catch return .refused;
             const sections = [_]spill.store.SectionSpec{.{ .name = section_name, .len = self.layout.small_bytes }};
-            const r = self.store.keep(.{ .keyed = k.keyed[0..at], .lineage = k.lineage, .origin = k.origin, .shared = k.shared, .group = k.group, .sections = &sections, .source = .{ .id = k.snap, .generation = pin.stamp } });
+            const r = self.store.keep(.{ .keyed = k.keyed[0..at], .raw = if (k.raw) |x| x[0..at] else null, .media = k.media, .lineage = k.lineage, .origin = k.origin, .shared = k.shared, .group = k.group, .sections = &sections, .source = .{ .id = k.snap, .generation = pin.stamp } });
             switch (r) {
                 .stored => return .stored,
                 .queued => |q| {
@@ -763,10 +846,29 @@ pub fn Side(comptime Dev: type) type {
 // -- the keep notice: rank 0's write at keep as rank_wire carries it ------------------------------------------------
 
 /// rank_wire's keep for a kept state rank 0 writes (`forks` holds the lineage's forks: at most max_keep_forks).
-pub fn keepMsg(slot: u32, kept: u64, base: u64, at: u32, key: Digest, group: u64, shared: bool, lin: format.Lineage, origin: ?format.Origin, forks: []rank_wire.Fork) !rank_wire.Keep {
+/// `pics`: the point's pictures (pointPictures; empty for a text point), carried as they are (rank_wire.Media is
+/// format.Media field for field: checked below).
+pub fn keepMsg(slot: u32, kept: u64, base: u64, at: u32, key: Digest, group: u64, shared: bool, lin: format.Lineage, origin: ?format.Origin, forks: []rank_wire.Fork, pics: Pictures) !rank_wire.Keep {
     if (lin.forks.len > forks.len or lin.forks.len > rank_wire.max_keep_forks) return error.TooManyForks;
+    if (pics.media.len > rank_wire.max_keep_media) return error.TooManyPictures;
     for (lin.forks, forks[0..lin.forks.len]) |f, *o| o.* = .{ .name = f.name, .at = f.at };
-    return .{ .slot = slot, .kept = kept, .base = base, .at = at, .point = key, .group = group, .shared = shared, .root = lin.root, .part = lin.part, .origin = if (origin) |o| .{ .key = o.key, .at = o.at } else null, .forks = forks[0..lin.forks.len] };
+    return .{ .slot = slot, .kept = kept, .base = base, .at = at, .point = key, .group = group, .shared = shared, .root = lin.root, .part = lin.part, .origin = if (origin) |o| .{ .key = o.key, .at = o.at } else null, .forks = forks[0..lin.forks.len], .placeholder = if (pics.media.len > 0) pics.placeholder else null, .media = wireMedia(pics.media) };
+}
+
+comptime {
+    // a keep's pictures are the store's, byte for byte (keepMsg and Follower.keep cast between the two)
+    std.debug.assert(@sizeOf(rank_wire.Media) == @sizeOf(format.Media) and @alignOf(rank_wire.Media) == @alignOf(format.Media));
+    std.debug.assert(@offsetOf(rank_wire.Media, "start") == @offsetOf(format.Media, "start"));
+    std.debug.assert(@offsetOf(rank_wire.Media, "len") == @offsetOf(format.Media, "len"));
+    std.debug.assert(@offsetOf(rank_wire.Media, "digest") == @offsetOf(format.Media, "digest"));
+}
+
+pub fn wireMedia(m: []const format.Media) []const rank_wire.Media {
+    return @ptrCast(m);
+}
+
+pub fn keepMedia(m: []const rank_wire.Media) []const format.Media {
+    return @ptrCast(m);
 }
 
 /// A keep's lineage as core/spill takes it (`forks` holds its forks).
@@ -838,6 +940,9 @@ pub fn Leader(comptime Dev: type) type {
         lead: ?*rank_wire.Leader,
         own_lead: bool = true, // false: the pair's one Leader (Lanes.rw), shared with the KV parts and freed by them
         min_tokens: u32,
+        image_cache: bool, // Settings.image_cache: pictures' points kept and found
+        pictures_kept: u64 = 0, // points written with pictures before their cut
+        pictures_refused: u64 = 0, // keeps and lookups with pictures turned away (their ids and media disagree, or image cache off)
         max_restores: u32, // restores in flight at most (Settings.restores, the store's reads; <= rank_wire.max_restores)
         flush_ms: u32,
         jobs: std.AutoHashMapUnmanaged(u64, *Job) = .empty,
@@ -885,7 +990,7 @@ pub fn Leader(comptime Dev: type) type {
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
             const wf: []rank_wire.Fork = if (wire != null) try gpa.alloc(rank_wire.Fork, rank_wire.max_keep_forks) else &.{};
-            self.* = .{ .gpa = gpa, .side = side, .fam = fam, .wire = wire, .lead = lead, .min_tokens = s.min_tokens, .max_restores = @intCast(@max(1, @min(s.restores, rank_wire.max_restores))), .flush_ms = s.flush_ms, .boot = boot, .wire_forks = wf };
+            self.* = .{ .gpa = gpa, .side = side, .fam = fam, .wire = wire, .lead = lead, .min_tokens = s.min_tokens, .image_cache = s.image_cache, .max_restores = @intCast(@max(1, @min(s.restores, rank_wire.max_restores))), .flush_ms = s.flush_ms, .boot = boot, .wire_forks = wf };
             return self;
         }
 
@@ -1089,7 +1194,14 @@ pub fn Leader(comptime Dev: type) type {
         fn lookupFn(ptr: *anyopaque, want: *const pc.Want) ?pc.Point {
             const self = of(ptr);
             if (self.broken != null) return null;
-            const hit = self.side.store.lookup(.{ .keyed = want.key, .longer_than = want.beyond, .max_at = want.max_at, .grid = want.grid }) orelse {
+            // pictures: every one accounted for by its full identity (the store then matches spans and digests before
+            // each point's cut), or no point at all; a missing or mismatched identity is a miss
+            if (want.images or want.media.len > 0) if (!self.image_cache or !pc.mediaKeys(want.key, want.key.len, want.media)) {
+                self.pictures_refused += 1;
+                self.misses += 1;
+                return null;
+            };
+            const hit = self.side.store.lookup(.{ .keyed = want.key, .media = asFormat(want.media), .longer_than = want.beyond, .max_at = want.max_at, .grid = want.grid }) orelse {
                 self.misses += 1;
                 return null;
             };
@@ -1100,10 +1212,23 @@ pub fn Leader(comptime Dev: type) type {
 
         fn keepFn(ptr: *anyopaque, kept: *const pc.Kept) ?u64 {
             const self = of(ptr);
-            if (self.broken != null or kept.images) return null; // (pictures need full payload digests: not written)
+            if (self.broken != null) return null;
             const bt = self.side.bt;
             const at = kept.at;
             if (at == 0 or at % bt != 0 or at < self.min_tokens or kept.key.len < at) return null;
+            // pictures: recorded with their spans and full digests (those before the cut), the keyed ids checked to
+            // derive from them and the prompt's model ids kept beside them; any disagreement keeps nothing on disk
+            var pics: Pictures = .{};
+            if (kept.images or kept.media.len > 0) {
+                if (!self.image_cache) {
+                    self.pictures_refused += 1;
+                    return null;
+                }
+                pics = pointPictures(kept.key, kept.raw, kept.media, at) orelse {
+                    self.pictures_refused += 1;
+                    return null;
+                };
+            }
             const info = self.fam.info(self.fam.ptr, kept.saved);
             if (info.at != at) return null;
             var forks: std.ArrayList(format.Fork) = .empty;
@@ -1116,9 +1241,11 @@ pub fn Leader(comptime Dev: type) type {
             if (self.side.layout.owner_layout == .owner_sharded) lin = lin.inPart(info.part orelse return null);
             const origin: ?format.Origin = if (kept.parent) |p| (if (self.points.get(p)) |r| .{ .key = r.key, .at = kept.fork } else null) else null;
             const keyed = kept.key[0..at];
-            const key = format.pointKey(keyed, bt, &.{});
-            const r = self.side.keepPoint(.{ .keyed = keyed, .key = key, .at = at, .base = info.base, .snap = info.id, .buf = info.buf, .lineage = lin, .origin = origin, .shared = kept.shared, .group = kept.group });
+            const key = format.pointKey(keyed, bt, pics.media);
+            const raw: ?[]const u32 = if (pics.media.len > 0) kept.raw[0..at] else null;
+            const r = self.side.keepPoint(.{ .keyed = keyed, .key = key, .at = at, .base = info.base, .snap = info.id, .buf = info.buf, .lineage = lin, .origin = origin, .shared = kept.shared, .group = kept.group, .raw = raw, .media = pics.media });
             if (r == .refused) return null;
+            if (pics.media.len > 0) self.pictures_kept += 1;
             const id = pointId(key);
             const gop = self.points.getOrPut(self.gpa, id) catch return null;
             if (!gop.found_existing) gop.value_ptr.room = 0;
@@ -1130,7 +1257,7 @@ pub fn Leader(comptime Dev: type) type {
             // now (its store.keep dedups when it holds it), so a point rank 0 holds is repaired on the pair
             if (self.wire != null) {
                 self.noted.put(self.gpa, info.id, .{ .key = key }) catch {};
-                const m = keepMsg(info.slot, info.id, info.base, at, key, kept.group, kept.shared, lin, origin, self.wire_forks) catch return id;
+                const m = keepMsg(info.slot, info.id, info.base, at, key, kept.group, kept.shared, lin, origin, self.wire_forks, pics) catch return id;
                 _ = self.post(0, .{ .keep = m }) catch {};
             }
             return id;
@@ -1206,6 +1333,8 @@ pub fn Leader(comptime Dev: type) type {
             var c = self.side.cached;
             c.presence_refused = self.presence_refused;
             c.compatible_misses = self.misses;
+            c.pictures_kept = self.pictures_kept;
+            c.pictures_refused = self.pictures_refused;
             out[0] = c;
             const n = @min(self.peers_n, out.len - 1);
             @memcpy(out[1..][0..n], self.peers[0..n]); // (as their last stats replies carried them)
@@ -1492,14 +1621,20 @@ pub fn Follower(comptime Dev: type) type {
         asked: std.AutoHashMapUnmanaged(u64, Digest) = .empty, // has answered, not yet reserved (an abort's forget)
         forks: []format.Fork,
         keyed: std.ArrayList(u32) = .empty,
+        raw: std.ArrayList(u32) = .empty, // a picture point's model ids (the noted placeholder at its pictures)
+        image_cache: bool,
         skipped: u64 = 0, // keep notes this rank could not write (ids or state not as rank 0's)
+        pictures_kept: u64 = 0, // this rank's points written with pictures before their cut (its stats reply's)
+        pictures_refused: u64 = 0, // keeps with pictures this rank turned away (image cache off, ids or media disagree)
         flush_ns: u64, // rank 0's done: the drain's bound (TF_SPILL_FLUSH_MS)
 
         /// `fam`: the kept states restores install into, or null until `attach` (lanes.followWith).
         pub fn create(gpa: Allocator, io: std.Io, rank: u16, fx: fingerprint.Exchange, fam: ?FollowerFamily, opening: Opening(Dev)) !*Self {
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
-            self.* = .{ .gpa = gpa, .io = io, .rank = rank, .wf = rank_wire.Follower.init(rank, fx), .fam = fam orelse undefined, .fam_live = fam != null, .opening = opening, .forks = try gpa.alloc(format.Fork, 4096), .flush_ns = @as(u64, opening.settings.flush_ms) * std.time.ns_per_ms };
+            const forks = try gpa.alloc(format.Fork, 4096);
+            errdefer gpa.free(forks);
+            self.* = .{ .gpa = gpa, .io = io, .rank = rank, .wf = rank_wire.Follower.init(rank, fx), .fam = fam orelse undefined, .fam_live = fam != null, .opening = opening, .forks = forks, .image_cache = opening.settings.image_cache, .flush_ns = @as(u64, opening.settings.flush_ms) * std.time.ns_per_ms };
             return self;
         }
 
@@ -1535,6 +1670,7 @@ pub fn Follower(comptime Dev: type) type {
             self.asked.deinit(self.gpa);
             if (self.side) |s| s.destroy() else if (self.opening) |*o| o.gens.deinit(self.gpa);
             self.keyed.deinit(self.gpa);
+            self.raw.deinit(self.gpa);
             self.gpa.free(self.forks);
             self.gpa.destroy(self);
         }
@@ -1567,16 +1703,19 @@ pub fn Follower(comptime Dev: type) type {
             const ids = self.fam.ids(self.fam.ptr, m.slot);
             const buf = self.fam.buf(self.fam.ptr, m.kept) orelse return self.skip();
             if (ids.len < m.at) return self.skip();
-            if (m.media.len > 0) return self.skip(); // (pictures' points: port/spill-pictures writes them)
+            const media = keepMedia(m.media);
+            if (media.len > 0 and !self.image_cache) return self.skipPictures(); // (the fingerprints agreed: not on a pair)
+            const placeholder = m.placeholder orelse 0;
+            if (placeholder >= format.picture_ids) return self.skipPictures(); // (rank_wire does not know the model's ids)
             self.keyed.resize(self.gpa, m.at) catch return self.skip();
-            for (ids[0..m.at], self.keyed.items) |q, *o| {
-                if (q < 0) return self.skip();
-                o.* = @intCast(q);
-            }
+            self.raw.resize(self.gpa, if (media.len > 0) m.at else 0) catch return self.skip();
+            // this rank's sequence (pictures' positions negative) with the kept pictures' keyed ids and placeholder
+            if (!followerIds(ids, m.at, media, placeholder, self.keyed.items, if (media.len > 0) self.raw.items else null)) return if (media.len > 0) self.skipPictures() else self.skip();
             // the point is rank 0's: this rank's ids must name the same one, or a restore could never agree on it
-            if (!std.mem.eql(u8, &format.pointKey(self.keyed.items, s.bt, &.{}), &m.point)) return self.skip();
+            if (!std.mem.eql(u8, &format.pointKey(self.keyed.items, s.bt, media), &m.point)) return self.skip();
             const lin = keepLineage(m, self.forks) catch return self.skip();
-            _ = s.keepPoint(.{ .keyed = self.keyed.items, .key = m.point, .at = m.at, .base = @intCast(m.base), .snap = m.kept, .buf = buf, .lineage = lin, .origin = keepOrigin(m), .shared = m.shared, .group = m.group });
+            const r = s.keepPoint(.{ .keyed = self.keyed.items, .key = m.point, .at = m.at, .base = @intCast(m.base), .snap = m.kept, .buf = buf, .lineage = lin, .origin = keepOrigin(m), .shared = m.shared, .group = m.group, .raw = if (media.len > 0) self.raw.items else null, .media = media });
+            if (r != .refused and media.len > 0) self.pictures_kept += 1; // (as rank 0 counts its own: Leader.keepFn)
         }
 
         pub fn share(self: *Self, _: Head, m: rank_wire.Share) !void {
@@ -1596,6 +1735,12 @@ pub fn Follower(comptime Dev: type) type {
 
         fn skip(self: *Self) void {
             self.skipped += 1;
+        }
+
+        /// A keep with pictures this rank turned away: skipped, and counted as rank 0 counts its refusals.
+        fn skipPictures(self: *Self) void {
+            self.skipped += 1;
+            self.pictures_refused += 1;
         }
 
         /// At every frame and while idle: copies handed on, restores copied as far as rank 0 allowed, writes staged.
@@ -1850,6 +1995,9 @@ pub fn Follower(comptime Dev: type) type {
                 s.refresh();
                 c = s.cached;
             }
+            // this rank's own picture keeps and refusals (rank 0's Leader counts its own the same way: countsFn)
+            c.pictures_kept = self.pictures_kept;
+            c.pictures_refused = self.pictures_refused;
             const v = countsValues(c);
             return switch (m.set) {
                 .tier => .{ .set = .tier, .n = v.n, .values = v.values },

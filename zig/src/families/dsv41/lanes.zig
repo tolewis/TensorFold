@@ -214,6 +214,67 @@ fn markEnds(marks: []const u32, at: usize) bool {
     return false;
 }
 
+// -- pictures in a resumed pass (recipe 0006; spill v2 restores take the same path as memory resumes) ------------------
+
+/// A picture's span [at, at + tokens) of the runtime sequence `seq` (the prompt's ids, each the placeholder `image_id`
+/// there) made dead: negative, so no Engram n-gram reaches into or across it.
+pub fn markPicture(seq: []i32, at: usize, tokens: usize, image_id: u32) !void {
+    if (tokens == 0 or at + tokens > seq.len) return error.BadImageSpan;
+    for (seq[at..][0..tokens]) |*q| {
+        if (q.* != @as(i64, image_id)) return error.BadImageSpan;
+        q.* = -1;
+    }
+}
+
+/// Whether a pass resuming at `resume_at` needs a picture's rows (the tower's run over it): a picture wholly before the
+/// cut is in the resumed state's rows and needs none; one straddling or after it gets all of its rows, of which the
+/// chunks embed only the positions at or past the cut (prompt.overlap).
+pub fn pictureNeedsRows(at: usize, tokens: usize, resume_at: usize) bool {
+    return at + tokens > resume_at;
+}
+
+/// A resumed sequence checked against its request: `ids` everywhere but the pictures' spans, which are negative
+/// (spill_state.checkEngramSeq over the request's own pictures). The tests' oracle for what markPicture builds; a
+/// restored resume needs no run of it (the pass's own comment says why).
+pub fn checkPictureSeq(gpa: std.mem.Allocator, seq: []const i32, ids: []const u32, images: []const lanes.stream.Image) !void {
+    const sp = try gpa.alloc([2]usize, images.len);
+    defer gpa.free(sp);
+    for (images, sp) |img, *x| x.* = .{ img.at, img.tokens };
+    try model.Model.spill.checkEngramSeq(seq, ids, sp);
+}
+
+test "pictures in a resumed pass: spans dead in the sequence, rows only for those the cut does not hold, the Engram check" {
+    const gpa = std.testing.allocator;
+    const ph: u32 = 129264;
+    // a prompt of 40 tokens: a picture at [4, 10), one straddling a cut at 16 ([14, 20)), one after it at [30, 34)
+    var ids: [40]u32 = undefined;
+    for (&ids, 0..) |*x, i| x.* = @intCast(1000 + i);
+    const imgs = [_]lanes.stream.Image{ .{ .at = 4, .tokens = 6, .bytes = "" }, .{ .at = 14, .tokens = 6, .bytes = "" }, .{ .at = 30, .tokens = 4, .bytes = "" } };
+    for (imgs) |img| @memset(ids[img.at..][0..img.tokens], ph);
+    var seq: [40]i32 = undefined;
+    for (&seq, ids) |*q, id| q.* = @intCast(id);
+    for (imgs) |img| try markPicture(&seq, img.at, img.tokens, ph);
+    try checkPictureSeq(gpa, &seq, &ids, &imgs);
+    // resuming at 16: the first picture is in the state, the straddling one and the later one run the tower
+    try std.testing.expect(!pictureNeedsRows(4, 6, 16));
+    try std.testing.expect(pictureNeedsRows(14, 6, 16));
+    try std.testing.expect(pictureNeedsRows(30, 4, 16));
+    try std.testing.expect(!pictureNeedsRows(14, 2, 16)); // (ending exactly at the cut: wholly before it)
+    try std.testing.expect(pictureNeedsRows(4, 6, 0)); // a fresh pass: every picture
+    // a sequence whose picture positions were not made dead, or a text id changed: refused
+    var live = seq;
+    live[15] = @intCast(ph);
+    try std.testing.expectError(error.EngramSeqMismatch, checkPictureSeq(gpa, &live, &ids, &imgs));
+    var other = seq;
+    other[12] += 1;
+    try std.testing.expectError(error.EngramSeqMismatch, checkPictureSeq(gpa, &other, &ids, &imgs));
+    // a picture span that does not hold the placeholder, or runs past the prompt: refused before anything runs
+    var bad = seq;
+    try std.testing.expectError(error.BadImageSpan, markPicture(&bad, 10, 3, ph));
+    try std.testing.expectError(error.BadImageSpan, markPicture(&bad, 38, 4, ph));
+    try std.testing.expectError(error.BadImageSpan, markPicture(&bad, 4, 0, ph));
+}
+
 /// Room left past a kept state's extent while placements fit so, for its conversation's next turn to resume in place.
 pub const growth_rows = 16 * model.chunk_rows;
 
@@ -879,6 +940,11 @@ pub const Lanes = struct {
                 try spans.append(gpa, .{ .at = img.at, .len = img.tokens, .row = at_row });
                 at_row += img.tokens;
             }
+            // a state read back from disk resumes with this request's own sequence, built above from its ids and its
+            // pictures' spans (the follower gets it at fill_begin). It is the point's by construction: the tier hit only
+            // because the point's media name exactly these spans (lane_host.tierMedia binds Request.cache_media to
+            // Request.images) and its keyed ids derive from them (format.mediaIds), so no check here could fail;
+            // checkPictureSeq is the tests' oracle for that sequence.
         }
         if (try self.begin(.fill_begin)) {
             try self.wire.int(gpa, u32, @intCast(slot));

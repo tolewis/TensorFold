@@ -24,13 +24,25 @@ comptime {
 pub const Digest = [32]u8;
 pub const zero_digest: Digest = @splat(0);
 
-/// The native spill format (bumped on any byte change below; another value is a foreign store).
-pub const version: u32 = 2;
+/// The native spill format's manifest version (bumped on any byte change below). Version 3 (pictures): a point with
+/// media writes 48-byte media entries naming the picture-id scheme its keyed ids were made with (`pictureId`); a text
+/// point is still written, byte for byte, as version 2, and version 2 manifests without media stay valid text points.
+pub const version: u32 = 3;
+/// The version a point without media is written as (and the oldest one read).
+pub const text_version: u32 = 2;
+/// The store namespace's version, in the compat digest: unchanged by version 3, so a store's text points survive it.
+/// (A change that cannot read the older points bumps it: the directory name changes and the old store is pruned.)
+pub const namespace_version: u32 = 2;
 pub const magic = "TFSPILL\x02".*;
 /// The manifest's fixed header.
 pub const header_bytes = 256;
 const fork_bytes = 20;
-const media_bytes = 40;
+const media_bytes = 48; // version 3: start, len, kind, scheme, SHA-256
+const media_v2_bytes = 40; // version 2 (never written with media: such a manifest is foreign)
+/// A version-3 media entry's kind: a picture (an image's span of the prompt).
+pub const media_picture: u32 = 1;
+/// The scheme a picture's keyed ids are made with: `pictureId` (recipe 0006's ids, seeded by the digest's first 8 bytes).
+pub const picture_scheme: u32 = 1;
 const block_ref_bytes = 80;
 const section_bytes = 56;
 const trailer_bytes = 8;
@@ -80,8 +92,9 @@ pub const Limits = struct {
 };
 
 /// A picture inside a point: its prompt positions and the full SHA-256 of its payload (recipe 0006's per-position
-/// keys are shortened; disk identity takes the whole digest and the span).
-pub const Media = struct {
+/// keys are shortened; disk identity takes the whole digest and the span). A picture may run past the point's cut
+/// (`start < at < start + len`). (extern: the same bytes as core/prompt_cache's Media, which the tier hands over.)
+pub const Media = extern struct {
     start: u32,
     len: u32,
     digest: Digest,
@@ -90,6 +103,42 @@ pub const Media = struct {
         return a.start == b.start and a.len == b.len and std.mem.eql(u8, &a.digest, &b.digest);
     }
 };
+
+/// Keyed ids at or above this are pictures' (`pictureId`); vocabulary ids stay below it.
+pub const picture_ids: u32 = 0x8000_0000;
+
+/// Scheme 1's keyed id for position `j` of a picture whose payload's SHA-256 is `digest` (equal to
+/// core/prompt_cache.pictureId, which the server keys prompts with; the tier's tests check the two agree).
+pub fn pictureId(digest: *const Digest, j: u32) u32 {
+    const seed = std.mem.readInt(u64, digest[0..8], .little);
+    return picture_ids | (@as(u32, @truncate(std.hash.Wyhash.hash(seed, std.mem.asBytes(&j)))) & 0x7fff_ffff);
+}
+
+/// Whether a point's ids agree with its media: spans in order, not overlapping, not empty, each starting inside the
+/// ids; every keyed id in a span is `pictureId(digest, offset)` and every other one a vocabulary id; with media the raw
+/// ids are required, equal the keyed ones outside the spans and hold model ids (below `picture_ids`) inside them.
+/// Bounded by the ids' length; what keep and recovery check before a point with pictures is trusted.
+pub fn mediaIds(keyed: []const u32, raw: ?[]const u32, media: []const Media) bool {
+    if (raw) |r| if (r.len != keyed.len) return false;
+    if (media.len > 0 and raw == null) return false;
+    var at: usize = 0;
+    for (media) |m| {
+        if (m.len == 0 or m.start < at or m.start >= keyed.len) return false;
+        const stop: usize = @intCast(@min(@as(u64, m.start) + m.len, keyed.len));
+        if (!textIds(keyed[at..m.start], if (raw) |r| r[at..m.start] else null)) return false;
+        for (keyed[m.start..stop], 0..) |id, j| if (id != pictureId(&m.digest, @intCast(j))) return false;
+        if (raw) |r| for (r[m.start..stop]) |id| if (id >= picture_ids) return false;
+        at = @intCast(@as(u64, m.start) + m.len); // (past the ids when the picture straddles the cut: the loop ends)
+    }
+    if (at < keyed.len) return textIds(keyed[at..], if (raw) |r| r[at..] else null);
+    return true;
+}
+
+fn textIds(keyed: []const u32, raw: ?[]const u32) bool {
+    for (keyed) |id| if (id >= picture_ids) return false;
+    if (raw) |r| if (!std.mem.eql(u32, keyed, r)) return false;
+    return true;
+}
 
 /// One fork of a lineage: a computation that resumed at `at` and computed its own rows from there.
 pub const Fork = struct { name: [16]u8, at: u32 };
@@ -255,6 +304,10 @@ fn keyOf(last: Digest, keyed: []const u32, whole: usize, block: u32, media: []co
     h.update(idsBytes(keyed[whole..]));
     const m: u32 = @intCast(media.len);
     h.update(std.mem.asBytes(&m));
+    if (m > 0) { // (version 3: the scheme the keyed ids were made with; a text point's key is unchanged)
+        h.update("|pictures");
+        h.update(std.mem.asBytes(&picture_scheme));
+    }
     for (media) |x| {
         h.update(std.mem.asBytes(&x.start));
         h.update(std.mem.asBytes(&x.len));
@@ -268,7 +321,7 @@ fn keyOf(last: Digest, keyed: []const u32, whole: usize, block: u32, media: []co
 pub fn compatDigest(common: Digest, layout: OwnerLayout, block_tokens: u32, block_bytes: u64) Digest {
     var h = Sha256.init(.{});
     h.update("tf-spill/compat");
-    h.update(std.mem.asBytes(&version));
+    h.update(std.mem.asBytes(&namespace_version));
     h.update(&common);
     const l: u32 = @intFromEnum(layout);
     h.update(std.mem.asBytes(&l));
@@ -361,6 +414,11 @@ pub const Manifest = struct {
         m.* = undefined;
     }
 
+    /// The version this manifest is written as: 3 with media, else 2 (a text point's bytes as before).
+    pub fn versionOf(m: *const Manifest) u32 {
+        return if (m.media.len > 0) version else text_version;
+    }
+
     pub fn encodedLen(m: *const Manifest) u64 {
         return header_bytes + m.lineage.forks.len * fork_bytes + m.media.len * media_bytes +
             m.blocks.len * block_ref_bytes + m.sections.len * section_bytes + trailer_bytes;
@@ -372,7 +430,7 @@ pub const Manifest = struct {
         @memset(out, 0);
         var w: Cursor = .{ .buf = out };
         w.bytes(&magic);
-        w.int(u32, version);
+        w.int(u32, m.versionOf());
         w.int(u32, header_bytes);
         w.bytes(&compat);
         w.bytes(&m.key);
@@ -406,6 +464,8 @@ pub const Manifest = struct {
         for (m.media) |x| {
             w.int(u32, x.start);
             w.int(u32, x.len);
+            w.int(u32, media_picture);
+            w.int(u32, picture_scheme);
             w.bytes(&x.digest);
         }
         for (m.blocks) |b| {
@@ -437,7 +497,8 @@ pub const Manifest = struct {
         if (raw.len < header_bytes + trailer_bytes or raw.len > limits.maxManifest()) return error.Corrupt;
         var r: Cursor = .{ .buf = @constCast(raw) };
         if (!std.mem.eql(u8, r.take(8), &magic)) return error.Foreign;
-        if (r.get(u32) != version or r.get(u32) != header_bytes) return error.Foreign;
+        const ver = r.get(u32);
+        if ((ver != version and ver != text_version) or r.get(u32) != header_bytes) return error.Foreign;
         if (!std.mem.eql(u8, r.take(32), &compat)) return error.Foreign;
         var m: Manifest = .{ .key = r.take(32)[0..32].*, .at = 0, .block_tokens = 0, .lineage = .{ .root = @splat(0) }, .ids_bytes = 0, .ids_crc = 0, .small_bytes = 0, .small_crc = 0 };
         m.at = r.get(u32);
@@ -467,9 +528,13 @@ pub const Manifest = struct {
         if (m.at == 0 or m.at > limits.max_tokens) return error.Corrupt;
         if (n_blocks != std.math.divCeil(u32, m.at, m.block_tokens) catch unreachable) return error.Corrupt;
         if (n_media > limits.max_media or n_sections > limits.max_sections or n_forks > limits.max_forks) return error.Corrupt;
+        // version 2 points are text points (no build wrote one with media; its ids name no scheme: foreign), version 3
+        // points hold pictures and their raw ids
+        if (ver == text_version and n_media > 0) return error.Foreign;
+        if (ver == version and (n_media == 0 or !m.flags.has_raw)) return error.Corrupt;
         const ids_want = @as(u64, m.at) * 4 * (if (m.flags.has_raw) @as(u64, 2) else 1);
         if (m.ids_bytes != ids_want or m.small_bytes > limits.max_small_bytes) return error.Corrupt;
-        const total = header_bytes + @as(u64, n_forks) * fork_bytes + @as(u64, n_media) * media_bytes +
+        const total = header_bytes + @as(u64, n_forks) * fork_bytes + @as(u64, n_media) * (if (ver == version) @as(u64, media_bytes) else media_v2_bytes) +
             @as(u64, n_blocks) * block_ref_bytes + @as(u64, n_sections) * section_bytes + trailer_bytes;
         if (raw.len != total) return error.Corrupt;
         const body = raw.len - trailer_bytes;
@@ -488,11 +553,17 @@ pub const Manifest = struct {
         }
         const media = try gpa.alloc(Media, n_media);
         errdefer gpa.free(media);
+        var media_end: u64 = 0;
         for (media) |*x| {
             x.start = r.get(u32);
             x.len = r.get(u32);
+            const kind = r.get(u32);
+            const scheme = r.get(u32);
             x.digest = r.take(32)[0..32].*;
-            if (x.len == 0 or x.start >= m.at or @as(u64, x.start) + x.len > limits.max_tokens) return error.Corrupt;
+            if (kind != media_picture or scheme != picture_scheme) return error.Foreign;
+            // in order, not overlapping, starting inside the point (one may run past its cut), inside the window
+            if (x.len == 0 or x.start < media_end or x.start >= m.at or @as(u64, x.start) + x.len > limits.max_tokens) return error.Corrupt;
+            media_end = @as(u64, x.start) + x.len;
         }
         // (a part-less point in an owner-sharded store, or a foreign block size where none is kept: damaged)
         const full = limits.fullBlockBytes(m.lineage.part) orelse return error.Corrupt;
@@ -765,4 +836,176 @@ test "a huge count in a forged header with a valid CRC is refused before allocat
     std.mem.writeInt(u32, raw[body..][0..4], crc32(raw[0..body]), .little);
     var failing = testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
     try testing.expectError(error.Corrupt, Manifest.parse(failing.allocator(), raw, compat, l));
+}
+
+// -- pictures (version 3) --------------------------------------------------------------------------------------------
+
+/// `sampleManifest` without media: a text point (version 2).
+fn textManifest(gpa: Allocator, l: Limits) !Manifest {
+    var m = try sampleManifest(gpa, l);
+    gpa.free(m.media);
+    m.media = &.{};
+    m.flags.has_raw = false;
+    m.ids_bytes = 37 * 4;
+    return m;
+}
+
+test "manifest versions: a text point is written and read as version 2, a point with pictures as version 3" {
+    const gpa = testing.allocator;
+    const l: Limits = .{ .max_tokens = 1024, .block_tokens = 16, .block_bytes = 4096, .max_small_bytes = 1 << 20 };
+    const compat: Digest = @splat(0x5a);
+    // text: version 2, 40-byte media entries never written, the bytes those of the format before version 3
+    var t = try textManifest(gpa, l);
+    defer t.deinit(gpa);
+    const traw = try t.encode(gpa, compat);
+    defer gpa.free(traw);
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, traw[8..12], .little));
+    var tback = try Manifest.parse(gpa, traw, compat, l);
+    tback.deinit(gpa);
+    // pictures: version 3, 48-byte entries (kind, scheme)
+    var p = try sampleManifest(gpa, l);
+    defer p.deinit(gpa);
+    const praw = try p.encode(gpa, compat);
+    defer gpa.free(praw);
+    try testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, praw[8..12], .little));
+    try testing.expectEqual(traw.len + media_bytes, praw.len);
+    var pback = try Manifest.parse(gpa, praw, compat, l);
+    defer pback.deinit(gpa);
+    try testing.expect(pback.media[0].eql(p.media[0]));
+    // the compat digest names the namespace, not the manifest version: version 3 keeps a store's text points
+    try testing.expectEqual(@as(u32, 2), namespace_version);
+
+    const Fix = struct {
+        fn crc(raw: []u8) void {
+            const body = raw.len - trailer_bytes;
+            std.mem.writeInt(u32, raw[body..][0..4], crc32(raw[0..body]), .little);
+        }
+    };
+    const bad = try gpa.dupe(u8, praw);
+    defer gpa.free(bad);
+    // a version 2 manifest with media (the scheme of its ids unknown): foreign, even with its CRC made good
+    std.mem.writeInt(u32, bad[8..12], 2, .little);
+    Fix.crc(bad);
+    try testing.expectError(error.Foreign, Manifest.parse(gpa, bad, compat, l));
+    // a version 3 manifest without media, or without raw ids: corrupt
+    const t3 = try gpa.dupe(u8, traw);
+    defer gpa.free(t3);
+    std.mem.writeInt(u32, t3[8..12], 3, .little);
+    Fix.crc(t3);
+    try testing.expectError(error.Corrupt, Manifest.parse(gpa, t3, compat, l));
+    @memcpy(bad, praw);
+    const flags_at = 8 + 4 + 4 + 32 + 32 + 4 + 4;
+    var fl: Flags = @bitCast(std.mem.readInt(u32, bad[flags_at..][0..4], .little));
+    fl.has_raw = false;
+    std.mem.writeInt(u32, bad[flags_at..][0..4], @bitCast(fl), .little);
+    Fix.crc(bad);
+    try testing.expectError(error.Corrupt, Manifest.parse(gpa, bad, compat, l));
+    // another kind or scheme: foreign; a span out of order or past the window: corrupt
+    const media_at = header_bytes + p.lineage.forks.len * fork_bytes;
+    @memcpy(bad, praw);
+    std.mem.writeInt(u32, bad[media_at + 8 ..][0..4], 2, .little);
+    Fix.crc(bad);
+    try testing.expectError(error.Foreign, Manifest.parse(gpa, bad, compat, l));
+    @memcpy(bad, praw);
+    std.mem.writeInt(u32, bad[media_at + 12 ..][0..4], 2, .little);
+    Fix.crc(bad);
+    try testing.expectError(error.Foreign, Manifest.parse(gpa, bad, compat, l));
+    @memcpy(bad, praw);
+    std.mem.writeInt(u32, bad[media_at + 4 ..][0..4], 2000, .little);
+    Fix.crc(bad);
+    try testing.expectError(error.Corrupt, Manifest.parse(gpa, bad, compat, l));
+    @memcpy(bad, praw);
+    std.mem.writeInt(u32, bad[media_at..][0..4], 37, .little); // at the cut, not before it
+    Fix.crc(bad);
+    try testing.expectError(error.Corrupt, Manifest.parse(gpa, bad, compat, l));
+}
+
+test "manifest with pictures: two overlapping spans are refused, a span straddling the cut is not" {
+    const gpa = testing.allocator;
+    const l: Limits = .{ .max_tokens = 1024, .block_tokens = 16, .block_bytes = 4096, .max_small_bytes = 1 << 20 };
+    const compat: Digest = @splat(0x5b);
+    var m = try sampleManifest(gpa, l);
+    defer m.deinit(gpa);
+    gpa.free(m.media);
+    const media = try gpa.alloc(Media, 2);
+    m.media = media;
+    media[0] = .{ .start = 4, .len = 3, .digest = @splat(9) };
+    media[1] = .{ .start = 30, .len = 20, .digest = @splat(8) }; // [30, 50) runs past the cut at 37
+    const raw = try m.encode(gpa, compat);
+    defer gpa.free(raw);
+    var back = try Manifest.parse(gpa, raw, compat, l);
+    back.deinit(gpa);
+    media[1].start = 5; // inside the first span
+    const raw2 = try m.encode(gpa, compat);
+    defer gpa.free(raw2);
+    try testing.expectError(error.Corrupt, Manifest.parse(gpa, raw2, compat, l));
+}
+
+test "manifest fuzz: random edits of a version 3 manifest never crash and never parse into an inconsistent point" {
+    const gpa = testing.allocator;
+    const l: Limits = .{ .max_tokens = 1024, .block_tokens = 16, .block_bytes = 4096, .max_small_bytes = 1 << 20 };
+    const compat: Digest = @splat(0x5c);
+    var m = try sampleManifest(gpa, l);
+    defer m.deinit(gpa);
+    const raw = try m.encode(gpa, compat);
+    defer gpa.free(raw);
+    var prng = std.Random.DefaultPrng.init(0x7069637475726573);
+    const rnd = prng.random();
+    const buf = try gpa.alloc(u8, raw.len + 64);
+    defer gpa.free(buf);
+    var parsed: usize = 0;
+    for (0..20_000) |_| {
+        // a copy, a few random bytes changed (in the media entries half the time), a random length, the CRC made good
+        // half the time so the field checks run, not only the trailer's
+        var n = raw.len;
+        @memcpy(buf[0..n], raw);
+        const media_at = header_bytes + m.lineage.forks.len * fork_bytes;
+        for (0..rnd.intRangeAtMost(usize, 1, 4)) |_| {
+            const i = if (rnd.boolean()) media_at + rnd.uintLessThan(usize, media_bytes) else rnd.uintLessThan(usize, n);
+            buf[i] = rnd.int(u8);
+        }
+        if (rnd.uintLessThan(u8, 8) == 0) n = rnd.uintLessThan(usize, raw.len + 64);
+        if (n >= trailer_bytes and rnd.boolean()) {
+            const body = n - trailer_bytes;
+            std.mem.writeInt(u32, buf[body..][0..4], crc32(buf[0..body]), .little);
+            std.mem.writeInt(u32, buf[body + 4 ..][0..4], 0, .little);
+        }
+        var got = Manifest.parse(gpa, buf[0..n], compat, l) catch continue;
+        defer got.deinit(gpa);
+        parsed += 1;
+        // whatever parses is consistent: spans in order inside the point and the window, version and media agree
+        var end: u64 = 0;
+        for (got.media) |x| {
+            try testing.expect(x.len > 0 and x.start >= end and x.start < got.at and @as(u64, x.start) + x.len <= l.max_tokens);
+            end = @as(u64, x.start) + x.len;
+        }
+        try testing.expect(got.media.len == 0 or got.flags.has_raw);
+        try testing.expect(got.at > 0 and got.at <= l.max_tokens and got.blocks.len == std.math.divCeil(u32, got.at, 16) catch unreachable);
+    }
+    try testing.expect(parsed > 0); // (the CRC-made-good edits of unchecked bytes, e.g. a digest, still parse)
+}
+
+test "media ids: keyed ids derive from the digest, raw ids hold model ids there and equal the keyed ones elsewhere" {
+    const d: Digest = @splat(3);
+    var keyed = [_]u32{ 5, 6, 0, 0, 0, 7, 0, 0 };
+    var raw = [_]u32{ 5, 6, 99, 99, 99, 7, 99, 99 };
+    for (2..5) |i| keyed[i] = pictureId(&d, @intCast(i - 2));
+    for (6..8) |i| keyed[i] = pictureId(&d, @intCast(i - 6)); // a second picture straddling the end
+    const m = [_]Media{ .{ .start = 2, .len = 3, .digest = d }, .{ .start = 6, .len = 10, .digest = d } };
+    try testing.expect(mediaIds(&keyed, &raw, &m));
+    try testing.expect(!mediaIds(&keyed, null, &m)); // pictures need their raw ids
+    try testing.expect(!mediaIds(&keyed, &raw, m[0..1])); // a picture the media does not name
+    try testing.expect(!mediaIds(&keyed, &raw, &.{ m[1], m[0] })); // out of order
+    try testing.expect(!mediaIds(&keyed, &raw, &.{ m[0], .{ .start = 4, .len = 1, .digest = d } })); // overlapping
+    var r2 = raw;
+    r2[0] = 4;
+    try testing.expect(!mediaIds(&keyed, &r2, &m)); // raw differs outside a picture
+    r2 = raw;
+    r2[3] = keyed[3];
+    try testing.expect(!mediaIds(&keyed, &r2, &m)); // a picture id where a model id belongs
+    var k2 = keyed;
+    k2[3] +%= 1;
+    try testing.expect(!mediaIds(&k2, &raw, &m)); // an id not made from the digest
+    try testing.expect(mediaIds(&.{ 1, 2, 3 }, null, &.{})); // text
+    try testing.expect(!mediaIds(&.{ 1, picture_ids, 3 }, null, &.{})); // a picture id without its media
 }

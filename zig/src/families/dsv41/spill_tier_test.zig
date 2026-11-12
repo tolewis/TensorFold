@@ -600,7 +600,7 @@ test "a keep crosses rank_wire with its lineage and origin intact; a lineage pas
     const forks = [_]format.Fork{ .{ .name = @splat(4), .at = 32 }, .{ .name = @splat(5), .at = 48 } };
     const lin: format.Lineage = .{ .root = @splat(1), .part = 2, .forks = &forks };
     var wf: [4]rank_wire.Fork = undefined;
-    const m = try tier.keepMsg(3, 77, 4096, 64, @splat(9), 5, true, lin, .{ .key = @splat(8), .at = 32 }, &wf);
+    const m = try tier.keepMsg(3, 77, 4096, 64, @splat(9), 5, true, lin, .{ .key = @splat(8), .at = 32 }, &wf, .{});
     var buf: [rank_wire.max_frame]u8 = undefined;
     const bytes = try rank_wire.encode(&buf, .{ .op = .keep, .from = 0, .epoch = 1, .txn = 1, .seq = 2 }, .{ .keep = m });
     var back: [4]rank_wire.Fork = undefined;
@@ -614,8 +614,8 @@ test "a keep crosses rank_wire with its lineage and origin intact; a lineage pas
     var one: [1]format.Fork = undefined;
     try testing.expectError(error.TooManyForks, tier.keepLineage(k, &one));
     var wf1: [1]rank_wire.Fork = undefined;
-    try testing.expectError(error.TooManyForks, tier.keepMsg(3, 77, 4096, 64, @splat(9), 5, true, lin, null, &wf1));
-    const none = try tier.keepMsg(3, 77, 4096, 64, @splat(9), 5, false, .{ .root = @splat(1) }, null, &wf);
+    try testing.expectError(error.TooManyForks, tier.keepMsg(3, 77, 4096, 64, @splat(9), 5, true, lin, null, &wf1, .{}));
+    const none = try tier.keepMsg(3, 77, 4096, 64, @splat(9), 5, false, .{ .root = @splat(1) }, null, &wf, .{});
     try testing.expect(none.part == null and none.origin == null and none.forks.len == 0);
 }
 
@@ -656,7 +656,7 @@ test "follower settings: flags over the environment, off without a directory or 
 /// Test frames beside the protocol's: [kind u8][payload].
 const T = struct {
     const snap: u8 = 20; // id u64, slot u32, base u64, at u32: the follower keeps a state (its own bytes there)
-    const ids: u8 = 21; // slot u32, then u32 ids: the slot's prompt as this rank holds it
+    const ids: u8 = 21; // slot u32, then u32 ids (i32 bits): the slot's sequence as this rank holds it
     const query: u8 = 24; // key [32]: the follower answers [present u8][restores open u8][committed u32][aborted u32][skipped u32]
     const verify: u8 = 25; // src u64, dst u64, at u32, src snap u64, dst snap u64: the follower answers [ok u8]
     const corrupt: u8 = 23;
@@ -764,7 +764,7 @@ const Peer = struct {
                     const n = (body.len - 4) / 4;
                     gpa.free(fam.ids[slot]);
                     fam.ids[slot] = try gpa.alloc(i32, n);
-                    for (fam.ids[slot]) |*x| x.* = @intCast(try r.int(u32));
+                    for (fam.ids[slot]) |*x| x.* = @bitCast(try r.int(u32)); // (pictures' positions negative)
                 },
                 T.query => {
                     var key: format.Digest = undefined;
@@ -1456,6 +1456,356 @@ test "two ranks: a slow follower never stalls rank 0's polls; validate is asked 
     const q = try w.query(key);
     try testing.expectEqual(@as(u8, 0), q[1]);
     try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, q[2..6], .little));
+    ld.destroy();
+    ld_alive = false;
+    try pr.finish();
+}
+// -- pictures (recipe 0006's content keys, recorded with their full digests) ------------------------------------------
+
+const placeholder: u32 = 129264; // the model's image token
+
+/// A picture of a test prompt: its span and the payload its digest is made from.
+const Pic = struct { start: u32, len: u32, payload: []const u8 };
+
+/// A prompt with pictures as the server keys it: text ids from `seed`; each picture's keyed ids made from its
+/// payload's SHA-256 (pc.pictureId), its raw ids the placeholder and its sequence positions negative (Lanes.seqs).
+const PicPrompt = struct {
+    keyed: []u32,
+    raw: []u32,
+    seq: []i32,
+    media: []pc.Media,
+
+    fn init(n: usize, seed: u32, pics: []const Pic) !PicPrompt {
+        const p: PicPrompt = .{ .keyed = try gpa.alloc(u32, n), .raw = try gpa.alloc(u32, n), .seq = try gpa.alloc(i32, n), .media = try gpa.alloc(pc.Media, pics.len) };
+        testIds(p.keyed, seed);
+        @memcpy(p.raw, p.keyed);
+        for (pics, p.media) |x, *m| {
+            m.* = .{ .start = x.start, .len = x.len, .digest = undefined };
+            std.crypto.hash.sha2.Sha256.hash(x.payload, &m.digest, .{});
+            for (0..x.len) |j| {
+                if (x.start + j >= n) break;
+                p.keyed[x.start + j] = pc.pictureId(&m.digest, @intCast(j));
+                p.raw[x.start + j] = placeholder;
+            }
+        }
+        for (p.seq, p.raw) |*q, id| q.* = if (id == placeholder) -1 else @intCast(id);
+        return p;
+    }
+
+    fn deinit(p: PicPrompt) void {
+        gpa.free(p.keyed);
+        gpa.free(p.raw);
+        gpa.free(p.seq);
+        gpa.free(p.media);
+    }
+
+    fn want(p: PicPrompt) pc.Want {
+        return .{ .key = p.keyed, .beyond = 0, .max_at = @intCast(p.keyed.len), .grid = bt, .images = true, .media = p.media };
+    }
+
+    /// The point a keep at `at` writes: its key over the pictures before the cut.
+    fn key(p: PicPrompt, at: u32) format.Digest {
+        var n: usize = 0;
+        while (n < p.media.len and p.media[n].start < at) n += 1;
+        return format.pointKey(p.keyed[0..at], bt, tier.asFormat(p.media[0..n]));
+    }
+};
+
+fn keepPics(t: pc.Tier, sn: *Snap, p: PicPrompt, lineage: []const pc.Fork) ?u64 {
+    return t.vtable.keep(t.ptr, &.{ .saved = sn, .key = p.keyed[0..sn.at], .at = @intCast(sn.at), .bytes = 0, .group = 9, .images = true, .media = p.media, .raw = p.raw, .lineage = lineage });
+}
+
+test "pictures: the server's cache ids are the store's scheme" {
+    var prng = std.Random.DefaultPrng.init(6);
+    for (0..2000) |_| {
+        var d: format.Digest = undefined;
+        prng.random().bytes(&d);
+        const j = prng.random().int(u32);
+        try testing.expectEqual(format.pictureId(&d, j), pc.pictureId(&d, j));
+        try testing.expect(pc.pictureId(&d, j) >= pc.picture_ids);
+    }
+}
+
+test "pictures: identical pictures across a restart hit and restore byte for byte; changed or unnamed pictures miss" {
+    const r = try Rank.init(0, "pics", 0);
+    defer r.deinit();
+    var fam: Fam0 = .{ .sim = r.sim };
+    defer fam.deinit();
+    // three pictures in a 6-block prompt, the point at 4 blocks: one wholly before the cut, one straddling it, one after
+    const pics = [_]Pic{ .{ .start = 5, .len = 9, .payload = "red apple" }, .{ .start = 4 * bt - 6, .len = 12, .payload = "blue sky" }, .{ .start = 5 * bt, .len = 7, .payload = "green" } };
+    const p = try PicPrompt.init(6 * bt, 31, &pics);
+    defer p.deinit();
+    const sn = try keptSnap(r.sim, 1, 0, 4 * bt);
+    defer gpa.destroy(sn);
+    {
+        const ld = try L.create(gpa, try r.side(0, agreement()), fam.family(), null, null, r.settings, @splat(3));
+        defer ld.destroy();
+        const t = ld.tier();
+        const id = keepPics(t, sn, p, &.{.{ .name = 5, .at = 0 }}) orelse return error.NotKept;
+        try testing.expectEqual(tier.pointId(p.key(4 * bt)), id);
+        try testing.expectEqual(@as(u64, 1), ld.pictures_kept);
+        try pumpUntil(ld, 1);
+        try testing.expect(t.vtable.lookup(t.ptr, &p.want()) != null);
+    }
+    // the process restarts: a new tier over the same store directory recovers the point with its pictures
+    const ld = try L.create(gpa, try r.side(0, agreement()), fam.family(), null, null, r.settings, @splat(4));
+    defer ld.destroy();
+    const t = ld.tier();
+    try testing.expectEqual(@as(u64, 1), ld.side.store.counts().recovered_points);
+    const hit = t.vtable.lookup(t.ptr, &p.want()) orelse return error.NotFound;
+    try testing.expectEqual(@as(u32, 4 * bt), hit.at);
+    r.sim.delay = 1;
+    const done = pollUntilDone(t, try t.vtable.begin(t.ptr, &hit));
+    try testing.expect(done == .ready);
+    const got: *Snap = @ptrCast(@alignCast(done.ready.saved));
+    try testing.expect(r.sim.sameRows(0, got.base, 4 * bt));
+    try testing.expectEqualSlices(u8, r.sim.bytes(sn.buf, r.sim.layout.small_bytes), r.sim.bytes(got.buf, r.sim.layout.small_bytes));
+    r.sim.freeSnap(got.buf);
+    try stagingDrains(ld.side.store);
+
+    // the prompt's next turn (more text, another picture far past the cut) finds the same point
+    const more = [_]Pic{ pics[0], pics[1], pics[2], .{ .start = 7 * bt, .len = 5, .payload = "later" } };
+    const p2 = try PicPrompt.init(8 * bt, 31, &more);
+    defer p2.deinit();
+    try testing.expectEqual(hit.id, (t.vtable.lookup(t.ptr, &p2.want()) orelse return error.NotFound).id);
+    // another picture in the same positions (its own ids), or the same ids under another payload's full digest
+    // (only bytes past the 8 that seed the ids differ): no hit
+    const changed = [_]Pic{ .{ .start = 5, .len = 9, .payload = "red apples" }, pics[1], pics[2] };
+    const p3 = try PicPrompt.init(6 * bt, 31, &changed);
+    defer p3.deinit();
+    try testing.expect(t.vtable.lookup(t.ptr, &p3.want()) == null);
+    var forged = p.want();
+    const fm = try gpa.dupe(pc.Media, p.media);
+    defer gpa.free(fm);
+    fm[1].digest[31] ^= 1;
+    forged.media = fm;
+    try testing.expect(t.vtable.lookup(t.ptr, &forged) == null);
+    // the straddling picture's span another length (its positions past the cut changed): no hit
+    fm[1] = p.media[1];
+    fm[1].len -= 1;
+    try testing.expect(t.vtable.lookup(t.ptr, &forged) == null);
+    // missing identities force a miss: no media at all, or one picture not named
+    var bare = p.want();
+    bare.media = &.{};
+    try testing.expect(t.vtable.lookup(t.ptr, &bare) == null);
+    var partial = p.want();
+    partial.media = p.media[1..];
+    try testing.expect(t.vtable.lookup(t.ptr, &partial) == null);
+    try testing.expect(ld.pictures_refused >= 2);
+}
+
+test "pictures: a keep whose ids disagree with its pictures writes nothing; text before every picture is a text point; image cache off" {
+    const r = try Rank.init(0, "picbad", 0);
+    defer r.deinit();
+    var fam: Fam0 = .{ .sim = r.sim };
+    defer fam.deinit();
+    const ld = try L.create(gpa, try r.side(0, agreement()), fam.family(), null, null, r.settings, @splat(3));
+    defer ld.destroy();
+    const t = ld.tier();
+    const pics = [_]Pic{.{ .start = 2 * bt + 3, .len = 6, .payload = "cat" }};
+    const p = try PicPrompt.init(4 * bt, 41, &pics);
+    defer p.deinit();
+    const sn = try keptSnap(r.sim, 1, 0, 3 * bt);
+    defer gpa.destroy(sn);
+    // no identities: nothing kept (the keyed ids hold a picture the tier cannot name)
+    try testing.expect(t.vtable.keep(t.ptr, &.{ .saved = sn, .key = p.keyed[0..sn.at], .at = 3 * bt, .bytes = 0, .images = true, .raw = p.raw }) == null);
+    // raw ids that are not the placeholder at the picture, or are missing
+    const raw = try gpa.dupe(u32, p.raw);
+    defer gpa.free(raw);
+    raw[2 * bt + 4] = 7;
+    try testing.expect(t.vtable.keep(t.ptr, &.{ .saved = sn, .key = p.keyed[0..sn.at], .at = 3 * bt, .bytes = 0, .images = true, .media = p.media, .raw = raw }) == null);
+    try testing.expect(t.vtable.keep(t.ptr, &.{ .saved = sn, .key = p.keyed[0..sn.at], .at = 3 * bt, .bytes = 0, .images = true, .media = p.media }) == null);
+    // keyed ids that do not derive from the named digest
+    const keyed = try gpa.dupe(u32, p.keyed);
+    defer gpa.free(keyed);
+    keyed[2 * bt + 5] ^= 1;
+    try testing.expect(t.vtable.keep(t.ptr, &.{ .saved = sn, .key = keyed[0..sn.at], .at = 3 * bt, .bytes = 0, .images = true, .media = p.media, .raw = p.raw }) == null);
+    try testing.expectEqual(@as(u64, 4), ld.pictures_refused);
+    {
+        // rank 0's counts carry them (TierCounts, appended: the stats wire and /metrics)
+        var out: [1]pc.TierCounts = undefined;
+        try testing.expectEqual(@as(usize, 1), t.vtable.counts(t.ptr, &out));
+        try testing.expectEqual(@as(u64, 4), out[0].pictures_refused);
+        try testing.expectEqual(ld.pictures_kept, out[0].pictures_kept);
+        // and survive the wire's encoding, an older peer's shorter reply zero-filling them
+        const v = tier.countsValues(out[0]);
+        try testing.expectEqual(@as(u64, 4), tier.valuesCounts(v.n, &v.values).pictures_refused);
+        try testing.expectEqual(@as(u64, 0), tier.valuesCounts(v.n - 2, &v.values).pictures_refused);
+    }
+    try testing.expectEqual(@as(u64, 0), ld.side.store.counts().queued);
+    // with image cache off nothing is kept for a prompt with pictures, nor found
+    ld.image_cache = false;
+    try testing.expect(keepPics(t, sn, p, &.{.{ .name = 1, .at = 0 }}) == null);
+    ld.image_cache = true;
+    // a cut no picture reaches: a text point (no media, no raw ids), found by the text prompt with no pictures too
+    const sn2 = try keptSnap(r.sim, 2, 4 * bt, 2 * bt);
+    defer gpa.destroy(sn2);
+    _ = keepPics(t, sn2, p, &.{.{ .name = 2, .at = 0 }}) orelse return error.NotKept;
+    try testing.expectEqual(@as(u64, 0), ld.pictures_kept);
+    try pumpUntil(ld, 1);
+    try testing.expect(ld.side.store.presence(format.pointKey(p.keyed[0 .. 2 * bt], bt, &.{})));
+    try testing.expect(t.vtable.lookup(t.ptr, &want(p.keyed[0 .. 2 * bt + 3])) != null);
+    try testing.expect(t.vtable.lookup(t.ptr, &p.want()) != null); // (the picture starts past its cut)
+    ld.image_cache = false;
+    try testing.expect(t.vtable.lookup(t.ptr, &p.want()) == null); // pictures stay out of the tier
+    ld.image_cache = true;
+    // a picture point, then the same cut with image cache off is refused and the point not found
+    const sn3 = try keptSnap(r.sim, 3, 8 * bt, 3 * bt);
+    defer gpa.destroy(sn3);
+    _ = keepPics(t, sn3, p, &.{.{ .name = 3, .at = 0 }}) orelse return error.NotKept;
+    try pumpUntil(ld, 2);
+    try testing.expectEqual(@as(u32, 3 * bt), (t.vtable.lookup(t.ptr, &p.want()) orelse return error.NotFound).at);
+    ld.image_cache = false;
+    try testing.expect(t.vtable.lookup(t.ptr, &p.want()) == null);
+    ld.image_cache = true;
+    try stagingDrains(ld.side.store);
+    // the follower's switch: TF_DS_IMAGE_CACHE=0 there too
+    try testing.expect(!tier.Settings.imageCache("0"));
+    try testing.expect(tier.Settings.imageCache(null) and tier.Settings.imageCache("1"));
+    try testing.expect(tier.Settings.imageCache(" 0")); // (exactly "0", as the server and round 2's fingerprint read it)
+}
+
+test "pictures: a keep carries them (text keeps unchanged), bounded; a follower rebuilds its ids from its sequence" {
+    var wf: [4]rank_wire.Fork = undefined;
+    const lin: format.Lineage = .{ .root = @splat(1) };
+    const text = try tier.keepMsg(1, 7, 0, 64, @splat(9), 5, false, lin, null, &wf, .{});
+    try testing.expectEqual(@as(?u32, null), text.placeholder);
+    try testing.expectEqual(@as(usize, 0), text.media.len);
+    const media = [_]format.Media{ .{ .start = 3, .len = 4, .digest = @splat(2) }, .{ .start = 60, .len = 10, .digest = @splat(3) } };
+    const m = try tier.keepMsg(1, 7, 0, 64, @splat(9), 5, false, lin, null, &wf, .{ .media = &media, .placeholder = placeholder });
+    try testing.expectEqual(@as(?u32, placeholder), m.placeholder);
+    // across rank_wire: the follower gets the store's media back field for field
+    const buf = try gpa.alloc(u8, rank_wire.max_frame);
+    defer gpa.free(buf);
+    const head: rank_wire.Head = .{ .op = .keep, .from = 0, .epoch = 1, .txn = 0, .seq = 3 };
+    const text_len = (try rank_wire.encode(buf, head, .{ .keep = text })).len;
+    const bytes = try rank_wire.encode(buf, head, .{ .keep = m });
+    try testing.expect(bytes.len > text_len);
+    var forks: [4]rank_wire.Fork = undefined;
+    var mb: [4]rank_wire.Media = undefined;
+    const f = try rank_wire.decodeInto(bytes, .{ .forks = &forks, .media = &mb });
+    const got = tier.keepMedia(f.msg.keep.media);
+    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expect(got[1].eql(media[1]));
+    try testing.expectEqual(@as(?u32, placeholder), f.msg.keep.placeholder);
+    var one: [1]rank_wire.Media = undefined;
+    try testing.expectError(error.BadCount, rank_wire.decodeInto(bytes, .{ .forks = &forks, .media = &one })); // no room
+    // bounded: overlapping, at-the-cut and empty spans refused before they reach the wire
+    const bads = [_][2]format.Media{
+        .{ media[0], .{ .start = 5, .len = 2, .digest = @splat(3) } }, // overlapping
+        .{ media[0], .{ .start = 64, .len = 2, .digest = @splat(3) } }, // at the cut
+        .{ media[0], .{ .start = 10, .len = 0, .digest = @splat(3) } }, // empty
+    };
+    for (bads) |bad| {
+        const k = try tier.keepMsg(1, 7, 0, 64, @splat(9), 5, false, lin, null, &wf, .{ .media = &bad, .placeholder = placeholder });
+        try testing.expectError(error.BadValue, rank_wire.encode(buf, head, .{ .keep = k }));
+    }
+    const many = try gpa.alloc(format.Media, rank_wire.max_keep_media + 1);
+    defer gpa.free(many);
+    for (many, 0..) |*x, i| x.* = .{ .start = @intCast(i * 2), .len = 1, .digest = @splat(4) };
+    try testing.expectError(error.TooManyPictures, tier.keepMsg(1, 7, 0, 4096, @splat(9), 5, false, lin, null, &wf, .{ .media = many, .placeholder = placeholder }));
+
+    // the follower's rebuild: its sequence (pictures negative) + the noted pictures give rank 0's keyed and raw ids
+    const pics = [_]Pic{ .{ .start = 2, .len = 5, .payload = "a" }, .{ .start = 12, .len = 8, .payload = "b" } };
+    const p = try PicPrompt.init(24, 51, &pics);
+    defer p.deinit();
+    const pm = tier.pointPictures(p.keyed, p.raw, p.media, 16) orelse return error.NoPictures;
+    try testing.expectEqual(@as(usize, 2), pm.media.len);
+    try testing.expectEqual(placeholder, pm.placeholder);
+    var keyed: [16]u32 = undefined;
+    var raw: [16]u32 = undefined;
+    try testing.expect(tier.followerIds(p.seq, 16, pm.media, pm.placeholder, &keyed, &raw));
+    try testing.expectEqualSlices(u32, p.keyed[0..16], &keyed);
+    try testing.expectEqualSlices(u32, p.raw[0..16], &raw);
+    // a sequence whose picture sits elsewhere, or a text position made dead: not rank 0's prompt
+    var seq = try gpa.dupe(i32, p.seq);
+    defer gpa.free(seq);
+    seq[1] = -1;
+    try testing.expect(!tier.followerIds(seq, 16, pm.media, pm.placeholder, &keyed, &raw));
+    @memcpy(seq, p.seq);
+    seq[13] = 5;
+    try testing.expect(!tier.followerIds(seq, 16, pm.media, pm.placeholder, &keyed, &raw));
+    // pointPictures: a cut before every picture is text; ids or raw ids off are refused
+    try testing.expectEqual(@as(usize, 0), (tier.pointPictures(p.keyed, p.raw, p.media, 2) orelse return error.NoPictures).media.len);
+    var r2 = try gpa.dupe(u32, p.raw);
+    defer gpa.free(r2);
+    r2[0] +%= 1;
+    try testing.expect(tier.pointPictures(p.keyed, r2, p.media, 16) == null);
+    try testing.expect(tier.pointPictures(p.keyed, p.raw[0..10], p.media, 16) == null);
+}
+
+/// A kept picture state on both ranks: the follower's own bytes at the same base, its sequence (pictures negative) in
+/// slot 0, then rank 0's keep.
+fn keepBothPics(w: *Rank0Wire, t: pc.Tier, sim: *Sim, id: u64, base: usize, at: usize, p: PicPrompt, follower_seq: []const i32) !*Snap {
+    const sn = try keptSnap(sim, id, base, at);
+    try w.send(T.snap, &.{ &le(u64, id), &le(u32, 0), &le(u64, base), &le(u32, @intCast(at)) });
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(gpa);
+    try raw.appendSlice(gpa, &le(u32, 0));
+    for (follower_seq) |x| try raw.appendSlice(gpa, &le(u32, @bitCast(x)));
+    try w.send(T.ids, &.{raw.items});
+    _ = keepPics(t, sn, p, &.{.{ .name = id, .at = 0 }}) orelse return error.NotKept;
+    return sn;
+}
+
+test "two ranks: a picture point written on both (the follower's ids from its sequence and the note), restored on both" {
+    const pr = try Pair.start("ppics", 0, 87);
+    defer pr.deinit();
+    const r0 = pr.r0;
+    const w = &pr.w;
+    var fam: Fam0 = .{ .sim = r0.sim };
+    defer fam.deinit();
+    const ld = try pr.leader(&fam, 8);
+    var ld_alive = true;
+    defer if (ld_alive) ld.destroy();
+    const t = ld.tier();
+    // two pictures before the cut, one straddling it
+    const pics = [_]Pic{ .{ .start = 1, .len = 3, .payload = "one" }, .{ .start = bt + 2, .len = 5, .payload = "two" }, .{ .start = 3 * bt - 4, .len = 9, .payload = "three" } };
+    const p = try PicPrompt.init(5 * bt, 61, &pics);
+    defer p.deinit();
+    const sn = try keepBothPics(w, t, r0.sim, 1, 0, 3 * bt, p, p.seq);
+    defer gpa.destroy(sn);
+    try pumpUntil(ld, 1);
+    const key = p.key(3 * bt);
+    try w.waitPresent(key, true);
+    const hit = t.vtable.lookup(t.ptr, &p.want()) orelse return error.NotFound;
+    const done = pollUntilDone(t, try t.vtable.begin(t.ptr, &hit));
+    try testing.expect(done == .ready);
+    const got: *Snap = @ptrCast(@alignCast(done.ready.saved));
+    defer r0.sim.freeSnap(got.buf);
+    try testing.expect(r0.sim.sameRows(0, got.base, 3 * bt));
+    try testing.expect(try w.yes(T.verify, &.{ &le(u64, 0), &le(u64, got.base), &le(u32, 3 * bt), &le(u64, 1), &le(u64, got.id) }));
+    try stagingDrains(ld.side.store);
+    // each rank counts its own picture keep (rank 1's rides its stats reply)
+    var counts: [pc.max_ranks]pc.TierCounts = undefined;
+    ld.stats_at = 0;
+    t.vtable.pump.?(t.ptr, std.time.ns_per_ms);
+    try testing.expectEqual(@as(usize, 2), t.vtable.counts(t.ptr, &counts));
+    try testing.expectEqual(@as(u64, 1), counts[0].pictures_kept);
+    try testing.expectEqual(@as(u64, 1), counts[1].pictures_kept);
+    try testing.expectEqual(@as(u64, 0), counts[1].pictures_refused);
+
+    // a follower whose sequence has a picture elsewhere never writes the point: presence refused, forgotten
+    const p2 = try PicPrompt.init(5 * bt, 62, &pics);
+    defer p2.deinit();
+    const seq = try gpa.dupe(i32, p2.seq);
+    defer gpa.free(seq);
+    seq[0] = -1;
+    const sn2 = try keepBothPics(w, t, r0.sim, 2, 4 * bt, 3 * bt, p2, seq);
+    defer gpa.destroy(sn2);
+    try pumpUntil(ld, 2);
+    const q = try w.query(p2.key(3 * bt));
+    try testing.expectEqual(@as(u8, 0), q[0]);
+    try testing.expect(std.mem.readInt(u32, q[10..14], .little) >= 1); // skipped
+    ld.stats_at = 0;
+    t.vtable.pump.?(t.ptr, std.time.ns_per_ms);
+    try testing.expectEqual(@as(usize, 2), t.vtable.counts(t.ptr, &counts));
+    try testing.expectEqual(@as(u64, 2), counts[0].pictures_kept); // (rank 0 wrote its copy)
+    try testing.expectEqual(@as(u64, 1), counts[1].pictures_kept); // rank 1 turned its copy away, counted there
+    try testing.expectEqual(@as(u64, 1), counts[1].pictures_refused);
+    const hit2 = t.vtable.lookup(t.ptr, &p2.want()) orelse return error.NotFound;
+    try testing.expectError(error.SpillNotOnEveryRank, t.vtable.begin(t.ptr, &hit2));
+    try testing.expect(t.vtable.lookup(t.ptr, &p2.want()) == null);
     ld.destroy();
     ld_alive = false;
     try pr.finish();

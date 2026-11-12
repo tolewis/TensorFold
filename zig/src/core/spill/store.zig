@@ -730,6 +730,12 @@ pub const Store = struct {
         var ch_owned = true;
         defer if (ch_owned) gpa.free(ch);
         if (!std.mem.eql(u8, &format.pointKeyChained(ch, keyed, l.block_tokens, m.media), &key)) return error.Corrupt;
+        if (m.media.len > 0) { // a point with pictures: its keyed and raw ids agree with its media (version 3)
+            const raw_ids = try gpa.alloc(u32, m.at);
+            defer gpa.free(raw_ids);
+            @memcpy(std.mem.sliceAsBytes(raw_ids), ids_raw[m.at * 4 ..][0 .. m.at * 4]);
+            if (!format.mediaIds(keyed, raw_ids, m.media)) return error.Corrupt;
+        }
         const spans = try gpa.alloc(format.Span, m.blocks.len);
         defer gpa.free(spans);
         format.blockNames(m.lineage, ch, keyed, l.block_tokens, spans);
@@ -1440,7 +1446,8 @@ pub const Store = struct {
         if (k.raw) |r| if (r.len != k.keyed.len) return false;
         if (k.media.len > l.max_media or k.sections.len > l.max_sections or k.lineage.forks.len > l.max_forks) return false;
         if (l.fullBlockBytes(k.lineage.part) == null) return false; // (owner-sharded: every point names its part)
-        for (k.media) |m| if (m.len == 0 or m.start >= k.keyed.len) return false;
+        // pictures: in order, inside the point, the keyed ids made from their digests and the raw ids beside them
+        if (!format.mediaIds(k.keyed, k.raw, k.media)) return false;
         var total: u64 = 0;
         for (k.sections) |sec| {
             if (sec.name.len == 0 or sec.name.len > 32) return false;

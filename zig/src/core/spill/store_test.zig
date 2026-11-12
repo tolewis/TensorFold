@@ -225,6 +225,7 @@ const KO = struct {
     shared: bool = false,
     group: u64 = 0,
     media: []const format.Media = &.{},
+    raw: ?[]const u32 = null, // with media: the raw ids (the same length as the keyed ones)
     capture: bool = true,
 };
 
@@ -233,7 +234,7 @@ fn keepIds(h: *H, ids: []const u32, o: KO) store.KeepResult {
     const at = ids.len;
     const tail_tokens = at % block_tokens;
     const r = h.s.keep(.{
-        .keyed = ids, .media = o.media, .lineage = o.lineage, .shared = o.shared, .group = o.group, .sections = &secs,
+        .keyed = ids, .raw = if (o.raw) |r| r[0..ids.len] else null, .media = o.media, .lineage = o.lineage, .shared = o.shared, .group = o.group, .sections = &secs,
         .tail_bytes = tail_tokens * bpt, .source = .{ .id = o.source, .generation = o.gen },
     });
     if (r == .queued) {
@@ -1343,8 +1344,26 @@ fn checkLookup(gpa: Allocator) !void {
     const ids = try idsOf(gpa, 5 * block_tokens, 1700);
     defer gpa.free(ids);
     const m = [_]format.Media{.{ .start = 3, .len = 4, .digest = @splat(1) }};
-    const k2 = try write(h, ids[0 .. 2 * block_tokens], .{ .lineage = lin(70), .source = 70, .media = &m });
-    const k4 = try write(h, ids[0 .. 4 * block_tokens], .{ .lineage = lin(70), .source = 70, .media = &m });
+    const raw = try gpa.dupe(u32, ids);
+    defer gpa.free(raw);
+    for (3..7) |i| { // the picture's keyed ids made from its digest, its raw ids the placeholder
+        ids[i] = format.pictureId(&m[0].digest, @intCast(i - 3));
+        raw[i] = 99;
+    }
+    // a point whose ids do not agree with its media is refused at keep (and would be at recovery)
+    try ensure(keepIds(h, ids[0 .. 2 * block_tokens], .{ .lineage = lin(70), .source = 70, .media = &m }) == .invalid, @src());
+    var forged = m;
+    forged[0].digest[20] ^= 1; // (the first 8 bytes seed the ids: the same ids, another picture past them)
+    const kf = try write(h, ids[0 .. 2 * block_tokens], .{ .lineage = lin(70), .source = 70, .media = &forged, .raw = raw });
+    var seeded = m;
+    seeded[0].digest[0] ^= 1; // (a seed byte changed: its ids no longer derive from it)
+    try ensure(keepIds(h, ids[0 .. 2 * block_tokens], .{ .lineage = lin(70), .source = 70, .media = &seeded, .raw = raw }) == .invalid, @src());
+    var placeholder = try gpa.dupe(u32, raw);
+    defer gpa.free(placeholder);
+    placeholder[4] = ids[4]; // a raw id inside the picture that is a picture's keyed id, not a model id
+    try ensure(keepIds(h, ids[0 .. 2 * block_tokens], .{ .lineage = lin(70), .source = 70, .media = &m, .raw = placeholder }) == .invalid, @src());
+    const k2 = try write(h, ids[0 .. 2 * block_tokens], .{ .lineage = lin(70), .source = 70, .media = &m, .raw = raw });
+    const k4 = try write(h, ids[0 .. 4 * block_tokens], .{ .lineage = lin(70), .source = 70, .media = &m, .raw = raw });
     const q = struct {
         fn at(hh: *H, x: store.Query) ?Digest {
             return if (hh.s.lookup(x)) |hit| hit.key else null;
@@ -1357,11 +1376,81 @@ fn checkLookup(gpa: Allocator) !void {
     var other = m;
     other[0].digest[0] = 2;
     try ensure(q.at(h, .{ .keyed = ids, .media = &other, .max_at = 80 }) == null, @src());
+    // the same shortened ids from another payload (only the full digest tells them apart): its own point, never m's
+    try ensure(std.meta.eql(q.at(h, .{ .keyed = ids, .media = &forged, .max_at = 80 }), kf), @src());
+    try ensure(!std.meta.eql(kf, k2), @src());
     try ensure(q.at(h, .{ .keyed = ids, .media = &.{}, .max_at = 80 }) == null, @src());
     var changed = try gpa.dupe(u32, ids);
     defer gpa.free(changed);
     changed[20] +%= 1;
     try ensure(std.meta.eql(q.at(h, .{ .keyed = changed, .media = &m, .max_at = 80 }), null), @src());
+    // across a restart: the points with pictures recover (their ids checked against their media) and match as before
+    try h.reopen();
+    try ensure(std.meta.eql(q.at(h, .{ .keyed = ids, .media = &m, .max_at = 70 }), k4), @src());
+    try ensure(std.meta.eql(q.at(h, .{ .keyed = ids, .media = &forged, .max_at = 80 }), kf), @src());
+    try ensure(q.at(h, .{ .keyed = ids, .media = &other, .max_at = 80 }) == null, @src());
+}
+
+/// Replace a point file's bytes (same name, truncated first).
+fn rewritePointFile(h: *H, key: Digest, suffix: []const u8, bytes: []const u8) !void {
+    var nb: [96]u8 = undefined;
+    var zb: [96]u8 = undefined;
+    const name = try std.fmt.bufPrintSentinel(&zb, "{s}", .{pointFile(&nb, key, suffix)}, 0);
+    const fd = c.openat(h.s.points_fd, name, .{ .ACCMODE = .WRONLY, .TRUNC = true, .CLOEXEC = true }, @as(c.mode_t, 0));
+    if (fd < 0) return CheckFailed;
+    defer _ = c.close(fd);
+    if (c.pwrite(fd, bytes.ptr, bytes.len, 0) != @as(isize, @intCast(bytes.len))) return CheckFailed;
+}
+
+/// A picture point's raw ids altered on disk with every CRC made good (the .ids file's in the manifest, the
+/// manifest's trailer): raw ids are not in the point key, so only recovery's `format.mediaIds` check catches it. A
+/// raw id inside the picture made a picture id, and a raw id outside it changed, each drop their point; an untouched
+/// picture point beside them recovers and still matches.
+fn checkPictureRecovery(gpa: Allocator) !void {
+    const h = try H.init(gpa, .{ .tag = "picrecover", .turns = 0 });
+    defer h.deinit();
+    const m = [_]format.Media{.{ .start = 3, .len = 4, .digest = @splat(7) }};
+    const n = 2 * block_tokens;
+    var keys: [3]Digest = undefined;
+    var keyed: [3][]u32 = undefined;
+    for (0..3) |i| {
+        keyed[i] = try idsOf(gpa, n, 1900 + i);
+        const raw = try gpa.dupe(u32, keyed[i]);
+        defer gpa.free(raw);
+        for (3..7) |j| {
+            keyed[i][j] = format.pictureId(&m[0].digest, @intCast(j - 3));
+            raw[j] = 99;
+        }
+        keys[i] = try write(h, keyed[i], .{ .lineage = lin(@intCast(80 + i)), .source = 80 + i, .media = &m, .raw = raw });
+    }
+    defer for (keyed) |k| gpa.free(k);
+    for (0..2) |i| {
+        var nb: [96]u8 = undefined;
+        var zb: [96]u8 = undefined;
+        const ids_raw = try fsio.readSmall(gpa, h.s.points_fd, try std.fmt.bufPrintSentinel(&zb, "{s}", .{pointFile(&nb, keys[i], ".ids")}, 0), 1 << 20);
+        defer gpa.free(ids_raw);
+        try ensure(ids_raw.len >= 2 * n * 4, @src());
+        const raw_ids: []align(1) u32 = std.mem.bytesAsSlice(u32, ids_raw[n * 4 ..][0 .. n * 4]);
+        if (i == 0) raw_ids[4] = keyed[i][4] else raw_ids[10] +%= 1; // a picture id inside, another model id outside
+        try rewritePointFile(h, keys[i], ".ids", ids_raw);
+        const man = try fsio.readSmall(gpa, h.s.points_fd, try std.fmt.bufPrintSentinel(&zb, "{s}", .{pointFile(&nb, keys[i], ".man")}, 0), 1 << 20);
+        defer gpa.free(man);
+        var mf = try format.Manifest.parse(gpa, man, h.cfg.compat, h.cfg.limits);
+        defer mf.deinit(gpa);
+        const same = try mf.encode(gpa, h.cfg.compat);
+        defer gpa.free(same);
+        try ensure(std.mem.eql(u8, same, man), @src()); // (the re-encoding is the manifest's own bytes)
+        mf.ids_crc = format.crc32(ids_raw);
+        const fixed = try mf.encode(gpa, h.cfg.compat);
+        defer gpa.free(fixed);
+        try rewritePointFile(h, keys[i], ".man", fixed);
+    }
+    try h.reopen();
+    try ensure(h.s.counts().recovered_dropped == 2, @src());
+    try ensure(!h.s.presence(keys[0]) and !h.s.presence(keys[1]) and h.s.presence(keys[2]), @src());
+    for (0..2) |i| try ensure(h.s.lookup(.{ .keyed = keyed[i], .media = &m, .max_at = 80 }) == null, @src());
+    const hit = h.s.lookup(.{ .keyed = keyed[2], .media = &m, .max_at = 80 }) orelse return CheckFailed;
+    try ensure(std.mem.eql(u8, &hit.key, &keys[2]), @src());
 }
 
 /// Disk faults on the write path: ENOSPC fails the point and leaves no temporary file or staging behind; short
@@ -1642,6 +1731,7 @@ const checks = [_]Check{
     .{ .name = "owner", .f = checkOwner },
     .{ .name = "prune", .f = checkPrune },
     .{ .name = "lookup", .f = checkLookup },
+    .{ .name = "picture recovery", .f = checkPictureRecovery },
     .{ .name = "write faults", .f = checkWriteFaults },
     .{ .name = "cancel read", .f = checkCancelRead },
     .{ .name = "fair reads", .f = checkFairReads },

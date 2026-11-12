@@ -11,7 +11,9 @@ const Value = json.Value;
 const Cx = errors.Cx;
 
 /// With images, `cache_key` is what the prompt cache matches: the ids with each image span spelled by its digest.
-pub const Rendered = struct { ids: []const u32, history_len: usize = 0, images: []const api.Image = &.{}, cache_key: []const u32 = &.{} };
+/// `media`: with it, each image's span and full payload digest (the durable tier's identity of it; the key's ids derive
+/// from the digest, prompt_cache.pictureId).
+pub const Rendered = struct { ids: []const u32, history_len: usize = 0, images: []const api.Image = &.{}, cache_key: []const u32 = &.{}, media: []const api.prompt_cache.Media = &.{} };
 
 pub const isTitle = messages_mod.isTitleRequest;
 
@@ -57,7 +59,16 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
     var history_len: usize = 0;
     if (history.len > 0 and history.len < prompt.len and std.mem.eql(u32, prompt[0..history.len], history)) history_len = history.len;
     if (history_len == 0 and prompt.len > 1 and std.mem.eql(u32, history, prompt)) history_len = prompt.len - 1; // a template with no generation suffix
-    if (input.images.len > 0) return spans(srv, cx, prompt, history_len, input.images);
+    if (input.images.len > 0) {
+        var r = try spans(srv, cx, prompt, history_len, input.images);
+        // TF_DS_IMAGE_CACHE=0: pictures keep nothing and resume nothing (no key: LaneHost.cacheable refuses the request)
+        if (!api.prompt_cache.imageCacheOn(if (std.c.getenv("TF_DS_IMAGE_CACHE")) |v| std.mem.span(v) else null)) {
+            r.cache_key = &.{};
+            r.media = &.{};
+            r.history_len = 0;
+        }
+        return r;
+    }
     return .{ .ids = prompt, .history_len = history_len };
 }
 
@@ -69,6 +80,7 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, history_len: usize, images: []
     var key: std.ArrayList(u32) = .empty;
     var placed: std.ArrayList(api.Image) = .empty;
     var history_extra: usize = 0;
+    var media: std.ArrayList(api.prompt_cache.Media) = .empty;
     for (ids, 0..) |id, i| {
         if (id != vision.token) {
             try out.append(cx.a, id);
@@ -84,17 +96,20 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, history_len: usize, images: []
         };
         try placed.append(cx.a, .{ .at = @intCast(out.items.len), .tokens = prep.tokens, .bytes = prep.payload });
         try out.appendNTimes(cx.a, vision.token, prep.tokens);
-        try spellImage(cx.a, &key, prep.payload, prep.tokens);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(prep.payload, &digest, .{});
+        try media.append(cx.a, .{ .start = @intCast(out.items.len - prep.tokens), .len = prep.tokens, .digest = digest });
+        try spellImage(cx.a, &key, &digest, prep.tokens);
         if (i < history_len) history_extra += prep.tokens - 1;
     }
     if (placed.items.len != images.len) return cx.refuse("image input: the prompt holds fewer image placeholders than images");
-    return .{ .ids = out.items, .images = placed.items, .cache_key = key.items, .history_len = if (history_len > 0) history_len + history_extra else 0 };
+    return .{ .ids = out.items, .images = placed.items, .cache_key = key.items, .media = media.items, .history_len = if (history_len > 0) history_len + history_extra else 0 };
 }
 
-/// An image span as the cache key spells it: ids past every vocabulary's, one a position, from the payload's digest.
-fn spellImage(a: std.mem.Allocator, key: *std.ArrayList(u32), payload: []const u8, tokens: u32) !void {
-    const h = std.hash.Wyhash.hash(0, payload);
-    for (0..tokens) |j| try key.append(a, 0x8000_0000 | @as(u32, @truncate((h +% @as(u64, j) *% 0x9e37_79b9_7f4a_7c15) >> 33)));
+/// An image span as the cache key spells it: ids past every vocabulary's, one a position, from the payload's SHA-256
+/// (prompt_cache.pictureId, so the durable tier's mediaKeys check binds them to the full digest a point records).
+fn spellImage(a: std.mem.Allocator, key: *std.ArrayList(u32), digest: *const [32]u8, tokens: u32) !void {
+    for (0..tokens) |j| try key.append(a, api.prompt_cache.pictureId(digest, @intCast(j)));
 }
 
 test "an image span's key depends on the image and the position, never on the vocabulary" {
@@ -105,9 +120,13 @@ test "an image span's key depends on the image and the position, never on the vo
     defer same.deinit(a);
     var other: std.ArrayList(u32) = .empty;
     defer other.deinit(a);
-    try spellImage(a, &one, "the same pixels", 64);
-    try spellImage(a, &same, "the same pixels", 64);
-    try spellImage(a, &other, "other pixels", 64);
+    var d1: [32]u8 = undefined;
+    var d2: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("the same pixels", &d1, .{});
+    std.crypto.hash.sha2.Sha256.hash("other pixels", &d2, .{});
+    try spellImage(a, &one, &d1, 64);
+    try spellImage(a, &same, &d1, 64);
+    try spellImage(a, &other, &d2, 64);
     try std.testing.expectEqualSlices(u32, one.items, same.items);
     try std.testing.expect(!std.mem.eql(u32, one.items, other.items));
     for (one.items) |id| try std.testing.expect(id >= 0x8000_0000);

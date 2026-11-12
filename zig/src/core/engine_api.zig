@@ -63,6 +63,9 @@ pub const Request = struct {
     images: []const Image = &.{},
     /// The tokens the prompt cache matches, each image span spelled by its image's digest; empty: the prompt itself.
     cache_key: []const u32 = &.{},
+    /// With `cache_key`: each image's identity for the durable tier (its span and the full SHA-256 its cache ids derive
+    /// from, prompt_cache.pictureId), in prompt order; empty: none known (the tier then keeps and finds nothing with them).
+    cache_media: []const prompt_cache.Media = &.{},
     max_tokens: u32,
     sampling: ?Sampling = null,
     /// Tokens that end the reply as ``stop`` (the token is delivered); empty when the request ignores EOS.
@@ -466,6 +469,7 @@ test {
     _ = @import("lane_host_reuse_test.zig");
     _ = @import("prompt_cache.zig");
     _ = @import("lane_host_tier_test.zig");
+    _ = @import("prompt_cache_media_test.zig");
     _ = @import("prompt_imprint.zig");
     _ = @import("keepalive.zig");
 }

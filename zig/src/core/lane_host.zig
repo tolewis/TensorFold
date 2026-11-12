@@ -227,8 +227,11 @@ pub const LaneHost = struct {
             job.reported(); // before a keep can evict the entry the pass restored
             const h = job.host;
             const store = h.cache orelse return;
+            const r = job.request;
+            if (!cacheable(r)) return;
+            const pics = r.images.len > 0; // (the tier records each picture's identity and the prompt's model ids)
             // an image span keyed by its digest (Request.cacheKey)
-            _ = store.keepWith(job.request.cacheKey(), at, s, job.request.chunks, .{ .group = job.join.group, .images = job.request.images.len > 0, .parent = job.parent, .fork = job.fork, .lineage = job.lineage });
+            _ = store.keepWith(r.cacheKey(), at, s, r.chunks, .{ .group = job.join.group, .images = pics, .media = if (pics) tierMedia(r) else &.{}, .raw = if (pics) r.prompt else &.{}, .parent = job.parent, .fork = job.fork, .lineage = job.lineage });
         }
 
         /// Report a restored prefix or its failed copy; an untouched prefix remains kept.
@@ -251,6 +254,23 @@ pub const LaneHost = struct {
             if (job.stream.reuse_failed) store.resumed(e, job.request.cacheKey(), false) else if (ok) store.resumed(e, job.request.cacheKey(), true);
         }
     };
+
+    /// Whether the cache may serve or keep a request: without images always; with them only when the server keyed their
+    /// positions by content (cache_key, one id a position: a kept state is found by tokens, and every picture's positions
+    /// hold the same placeholder). Upstream's server always keys them; TF_DS_IMAGE_CACHE=0 leaves the key empty.
+    fn cacheable(r: *const Request) bool {
+        return r.images.len == 0 or r.cache_key.len == r.prompt.len;
+    }
+
+    /// The pictures' identities the durable tier gets for a request: its `cache_media` only when they name exactly the
+    /// spans the engine runs (`images`: the spans its restored rows and tower work are placed by), one for one; anything
+    /// else gives none, and the tier then misses and keeps nothing for it (a disk hit must not resume pictures placed
+    /// elsewhere than the point recorded them).
+    pub fn tierMedia(r: *const Request) []const pc.Media {
+        if (r.cache_media.len != r.images.len) return &.{};
+        for (r.cache_media, r.images) |m, img| if (m.start != img.at or m.len != img.tokens) return &.{};
+        return r.cache_media;
+    }
 
     pub fn init(gpa: Allocator, io: std.Io, core: *lanes.Engine, info_: Info) LaneHost {
         var enforced = info_;
@@ -580,7 +600,7 @@ pub const LaneHost = struct {
         const r = job.request;
         var reuse: lanes.stream.Reuse = .{};
         // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
-        if (h.cache) |store| if (store.lookup(h.gpa, r.cacheKey(), r.history_len, r.shared_prefixes, r.chunks)) |l| {
+        if (cacheable(r)) if (h.cache) |store| if (store.lookup(h.gpa, r.cacheKey(), r.history_len, r.shared_prefixes, r.chunks)) |l| {
             job.entry = l.entry;
             job.kept0 = store.counts.kept;
             job.marks = l.marks;
@@ -1066,10 +1086,10 @@ pub const LaneHost = struct {
     fn park(h: *LaneHost, job: *Job) bool {
         const store = h.cache orelse return false;
         const r = job.request;
-        if (r.images.len > 0 and r.cache_key.len == 0) return false; // pictures without their digest key: never from disk
+        if (!cacheable(r)) return false;
         const key = r.cacheKey();
         const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
-        const probe = store.probe(key, r.chunks);
+        const probe = store.probeMedia(key, r.chunks, r.images.len > 0, tierMedia(r));
         if (!job.tried_disk) if (probe.durable) |p| {
             job.tried_disk = true;
             h.lock();

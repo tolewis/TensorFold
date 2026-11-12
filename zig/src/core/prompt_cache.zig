@@ -77,7 +77,70 @@ pub const Want = struct {
     max_at: u32,
     grid: u32 = 0,
     lookahead: u32 = 0,
+    /// The prompt holds pictures, and each one's identity (every picture, in prompt order; see `Media`). A point
+    /// holding pictures matches only when every picture before its cut has the same span and payload digest; a prompt
+    /// whose picture ids `media` does not account for (`mediaKeys`) finds nothing.
+    images: bool = false,
+    media: []const Media = &.{},
 };
+
+// -- pictures (recipe patch 0006's content keys; spill v2's disk identity) -------------------------------------------
+
+/// A picture of a prompt as the durable tier names it: its positions [start, start + len) and the full SHA-256 of
+/// its payload. Recipe 0006's per-position cache ids (`pictureId`) are shortened from the digest; disk identity takes
+/// the whole digest and the span. (extern: the same bytes as core/spill's format.Media.)
+pub const Media = extern struct {
+    start: u32,
+    len: u32,
+    digest: [32]u8,
+
+    pub fn eql(a: Media, b: Media) bool {
+        return a.start == b.start and a.len == b.len and std.mem.eql(u8, &a.digest, &b.digest);
+    }
+};
+
+/// TF_DS_IMAGE_CACHE's one reading (the server's content keys, the disk tier and the rank fingerprint alike): on unless
+/// it is exactly "0".
+pub fn imageCacheOn(v: ?[]const u8) bool {
+    return !std.mem.eql(u8, v orelse return true, "0");
+}
+
+test imageCacheOn {
+    try std.testing.expect(!imageCacheOn("0"));
+    try std.testing.expect(imageCacheOn(null) and imageCacheOn("1") and imageCacheOn(""));
+    try std.testing.expect(imageCacheOn(" 0") and imageCacheOn("0 ")); // (exact, as round 2 read it)
+}
+
+/// Cache ids at or above this are pictures' (`pictureId`); a vocabulary id is always below it.
+pub const picture_ids: u32 = 0x8000_0000;
+
+/// The prompt cache's id for position `j` of a picture whose payload's SHA-256 is `digest` (recipe 0006): above every
+/// vocabulary id, so it never equals a text token, and the same for the same picture at any place in any prompt.
+pub fn pictureId(digest: *const [32]u8, j: u32) u32 {
+    const seed = std.mem.readInt(u64, digest[0..8], .little);
+    return picture_ids | (@as(u32, @truncate(std.hash.Wyhash.hash(seed, std.mem.asBytes(&j)))) & 0x7fff_ffff);
+}
+
+/// Whether `media` names every picture in `key[0..n]` and nothing else: spans in order, not overlapping, not empty;
+/// each span position below `n` holds `pictureId(digest, offset)`, every other position below `n` a vocabulary id.
+/// Spans may run past `n` (a picture straddling a cut); spans starting at or past `n` are not looked at. The check
+/// that binds the shortened per-position ids to the full digests a point records.
+pub fn mediaKeys(key: []const u32, n: usize, media: []const Media) bool {
+    if (n > key.len) return false;
+    var at: usize = 0; // positions before it are checked
+    var prev_end: u64 = 0;
+    for (media) |m| {
+        if (m.len == 0 or m.start < prev_end) return false;
+        prev_end = @as(u64, m.start) + m.len;
+        if (m.start >= n) continue;
+        for (key[at..m.start]) |id| if (id >= picture_ids) return false;
+        const stop: usize = @intCast(@min(prev_end, n));
+        for (key[m.start..stop], 0..) |id, j| if (id != pictureId(&m.digest, @intCast(j))) return false;
+        at = stop;
+    }
+    for (key[at..n]) |id| if (id >= picture_ids) return false;
+    return true;
+}
 
 /// A kept state the tier writes (enqueued at keep). `saved` stays the family's: the tier reads it until `release`.
 pub const Kept = struct {
@@ -89,6 +152,11 @@ pub const Kept = struct {
     group: u64 = 0,
     shared: bool = false,
     images: bool = false,
+    /// With pictures: each one's identity (every picture of the prompt, in order; the tier records those before `at`)
+    /// and the prompt's model ids (the placeholder at a picture's positions; at least `at` of them), valid during the
+    /// call. A picture before `at` that `media` does not name keeps nothing on disk.
+    media: []const Media = &.{},
+    raw: []const u32 = &.{},
     /// The point its rows' computation forks from (the state its pass resumed from; null: a fresh prefill, or a resumed
     /// state that was never written), and where.
     parent: ?u64 = null,
@@ -150,6 +218,9 @@ pub const TierCounts = struct {
     quota_trims: u64 = 0,
     recovered_points: u64 = 0, // published points found at start
     dropped_temporaries: u64 = 0, // incomplete records removed at start
+    // (appended: the stats wire carries fields in order, and an older peer's reply zero-fills those it lacks)
+    pictures_kept: u64 = 0, // points written with pictures before their cut (rank 0)
+    pictures_refused: u64 = 0, // keeps and lookups with pictures turned away: ids and media disagree, or image cache off (rank 0)
 
     pub const gauges = [_][]const u8{ "points", "blocks", "stored_bytes", "cap_bytes", "disk_free_bytes", "staging_bytes", "staging_peak", "writes_pending" };
 
@@ -189,6 +260,8 @@ pub const TierCounts = struct {
         .quota_trims = "Writes that trimmed their conversation to its quota.",
         .recovered_points = "Published points found at start.",
         .dropped_temporaries = "Incomplete records removed at start.",
+        .pictures_kept = "Points written to disk with pictures before their cut.",
+        .pictures_refused = "Disk keeps and lookups with pictures turned away (ids and media disagree, or image cache off).",
     };
 };
 
@@ -384,6 +457,8 @@ pub const Probe = struct { memory: ?*Entry = null, durable: ?Point = null };
 pub const KeepInfo = struct {
     group: u64 = 0,
     images: bool = false,
+    media: []const Media = &.{}, // with pictures: each one's identity and the prompt's model ids (Kept's, for the tier)
+    raw: []const u32 = &.{},
     parent: ?u64 = null,
     fork: u32 = 0,
     lineage: []const Fork = &.{}, // the pass's (Store.passLineage), copied into the entry
@@ -509,13 +584,19 @@ pub const Store = struct {
 
     /// What `key` would resume, changing nothing in memory: the best usable kept state, and the tier's longer point.
     pub fn probe(s: *Store, key: []const u32, starts: []const u32) Probe {
+        return s.probeMedia(key, starts, false, &.{});
+    }
+
+    /// `probe` for a prompt with pictures: `images` (it holds some) and each one's identity go to the tier's lookup
+    /// (Want.images, Want.media), so a point is found only for the same pictures in the same places.
+    pub fn probeMedia(s: *Store, key: []const u32, starts: []const u32, images: bool, media: []const Media) Probe {
         const m = s.find(key, starts);
         const t = s.tier orelse return .{ .memory = m };
         const have: u32 = if (m) |e| e.at else 0;
         s.stats.disk_lookups += 1;
         const max_at = s.rules.maxAt(key.len) orelse return .{ .memory = m };
         if (max_at <= have) return .{ .memory = m };
-        const want: Want = .{ .key = key, .beyond = have, .max_at = max_at, .grid = s.rules.grid, .lookahead = s.rules.lookahead };
+        const want: Want = .{ .key = key, .beyond = have, .max_at = max_at, .grid = s.rules.grid, .lookahead = s.rules.lookahead, .images = images, .media = media };
         const p = t.vtable.lookup(t.ptr, &want) orelse return .{ .memory = m };
         if (!s.pointFits(p, key, starts, have)) return .{ .memory = m };
         s.stats.disk_hits += 1;
@@ -947,7 +1028,7 @@ pub const Store = struct {
         s.held += charged;
         s.counts.kept += 1;
         if (s.tier) |t| { // write at keep: the tier stages the state's bytes between rounds
-            e.point = t.vtable.keep(t.ptr, &.{ .saved = saved, .key = tokens, .at = at, .bytes = charged, .group = info.group, .shared = shared, .images = info.images, .parent = info.parent, .fork = info.fork, .lineage = lin });
+            e.point = t.vtable.keep(t.ptr, &.{ .saved = saved, .key = tokens, .at = at, .bytes = charged, .group = info.group, .shared = shared, .images = info.images, .media = info.media, .raw = info.raw, .parent = info.parent, .fork = info.fork, .lineage = lin });
             if (e.point != null) s.stats.writes_enqueued += 1;
         }
         if (shared) s.learn(e, starts);

@@ -415,6 +415,7 @@ pub fn spillSettings(dir: []const u8, gib: f64, min_free_gib: f64, quota: f64, m
     var s: spill_tier.Settings = .{ .dir = dir, .gib = gib, .min_free_gib = min_free_gib, .quota = quota, .min_tokens = min_tokens, .turns = turns, .flush_ms = flush_ms };
     if (getenv("TF_DS_SPILL_STAGING_MIB")) |v| s.staging_mib = std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch return error.BadSpillSetting;
     if (s.staging_mib < spill_tier.min_staging_mib) return error.BadSpillSetting;
+    s.image_cache = spill_tier.Settings.imageCache(getenv("TF_DS_IMAGE_CACHE")); // (pictures' points: the fingerprint's reading)
     return s;
 }
 
@@ -442,7 +443,7 @@ pub fn getenvFn(name: [:0]const u8) ?[]const u8 {
 pub fn rankExchange(gpa: std.mem.Allocator, io: std.Io, mo: model.Options, m: *model.Model, s: ?spill_tier.Settings, layout: *const model.Model.spill.StateLayout) !@import("fingerprint.zig").Exchange {
     const envp = try rank_identity.Extra.envFor(getenvFn, s != null);
     var fbuf: [256]u8 = undefined;
-    const image_cache = if (getenv("TF_DS_IMAGE_CACHE")) |v| !std.mem.eql(u8, v, "0") else true;
+    const image_cache = spill_tier.Settings.imageCache(getenv("TF_DS_IMAGE_CACHE"));
     // TF_DS_KV_SHARD's switches every rank's planner takes (carry, twins) and its part size: agreed in `features`
     const kvs: kv_lanes.Settings = if (m.kvs != null) try kv_lanes.Settings.fromEnv(getenvFn) else .{ .carry = false, .twins = false };
     const part_rows: u64 = if (m.caches.shard) |x| x.part else 0;
@@ -461,7 +462,10 @@ pub fn rankExchange(gpa: std.mem.Allocator, io: std.Io, mo: model.Options, m: *m
         .rank_cache_sha = envp.rank_cache_sha,
         .engram_revision = envp.engram_revision,
         .features = features,
-        .native_format = core.spill.format.version,
+        // the store's namespace version, not its newest format: version-3 points (pictures) came with no change to a
+        // version-2 text point, so a v3 reader shares round 2's namespace and its text points (a v2 reader drops v3
+        // manifests as foreign); a format change that breaks old points bumps namespace_version
+        .native_format = core.spill.format.namespace_version,
         .chunk_rows = model.chunk_rows,
         .replay_floor = prompt.replay_floor,
         .idx_split = prompt.idx_split,
