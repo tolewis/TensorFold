@@ -13,9 +13,9 @@ zig build xpu-native -Dtp=1 -Doptimize=ReleaseFast -Dcpu=skylake_avx512 \
 
 On jubiku use `nice -n 19` before the compile. Install the binary as `tensorfold-native-<sha>-fleet-tp1-skx`.
 
-Live: `tensorfold-native-ab047651-jubiku-p4-tp1-skx` (git `ab047651`, lane/jubiku-p4).
-The 2026-11-12 unify window built `c664084e3` as `tensorfold-native-c664084e-fleet-tp1-skx`
-(tag `prod/jubiku/2026-11-12`); it ran neutral to -2.5% against the live set, so the p4 binary stays.
+Live: `tensorfold-native-c664084e-fleet-tp1-skx` (git `c664084e3`, tag `prod/jubiku/2026-11-12`).
+Switched 2026-11-12 by lead decision after the unify window showed no loss; K1B stays out.
+Previous live binary: `tensorfold-native-ab047651-jubiku-p4-tp1-skx` (git `ab047651`).
 
 ## Serve
 
