@@ -8,6 +8,7 @@ pub const draft_depth = @import("draft_depth.zig");
 pub const CopyIndex = @import("copy_index.zig").CopyIndex;
 pub const tokenizer = @import("tokenizer"); // a module of its own, so the native server shares it
 pub const ids_json = @import("ids_json.zig");
+pub const spill = @import("spill/root.zig"); // wojo's GLM 0088/0110 spill v2 store (off unless a caller opens one)
 
 test {
     _ = safetensors;
@@ -16,4 +17,5 @@ test {
     _ = draft_depth;
     _ = @import("copy_index.zig");
     _ = ids_json;
+    _ = spill;
 }
