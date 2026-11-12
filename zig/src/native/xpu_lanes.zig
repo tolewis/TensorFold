@@ -4,6 +4,7 @@ const api = @import("engine_api");
 const lanes = @import("lanes");
 const xq = @import("xpu_qwen27");
 const be = lanes.backend;
+const TREE_MIN = @import("xpu_dflash2.zig").TREE_MIN;
 const Drafter = xq.drafter.Drafter;
 const Allocator = std.mem.Allocator;
 

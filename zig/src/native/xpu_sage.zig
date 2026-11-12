@@ -738,9 +738,8 @@ pub const Slots = struct {
         errdefer b.gpa.free(ids);
         var gdn: kv.Lease = .{};
         errdefer p.finish(&gdn);
-        const reclaim = p.reclaim;
-        p.reclaim = null;
-        defer p.reclaim = reclaim;
+        p.leaveReclaim(&b);
+        defer _ = p.joinReclaim(.{ .ctx = &b, .call = Slots.reclaimFn }) catch {};
         try p.promise(&gdn, b.gdn_pages);
         try p.cover(&gdn, b.gdn_pages, null);
         @memcpy(ids[kv_n..], gdn.ids.items);
@@ -1116,7 +1115,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         return null;
     }
     h.back.pool = try kv.Pool.init(gpa, pages, r.kvBytesPerToken() * sage.PAGE);
-    h.back.pool.?.reclaim = .{ .ctx = &h.back, .call = Slots.reclaimFn }; // a lease evicts kept states it needs pages of
+    try h.back.pool.?.joinReclaim(.{ .ctx = &h.back, .call = Slots.reclaimFn }); // a lease evicts kept states it needs pages of
     h.back.gdn_pages = sage.snapshot.gdnPages(r);
     h.back.publish();
     const pool_tokens = @as(u64, pages) * sage.PAGE;
