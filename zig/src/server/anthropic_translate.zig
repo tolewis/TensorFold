@@ -76,18 +76,10 @@ fn messages(cx: *Cx, value: ?Value, system: ?Value) errors.Refused!Value {
         try m.put(a, "content", .{ .string = joined.items });
         try out.append(a, .{ .object = m });
     };
-    for (list.array, 0..) |message, index| {
+    for (list.array) |message| {
         if (message != .object or !roleIs(message, &.{ "user", "assistant", "system" })) return cx.refuse("message role must be user, assistant or system");
         const role = message.get("role").?.string;
         if (std.mem.eql(u8, role, "system")) {
-            const previous: Value = if (index > 0) list.array[index - 1] else .{ .object = try json.newObject(a) };
-            const following: Value = if (index + 1 < list.array.len) list.array[index + 1] else blk: {
-                const f = try json.newObject(a);
-                try f.put(a, "role", .{ .string = "assistant" });
-                break :blk .{ .object = f };
-            };
-            if (previous != .object or !roleIs(previous, &.{ "user", "system" }) or following != .object or !roleIs(following, &.{ "assistant", "system" }))
-                return cx.refuse("mid-conversation system messages must follow a user turn and precede an assistant or end");
             const clear = message.get("clear_at");
             const clear_ok = clear == null or clear.? == .null or (clear.? == .string and std.mem.eql(u8, clear.?.string, "never"));
             if (!clear_ok or json.truthyField(message, "output_config")) return cx.refuse("turn-scoped system messages and per-message output_config are unsupported");

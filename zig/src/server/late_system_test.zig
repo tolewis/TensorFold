@@ -20,6 +20,13 @@ const misplaced_body =
     \\{"model":"m","max_tokens":4,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"ok"},{"role":"system","content":"be brief"}]}
 ;
 
+const before_user_body =
+    \\{"model":"m","max_tokens":4,"messages":[{"role":"user","content":"hi"},{"role":"system","content":"be brief"},{"role":"user","content":"go"}]}
+;
+const scoped_body =
+    \\{"model":"m","max_tokens":4,"messages":[{"role":"user","content":"hi"},{"role":"system","content":"be brief","clear_at":"next_turn"},{"role":"assistant","content":"ok"}]}
+;
+
 /// Drops a system message after the first, so the late-system probe comes back as user.
 const DropLate = struct {
     fn text(t: *@This()) model_text.Text {
@@ -203,10 +210,17 @@ test "a mid-conversation system message renders the same prompt on Messages and 
     defer std.testing.allocator.free(want);
     try std.testing.expect(std.mem.indexOf(u8, counted.body, want) != null);
 
-    const misplaced = try exchange(srv, "/v1/messages", misplaced_body);
-    defer std.testing.allocator.free(misplaced.body);
-    try std.testing.expectEqual(@as(u16, 400), misplaced.status);
-    try std.testing.expect(std.mem.indexOf(u8, misplaced.body, "mid-conversation system messages must follow a user turn and precede an assistant or end") != null);
+    // A system turn may sit anywhere: after an assistant turn, last, or before the newest user turn.
+    for ([_][]const u8{ misplaced_body, before_user_body }) |body| {
+        const placed = try exchange(srv, "/v1/messages", body);
+        defer std.testing.allocator.free(placed.body);
+        try std.testing.expectEqual(@as(u16, 200), placed.status);
+    }
+    // A turn-scoped system message is still refused.
+    const scoped = try exchange(srv, "/v1/messages", scoped_body);
+    defer std.testing.allocator.free(scoped.body);
+    try std.testing.expectEqual(@as(u16, 400), scoped.status);
+    try std.testing.expect(std.mem.indexOf(u8, scoped.body, "turn-scoped system messages and per-message output_config are unsupported") != null);
 }
 
 const clear_old_body =
