@@ -269,6 +269,7 @@ pub const Dev = struct {
         if (d.ring.len == 0) d.ring = @as([*]u8, @ptrCast(try d.g.hostAlloc(ring_bytes)))[0..ring_bytes];
         const need = std.mem.alignForward(usize, @max(n, 1), 64);
         if (d.ring_at + need > d.ring.len) d.settle();
+        if (d.ring_at + need > d.ring.len) return ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, dst, src, n, null, 0, null)); // no drain (a test's lost)
         const at = d.ring_at;
         @memcpy(d.ring[at..][0..n], @as([*]const u8, @ptrCast(src.?))[0..n]);
         d.ring_at = at + need;
