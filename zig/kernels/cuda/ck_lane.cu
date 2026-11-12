@@ -6,10 +6,21 @@
 #include <stdint.h>
 
 #include "mma4.cuh"
+#include "nvfp4q.cuh"
 #include "common/qmm_frag.cuh"
 
 using namespace qmm_frag;
 using namespace mma4;
+
+// The checkpoint's NVFP4 rows for the prompt GEMM: e2m1 codes [m][k/2] then e4m3 block scales [m][k/16].
+namespace tf_ck4p {
+
+// The larger, or a NaN when either is (fmaxf drops it): a block holding a NaN gets a NaN scale.
+__device__ __forceinline__ float max_nan(float a, float b) { return (a > b || a != a) ? a : b; }
+
+#include "common/unpack8_value.cuh"
+
+}  // namespace tf_ck4p
 
 namespace tf_ck {
 
@@ -36,7 +47,8 @@ struct Tile {
 template <typename C, bool CLUSTER>
 __device__ __forceinline__ void lane(const uint8_t* __restrict__ x, const uint8_t* __restrict__ w, float alpha,
                                      __nv_bfloat16* __restrict__ out, float* __restrict__ part, int M, int N, int K,
-                                     int SK, int group) {
+                                     int SK, int group, const float* __restrict__ sa = nullptr,
+                                     const float* __restrict__ ws = nullptr) {
     using T = Tile<C, CLUSTER>;
     constexpr int THREADS = C::THREADS, CH = T::ROW / 16;
     extern __shared__ __align__(128) unsigned char buf[];
@@ -102,6 +114,12 @@ __device__ __forceinline__ void lane(const uint8_t* __restrict__ x, const uint8_
     }
     wait<0>();
     __syncthreads();
+    // A row's activation scale and an output row's weight scale when the checkpoint carries them. The weight
+    // scale a row is its FP8 tile table's, replicated over the K groups: [(row / 64) * KG * 64 + row % 64].
+    auto mul = [&](int row, int col) {
+        const float r = ws ? ws[static_cast<size_t>(col >> 6) * KG * 64 + (col & 63)] : 1.0f;
+        return alpha * (sa ? sa[row] : 1.0f) * r;
+    };
     auto put = [&](int row, int col, float v0, float v1) {
         __nv_bfloat16* dst = out + static_cast<size_t>(row) * N + col;
         if (col + 1 < N && (N & 1) == 0) {
@@ -135,7 +153,10 @@ __device__ __forceinline__ void lane(const uint8_t* __restrict__ x, const uint8_
                 v0 = v0 + theirs[2 * pr * THREADS + tid];
                 v1 = v1 + theirs[(2 * pr + 1) * THREADS + tid];
             }
-            if (row < M) put(row, col, v0 * alpha, v1 * alpha);
+            if (row < M) {
+                const float f = mul(row, col);
+                put(row, col, v0 * f, v1 * f);
+            }
         }
         cluster.sync();
 #endif
@@ -155,7 +176,8 @@ __device__ __forceinline__ void lane(const uint8_t* __restrict__ x, const uint8_
                         if (col + 1 < N) dst[1] = acc[i][j][2 * h + 1];
                         continue;
                     }
-                    put(row, col, acc[i][j][2 * h] * alpha, acc[i][j][2 * h + 1] * alpha);
+                    const float f = mul(row, col);
+                    put(row, col, acc[i][j][2 * h] * f, acc[i][j][2 * h + 1] * f);
                 }
             }
     }
@@ -180,6 +202,58 @@ TF_CK8(tf_ck8_64s, 64, 64, 1, true, false)
 TF_CK8(tf_ck8_64sc, 64, 64, 1, true, true)
 TF_CK8(tf_ck8_128, 128, 64, 2, true, false)
 TF_CK8(tf_ck8_128c, 128, 128, 2, true, true)
+
+// The same tiles with a checkpoint's own scales: sa[row] the activation's, rs[col] the weight's, alpha 1.
+#define TF_CK8R(NAME, BM, BN, WM, SKIP, CLUSTER)                                                                     \
+    extern "C" __global__ void __launch_bounds__(WM * 128)                                                           \
+        NAME(const uint8_t* __restrict__ x, const uint8_t* __restrict__ w, float alpha, __nv_bfloat16* __restrict__ out, \
+             float* __restrict__ part, int M, int N, int K, int SK, int group, const float* __restrict__ sa,          \
+             const float* __restrict__ ws) {                                                                          \
+        tf_ck::lane<tf_ck::Cfg<BM, BN, WM, 4, SKIP>, CLUSTER>(x, w, alpha, out, part, M, N, K, SK, group, sa, ws);    \
+    }
+TF_CK8R(tf_ck8_128r, 128, 64, 2, true, false)
+TF_CK8R(tf_ck8_128rc, 128, 128, 2, true, true)
+
+// Per-row activation scale: e4m3(x / sa[row]) in the FP8 weights' fragment order, sa = amax / 448 (1e-6 floor).
+extern "C" __global__ void __launch_bounds__(128)
+    tf_ck_quant8_rows(const __nv_bfloat16* __restrict__ x, int ldx, int M, int K, uint8_t* __restrict__ out,
+                      float* __restrict__ sa) {
+    __shared__ float red[128];
+    const int row = blockIdx.x, tid = threadIdx.x;
+    float amax = 0.0f;
+    for (int i = tid; i < K; i += 128) {
+        const float v = __bfloat162float(x[static_cast<size_t>(row) * ldx + i]);
+        amax = fmaxf(amax, fabsf(v));
+    }
+    red[tid] = amax;
+    __syncthreads();
+    for (int s = 64; s > 0; s >>= 1) {
+        if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+        __syncthreads();
+    }
+    const float scale = fmaxf(red[0] / 448.0f, 1e-6f);
+    if (tid == 0) sa[row] = scale;
+    __syncthreads();
+    const float inv = 1.0f / scale;
+    for (int grp = tid; grp < K / 16; grp += 128) {
+        const uint4* src = reinterpret_cast<const uint4*>(x + static_cast<size_t>(row) * ldx + grp * 16);
+        float f[16];
+        tf_ck::unpack8(src[0], *reinterpret_cast<float(*)[8]>(f));
+        tf_ck::unpack8(src[1], *reinterpret_cast<float(*)[8]>(f + 8));
+        uint32_t w[4];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            uint32_t packed = 0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int k = 2 * q + (j % 2) + 8 * (j / 2);
+                packed |= static_cast<uint32_t>(__nv_cvt_float_to_fp8(f[k] * inv, __NV_SATFINITE, __NV_E4M3)) << (8 * j);
+            }
+            w[q] = packed;
+        }
+        *reinterpret_cast<uint4*>(out + static_cast<size_t>(row) * K + grp * 16) = make_uint4(w[0], w[1], w[2], w[3]);
+    }
+}
 
 // The slices summed in slice order, one fp32 add a slice, then the factor and one bf16 rounding.
 extern "C" __global__ void __launch_bounds__(256)
@@ -213,4 +287,121 @@ extern "C" __global__ void __launch_bounds__(128)
         w[q] = packed;
     }
     *reinterpret_cast<uint4*>(out + static_cast<size_t>(row) * K + grp * 16) = make_uint4(w[0], w[1], w[2], w[3]);
+}
+
+// The checkpoint's NVFP4 prompt GEMM: 128 rows by 128 columns a CTA, K steps in flight, block-scaled FP4 mma.
+namespace tf_ck4p {
+
+constexpr int PM = 128, PN = 128, PSTAGES = 4;  // rows, columns, staged 64-input steps
+
+// One staged step: the rows' codes (32 bytes, swizzled for ldmatrix) and block scales, two 64-column weight
+// tiles as packed (fragment order) and their scales.
+struct Stage {
+    uint4 a[PM][2];
+    uint32_t sa[PM];
+    uint2 b[2][256];
+    uint32_t sb[2][64];
+};
+
+}  // namespace tf_ck4p
+
+// A 16-input block a thread: e4m3 scale e4m3(g * amax / 6) at scales[r][b], codes e2m1(x * g / scale) at codes[r].
+extern "C" __global__ void __launch_bounds__(128)
+    tf_ck_quant4_rows(const __nv_bfloat16* __restrict__ x, int ldx, int M, int K, float g, uint8_t* __restrict__ codes,
+                      uint8_t* __restrict__ scales) {
+    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;  // one thread a block of 16
+    if (i >= static_cast<long long>(M) * (K / 16)) return;
+    const int row = static_cast<int>(i / (K / 16)), blk = static_cast<int>(i % (K / 16));
+    const uint4* src = reinterpret_cast<const uint4*>(x + static_cast<size_t>(row) * ldx + blk * 16);
+    float f[16];
+    tf_ck4p::unpack8(src[0], *reinterpret_cast<float(*)[8]>(f));
+    tf_ck4p::unpack8(src[1], *reinterpret_cast<float(*)[8]>(f + 8));
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 16; ++j) amax = tf_ck4p::max_nan(amax, fabsf(f[j]));
+    const nvfp4q::Scale sc = nvfp4q::block_scale(amax, g);
+    uint32_t w[2] = {0u, 0u};
+#pragma unroll
+    for (int j = 0; j < 16; ++j) w[j / 8] |= nvfp4q::e2m1(f[j] * sc.mul) << (4 * (j % 8));
+    *reinterpret_cast<uint2*>(codes + static_cast<size_t>(row) * (K / 2) + blk * 8) = make_uint2(w[0], w[1]);
+    scales[static_cast<size_t>(row) * (K / 16) + blk] = static_cast<uint8_t>(sc.sf8);
+}
+
+// out (M, N) bf16 = codes (M, K/2) times the packed words (npad/64, K/64, 8, 32, 2) under their scales, times `scale`.
+extern "C" __global__ void __launch_bounds__(256)
+    tf_ck4_prompt(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ xs, const uint32_t* __restrict__ w,
+                  const uint8_t* __restrict__ ws, float scale, __nv_bfloat16* __restrict__ out, int M, int N, int K,
+                  int npad, int group) {
+    using namespace tf_ck4p;
+    __shared__ __align__(128) Stage st[PSTAGES];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
+    const int wm = warp >> 2, wn = warp & 3;
+    const int NB = npad / 64, KG = K / 64;
+    const int2 at = tile_of(blockIdx.x, M, N, PM, PN, group);
+    const int m0 = at.x, n0 = at.y;
+    // loader roles: a row tid / 2 (16 bytes tid % 2) and its scales; weight tile tid / 128, 16 bytes tid % 128
+    const int arow = tid >> 1, half = tid & 1, bt = tid >> 7, bq = tid & 127;
+    // ldmatrix rows: lane l gives row (l % 8) + 8 ((l / 8) % 2) of chunk l / 16
+    const int lrow = (lane & 7) + ((lane >> 3) & 1) * 8, lchunk = lane >> 4;
+    const int nbt = n0 / 64 + bt < NB ? n0 / 64 + bt : NB - 1;  // past npad: the last tile, unread
+    const size_t tile = static_cast<size_t>(nbt) * KG;
+    auto load = [&](int stage, int kg) {
+        Stage& p = st[stage];
+        const int r = m0 + arow < M ? m0 + arow : M - 1;  // rows past M read the last, masked at the epilogue
+        cp16(&p.a[arow][chunk<A4>(arow, half)], codes + static_cast<size_t>(r) * (K / 2) + kg * 32 + half * 16);
+        if (!half) cp4(&p.sa[arow], xs + static_cast<size_t>(r) * (K / 16) + kg * 4);
+        cp16(reinterpret_cast<uint4*>(p.b[bt]) + bq, reinterpret_cast<const uint4*>(w) + (tile + kg) * 128 + bq);
+        if (bq < 16) cp16(reinterpret_cast<uint4*>(p.sb[bt]) + bq, reinterpret_cast<const uint4*>(ws) + (tile + kg) * 16 + bq);
+    };
+#pragma unroll
+    for (int s = 0; s < PSTAGES - 1; ++s) {
+        if (s < KG) load(s, s);
+        commit();
+    }
+    float acc[4][4][4] = {};
+    for (int kg = 0; kg < KG; ++kg) {
+        wait<PSTAGES - 2>();
+        __syncthreads();
+        if (kg + PSTAGES - 1 < KG) load((kg + PSTAGES - 1) % PSTAGES, kg + PSTAGES - 1);
+        commit();
+        const Stage& p = st[kg % PSTAGES];
+        uint2 b[4];
+        uint32_t sb[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int nt = (wn & 1) * 4 + j;
+            b[j] = p.b[wn >> 1][nt * 32 + lane];
+            sb[j] = p.sb[wn >> 1][nt * 8 + g];
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int r0 = wm * 64 + i * 16;
+            uint32_t a[4];
+            const int r = r0 + lrow;
+            ldmatrix4(a, &p.a[r][chunk<A4>(r, lchunk)]);
+            const uint32_t sa = p.sa[r0 + g + (t & 1) * 8];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) mma_fp4(acc[i][j], a, b[j].x, b[j].y, sa, sb[j]);
+        }
+    }
+    wait<0>();
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int row = m0 + wm * 64 + i * 16 + (lane >> 2) + h * 8;
+            if (row >= M) continue;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int col = n0 + wn * 32 + j * 8 + (lane & 3) * 2;
+                const float v0 = acc[i][j][2 * h] * scale, v1 = acc[i][j][2 * h + 1] * scale;
+                __nv_bfloat16* dst = out + static_cast<size_t>(row) * N + col;
+                if (col + 1 < N) {
+                    *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(v0, v1);
+                } else if (col < N) {
+                    dst[0] = __float2bfloat16_rn(v0);
+                }
+            }
+        }
 }
