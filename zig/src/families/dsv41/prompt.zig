@@ -254,6 +254,7 @@ pub const Chunk = struct {
     // the grouped EXL3 linears of decode-sized rows (1..128): rotated rows, split-K partials, each layer's counters
     gxh: u64 = 0, // fp16 [128, the largest group's sum of K]
     gz: u64 = 0, // fp32 [the largest group's split-K partials at 128 rows]
+    plain_tmp: u64 = 0, // bf16 [cap, the widest plain linear's N]: a plain linear's result when the caller wants fp32
     counters: [640]Counter = undefined,
     n_counters: usize = 0,
     ktop: u64 = 0, // int64 [cap, index_topk]: torch's top-k values for _topk_finish
@@ -413,6 +414,7 @@ pub const Chunk = struct {
         // prefill.Workspace: the largest prompt GEMM's rotated input and W_q (fp16) over every layer, and the Hadamard
         var max_xk: usize = 0;
         var max_kn: usize = 0;
+        var max_plain_n: usize = 0;
         for (e.w.layers) |lay| {
             var ls: [16]?weights.Linear = @splat(null);
             ls[0] = lay.wq_a;
@@ -429,10 +431,13 @@ pub const Chunk = struct {
                 const l = ol orelse continue;
                 max_xk = @max(max_xk, l.k);
                 max_kn = @max(max_kn, @as(usize, l.k) * l.n);
+                if (l.plain != 0) max_plain_n = @max(max_plain_n, l.n);
             }
         }
         ch.ws = .{ .xh = try a.take(cap * max_xk * 2), .w = try a.take(max_kn * 2), .h = try a.take(128 * 128 * 2) };
         ch.blas_ws = try a.take(cublas.Blas.workspace_bytes);
+        // a plain (mixed pack) linear's fp32 output: its bf16 result, then ops.toF32
+        ch.plain_tmp = try a.take(@max(cap * max_plain_n * 2, 1));
         // grouped linears: every layer's counters (int32 [8 N / 128], zeros, left zero by each launch), the largest
         // group's rotated rows and partials at 128 rows
         var max_gk: usize = 0;
@@ -526,6 +531,8 @@ fn layerLinears(e: *const Engine, ch: *Chunk, a: *Arena, lay: weights.Layer, max
 /// One linear alone at 128 rows in the chunk's grouped-linear sizes, and its split-K counters (int32 [8 N / 128], zeros,
 /// left zero by each launch).
 fn addLinear(e: *const Engine, ch: *Chunk, a: *Arena, l: weights.Linear, max_gk: *usize, max_gz: *usize) !void {
+    // A mixed pack's plain linear runs on cuBLAS: no rot_many / glinear counters.
+    if (l.plain != 0) return;
     max_gk.* = @max(max_gk.*, l.k);
     max_gz.* = @max(max_gz.*, exl3_linear.zFloats(&[_]weights.Linear{l}, 128));
     if (ch.n_counters == ch.counters.len) return error.TooManyLinears;
@@ -582,22 +589,69 @@ pub fn counterOf(ch: *const Chunk, l: weights.Linear) !u64 {
 /// TF_EXL3_PDL and TF_EXL3_L2_DISCARD).
 pub fn grouped(e: *const Engine, ch: *const Chunk, m: usize, ls: []const weights.Linear, xs: []const u64, ldxs: []const usize, outs: []const u64, ldos: []const usize, types: []const exl3_linear.DType) !void {
     if (m == 0 or m > 128 or ls.len > 8) return error.NotADecodeWindow;
+    // The group's EXL3 linears go through rot_many + glinear; a mixed pack's plain ones run on cuBLAS after them
+    // (the same stream, so they start after glinear has read the rotated rows in ch.gxh).
     var calls: [8]exl3_linear.Call = undefined;
+    var plain: [8]usize = undefined;
+    var n_calls: usize = 0;
+    var n_plain: usize = 0;
     var off: usize = 0;
     for (ls, 0..) |l, i| {
-        calls[i] = .{ .layer = l, .x = xs[i], .ldx = @intCast(ldxs[i]), .x_dtype = .bf16, .xh = ch.gxh + off * 2, .y = outs[i], .ldy = @intCast(ldos[i]), .y_dtype = types[i], .counters = try counterOf(ch, l) };
+        if (l.plain != 0) {
+            plain[n_plain] = i;
+            n_plain += 1;
+            continue;
+        }
+        calls[n_calls] = .{ .layer = l, .x = xs[i], .ldx = @intCast(ldxs[i]), .x_dtype = .bf16, .xh = ch.gxh + off * 2, .y = outs[i], .ldy = @intCast(ldos[i]), .y_dtype = types[i], .counters = try counterOf(ch, l) };
         off += m * l.k;
+        n_calls += 1;
     }
-    try exl3_linear.rotMany(e.lin, e.s, calls[0..ls.len], m, true);
-    try exl3_linear.glinear(e.lin, e.s, calls[0..ls.len], m, ch.gz, true, true);
+    if (n_calls > 0) {
+        try exl3_linear.rotMany(e.lin, e.s, calls[0..n_calls], m, true);
+        try exl3_linear.glinear(e.lin, e.s, calls[0..n_calls], m, ch.gz, true, true);
+    }
+    for (plain[0..n_plain]) |i| {
+        const l = ls[i];
+        if (ldxs[i] != @as(usize, l.k) or ldos[i] != @as(usize, l.n)) return error.UnsupportedPlainLinear;
+        if (types[i] == .bf16) {
+            try e.blas.linearBf16(xs[i], l.plain, outs[i], m, @as(usize, l.k), @as(usize, l.n));
+        } else {
+            try e.blas.linearBf16(xs[i], l.plain, ch.plain_tmp, m, @as(usize, l.k), @as(usize, l.n));
+            try e.ops.toF32(e.s, ch.plain_tmp, outs[i], m * @as(usize, l.n));
+        }
+    }
 }
 
 /// Exl3Group.rotated on m rows already rotated into each call's xh (a kernel that folds the rotation in wrote them):
 /// the glinear launches alone, each call's counters and folds as given.
 pub fn groupedRotated(e: *const Engine, ch: *const Chunk, m: usize, calls: []exl3_linear.Call) !void {
     if (m == 0 or m > 128 or calls.len > exl3_linear.gmax) return error.NotADecodeWindow;
-    for (calls) |*c| c.counters = try counterOf(ch, c.layer);
-    try exl3_linear.glinear(e.lin, e.s, calls, m, ch.gz, true, true);
+    // The rows are already rotated for the EXL3 linears (a kernel wrote each call's xh). A mixed pack's plain linear
+    // takes the unrotated rows: its call carries x, not xh.
+    var exl3: [exl3_linear.gmax]exl3_linear.Call = undefined;
+    var plain: [exl3_linear.gmax]exl3_linear.Call = undefined;
+    var n_exl3: usize = 0;
+    var n_plain: usize = 0;
+    for (calls) |c| {
+        if (c.layer.plain != 0) {
+            plain[n_plain] = c;
+            n_plain += 1;
+        } else {
+            exl3[n_exl3] = c;
+            n_exl3 += 1;
+        }
+    }
+    for (exl3[0..n_exl3]) |*c| c.counters = try counterOf(ch, c.layer);
+    if (n_exl3 > 0) try exl3_linear.glinear(e.lin, e.s, exl3[0..n_exl3], m, ch.gz, true, true);
+    for (plain[0..n_plain]) |c| {
+        if (c.x == 0 or c.xh != 0 or c.ldx != @as(i64, c.layer.k) or c.ldy != @as(i64, c.layer.n)) return error.UnsupportedPlainLinear;
+        if (c.y_dtype == .bf16) {
+            try e.blas.linearBf16(c.x, c.layer.plain, c.y, m, @as(usize, c.layer.k), @as(usize, c.layer.n));
+        } else {
+            try e.blas.linearBf16(c.x, c.layer.plain, ch.plain_tmp, m, @as(usize, c.layer.k), @as(usize, c.layer.n));
+            try e.ops.toF32(e.s, ch.plain_tmp, c.y, m * @as(usize, c.layer.n));
+        }
+    }
 }
 
 /// The pool's compressed-attention caches (model.py PoolCache: comp, index_k, comp_raw), by kv-source layer: the
@@ -804,6 +858,18 @@ pub fn attnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
 
 /// mm(layer, x, out_dtype) of m rows: the prompt GEMM beyond 128 rows, the layer's own group (GROUPED) up to 128.
 fn mmRows(e: *const Engine, ch: *const Chunk, m: usize, l: weights.Linear, x: u64, ldx: usize, out: u64, out_type: tri_markov.OutType, os: usize) !void {
+    // A mixed pack's float linear: torch's nn.Linear on bf16 rows (cublas.Blas.linearBf16), then the exact
+    // bf16 -> fp32 widen when the caller wants fp32 (torch's mm's out_dtype).
+    if (l.plain != 0) {
+        if (ldx != @as(usize, l.k) or os != @as(usize, l.n)) return error.UnsupportedPlainLinear;
+        if (out_type == .bf16) {
+            try e.blas.linearBf16(x, l.plain, out, m, @as(usize, l.k), @as(usize, l.n));
+        } else {
+            try e.blas.linearBf16(x, l.plain, ch.plain_tmp, m, @as(usize, l.k), @as(usize, l.n));
+            try e.ops.toF32(e.s, ch.plain_tmp, out, m * @as(usize, l.n));
+        }
+        return;
+    }
     if (m > 128) return exl3_prefill.matmul(e.pf, e.t, ch.ws, l, x, .bf16, ldx, out, out_type, os, m);
     const dt: exl3_linear.DType = switch (out_type) {
         .bf16 => .bf16,

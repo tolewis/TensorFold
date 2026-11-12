@@ -17,7 +17,10 @@ const span_piece = 64 << 20;
 /// An EXL3 linear in the strips layout: words int32 [N/128, K/16, 8, 8 * bits], fp16 suh [K] and svh [N].
 /// plan_n: the N its decode plan is made for, when not n: a 2D node's column part of a TP2 slice keeps that slice's
 /// plan (linear.py pinned plans), so its columns sum in the slice's K order.
-pub const Linear = struct { words: u64, suh: u64, svh: u64, k: u32, n: u32, k2: u32, plan_n: u32 = 0 };
+/// plain: a mixed pack's float linear (EAQ v1.1 stores 27 indexer/compressor linears as BF16 `.weight`): its BF16
+/// [N, K] bytes, with words, suh and svh 0. A plain linear runs through cuBLAS (`cublas.Blas.linearBf16`) instead of
+/// the EXL3 kernels; the same image still serves packs whose every linear is EXL3.
+pub const Linear = struct { words: u64, suh: u64, svh: u64, k: u32, n: u32, k2: u32, plan_n: u32 = 0, plain: u64 = 0 };
 
 /// A layer's routed experts and its shared expert (the last entry), as exl3_experts.prepare lays them out. On a 2D node
 /// (exl3/experts2d.py prepare) gate / up hold its intermediate blocks (width of the half's down_k) and down its
@@ -167,6 +170,7 @@ const Loader = struct {
     direct: ?dio.File = null, // the cache reopened for direct reads (no page cache to fill and then reclaim)
     span_bytes: u64 = 0, // bytes read as spans and the time they took, for the load's log line
     span_ns: u64 = 0,
+    plain_count: usize = 0, // mixed pack float linears loaded (the model card's "mixed pack: N float linears")
 
     fn deinit(L: *Loader) void {
         L.host.deinit(L.gpa);
@@ -265,10 +269,52 @@ const Loader = struct {
         return L.upload(tensor, try L.entry(try plan.plainKey(&kb, tensor, dtype)));
     }
 
-    /// linear(prefix, cols, rows): Exl3Linear.from_tensors in strips.
+    /// Whether the source holds `key` (the cache's index, or the checkpoint's header by the tensor's name).
+    fn has(L: *const Loader, key: []const u8, name: []const u8) bool {
+        return switch (L.src) {
+            .cache => |c| c.index.get(key) != null,
+            .shards => |sh| sh.get(name) != null,
+        };
+    }
+
+    /// A plain entry's dtype and [n, k] (rank 2).
+    fn shape2(L: *Loader, key: []const u8) !struct { dtype: rank_cache.DType, shape: [2]usize } {
+        return switch (L.src) {
+            .cache => |c| blk: {
+                const e = c.index.get(key) orelse return error.MissingEntry;
+                if (e.rank != 2) return error.UnexpectedTensor;
+                break :blk .{ .dtype = e.dtype, .shape = .{ e.shape[0], e.shape[1] } };
+            },
+            .shards => |sh| blk: {
+                const s = try checkpoint.describe(sh, key);
+                if (s.rank != 2) return error.UnexpectedTensor;
+                break :blk .{ .dtype = s.dtype, .shape = .{ s.shape[0], s.shape[1] } };
+            },
+        };
+    }
+
+    /// A mixed pack's float linear: the checkpoint's BF16 `.weight` [n, k], uploaded whole.
+    fn plainLinear(L: *Loader, name: []const u8, key: []const u8) !Linear {
+        const s = try L.shape2(key);
+        if (s.dtype != .bf16) return error.UnsupportedPlainLinear;
+        const ptr = try L.upload(name, try L.entry(key));
+        L.plain_count += 1;
+        return .{ .words = 0, .suh = 0, .svh = 0, .k = @intCast(s.shape[1]), .n = @intCast(s.shape[0]), .k2 = 0, .plain = ptr };
+    }
+
+    /// linear(prefix, cols, rows): Exl3Linear.from_tensors in strips, or a mixed pack's plain BF16 `.weight` when the
+    /// checkpoint has one for a whole, replicated linear (the 27 EAQ v1.1 indexer/compressor linears). A split linear
+    /// (cols or rows set) keeps its EXL3 parts: the mixed pack's float linears are all replicated.
     fn linear(L: *Loader, prefix: []const u8, cols: ?[2]usize, rows: ?[2]usize) !Linear {
         var kb: [256]u8 = undefined;
         var nb: [256]u8 = undefined;
+        if (cols == null and rows == null) {
+            var pb: [256]u8 = undefined;
+            var pbk: [256]u8 = undefined;
+            const name = try std.fmt.bufPrint(&pb, "{s}.weight", .{prefix});
+            const key = try plan.plainKey(&pbk, name, null);
+            if (L.has(key, name)) return L.plainLinear(name, key);
+        }
         const tr = try L.entry(try plan.partKey(&kb, prefix, cols, rows, "tr"));
         const t = try L.shape(try plan.partKey(&kb, prefix, cols, rows, "tr"));
         const kt = t[0];
@@ -520,6 +566,7 @@ pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, src: Source, c: Confi
             .conf = try L.plain(try std.fmt.bufPrint(&tb, "{s}.confidence_head.proj.weight", .{last}), null),
         };
     }
+    if (L.plain_count > 0) std.log.info("mixed pack: {d} float linears", .{L.plain_count});
     if (L.span_bytes > 0) std.log.info("rank cache: {d:.1} GiB of expert entries read whole in {d:.1} s", .{ @as(f64, @floatFromInt(L.span_bytes)) / (1 << 30), @as(f64, @floatFromInt(L.span_ns)) / 1e9 });
     return w;
 }

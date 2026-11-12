@@ -657,9 +657,9 @@ pub const Round = struct {
         const all = rd.clk_marks and (rd.clk_ratio == null or rd.clk_ratio.? == rd.cur_ratio);
         if (rd.clk != 0 and (all or (rd.clk_shard and PhaseTimer.shardMark(p)))) {
             const now = cuda.launch.count;
-            rd.launches[@intFromEnum(p)] += now -% rd.launch_mark;
+            rd.launches[@backingInt(p)] += now -% rd.launch_mark;
             rd.launch_mark = now;
-            try rd.clock(e, @intFromEnum(p));
+            try rd.clock(e, @backingInt(p));
         }
         if (rd.timer) |t| try t.mark(e.s, p);
     }
@@ -863,18 +863,26 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
     {
         var rot: [2]tri_norm.Rot = undefined;
         var calls: [2]exl3_linear.Call = undefined;
-        var n: usize = 0;
+        var n: usize = 0; // every call: the EXL3 ones and a mixed pack's plain indexer wq_b
+        var ne: usize = 0; // the EXL3 calls: their rotated-row slots in rd.xhq
         const qls = [_]?weights.Linear{ lay.wq_b, if (need_iq) lay.idx_wq_b else null };
         const outs = [_]u64{ rd.q, rd.iq };
-        for (qls) |ol| {
+        for (qls, 0..) |ol, i| {
             const l = ol orelse continue;
-            const xh = rd.xhq + n * R * c.q_lora * 2;
-            rot[n] = .{ .suh = l.suh, .h = xh };
-            calls[n] = .{ .layer = l, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = xh, .y = outs[n], .ldy = @intCast(l.n), .y_dtype = .bf16, .counters = 0 };
-            if (n == 0) calls[n].rope = .{ .cos = rope.cos, .sin = rope.sin, .pos = pos, .hd = @intCast(hd), .rd = @intCast(rd_dim) };
+            if (l.plain != 0) {
+                // EAQ v1.1's indexer wq_b is a BF16 nn.Linear: the q RMSNorm's unrotated rows, no suh, no q's RoPE.
+                calls[n] = .{ .layer = l, .x = rd.qr, .ldx = @intCast(l.k), .x_dtype = .bf16, .xh = 0, .y = outs[i], .ldy = @intCast(l.n), .y_dtype = .bf16, .counters = 0 };
+                n += 1;
+                continue;
+            }
+            const xh = rd.xhq + ne * R * c.q_lora * 2;
+            rot[ne] = .{ .suh = l.suh, .h = xh };
+            calls[n] = .{ .layer = l, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = xh, .y = outs[i], .ldy = @intCast(l.n), .y_dtype = .bf16, .counters = 0 };
+            if (ne == 0) calls[n].rope = .{ .cos = rope.cos, .sin = rope.sin, .pos = pos, .hd = @intCast(hd), .rd = @intCast(rd_dim) };
+            ne += 1;
             n += 1;
         }
-        try tri_norm.qKvNorm(t, rd.qa, lay.wq_a.n, lay.q_norm, c.eps, rot[0..n], rd.ykv, lay.kv_norm, rope.cos, rope.sin, pos, ring, ring_rows, rd.g(.wslot), true, rd_dim, rd.qr, rd.kout, R, lay.wq_a.n, hd);
+        try tri_norm.qKvNorm(t, rd.qa, lay.wq_a.n, lay.q_norm, c.eps, rot[0..ne], rd.ykv, lay.kv_norm, rope.cos, rope.sin, pos, ring, ring_rows, rd.g(.wslot), true, rd_dim, rd.qr, rd.kout, R, lay.wq_a.n, hd);
         try prompt.groupedRotated(e, ch, R, calls[0..n]);
     }
     // the prefetch: this layer's wo_a and wo_b behind q's linears
@@ -1295,6 +1303,8 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
 
 /// An EXL3 linear's words: their first byte and length (k * n values of k2 / 2 bits).
 fn linearBytes(l: weights.Linear) [2]u64 {
+    // A plain (mixed pack) linear has no trellis to prefetch; the prefetch skips a zero range.
+    if (l.plain != 0) return .{ 0, 0 };
     return .{ l.words, @as(u64, l.k) * l.n * l.k2 / 16 };
 }
 
