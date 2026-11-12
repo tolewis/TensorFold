@@ -30,6 +30,8 @@ const ring2d = @import("ring2d.zig");
 const rdma = @import("rdma.zig");
 const rdma_env = @import("rdma_env.zig");
 const pool_mod = @import("pool.zig");
+const shard = @import("shard.zig");
+const shard_ops = @import("shard_ops.zig");
 
 /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
 pub const chunk_rows = 2048;
@@ -52,6 +54,12 @@ pub const Options = struct {
     engram_dir: ?[]const u8 = null, // the Engram tables (none: a checkpoint without Engram layers)
     token_map: ?[]const u8 = null, // the compressed token map (the lane's JSON cache)
     pool: usize = 1 << 18, // positions of the streams' shared plane (their extents together)
+    // the positions one conversation may reach (its prompt and reply: the RoPE table's rows, the prompt chunks' and
+    // rounds' buckets); null: rank 0's (a follower adopts it at open), or the pool's on rank 0 (today's engine)
+    window: ?usize = null,
+    // TF_DS_KV_SHARD (shard.zig): owner-only compressed rows over the TP2 ranks; null: read from the environment on
+    // every rank alike (TF_DS_KV_SHARD, TF_DS_KV_SHARD_DECODE), as TF_DS_IDX_SPLIT is
+    kv_shard: ?shard.Mode = null,
     drafts: bool = true, // load the DSpark drafter
     rdma_devices: ?[]const u8 = null, // the decode gathers over RDMA on these devices (comma separated), else NCCL: TP2's
     // ring (rdma.zig), or at world 4 the 2D split's decode-size exchanges over its rings (ring2d.zig)
@@ -145,6 +153,11 @@ pub const Model = struct {
     // world 4: the 2D split's exchanges (prompt2d.zig, TP4's), with the RDMA rings when asked
     two: ?prompt2d.Two = null,
     rdma_rings: ?ring2d.Rings = null,
+    // the pool / window split and TF_DS_KV_SHARD (open): the positions one stream's extent may take at most (a part
+    // sharded; the request check's bound), the single-conversation limit reported (shard.plan), the shard's kernels
+    request_cap: usize = 0,
+    window_cap: usize = 0,
+    kvs: ?shard_ops.KvShard = null,
 
     /// Loads rank o.rank's weights from the lane's rank cache, links the ranks (rank 0 listens on o.port), opens NCCL
     /// and sets up every buffer. Needs `ctx` current on this thread.
@@ -171,7 +184,7 @@ pub const Model = struct {
         m.streams = o.streams;
         m.round_ms = o.round_ms orelse &draft.round_ms;
         if (m.round_ms.len == 0) return error.BadRoundMs;
-        m.pool_cap = o.pool;
+        m.pool_cap = o.pool; // (agree, below, compares it with the other rank's)
         m.fill_slot = 0;
         m.prof = false;
         m.timer = null;
@@ -196,6 +209,7 @@ pub const Model = struct {
         m.pgraphs = null;
         m.two = null;
         m.rdma_rings = null;
+        m.kvs = null;
         const d = ctx.d;
         m.cfg = try Config.read(a, io, o.model_dir);
         const c = &m.cfg;
@@ -220,6 +234,28 @@ pub const Model = struct {
         errdefer m.fan.close();
         m.comm = try m.fan.comm(o.rank, o.world);
         errdefer m.comm.deinit();
+
+        // the pool, the window and the shard: every rank's compared first thing after NCCL, before anything rank-local
+        // can fail and before any buffer depends on them (a follower without a window takes rank 0's). A setting this
+        // rank cannot parse is refused after the gather, so the other rank refuses with it instead of waiting. Then the
+        // plan (shard.plan: the effective single-conversation limit), the same on every rank from the same numbers.
+        const want_mode: anyerror!shard.Mode = if (o.kv_shard) |k| k else shard.Mode.parse(envOf("TF_DS_KV_SHARD"), envOf("TF_DS_KV_SHARD_DECODE"));
+        // the pool and window are 0008's (pool.zig): rank 0's pool is TF_DS_POOL over --context (native.open), a
+        // follower's its --pool; a window is --context on rank 0 and TF_DS_WINDOW on a follower (else rank 0's)
+        const want_pool: anyerror!usize = if (o.pool == 0) error.BadPool else o.pool;
+        const want_window: anyerror!?usize = windowOf(o);
+        const ag = try agree(m, o, want_mode, want_pool, want_window);
+        const mode = ag.mode;
+        const pool = ag.pool;
+        const window = ag.window;
+        m.pool_cap = pool;
+        if (mode != .off and (o.world != 2 or sp.pair != null)) return error.KvShardNeedsTwoRanks;
+        const pl = try shard.plan(pool, window, o.round_rows, o.world, mode != .off);
+        // PORT(round2): the spill store's compat digest carries the owner layout (dsv41-state's StateLayout.owner_layout:
+        // owner_sharded with the part size) and its block lineage the part salt; until then the spill tier must stay off
+        // with TF_DS_KV_SHARD=1 (a replicated pack reads a sharded plane's local rows as pool rows)
+        m.request_cap = pl.extent;
+        m.window_cap = pl.window;
         // TP2: the decode gathers' RDMA ring (both ranks connect before either returns)
         if (sp.pair == null and o.rdma_devices != null) {
             const list = o.rdma_devices.?;
@@ -250,8 +286,9 @@ pub const Model = struct {
 
         // the RoPE tables (the served build's bits: torch CPU pow and polar), every position a stream can reach (the window, not the pool)
         const half = c.rope_dim / 2;
-        const win = try pool_mod.window(o.pool, if (std.c.getenv("TF_DS_WINDOW")) |v| std.mem.span(v) else null);
-        const rope_rows = pool_mod.ropeRows(win, round.max_rows);
+        // (0008's ropeRows over the longest extent a stream may take: the window's rows rounded up to whole blocks,
+        // and in a part when sharded; the pool's only when the pool is the window)
+        const rope_rows = pool_mod.ropeRows(m.request_cap, round.max_rows);
         m.rope_buf = try cuda.DeviceBuffer.alloc(d, 4 * rope_rows * half * 4);
         errdefer m.rope_buf.free();
         {
@@ -289,8 +326,17 @@ pub const Model = struct {
         }
         m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
         m.eng.round_rows = o.round_rows;
-        m.ch = try prompt.Chunk.init(&m.eng, &m.arena, chunk_rows, o.pool);
-        m.caches = try prompt.Caches.init(&m.eng, &m.arena, o.pool, m.streams);
+        m.ch = try prompt.Chunk.init(&m.eng, &m.arena, chunk_rows, m.request_cap);
+        errdefer if (m.kvs) |*x| x.k.unload(); // (registered before the load: nothing between them leaks it)
+        if (mode != .off) {
+            // TF_DS_KV_SHARD: the fetch kernels, the parts (a trash row a round row), owner-only planes
+            if (!cuda.kernels.available) return error.NoKernelImages;
+            const sh = try shard.Shard.init(o.rank, o.world, pool, round.max_rows);
+            m.kvs = .{ .sh = sh, .mode = mode, .k = try shard_ops.Kernels.load(d, cuda.kernels.dsv41_shard) };
+            m.eng.kv = &m.kvs.?;
+            m.caches = try prompt.Caches.initShard(&m.eng, &m.arena, pool, m.streams, sh);
+            try m.ch.useShard(&m.eng, &m.arena, prompt.prompt_fetch_rows, m.request_cap);
+        } else m.caches = try prompt.Caches.init(&m.eng, &m.arena, pool, m.streams);
         m.blas = try cublas.Blas.open(m.stream, m.ch.blas_ws);
         errdefer m.blas.close();
         m.eng.blas = &m.blas;
@@ -300,7 +346,8 @@ pub const Model = struct {
             r.* = try m.arena.take(m.streams * m.eng.ringBytes());
             try d.check(d.api.cuMemsetD8Async(r.*, 0, m.streams * m.eng.ringBytes(), m.stream.handle), "cuMemsetD8Async");
         }
-        m.rd = try round.Round.init(&m.eng, &m.arena, a, o.pool);
+        m.rd = try round.Round.init(&m.eng, &m.arena, a, m.request_cap);
+        if (m.kvs != null) try m.rd.useShard(&m.eng, &m.arena, a);
         m.amax = try m.arena.take(round.max_rows * 4);
         if (o.graphs) m.graphs = round.Graphs.init(gpa);
         if (o.side) try m.rd.useSide(&m.eng);
@@ -358,7 +405,89 @@ pub const Model = struct {
         m.ids64 = try a.alloc(i64, chunk_rows);
         m.vocab = sp.world * (if (m.two) |t| t.hw[0] + t.hw[1] else m.w.head.n); // 2D: both pairs' vocabulary parts
         m.logits = try a.alloc(f32, round.max_rows * m.vocab);
+        if (mode != .off or window != pool) m.notePlan(mode, pl);
         return m;
+    }
+
+    /// The environment variable `name` (null when unset).
+    fn envOf(name: [:0]const u8) ?[]const u8 {
+        return std.mem.span(std.c.getenv(name) orelse return null);
+    }
+
+    /// The window this rank was given: `o.window` (rank 0: --context), else TF_DS_WINDOW (0008: the recipe gives it to
+    /// every rank, = CONTEXT; never past the pool), else null (agree takes rank 0's). When both are given they must be one
+    /// number, so the RoPE tables and the request bound cannot disagree on a rank.
+    fn windowOf(o: Options) !?usize {
+        return pickWindow(o.window, o.pool, envOf("TF_DS_WINDOW"));
+    }
+    fn pickWindow(given: ?usize, pool: usize, env: ?[]const u8) !?usize {
+        const set = env != null and std.mem.trim(u8, env.?, " \t\r\n").len != 0;
+        const from_env: ?usize = if (set) try pool_mod.window(pool, env) else null;
+        if (given) |w| {
+            if (from_env) |e| if (e != @min(w, pool)) return error.BadWindow;
+            return w;
+        }
+        return from_env;
+    }
+
+    /// What every rank serves once agree has compared them.
+    const Agreed = struct { mode: shard.Mode, pool: usize, window: usize };
+
+    /// Every rank's (mode, pool, window, round rows) gathered and compared before any buffer depends on them. A rank
+    /// whose shard switch or pool did not parse sends a sentinel (bad_setting) instead of failing before the gather,
+    /// then refuses with its own error after it; the other rank sees the sentinel and refuses too (KvShardMismatch),
+    /// so neither waits on the other. A rank whose switch, pool or round rows differ from rank 0's refuses
+    /// (KvShardMismatch, on both at once), a window given on both must match, and a rank without one takes rank 0's
+    /// (the follower lane has no --context).
+    fn agree(m: *Model, o: Options, want_mode: anyerror!shard.Mode, want_pool: anyerror!usize, want_window: anyerror!?usize) !Agreed {
+        const n: usize = 4;
+        const bad_setting: u64 = 0xff;
+        const mine = [n]u64{
+            if (want_mode) |x| @backingInt(x) else |_| bad_setting,
+            if (want_pool) |x| x else |_| 0,
+            if (want_window) |x| x orelse 0 else |_| bad_setting,
+            o.round_rows,
+        };
+        var dev = try cuda.DeviceBuffer.alloc(m.ctx.d, (1 + o.world) * n * 8);
+        defer dev.free();
+        try dev.upload(0, std.mem.sliceAsBytes(&mine));
+        try m.comm.allGather(dev.ptr, dev.ptr + n * 8, n, .u64, m.stream);
+        try m.stream.synchronize();
+        var all: [4][n]u64 = undefined;
+        if (o.world > all.len) return error.BadWorld;
+        try dev.download(n * 8, std.mem.sliceAsBytes(all[0..o.world]));
+        // this rank's own parse errors first (each rank names what it could not read), then any other rank's
+        const mode = try want_mode;
+        const pool = try want_pool;
+        const own_window = try want_window;
+        for (all[0..o.world]) |r| {
+            if (r[0] == bad_setting or r[1] == 0 or r[2] == bad_setting) return error.KvShardMismatch;
+            if (r[0] != all[0][0] or r[1] != all[0][1] or r[3] != all[0][3]) return error.KvShardMismatch;
+            if (r[2] != 0 and all[0][2] != 0 and r[2] != all[0][2]) return error.KvShardMismatch;
+        }
+        const window = if (own_window) |w| w else if (all[0][2] != 0) all[0][2] else pool;
+        return .{ .mode = mode, .pool = pool, .window = window };
+    }
+
+    /// The start-up's note of what it serves when the pool is not the window or the shard is on: the pool, its parts,
+    /// the single-conversation limit (below the window asked: said so, with the numbers), the compressed planes'
+    /// bytes a rank (calculated: rows by the formula; the arena's figure is the measured one).
+    fn notePlan(m: *const Model, mode: shard.Mode, pl: shard.Plan) void {
+        var src: [16]shard.Source = undefined;
+        var ns: usize = 0;
+        const c = m.eng.c;
+        for (m.w.layers) |lay| {
+            if (lay.comp_wkv == null or ns == src.len) continue;
+            src[ns] = .{ .ratio = lay.ratio, .comp_row = c.head_dim / 2 + c.head_dim / 16, .idx_row = if (lay.idx_wk != null) c.index_head_dim / 2 + c.index_head_dim / 32 else 0 };
+            ns += 1;
+        }
+        const sharded = mode != .off;
+        const trash: usize = if (m.kvs) |k| k.sh.trash else 0;
+        const planes = shard.poolBytes(src[0..ns], pl.pool, m.world, sharded, trash);
+        const flat = shard.poolBytes(src[0..ns], pl.pool, m.world, false, 0);
+        std.log.info("dsv41: pool {d} positions, {s} {d} a part; a conversation may use up to {d} tokens{s}; compressed planes {d} MiB a rank ({d} MiB replicated); arena {d} MiB used", .{
+            pl.pool, @tagName(mode), pl.part, pl.window, if (pl.shrunk) " (less than the window asked: a part holds no more)" else "", planes >> 20, flat >> 20, m.arena.used >> 20,
+        });
     }
 
     pub fn close(m: *Model) void {
@@ -385,6 +514,7 @@ pub const Model = struct {
         if (m.tables) |*t| t.close();
         if (m.rdma_rings) |*r| r.close(m.gpa);
         m.blas.close();
+        if (m.kvs) |*x| x.k.unload();
         m.arena.deinit();
         m.rope_buf.free();
         m.ex.unload();
@@ -493,23 +623,67 @@ pub const Model = struct {
     /// The compressed rows of positions [0, at) of the extent at `from` copied into the extent at `to` (a kept prompt
     /// resumed in another extent while a live stream holds its own), in the stream's order: every kv-source layer's
     /// codes and scales and its index keys, the rows view() places at those positions.
+    /// TF_DS_KV_SHARD: the extents lie in one part each (else CrossesPart, nothing copied); the index keys copy on
+    /// every rank as replicated, the compressed rows by shard.Shard.extentMove: within a part its owner copies them
+    /// (the other rank holds none), across parts (a carry) the source's owner sends them straight from its plane and the
+    /// destination's owner receives them into its own, both ranks in this same order (lanes.zig runs copyExtent on
+    /// every rank in its frame order). The source's rows stay; nothing is freed.
     pub fn copyExtent(m: *Model, from: usize, to: usize, at: usize) !void {
         const c = m.eng.c;
         const cs = &m.caches;
+        const mv: ?shard.Move = if (cs.shard) |sh| try sh.extentMove(from, to, at) else null;
+        var spans: [2 * 64]comm_mod.Span = undefined;
+        var ns: usize = 0;
         for (m.eng.w.layers, 0..) |lay, i| {
             if (lay.comp_wkv == null) continue;
             const r: usize = lay.ratio;
             if (from % r != 0 or to % r != 0 or at % r != 0) return error.BadView;
             const n = at / r;
-            try m.copySpan(cs.comp_codes[i], from / r, to / r, n, c.head_dim / 2);
-            try m.copySpan(cs.comp_scales[i], from / r, to / r, n, c.head_dim / 16);
+            const cb = c.head_dim / 2;
+            const sb = c.head_dim / 16;
+            if (mv) |x| switch (x) {
+                .none => {},
+                .local => |l| {
+                    try m.copySpan(cs.comp_codes[i], l.from / r, l.to / r, n, cb);
+                    try m.copySpan(cs.comp_scales[i], l.from / r, l.to / r, n, sb);
+                },
+                .send => |t| {
+                    spans[ns] = .{ .ptr = cs.comp_codes[i] + t.from / r * cb, .bytes = n * cb };
+                    spans[ns + 1] = .{ .ptr = cs.comp_scales[i] + t.from / r * sb, .bytes = n * sb };
+                    ns += 2;
+                },
+                .recv => |t| {
+                    spans[ns] = .{ .ptr = cs.comp_codes[i] + t.to / r * cb, .bytes = n * cb };
+                    spans[ns + 1] = .{ .ptr = cs.comp_scales[i] + t.to / r * sb, .bytes = n * sb };
+                    ns += 2;
+                },
+            } else {
+                try m.copySpan(cs.comp_codes[i], from / r, to / r, n, cb);
+                try m.copySpan(cs.comp_scales[i], from / r, to / r, n, sb);
+            }
             if (lay.idx_wk != null) {
                 try m.copySpan(cs.idx_codes[i], from / r, to / r, n, c.index_head_dim / 2);
                 try m.copySpan(cs.idx_scales[i], from / r, to / r, n, c.index_head_dim / 32);
             }
         }
+        // PORT(round2): a carry (lanes' frame order, parts.zig's carry plan: only to avoid a recompute, an eviction or a
+        // pause; staged spill writes and the new generation published after both ranks finish) calls this across parts
+        const x = mv orelse return;
+        var bytes: usize = 0;
+        for (spans[0..ns]) |sp| bytes += sp.bytes;
+        switch (x) {
+            .send => |t| try m.comm.sendSpans(spans[0..ns], t.peer, m.stream),
+            .recv => |t| try m.comm.recvSpans(spans[0..ns], t.peer, m.stream),
+            else => return,
+        }
+        if (m.kvs) |*k| {
+            k.stats.carries += 1;
+            k.stats.carry_bytes += bytes;
+        }
     }
 
+    /// Rows [from, from + n) of `plane` (rows of `row` bytes; a sharded plane's rows of this rank's part) to rows
+    /// [to, to + n), in the stream's order.
     fn copySpan(m: *Model, plane: u64, from: usize, to: usize, n: usize, row: usize) !void {
         const d = m.ctx.d;
         try d.check(d.api.cuMemcpyDtoDAsync_v2(plane + to * row, plane + from * row, n * row, m.stream.handle), "cuMemcpyDtoDAsync");
@@ -728,7 +902,7 @@ pub const Model = struct {
         const e = &m.eng;
         if (m.prof) try m.stream.synchronize(); // (the GPU idle, so the issue time shows whether the host keeps it fed)
         const t0 = m.now();
-        try round.forward(e, &m.rd, &m.ch, &m.caches, m.rings, if (m.eh) |*x| x else null, &.{}, rows, m.pool_cap, null, if (m.graphs) |*g| g else null);
+        try round.forward(e, &m.rd, &m.ch, &m.caches, m.rings, if (m.eh) |*x| x else null, &.{}, rows, m.request_cap, null, if (m.graphs) |*g| g else null);
         if (m.prof) {
             m.t_enqueue = m.now() - t0;
             try m.stream.synchronize();
@@ -825,3 +999,14 @@ pub const Model = struct {
         try dr.pass(&m.eng, &m.ch, pool, tokens, q0, slots, steps, null);
     }
 };
+
+test "pickWindow: --context wins and must match TF_DS_WINDOW; a follower takes TF_DS_WINDOW, else rank 0's" {
+    try std.testing.expectEqual(@as(?usize, 1048576), try Model.pickWindow(1048576, 2101248, null));
+    try std.testing.expectEqual(@as(?usize, 1048576), try Model.pickWindow(1048576, 2101248, "1048576"));
+    try std.testing.expectEqual(@as(?usize, 1048576), try Model.pickWindow(1048576, 2101248, " "));
+    try std.testing.expectError(error.BadWindow, Model.pickWindow(1048576, 2101248, "65536"));
+    try std.testing.expectError(error.BadWindow, Model.pickWindow(null, 2101248, "x"));
+    try std.testing.expectEqual(@as(?usize, 65536), try Model.pickWindow(null, 2101248, "65536"));
+    try std.testing.expectEqual(@as(?usize, 2101248), try Model.pickWindow(null, 2101248, "9999999")); // never past the pool
+    try std.testing.expectEqual(@as(?usize, null), try Model.pickWindow(null, 2101248, null));
+}

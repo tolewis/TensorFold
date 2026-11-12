@@ -29,6 +29,7 @@ const kernels = [_]Kernel{
     .{ .name = "torch_nemotron_constants", .src = "torch_ops/nemotron_constants", .flags = torch_ops },
     .{ .name = "dsv41_ops", .flags = torch_ops }, // ours: the DeepSeek-V4.1 casts torch_ops/ lacks
     .{ .name = "dsv41_torch", .flags = torch_ops }, // ours: DeepSeek-V4.1 torch arithmetic at torch's rounding points
+    .{ .name = "dsv41_shard", .flags = torch_ops }, // ours: TF_DS_KV_SHARD's fetch and select byte movers (GLM 0118 port)
     .{ .name = "dsv41_rdma", .src = "dsv41/rdma_gather", .flags = &.{"-O3"} }, // ours: the decode gathers' RDMA kernel pair
 };
 

@@ -27,6 +27,8 @@ const exl3_experts2d = @import("exl3_experts2d.zig");
 const engram = @import("engram.zig");
 const exact = @import("exact.zig");
 const ops_mod = @import("ops.zig");
+const shard = @import("shard.zig");
+const shard_ops = @import("shard_ops.zig");
 
 const Engine = prompt.Engine;
 const Chunk = prompt.Chunk;
@@ -76,6 +78,9 @@ pub const Rows = struct {
     bases: ?[]const i64 = null,
     ends: ?[]const i64 = null,
     windows: ?[]const Window = null,
+    /// TF_DS_KV_SHARD: each row's part (its extent's owner), plain data from the lane's windows (lanes.Built); null or
+    /// a negative entry: the part of the row's extent base. A part that is not its base's is refused (BadPart).
+    parts: ?[]const i64 = null,
 
     fn slotOf(r: Rows, i: usize) i64 {
         return if (r.slots) |v| v[i] else 0;
@@ -86,7 +91,15 @@ pub const Rows = struct {
     fn endOf(r: Rows, i: usize) i64 {
         return if (r.ends) |v| v[i] else r.end;
     }
+    /// The rank holding row i's compressed rows (TF_DS_KV_SHARD; shard.rowOwner: a malformed extent is BadRound).
+    pub fn ownerOf(r: Rows, i: usize, sh: shard.Shard) !u32 {
+        return shard.rowOwner(sh, r.baseOf(i), r.endOf(i), if (r.parts) |v| v[i] else -1);
+    }
 };
+
+/// TF_DS_KV_SHARD's index tensors by row (shard.SGlue, int64 [R] each at max_rows apart, a rank's own: Round.sglue).
+const SGlue = shard.SGlue;
+const sglue_n = shard.sglue_n;
 
 /// A window of a concurrent round: its first row, its rows, its stream's ids through the window (Engram's n-grams).
 pub const Window = struct { row: usize, n: usize, seq: []const i32 };
@@ -197,6 +210,21 @@ pub const Round = struct {
     clk_ratio: ?u8 = null, // phase clocks only in the layers of this compress ratio (TF_DS_CLOCK_MARKS=3: ratio 2)
     cur_ratio: u8 = 0, // the layer a stretch is on (its compress ratio) // clocks at every phase mark too (Model.useClock(true)), not only around the stretches
     clk: u64 = 0, // [1 + 2 * max_clocks] u64: the count, then each clock and its phase (PhaseTimer.Phase or clock_*)
+    // TF_DS_KV_SHARD (useShard, before any capture): the rows' shard glue (int64 [sglue_n, max_rows]); the decode fetch's
+    // gathered rows (codes, scales [world][round_rows][index_topk] rows) and the renumbered (or masked) picks
+    // [round_rows, index_topk + 16]; owner decode's both ranks' queries [world][round_rows][heads][head_dim] bf16, the
+    // other rank's heads' outputs, its rotated wo_a inputs [groups][round_rows, K] fp16 sent and received, and each
+    // layer's other-rank sinks (f32 [heads]) and wo_a suh (fp16, its groups' concatenated)
+    sglue: u64 = 0,
+    fc: u64 = 0,
+    fs: u64 = 0,
+    fidx: u64 = 0,
+    qall: u64 = 0,
+    o_peer: u64 = 0,
+    xh_peer: u64 = 0,
+    xh_recv: u64 = 0,
+    peer_sink: []u64 = &.{},
+    peer_suh: []u64 = &.{},
 
     pub fn init(e: *const Engine, a: *prompt.Arena, gpa: std.mem.Allocator, pool_cap: usize) !Round {
         const c = e.c;
@@ -222,6 +250,16 @@ pub const Round = struct {
         rd.bucket = 0;
         rd.has_cand = false;
         rd.kk = 0;
+        rd.sglue = 0;
+        rd.fc = 0;
+        rd.fs = 0;
+        rd.fidx = 0;
+        rd.qall = 0;
+        rd.o_peer = 0;
+        rd.xh_peer = 0;
+        rd.xh_recv = 0;
+        rd.peer_sink = &.{};
+        rd.peer_suh = &.{};
         rd.glue = try a.take(glue_n * max_rows * 8); // glue rows at max_rows apart
         rd.inputs = try a.take(5 * R * 8);
         rd.ids = rd.inputs;
@@ -332,6 +370,55 @@ pub const Round = struct {
         rd.pf_out = false;
         rd.timer = null;
         return rd;
+    }
+
+    /// TF_DS_KV_SHARD (e.kv): the sharded decode's buffers, every one allocated here, before any graph capture (a
+    /// round's rows change their contents, never their addresses); owner decode also gathers the other rank's sinks and
+    /// wo_a suh of every layer once (an all-gather of each: both ranks call this at the same point of open).
+    pub fn useShard(rd: *Round, e: *const Engine, a: *prompt.Arena, gpa: std.mem.Allocator) !void {
+        const kv = e.kv orelse return error.NoKvShard;
+        const c = e.c;
+        const R = e.round_rows;
+        const K = c.index_topk;
+        const world: usize = kv.sh.world;
+        rd.sglue = try a.take(sglue_n * max_rows * 8);
+        rd.fidx = try a.take(R * (K + 16) * 8);
+        if (kv.mode == .fetch) {
+            rd.fc = try a.take(world * R * K * c.head_dim / 2);
+            rd.fs = try a.take(world * R * K * c.head_dim / 16);
+        }
+        if (kv.mode != .owner) return;
+        const hl = e.heads();
+        const hd = c.head_dim;
+        const l0 = e.w.layers[0];
+        var wo_k: usize = 0;
+        for (l0.wo_a[0..l0.groups]) |wo| wo_k += wo.k;
+        rd.qall = try a.take(world * R * hl * hd * 2);
+        rd.o_peer = try a.take(R * hl * hd * 2);
+        rd.xh_peer = try a.take(R * wo_k * 2);
+        rd.xh_recv = try a.take(R * wo_k * 2);
+        rd.peer_sink = try gpa.alloc(u64, e.w.layers.len);
+        rd.peer_suh = try gpa.alloc(u64, e.w.layers.len);
+        const peer = kv.sh.peer();
+        for (e.w.layers, 0..) |lay, li| {
+            var k: usize = 0;
+            for (lay.wo_a[0..lay.groups]) |wo| k += wo.k;
+            if (k != wo_k) return error.UnevenWoA; // (the exchange's rows: every layer's wo_a alike)
+            // the other rank's slice of each, gathered in rank order: its own heads' sinks, its groups' suh
+            const sinks = try a.take(world * hl * 4);
+            try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(sinks + kv.sh.rank * hl * 4, lay.sink, hl * 4, e.s.handle), "cuMemcpyDtoDAsync");
+            try e.comm.allGatherInPlace(sinks, hl * 4, e.s);
+            rd.peer_sink[li] = sinks + peer * hl * 4;
+            const suh = try a.take(world * wo_k * 2);
+            try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(suh + kv.sh.rank * wo_k * 2, rd.wo_suh[li], wo_k * 2, e.s.handle), "cuMemcpyDtoDAsync");
+            try e.comm.allGatherInPlace(suh, wo_k * 2, e.s);
+            rd.peer_suh[li] = suh + peer * wo_k * 2;
+        }
+        try e.s.synchronize();
+    }
+
+    fn sgl(rd: *const Round, k: SGlue) u64 {
+        return rd.sglue + @as(u64, @backingInt(k)) * max_rows * 8;
     }
 
     /// The mixes' side work (the dots of the stored streams and the Sinkhorn) on a stream of its own, as the served
@@ -488,6 +575,23 @@ fn setGlue(e: *const Engine, rd: *Round, rows: Rows) !void {
     try prompt.upload(e, rd.inputs, &in, 5 * R * 8);
     rd.ids = rd.inputs;
     rd.pos = rd.inputs + R * 8;
+    if (e.kv) |kv| try setShardGlue(e, rd, rows, kv.sh);
+}
+
+/// TF_DS_KV_SHARD's glue for these rows on this rank (SGlue), uploaded in one copy: the replicated glue's store
+/// targets moved into this rank's plane (or a trash row), each row's local extent base and holding flag, its fetch base.
+fn setShardGlue(e: *const Engine, rd: *Round, rows: Rows, sh: shard.Shard) !void {
+    const R = rows.ids.len;
+    if (R > max_rows) return error.WindowTooWide;
+    var bases: [max_rows]i64 = undefined;
+    var ends: [max_rows]i64 = undefined;
+    for (0..R) |i| {
+        bases[i] = rows.baseOf(i);
+        ends[i] = rows.endOf(i);
+    }
+    var hg: [sglue_n * max_rows]i64 = undefined;
+    try shard.glueRows(sh, rows.pos[0..R], bases[0..R], ends[0..R], if (rows.parts) |v| v[0..R] else null, e.c.index_topk, max_rows, &hg);
+    try prompt.upload(e, rd.sglue, &hg, hg.len * 8);
 }
 
 /// The layer's RoPE table rows (model.py _cs: the compressed table for a compressed layer).
@@ -610,9 +714,11 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
                 try tri_norm.ropeHeads(t, rd.ik, rope.cos, rope.sin, gpos, rd_dim, false, R, 1, id);
                 try tri_attn.fp4Store(t, rd.ik, id, cs.idx_codes[li], cs.idx_scales[li], ctarget, R, id, 32, false);
             }
-            // the latent rotated in place (it is not read again), then stored
+            // the latent rotated in place (it is not read again), then stored (TF_DS_KV_SHARD: into this rank's plane,
+            // the owner's row or the round row's trash row)
             try tri_norm.ropeHeads(t, rd.lat, rope.cos, rope.sin, gpos, rd_dim, false, R, 1, hd);
-            try tri_attn.fp4Store(t, rd.lat, hd, cs.comp_codes[li], cs.comp_scales[li], ctarget, R, hd, 16, true);
+            const ltarget = if (e.kv != null) rd.sgl(if (ratio == 1) .ltarget1 else .ltarget2) else ctarget;
+            try tri_attn.fp4Store(t, rd.lat, hd, cs.comp_codes[li], cs.comp_scales[li], ltarget, R, hd, 16, true);
         }
         const src = sh.kv_layer orelse return error.NoKvSource;
         const vis = rd.g(if (ratio == 1) .vis1 else .vis2);
@@ -684,7 +790,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
     try rd.mark(e, .a_idx);
     // rot_attn: the merge applies the inverse RoPE and writes wo_a's rotated input rows; wo_ab with its fold
     const gk = lay.wo_a[0].k;
-    try tri_attn.sparseAttn(t, .{
+    const attn: tri_attn.Attn = .{
         .q = rd.q,
         .out = rd.o,
         .rows = R,
@@ -706,7 +812,14 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
         .ring_rows = ring_rows,
         .rot = .{ .cos = rope.cos, .sin = rope.sin, .rd = rd_dim, .suh = rd.wo_suh[li], .xh = rd.xhwo, .gh = gk / hd },
         .parts = .{ .pm = rd.pm_, .pl = rd.pl_, .po = rd.po_ },
-    });
+    };
+    // TF_DS_KV_SHARD: a compressed layer's picked rows are on each row's owner only
+    const mode: shard.Mode = if (e.kv) |kv| (if (ratio != 0 and attn.n_idx > 0) kv.mode else .off) else .off;
+    switch (mode) {
+        .off => try tri_attn.sparseAttn(t, attn),
+        .fetch => try fetchDecode(e, rd, attn, ratio),
+        .owner => try ownerDecode(e, rd, attn, ratio, li),
+    }
     try rd.mark(e, .a_core);
     var calls: [exl3_linear.gmax]exl3_linear.Call = undefined;
     const uw = lay.groups * lay.wo_a[0].n;
@@ -726,6 +839,97 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
     try prompt.groupedRotated(e, ch, R, &cb_call);
     // the prefetch behind wo_b: the ffn mix's weights, the router, the shared expert's gate
     try rd.prefetch(e, &.{ .{ lay.hc_ffn[0], hcFnBytes(c) }, .{ lay.gate_w, @as(u64, c.experts) * c.hidden * 2 }, lay.experts.shared_gate, lay.experts.shared_up, lay.experts.shared_down }, prefetch_budget / 2);
+}
+
+/// TF_DS_KV_SHARD's decode attention by sparse fetch (the reference): each rank packs the picks of the rows it holds
+/// (codes and scales from its plane at the row's local base, pick order) into its slot of the gathered buffer
+/// ([world][R][index_topk] rows), renumbers every row's picks to its row there (relative: j), the slots all-gathered in
+/// place; then both ranks attend every row for their own heads over the gathered rows at the row's fetch base. The
+/// same schedule on both ranks whoever holds the rows (an all-gather of fixed size a round's rows), every buffer the
+/// round's own (graph-safe); each row reads the replicated bytes in the replicated order (shard.zig's tests).
+fn fetchDecode(e: *const Engine, rd: *Round, a: tri_attn.Attn, ratio: usize) !void {
+    const c = e.c;
+    const R = rd.r;
+    const K = c.index_topk;
+    const kk = a.n_idx;
+    if (kk > K or rd.fc == 0) return error.NoKvShard;
+    const cb = c.head_dim / 2;
+    const sb = c.head_dim / 16;
+    const final = R > tri.decode_rows;
+    const kos = if (final) (kk + 15) / 16 * 16 else kk;
+    const sl = shard.decodeSlots(e.kv.?.sh.rank, R, K, cb, sb);
+    try shard_ops.fetch(&e.kv.?.k, e.s, .{
+        .codes = a.comp.fp4.codes,
+        .scales = a.comp.fp4.scales,
+        .cb = cb,
+        .sb = sb,
+        .idx = a.idx,
+        .ks = kk,
+        .kk = kk,
+        .rows = R,
+        .sbase = rd.sgl(if (ratio == 1) .lbase1 else .lbase2),
+        .own = rd.sgl(.own),
+        .copy = true,
+        .dcodes = rd.fc + sl.codes,
+        .dscales = rd.fs + sl.scales,
+        .dk = K,
+        .out = rd.fidx,
+        .kos = kos,
+        .how = .relative,
+    });
+    try e.comm.allGatherInPlace(rd.fc, sl.slot_c, e.s);
+    try e.comm.allGatherInPlace(rd.fs, sl.slot_s, e.s);
+    var b = a;
+    b.comp = .{ .fp4 = .{ .codes = rd.fc, .scales = rd.fs } };
+    b.idx = rd.fidx;
+    b.cbase = rd.sgl(.fbase);
+    try tri_attn.sparseAttn(e.t, b);
+}
+
+/// TF_DS_KV_SHARD's owner-computed decode: the ranks' queries gathered; each rank attends the rows it holds (the
+/// others' picks masked to none) for its own heads (its sinks, its wo_a rotation: the replicated call over its own
+/// plane at the row's local base) and then for the other rank's heads with that rank's queries, sinks and wo_a suh
+/// (the same 32-head kernels, no 64-head variant needed), whose rotated wo_a inputs go back in one exchange; a rank
+/// takes the returned rows for the rows it does not hold. Every head of a row is computed by the kernel, keys and
+/// order its own rank would use, so the bits are the replicated ones (GPU validation: docs/port/shard-attn.md).
+/// Rounds of the split path only (the merge applies the rotation; tri.decode_rows is the round's bound).
+/// PORT(kit): a 64-head variant of _sparse_attn_part and its merge with per-head sinks and both ranks' suh (an
+/// explicitly audited kit; the recorded one has none) would make the two 32-head passes one.
+fn ownerDecode(e: *const Engine, rd: *Round, a: tri_attn.Attn, ratio: usize, li: usize) !void {
+    const c = e.c;
+    const kv = e.kv.?;
+    const R = rd.r;
+    const kk = a.n_idx;
+    const hl = e.heads();
+    const hd = c.head_dim;
+    if (R > tri.decode_rows) return error.NotPortedYet; // (a one-pass round has no merge to carry the rotation)
+    if (rd.qall == 0 or kk > c.index_topk) return error.NoKvShard;
+    const rot = a.rot orelse return error.NoRotation;
+    const lay = e.w.layers[li];
+    const gk = lay.wo_a[0].k;
+    const wo_k = lay.groups * gk;
+    const peer = kv.sh.peer();
+    // both ranks' queries, rank after rank: [world][R][hl][hd]
+    try e.comm.allGather(a.q, rd.qall, R * hl * hd, .bf16, e.s);
+    // the picks of the rows this rank holds, none for the others'
+    try shard_ops.fetch(&kv.k, e.s, .{ .cb = hd / 2, .sb = hd / 16, .idx = a.idx, .ks = kk, .kk = kk, .rows = R, .own = rd.sgl(.own), .copy = false, .dk = 0, .out = rd.fidx, .kos = kk, .how = .mask });
+    var mine = a;
+    mine.idx = rd.fidx;
+    mine.cbase = rd.sgl(if (ratio == 1) .lbase1 else .lbase2);
+    try tri_attn.sparseAttn(e.t, mine);
+    var theirs = mine;
+    theirs.q = rd.qall + peer * R * hl * hd * 2;
+    theirs.out = rd.o_peer;
+    theirs.sink = rd.peer_sink[li];
+    var prot = rot;
+    prot.suh = rd.peer_suh[li];
+    prot.xh = rd.xh_peer;
+    theirs.rot = prot;
+    try tri_attn.sparseAttn(e.t, theirs);
+    // the other rank's heads of my rows to it, mine of its rows from it; then its rows' inputs in place
+    try e.comm.exchange(rd.xh_peer, R * wo_k, rd.xh_recv, R * wo_k, .f16, peer, e.s);
+    const x = shard.xhPlanes(R, lay.groups, gk);
+    try shard_ops.select(&kv.k, e.s, rd.xh_recv, rot.xh, rd.sgl(.own), 0, R, x.row_bytes, x.planes, x.plane_bytes);
 }
 
 /// Model.moe of a decode window (shared_side off: SHARED_OVERLAP unset in the served lane): the gate's chunk sums
@@ -911,6 +1115,11 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
     rd.has_cblk = false;
     rd.kk = 0;
     try setGlue(e, rd, rows);
+    if (e.kv) |kv| switch (kv.mode) {
+        .off => {},
+        .fetch => kv.stats.fetch_rounds += 1,
+        .owner => kv.stats.owner_rounds += 1,
+    };
     var cy: Carry = .{ .h = rd.h, .spare = rd.h_alt, .pre = rd.pre, .pre_f = rd.pre_f };
     // the round's Engram reads, every layer's at once (AIO): hashed and submitted once the first stretch is issued
     // (its GPU time covers the reads), landed on the host before each Engram layer's stretch

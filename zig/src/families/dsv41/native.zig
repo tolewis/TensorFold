@@ -21,6 +21,18 @@
 //!   TF_DS_FIX_K=K                               a measurement: every drafted stream verifies K drafts a round
 //!   TF_DS_SOLO_OVERHEAD=1                       a lone drafted stream's head windows cost the fixed draft allowance
 //!   TF_DS_NO_COPIES=1                           a drafted stream proposes no suffix-lookup copy windows
+//!   TF_DS_POOL=P, TF_DS_WINDOW=W                (0008, pool.zig) the pool's positions, every stream's extents
+//!                                               together (unset: the context), and the window a request may use
+//!                                               (rank 0: the context; a follower without it takes rank 0's);
+//!                                               rank 1's pool is its --pool. Model.open compares the ranks' pool and
+//!                                               window before any request. With TF_DS_KV_SHARD=1 the same pool is cut
+//!                                               into one part a rank, each holding the whole window
+//!   TF_DS_KV_SHARD=1                            (GLM 0118's port, shard.zig; TP2 only, off by default) each
+//!                                               conversation's compressed latents held once, on the rank whose half
+//!                                               of the pool its extent lies in; prompts fetch the picked rows from it,
+//!                                               rounds too (TF_DS_KV_SHARD_DECODE=fetch, the default) or the owner
+//!                                               attends both ranks' heads (=owner). A request then fits a part: the
+//!                                               limit is reported (Loaded.window, the log), never silently halved
 //! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). The pool holds --context
 //! positions for every stream together (each takes an extent: its prompt, its max_tokens and a round's rows).
 //! TF_TP_WORLD=4: the four nodes of the exact 2D split (prompt2d.zig), ranks 1-3 `tf-dsv41-lanes` following on the
@@ -66,6 +78,9 @@ pub const Loaded = struct {
     snaps: ?Snaps = null,
     /// Images in requests (the server renders their placeholders; the tower runs on this rank).
     vision: ?lanes.stream.Vision = null,
+    /// The single-conversation limit (prompt + reply tokens) when it is not the context asked for: TF_DS_POOL or
+    /// TF_DS_KV_SHARD (a part may hold less than the window); null: the context, as ever.
+    window: ?usize = null,
 };
 
 pub const Snaps = struct {
@@ -139,6 +154,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .prefetch = if (getenv("TF_DS_L2_PREFETCH")) |v| !std.mem.eql(u8, v, "0") else false,
         .engram_aio = if (getenv("TF_DS_ENGRAM_AIO")) |v| !std.mem.eql(u8, v, "0") else false,
         .pool = try pool_mod.resolve(o.context, getenv("TF_DS_POOL")), // may exceed the window: more kept prompts stay resident
+        .window = o.context, // (a follower takes TF_DS_WINDOW, else rank 0's: Model.open)
         .drafts = o.drafts,
         .arena_bytes = arena_gib << 30,
         .round_rows = if (getenv("TF_DS_ROUND_ROWS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadRoundRows else round.default_rows,
@@ -158,7 +174,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     // the pool is the model's (preallocated): a stream takes no device memory of its own
     const L = lanes_mod.Lanes;
     const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .tail = @intCast(st.m.cfg.window) };
-    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null };
+    const window: ?usize = if (st.m.kvs != null or st.m.pool_cap != o.context) st.m.window_cap else null;
+    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null, .window = window };
 }
 
 fn deinitFn(ptr: *anyopaque) void {
@@ -183,12 +200,31 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
         error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
         error.NoVisionKit => "this checkpoint reads images: its kit (TF_DS_KIT) needs vision/torch_fmha_sm120.cubin and vision/gate_bias_vl.safetensors",
+        error.BadPool => "TF_DS_POOL (rank 1: --pool): the pool's positions, a whole number of at least the context (unset: the context)",
+        error.BadWindow => "TF_DS_WINDOW: the positions one request may use, a whole number; on rank 0 it must be --context (start.sh sets both from CONTEXT)",
+        error.BadKvShard => "TF_DS_KV_SHARD: 1 (on) or 0 (off)",
+        error.BadKvShardDecode => "TF_DS_KV_SHARD_DECODE: fetch (the default) or owner",
+        error.KvShardNeedsTwoRanks => "TF_DS_KV_SHARD=1 shards the compressed latents over the two TP2 ranks: TF_TP_WORLD=2",
+        error.KvShardMismatch => "the ranks disagree on TF_DS_KV_SHARD, the pool (TF_DS_POOL, else rank 1's --pool), TF_DS_ROUND_ROWS or the window, or the other rank could not read one of them: give every rank the same TF_DS_* environment (start.sh's ENGINE_ENV) and settings",
+        error.BadPart => "TF_DS_KV_SHARD=1: a round row whose part is not its extent's (a placement bug): restart with TF_DS_KV_SHARD=0",
+        error.BadRound => "a round row with a malformed extent or position (an engine bug); with TF_DS_KV_SHARD=1, restart with TF_DS_KV_SHARD=0",
+        error.WindowTooWide => "TF_DS_KV_SHARD=1: a round of more rows than the shard's trash rows (TF_DS_ROUND_ROWS above 48): lower TF_DS_ROUND_ROWS or set TF_DS_KV_SHARD=0",
+        error.FetchTooLarge => "TF_DS_KV_SHARD=1: a prompt chunk's fetched rows exceed the fetch buffer (an engine bug): restart with TF_DS_KV_SHARD=0",
+        error.BadFetch, error.BadSelect, error.NoKvShard => "TF_DS_KV_SHARD=1: the sharded attention's buffers or kernels are not set up as it needs (an engine bug): restart with TF_DS_KV_SHARD=0",
+        error.UnevenWoA => "TF_DS_KV_SHARD_DECODE=owner needs every layer's wo_a of one width: use TF_DS_KV_SHARD_DECODE=fetch",
+        error.PoolNotWholeParts => "TF_DS_KV_SHARD=1: the pool (TF_DS_POOL, else the context) must be whole 4,096-position parts (two parts of 2,048-position blocks)",
+        error.PartTooSmall => "TF_DS_KV_SHARD=1 cuts the pool (TF_DS_POOL) into one part a rank, and a conversation fits one part: each part must hold the window and a round's rows and two, in whole 2,048-position blocks (2,101,248 at the 1M window): raise TF_DS_POOL or lower --context",
+        error.CrossesPart => "TF_DS_KV_SHARD=1: an extent that crosses a part (a placement bug): restart with TF_DS_KV_SHARD=0",
         else => null,
     };
 }
 
 test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoMaster).?, "TF_TP_MASTER") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.PartTooSmall).?, "TF_DS_POOL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.KvShardMismatch).?, "--pool") != null);
+    for ([_]anyerror{ error.BadPart, error.WindowTooWide, error.FetchTooLarge, error.BadFetch, error.NoKvShard, error.CrossesPart }) |err|
+        try std.testing.expect(std.mem.indexOf(u8, explain(null, err).?, "TF_DS_KV_SHARD=0") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoFreeSlot).?, "TF_DS_STREAMS") != null);
     try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));
 }

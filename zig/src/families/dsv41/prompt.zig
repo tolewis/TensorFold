@@ -34,6 +34,8 @@ const tri_index = @import("tri_index.zig");
 const exl3_linear = @import("exl3_linear.zig");
 const prompt2d = @import("prompt2d.zig");
 const rdma = @import("rdma.zig");
+const shard = @import("shard.zig");
+const shard_ops = @import("shard_ops.zig");
 
 /// The indexer's [rows, n_comp] keys a row block holds at most (model.py: rb * n_comp <= 2^26 / 4 past 16 rows).
 const key_elems: usize = 1 << 24;
@@ -125,6 +127,7 @@ pub const Engine = struct {
     round_rows: usize = 16, // a concurrent round's rows at most (TF_DS_ROUND_ROWS; round.max_rows at most)
     two: ?*const prompt2d.Two = null, // a node of the four-node 2D split (prompt2d.zig); `world` stays TP2's
     ring: ?*rdma.Ring = null, // TP2: the decode-size all-gathers over the RDMA ring (the served lane's), else NCCL
+    kv: ?*shard_ops.KvShard = null, // TF_DS_KV_SHARD: the parts, the decode mode, the fetch kernels (null: replicated)
 
     /// A decode-size all-gather of `count` fp32 a rank into `dst`, rank after rank: the RDMA ring when the engine has
     /// one and the slice fits a slot (whole float4s), else NCCL. The same bytes either way.
@@ -260,6 +263,18 @@ pub const Chunk = struct {
     head_l: u64 = 0, // fp32 [1, this rank's vocabulary columns]: its logits
     head_g: u64 = 0, // fp32 [world, 1, columns]: their gather (the prompt's logits, rank after rank)
     pending: bool = false, // gm holds a MoE gather whose post is not in h yet
+    // TF_DS_KV_SHARD (useShard): a prompt block's fetched rows (sf_rows of them: codes [sf_rows, head_dim / 2], scales
+    // [sf_rows, head_dim / 16]; the owner packs into them and sends, the other rank receives into them) and the block's
+    // picks renumbered to them (int64 [cap, index_topk + 16])
+    sf_codes: u64 = 0,
+    sf_scales: u64 = 0,
+    sf_idx: u64 = 0,
+    sf_rows: usize = 0,
+    // the union's marks and their prefix sums (int32 [sf_cum_rows]: a compressed row a position at most) and the scan's
+    // segment sums with the count after them (int32 [shard_ops.scan_segs + 1])
+    sf_cum: u64 = 0,
+    sf_cum_rows: usize = 0,
+    sf_sums: u64 = 0,
 
     /// Every buffer for `cap` rows from `a`, the compressed layers' for chunks ending by position `tokens`; the scratch
     /// the served build zeros (or fills with -1) is set the same.
@@ -277,6 +292,13 @@ pub const Chunk = struct {
         var ch: Chunk = undefined;
         ch.spans = &.{};
         ch.img_rows = 0;
+        ch.sf_codes = 0;
+        ch.sf_scales = 0;
+        ch.sf_idx = 0;
+        ch.sf_rows = 0;
+        ch.sf_cum = 0;
+        ch.sf_cum_rows = 0;
+        ch.sf_sums = 0;
         ch.cap = cap;
         ch.n = 0;
         ch.start = 0;
@@ -453,7 +475,26 @@ pub const Chunk = struct {
         try upload(e, ch.ws.h, &had, had.len * 2);
         return ch;
     }
+
+    /// TF_DS_KV_SHARD: the prompt fetch's buffers, allocated once at open: the fetched rows bounded by `fetch_rows`
+    /// (64K rows, 18 MiB: a chunk's visible rows up to 64K compressed rows, or its union, or a block's at this
+    /// checkpoint's 512 picks a row 128 rows a block), the renumbered picks, and the union's marks for chunks ending by
+    /// position `positions` (4 bytes a position).
+    pub fn useShard(ch: *Chunk, e: *const Engine, a: *Arena, fetch_rows: usize, positions: usize) !void {
+        const c = e.c;
+        ch.sf_rows = fetch_rows;
+        ch.sf_codes = try a.take(fetch_rows * c.head_dim / 2);
+        ch.sf_scales = try a.take(fetch_rows * c.head_dim / 16);
+        ch.sf_idx = try a.take(ch.cap * (c.index_topk + 16) * 8);
+        ch.sf_cum_rows = positions + 2;
+        ch.sf_cum = try a.take(ch.sf_cum_rows * 4);
+        ch.sf_sums = try a.take((shard_ops.scan_segs + 1) * 4);
+    }
 };
+
+/// The prompt fetch buffer's rows (Chunk.useShard): a chunk's visible rows up to this many, its union, or a block of
+/// 128 rows of 512 picks.
+pub const prompt_fetch_rows: usize = 65536;
 
 /// A layer's linears in the chunk's grouped-linear sizes (its attention input group, its wo_a group, each alone at 128
 /// rows) and each one's split-K counters (Chunk.init).
@@ -573,16 +614,33 @@ pub const Caches = struct {
     raw_score: [64]u64 = @splat(0),
     cap: usize = 0, // positions
     slots: usize = 1, // the positional stores' slots
+    /// TF_DS_KV_SHARD: the compressed codes and scales hold this rank's part only (shard.Shard.planeRows rows: the
+    /// part's, the pad rows, the trash rows), from the part's first position; the index keys stay pool-wide.
+    shard: ?shard.Shard = null,
+    /// A sharded view: whether this rank holds its extent's compressed rows (the planes 0 when it does not: no pointer
+    /// into rows this rank does not have). null: replicated.
+    own: ?bool = null,
 
     pub fn init(e: *const Engine, a: *Arena, cap: usize, slots: usize) !Caches {
+        return initParts(e, a, cap, slots, null);
+    }
+
+    /// TF_DS_KV_SHARD: the pool's caches with owner-only compressed rows (`sh`'s parts; its pool `cap`).
+    pub fn initShard(e: *const Engine, a: *Arena, cap: usize, slots: usize, sh: shard.Shard) !Caches {
+        if (sh.pool != cap) return error.BadShard;
+        return initParts(e, a, cap, slots, sh);
+    }
+
+    fn initParts(e: *const Engine, a: *Arena, cap: usize, slots: usize, sh: ?shard.Shard) !Caches {
         const c = e.c;
-        var cs: Caches = .{ .cap = cap, .slots = slots };
+        var cs: Caches = .{ .cap = cap, .slots = slots, .shard = sh };
         for (e.w.layers, 0..) |lay, i| {
             if (lay.comp_wkv == null) continue;
             const r: usize = lay.ratio;
             const rows = cap / r + 2;
-            cs.comp_codes[i] = try a.take(rows * c.head_dim / 2);
-            cs.comp_scales[i] = try a.take(rows * c.head_dim / 16);
+            const crows = cs.compRows(r);
+            cs.comp_codes[i] = try a.take(crows * c.head_dim / 2);
+            cs.comp_scales[i] = try a.take(crows * c.head_dim / 16);
             if (lay.idx_wk != null) {
                 cs.idx_codes[i] = try a.take(rows * c.index_head_dim / 2);
                 cs.idx_scales[i] = try a.take(rows * c.index_head_dim / 32);
@@ -596,6 +654,13 @@ pub const Caches = struct {
         return cs;
     }
 
+    /// Rows of a ratio-`r` source's compressed codes (and scales) on this rank: the pool's and two, or sharded its
+    /// part's, two and the trash rows.
+    pub fn compRows(cs: *const Caches, r: usize) usize {
+        if (cs.shard) |sh| return sh.planeRows(r);
+        return cs.cap / r + 2;
+    }
+
     /// A new pool's caches, as PoolCache makes them: zeros, the index keys' E8M0 scales 127 (1.0).
     pub fn clear(cs: *const Caches, e: *const Engine) !void {
         const c = e.c;
@@ -603,8 +668,9 @@ pub const Caches = struct {
             if (lay.comp_wkv == null) continue;
             const r: usize = lay.ratio;
             const rows = cs.cap / r + 2;
-            try fill(e, cs.comp_codes[i], 0, rows * c.head_dim / 2);
-            try fill(e, cs.comp_scales[i], 0, rows * c.head_dim / 16);
+            const crows = cs.compRows(r);
+            try fill(e, cs.comp_codes[i], 0, crows * c.head_dim / 2);
+            try fill(e, cs.comp_scales[i], 0, crows * c.head_dim / 16);
             if (lay.idx_wk != null) {
                 try fill(e, cs.idx_codes[i], 0, rows * c.index_head_dim / 2);
                 try fill(e, cs.idx_scales[i], 127, rows * c.index_head_dim / 32);
@@ -624,13 +690,29 @@ pub const Caches = struct {
         var v = cs.*;
         v.slots = 1;
         v.cap = cs.cap - base;
+        if (cs.shard) |sh| {
+            // sharded: the extent ends in its part (Model.request_cap keeps an extent to one), its compressed rows
+            // from the part's first row on the owner, none on the other rank
+            v.own = sh.owns(base);
+            v.cap = sh.start(sh.owner(base)) + sh.part - base;
+        }
         for (e.w.layers, 0..) |lay, i| {
             if (lay.comp_wkv == null) continue;
             const r: usize = lay.ratio;
             if (base % r != 0) return error.BadView;
             const g = base / r;
-            v.comp_codes[i] += g * c.head_dim / 2;
-            v.comp_scales[i] += g * c.head_dim / 16;
+            if (cs.shard) |sh| {
+                if (sh.planeBase(base, r)) |lg| {
+                    v.comp_codes[i] += lg * c.head_dim / 2;
+                    v.comp_scales[i] += lg * c.head_dim / 16;
+                } else {
+                    v.comp_codes[i] = 0;
+                    v.comp_scales[i] = 0;
+                }
+            } else {
+                v.comp_codes[i] += g * c.head_dim / 2;
+                v.comp_scales[i] += g * c.head_dim / 16;
+            }
             if (lay.idx_wk != null) {
                 v.idx_codes[i] += g * c.index_head_dim / 2;
                 v.idx_scales[i] += g * c.index_head_dim / 32;
@@ -776,11 +858,12 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     var comp: tri_attn.Comp = .none;
     var n_idx: usize = 0;
     var padded = false;
+    var n_comp_end: usize = 0;
     if (lay.ratio != 0) {
         const r: usize = lay.ratio;
         if (lay.comp_wkv != null and !kv_done) try kvSourceUpdate(e, ch, cs, sh, li);
         const src = sh.kv_layer orelse return error.NoKvSource;
-        const n_comp_end = (start + n) / r;
+        n_comp_end = (start + n) / r;
         // vis = (pos + 1) // ratio: the compressed entries row i may see (host-made: the same integers)
         var vis_host: [4096]i64 = undefined;
         if (n > vis_host.len) return error.ChunkTooLong;
@@ -798,7 +881,7 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
             padded = true;
         }
     }
-    try tri_attn.sparseAttn(e.t, .{
+    const attn: tri_attn.Attn = .{
         .q = ch.q,
         .out = ch.o,
         .rows = n,
@@ -817,7 +900,9 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
         .scale = scale(hd),
         .window = c.window,
         .one_split = one_split,
-    });
+    };
+    // TF_DS_KV_SHARD: the extent's compressed rows are on its owner only: the picked ones fetched to the other rank
+    if (cs.own != null and n_idx > 0) try shardAttend(e, ch, cs, attn, n_comp_end) else try tri_attn.sparseAttn(e.t, attn);
     try tri_norm.ropeHeads(e.t, ch.o, rope.cos, rope.sin, ch.pos, rd, true, n, hl, hd);
     // ring[pos[-keep:] % R] = kv[-keep:] (ring mode wrote them before the attention)
     const keep: usize = if (ring_mode) 0 else @min(n, ring_rows);
@@ -855,6 +940,103 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     try mm(e, ch, lay.wo_b, ch.u, uw, ch.pa, .fp32, c.hidden);
 }
 
+/// TF_DS_KV_SHARD's prompt attention (GLM 0118's sparse fetch, its final form: the chunk's history rows sent once):
+/// the owner sends what the chunk's picks read, the other rank attends over that copy for its own 32 heads; both ranks
+/// choose the same way from the same integers (shard.promptFetch) and run the same sends and receives in order.
+/// - contiguous: the visible rows [0, n_comp_end) straight from the owner's plane into the fetch buffer at the same rows
+///   (no kernel, no host read); the other rank runs the replicated launch with only its compressed pointers moved.
+/// - union: the chunk's distinct picks (dsv41_shard.cu's mark and scan; their count read on the host, both ranks alike
+///   from the replicated picks), the owner packing them in position order and the other rank renumbering its picks to
+///   them; one send and the replicated launch over the whole chunk when they fit the buffer, else per block of
+///   shard.blockRows rows (a block's union fits: at most its picks), a block of a one-pass chunk kept one pass.
+/// Either way every row reads the same bytes in the same order as replicated (shard.zig's "prompt fetch" test), so its
+/// bits are the replicated ones. The owner attends its own rows after its sends, so the other rank starts at once.
+/// Needs GPU validation of the blocked launches against the whole-chunk one (docs/port/shard-attn.md).
+/// PORT(round2): borrowed twins (the other part's free rows hold a copy of the filling prompt's latents, all or none,
+/// released before the first round) skip this fetch entirely.
+fn shardAttend(e: *const Engine, ch: *Chunk, cs: *const Caches, a: tri_attn.Attn, n_comp_end: usize) !void {
+    const kv = e.kv orelse return error.NoKvShard;
+    const own = cs.own.?;
+    const c = e.c;
+    const n = a.rows;
+    const kk = a.n_idx;
+    const cb = c.head_dim / 2;
+    const sb = c.head_dim / 16;
+    if (ch.sf_rows == 0 or n_comp_end > ch.sf_cum_rows) return error.NoKvShard;
+    const peer = kv.sh.peer();
+    const CSpan = @import("comm.zig").Span;
+    const sf: tri_attn.Comp = .{ .fp4 = .{ .codes = ch.sf_codes, .scales = ch.sf_scales } };
+    kv.stats.prompt_fetches += 1;
+    kv.stats.prompt_picks += n * kk;
+    switch (shard.promptFetch(n_comp_end, n, kk, ch.sf_rows)) {
+        .contiguous => {
+            if (own) {
+                const spans = [_]CSpan{ .{ .ptr = a.comp.fp4.codes, .bytes = n_comp_end * cb }, .{ .ptr = a.comp.fp4.scales, .bytes = n_comp_end * sb } };
+                try e.comm.sendSpans(&spans, peer, e.s);
+                try tri_attn.sparseAttn(e.t, a);
+            } else {
+                const spans = [_]CSpan{ .{ .ptr = ch.sf_codes, .bytes = n_comp_end * cb }, .{ .ptr = ch.sf_scales, .bytes = n_comp_end * sb } };
+                try e.comm.recvSpans(&spans, peer, e.s);
+                var b = a;
+                b.comp = sf;
+                try tri_attn.sparseAttn(e.t, b);
+            }
+            kv.stats.prompt_rows += n_comp_end;
+            kv.stats.prompt_bytes += n_comp_end * (cb + sb);
+        },
+        .@"union" => {
+            // (a.idx's row stride: padded to whole 16-column tiles exactly when attention() padded it)
+            const final = n > tri.decode_rows or a.one_split;
+            const kos = if (final) (kk + 15) / 16 * 16 else kk;
+            const total = try unionOf(e, ch, kv, 0, n, kk, n_comp_end);
+            const B = shard.unionBlockRows(total, n, kk, ch.sf_rows);
+            var r0: usize = 0;
+            while (r0 < n) : (r0 += B) {
+                const blk = shard.promptBlock(r0, n, B, a.h, a.hd, kk);
+                const count = if (B == n) total else try unionOf(e, ch, kv, r0, blk.m, kk, n_comp_end);
+                if (count > ch.sf_rows) return error.FetchTooLarge; // (both ranks: the same count)
+                const spans = [_]CSpan{ .{ .ptr = ch.sf_codes, .bytes = count * cb }, .{ .ptr = ch.sf_scales, .bytes = count * sb } };
+                if (own) {
+                    try shard_ops.unionCompact(&kv.k, e.s, a.comp.fp4.codes, a.comp.fp4.scales, cb, sb, ch.sf_cum, n_comp_end, ch.sf_codes, ch.sf_scales);
+                    try e.comm.sendSpans(&spans, peer, e.s);
+                } else {
+                    try shard_ops.unionRenumber(&kv.k, e.s, ch.cidx + blk.idx, kk, kk, blk.m, ch.sf_cum, n_comp_end, ch.sf_idx, kos);
+                    try e.comm.recvSpans(&spans, peer, e.s);
+                    var b = a;
+                    if (B != n) {
+                        b.q = a.q + blk.act;
+                        b.out = a.out + blk.act;
+                        b.pos = a.pos + blk.pos;
+                        b.rows = blk.m;
+                        b.one_split = final; // (a block of a one-pass chunk stays one pass, whatever its rows)
+                    }
+                    b.comp = sf;
+                    b.idx = ch.sf_idx;
+                    b.n_idx = kk;
+                    try tri_attn.sparseAttn(e.t, b);
+                }
+                kv.stats.prompt_rows += count;
+                kv.stats.prompt_bytes += count * (cb + sb);
+            }
+            if (own) try tri_attn.sparseAttn(e.t, a);
+        },
+    }
+}
+
+/// The union of rows [r0, r0 + m)'s picks below `limit` (shard.UnionRef): marked and scanned into ch.sf_cum on this
+/// rank, both ranks alike (the picks are replicated), and its count read on the host (a stream synchronize: a prompt
+/// chunk is never captured).
+fn unionOf(e: *const Engine, ch: *Chunk, kv: *shard_ops.KvShard, r0: usize, m: usize, kk: usize, limit: usize) !usize {
+    try fill32(e, ch.sf_cum, 0, limit);
+    try shard_ops.unionCount(&kv.k, e.s, ch.cidx + r0 * kk * 8, kk, kk, m, ch.sf_cum, limit, ch.sf_sums);
+    try e.s.synchronize();
+    var count: i32 = 0;
+    try e.d.check(e.d.api.cuMemcpyDtoH_v2(&count, ch.sf_sums + shard_ops.scan_segs * 4, 4), "cuMemcpyDtoH");
+    kv.stats.prompt_syncs += 1;
+    if (count < 0 or count > m * kk) return error.BadFetch;
+    return @intCast(count);
+}
+
 /// kv_source_update of a kv-source layer on the chunk (no earlier pending row: a chunk starting on a group boundary):
 /// _compress's new latents (ratio 1: RMSNorm of the bf16 projection; ratio 2: of the pairs' softmax-weighted kv), its
 /// positional store's last RAW rows, then the index keys (RMSNorm of idx_wk's projection, RoPE) and the RoPE'd latents
@@ -869,6 +1051,8 @@ fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, 
     const r: usize = lay.ratio;
     const cwkv = lay.comp_wkv.?;
     if (start % r != 0) return notPorted(@src()); // the group's earlier rows from the positional store
+    // TF_DS_KV_SHARD: a sharded view ends at its part's end (an extent never crosses a part: refused, not written past)
+    if (cs.own != null and start + n > cs.cap) return error.CrossesPart;
     const full = n / r;
     if (r == 1) {
         try mm(e, ch, cwkv, ch.x, c.hidden, ch.lat2, .bf16, hd);
@@ -911,6 +1095,8 @@ fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, 
         // switch "comp": the packed cache's rows in one launch (fp4_store: store_rows' bytes)
         try tri_attn.fp4Store(e.t, ch.ik, id, cs.idx_codes[li], cs.idx_scales[li], ch.groups, full, id, 32, false);
     }
+    // TF_DS_KV_SHARD: only the extent's owner holds (and stores) its compressed rows; the other rank's view has none
+    if (cs.own != null and !cs.own.?) return;
     try e.ops.copyRows(e.s, ch.lat, hd * 2, ch.lat2, hd * 2, hd * 2, full);
     try e.exact.rope(e.s, ch.lat2, hd, hd - rd, rot.cos, rot.sin, ch.gpos, full, rd / 2, false);
     try tri_attn.fp4Store(e.t, ch.lat2, hd, cs.comp_codes[li], cs.comp_scales[li], ch.groups, full, hd, 16, true);
@@ -1416,6 +1602,12 @@ pub fn head(e: *const Engine, ch: *Chunk) !void {
 pub fn endLayer(ch: *Chunk) void {
     ch.pending = true;
     std.mem.swap(u64, &ch.pre, &ch.pre_f);
+}
+
+test {
+    // the shard's host-only geometry and the launchers' declarations
+    _ = shard;
+    _ = shard_ops;
 }
 
 test "hd ** -0.5 as the served build passes it" {

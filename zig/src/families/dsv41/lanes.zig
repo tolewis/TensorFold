@@ -95,8 +95,9 @@ pub const Reader = struct {
 };
 
 /// A window of a round as both ranks build it: its stream's slot and extent, its first position, whether its rows'
-/// taps go into the drafter, its rows' ids.
-pub const Win = struct { slot: usize, base: usize, end: usize, start: usize, absorb: bool, ids: []const i32 };
+/// taps go into the drafter, its rows' ids; TF_DS_KV_SHARD: its extent's part (the rank holding its compressed rows;
+/// -1: its base's, which round.Rows.ownerOf derives and checks).
+pub const Win = struct { slot: usize, base: usize, end: usize, start: usize, absorb: bool, ids: []const i32, part: i64 = -1 };
 
 /// The rows of a round (round.Rows' slices point here).
 pub const Built = struct {
@@ -105,6 +106,7 @@ pub const Built = struct {
     slots: [max_rows]i64 = undefined,
     bases: [max_rows]i64 = undefined,
     ends: [max_rows]i64 = undefined,
+    parts: [max_rows]i64 = undefined, // TF_DS_KV_SHARD: each row's part, plain data for the attention (Win.part)
     wins: [max_streams]round.Window = undefined,
     absorb: [max_streams]bool = undefined,
     r: usize = 0,
@@ -129,13 +131,14 @@ pub const Built = struct {
                 b.slots[b.r + j] = @intCast(w.slot);
                 b.bases[b.r + j] = @intCast(w.base);
                 b.ends[b.r + j] = @intCast(w.end);
+                b.parts[b.r + j] = w.part;
             }
             b.wins[i] = .{ .row = b.r, .n = w.ids.len, .seq = seq.items[0 .. w.start + w.ids.len] };
             b.absorb[i] = w.absorb;
             b.r += w.ids.len;
         }
         const R = b.r;
-        return .{ .ids = b.ids[0..R], .pos = b.pos[0..R], .slots = b.slots[0..R], .bases = b.bases[0..R], .ends = b.ends[0..R], .windows = b.wins[0..b.n] };
+        return .{ .ids = b.ids[0..R], .pos = b.pos[0..R], .slots = b.slots[0..R], .bases = b.bases[0..R], .ends = b.ends[0..R], .windows = b.wins[0..b.n], .parts = b.parts[0..R] };
     }
 };
 
@@ -526,7 +529,10 @@ pub const Lanes = struct {
         const len = ids.len;
         if (len == 0) return error.EmptyPrompt;
         const size = std.mem.alignForward(usize, len + s.max_new + m.eng.round_rows + 2, model.chunk_rows);
-        if (size > m.pool_cap) return error.PromptTooLong;
+        if (size > m.request_cap) return error.PromptTooLong; // (the pool's, unless TF_DS_POOL or TF_DS_KV_SHARD part it)
+        // PORT(round2): TF_DS_KV_SHARD places an extent inside one part (parts.zig's planner: part-local placeSoft and
+        // eviction, borrowed twins, carries) and sets Win.part; until then an extent across the parts' boundary is
+        // refused where it is used (prompt.kvSourceUpdate, round.Rows.ownerOf: CrossesPart), never written past.
         if (self.streams.fetchRemove(s)) |old| self.used[old.value.slot] = false;
         const slot = std.mem.indexOfScalar(bool, self.used[0..self.m.streams], false) orelse return error.NoFreeSlot;
         var taken: [max_streams][2]usize = undefined;
