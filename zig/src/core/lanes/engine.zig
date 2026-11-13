@@ -59,6 +59,7 @@ pub const Engine = struct {
                 .most_drafts = cfg.most_drafts,
                 .family_costs = &cfg.family_costs,
                 .shared_costs = &cfg.shared_costs,
+                .stream_costs = cfg.stream_costs,
                 .mtp_step_ms = cfg.mtp_step_ms,
                 .plain_guard = cfg.plain_guard,
                 .node_probabilities = cfg.node_probabilities,

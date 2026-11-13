@@ -52,6 +52,7 @@ pub const Rule = struct {
     most_drafts: u32,
     family_costs: *const Table,
     shared_costs: *const Table,
+    stream_costs: []const Table = &.{}, // Config.stream_costs: a shared forward's costs by its streams
     mtp_step_ms: f64,
     plain_guard: bool,
     node_probabilities: bool,
@@ -218,7 +219,7 @@ pub const Rule = struct {
         const ones = try r.gpa.alloc(u32, whos.len);
         defer r.gpa.free(ones);
         @memset(ones, 1);
-        const counts = try alloc.allocate(r.gpa, ones, probs, r.shared_costs, r.overheadMs(whos.len), @max(whos.len, r.batch_rows));
+        const counts = try alloc.allocate(r.gpa, ones, probs, r.shared(whos.len), r.overheadMs(whos.len), @max(whos.len, r.batch_rows));
         defer r.gpa.free(counts);
         if (r.plain_guard) {
             // no draft where none pays; a probe after a growing run of plain rounds
@@ -246,8 +247,13 @@ pub const Rule = struct {
         return best.ms;
     }
 
+    /// The cost table of a shared forward of this many streams (Config.sharedCosts).
+    pub fn shared(r: *const Rule, streams: usize) *const Table {
+        return @import("config.zig").streamTable(r.stream_costs, r.shared_costs, streams);
+    }
+
     pub fn observeOverhead(r: *Rule, streams: u32, rows: u64, ms: f64) !void {
-        const forward = r.shared_costs.get(@intCast(rows)) orelse return;
+        const forward = r.shared(streams).get(@intCast(rows)) orelse return;
         const extra = if (ms - forward > 0.0) ms - forward else 0.0;
         for (r.overhead.items) |*o| {
             if (o.streams == streams) {

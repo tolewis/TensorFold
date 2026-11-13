@@ -11,6 +11,9 @@
 //!                                               they need, the pool's caches by the context)
 //!   TF_DS_ROUND_MS                              the lane core's round costs by rows (ms, comma separated; the
 //!                                               served ROUND_MS unless set: a four-node lane's rounds cost less)
+//!   TF_DS_ROUND_MS_<n>                          a round of n streams (2 and up) by its rows, in TF_DS_ROUND_MS's form: a row of
+//!                                               another stream costs more than a draft row of the same stream, so the draft depth
+//!                                               of shared rounds is priced from their own table (unset: TF_DS_ROUND_MS's)
 //!   TF_DS_ROUND_ROWS, TF_DS_STREAMS             a round's rows at most (16; the four-node lane's 48) and the pool's
 //!                                               streams (4; its 16): --parallel at most the streams
 //!   TF_DS_PROMPT_WINDOW_ROWS=<rows>             a prompt chunk under these rows (64 .. 128; 64 unset) takes the MoE decode window
@@ -268,6 +271,17 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     st.lanes.draft_cal = if (getenv("TF_DS_T25_DRAFT_CAL")) |v| lanes_mod.parseCalWeight(v) catch return error.BadDraftCal else 0.0;
     st.lanes.cal_log = if (getenv("TF_DS_T25_CAL_LOG")) |v| std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch return error.BadCalLog else 0;
     st.lanes.no_copies = if (getenv("TF_DS_NO_COPIES")) |v| !std.mem.eql(u8, v, "0") else false;
+    {
+        // TF_DS_ROUND_MS_<n>: a round of n streams by its rows (unset: TF_DS_ROUND_MS's table)
+        var n: usize = 2;
+        while (n <= model.max_streams) : (n += 1) {
+            var name: [32]u8 = undefined;
+            const text = std.fmt.bufPrint(name[0 .. name.len - 1], "TF_DS_ROUND_MS_{d}", .{n}) catch unreachable;
+            name[text.len] = 0;
+            const key: [:0]const u8 = name[0..text.len :0];
+            if (nonEmpty(getenv(key))) |v| try st.lanes.setStreamCosts(n, lanes_mod.parseMs(std.heap.page_allocator, v) catch return error.BadRoundMs);
+        }
+    }
     if (getenv("TF_DS_SERVE_PROFILE")) |v| {
         const every = std.fmt.parseInt(u64, std.mem.trim(u8, v, " "), 10) catch return error.BadServeProfile;
         if (every != 0) {

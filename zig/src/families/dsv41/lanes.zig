@@ -475,6 +475,11 @@ pub const Lanes = struct {
     streams: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
     wc: [window_rows]lanes.config.Cost = undefined, // the window costs (init)
     sc: [max_rows]lanes.config.Cost = undefined, // the shared forwards' costs (init)
+    // TF_DS_ROUND_MS_<n>: the costs of a round of n streams by its rows (n from 2; setStreamCosts), and each as facts
+    // hands it over (empty: none, the round takes TF_DS_ROUND_MS)
+    scn: [max_streams - 1][max_rows]lanes.config.Cost = undefined,
+    scn_rows: [max_streams - 1]usize = @splat(0),
+    scn_view: [max_streams - 1][]const lanes.config.Cost = @splat(&.{}),
     used: [max_streams]bool = @splat(false),
     seqs: [max_streams]std.ArrayList(i32) = @splat(.empty),
     built: Built = .{},
@@ -511,6 +516,15 @@ pub const Lanes = struct {
         return ln;
     }
 
+    /// A round of `streams` streams (2 and up) costs `ms[rows - 1]` at `rows` rows (TF_DS_ROUND_MS_<streams>): a row of
+    /// another stream costs more than a draft row of the same stream, which one table by rows cannot hold. Before facts.
+    pub fn setStreamCosts(self: *Lanes, streams: usize, ms: []const f64) !void {
+        if (streams < 2 or streams > max_streams or ms.len == 0) return error.BadRoundMs;
+        const t = &self.scn[streams - 2];
+        for (t, 0..) |*c, i| c.* = .{ .width = @intCast(i + 1), .ms = ms[@min(i, ms.len - 1)] };
+        self.scn_rows[streams - 2] = max_rows;
+    }
+
     /// Tells rank 1 to stop, then frees the host state (the model is the caller's).
     pub fn deinit(self: *Lanes) void {
         self.stopKv();
@@ -544,8 +558,14 @@ pub const Lanes = struct {
 
     /// The facts the round loop reads: windows of the pending row and up to the drafter's block, several streams'
     /// windows in one forward of at most 16 rows (four streams), the drafter's chances, the served lane's round ms.
-    pub fn facts(self: *const Lanes) lanes.Model {
+    pub fn facts(self: *Lanes) lanes.Model {
         const drafting = self.m.drafting();
+        const rr = self.m.eng.round_rows;
+        var given: usize = 0;
+        for (&self.scn_view, &self.scn, self.scn_rows, 0..) |*v, *t, n, i| {
+            v.* = if (n == 0) &.{} else t[0..@min(n, rr)];
+            if (n != 0) given = i + 1;
+        }
         return .{
             .exact_width = window_rows,
             .gpu_tokens = false,
@@ -564,6 +584,7 @@ pub const Lanes = struct {
             .batch_rows = @intCast(self.m.eng.round_rows),
             .max_streams = @intCast(self.m.streams),
             .shared_costs = self.sc[0..self.m.eng.round_rows],
+            .stream_costs = self.scn_view[0..given],
             .draft_probabilities = drafting,
             .draft_streams = drafting,
         };

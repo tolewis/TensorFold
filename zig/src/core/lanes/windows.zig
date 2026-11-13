@@ -177,7 +177,7 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
         }
     }
     const overhead = soloHeadOverhead(e.cfg.solo_head_overhead_ms, e.rule.overheadMs(plans.len), e.alone, plans.len, if (plans.len > 0) plans[0].kind else .none);
-    const counts = try alloc.allocate(a, fixed, probs, &e.cfg.shared_costs, overhead, @max(plans.len, e.cfg.batch_rows));
+    const counts = try alloc.allocate(a, fixed, probs, e.cfg.sharedCosts(plans.len), overhead, @max(plans.len, e.cfg.batch_rows));
     for (plans, probs, counts, raw) |*p, chances, c, rw| {
         if (p.kind == .head) p.stream.granted = c;
         if (e.cfg.draft_cal > 0.0) p.stream.predict(if (p.kind == .head) rw[0..c] else &.{});

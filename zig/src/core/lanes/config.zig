@@ -32,6 +32,10 @@ pub const Model = struct {
     batch_rows: u32 = 0, // a shared forward's rows at most (0: 32)
     max_streams: u32 = 0, // a shared forward's streams at most (0: 32)
     shared_costs: []const Cost = &.{}, // shared forwards' ms by total rows (timed at load)
+    // shared forwards' ms by total rows for a round of 2, 3, ... streams (the first table: two streams). A row of
+    // another stream and a draft row of the same stream cost differently, so one table by rows cannot price both.
+    // An empty table, or a count past the last, takes shared_costs
+    stream_costs: []const []const Cost = &.{},
     draft_probabilities: bool = false, // the head gives each drafted node's chance of landing
     draft_streams: bool = false, // the head drafts every stream of a shared round in one batch
     head_trees: bool = false, // the head drafts trees of lanes (DraftRequest.lanes) and holds them
@@ -67,6 +71,7 @@ pub const Config = struct {
     depth_prior: []f64,
     family_costs: Table,
     shared_costs: Table,
+    stream_costs: []Table = &.{}, // Model.stream_costs, each extended to batch_rows (an empty table: none)
     lane_costs: Table, // window ms by rows to 64 (lanes/plan_lanes.zig)
     mtp_step_ms: f64,
     enter_match: i64 = 8, // matching tokens a copy needs (rejects coincidental indentation)
@@ -107,6 +112,21 @@ pub const Config = struct {
         }
         const depth_prior = try gpa.dupe(f64, prior);
         errdefer gpa.free(depth_prior);
+        // a round's costs by its streams: each table as given, extended like the shared one
+        const stream_costs = try gpa.alloc(Table, m.stream_costs.len);
+        for (stream_costs) |*t| t.* = .{};
+        errdefer {
+            for (stream_costs) |*t| t.deinit(gpa);
+            gpa.free(stream_costs);
+        }
+        for (stream_costs, m.stream_costs) |*t, given| {
+            var kept: std.ArrayList(Cost) = .empty;
+            defer kept.deinit(gpa);
+            for (given) |c| {
+                if (c.width >= 1 and c.width <= batch_rows) try kept.append(gpa, c);
+            }
+            t.* = try alloc.extendCosts(gpa, kept.items, batch_rows);
+        }
         return .{
             .family_width = width,
             .max_copy = max_copy,
@@ -126,6 +146,7 @@ pub const Config = struct {
             .depth_prior = depth_prior,
             .family_costs = family_costs,
             .shared_costs = try alloc.extendCosts(gpa, timed.items, batch_rows),
+            .stream_costs = stream_costs,
             .lane_costs = try alloc.extendCosts(gpa, m.lane_costs, 64),
             .mtp_step_ms = m.mtp_step_ms,
             .solo_head_overhead_ms = m.solo_head_overhead_ms,
@@ -139,9 +160,44 @@ pub const Config = struct {
         gpa.free(c.depth_prior);
         c.family_costs.deinit(gpa);
         c.shared_costs.deinit(gpa);
+        for (c.stream_costs) |*t| t.deinit(gpa);
+        gpa.free(c.stream_costs);
         c.lane_costs.deinit(gpa);
     }
+
+    /// The cost table of a shared forward of this many streams: its own (Model.stream_costs) when one is given.
+    pub fn sharedCosts(c: *const Config, streams: usize) *const Table {
+        return streamTable(c.stream_costs, &c.shared_costs, streams);
+    }
 };
+
+/// `tables[streams - 2]` when it is there and not empty, else `shared`.
+pub fn streamTable(tables: []const Table, shared: *const Table, streams: usize) *const Table {
+    if (streams >= 2 and streams - 2 < tables.len and !tables[streams - 2].empty()) return &tables[streams - 2];
+    return shared;
+}
+
+test "a round of several streams takes its own cost table when one is given" {
+    const gpa = std.testing.allocator;
+    const one = [_]Cost{ .{ .width = 1, .ms = 20.0 }, .{ .width = 2, .ms = 24.0 }, .{ .width = 3, .ms = 28.0 } };
+    const two = [_]Cost{ .{ .width = 2, .ms = 27.0 }, .{ .width = 3, .ms = 31.0 }, .{ .width = 4, .ms = 35.0 } };
+    // no table for three streams, one for four
+    const four = [_]Cost{ .{ .width = 4, .ms = 40.0 }, .{ .width = 5, .ms = 44.5 } };
+    const by = [_][]const Cost{ &two, &.{}, &four };
+    var c = try Config.init(gpa, .{ .exact_width = 8, .hidden_rows = true, .batch_rows = 8, .shared_costs = &one, .stream_costs = &by }, 8, 7);
+    defer c.deinit(gpa);
+    try std.testing.expectEqual(@as(?f64, 24.0), c.sharedCosts(1).get(2));
+    try std.testing.expectEqual(@as(?f64, 27.0), c.sharedCosts(2).get(2));
+    try std.testing.expectEqual(@as(?f64, 35.0), c.sharedCosts(2).get(4));
+    try std.testing.expectEqual(@as(?f64, 24.0), c.sharedCosts(3).get(2)); // (an empty table: the shared one)
+    try std.testing.expectEqual(@as(?f64, 44.5), c.sharedCosts(4).get(5));
+    try std.testing.expectEqual(@as(?f64, 53.4), c.sharedCosts(4).get(6)); // (past the widest: its ms a row)
+    try std.testing.expectEqual(@as(?f64, 28.0), c.sharedCosts(5).get(3)); // (a count past the last table)
+    // unset: every count takes the shared table
+    var plain = try Config.init(gpa, .{ .exact_width = 8, .hidden_rows = true, .batch_rows = 8, .shared_costs = &one }, 8, 7);
+    defer plain.deinit(gpa);
+    try std.testing.expectEqual(@as(?f64, 28.0), plain.sharedCosts(4).get(3));
+}
 
 test "setup derives widths like Python" {
     const gpa = std.testing.allocator;
