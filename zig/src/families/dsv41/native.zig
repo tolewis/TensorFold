@@ -35,6 +35,9 @@
 //!                                               predicted drafts (unset or 0: off; core/lanes/windows.zig)
 //!   TF_DS_T25_CAL_LOG                           print every n-th calibrated verify of a stream to stderr (unset or 0: off)
 //!   TF_DS_NO_COPIES=1                           a drafted stream proposes no suffix-lookup copy windows
+//!   TF_DS_SERVE_PROFILE=N                       a measurement: rank 0 prints its backend's times (send, forward, absorb,
+//!                                               logits, sample, the drafter pass, the rest of a round) to stderr every N
+//!                                               rounds; the forward is synchronized apart, so the rounds are a little slower
 //!   TF_DS_POOL=P, TF_DS_WINDOW=W                (0008, pool.zig) the pool's positions, every stream's extents
 //!                                               together (unset: the context), and the window a request may use
 //!                                               (rank 0: the context; a follower without it takes rank 0's);
@@ -265,6 +268,14 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     st.lanes.draft_cal = if (getenv("TF_DS_T25_DRAFT_CAL")) |v| lanes_mod.parseCalWeight(v) catch return error.BadDraftCal else 0.0;
     st.lanes.cal_log = if (getenv("TF_DS_T25_CAL_LOG")) |v| std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch return error.BadCalLog else 0;
     st.lanes.no_copies = if (getenv("TF_DS_NO_COPIES")) |v| !std.mem.eql(u8, v, "0") else false;
+    if (getenv("TF_DS_SERVE_PROFILE")) |v| {
+        const every = std.fmt.parseInt(u64, std.mem.trim(u8, v, " "), 10) catch return error.BadServeProfile;
+        if (every != 0) {
+            st.lanes.prof = .{};
+            st.lanes.prof_every = every;
+            st.m.prof = true; // the forward and the absorb synchronized apart: a measurement, not a served setting
+        }
+    }
     // a vision checkpoint's tower on this rank, from the kit's vision/ (torch's attention cubin, the routing bias)
     st.vision = null;
     if (st.m.cfg.vision) st.vision = try vision_mod.Vision.open(gpa, io, st.m, dir, getenv("TF_DS_KIT").?);
@@ -645,6 +656,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.BadPromptWindowRows => rows_mod.window_hint,
         error.BadPromptGemmRows => rows_mod.gemm_hint,
         error.PromptRowsMismatch => "TF_DS_PROMPT_WINDOW_ROWS / TF_DS_PROMPT_GEMM_ROWS: the ranks run different prompt paths; set them alike on every rank (tf-dsv41-lanes reads them too)",
+        error.BadServeProfile => "TF_DS_SERVE_PROFILE: the rounds between two profile lines, a whole number (0: off)",
         error.BadRoundRows => "TF_DS_ROUND_ROWS: a round's rows at most, 16 .. 48",
         error.BadGraphCap => "TF_DS_GRAPH_CAP: the captured CUDA graphs kept at most, a count (0: all)",
         error.BadPlainRows => "TF_DS_PLAIN_ROWS: the rows a mixed pack's plain linear runs over, 0 (the round's own) or a count up to TF_DS_ROUND_ROWS",

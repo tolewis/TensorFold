@@ -375,6 +375,27 @@ pub const Profile = struct {
     prefills: u64 = 0,
 };
 
+/// TF_DS_SERVE_PROFILE: the served rank 0's backend times as one stderr line (ms a round; a pass's ms a pass).
+/// `period_ms` is a round's start to the next one's; `other_ms` is what of it the backend calls do not hold (the round
+/// loop, the server, the keep). The forward and the absorb are synchronized apart (Model.prof), as tf-dsv41-lanes
+/// --profile has them.
+fn printServeProfile(p: Profile, period: u64, periods: u64) void {
+    const ms = struct {
+        fn f(ns: u64, n: u64) f64 {
+            return if (n == 0) 0 else @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(n)) / 1e6;
+        }
+    }.f;
+    const period_ms = ms(period, periods);
+    const pass_a_round = if (p.rounds == 0) 0 else @as(f64, @floatFromInt(p.pass)) / @as(f64, @floatFromInt(p.rounds)) / 1e6;
+    const held = ms(p.send, p.rounds) + ms(p.forward, p.rounds) + ms(p.absorb, p.rounds) + ms(p.logits, p.rounds) + ms(p.sample, p.rounds) + pass_a_round;
+    std.debug.print("{{\"rank\": 0, \"serve_profile\": {{\"rounds\": {d}, \"rows_a_round\": {d:.2}, \"period_ms\": {d:.3}, \"send_ms\": {d:.3}, \"enqueue_ms\": {d:.3}, \"forward_ms\": {d:.3}, \"absorb_ms\": {d:.3}, \"logits_ms\": {d:.3}, \"sample_ms\": {d:.3}, \"passes\": {d}, \"streams_a_pass\": {d:.2}, \"pass_ms\": {d:.3}, \"pass_ms_a_round\": {d:.3}, \"other_ms\": {d:.3}, \"prefills\": {d}, \"prefill_ms\": {d:.1}}}}}\n", .{
+        p.rounds,                               ms(p.rows * 1000000, p.rounds), period_ms,              ms(p.send, p.rounds),                      ms(p.enqueue, p.rounds),
+        ms(p.forward, p.rounds),                ms(p.absorb, p.rounds),         ms(p.logits, p.rounds), ms(p.sample, p.rounds),                    p.passes,
+        ms(p.pass_streams * 1000000, p.passes), ms(p.pass, p.passes),           pass_a_round,           if (periods == 0) 0 else period_ms - held, p.prefills,
+        ms(p.prefill, p.prefills),
+    });
+}
+
 /// A round-cost table "30.0,35.2,..." (TF_DS_ROUND_MS's form): ms by rows from 1.
 pub fn parseMs(a: std.mem.Allocator, text: []const u8) ![]const f64 {
     var out: std.ArrayList(f64) = .empty;
@@ -463,6 +484,10 @@ pub const Lanes = struct {
     draft_cal: f64 = 0.0, // TF_DS_T25_DRAFT_CAL: the weight of a round in each stream's draft-survival calibration (0: off)
     cal_log: u32 = 0, // TF_DS_T25_CAL_LOG: every n-th calibrated verify of a stream prints to stderr (0: off)
     no_copies: bool = false, // TF_DS_NO_COPIES=1: a drafted stream proposes no suffix-lookup copy windows
+    prof_every: u64 = 0, // TF_DS_SERVE_PROFILE=N: the served rank 0 prints `prof` every N rounds and starts it again (0: off)
+    prof_last: u64 = 0, // the last round's start (Model.now)
+    prof_period: u64 = 0, // the rounds' start-to-start times under a second, summed (ns), and their count
+    prof_periods: u64 = 0,
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
@@ -1074,6 +1099,14 @@ pub const Lanes = struct {
         var wins: [max_streams]Win = undefined;
         try self.roundWins(windows, &ids, &wins);
         const t0 = m.now();
+        if (self.prof_every != 0) {
+            // a round's start to the next one's: what the backend's own times leave is the round loop's and the server's
+            if (self.prof_last != 0 and t0 - self.prof_last < std.time.ns_per_s) {
+                self.prof_period += t0 - self.prof_last;
+                self.prof_periods += 1;
+            }
+            self.prof_last = t0;
+        }
         if (try self.begin(.verify)) {
             try self.wire.int(gpa, u32, @intCast(windows.len));
             for (wins[0..windows.len]) |w| try writeWin(&self.wire, gpa, w, self.kv != null);
@@ -1104,6 +1137,12 @@ pub const Lanes = struct {
             p.sample += m.now() - t3;
             p.rounds += 1;
             p.rows += rows.ids.len;
+            if (self.prof_every != 0 and p.rounds >= self.prof_every) {
+                printServeProfile(p.*, self.prof_period, self.prof_periods);
+                p.* = .{};
+                self.prof_period = 0;
+                self.prof_periods = 0;
+            }
         };
         const V = m.vocab;
         for (windows, out, 0..) |w, *o, k| {
