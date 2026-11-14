@@ -8,6 +8,7 @@
 //! top. The token is the first best score. float64 as numpy computes it on the served image (numpy 2.1: its exp and log
 //! are libm's, a row's sum of 20 its 8-accumulator pairwise sum; zrec np_libm.py).
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// exact_sampling.Sampling (the served lane's defaults: temperature 1.0, top_k 20, top_p 0.95, min_p 0).
 pub const Sampling = struct {
@@ -67,15 +68,13 @@ fn before(va: f32, ia: i64, vb: f32, ib: i64) bool {
     return va > vb or (va == vb and ia < ib);
 }
 
-/// The row's first `count` (value, id) in that order: torch.topk's set (of equal values the lower ids) as np.lexsort
-/// orders it.
-pub fn topCandidates(row: []const f32, count: usize, values: []f32, ids: []i64) usize {
+/// Reference top-k (pre-optimization) for equivalence tests.
+fn topCandidatesRef(row: []const f32, count: usize, values: []f32, ids: []i64) usize {
     const k = @min(count, row.len);
     var n: usize = 0;
     for (row, 0..) |v, i| {
         const id: i64 = @intCast(i);
         if (n == k and !before(v, id, values[k - 1], ids[k - 1])) continue;
-        // insert in order, dropping the last when full
         var j: usize = if (n < k) n else k - 1;
         while (j > 0 and before(v, id, values[j - 1], ids[j - 1])) : (j -= 1) {
             values[j] = values[j - 1];
@@ -86,6 +85,67 @@ pub fn topCandidates(row: []const f32, count: usize, values: []f32, ids: []i64) 
         if (n < k) n += 1;
     }
     return n;
+}
+
+fn worstAmong(values: []const f32, ids: []const i64, n: usize) usize {
+    var w: usize = 0;
+    for (1..n) |i| {
+        if (before(values[w], ids[w], values[i], ids[i])) {
+            w = i;
+        } else if (!before(values[i], ids[i], values[w], ids[w]) and ids[i] > ids[w]) {
+            w = i;
+        }
+    }
+    return w;
+}
+
+fn sortCandidatesLex(values: []f32, ids: []i64, n: usize) void {
+    var i: usize = 1;
+    while (i < n) : (i += 1) {
+        const v = values[i];
+        const id = ids[i];
+        var j = i;
+        while (j > 0 and before(v, id, values[j - 1], ids[j - 1])) : (j -= 1) {
+            values[j] = values[j - 1];
+            ids[j] = ids[j - 1];
+        }
+        values[j] = v;
+        ids[j] = id;
+    }
+}
+
+fn topCandidatesPass(row: []const f32, count: usize, id_bias: i64, values: []f32, ids: []i64) usize {
+    const k = @min(count, row.len);
+    var n: usize = 0;
+    var worst: usize = 0;
+    for (row, 0..) |v, i| {
+        const id = id_bias + @as(i64, @intCast(i));
+        if (n == k) {
+            const wv = values[worst];
+            const wi = ids[worst];
+            if (v < wv) continue;
+            if (v == wv and id >= wi) continue;
+            if (!before(v, id, wv, wi)) continue;
+            values[worst] = v;
+            ids[worst] = id;
+            worst = worstAmong(values[0..k], ids[0..k], k);
+        } else {
+            values[n] = v;
+            ids[n] = id;
+            n += 1;
+            if (n == k) worst = worstAmong(values[0..k], ids[0..k], k);
+        }
+    }
+    sortCandidatesLex(values[0..n], ids[0..n], n);
+    return n;
+}
+
+/// The row's first `count` (value, id) in that order: torch.topk's set (of equal values the lower ids) as np.lexsort
+/// orders it.
+/// The row's first `count` (value, id) in that order: torch.topk's set (of equal values the lower ids) as np.lexsort
+/// orders it.
+pub fn topCandidates(row: []const f32, count: usize, values: []f32, ids: []i64) usize {
+    return topCandidatesPass(row, count, 0, values, ids);
 }
 
 /// The first index of the largest value (np.argmax / torch.argmax on a row without NaN).
@@ -167,4 +227,170 @@ test "top candidates by value, then id" {
     try std.testing.expectEqual(@as(usize, 4), topCandidates(&row, 4, &v, &ids));
     try std.testing.expectEqualSlices(i64, &.{ 1, 3, 5, 2 }, &ids);
     try std.testing.expectEqualSlices(f32, &.{ 5, 5, 5, 3 }, &v);
+}
+
+const test_vocab: usize = 129_280;
+
+fn sampleRowRef(row: []const f32, position: u64, s: Sampling) !i64 {
+    if (s.temperature <= 0) return @intCast(argmax(row));
+    if (s.top_k == 0) return error.NotPortedYet;
+    const count = @min(row.len, s.top_k + margin);
+    if (count > max_candidates) return error.TooManyCandidates;
+    var values: [max_candidates]f32 = undefined;
+    var ids: [max_candidates]i64 = undefined;
+    const width = topCandidatesRef(row, count, &values, &ids);
+    const k = @max(1, @min(s.top_k, width));
+    const t = @max(s.temperature, 1e-6);
+    var scaled: [max_candidates]f64 = undefined;
+    var score: [max_candidates]f64 = undefined;
+    for (0..k) |j| {
+        scaled[j] = @as(f64, values[j]) / t;
+        const u = uniform(s.seed, position, @bitCast(ids[j]));
+        score[j] = scaled[j] - log(-log(u));
+    }
+    if (0.0 < s.top_p and s.top_p < 1.0) {
+        var mx = scaled[0];
+        for (scaled[1..k]) |v| mx = @max(mx, v);
+        var probs: [max_candidates]f64 = undefined;
+        for (0..k) |j| probs[j] = exp(scaled[j] - mx);
+        const sum = pairwiseSum(probs[0..k]);
+        for (0..k) |j| probs[j] /= sum;
+        var acc: f64 = 0.0;
+        var below: usize = 0;
+        for (0..k) |j| {
+            acc += probs[j];
+            if (acc < s.top_p) below += 1;
+        }
+        const keep = below + 1;
+        for (keep..k) |j| score[j] = -std.math.inf(f64);
+    }
+    if (s.min_p > 0.0) {
+        const floor = scaled[0] + log(s.min_p);
+        for (0..k) |j| {
+            if (scaled[j] < floor) score[j] = -std.math.inf(f64);
+        }
+    }
+    var best: usize = 0;
+    for (0..k) |j| {
+        if (score[j] > score[best]) best = j;
+    }
+    return ids[best];
+}
+
+fn fillRandomNormal(row: []f32, rand: std.Random) void {
+    for (row) |*v| v.* = rand.float(f32) * 4.0 - 2.0;
+}
+
+fn fillPeaked(row: []f32, rand: std.Random) void {
+    @memset(row, 0.0);
+    row[rand.intRangeLessThan(usize, 0, row.len)] = 10.0;
+}
+
+fn fillFlat(row: []f32) void {
+    @memset(row, 1.0);
+}
+
+fn monotonicNs() i128 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+}
+
+fn benchSampleRowUs(
+    row: []f32,
+    rounds: usize,
+    position: u64,
+    s: Sampling,
+    comptime label: []const u8,
+    comptime sample: *const fn ([]const f32, u64, Sampling) anyerror!i64,
+) void {
+    const t0 = monotonicNs();
+    var i: usize = 0;
+    while (i < rounds) : (i += 1) {
+        _ = sample(row, position +% @as(u64, @intCast(i)), s) catch unreachable;
+    }
+    const ns = monotonicNs() - t0;
+    const us = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(rounds)) / 1000.0;
+    std.debug.print("sampleRow {s}: {d:.1} us/row\n", .{ label, us });
+}
+
+test "topCandidates matches reference on vocab rows" {
+    var prng = std.Random.DefaultPrng.init(0xA11CE);
+    const rand = prng.random();
+    const row = try std.testing.allocator.alloc(f32, test_vocab);
+    defer std.testing.allocator.free(row);
+    var v0: [max_candidates]f32 = undefined;
+    var id0: [max_candidates]i64 = undefined;
+    var v1: [max_candidates]f32 = undefined;
+    var id1: [max_candidates]i64 = undefined;
+    for (0..200) |_| {
+        fillRandomNormal(row, rand);
+        const n0 = topCandidatesRef(row, 28, &v0, &id0);
+        const n1 = topCandidates(row, 28, &v1, &id1);
+        try std.testing.expectEqual(n0, n1);
+        try std.testing.expectEqualSlices(f32, v0[0..n0], v1[0..n1]);
+        try std.testing.expectEqualSlices(i64, id0[0..n0], id1[0..n1]);
+        fillFlat(row);
+        const nf0 = topCandidatesRef(row, 28, &v0, &id0);
+        const nf1 = topCandidates(row, 28, &v1, &id1);
+        try std.testing.expectEqual(nf0, nf1);
+        try std.testing.expectEqualSlices(f32, v0[0..nf0], v1[0..nf1]);
+        try std.testing.expectEqualSlices(i64, id0[0..nf0], id1[0..nf1]);
+    }
+}
+
+test "sampleRow matches reference" {
+    var prng = std.Random.DefaultPrng.init(0x51A1E);
+    const rand = prng.random();
+    const row = try std.testing.allocator.alloc(f32, test_vocab);
+    defer std.testing.allocator.free(row);
+    const configs = [_]Sampling{
+        .{ .seed = 1, .temperature = 1.0, .top_k = 20, .top_p = 0.95, .min_p = 0.0 },
+        .{ .seed = 2, .temperature = 1.0, .top_k = 20, .top_p = 1.0, .min_p = 0.0 },
+        .{ .seed = 3, .temperature = 1.0, .top_k = 1, .top_p = 0.95, .min_p = 0.0 },
+        .{ .seed = 4, .temperature = 1.0, .top_k = 64, .top_p = 0.95, .min_p = 0.0 },
+        .{ .seed = 5, .temperature = 1.0, .top_k = 20, .top_p = 0.95, .min_p = 0.05 },
+    };
+    var trial: usize = 0;
+    while (trial < 20_000) : (trial += 1) {
+        if (trial % 3 == 0) fillFlat(row) else fillRandomNormal(row, rand);
+        const cfg = configs[trial % configs.len];
+        const pos: u64 = @intCast(trial * 17 + 3);
+        if (cfg.top_k + margin > max_candidates) {
+            try std.testing.expectError(error.TooManyCandidates, sampleRow(row, pos, cfg));
+            try std.testing.expectError(error.TooManyCandidates, sampleRowRef(row, pos, cfg));
+            continue;
+        }
+        const got = try sampleRow(row, pos, cfg);
+        const want = try sampleRowRef(row, pos, cfg);
+        try std.testing.expectEqual(want, got);
+    }
+    // many ties: partial flat
+    for (0..500) |_| {
+        fillRandomNormal(row, rand);
+        for (row) |*v| {
+            if (rand.boolean()) v.* = 0.5;
+        }
+        const cfg = configs[0];
+        const pos: u64 = rand.int(u64);
+        try std.testing.expectEqual(try sampleRowRef(row, pos, cfg), try sampleRow(row, pos, cfg));
+    }
+}
+
+test "sampleRow draw timing on server vocab" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const s = Sampling{ .seed = 9001, .temperature = 1.0, .top_k = 20, .top_p = 0.95, .min_p = 0.0 };
+    var prng = std.Random.DefaultPrng.init(0xBEEF);
+    const row = try std.testing.allocator.alloc(f32, test_vocab);
+    defer std.testing.allocator.free(row);
+    fillRandomNormal(row, prng.random());
+    const rounds: usize = 400;
+    benchSampleRowUs(row, rounds, 100, s, "ref-random", sampleRowRef);
+    benchSampleRowUs(row, rounds, 100, s, "random", sampleRow);
+    fillPeaked(row, prng.random());
+    benchSampleRowUs(row, rounds, 100, s, "ref-peaked", sampleRowRef);
+    benchSampleRowUs(row, rounds, 100, s, "peaked", sampleRow);
+    fillFlat(row);
+    benchSampleRowUs(row, rounds, 100, s, "ref-flat", sampleRowRef);
+    benchSampleRowUs(row, rounds, 100, s, "flat", sampleRow);
 }
