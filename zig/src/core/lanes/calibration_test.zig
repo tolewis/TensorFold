@@ -188,6 +188,19 @@ test "the probe logs one line on its period and never on an empty round" {
     try std.testing.expectEqual(@as(u64, 3), s.cal_rounds);
 }
 
+test "fix_k raw held chances are not overwritten by forced allocation chances" {
+    var s = try Stream.init(gpa, .{ .id = "s", .prompt = &.{1}, .max_new = 8 });
+    defer s.deinit(gpa);
+    const raw = [_]f64{ 0.9, 0.81, 0.729 };
+    s.rememberHeld(&raw);
+    const forced = [_]f64{ 1.0, 1.0, 0.0 };
+    if (s.cal_held == 0) s.rememberHeld(&forced);
+    try std.testing.expectEqual(@as(u32, 3), s.cal_held);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.9), s.cal_held_raw[0], 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.81), s.cal_held_raw[1], 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.729), s.cal_held_raw[2], 1e-12);
+}
+
 test "cal log runs with draft calibration off when cal_log is set" {
     var g: [1]u32 = undefined;
     var p: [1]f64 = undefined;

@@ -173,7 +173,7 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
         } else {
             fx.* = 1;
             rw.* = try nodeChances(e, p.stream, n);
-            if (p.kind == .head and n > 0 and (e.cfg.draft_cal > 0.0 or e.cfg.cal_log > 0)) {
+            if (p.kind == .head and n > 0 and (e.cfg.draft_cal > 0.0 or e.cfg.cal_log > 0) and p.stream.cal_held == 0) {
                 p.stream.rememberHeld(rw.*);
             }
             pr.* = if (e.cfg.draft_cal > 0.0) try calibrated(a, rw.*, p.stream.calScale(e.cfg.cal_ceil)) else rw.*;
