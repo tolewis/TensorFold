@@ -116,7 +116,7 @@ test "the average moves by the weight toward the round's kept and expected draft
     s.observeCal(0.5, 1.0);
     try std.testing.expectApproxEqAbs(@as(f64, 0.5 / 0.9), s.cal, 1e-6);
     s.cal = 0.0;
-    try std.testing.expectEqual(@as(f64, 0.2), s.calScale());
+    try std.testing.expectEqual(@as(f64, 0.2), s.calScale(1.0));
 }
 
 /// The cal after 20 rounds of 4 drafts whose true per-draft survival is `factor` (its expected kept drafts).
@@ -165,7 +165,7 @@ fn meanScale(factor: f64) f64 {
         }
         s.predict(&raw);
         s.observeCal(0.2, kept);
-        total += s.calScale();
+        total += s.calScale(1.0);
     }
     return total / rounds;
 }
@@ -181,11 +181,37 @@ test "the probe logs one line on its period and never on an empty round" {
     defer s.deinit(gpa);
     s.predict(&.{ 0.9, 0.81 });
     s.observeCal(0.2, 1.0);
-    s.logCal(1, 3, 1, 2);
-    s.logCal(0, 3, 1, 2);
+    s.logCal(1, 1.0, 3, 1, 2);
+    s.logCal(0, 1.0, 3, 1, 2);
     s.cal_n = 0;
-    s.logCal(1, 1, 0, 1);
+    s.logCal(1, 1.0, 1, 0, 1);
     try std.testing.expectEqual(@as(u64, 3), s.cal_rounds);
+}
+
+test "cal log runs with draft calibration off when cal_log is set" {
+    var g: [1]u32 = undefined;
+    var p: [1]f64 = undefined;
+    try grants(0.0, &.{1.0}, &g, &p);
+    try std.testing.expectEqual(@as(u32, 4), g[0]);
+}
+
+test "cal_ceil above 1 lets scale rise and clamps calibrated chances" {
+    const raw = [_]f64{ 0.9, 0.81, 0.729 };
+    var s = try Stream.init(gpa, .{ .id = "s", .prompt = &.{1}, .max_new = 8 });
+    defer s.deinit(gpa);
+    s.cal = 1.35;
+    try std.testing.expectEqual(@as(f64, 1.0), s.calScale(1.0));
+    try std.testing.expectApproxEqAbs(@as(f64, 1.35), s.calScale(1.5), 1e-12);
+    const scaled = try win.calibrated(gpa, &raw, s.calScale(1.5));
+    defer gpa.free(scaled);
+    for (scaled) |v| try std.testing.expect(v <= 1.0);
+    try std.testing.expect(scaled[0] > 0.9);
+}
+
+test "the ceiling must lie in 1..2" {
+    try std.testing.expectError(error.BadCalCeil, Config.init(gpa, .{ .cal_ceil = 0.5 }, 16, 15));
+    var ok = try Config.init(gpa, .{ .cal_ceil = 1.5 }, 16, 15);
+    ok.deinit(gpa);
 }
 
 test "the weight must lie in 0..1" {

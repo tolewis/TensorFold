@@ -444,8 +444,10 @@ pub const Engine = struct {
                 } else if (p.kind == .head) {
                     if (e.cfg.draft_cal > 0.0) {
                         s.observeCal(e.cfg.draft_cal, @floatFromInt(kept));
-                        s.logCal(e.cfg.cal_log, rows, kept, path.len);
                         s.cal_n = 0;
+                    }
+                    if (e.cfg.cal_log > 0) {
+                        s.logCal(e.cfg.cal_log, e.cfg.cal_ceil, rows, kept, path.len);
                     }
                     if (p.lanes) |l| if (s.odds != null) observeLanes(s, l, path);
                     const ds = try accept.depths(a, parents);

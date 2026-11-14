@@ -412,6 +412,8 @@ pub fn parseCalWeight(text: []const u8) !f64 {
     return v;
 }
 
+pub const parseCalCeil = lanes.config.parseCalCeil;
+
 /// A stream's place in the pool and the drafts it holds; TF_DS_KV_SHARD: its planner stream, part and generation
 /// (parts.zig's Live), and whether its first decode round ran (planDecode).
 const Lane = struct {
@@ -488,6 +490,7 @@ pub const Lanes = struct {
     solo_overhead: bool = false, // TF_DS_SOLO_OVERHEAD=1: a lone drafted stream's head windows cost the fixed draft allowance
     draft_cal: f64 = 0.0, // TF_DS_T25_DRAFT_CAL: the weight of a round in each stream's draft-survival calibration (0: off)
     cal_log: u32 = 0, // TF_DS_T25_CAL_LOG: every n-th calibrated verify of a stream prints to stderr (0: off)
+    cal_ceil: f64 = 1.0, // TF_DS_T25_CAL_CEIL: upper clamp of calScale (unset: 1.0)
     no_copies: bool = false, // TF_DS_NO_COPIES=1: a drafted stream proposes no suffix-lookup copy windows
     prof_every: u64 = 0, // TF_DS_SERVE_PROFILE=N: the served rank 0 prints `prof` every N rounds and starts it again (0: off)
     prof_last: u64 = 0, // the last round's start (Model.now)
@@ -578,6 +581,7 @@ pub const Lanes = struct {
             .solo_head_overhead_ms = if (drafting and self.solo_overhead) draft.draft_ms else null, // opt-in: the Python engine's fixed draft allowance
             .draft_cal = self.draft_cal,
             .cal_log = self.cal_log,
+            .cal_ceil = self.cal_ceil,
             .copy_proposals = !(drafting and self.no_copies), // opt-in: the draft head proposes; the Python engine makes no copies either
             .streams_exact = true,
             .hidden_rows = true,
@@ -1269,11 +1273,12 @@ pub const Lanes = struct {
         const self = of(ptr);
         const l = self.streams.getPtr(s) orelse return false;
         if (out.len > l.nheld) return false;
+        survivals(l.confs[0..out.len], out);
         if (self.fix_k) |k| {
+            if (self.cal_log > 0 or self.draft_cal > 0.0) s.rememberHeld(out);
             for (out, 0..) |*o, j| o.* = if (j < k) 1.0 else 0.0;
             return true;
         }
-        survivals(l.confs[0..out.len], out);
         return true;
     }
 

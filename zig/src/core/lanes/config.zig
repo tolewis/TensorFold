@@ -7,6 +7,13 @@ const Constants = @import("depth.zig").Constants;
 
 pub const Cost = alloc.Cost;
 
+/// TF_DS_T25_CAL_CEIL: finite, from 1.0 (default) to 2.0.
+pub fn parseCalCeil(text: []const u8) !f64 {
+    const v = try std.fmt.parseFloat(f64, std.mem.trim(u8, text, " "));
+    if (!std.math.isFinite(v) or v < 1.0 or v > 2.0) return error.BadCalCeil;
+    return v;
+}
+
 /// The class default acceptance by depth (Python DraftDepth.depth_prior).
 pub const default_prior = [_]f64{ 0.85, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5 };
 
@@ -15,6 +22,7 @@ pub const Model = struct {
     solo_head_overhead_ms: ?f64 = null, // fixed overhead for a lone head window; null keeps the live estimate
     draft_cal: f64 = 0.0, // the weight of a round in each stream's realised-over-predicted draft survival (0: off)
     cal_log: u32 = 0, // print every n-th calibrated verify of a stream to stderr (0: off)
+    cal_ceil: f64 = 1.0, // TF_DS_T25_CAL_CEIL: upper clamp of calScale (unset: 1.0)
     copy_proposals: bool = true, // suffix-lookup copy windows; false opts a backend out
     exact_width: u32 = 1, // the widest window that reproduces one-token steps bit for bit
     first_copy_rows: u32 = 0, // a lone stream's first copy window (0: the exact width)
@@ -46,6 +54,7 @@ pub const Config = struct {
     solo_head_overhead_ms: ?f64 = null, // fixed overhead for a lone head window; null keeps the live estimate
     draft_cal: f64 = 0.0, // Model.draft_cal
     cal_log: u32 = 0, // Model.cal_log
+    cal_ceil: f64 = 1.0, // Model.cal_ceil
     copy_proposals: bool = true, // suffix-lookup copy windows; false opts a backend out
     family_width: u32,
     max_copy: u32,
@@ -80,6 +89,7 @@ pub const Config = struct {
 
     pub fn init(gpa: Allocator, m: Model, max_rows: u32, max_draft: u32) !Config {
         if (!std.math.isFinite(m.draft_cal) or m.draft_cal < 0.0 or m.draft_cal > 1.0) return error.BadDraftCal;
+        if (!std.math.isFinite(m.cal_ceil) or m.cal_ceil < 1.0 or m.cal_ceil > 2.0) return error.BadCalCeil;
         if (max_rows < 1) return error.BadMaxRows;
         if (m.solo_head_overhead_ms) |cost| {
             if (!std.math.isFinite(cost) or cost < 0.0) return error.BadSoloHeadOverhead;
@@ -152,6 +162,7 @@ pub const Config = struct {
             .solo_head_overhead_ms = m.solo_head_overhead_ms,
             .draft_cal = m.draft_cal,
             .cal_log = m.cal_log,
+            .cal_ceil = m.cal_ceil,
             .copy_proposals = m.copy_proposals,
         };
     }

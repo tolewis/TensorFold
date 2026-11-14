@@ -173,7 +173,10 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
         } else {
             fx.* = 1;
             rw.* = try nodeChances(e, p.stream, n);
-            pr.* = if (e.cfg.draft_cal > 0.0) try calibrated(a, rw.*, p.stream.calScale()) else rw.*;
+            if (p.kind == .head and n > 0 and (e.cfg.draft_cal > 0.0 or e.cfg.cal_log > 0) and p.stream.cal_held == 0) {
+                p.stream.rememberHeld(rw.*);
+            }
+            pr.* = if (e.cfg.draft_cal > 0.0) try calibrated(a, rw.*, p.stream.calScale(e.cfg.cal_ceil)) else rw.*;
         }
     }
     const overhead = soloHeadOverhead(e.cfg.solo_head_overhead_ms, e.rule.overheadMs(plans.len), e.alone, plans.len, if (plans.len > 0) plans[0].kind else .none);
@@ -223,7 +226,7 @@ pub fn calibrated(a: std.mem.Allocator, chances: []const f64, scale: f64) ![]con
     var factor: f64 = 1.0;
     for (out, chances) |*o, c| {
         factor *= scale;
-        o.* = c * factor;
+        o.* = @min(1.0, c * factor);
     }
     return out;
 }

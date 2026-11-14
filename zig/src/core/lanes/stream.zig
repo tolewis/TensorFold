@@ -219,6 +219,8 @@ pub const Stream = struct {
     served: ?u64 = null,
     granted: ?u32 = null,
     cal: f64 = 1.0, // realised over predicted drafts, a moving average (TF_DS_T25_DRAFT_CAL)
+    cal_held: u32 = 0, // head drafts offered before the grant (TF_DS_T25_CAL_LOG held)
+    cal_held_raw: [cal_max]f64 = @splat(0.0), // their raw cumulative chances (held_chances)
     cal_raw: [cal_max]f64 = @splat(0.0), // the granted drafts' cumulative chances this round, before calibration
     cal_n: usize = 0, // and how many (0: none)
     cal_kept: f64 = 0.0, // moving averages of the drafts kept and of the drafts the chances expected, over verified rounds
@@ -272,6 +274,7 @@ pub const Stream = struct {
         s.served = null;
         s.granted = null;
         s.cal_n = 0;
+        s.cal_held = 0;
         s.copy_width = null;
     }
 
@@ -343,8 +346,15 @@ pub const Stream = struct {
     }
 
     /// The survival scale the allocation uses: a cold or noisy stream cannot collapse its depth to nothing.
-    pub fn calScale(s: *const Stream) f64 {
-        return std.math.clamp(s.cal, cal_floor, 1.0);
+    pub fn calScale(s: *const Stream, ceil: f64) f64 {
+        return std.math.clamp(s.cal, cal_floor, ceil);
+    }
+
+    /// Raw cumulative chances for each held draft before a grant trims them (TF_DS_T25_CAL_LOG).
+    pub fn rememberHeld(s: *Stream, chances: []const f64) void {
+        const n = @min(chances.len, cal_max);
+        s.cal_held = @intCast(chances.len);
+        @memcpy(s.cal_held_raw[0..n], chances[0..n]);
     }
 
     /// Remember the granted drafts' raw cumulative chances for the round's verify.
@@ -381,16 +391,21 @@ pub const Stream = struct {
     }
 
     /// One line on stderr for the probe: the round, what it predicted, and what the next allocation will see.
-    pub fn logCal(s: *Stream, every: u32, rows: usize, kept: usize, tokens: usize) void {
+    pub fn logCal(s: *Stream, every: u32, ceil: f64, rows: usize, kept: usize, tokens: usize) void {
         s.cal_rounds += 1;
         if (every == 0 or s.cal_rounds % every != 0) return;
-        var buf: [1024]u8 = undefined;
+        var buf: [1536]u8 = undefined;
         var at: usize = 0;
         const n = s.cal_n;
-        at += (std.fmt.bufPrint(buf[at..], "tf-cal {{\"stream\": \"{s}\", \"rows\": {d}, \"granted\": {d}, \"kept\": {d}, \"pred_sum\": {d:.3}, \"chances\": [", .{ s.id, rows, n, kept, s.predicted() }) catch return).len;
+        const held_n = @min(s.cal_held, cal_max);
+        at += (std.fmt.bufPrint(buf[at..], "tf-cal {{\"stream\": \"{s}\", \"rows\": {d}, \"held\": {d}, \"held_chances\": [", .{ s.id, rows, s.cal_held }) catch return).len;
+        for (s.cal_held_raw[0..held_n], 0..) |p, i| {
+            at += (std.fmt.bufPrint(buf[at..], "{s}{d:.3}", .{ if (i > 0) ", " else "", p }) catch return).len;
+        }
+        at += (std.fmt.bufPrint(buf[at..], "], \"granted\": {d}, \"kept\": {d}, \"pred_sum\": {d:.3}, \"chances\": [", .{ n, kept, s.predicted() }) catch return).len;
         for (s.cal_raw[0..n], 0..) |p, i| at += (std.fmt.bufPrint(buf[at..], "{s}{d:.3}", .{ if (i > 0) ", " else "", p }) catch return).len;
         at += (std.fmt.bufPrint(buf[at..], "], \"c\": {d:.3}, \"cal\": {d:.3}, \"next\": [", .{ s.cal_c, s.cal }) catch return).len;
-        const scale = s.calScale();
+        const scale = s.calScale(ceil);
         var factor: f64 = 1.0;
         for (s.cal_raw[0..n], 0..) |p, i| {
             factor *= scale;
