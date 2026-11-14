@@ -14,6 +14,13 @@ pub fn parseCalCeil(text: []const u8) !f64 {
     return v;
 }
 
+/// TF_DS_T25_FULL_AT: finite, from 0.5 (a low kept share) to 1.0 (always full grants).
+pub fn parseFullAt(text: []const u8) !f64 {
+    const v = try std.fmt.parseFloat(f64, std.mem.trim(u8, text, " "));
+    if (!std.math.isFinite(v) or v < 0.5 or v > 1.0) return error.BadFullAt;
+    return v;
+}
+
 /// The class default acceptance by depth (Python DraftDepth.depth_prior).
 pub const default_prior = [_]f64{ 0.85, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5 };
 
@@ -23,6 +30,8 @@ pub const Model = struct {
     draft_cal: f64 = 0.0, // the weight of a round in each stream's realised-over-predicted draft survival (0: off)
     cal_log: u32 = 0, // print every n-th calibrated verify of a stream to stderr (0: off)
     cal_ceil: f64 = 1.0, // TF_DS_T25_CAL_CEIL: upper clamp of calScale (unset: 1.0)
+    full_at: ?f64 = null, // TF_DS_T25_FULL_AT: head grants use chance 1.0 when kept share >= this (unset: off)
+    fix_k: ?u32 = null, // TF_DS_FIX_K: every stream verifies K drafts (wins over full_at)
     copy_proposals: bool = true, // suffix-lookup copy windows; false opts a backend out
     exact_width: u32 = 1, // the widest window that reproduces one-token steps bit for bit
     first_copy_rows: u32 = 0, // a lone stream's first copy window (0: the exact width)
@@ -55,6 +64,8 @@ pub const Config = struct {
     draft_cal: f64 = 0.0, // Model.draft_cal
     cal_log: u32 = 0, // Model.cal_log
     cal_ceil: f64 = 1.0, // Model.cal_ceil
+    full_at: ?f64 = null, // Model.full_at
+    fix_k: ?u32 = null, // Model.fix_k
     copy_proposals: bool = true, // suffix-lookup copy windows; false opts a backend out
     family_width: u32,
     max_copy: u32,
@@ -163,6 +174,8 @@ pub const Config = struct {
             .draft_cal = m.draft_cal,
             .cal_log = m.cal_log,
             .cal_ceil = m.cal_ceil,
+            .full_at = m.full_at,
+            .fix_k = m.fix_k,
             .copy_proposals = m.copy_proposals,
         };
     }

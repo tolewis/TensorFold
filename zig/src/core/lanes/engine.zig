@@ -442,11 +442,15 @@ pub const Engine = struct {
                         s.copy_width = if (kept == rows - 1) @min(e.cfg.max_copy, 2 * width + 1) else e.cfg.first_copy;
                     }
                 } else if (p.kind == .head) {
+                    if (e.cfg.full_at != null) {
+                        const g = s.granted orelse @as(u32, @intCast(if (kept < p.count()) kept else p.count()));
+                        s.observeShare(g, kept);
+                    }
                     if (e.cfg.draft_cal > 0.0) {
                         s.observeCal(e.cfg.draft_cal, @floatFromInt(kept));
                     }
                     if (e.cfg.cal_log > 0) {
-                        s.logCal(e.cfg.cal_log, e.cfg.cal_ceil, rows, kept, path.len);
+                        s.logCal(e.cfg.cal_log, e.cfg.cal_ceil, e.cfg.full_at, rows, kept, path.len);
                         s.cal_held = 0;
                         if (e.cfg.draft_cal == 0.0) s.cal_n = 0;
                     }

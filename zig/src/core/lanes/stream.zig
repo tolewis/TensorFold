@@ -227,6 +227,9 @@ pub const Stream = struct {
     cal_sum: f64 = 0.0, // (0: no round yet)
     cal_c: f64 = 1.0, // the per-draft survival the last verified round solved for
     cal_rounds: u64 = 0, // calibrated verifies, for the log
+    share_granted: f64 = 0.0, // moving average of drafts granted (TF_DS_T25_FULL_AT)
+    share_kept: f64 = 0.0, // moving average of drafts kept on verify
+    share_verifies: u32 = 0, // head verifies counted toward kept share
     copy_width: ?u32 = null,
     gate: ?call_gate.Gate = null,
 
@@ -370,6 +373,38 @@ pub const Stream = struct {
         return sum;
     }
 
+    /// The weight of one head verify in the kept-share averages (TF_DS_T25_FULL_AT).
+    pub const share_weight: f64 = 0.1;
+    /// Head verifies before a stream has a kept share (TF_DS_T25_FULL_AT).
+    pub const share_min_verifies: u32 = 8;
+
+    /// Moving averages of granted and kept drafts on head verifies (weight share_weight).
+    pub fn observeShare(s: *Stream, granted: u32, kept: usize) void {
+        const g = @as(f64, @floatFromInt(granted));
+        const k = @as(f64, @floatFromInt(kept));
+        if (granted == 0 and kept == 0) return;
+        if (s.share_verifies > 0) {
+            s.share_granted = (1.0 - share_weight) * s.share_granted + share_weight * g;
+            s.share_kept = (1.0 - share_weight) * s.share_kept + share_weight * k;
+        } else {
+            s.share_granted = g;
+            s.share_kept = k;
+        }
+        s.share_verifies += 1;
+    }
+
+    /// Granted-over-kept share after enough verifies; null while cold.
+    pub fn keptShare(s: *const Stream) ?f64 {
+        if (s.share_verifies < share_min_verifies or s.share_granted <= 0.0) return null;
+        return s.share_kept / s.share_granted;
+    }
+
+    /// Whether allocation should give this stream full draft chances (TF_DS_T25_FULL_AT).
+    pub fn fullGrant(s: *const Stream, thresh: f64) bool {
+        const sh = s.keptShare() orelse return false;
+        return sh >= thresh;
+    }
+
     /// Fold the round into the averages of kept and expected drafts, weight `w`, and set `cal` to the per-draft
     /// survival whose expected drafts are the average's share of this round's chances. A per-round ratio would bias
     /// `cal` low: its noise is clipped at 1 on one side only.
@@ -391,7 +426,7 @@ pub const Stream = struct {
     }
 
     /// One line on stderr for the probe: the round, what it predicted, and what the next allocation will see.
-    pub fn logCal(s: *Stream, every: u32, ceil: f64, rows: usize, kept: usize, tokens: usize) void {
+    pub fn logCal(s: *Stream, every: u32, ceil: f64, full_at: ?f64, rows: usize, kept: usize, tokens: usize) void {
         s.cal_rounds += 1;
         if (every == 0 or s.cal_rounds % every != 0) return;
         var buf: [1536]u8 = undefined;
@@ -411,7 +446,14 @@ pub const Stream = struct {
             factor *= scale;
             at += (std.fmt.bufPrint(buf[at..], "{s}{d:.3}", .{ if (i > 0) ", " else "", p * factor }) catch return).len;
         }
-        at += (std.fmt.bufPrint(buf[at..], "], \"tokens\": {d}}}\n", .{tokens}) catch return).len;
+        at += (std.fmt.bufPrint(buf[at..], "], \"tokens\": {d}", .{tokens}) catch return).len;
+        if (s.keptShare()) |sh| {
+            at += (std.fmt.bufPrint(buf[at..], ", \"share\": {d:.3}", .{sh}) catch return).len;
+        } else {
+            at += (std.fmt.bufPrint(buf[at..], ", \"share\": null", .{}) catch return).len;
+        }
+        const full: u8 = if (full_at) |t| @intFromBool(s.fullGrant(t)) else 0;
+        at += (std.fmt.bufPrint(buf[at..], ", \"full\": {d}}}\n", .{full}) catch return).len;
         std.debug.print("{s}", .{buf[0..at]});
     }
 

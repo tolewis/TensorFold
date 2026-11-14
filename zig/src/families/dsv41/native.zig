@@ -37,6 +37,7 @@
 //!   TF_DS_T25_DRAFT_CAL                         a weight in (0, 1]: each stream's draft survival is scaled by its realised over
 //!                                               predicted drafts (unset or 0: off; core/lanes/windows.zig)
 //!   TF_DS_T25_CAL_LOG                           print every n-th calibrated verify of a stream to stderr (unset or 0: off)
+//!   TF_DS_T25_FULL_AT=x                         0.5..1.0: streams whose kept share >= x get chance 1.0 on held drafts (unset: off)
 //!   TF_DS_NO_COPIES=1                           a drafted stream proposes no suffix-lookup copy windows
 //!   TF_DS_SERVE_PROFILE=N                       a measurement: rank 0 prints its backend's times (send, forward, absorb,
 //!                                               logits, sample, the drafter pass, the rest of a round) to stderr every N
@@ -271,6 +272,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     st.lanes.draft_cal = if (getenv("TF_DS_T25_DRAFT_CAL")) |v| lanes_mod.parseCalWeight(v) catch return error.BadDraftCal else 0.0;
     st.lanes.cal_log = if (getenv("TF_DS_T25_CAL_LOG")) |v| std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch return error.BadCalLog else 0;
     st.lanes.cal_ceil = if (getenv("TF_DS_T25_CAL_CEIL")) |v| lanes_mod.parseCalCeil(v) catch return error.BadCalCeil else 1.0;
+    st.lanes.full_at = if (getenv("TF_DS_T25_FULL_AT")) |v| lanes_mod.parseFullAt(v) catch return error.BadFullAt else null;
     st.lanes.no_copies = if (getenv("TF_DS_NO_COPIES")) |v| !std.mem.eql(u8, v, "0") else false;
     {
         // TF_DS_ROUND_MS_<n>: a round of n streams by its rows (unset: TF_DS_ROUND_MS's table)
