@@ -333,6 +333,38 @@ fn lowChances(_: *anyopaque, _: *Stream, out: []f64) anyerror!bool {
     return true;
 }
 
+test "full_at applies only when one plan is in the round" {
+    var costs: [16]Cost = undefined;
+    for (&costs, 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 5.0 + 2.0 * @as(f64, @floatFromInt(w)) };
+    var cfg = try Config.init(gpa, .{ .exact_width = 16, .mtp = true, .speculate = true, .drafts = 4, .window_costs = &costs, .mtp_step_ms = 0.5, .draft_probabilities = true, .full_at = 0.8 }, 16, 15);
+    defer cfg.deinit(gpa);
+    var target: fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var vtable = target.backend().vtable.*;
+    vtable.probabilities = lowChances;
+    var token: u8 = 0;
+    var engine = Engine.init(gpa, &cfg, .{ .ptr = &target, .vtable = &vtable }, .{ .ptr = &token, .vtable = &.{ .start = startNow, .elapsed_ms = elapsed } });
+    defer engine.deinit();
+    var s0 = try Stream.init(gpa, .{ .id = "a", .prompt = &.{1}, .max_new = 8 });
+    defer s0.deinit(gpa);
+    var s1 = try Stream.init(gpa, .{ .id = "b", .prompt = &.{2}, .max_new = 8 });
+    defer s1.deinit(gpa);
+    warmShare(&s0, 10, 9, 8);
+    warmShare(&s1, 10, 9, 8);
+    const alone: win.Plan = .{ .stream = &s0, .position = 0, .kind = .head, .held = 4 };
+    try win.allocate(&engine, &.{alone});
+    try std.testing.expectEqual(@as(u32, 4), s0.granted.?);
+    s0.granted = null;
+    s1.granted = null;
+    const pair = [_]win.Plan{
+        .{ .stream = &s0, .position = 0, .kind = .head, .held = 4 },
+        .{ .stream = &s1, .position = 0, .kind = .head, .held = 4 },
+    };
+    try win.allocate(&engine, &pair);
+    try std.testing.expect((s0.granted orelse 0) < 4);
+    try std.testing.expect((s1.granted orelse 0) < 4);
+}
+
 test "fix_k wins over full_at" {
     var costs: [16]Cost = undefined;
     for (&costs, 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 5.0 };

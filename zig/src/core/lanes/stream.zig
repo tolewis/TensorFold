@@ -393,7 +393,7 @@ pub const Stream = struct {
         s.share_verifies += 1;
     }
 
-    /// Granted-over-kept share after enough verifies; null while cold.
+    /// Kept-over-granted share after enough verifies; null while cold.
     pub fn keptShare(s: *const Stream) ?f64 {
         if (s.share_verifies < share_min_verifies or s.share_granted <= 0.0) return null;
         return s.share_kept / s.share_granted;

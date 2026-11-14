@@ -179,7 +179,7 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
             pr.* = if (e.cfg.draft_cal > 0.0) try calibrated(a, rw.*, p.stream.calScale(e.cfg.cal_ceil)) else rw.*;
             if (p.kind == .head) {
                 if (e.cfg.full_at) |thresh| {
-                    if (e.cfg.fix_k == null and p.stream.fullGrant(thresh)) {
+                    if (plans.len == 1 and e.cfg.fix_k == null and p.stream.fullGrant(thresh)) {
                         const ones = try a.alloc(f64, n);
                         for (ones) |*o| o.* = 1.0;
                         pr.* = ones;
@@ -190,10 +190,10 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
     }
     const overhead = soloHeadOverhead(e.cfg.solo_head_overhead_ms, e.rule.overheadMs(plans.len), e.alone, plans.len, if (plans.len > 0) plans[0].kind else .none);
     const counts = try alloc.allocate(a, fixed, probs, e.cfg.sharedCosts(plans.len), overhead, @max(plans.len, e.cfg.batch_rows));
-    for (plans, probs, counts) |*p, chances, c| {
+    for (plans, probs, counts, raw) |*p, chances, c, rw| {
         if (p.kind == .head) p.stream.granted = c;
         if (p.kind == .head and (e.cfg.draft_cal > 0.0 or e.cfg.cal_log > 0)) {
-            p.stream.predict(chances[0..c]);
+            p.stream.predict(rw[0..c]);
         }
         if (chances.len == 0 or c == chances.len) continue;
         if (c == 0) {
