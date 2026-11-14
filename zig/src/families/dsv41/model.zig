@@ -80,6 +80,19 @@ pub const Options = struct {
     vision_bias: ?[]const u8 = null, // gate_bias_vl.safetensors (null: the kit's vision/): the image-span routing bias
 };
 
+/// TF_DS_SERVE_PROFILE: one fillChunk's device buckets (ns).
+pub const TurnFillPass = struct {
+    upload_ns: u64 = 0,
+    replay_ns: u64 = 0,
+    layers_ns: u64 = 0,
+    drafter_ns: u64 = 0,
+    tokens: u32 = 0,
+
+    pub fn deviceNs(p: TurnFillPass) u64 {
+        return p.upload_ns + p.replay_ns + p.layers_ns + p.drafter_ns;
+    }
+};
+
 pub const Model = struct {
     gpa: std.mem.Allocator,
     host: std.heap.ArenaAllocator, // allocations that live as long as the model
@@ -157,6 +170,8 @@ pub const Model = struct {
     clk_rounds: u64 = 0,
     t_forward: u64 = 0,
     t_absorb: u64 = 0,
+    turn_timing: bool = false,
+    turn_pass: TurnFillPass = .{},
     // world 4: the 2D split's exchanges (prompt2d.zig, TP4's), with the RDMA rings when asked
     two: ?prompt2d.Two = null,
     rdma_rings: ?ring2d.Rings = null,
@@ -1140,8 +1155,19 @@ pub const Model = struct {
     /// layer with the served bounded replay (replay = the prompt's length - the window: an encoder-only chunk stops at
     /// the decoder's first layer). A chunk that reaches the head leaves the logits of its last row in ch.head_g and,
     /// drafting, its DSpark taps absorbed into the slot's drafter rings. True when it reached the head.
+    fn turnSyncedNow(m: *Model) u64 {
+        m.stream.synchronize() catch {};
+        return m.now();
+    }
+
     pub fn fillChunk(m: *Model, seq: []const i32, start: usize, n: usize, replay: usize) !bool {
         if (n == 0 or n > chunk_rows or seq.len != start + n) return error.BadChunk;
+        const timing = m.turn_timing;
+        var turn: TurnFillPass = .{};
+        if (timing) turn.tokens = @intCast(n);
+        defer if (timing) {
+            m.turn_pass = turn;
+        };
         const e = &m.eng;
         const c = e.c;
         const ch = &m.ch;
@@ -1152,9 +1178,19 @@ pub const Model = struct {
         var shared: prompt.Shared = .{};
         const pt = m.ptimer;
         if (pt) |t| try t.mark(m.stream, .start);
+        var layers0: u64 = 0;
+        if (timing) {
+            _ = turnSyncedNow(m);
+            layers0 = m.now();
+        }
         try prompt.begin(e, ch, m.ids64[0..n], start, m.host_pos);
         if (ch.spans.len > 0) try prompt.embedSpans(e, ch);
         if (pt) |t| try t.mark(m.stream, .embed);
+        if (timing) {
+            const t1 = turnSyncedNow(m);
+            turn.upload_ns = t1 - layers0;
+            layers0 = t1;
+        }
         const taps = m.dr != null;
         var floor: usize = 0;
         var kv_done: ?usize = null;
@@ -1186,9 +1222,14 @@ pub const Model = struct {
         }
         for (0..c.layers) |li| {
             if (li == c.layers / 2) {
-                if (!try prompt.replayCut(e, ch, &m.view, &shared, li, replay, m.host_pos)) {
+                var replay0: u64 = 0;
+                if (timing) replay0 = turnSyncedNow(m);
+                const past = try prompt.replayCut(e, ch, &m.view, &shared, li, replay, m.host_pos);
+                if (timing) turn.replay_ns += turnSyncedNow(m) - replay0;
+                if (!past) {
                     // encoder-only: no synchronize either (as at the chunk's end below), so the next chunk's host steps
                     // run while this one's last layers do; the profile alone waits
+                    if (timing) turn.layers_ns = turnSyncedNow(m) - layers0 - turn.replay_ns;
                     if (pt) |t| {
                         try m.stream.synchronize();
                         try t.finish();
@@ -1246,11 +1287,14 @@ pub const Model = struct {
         }
         try prompt.head(e, ch);
         if (pt) |t| try t.mark(m.stream, .head);
+        if (timing) turn.layers_ns = turnSyncedNow(m) - layers0 - turn.replay_ns;
         if (m.dr) |*dr| {
+            const draft0 = if (timing) turnSyncedNow(m) else 0;
             // its taps (the tap layers side by side) into the slot's drafter rings
             const dw = c.hidden;
             for (0..c.dspark_taps.slice().len) |j| try e.ops.copyRows(e.s, prompt.tapRows(e, ch, j), dw * 2, dr.at + j * dw * 2, dr.taps_w * 2, dw * 2, ch.n);
             try dr.absorb(e, ch, &m.dpool.?, m.fill_slot, dr.at, ch.n, ch.start);
+            if (timing) turn.drafter_ns = turnSyncedNow(m) - draft0;
         }
         // no synchronize: the next chunk's host steps (its first Engram layer's hashing, table reads and decode, ~0.14 s
         // at 2,048 rows) run while this chunk's kernels do; readers of the results (the prompt's logits) synchronize.

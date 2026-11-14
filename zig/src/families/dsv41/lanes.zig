@@ -435,6 +435,8 @@ fn profileMs(ns: u64, n: u64) f64 {
     return if (n == 0) 0 else @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(n)) / 1e6;
 }
 
+pub const max_turn_passes = 16;
+
 /// TF_DS_SERVE_PROFILE: one prefill's parts from the request to the first token (ns, summed).
 pub const TurnPrefill = struct {
     arrived_ns: u64 = 0,
@@ -447,14 +449,31 @@ pub const TurnPrefill = struct {
     restore_device_ns: u64 = 0,
     prefill_forward_host_ns: u64 = 0,
     prefill_forward_device_ns: u64 = 0,
+    fill_upload_device_ns: u64 = 0,
+    fill_replay_device_ns: u64 = 0,
+    fill_layers_device_ns: u64 = 0,
+    fill_drafter_device_ns: u64 = 0,
     logits_sample_host_ns: u64 = 0,
     first_draft_host_ns: u64 = 0,
     first_send_host_ns: u64 = 0,
     passes: u32 = 0,
+    pass_n: u32 = 0,
+    pass_tokens: [max_turn_passes]u32 = @splat(0),
     computed: u32 = 0,
     cached: u32 = 0,
     done_ns: u64 = 0,
 };
+
+pub fn mergeTurnFillPass(tp: *TurnPrefill, p: model.TurnFillPass) void {
+    tp.fill_upload_device_ns += p.upload_ns;
+    tp.fill_replay_device_ns += p.replay_ns;
+    tp.fill_layers_device_ns += p.layers_ns;
+    tp.fill_drafter_device_ns += p.drafter_ns;
+    if (tp.pass_n < max_turn_passes) {
+        tp.pass_tokens[tp.pass_n] = p.tokens;
+        tp.pass_n += 1;
+    }
+}
 
 fn turnNsToMs(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1e6;
@@ -477,9 +496,13 @@ pub fn turnProfileTtftNs(tp: TurnPrefill) u64 {
     return tp.done_ns -| tp.wall0_ns;
 }
 
+pub fn turnProfileFillDeviceNs(tp: TurnPrefill) u64 {
+    return tp.fill_upload_device_ns + tp.fill_replay_device_ns + tp.fill_layers_device_ns + tp.fill_drafter_device_ns;
+}
+
 pub fn turnProfilePartsNs(tp: TurnPrefill) u64 {
     return turnProfileTemplateNs(tp) + turnProfileQueueNs(tp) + tp.cache_search_host_ns + tp.open_host_ns + tp.restore_host_ns +
-        tp.restore_device_ns + tp.prefill_forward_host_ns + tp.prefill_forward_device_ns + tp.logits_sample_host_ns +
+        tp.restore_device_ns + tp.prefill_forward_host_ns + turnProfileFillDeviceNs(tp) + tp.logits_sample_host_ns +
         tp.first_draft_host_ns + tp.first_send_host_ns;
 }
 
@@ -491,7 +514,8 @@ pub fn turnProfileOtherMs(tp: TurnPrefill) f64 {
 pub fn printTurnProfile(tp: TurnPrefill) void {
     const ttft_ms = turnNsToMs(turnProfileTtftNs(tp));
     const other = turnProfileOtherMs(tp);
-    std.debug.print("{{\"turn_profile\": {{\"template_tokenize_host_ms\": {d:.3}, \"queue_host_ms\": {d:.3}, \"cache_search_host_ms\": {d:.3}, \"open_host_ms\": {d:.3}, \"restore_host_ms\": {d:.3}, \"restore_device_ms\": {d:.3}, \"prefill_forward_host_ms\": {d:.3}, \"prefill_forward_device_ms\": {d:.3}, \"logits_sample_host_ms\": {d:.3}, \"first_draft_host_ms\": {d:.3}, \"first_send_host_ms\": {d:.3}, \"passes\": {d}, \"computed_tokens\": {d}, \"cached_tokens\": {d}, \"ttft_ms\": {d:.3}, \"other_ms\": {d:.3}}}}}\n", .{
+  const fill_dev = turnProfileFillDeviceNs(tp);
+    std.debug.print("{{\"turn_profile\": {{\"template_tokenize_host_ms\": {d:.3}, \"queue_host_ms\": {d:.3}, \"cache_search_host_ms\": {d:.3}, \"open_host_ms\": {d:.3}, \"restore_host_ms\": {d:.3}, \"restore_device_ms\": {d:.3}, \"prefill_forward_host_ms\": {d:.3}, \"prefill_forward_device_ms\": {d:.3}, \"fill_upload_device_ms\": {d:.3}, \"fill_replay_device_ms\": {d:.3}, \"fill_layers_device_ms\": {d:.3}, \"fill_drafter_device_ms\": {d:.3}, \"logits_sample_host_ms\": {d:.3}, \"first_draft_host_ms\": {d:.3}, \"first_send_host_ms\": {d:.3}, \"passes\": {d}, \"pass_tokens\": [", .{
         turnNsToMs(turnProfileTemplateNs(tp)),
         turnNsToMs(turnProfileQueueNs(tp)),
         turnNsToMs(tp.cache_search_host_ns),
@@ -499,16 +523,21 @@ pub fn printTurnProfile(tp: TurnPrefill) void {
         turnNsToMs(tp.restore_host_ns),
         turnNsToMs(tp.restore_device_ns),
         turnNsToMs(tp.prefill_forward_host_ns),
-        turnNsToMs(tp.prefill_forward_device_ns),
+        turnNsToMs(fill_dev),
+        turnNsToMs(tp.fill_upload_device_ns),
+        turnNsToMs(tp.fill_replay_device_ns),
+        turnNsToMs(tp.fill_layers_device_ns),
+        turnNsToMs(tp.fill_drafter_device_ns),
         turnNsToMs(tp.logits_sample_host_ns),
         turnNsToMs(tp.first_draft_host_ns),
         turnNsToMs(tp.first_send_host_ns),
         tp.passes,
-        tp.computed,
-        tp.cached,
-        ttft_ms,
-        other,
     });
+    for (0..tp.pass_n) |i| {
+        if (i > 0) std.debug.print(", ", .{});
+        std.debug.print("{d}", .{tp.pass_tokens[i]});
+    }
+    std.debug.print("], \"computed_tokens\": {d}, \"cached_tokens\": {d}, \"ttft_ms\": {d:.3}, \"other_ms\": {d:.3}}}}}\n", .{ tp.computed, tp.cached, ttft_ms, other });
 }
 
 test "turnProfileOtherMs is the ttft wall minus the named parts" {
@@ -521,15 +550,33 @@ test "turnProfileOtherMs is the ttft wall minus the named parts" {
         .open_host_ns = 8_000_000,
         .restore_host_ns = 12_000_000,
         .restore_device_ns = 85_000_000,
+        .fill_layers_device_ns = 70_000_000,
         .prefill_forward_device_ns = 70_000_000,
         .prefill_forward_host_ns = 3_000_000,
         .logits_sample_host_ns = 15_000_000,
         .computed = 189,
         .cached = 2800,
         .passes = 1,
+        .pass_n = 1,
+        .pass_tokens = blk: {
+            var a: [max_turn_passes]u32 = @splat(0);
+            a[0] = 189;
+            break :blk a;
+        },
     };
     try std.testing.expect(turnProfileTtftNs(tp) == 468_000_000);
     try std.testing.expectApproxEqAbs(@as(f64, 270.0), turnProfileOtherMs(tp), 0.001);
+    try std.testing.expectEqual(turnProfileFillDeviceNs(tp), tp.prefill_forward_device_ns);
+}
+
+test "mergeTurnFillPass splits fill device time and records pass_tokens" {
+    var tp: TurnPrefill = .{};
+    const p: model.TurnFillPass = .{ .upload_ns = 10_000_000, .replay_ns = 20_000_000, .layers_ns = 170_000_000, .drafter_ns = 5_000_000, .tokens = 2048 };
+    mergeTurnFillPass(&tp, p);
+    try std.testing.expectEqual(@as(u32, 1), tp.pass_n);
+    try std.testing.expectEqual(@as(u32, 2048), tp.pass_tokens[0]);
+    try std.testing.expectEqual(@as(u64, 170_000_000), tp.fill_layers_device_ns);
+    try std.testing.expectEqual(@as(u64, 205_000_000), model.TurnFillPass.deviceNs(p));
 }
 
 test "mergePassParts rolls per-pass part times into the profile" {
@@ -1098,12 +1145,12 @@ pub const Lanes = struct {
                 // TF_DS_KV_SHARD: the stream's twins pinned while its chunk runs (parts.zig setPartial), not between
                 if (f.part) |id| self.kv.?.planner.setPartial(id, true);
                 defer if (f.part) |id| self.kv.?.planner.setPartial(id, false);
-                if (self.turn_prefill != null) m.stream.synchronize() catch {};
-                const chunk_dev0 = if (self.turn_prefill != null) m.now() else 0;
+                m.turn_timing = self.turn_prefill != null;
+                defer m.turn_timing = false;
                 const head = try m.fillChunk(seq[0 .. start + n], start, n, f.replay);
                 if (self.turn_prefill) |*tp| {
-                    m.stream.synchronize() catch {};
-                    tp.prefill_forward_device_ns += m.now() - chunk_dev0;
+                    mergeTurnFillPass(tp, m.turn_pass);
+                    tp.prefill_forward_device_ns += m.turn_pass.deviceNs();
                     tp.passes += 1;
                 }
                 break :blk head;
@@ -1140,7 +1187,8 @@ pub const Lanes = struct {
             tp.logits_sample_host_ns += m.now() - logit0;
             tp.done_ns = m.now();
             tp.cached = s.cached;
-            tp.computed = @intCast(done.len -| s.cached);
+            tp.computed = @intCast(s.prompt_len -| @as(usize, s.cached));
+            tp.prefill_forward_device_ns = turnProfileFillDeviceNs(tp.*);
             printTurnProfile(tp.*);
             self.turn_prefill = null;
         }
