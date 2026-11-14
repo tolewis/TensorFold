@@ -206,6 +206,46 @@ test "cal_ceil above 1 lets scale rise and clamps calibrated chances" {
     defer gpa.free(scaled);
     for (scaled) |v| try std.testing.expect(v <= 1.0);
     try std.testing.expect(scaled[0] > 0.9);
+    const rising = [_]f64{ 0.50, 0.48 };
+    const capped = try win.calibrated(gpa, &rising, 1.5);
+    defer gpa.free(capped);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.75), capped[0], 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.75), capped[1], 1e-12);
+    try std.testing.expect(capped[1] < 1.0);
+}
+
+test "cal log fields follow each round with draft cal off" {
+    var s = try Stream.init(gpa, .{ .id = "s", .prompt = &.{1}, .max_new = 8 });
+    defer s.deinit(gpa);
+    const r1_held = [_]f64{ 0.9, 0.81, 0.729 };
+    s.rememberHeld(&r1_held);
+    try std.testing.expectEqual(@as(u32, 3), s.cal_held);
+    var r1_grant = [_]f64{ r1_held[0], r1_held[1] };
+    s.predict(&r1_grant);
+    s.granted = 2;
+    try std.testing.expectEqual(@as(usize, 2), s.cal_n);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.71), s.predicted(), 1e-12);
+    s.logCal(1, 1.0, 4, 2, 3);
+    s.cal_held = 0;
+    s.cal_n = 0;
+    const r2_held = [_]f64{ 0.5, 0.4 };
+    s.rememberHeld(&r2_held);
+    try std.testing.expectEqual(@as(u32, 2), s.cal_held);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), s.cal_held_raw[0], 1e-12);
+    s.predict(&.{r2_held[0]});
+    s.granted = 1;
+    try std.testing.expectEqual(@as(usize, 1), s.cal_n);
+    s.logCal(1, 1.0, 2, 1, 2);
+    s.cal_held = 0;
+    s.cal_n = 0;
+    s.predict(&r1_grant);
+    s.cal = 0.5;
+    try std.testing.expectEqual(@as(usize, 2), s.cal_n);
+    s.observeCal(0.5, 1.0);
+    try std.testing.expectEqual(@as(usize, 2), s.cal_n);
+    s.logCal(1, 1.0, 4, 2, 3);
+    try std.testing.expectEqual(@as(usize, 2), s.cal_n);
+    s.cal_n = 0;
 }
 
 test "the ceiling must lie in 1..2" {

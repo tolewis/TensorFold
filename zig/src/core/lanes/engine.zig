@@ -444,17 +444,21 @@ pub const Engine = struct {
                 } else if (p.kind == .head) {
                     if (e.cfg.draft_cal > 0.0) {
                         s.observeCal(e.cfg.draft_cal, @floatFromInt(kept));
-                        s.cal_n = 0;
                     }
                     if (e.cfg.cal_log > 0) {
                         s.logCal(e.cfg.cal_log, e.cfg.cal_ceil, rows, kept, path.len);
+                        s.cal_held = 0;
+                        if (e.cfg.draft_cal == 0.0) s.cal_n = 0;
                     }
+                    if (e.cfg.draft_cal > 0.0) s.cal_n = 0;
                     if (p.lanes) |l| if (s.odds != null) observeLanes(s, l, path);
                     const ds = try accept.depths(a, parents);
                     const chain = if (p.branch_from > 0) ds[0..p.branch_from] else ds;
                     var chain_kept: usize = 0;
                     for (path[1..]) |r| chain_kept += @intFromBool(p.branch_from == 0 or r < p.branch_from);
                     try e.rule.observeDepth(win.who(s), std.mem.max(u32, chain), @intCast(chain_kept));
+                } else if (e.cfg.cal_log > 0) {
+                    s.cal_held = 0;
                 }
                 var kept_branch: u64 = 0;
                 if (p.branch_from > 0) {

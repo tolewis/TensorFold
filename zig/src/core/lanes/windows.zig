@@ -173,7 +173,7 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
         } else {
             fx.* = 1;
             rw.* = try nodeChances(e, p.stream, n);
-            if (p.kind == .head and n > 0 and (e.cfg.draft_cal > 0.0 or e.cfg.cal_log > 0) and p.stream.cal_held == 0) {
+            if (p.kind == .head and n > 0 and (e.cfg.draft_cal > 0.0 or e.cfg.cal_log > 0)) {
                 p.stream.rememberHeld(rw.*);
             }
             pr.* = if (e.cfg.draft_cal > 0.0) try calibrated(a, rw.*, p.stream.calScale(e.cfg.cal_ceil)) else rw.*;
@@ -183,7 +183,9 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
     const counts = try alloc.allocate(a, fixed, probs, e.cfg.sharedCosts(plans.len), overhead, @max(plans.len, e.cfg.batch_rows));
     for (plans, probs, counts, raw) |*p, chances, c, rw| {
         if (p.kind == .head) p.stream.granted = c;
-        if (e.cfg.draft_cal > 0.0) p.stream.predict(if (p.kind == .head) rw[0..c] else &.{});
+        if (p.kind == .head and (e.cfg.draft_cal > 0.0 or e.cfg.cal_log > 0)) {
+            p.stream.predict(rw[0..c]);
+        }
         if (chances.len == 0 or c == chances.len) continue;
         if (c == 0) {
             p.kind = .none;
@@ -224,9 +226,11 @@ pub fn nodeChances(e: *Engine, s: *Stream, n: usize) ![]const f64 {
 pub fn calibrated(a: std.mem.Allocator, chances: []const f64, scale: f64) ![]const f64 {
     const out = try a.alloc(f64, chances.len);
     var factor: f64 = 1.0;
+    var prev: f64 = 1.0;
     for (out, chances) |*o, c| {
         factor *= scale;
-        o.* = @min(1.0, c * factor);
+        o.* = @min(prev, @min(1.0, c * factor));
+        prev = o.*;
     }
     return out;
 }
