@@ -883,8 +883,10 @@ pub const Lanes = struct {
             const len = f.len;
             if (start > 0 and s.isCancelled()) return error.Cancelled;
             var n: usize = @min(model.chunk_rows, len - start);
-            if (self.turn_keep and f.replay_x > start and start + n > f.replay_x) n = f.replay_x - start;
-            if (n == 0) return error.FillUnfinished;
+            if (self.turn_keep and f.replay_x > start and start + n > f.replay_x) {
+                n = f.replay_x - start;
+                if (n == 0) return error.FillUnfinished;
+            }
             if (try self.begin(.fill_chunk)) {
                 try self.wire.int(self.gpa, u64, start);
                 try self.wire.int(self.gpa, u32, @intCast(n));

@@ -465,9 +465,11 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
                     h.spill = o.spill;
                 } else if (fine and @hasField(@TypeOf(sn), "usable")) h.snap_vt.usable = sn.usable;
             }
-            if (@hasField(@TypeOf(loaded), "grid") and loaded.grid != 0 and store.rules.grid == 0) store.rules.grid = loaded.grid;
-            if (@hasField(@TypeOf(loaded), "replay") and store.rules.window == 0) store.rules.window = loaded.replay;
-            if (fine) store.rules.fine_grid = loaded.fine_grid;
+            if (fine) {
+                if (@hasField(@TypeOf(loaded), "grid") and loaded.grid != 0) store.rules.grid = loaded.grid;
+                if (@hasField(@TypeOf(loaded), "replay")) store.rules.window = loaded.replay;
+                store.rules.fine_grid = loaded.fine_grid;
+            }
         }
     };
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0

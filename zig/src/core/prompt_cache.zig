@@ -467,8 +467,6 @@ pub const KeepInfo = struct {
     parent: ?u64 = null,
     fork: u32 = 0,
     lineage: []const Fork = &.{}, // the pass's (Store.passLineage), copied into the entry
-    /// TF_DS_TURN_KEEP: this keep is the replay-cut state; replaces prior fine-grid keeps of the same prompt.
-    turn_cut: bool = false,
 };
 
 pub const Store = struct {
@@ -1040,22 +1038,22 @@ pub const Store = struct {
         }
         if (shared) s.learn(e, starts);
         if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held -| s.restoring_bytes); // spare storage only inside what the budget leaves
-        if (info.turn_cut) s.dropPriorTurnCuts(prompt, at, @as(usize, at) + s.rules.lookahead);
+        const fine_keep = s.rules.fine_grid > 0 and s.rules.grid > 0 and at % s.rules.grid != 0;
+        if (fine_keep) s.dropPriorTurnCuts(prompt, at);
         return true;
     }
 
-    /// Drop older replay-cut memory states for the same growing prompt (one fine-grid keep a conversation).
-    fn dropPriorTurnCuts(s: *Store, prompt: []const u32, except: u32, n: usize) void {
-        if (s.rules.fine_grid == 0) return;
-        const key = prompt[0..@min(n, prompt.len)];
+    /// Drop older replay-cut memory states superseded by a new fine-grid keep (call only after the pass lets go of its resume entry).
+    fn dropPriorTurnCuts(s: *Store, prompt: []const u32, at: u32) void {
+        if (s.rules.fine_grid == 0 or s.rules.grid == 0) return;
         var i: usize = 0;
         while (i < s.entries.items.len) {
             const e = s.entries.items[i];
-            if (e.at == except) {
+            if (e.at >= at) {
                 i += 1;
                 continue;
             }
-            if (s.rules.grid > 0 and e.at % s.rules.grid == 0) {
+            if (e.at % s.rules.grid == 0) {
                 i += 1;
                 continue;
             }
@@ -1063,7 +1061,7 @@ pub const Store = struct {
                 i += 1;
                 continue;
             }
-            if (e.tokens.len < key.len or !std.mem.eql(u32, e.tokens[0..key.len], key)) {
+            if (e.tokens.len > prompt.len or !std.mem.eql(u32, e.tokens, prompt[0..e.tokens.len])) {
                 i += 1;
                 continue;
             }

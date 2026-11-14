@@ -79,10 +79,10 @@ fn keepHook(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
     const st = j.store orelse return;
     const e = if (s.reuse_failed) null else j.entry;
     const pics = j.media.len > 0;
-    const ln: *dsv41.lanes.Lanes = @ptrCast(@alignCast(st.family.ptr));
-    const cut = if (ln.turn_keep) dsv41.lanes.replayCutAt(@intCast(s.prompt_len), @intCast(st.rules.window)) else 0;
-    const turn_cut = ln.turn_keep and cut > 0 and at == cut;
-    _ = st.keepWith(j.key, at, s, &.{}, .{ .lineage = j.lineage, .parent = if (e) |x| x.point else null, .fork = if (e) |x| x.at else 0, .images = pics, .media = j.media, .raw = if (pics) j.req.prompt else &.{}, .turn_cut = turn_cut });
+    const parent = if (e) |x| x.point else null;
+    const fork = if (e) |x| x.at else 0;
+    j.entry = null; // as lane_host Job.kept: a keep may evict the entry this pass restored
+    _ = st.keepWith(j.key, at, s, &.{}, .{ .lineage = j.lineage, .parent = parent, .fork = fork, .images = pics, .media = j.media, .raw = if (pics) j.req.prompt else &.{} });
 }
 
 /// The tier's writes drained (bounded), then every memory state forgotten: the next hit comes from disk.
