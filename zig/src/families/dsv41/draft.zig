@@ -94,6 +94,44 @@ pub const Probe = struct {
     }
 };
 
+/// One drafter pass's host / device split (ns, TF_DS_SERVE_PROFILE).
+pub const PassSplit = struct {
+    host: u64 = 0,
+    run: u64 = 0,
+    wait: u64 = 0,
+    read: u64 = 0,
+};
+
+/// One pass with TF_DS_PASS_PARTS: per-part device time after each synchronize (ns).
+pub const PassPartsOnce = struct {
+    embed: u64 = 0,
+    stages: [max_stages]u64 = @splat(0),
+    markov: [max_block]u64 = @splat(0),
+    conf: u64 = 0,
+    n_stages: usize = 0,
+    n_markov: usize = 0,
+};
+
+/// Optional measurement of a pass (null: no change to timing or the graph path).
+pub const PassMeasure = struct {
+    ctx: *anyopaque,
+    now: *const fn (ctx: *anyopaque) u64,
+    host_start: u64,
+    split: ?*PassSplit = null,
+    parts: ?*PassPartsOnce = null,
+    pass_parts: bool = false,
+    part_t: u64 = 0,
+
+    fn clock(self: *const PassMeasure) u64 {
+        return self.now(self.ctx);
+    }
+
+    fn partBegin(self: *PassMeasure) void {
+        if (!self.pass_parts or self.parts == null) return;
+        self.part_t = self.clock();
+    }
+};
+
 /// An absorb_many item: a drafting stream's slot, its window rows' taps (bf16 [n, taps * D], contiguous rows) and the
 /// window's first position.
 pub const Item = struct { slot: usize, taps: u64, n: usize, start: usize };
@@ -137,7 +175,7 @@ pub const PassGraphs = struct {
         const key: Key = .{ .streams = @intCast(N), .steps = @intCast(steps) };
         if (g.map.getPtr(key)) |x| return x.launchOn(e.s);
         try cuda.graph.beginCapture(e.s, .thread_local);
-        dr.body(e, ch, pool, N, steps, null) catch |err| {
+        dr.body(e, ch, pool, N, steps, null, null) catch |err| {
             if (cuda.graph.endCapture(e.s)) |got| {
                 var x = got;
                 x.deinit();
@@ -435,7 +473,7 @@ pub const Drafter = struct {
 
     /// BatchDraftGraph.run for N streams (tokens at positions q0 in slots): each stream's `steps` drafts and their
     /// confidences into drafts / confs. Each slot's rings hold its positions before q0 (absorbed).
-    pub fn pass(dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, tokens: []const i64, q0: []const i64, slots: []const i64, steps: usize, probe: ?Probe) !void {
+    pub fn pass(dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, tokens: []const i64, q0: []const i64, slots: []const i64, steps: usize, probe: ?Probe, measure: ?*PassMeasure) !void {
         const N = tokens.len;
         const n = dr.n;
         const R = N * n;
@@ -465,9 +503,28 @@ pub const Drafter = struct {
         var ho: [max_streams * (max_block + 1)]i64 = @splat(0);
         for (0..N) |i| ho[i * ts] = tokens[i];
         try prompt.upload(e, dr.out, &ho, N * ts * 8);
-        if (dr.graphs != null and probe == null) try dr.graphs.?.run(dr, e, ch, pool, N, steps) else try dr.body(e, ch, pool, N, steps, probe);
+        var t = if (measure) |m| m.clock() else 0;
+        if (measure) |m| {
+            if (m.split) |s| s.host += t - m.host_start;
+        }
+        const eager = probe != null or (measure != null and measure.?.pass_parts);
+        if (dr.graphs != null and !eager) try dr.graphs.?.run(dr, e, ch, pool, N, steps) else try dr.body(e, ch, pool, N, steps, probe, measure);
+        if (measure) |m| {
+            if (m.split) |s| {
+                const t1 = m.clock();
+                s.run += t1 - t;
+                t = t1;
+            }
+        }
         // one host read: the drafts and the confidences
         try e.s.synchronize();
+        if (measure) |m| {
+            if (m.split) |s| {
+                const t1 = m.clock();
+                s.wait += t1 - t;
+                t = t1;
+            }
+        }
         var hc: [max_streams * max_block]f32 = undefined;
         try e.d.check(e.d.api.cuMemcpyDtoH_v2(&ho, dr.out, N * ts * 8), "cuMemcpyDtoH");
         try e.d.check(e.d.api.cuMemcpyDtoH_v2(&hc, dr.conf, N * steps * 4), "cuMemcpyDtoH");
@@ -475,20 +532,40 @@ pub const Drafter = struct {
             dr.drafts[i][j] = ho[i * ts + 1 + j];
             dr.confs[i][j] = hc[i * steps + j];
         };
+        if (measure) |m| {
+            if (m.split) |s| s.read += m.clock() - t;
+        }
         dr.streams = N;
         dr.steps = steps;
     }
 
+    fn partTick(e: *const Engine, measure: ?*PassMeasure, dst: *u64) !void {
+        const m = measure orelse return;
+        if (!m.pass_parts or m.parts == null) return;
+        try e.s.synchronize();
+        const t1 = m.clock();
+        dst.* += t1 - m.part_t;
+        m.part_t = t1;
+    }
+
     /// The pass's device work for N streams of `steps` drafts, from the rows' embeddings to the confidence head (its
     /// inputs uploaded: the index rows, the pick lists, the Markov loop's first column): what a pass graph captures.
-    fn body(dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, N: usize, steps: usize, probe: ?Probe) !void {
+    fn body(dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, N: usize, steps: usize, probe: ?Probe, measure: ?*PassMeasure) !void {
         const c = e.c;
         const t = e.t;
         const n = dr.n;
         const R = N * n;
         const d = c.hidden;
+        if (measure) |m| {
+            m.partBegin();
+            if (m.parts) |p| {
+                p.n_stages = dr.ds.blocks.len;
+                p.n_markov = steps;
+            }
+        }
         // the streams: every row's token embedding in each stream, pre (1, 0, 0, 0)
         try tri_basic.embedInit(t, e.w.embed, dr.row(0), dr.h, dr.pre, R, d, c.hc);
+        if (measure) |m| if (m.parts) |p| try partTick(e, measure, &p.embed);
         // _stages_fused
         var h = dr.h;
         var spare = dr.h_alt;
@@ -512,6 +589,7 @@ pub const Drafter = struct {
             try Probe.check(probe, .moe_gather, j, dr.gm);
             pending = dr.gm;
             std.mem.swap(u64, &pre, &pre_f);
+            if (measure) |m| if (m.parts) |p| if (j < p.stages.len) try partTick(e, measure, &p.stages[j]);
         }
         try tri_basic.hcPost(t, dr.gm, h, dr.post, dr.comb, h, e.world, R, d);
         const S = dr.ds.blocks.len;
@@ -525,7 +603,14 @@ pub const Drafter = struct {
         // the Markov loop: out [N, steps + 1], each stream's last token first
         const ts = steps + 1;
         var g: MarkovGather = .{ .e = e, .dst = dr.mg };
-        try dr.mk.steps(t, dr.local, dr.out, ts, N, n, steps, dr.msc, .{ .ctx = &g, .run = MarkovGather.run });
+        const mk_gather: tri_markov.Gather = .{ .ctx = &g, .run = MarkovGather.run };
+        if (measure != null and measure.?.pass_parts) {
+            for (0..steps) |i| {
+                const send = try dr.mk.localBest(t, dr.local, dr.out, ts, N, n, i, dr.msc) orelse continue;
+                try dr.mk.pick(t, try mk_gather.run(mk_gather.ctx, send, N), dr.mk.world, dr.out, ts, N, i);
+                if (measure) |m| if (m.parts) |p| if (i < p.markov.len) try partTick(e, measure, &p.markov[i]);
+            }
+        } else try dr.mk.steps(t, dr.local, dr.out, ts, N, n, steps, dr.msc, mk_gather);
         try Probe.check(probe, .markov, S, dr.out);
         // the confidence head: [xc (fp32), the embedding rows the steps read (fp32)] @ conf^T, a stream's first steps rows
         const rank = c.markov_rank;
@@ -539,6 +624,7 @@ pub const Drafter = struct {
         try e.ops.copyRows(e.s, dr.xcf, d * 4, dr.conf_in, w * 4, d * 4, N * steps);
         try e.ops.copyRows(e.s, dr.ef, rank * 4, dr.conf_in + d * 4, w * 4, rank * 4, N * steps);
         try e.blas.xv(dr.conf_in, dr.confw, dr.conf, N * steps, w);
+        if (measure) |m| if (m.parts) |p| try partTick(e, measure, &p.conf);
     }
 
     /// pre_mix of _stages_fused: hc_pre2 of the streams h with the pending gathered partials posted in (into the spare
@@ -682,6 +768,11 @@ pub fn chooseK(conf: []const f32, kmax: usize, live: usize, drafts: usize, round
         }
     }
     return best;
+}
+
+test "pass split buckets sum to the pass wall time" {
+    const s: PassSplit = .{ .host = 1_000_000, .run = 2_000_000, .wait = 500_000, .read = 250_000 };
+    try std.testing.expectEqual(@as(u64, 3_750_000), s.host + s.run + s.wait + s.read);
 }
 
 test "draft depths and pass steps as multi.py takes them" {

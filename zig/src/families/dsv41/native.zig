@@ -43,6 +43,8 @@
 //!   TF_DS_SERVE_PROFILE=N                       a measurement: rank 0 prints its backend's times (send, forward, absorb,
 //!                                               logits, sample, the drafter pass, the rest of a round) to stderr every N
 //!                                               rounds; the forward is synchronized apart, so the rounds are a little slower
+//!   TF_DS_PASS_PARTS=1                          with SERVE_PROFILE: split pass ms (host, run, wait, read) and per-part body
+//!                                               times (eager body, not the pass graph)
 //!   TF_DS_POOL=P, TF_DS_WINDOW=W                (0008, pool.zig) the pool's positions, every stream's extents
 //!                                               together (unset: the context), and the window a request may use
 //!                                               (rank 0: the context; a follower without it takes rank 0's);
@@ -293,6 +295,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
             st.lanes.prof = .{};
             st.lanes.prof_every = every;
             st.m.prof = true; // the forward and the absorb synchronized apart: a measurement, not a served setting
+            if (getenv("TF_DS_PASS_PARTS")) |pp| {
+                if (std.mem.eql(u8, std.mem.trim(u8, pp, " "), "1")) st.lanes.pass_parts = true;
+            }
         }
     }
     // a vision checkpoint's tower on this rank, from the kit's vision/ (torch's attention cubin, the routing bias)
