@@ -669,6 +669,8 @@ pub const LaneHost = struct {
             .chunks = r.chunks,
             .reuse = reuse,
             .images = r.images,
+            .arrived_ns = r.arrived_ns,
+            .queued_ns = r.queued_ns,
         }) catch {
             job.proposer.deinit();
             return h.drop(job, "out of memory");
@@ -676,6 +678,7 @@ pub const LaneHost = struct {
         job.started = true;
         const began = std.Io.Clock.awake.now(h.io).toNanoseconds();
         job.began = began;
+        job.stream.engine_began_ns = @intCast(began);
         if (h.loneFits(job)) return h.runLone(job, began);
         // between two prompt chunks: the other streams' rounds (interleave), and parked work's service, which runs
         // with the interleave off too

@@ -435,6 +435,103 @@ fn profileMs(ns: u64, n: u64) f64 {
     return if (n == 0) 0 else @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(n)) / 1e6;
 }
 
+/// TF_DS_SERVE_PROFILE: one prefill's parts from the request to the first token (ns, summed).
+pub const TurnPrefill = struct {
+    arrived_ns: u64 = 0,
+    queued_ns: u64 = 0,
+    engine_began_ns: u64 = 0,
+    wall0_ns: u64 = 0,
+    cache_search_host_ns: u64 = 0,
+    open_host_ns: u64 = 0,
+    restore_host_ns: u64 = 0,
+    restore_device_ns: u64 = 0,
+    prefill_forward_host_ns: u64 = 0,
+    prefill_forward_device_ns: u64 = 0,
+    logits_sample_host_ns: u64 = 0,
+    first_draft_host_ns: u64 = 0,
+    first_send_host_ns: u64 = 0,
+    passes: u32 = 0,
+    computed: u32 = 0,
+    cached: u32 = 0,
+    done_ns: u64 = 0,
+};
+
+fn turnNsToMs(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1e6;
+}
+
+pub fn turnProfileTemplateNs(tp: TurnPrefill) u64 {
+    if (tp.arrived_ns == 0 or tp.queued_ns <= tp.arrived_ns) return 0;
+    return tp.queued_ns - tp.arrived_ns;
+}
+
+pub fn turnProfileQueueNs(tp: TurnPrefill) u64 {
+    if (tp.wall0_ns == 0) return 0;
+    if (tp.queued_ns != 0 and tp.wall0_ns > tp.queued_ns) return tp.wall0_ns - tp.queued_ns;
+    if (tp.engine_began_ns != 0 and tp.wall0_ns > tp.engine_began_ns) return tp.wall0_ns - tp.engine_began_ns;
+    return 0;
+}
+
+pub fn turnProfileTtftNs(tp: TurnPrefill) u64 {
+    if (tp.arrived_ns != 0 and tp.done_ns > tp.arrived_ns) return tp.done_ns - tp.arrived_ns;
+    return tp.done_ns -| tp.wall0_ns;
+}
+
+pub fn turnProfilePartsNs(tp: TurnPrefill) u64 {
+    return turnProfileTemplateNs(tp) + turnProfileQueueNs(tp) + tp.cache_search_host_ns + tp.open_host_ns + tp.restore_host_ns +
+        tp.restore_device_ns + tp.prefill_forward_host_ns + tp.prefill_forward_device_ns + tp.logits_sample_host_ns +
+        tp.first_draft_host_ns + tp.first_send_host_ns;
+}
+
+pub fn turnProfileOtherMs(tp: TurnPrefill) f64 {
+    return turnNsToMs(turnProfileTtftNs(tp) -| turnProfilePartsNs(tp));
+}
+
+/// One stderr line (ms a part; host and device apart).
+pub fn printTurnProfile(tp: TurnPrefill) void {
+    const ttft_ms = turnNsToMs(turnProfileTtftNs(tp));
+    const other = turnProfileOtherMs(tp);
+    std.debug.print("{{\"turn_profile\": {{\"template_tokenize_host_ms\": {d:.3}, \"queue_host_ms\": {d:.3}, \"cache_search_host_ms\": {d:.3}, \"open_host_ms\": {d:.3}, \"restore_host_ms\": {d:.3}, \"restore_device_ms\": {d:.3}, \"prefill_forward_host_ms\": {d:.3}, \"prefill_forward_device_ms\": {d:.3}, \"logits_sample_host_ms\": {d:.3}, \"first_draft_host_ms\": {d:.3}, \"first_send_host_ms\": {d:.3}, \"passes\": {d}, \"computed_tokens\": {d}, \"cached_tokens\": {d}, \"ttft_ms\": {d:.3}, \"other_ms\": {d:.3}}}}}\n", .{
+        turnNsToMs(turnProfileTemplateNs(tp)),
+        turnNsToMs(turnProfileQueueNs(tp)),
+        turnNsToMs(tp.cache_search_host_ns),
+        turnNsToMs(tp.open_host_ns),
+        turnNsToMs(tp.restore_host_ns),
+        turnNsToMs(tp.restore_device_ns),
+        turnNsToMs(tp.prefill_forward_host_ns),
+        turnNsToMs(tp.prefill_forward_device_ns),
+        turnNsToMs(tp.logits_sample_host_ns),
+        turnNsToMs(tp.first_draft_host_ns),
+        turnNsToMs(tp.first_send_host_ns),
+        tp.passes,
+        tp.computed,
+        tp.cached,
+        ttft_ms,
+        other,
+    });
+}
+
+test "turnProfileOtherMs is the ttft wall minus the named parts" {
+    const tp: TurnPrefill = .{
+        .arrived_ns = 0,
+        .queued_ns = 0,
+        .wall0_ns = 1_000_000,
+        .done_ns = 469_000_000,
+        .cache_search_host_ns = 5_000_000,
+        .open_host_ns = 8_000_000,
+        .restore_host_ns = 12_000_000,
+        .restore_device_ns = 85_000_000,
+        .prefill_forward_device_ns = 70_000_000,
+        .prefill_forward_host_ns = 3_000_000,
+        .logits_sample_host_ns = 15_000_000,
+        .computed = 189,
+        .cached = 2800,
+        .passes = 1,
+    };
+    try std.testing.expect(turnProfileTtftNs(tp) == 468_000_000);
+    try std.testing.expectApproxEqAbs(@as(f64, 270.0), turnProfileOtherMs(tp), 0.001);
+}
+
 test "mergePassParts rolls per-pass part times into the profile" {
     var p: Profile = .{};
     const once: draft.PassPartsOnce = .{
@@ -603,6 +700,7 @@ pub const Lanes = struct {
     prof_last: u64 = 0, // the last round's start (Model.now)
     prof_period: u64 = 0, // the rounds' start-to-start times under a second, summed (ns), and their count
     prof_periods: u64 = 0,
+    turn_prefill: ?TurnPrefill = null, // TF_DS_SERVE_PROFILE: the filling pass being timed (null: off or between prefills)
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
@@ -965,7 +1063,10 @@ pub const Lanes = struct {
         if (self.fill == null) {
             if (self.paused != null and self.paused.?.s == s) try self.fillResume() else try self.fillOpen(s);
         }
-        errdefer self.fill = null;
+        errdefer {
+            self.fill = null;
+            self.turn_prefill = null;
+        }
         const f = &self.fill.?;
         const seq = self.seqs[f.slot].items;
         m.fill_seq = seq;
@@ -984,18 +1085,28 @@ pub const Lanes = struct {
                 n = f.replay_x - start;
                 if (n == 0) return error.FillUnfinished;
             }
+            const chunk_host0 = if (self.turn_prefill != null) m.now() else 0;
             if (try self.begin(.fill_chunk)) {
                 try self.wire.int(self.gpa, u64, start);
                 try self.wire.int(self.gpa, u32, @intCast(n));
                 try self.wire.int(self.gpa, u64, f.replay);
                 try self.flush();
             }
+            if (self.turn_prefill) |*tp| tp.prefill_forward_host_ns += m.now() - chunk_host0;
             if (self.spill) |t| t.bump(f.base + start, f.base + start + n);
             f.head = blk: {
                 // TF_DS_KV_SHARD: the stream's twins pinned while its chunk runs (parts.zig setPartial), not between
                 if (f.part) |id| self.kv.?.planner.setPartial(id, true);
                 defer if (f.part) |id| self.kv.?.planner.setPartial(id, false);
-                break :blk try m.fillChunk(seq[0 .. start + n], start, n, f.replay);
+                if (self.turn_prefill != null) m.stream.synchronize() catch {};
+                const chunk_dev0 = if (self.turn_prefill != null) m.now() else 0;
+                const head = try m.fillChunk(seq[0 .. start + n], start, n, f.replay);
+                if (self.turn_prefill) |*tp| {
+                    m.stream.synchronize() catch {};
+                    tp.prefill_forward_device_ns += m.now() - chunk_dev0;
+                    tp.passes += 1;
+                }
+                break :blk head;
             };
             f.start += n;
             const replay_keep = self.turn_keep and f.replay_x > 0 and f.start == f.replay_x;
@@ -1017,6 +1128,7 @@ pub const Lanes = struct {
         if (!done.head) return error.NoPromptLogits;
         // a state read back from disk: the drafter's rings were rebuilt by the replay before the first draft
         if (self.spill != null and m.drafting() and done.restored) try m.spillCheckResumed(done.slot, done.len);
+        const logit0 = if (self.turn_prefill != null) m.now() else 0;
         const logits = try m.promptLogitsHost();
         if (logits_sha) {
             var dg: [32]u8 = undefined;
@@ -1024,6 +1136,14 @@ pub const Lanes = struct {
             std.debug.print("{{\"prompt_logits\": \"{s}\", \"sha256\": \"{s}\"}}\n", .{ s.id, std.fmt.bytesToHex(dg, .lower) });
         }
         const token = try draw(logits, done.len, s.sampling);
+        if (self.turn_prefill) |*tp| {
+            tp.logits_sample_host_ns += m.now() - logit0;
+            tp.done_ns = m.now();
+            tp.cached = s.cached;
+            tp.computed = @intCast(done.len -| s.cached);
+            printTurnProfile(tp.*);
+            self.turn_prefill = null;
+        }
         self.streams.getPtr(s).?.first = self.take(token);
         return true;
     }
@@ -1049,6 +1169,13 @@ pub const Lanes = struct {
     fn fillOpen(self: *Lanes, s: *lanes.Stream) !void {
         const m = self.m;
         const gpa = self.gpa;
+        const open0 = m.now();
+        if (self.prof != null) self.turn_prefill = .{
+            .arrived_ns = s.arrived_ns,
+            .queued_ns = s.queued_ns,
+            .engine_began_ns = s.engine_began_ns,
+            .wall0_ns = open0,
+        };
         const ids = s.prompt();
         const len = ids.len;
         if (len == 0) return error.EmptyPrompt;
@@ -1115,6 +1242,8 @@ pub const Lanes = struct {
         if (parted == null) self.staleOver(if (kept != null and !moved) base + kept.?.at else base, base + size, kept);
         try self.streams.put(gpa, s, .{ .slot = slot, .base = base, .end = base + size, .id = if (parted) |pp| pp.id else 0, .part = if (parted) |pp| pp.part else 0, .gen = if (parted) |pp| pp.gen else 0 });
         self.used[slot] = true;
+        const place_done = m.now();
+        if (self.turn_prefill) |*tp| tp.cache_search_host_ns += place_done - open0;
         errdefer {
             _ = self.streams.remove(s);
             self.used[slot] = false;
@@ -1188,7 +1317,9 @@ pub const Lanes = struct {
         }
         const replay = len -| m.cfg.window;
         var start: usize = 0;
+        if (self.turn_prefill) |*tp| tp.open_host_ns += m.now() - place_done;
         if (kept) |sn| {
+            const restore0 = if (self.turn_prefill != null) m.now() else 0;
             if (try self.begin(.snap_restore)) {
                 try self.wire.int(gpa, u64, sn.id);
                 try self.wire.int(gpa, u32, @intCast(slot));
@@ -1197,11 +1328,17 @@ pub const Lanes = struct {
                 try self.wire.int(gpa, u64, sn.at);
                 try self.flush();
             }
+            if (self.turn_prefill) |*tp| tp.restore_host_ns += m.now() - restore0;
+            const restore_dev0 = if (self.turn_prefill != null) m.now() else 0;
             if (base != sn.base and parted == null) {
                 if (self.spill) |t| t.bump(base, base + sn.at);
                 try m.copyExtent(sn.base, base, sn.at);
             }
             try m.snapCopy(slot, sn.buf.ptr, false);
+            if (self.turn_prefill) |*tp| {
+                m.stream.synchronize() catch {};
+                tp.restore_device_ns += m.now() - restore_dev0;
+            }
             start = sn.at;
             s.cached = @intCast(sn.at);
         }

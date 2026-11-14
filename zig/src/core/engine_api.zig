@@ -91,6 +91,10 @@ pub const Request = struct {
     structure: ?Structure = null,
     /// Stop a short exact cycle while the think block is open.
     loop_guard: bool = false,
+    /// Nanoseconds when the HTTP handler received the request (0: not set).
+    arrived_ns: u64 = 0,
+    /// Nanoseconds when the engine was submitted the request (0: not set).
+    queued_ns: u64 = 0,
 
     /// What the prompt cache matches and keeps under: `cache_key`, or the prompt when it has none.
     pub fn cacheKey(r: *const Request) []const u32 {

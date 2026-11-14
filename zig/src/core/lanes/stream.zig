@@ -140,6 +140,9 @@ pub const Spec = struct {
     chunks: []const u32 = &.{}, // where prefill chunks start after 0 (Python's PrefillPlan); empty: the backend's step
     reuse: Reuse = .{},
     images: []const Image = &.{}, // in prompt order; the caller's until the stream is released
+    arrived_ns: u64 = 0,
+    queued_ns: u64 = 0,
+    engine_began_ns: u64 = 0,
     /// tool_choice required: the answer must open a call (null: the model may answer in text).
     call: ?struct {
         opener: u32,
@@ -232,6 +235,9 @@ pub const Stream = struct {
     share_verifies: u32 = 0, // head verifies counted toward kept share
     copy_width: ?u32 = null,
     gate: ?call_gate.Gate = null,
+    arrived_ns: u64 = 0,
+    queued_ns: u64 = 0,
+    engine_began_ns: u64 = 0,
 
     pub fn init(gpa: Allocator, spec: Spec) !Stream {
         var s: Stream = .{
@@ -252,6 +258,9 @@ pub const Stream = struct {
             .chunks = spec.chunks,
             .reuse = spec.reuse,
             .images = spec.images,
+            .arrived_ns = spec.arrived_ns,
+            .queued_ns = spec.queued_ns,
+            .engine_began_ns = spec.engine_began_ns,
         };
         if (spec.call) |c| {
             s.gate = call_gate.Gate.afterPrompt(spec.prompt, c.opener, c.think_open, c.think_end, c.lex, c.lead, c.names, c.tail);
