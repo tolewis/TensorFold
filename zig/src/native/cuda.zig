@@ -451,20 +451,24 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         if (want > 0) {
             h.snap_vt = .{ .bytes = sn.bytes, .save = sn.save, .restore = sn.restore, .drop = sn.drop };
             h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, .{ .tail = if (@hasField(@TypeOf(sn), "tail")) sn.tail else 0 }, want);
+            const store = &h.cache.?;
+            const fine = @hasField(@TypeOf(loaded), "fine_grid") and loaded.fine_grid != 0;
             // the spill tier (off by default: nothing below runs then)
             if (@hasField(@TypeOf(loaded), "tier")) {
-                const store = &h.cache.?;
                 if (loaded.tier) |t| {
                     if (@hasField(@TypeOf(sn), "usable")) h.snap_vt.usable = sn.usable;
                     var seed: [4]u8 = undefined;
                     io.random(&seed);
                     store.setTier(t, std.mem.readInt(u32, &seed, .little));
-                }
-                if (loaded.tier != null) {
                     store.rules.grid = loaded.grid; // the native rule: 0 < at < len, on the chunk grid, before the replay
                     store.rules.window = loaded.replay;
                     h.spill = o.spill;
-                }
+                } else if (fine and @hasField(@TypeOf(sn), "usable")) h.snap_vt.usable = sn.usable;
+            }
+            if (fine) {
+                if (@hasField(@TypeOf(loaded), "grid") and loaded.grid != 0) store.rules.grid = loaded.grid;
+                if (@hasField(@TypeOf(loaded), "replay")) store.rules.window = loaded.replay;
+                store.rules.fine_grid = loaded.fine_grid;
             }
         }
     };

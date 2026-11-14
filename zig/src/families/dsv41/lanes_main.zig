@@ -79,7 +79,10 @@ fn keepHook(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
     const st = j.store orelse return;
     const e = if (s.reuse_failed) null else j.entry;
     const pics = j.media.len > 0;
-    _ = st.keepWith(j.key, at, s, &.{}, .{ .lineage = j.lineage, .parent = if (e) |x| x.point else null, .fork = if (e) |x| x.at else 0, .images = pics, .media = j.media, .raw = if (pics) j.req.prompt else &.{} });
+    const parent = if (e) |x| x.point else null;
+    const fork = if (e) |x| x.at else 0;
+    j.entry = null; // as lane_host Job.kept: a keep may evict the entry this pass restored
+    _ = st.keepWith(j.key, at, s, &.{}, .{ .lineage = j.lineage, .parent = parent, .fork = fork, .images = pics, .media = j.media, .raw = if (pics) j.req.prompt else &.{} });
 }
 
 /// The tier's writes drained (bounded), then every memory state forgotten: the next hit comes from disk.
@@ -296,6 +299,7 @@ pub fn main(init: std.process.Init) !u8 {
     };
     try ln.startKv();
     ln.fix_k = fix_k;
+    ln.turn_keep = if (std.c.getenv("TF_DS_TURN_KEEP")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else false;
     var snap_vt: pcache.Snapshots.VTable = undefined;
     var store_v: pcache.Store = undefined;
     var store: ?*pcache.Store = null;
@@ -306,7 +310,9 @@ pub fn main(init: std.process.Init) !u8 {
     if (spill != null) {
         const L = dsv41.lanes.Lanes;
         snap_vt = .{ .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .usable = L.usableFn };
-        store_v = pcache.Store.init(gpa, .{ .ptr = &ln, .vtable = &snap_vt }, .{ .grid = dsv41.model.chunk_rows, .window = @intCast(m.cfg.window) }, @intFromFloat(cache_gib * (1 << 30)));
+        var rules = pcache.Rules{ .grid = dsv41.model.chunk_rows, .window = @intCast(m.cfg.window) };
+        if (ln.turn_keep) rules.fine_grid = 2;
+        store_v = pcache.Store.init(gpa, .{ .ptr = &ln, .vtable = &snap_vt }, rules, @intFromFloat(cache_gib * (1 << 30)));
         var seed: [4]u8 = undefined;
         io.random(&seed);
         store_v.setTier(ln.spill.?.tier(), std.mem.readInt(u32, &seed, .little));

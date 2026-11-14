@@ -214,6 +214,21 @@ fn markEnds(marks: []const u32, at: usize) bool {
     return false;
 }
 
+/// Even floor of `len - window` (WP-T1 replay-cut keep); 0 when that difference is 0.
+pub fn replayCutAt(len: usize, window: usize) usize {
+    const raw = len -| window;
+    if (raw == 0) return 0;
+    return raw & ~@as(usize, 1);
+}
+
+fn snapChunkEligible(at: usize, len: usize, window: usize) bool {
+    return at > 0 and at < len and at % model.chunk_rows == 0 and at <= len -| window;
+}
+
+fn snapTurnEligible(at: usize, len: usize, window: usize) bool {
+    return at > 0 and at < len and at % 2 == 0 and at <= len -| window;
+}
+
 // -- pictures in a resumed pass (recipe 0006; spill v2 restores take the same path as memory resumes) ------------------
 
 /// A picture's span [at, at + tokens) of the runtime sequence `seq` (the prompt's ids, each the placeholder `image_id`
@@ -367,33 +382,91 @@ pub const Profile = struct {
     logits: u64 = 0,
     sample: u64 = 0,
     pass: u64 = 0,
+    pass_host: u64 = 0,
+    pass_run: u64 = 0,
+    pass_wait: u64 = 0,
+    pass_read: u64 = 0,
     prefill: u64 = 0,
     rounds: u64 = 0,
     rows: u64 = 0,
     passes: u64 = 0,
     pass_streams: u64 = 0,
     prefills: u64 = 0,
+    parts_embed: u64 = 0,
+    parts_stage: [draft.max_stages]u64 = @splat(0),
+    parts_markov: [draft.max_block]u64 = @splat(0),
+    parts_conf: u64 = 0,
+    parts_passes: u64 = 0,
+    parts_n_stages: usize = 0,
+    parts_n_markov: usize = 0,
 };
+
+fn mergePassParts(p: *Profile, once: draft.PassPartsOnce) void {
+    p.parts_passes += 1;
+    p.parts_embed += once.embed;
+    for (once.stages[0..once.n_stages], 0..) |v, i| p.parts_stage[i] += v;
+    for (once.markov[0..once.n_markov], 0..) |v, i| p.parts_markov[i] += v;
+    p.parts_conf += once.conf;
+    p.parts_n_stages = @max(p.parts_n_stages, once.n_stages);
+    p.parts_n_markov = @max(p.parts_n_markov, once.n_markov);
+}
+
+fn profileMs(ns: u64, n: u64) f64 {
+    return if (n == 0) 0 else @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(n)) / 1e6;
+}
+
+test "mergePassParts rolls per-pass part times into the profile" {
+    var p: Profile = .{};
+    const once: draft.PassPartsOnce = .{
+        .embed = 100,
+        .stages = .{ 10, 20, 30, 0 },
+        .markov = .{ 5, 6, 0, 0, 0, 0, 0, 0 },
+        .conf = 7,
+        .n_stages = 3,
+        .n_markov = 2,
+    };
+    mergePassParts(&p, once);
+    try std.testing.expectEqual(@as(u64, 1), p.parts_passes);
+    try std.testing.expectEqual(@as(u64, 10), p.parts_stage[1]);
+    try std.testing.expectEqual(@as(usize, 3), p.parts_n_stages);
+}
+
+fn printPassPartsMs(p: Profile) void {
+    if (p.parts_passes == 0) {
+        std.debug.print(", \"pass_parts_ms\": null", .{});
+        return;
+    }
+    const m = profileMs;
+    const n = p.parts_passes;
+    std.debug.print(", \"pass_parts_ms\": [", .{});
+    std.debug.print("{d:.3}", .{m(p.parts_embed, n)});
+    for (0..p.parts_n_stages) |i| {
+        std.debug.print(", {d:.3}", .{m(p.parts_stage[i], n)});
+    }
+    for (0..p.parts_n_markov) |i| {
+        std.debug.print(", {d:.3}", .{m(p.parts_markov[i], n)});
+    }
+    std.debug.print(", {d:.3}]", .{m(p.parts_conf, n)});
+}
 
 /// TF_DS_SERVE_PROFILE: the served rank 0's backend times as one stderr line (ms a round; a pass's ms a pass).
 /// `period_ms` is a round's start to the next one's; `other_ms` is what of it the backend calls do not hold (the round
 /// loop, the server, the keep). The forward and the absorb are synchronized apart (Model.prof), as tf-dsv41-lanes
 /// --profile has them.
 fn printServeProfile(p: Profile, period: u64, periods: u64) void {
-    const ms = struct {
-        fn f(ns: u64, n: u64) f64 {
-            return if (n == 0) 0 else @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(n)) / 1e6;
-        }
-    }.f;
+    const ms = profileMs;
     const period_ms = ms(period, periods);
     const pass_a_round = if (p.rounds == 0) 0 else @as(f64, @floatFromInt(p.pass)) / @as(f64, @floatFromInt(p.rounds)) / 1e6;
     const held = ms(p.send, p.rounds) + ms(p.forward, p.rounds) + ms(p.absorb, p.rounds) + ms(p.logits, p.rounds) + ms(p.sample, p.rounds) + pass_a_round;
-    std.debug.print("{{\"rank\": 0, \"serve_profile\": {{\"rounds\": {d}, \"rows_a_round\": {d:.2}, \"period_ms\": {d:.3}, \"send_ms\": {d:.3}, \"enqueue_ms\": {d:.3}, \"forward_ms\": {d:.3}, \"absorb_ms\": {d:.3}, \"logits_ms\": {d:.3}, \"sample_ms\": {d:.3}, \"passes\": {d}, \"streams_a_pass\": {d:.2}, \"pass_ms\": {d:.3}, \"pass_ms_a_round\": {d:.3}, \"other_ms\": {d:.3}, \"prefills\": {d}, \"prefill_ms\": {d:.1}}}}}\n", .{
+    std.debug.print("{{\"rank\": 0, \"serve_profile\": {{\"rounds\": {d}, \"rows_a_round\": {d:.2}, \"period_ms\": {d:.3}, \"send_ms\": {d:.3}, \"enqueue_ms\": {d:.3}, \"forward_ms\": {d:.3}, \"absorb_ms\": {d:.3}, \"logits_ms\": {d:.3}, \"sample_ms\": {d:.3}, \"passes\": {d}, \"streams_a_pass\": {d:.2}, \"pass_ms\": {d:.3}, \"pass_host_ms\": {d:.3}, \"pass_run_ms\": {d:.3}, \"pass_wait_ms\": {d:.3}, \"pass_read_ms\": {d:.3}, \"pass_ms_a_round\": {d:.3}, \"other_ms\": {d:.3}, \"prefills\": {d}, \"prefill_ms\": {d:.1}", .{
         p.rounds,                               ms(p.rows * 1000000, p.rounds), period_ms,              ms(p.send, p.rounds),                      ms(p.enqueue, p.rounds),
         ms(p.forward, p.rounds),                ms(p.absorb, p.rounds),         ms(p.logits, p.rounds), ms(p.sample, p.rounds),                    p.passes,
-        ms(p.pass_streams * 1000000, p.passes), ms(p.pass, p.passes),           pass_a_round,           if (periods == 0) 0 else period_ms - held, p.prefills,
+        ms(p.pass_streams * 1000000, p.passes), ms(p.pass, p.passes),           ms(p.pass_host, p.passes), ms(p.pass_run, p.passes), ms(p.pass_wait, p.passes),
+        ms(p.pass_read, p.passes),              pass_a_round,                   if (periods == 0) 0 else period_ms - held, p.prefills,
         ms(p.prefill, p.prefills),
     });
+    printPassPartsMs(p);
+    std.debug.print("}}}}\n", .{});
 }
 
 /// A round-cost table "30.0,35.2,..." (TF_DS_ROUND_MS's form): ms by rows from 1.
@@ -448,6 +521,7 @@ pub const Snap = struct {
     loading: bool = false, // a restore's destination: its rows held back, not usable until every rank installed it
     restored: bool = false, // read back from the spill tier
     part: u8 = 0, // TF_DS_KV_SHARD: the part holding its rows (parts.zig's Kept; a live move changes it)
+    turn_cut: bool = false, // TF_DS_TURN_KEEP: memory-only keep at the replay cut (not a chunk-grid point)
 };
 
 /// Kept states this long or longer say so in the log when they go stale (their prompts then run again from 0).
@@ -458,7 +532,7 @@ fn noteStale(sn: *const Snap, why: []const u8) void {
 }
 
 /// A prompt pass between its pieces: the chunk it runs next and what its chunk loop reads.
-const Fill = struct { s: *const lanes.Stream, slot: usize, len: usize, replay: usize, last_end: usize, start: usize, head: bool = false, base: usize = 0, restored: bool = false, part: ?u64 = null };
+const Fill = struct { s: *const lanes.Stream, slot: usize, len: usize, replay: usize, last_end: usize, replay_x: usize = 0, start: usize, head: bool = false, base: usize = 0, restored: bool = false, part: ?u64 = null };
 
 /// How long a request waits for the live stream that holds the kept state it resumes from to end (then it resumes
 /// in place and every kept state stays) before other kept states give their room for a copy of it.
@@ -493,6 +567,7 @@ pub const Lanes = struct {
     cal_ceil: f64 = 1.0, // TF_DS_T25_CAL_CEIL: upper clamp of calScale (unset: 1.0)
     no_copies: bool = false, // TF_DS_NO_COPIES=1: a drafted stream proposes no suffix-lookup copy windows
     prof_every: u64 = 0, // TF_DS_SERVE_PROFILE=N: the served rank 0 prints `prof` every N rounds and starts it again (0: off)
+    pass_parts: bool = false, // TF_DS_PASS_PARTS=1 with SERVE_PROFILE: per-part pass time (eager body, not the graph)
     prof_last: u64 = 0, // the last round's start (Model.now)
     prof_period: u64 = 0, // the rounds' start-to-start times under a second, summed (ns), and their count
     prof_periods: u64 = 0,
@@ -509,6 +584,8 @@ pub const Lanes = struct {
     /// The pair's one rank_wire Leader (native.openPair: agreed with rank_identity's full fingerprint before anything
     /// spill- or shard-related crosses), shared by the spill tier and the KV parts; owned here (null: neither is on).
     rw: ?*rank_wire.Leader = null,
+    /// TF_DS_TURN_KEEP=1: split the prompt pass at the replay cut, keep that state in memory only.
+    turn_keep: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
@@ -868,7 +945,11 @@ pub const Lanes = struct {
             const start = f.start;
             const len = f.len;
             if (start > 0 and s.isCancelled()) return error.Cancelled;
-            const n = @min(model.chunk_rows, len - start);
+            var n: usize = @min(model.chunk_rows, len - start);
+            if (self.turn_keep and f.replay_x > start and start + n > f.replay_x) {
+                n = f.replay_x - start;
+                if (n == 0) return error.FillUnfinished;
+            }
             if (try self.begin(.fill_chunk)) {
                 try self.wire.int(self.gpa, u64, start);
                 try self.wire.int(self.gpa, u32, @intCast(n));
@@ -883,7 +964,8 @@ pub const Lanes = struct {
                 break :blk try m.fillChunk(seq[0 .. start + n], start, n, f.replay);
             };
             f.start += n;
-            if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
+            const replay_keep = self.turn_keep and f.replay_x > 0 and f.start == f.replay_x;
+            if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and (f.start == f.last_end or markEnds(s.reuse.marks, f.start) or replay_keep)) k.at(k.ptr, s, @intCast(f.start));
             // the host's work between this pass's chunks (Stream.between: the prefill interleave's rounds, parked work's
             // service): the read-ahead joined and the prompt's ids gone first, as at a piece's end and on rank 1, which
             // reads ahead again at the next chunk
@@ -1092,7 +1174,8 @@ pub const Lanes = struct {
         // where this pass keeps states: the cache's marks and its last chunk end before the replay (the served lane's
         // kept prompt), each at the chunk end at or before it
         const last_end = @min(replay, len - 1) / model.chunk_rows * model.chunk_rows;
-        self.fill = .{ .s = s, .slot = slot, .len = len, .replay = replay, .last_end = last_end, .start = start, .base = base, .restored = if (kept) |sn| sn.restored else false, .part = if (parted) |pp| pp.id else null };
+        const replay_x = if (self.turn_keep) replayCutAt(len, m.cfg.window) else 0;
+        self.fill = .{ .s = s, .slot = slot, .len = len, .replay = replay, .last_end = last_end, .replay_x = replay_x, .start = start, .base = base, .restored = if (kept) |sn| sn.restored else false, .part = if (parted) |pp| pp.id else null };
     }
 
     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
@@ -1213,6 +1296,7 @@ pub const Lanes = struct {
         const self = of(ptr);
         const m = self.m;
         const gpa = self.gpa;
+        const host_start = m.now();
         if (m.dr == null) return error.NoDraftHead;
         const block = m.dr.?.n;
         var tokens: [max_streams]i64 = undefined;
@@ -1249,20 +1333,40 @@ pub const Lanes = struct {
             }
             try self.flush();
         }
-        const t0 = m.now();
-        try m.pass(tokens[0..n], q0[0..n], slots[0..n], steps);
-        if (self.prof) |*p| {
-            p.pass += m.now() - t0;
-            p.passes += 1;
-            p.pass_streams += n;
-        }
+        var split: draft.PassSplit = .{};
+        var parts_once: draft.PassPartsOnce = .{};
+        var measure: draft.PassMeasure = undefined;
+        const meas: ?*draft.PassMeasure = if (self.prof != null) blk: {
+            measure = .{
+                .ctx = m,
+                .now = Model.passNow,
+                .host_start = host_start,
+                .split = &split,
+                .parts = if (self.pass_parts) &parts_once else null,
+                .pass_parts = self.pass_parts,
+            };
+            break :blk &measure;
+        } else null;
+        try m.pass(tokens[0..n], q0[0..n], slots[0..n], steps, meas);
         const d = &m.dr.?;
+        const t_read = m.now();
         for (asked[0..n], depths[0..n], 0..) |l, k, i| {
             for (0..k) |j| {
                 l.held[j] = @intCast(d.drafts[i][j]);
                 l.confs[j] = d.confs[i][j];
             }
             l.nheld = k;
+        }
+        if (self.prof) |*p| {
+            const held_copy = m.now() - t_read;
+            p.pass_host += split.host;
+            p.pass_run += split.run;
+            p.pass_wait += split.wait;
+            p.pass_read += split.read + held_copy;
+            p.pass += split.host + split.run + split.wait + split.read + held_copy;
+            if (self.pass_parts) mergePassParts(p, parts_once);
+            p.passes += 1;
+            p.pass_streams += n;
         }
     }
 
@@ -1287,7 +1391,11 @@ pub const Lanes = struct {
     fn usable(self: *const Lanes, sn: *const Snap, len: usize) bool {
         if (std.mem.indexOfScalar(*Snap, self.snaps.items, @constCast(sn)) == null) return false;
         if (self.kv) |k| if (k.planner.keptIndex(sn.id) == null) return false; // (TF_DS_KV_SHARD: its rows the planner holds)
-        return !sn.stale and !sn.loading and sn.at > 0 and sn.at < len and sn.at % model.chunk_rows == 0 and sn.at <= len -| self.m.cfg.window;
+        const window = self.m.cfg.window;
+        if (sn.turn_cut or (self.turn_keep and sn.at % model.chunk_rows != 0)) {
+            return !sn.stale and !sn.loading and snapTurnEligible(sn.at, len, window);
+        }
+        return !sn.stale and !sn.loading and snapChunkEligible(sn.at, len, window);
     }
 
     /// The first extent that fits around the live streams and the kept states. Kept states give their room oldest
@@ -1370,11 +1478,23 @@ pub const Lanes = struct {
         const self = of(ptr);
         const s: *const lanes.Stream = @ptrCast(@alignCast(owner orelse return error.NoStream));
         const l = self.streams.getPtr(s) orelse return error.UnknownStream;
-        if (at == 0 or at % model.chunk_rows != 0 or at > s.prompt_len -| self.m.cfg.window) return error.NotAChunkEnd;
+        const len = s.prompt_len;
+        const window = self.m.cfg.window;
+        const chunk = snapChunkEligible(at, len, window);
+        const turn = self.turn_keep and snapTurnEligible(at, len, window);
+        if (!chunk and !turn) return error.NotAChunkEnd;
         const sn = try self.gpa.create(Snap);
         errdefer self.gpa.destroy(sn);
-        sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .end = l.end, .part = l.part, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()), .slot = @intCast(l.slot) };
+        sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .end = l.end, .part = l.part, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()), .slot = @intCast(l.slot), .turn_cut = turn and !chunk };
         errdefer sn.buf.free();
+        if (sn.turn_cut) {
+            for (self.snaps.items) |other| {
+                if (other.turn_cut and other.base == l.base and !other.stale) {
+                    noteStale(other, "a newer replay-cut keep replaced it");
+                    other.stale = true;
+                }
+            }
+        }
         try self.snaps.append(self.gpa, sn);
         self.next_snap += 1;
         if (try self.begin(.snap_save)) {
@@ -2014,7 +2134,7 @@ pub fn followPair(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower, fx:
                     q0[i] = try r.int(i64);
                     slots[i] = try r.int(i64);
                 }
-                m.pass(tokens[0..n], q0[0..n], slots[0..n], steps) catch |err| try roundRefused(err);
+                m.pass(tokens[0..n], q0[0..n], slots[0..n], steps, null) catch |err| try roundRefused(err);
             },
             .fill_images => {
                 const count = try r.int(u32);
@@ -2778,4 +2898,33 @@ test "spill + shard: an owner-sharded reserve lands only on the follower planner
     other = want;
     other.generation = 0;
     try std.testing.expectError(error.SpillNotAgreed, pf.reserve(h, other));
+}
+
+test "TF_DS_TURN_KEEP: replay cut X and the next turn's computed rows" {
+    const window: usize = 128;
+    try std.testing.expectEqual(@as(usize, 2772), replayCutAt(2900, window));
+    const x = replayCutAt(2900, window);
+    try std.testing.expectEqual(@as(usize, 178), 2950 - x); // growth 49 + 128, +1 from align2 on the prior turn's end
+    var m: Model = undefined;
+    m.cfg.window = window;
+    var ln = testLanes(&m);
+    ln.turn_keep = true;
+    defer ln.snaps.deinit(std.testing.allocator);
+    var sn: Snap = .{ .id = 1, .at = x, .base = 0, .buf = undefined, .turn_cut = true };
+    try ln.snaps.append(std.testing.allocator, &sn);
+    try std.testing.expect(ln.usable(&sn, 2950));
+    try std.testing.expect(!snapTurnEligible(2773, 2900, window));
+    try std.testing.expect(!snapTurnEligible(2900, 2900, window));
+    try std.testing.expect(!ln.usable(&sn, x + window)); // at the prompt end boundary
+}
+
+test "TF_DS_TURN_KEEP: a partial prefill piece ends at the replay cut" {
+    const window: usize = 128;
+    const len: usize = 2900;
+    const x = replayCutAt(len, window);
+    const start: usize = 2048;
+    var n: usize = @min(model.chunk_rows, len - start);
+    if (start + n > x) n = x - start;
+    try std.testing.expectEqual(x - start, n);
+    try std.testing.expect(n < model.chunk_rows);
 }

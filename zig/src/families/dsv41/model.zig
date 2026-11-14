@@ -1364,14 +1364,19 @@ pub const Model = struct {
         return m.logits[0..m.vocab];
     }
 
+    /// The monotonic clock for `PassMeasure` (`ctx` is `*Model`).
+    pub fn passNow(ctx: *anyopaque) u64 {
+        return @as(*Model, @ptrCast(@alignCast(ctx))).now();
+    }
+
     /// The drafter's batched pass for N streams: each one's pending token at position q0 in its slot (its rings hold
     /// its positions below q0), `steps` drafts each (the drafter's drafts and confidences on the host).
-    pub fn pass(m: *Model, tokens: []const i64, q0: []const i64, slots: []const i64, steps: usize) !void {
+    pub fn pass(m: *Model, tokens: []const i64, q0: []const i64, slots: []const i64, steps: usize, measure: ?*@import("draft.zig").PassMeasure) !void {
         if (m.dr == null) return error.NoDrafter;
         const dr = &m.dr.?;
         const pool = &m.dpool.?;
         for (q0, slots) |q, s| pool.absorbed[@intCast(s)] = @intCast(q);
-        try dr.pass(&m.eng, &m.ch, pool, tokens, q0, slots, steps, null);
+        try dr.pass(&m.eng, &m.ch, pool, tokens, q0, slots, steps, null, measure);
     }
 };
 

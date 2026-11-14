@@ -494,3 +494,94 @@ test "past the learned-state cap the least recently used state is forgotten, and
     try std.testing.expectEqual(fresh(&p3), g.pass(&t, &p3, plan));
     try std.testing.expect(im.has(imprint.Imprint.keyOf(&two))); // learned again by that pass
 }
+
+test "TF_DS_TURN_KEEP Rules.fine_grid: replay-cut points are eligible in memory, not on chunk grid" {
+    const r = pc.Rules{ .grid = 2048, .window = 128, .fine_grid = 2, .lookahead = 0 };
+    try std.testing.expect(r.eligible(2772, 2900));
+    try std.testing.expect(r.eligible(2048, 2900));
+    try std.testing.expect(!r.eligible(2773, 2900));
+    try std.testing.expect(!r.eligible(2899, 2900));
+    try std.testing.expect(!r.eligible(2900, 2900));
+}
+
+fn eligibleBeforeFineGrid(r: pc.Rules, at: u32, len: usize) bool {
+    if (at == 0 or at >= len) return false;
+    if (r.grid > 0 and at % r.grid != 0) return false;
+    return @as(usize, at) + r.window <= len and @as(usize, at) + r.lookahead <= len;
+}
+
+test "TF_DS_TURN_KEEP Rules.fine_grid off: eligible matches the pre-patch rule" {
+    const window: u32 = 128;
+  const table = [_]struct { at: u32, len: usize }{
+        .{ .at = 2048, .len = 2900 },
+        .{ .at = 2772, .len = 2900 },
+        .{ .at = 1024, .len = 2900 },
+        .{ .at = 1, .len = 2900 },
+        .{ .at = 0, .len = 2900 },
+        .{ .at = 2900, .len = 2900 },
+        .{ .at = 2048, .len = 2200 },
+        .{ .at = 512, .len = 600 },
+    };
+    inline for (.{ 0, 2048 }) |grid| {
+        const old: pc.Rules = .{ .grid = grid, .window = window, .lookahead = 0 };
+        const neu: pc.Rules = .{ .grid = grid, .window = window, .fine_grid = 0, .lookahead = 0 };
+        for (table) |row| {
+            try std.testing.expectEqual(eligibleBeforeFineGrid(old, row.at, row.len), neu.eligible(row.at, row.len));
+        }
+    }
+}
+
+fn countFineGridEntries(s: *const Store) usize {
+    var n: usize = 0;
+    for (s.entries.items) |e| {
+        if (s.rules.grid > 0 and e.at % s.rules.grid == 0) continue;
+        if (s.rules.fine_grid > 0 and e.at % s.rules.fine_grid == 0) n += 1;
+    }
+    return n;
+}
+
+test "TF_DS_TURN_KEEP: two replay-cut keeps leave one fine-grid entry; chunk keep stays" {
+    const gpa = std.testing.allocator;
+    const rules = pc.Rules{ .grid = 2048, .window = 128, .fine_grid = 2, .lookahead = 0, .min_prompt = 0 };
+    var f: Fake = .{ .gpa = gpa };
+    var s = Store.init(gpa, f.snapshots(), rules, 1 << 30);
+    defer s.deinit();
+    const p1 = p1: {
+        const buf = try gpa.alloc(u32, 2900);
+        for (buf) |*x| x.* = 1;
+        break :p1 buf;
+    };
+    defer gpa.free(p1);
+    const p2 = p2: {
+        const buf = try gpa.alloc(u32, 2950);
+        @memcpy(buf[0..2900], p1);
+        for (buf[2900..]) |*x| x.* = 2;
+        break :p2 buf;
+    };
+    defer gpa.free(p2);
+    const p3 = p3: {
+        const buf = try gpa.alloc(u32, 3000);
+        @memcpy(buf[0..2950], p2);
+        for (buf[2950..]) |*x| x.* = 3;
+        break :p3 buf;
+    };
+    defer gpa.free(p3);
+    const x1: u32 = 2772;
+    const x2: u32 = 2822;
+    const x3: u32 = 2872;
+    try std.testing.expect(s.keepWith(p1, x1, null, &.{}, .{}));
+    try std.testing.expect(s.keep(p1, 2048, null, &.{}));
+    try std.testing.expectEqual(@as(usize, 1), countFineGridEntries(&s));
+    try std.testing.expect(s.keepWith(p2, x2, null, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 1), countFineGridEntries(&s));
+    for (s.entries.items) |e| if (e.at % 2048 != 0) try std.testing.expectEqual(x2, e.at);
+    try std.testing.expect(s.keepWith(p3, x3, null, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 1), countFineGridEntries(&s));
+    for (s.entries.items) |e| if (e.at % 2048 != 0) try std.testing.expectEqual(x3, e.at);
+    var chunks: usize = 0;
+    for (s.entries.items) |e| {
+        if (e.at == 2048) chunks += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), chunks);
+    try std.testing.expectEqual(@as(usize, 2), f.live); // one fine + one chunk
+}
