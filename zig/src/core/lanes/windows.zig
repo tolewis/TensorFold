@@ -177,6 +177,15 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
                 p.stream.rememberHeld(rw.*);
             }
             pr.* = if (e.cfg.draft_cal > 0.0) try calibrated(a, rw.*, p.stream.calScale(e.cfg.cal_ceil)) else rw.*;
+            if (p.kind == .head) {
+                if (e.cfg.full_at) |thresh| {
+                    if (plans.len == 1 and e.cfg.fix_k == null and p.stream.fullGrant(thresh)) {
+                        const ones = try a.alloc(f64, n);
+                        for (ones) |*o| o.* = 1.0;
+                        pr.* = ones;
+                    }
+                }
+            }
         }
     }
     const overhead = soloHeadOverhead(e.cfg.solo_head_overhead_ms, e.rule.overheadMs(plans.len), e.alone, plans.len, if (plans.len > 0) plans[0].kind else .none);

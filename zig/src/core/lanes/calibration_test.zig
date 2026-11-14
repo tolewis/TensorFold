@@ -181,10 +181,10 @@ test "the probe logs one line on its period and never on an empty round" {
     defer s.deinit(gpa);
     s.predict(&.{ 0.9, 0.81 });
     s.observeCal(0.2, 1.0);
-    s.logCal(1, 1.0, 3, 1, 2);
-    s.logCal(0, 1.0, 3, 1, 2);
+    s.logCal(1, 1.0, null, 3, 1, 2);
+    s.logCal(0, 1.0, null, 3, 1, 2);
     s.cal_n = 0;
-    s.logCal(1, 1.0, 1, 0, 1);
+    s.logCal(1, 1.0, null, 1, 0, 1);
     try std.testing.expectEqual(@as(u64, 3), s.cal_rounds);
 }
 
@@ -238,7 +238,7 @@ test "cal log fields follow each round with draft cal off" {
     s.granted = 2;
     try std.testing.expectEqual(@as(usize, 2), s.cal_n);
     try std.testing.expectApproxEqAbs(@as(f64, 1.71), s.predicted(), 1e-12);
-    s.logCal(1, 1.0, 4, 2, 3);
+    s.logCal(1, 1.0, null, 4, 2, 3);
     s.cal_held = 0;
     s.cal_n = 0;
     const r2_held = [_]f64{ 0.5, 0.4 };
@@ -248,7 +248,7 @@ test "cal log fields follow each round with draft cal off" {
     s.predict(&.{r2_held[0]});
     s.granted = 1;
     try std.testing.expectEqual(@as(usize, 1), s.cal_n);
-    s.logCal(1, 1.0, 2, 1, 2);
+    s.logCal(1, 1.0, null, 2, 1, 2);
     s.cal_held = 0;
     s.cal_n = 0;
     s.predict(&r1_grant);
@@ -256,7 +256,7 @@ test "cal log fields follow each round with draft cal off" {
     try std.testing.expectEqual(@as(usize, 2), s.cal_n);
     s.observeCal(0.5, 1.0);
     try std.testing.expectEqual(@as(usize, 2), s.cal_n);
-    s.logCal(1, 1.0, 4, 2, 3);
+    s.logCal(1, 1.0, null, 4, 2, 3);
     try std.testing.expectEqual(@as(usize, 2), s.cal_n);
     s.cal_n = 0;
 }
@@ -273,4 +273,121 @@ test "the weight must lie in 0..1" {
     }
     var ok = try Config.init(gpa, .{ .draft_cal = 1.0 }, 16, 15);
     ok.deinit(gpa);
+}
+
+fn warmShare(s: *Stream, granted: u32, kept: usize, rounds: usize) void {
+    for (0..rounds) |_| s.observeShare(granted, kept);
+}
+
+test "without full_at the present calibration grants are unchanged" {
+    var g: [1]u32 = undefined;
+    var p: [1]f64 = undefined;
+    try grants(0.5, &.{0.5}, &g, &p);
+    try std.testing.expectEqual(@as(u32, 2), g[0]);
+}
+
+test "a stream that keeps 9 of 10 drafts gets full grants at x = 0.8 after 8 verifies" {
+    var costs: [16]Cost = undefined;
+    for (&costs, 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 5.0 + 2.0 * @as(f64, @floatFromInt(w)) };
+    var cfg = try Config.init(gpa, .{ .exact_width = 16, .mtp = true, .speculate = true, .drafts = 4, .window_costs = &costs, .mtp_step_ms = 0.5, .draft_probabilities = true, .draft_cal = 0.5, .full_at = 0.8 }, 16, 15);
+    defer cfg.deinit(gpa);
+    var target: fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var vtable = target.backend().vtable.*;
+    vtable.probabilities = chances;
+    var token: u8 = 0;
+    var engine = Engine.init(gpa, &cfg, .{ .ptr = &target, .vtable = &vtable }, .{ .ptr = &token, .vtable = &.{ .start = startNow, .elapsed_ms = elapsed } });
+    defer engine.deinit();
+    var s = try Stream.init(gpa, .{ .id = "hot", .prompt = &.{ 1, 2, 3 }, .max_new = 8 });
+    defer s.deinit(gpa);
+    warmShare(&s, 10, 9, 8);
+    try std.testing.expect(s.fullGrant(0.8));
+    const plan: win.Plan = .{ .stream = &s, .position = 0, .kind = .head, .held = 4 };
+    try win.allocate(&engine, &.{plan});
+    try std.testing.expectEqual(@as(u32, 4), s.granted.?);
+}
+
+test "a stream that keeps 6 of 10 drafts does not get full grants at x = 0.8" {
+    var s = try Stream.init(gpa, .{ .id = "cold", .prompt = &.{1}, .max_new = 8 });
+    defer s.deinit(gpa);
+    warmShare(&s, 10, 6, 8);
+    try std.testing.expect(!s.fullGrant(0.8));
+}
+
+test "a full stream whose kept share falls under x reverts to the rule" {
+    var s = try Stream.init(gpa, .{ .id = "drop", .prompt = &.{1}, .max_new = 8 });
+    defer s.deinit(gpa);
+    warmShare(&s, 10, 9, 8);
+    try std.testing.expect(s.fullGrant(0.8));
+    warmShare(&s, 10, 5, 12);
+    try std.testing.expect(!s.fullGrant(0.8));
+}
+
+test "TF_DS_T25_FULL_AT must lie in 0.5..1" {
+    try std.testing.expectError(error.BadFullAt, Config.parseFullAt("0.4"));
+    try std.testing.expectEqual(@as(f64, 0.8), try Config.parseFullAt("0.8"));
+}
+
+fn lowChances(_: *anyopaque, _: *Stream, out: []f64) anyerror!bool {
+    for (out) |*o| o.* = 0.1;
+    return true;
+}
+
+test "full_at applies only when one plan is in the round" {
+    var costs: [16]Cost = undefined;
+    for (&costs, 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 5.0 + 2.0 * @as(f64, @floatFromInt(w)) };
+    var cfg = try Config.init(gpa, .{ .exact_width = 16, .mtp = true, .speculate = true, .drafts = 4, .window_costs = &costs, .mtp_step_ms = 0.5, .draft_probabilities = true, .full_at = 0.8 }, 16, 15);
+    defer cfg.deinit(gpa);
+    var target: fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var vtable = target.backend().vtable.*;
+    vtable.probabilities = lowChances;
+    var token: u8 = 0;
+    var engine = Engine.init(gpa, &cfg, .{ .ptr = &target, .vtable = &vtable }, .{ .ptr = &token, .vtable = &.{ .start = startNow, .elapsed_ms = elapsed } });
+    defer engine.deinit();
+    var s0 = try Stream.init(gpa, .{ .id = "a", .prompt = &.{1}, .max_new = 8 });
+    defer s0.deinit(gpa);
+    var s1 = try Stream.init(gpa, .{ .id = "b", .prompt = &.{2}, .max_new = 8 });
+    defer s1.deinit(gpa);
+    warmShare(&s0, 10, 9, 8);
+    warmShare(&s1, 10, 9, 8);
+    const alone: win.Plan = .{ .stream = &s0, .position = 0, .kind = .head, .held = 4 };
+    try win.allocate(&engine, &.{alone});
+    try std.testing.expectEqual(@as(u32, 4), s0.granted.?);
+    s0.granted = null;
+    s1.granted = null;
+    const pair = [_]win.Plan{
+        .{ .stream = &s0, .position = 0, .kind = .head, .held = 4 },
+        .{ .stream = &s1, .position = 0, .kind = .head, .held = 4 },
+    };
+    try win.allocate(&engine, &pair);
+    try std.testing.expect((s0.granted orelse 0) < 4);
+    try std.testing.expect((s1.granted orelse 0) < 4);
+}
+
+test "fix_k wins over full_at" {
+    var costs: [16]Cost = undefined;
+    for (&costs, 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 5.0 };
+    var target: fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var vtable = target.backend().vtable.*;
+    vtable.probabilities = lowChances;
+    var token: u8 = 0;
+    var s = try Stream.init(gpa, .{ .id = "s", .prompt = &.{1}, .max_new = 8 });
+    defer s.deinit(gpa);
+    warmShare(&s, 10, 9, 8);
+    const plan: win.Plan = .{ .stream = &s, .position = 0, .kind = .head, .held = 4 };
+    var cfg_full = try Config.init(gpa, .{ .exact_width = 16, .mtp = true, .speculate = true, .drafts = 4, .window_costs = &costs, .mtp_step_ms = 0.5, .draft_probabilities = true, .full_at = 0.8 }, 16, 15);
+    defer cfg_full.deinit(gpa);
+    var engine_full = Engine.init(gpa, &cfg_full, .{ .ptr = &target, .vtable = &vtable }, .{ .ptr = &token, .vtable = &.{ .start = startNow, .elapsed_ms = elapsed } });
+    defer engine_full.deinit();
+    try win.allocate(&engine_full, &.{plan});
+    try std.testing.expectEqual(@as(u32, 4), s.granted.?);
+    s.granted = null;
+    var cfg_k = try Config.init(gpa, .{ .exact_width = 16, .mtp = true, .speculate = true, .drafts = 4, .window_costs = &costs, .mtp_step_ms = 0.5, .draft_probabilities = true, .full_at = 0.8, .fix_k = 1 }, 16, 15);
+    defer cfg_k.deinit(gpa);
+    var engine_k = Engine.init(gpa, &cfg_k, .{ .ptr = &target, .vtable = &vtable }, .{ .ptr = &token, .vtable = &.{ .start = startNow, .elapsed_ms = elapsed } });
+    defer engine_k.deinit();
+    try win.allocate(&engine_k, &.{plan});
+    try std.testing.expect((s.granted orelse 0) < 4);
 }
