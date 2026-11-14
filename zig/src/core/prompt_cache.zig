@@ -403,12 +403,17 @@ pub const Rules = struct {
     grid: u32 = 0,
     /// The rows a resumed pass replays at its end (dsv41: the window): a state is usable only this far from the end.
     window: u32 = 0,
+    /// TF_DS_TURN_KEEP: memory-only replay-cut keeps on this grid (dsv41: 2); spill keeps stay on `grid`.
+    fine_grid: u32 = 0,
 
     /// The native rule (Lanes.usable): 0 < at < len, on the grid, at most len - window, its lookahead inside the prompt.
     pub fn eligible(r: Rules, at: u32, len: usize) bool {
         if (at == 0 or at >= len) return false;
-        if (r.grid > 0 and at % r.grid != 0) return false;
-        return @as(usize, at) + r.window <= len and @as(usize, at) + r.lookahead <= len;
+        const tail_ok = @as(usize, at) + r.window <= len and @as(usize, at) + r.lookahead <= len;
+        if (!tail_ok) return false;
+        if (r.grid > 0 and at % r.grid == 0) return true;
+        if (r.fine_grid > 0 and at % r.fine_grid == 0) return true;
+        return r.grid == 0 and r.fine_grid == 0;
     }
 
     /// The grid point at or before `at` (`at` itself without a grid).
@@ -462,6 +467,8 @@ pub const KeepInfo = struct {
     parent: ?u64 = null,
     fork: u32 = 0,
     lineage: []const Fork = &.{}, // the pass's (Store.passLineage), copied into the entry
+    /// TF_DS_TURN_KEEP: this keep is the replay-cut state; replaces prior fine-grid keeps of the same prompt.
+    turn_cut: bool = false,
 };
 
 pub const Store = struct {
@@ -1033,7 +1040,36 @@ pub const Store = struct {
         }
         if (shared) s.learn(e, starts);
         if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held -| s.restoring_bytes); // spare storage only inside what the budget leaves
+        if (info.turn_cut) s.dropPriorTurnCuts(prompt, at, @as(usize, at) + s.rules.lookahead);
         return true;
+    }
+
+    /// Drop older replay-cut memory states for the same growing prompt (one fine-grid keep a conversation).
+    fn dropPriorTurnCuts(s: *Store, prompt: []const u32, except: u32, n: usize) void {
+        if (s.rules.fine_grid == 0) return;
+        const key = prompt[0..@min(n, prompt.len)];
+        var i: usize = 0;
+        while (i < s.entries.items.len) {
+            const e = s.entries.items[i];
+            if (e.at == except) {
+                i += 1;
+                continue;
+            }
+            if (s.rules.grid > 0 and e.at % s.rules.grid == 0) {
+                i += 1;
+                continue;
+            }
+            if (e.at % s.rules.fine_grid != 0) {
+                i += 1;
+                continue;
+            }
+            if (e.tokens.len < key.len or !std.mem.eql(u32, e.tokens[0..key.len], key)) {
+                i += 1;
+                continue;
+            }
+            s.remove(i);
+            s.counts.evicted += 1;
+        }
     }
 
     /// A shared cut's state written to disk once (--learn): later sessions read it back, after a restart too.

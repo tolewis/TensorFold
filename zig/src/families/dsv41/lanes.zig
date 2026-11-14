@@ -214,6 +214,21 @@ fn markEnds(marks: []const u32, at: usize) bool {
     return false;
 }
 
+/// Even floor of `len - window` (WP-T1 replay-cut keep); 0 when that difference is 0.
+pub fn replayCutAt(len: usize, window: usize) usize {
+    const raw = len -| window;
+    if (raw == 0) return 0;
+    return raw & ~@as(usize, 1);
+}
+
+fn snapChunkEligible(at: usize, len: usize, window: usize) bool {
+    return at > 0 and at < len and at % model.chunk_rows == 0 and at <= len -| window;
+}
+
+fn snapTurnEligible(at: usize, len: usize, window: usize) bool {
+    return at > 0 and at < len and at % 2 == 0 and at <= len -| window;
+}
+
 // -- pictures in a resumed pass (recipe 0006; spill v2 restores take the same path as memory resumes) ------------------
 
 /// A picture's span [at, at + tokens) of the runtime sequence `seq` (the prompt's ids, each the placeholder `image_id`
@@ -446,6 +461,7 @@ pub const Snap = struct {
     loading: bool = false, // a restore's destination: its rows held back, not usable until every rank installed it
     restored: bool = false, // read back from the spill tier
     part: u8 = 0, // TF_DS_KV_SHARD: the part holding its rows (parts.zig's Kept; a live move changes it)
+    turn_cut: bool = false, // TF_DS_TURN_KEEP: memory-only keep at the replay cut (not a chunk-grid point)
 };
 
 /// Kept states this long or longer say so in the log when they go stale (their prompts then run again from 0).
@@ -456,7 +472,7 @@ fn noteStale(sn: *const Snap, why: []const u8) void {
 }
 
 /// A prompt pass between its pieces: the chunk it runs next and what its chunk loop reads.
-const Fill = struct { s: *const lanes.Stream, slot: usize, len: usize, replay: usize, last_end: usize, start: usize, head: bool = false, base: usize = 0, restored: bool = false, part: ?u64 = null };
+const Fill = struct { s: *const lanes.Stream, slot: usize, len: usize, replay: usize, last_end: usize, replay_x: usize = 0, start: usize, head: bool = false, base: usize = 0, restored: bool = false, part: ?u64 = null };
 
 /// How long a request waits for the live stream that holds the kept state it resumes from to end (then it resumes
 /// in place and every kept state stays) before other kept states give their room for a copy of it.
@@ -506,6 +522,8 @@ pub const Lanes = struct {
     /// The pair's one rank_wire Leader (native.openPair: agreed with rank_identity's full fingerprint before anything
     /// spill- or shard-related crosses), shared by the spill tier and the KV parts; owned here (null: neither is on).
     rw: ?*rank_wire.Leader = null,
+    /// TF_DS_TURN_KEEP=1: split the prompt pass at the replay cut, keep that state in memory only.
+    turn_keep: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
@@ -864,7 +882,9 @@ pub const Lanes = struct {
             const start = f.start;
             const len = f.len;
             if (start > 0 and s.isCancelled()) return error.Cancelled;
-            const n = @min(model.chunk_rows, len - start);
+            var n: usize = @min(model.chunk_rows, len - start);
+            if (self.turn_keep and f.replay_x > start and start + n > f.replay_x) n = f.replay_x - start;
+            if (n == 0) return error.FillUnfinished;
             if (try self.begin(.fill_chunk)) {
                 try self.wire.int(self.gpa, u64, start);
                 try self.wire.int(self.gpa, u32, @intCast(n));
@@ -879,7 +899,8 @@ pub const Lanes = struct {
                 break :blk try m.fillChunk(seq[0 .. start + n], start, n, f.replay);
             };
             f.start += n;
-            if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
+            const replay_keep = self.turn_keep and f.replay_x > 0 and f.start == f.replay_x;
+            if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and (f.start == f.last_end or markEnds(s.reuse.marks, f.start) or replay_keep)) k.at(k.ptr, s, @intCast(f.start));
             // the host's work between this pass's chunks (Stream.between: the prefill interleave's rounds, parked work's
             // service): the read-ahead joined and the prompt's ids gone first, as at a piece's end and on rank 1, which
             // reads ahead again at the next chunk
@@ -1088,7 +1109,8 @@ pub const Lanes = struct {
         // where this pass keeps states: the cache's marks and its last chunk end before the replay (the served lane's
         // kept prompt), each at the chunk end at or before it
         const last_end = @min(replay, len - 1) / model.chunk_rows * model.chunk_rows;
-        self.fill = .{ .s = s, .slot = slot, .len = len, .replay = replay, .last_end = last_end, .start = start, .base = base, .restored = if (kept) |sn| sn.restored else false, .part = if (parted) |pp| pp.id else null };
+        const replay_x = if (self.turn_keep) replayCutAt(len, m.cfg.window) else 0;
+        self.fill = .{ .s = s, .slot = slot, .len = len, .replay = replay, .last_end = last_end, .replay_x = replay_x, .start = start, .base = base, .restored = if (kept) |sn| sn.restored else false, .part = if (parted) |pp| pp.id else null };
     }
 
     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
@@ -1282,7 +1304,11 @@ pub const Lanes = struct {
     fn usable(self: *const Lanes, sn: *const Snap, len: usize) bool {
         if (std.mem.indexOfScalar(*Snap, self.snaps.items, @constCast(sn)) == null) return false;
         if (self.kv) |k| if (k.planner.keptIndex(sn.id) == null) return false; // (TF_DS_KV_SHARD: its rows the planner holds)
-        return !sn.stale and !sn.loading and sn.at > 0 and sn.at < len and sn.at % model.chunk_rows == 0 and sn.at <= len -| self.m.cfg.window;
+        const window = self.m.cfg.window;
+        if (sn.turn_cut or (self.turn_keep and sn.at % model.chunk_rows != 0)) {
+            return !sn.stale and !sn.loading and snapTurnEligible(sn.at, len, window);
+        }
+        return !sn.stale and !sn.loading and snapChunkEligible(sn.at, len, window);
     }
 
     /// The first extent that fits around the live streams and the kept states. Kept states give their room oldest
@@ -1365,11 +1391,23 @@ pub const Lanes = struct {
         const self = of(ptr);
         const s: *const lanes.Stream = @ptrCast(@alignCast(owner orelse return error.NoStream));
         const l = self.streams.getPtr(s) orelse return error.UnknownStream;
-        if (at == 0 or at % model.chunk_rows != 0 or at > s.prompt_len -| self.m.cfg.window) return error.NotAChunkEnd;
+        const len = s.prompt_len;
+        const window = self.m.cfg.window;
+        const chunk = snapChunkEligible(at, len, window);
+        const turn = self.turn_keep and snapTurnEligible(at, len, window);
+        if (!chunk and !turn) return error.NotAChunkEnd;
         const sn = try self.gpa.create(Snap);
         errdefer self.gpa.destroy(sn);
-        sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .end = l.end, .part = l.part, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()), .slot = @intCast(l.slot) };
+        sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .end = l.end, .part = l.part, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()), .slot = @intCast(l.slot), .turn_cut = turn and !chunk };
         errdefer sn.buf.free();
+        if (sn.turn_cut) {
+            for (self.snaps.items) |other| {
+                if (other.turn_cut and other.base == l.base and !other.stale) {
+                    noteStale(other, "a newer replay-cut keep replaced it");
+                    other.stale = true;
+                }
+            }
+        }
         try self.snaps.append(self.gpa, sn);
         self.next_snap += 1;
         if (try self.begin(.snap_save)) {
@@ -2773,4 +2811,33 @@ test "spill + shard: an owner-sharded reserve lands only on the follower planner
     other = want;
     other.generation = 0;
     try std.testing.expectError(error.SpillNotAgreed, pf.reserve(h, other));
+}
+
+test "TF_DS_TURN_KEEP: replay cut X and the next turn's computed rows" {
+    const window: usize = 128;
+    try std.testing.expectEqual(@as(usize, 2772), replayCutAt(2900, window));
+    const x = replayCutAt(2900, window);
+    try std.testing.expectEqual(@as(usize, 178), 2950 - x); // growth 49 + 128, +1 from align2 on the prior turn's end
+    var m: Model = undefined;
+    m.cfg.window = window;
+    var ln = testLanes(&m);
+    ln.turn_keep = true;
+    defer ln.snaps.deinit(std.testing.allocator);
+    var sn: Snap = .{ .id = 1, .at = x, .base = 0, .buf = undefined, .turn_cut = true };
+    try ln.snaps.append(std.testing.allocator, &sn);
+    try std.testing.expect(ln.usable(&sn, 2950));
+    try std.testing.expect(!snapTurnEligible(2773, 2900, window));
+    try std.testing.expect(!snapTurnEligible(2900, 2900, window));
+    try std.testing.expect(!ln.usable(&sn, x + window)); // at the prompt end boundary
+}
+
+test "TF_DS_TURN_KEEP: a partial prefill piece ends at the replay cut" {
+    const window: usize = 128;
+    const len: usize = 2900;
+    const x = replayCutAt(len, window);
+    const start: usize = 2048;
+    var n: usize = @min(model.chunk_rows, len - start);
+    if (start + n > x) n = x - start;
+    try std.testing.expectEqual(x - start, n);
+    try std.testing.expect(n < model.chunk_rows);
 }

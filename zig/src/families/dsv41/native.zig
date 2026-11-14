@@ -38,6 +38,8 @@
 //!                                               predicted drafts (unset or 0: off; core/lanes/windows.zig)
 //!   TF_DS_T25_CAL_LOG                           print every n-th calibrated verify of a stream to stderr (unset or 0: off)
 //!   TF_DS_NO_COPIES=1                           a drafted stream proposes no suffix-lookup copy windows
+//!   TF_DS_TURN_KEEP=1                           after each prompt pass, keep one more state at the replay cut (even floor of
+//!                                               len - window, memory only); the next turn restores it and runs growth + window
 //!   TF_DS_SERVE_PROFILE=N                       a measurement: rank 0 prints its backend's times (send, forward, absorb,
 //!                                               logits, sample, the drafter pass, the rest of a round) to stderr every N
 //!                                               rounds; the forward is synchronized apart, so the rounds are a little slower
@@ -134,6 +136,8 @@ pub const Loaded = struct {
     /// replay window, Lanes.usable's).
     grid: u32 = 0,
     replay: u32 = 0,
+    /// TF_DS_TURN_KEEP: prompt-cache `Rules.fine_grid` (2); 0 with the switch off.
+    fine_grid: u32 = 0,
     /// TF_DS_KV_SHARD: the parts' counters and rows for /health and /metrics (null: the switch off).
     kv_parts: ?lanes.kv_parts.Source = null,
     /// The broken-pair policy's hooks (TF_DS_PAIR_BROKEN, exit by default; null: degrade). `ctx` is `ctx`.
@@ -271,6 +275,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     st.lanes.draft_cal = if (getenv("TF_DS_T25_DRAFT_CAL")) |v| lanes_mod.parseCalWeight(v) catch return error.BadDraftCal else 0.0;
     st.lanes.cal_log = if (getenv("TF_DS_T25_CAL_LOG")) |v| std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch return error.BadCalLog else 0;
     st.lanes.no_copies = if (getenv("TF_DS_NO_COPIES")) |v| !std.mem.eql(u8, v, "0") else false;
+    st.lanes.turn_keep = if (getenv("TF_DS_TURN_KEEP")) |v| !std.mem.eql(u8, v, "0") else false;
     {
         // TF_DS_ROUND_MS_<n>: a round of n streams by its rows (unset: TF_DS_ROUND_MS's table)
         var n: usize = 2;
@@ -307,7 +312,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const kv_parts: ?lanes.kv_parts.Source = if (st.m.kvs != null) .{ .ctx = &st.lanes, .read = L.kvPartsFn } else null;
     const pair: ?Pair = if (pair_mode == .exit) .{ .watch = pairWatch, .abort = pairAbort } else null;
     if (pair != null) std.log.info("dsv41: a broken rank pair ends this server with status {d} for a restart of both ranks (TF_DS_PAIR_BROKEN=degrade: requests fail one by one instead)", .{api.LaneHost.pair_exit_code});
-    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null, .window = window, .tier = tier, .grid = model.chunk_rows, .replay = @intCast(st.m.cfg.window), .kv_parts = kv_parts, .pair = pair, .quiet = quietFn };
+    if (st.lanes.turn_keep) std.log.info("dsv41: turn keep at the replay cut (TF_DS_TURN_KEEP=1)", .{});
+    const fine_grid: u32 = if (st.lanes.turn_keep) 2 else 0;
+    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null, .window = window, .tier = tier, .grid = model.chunk_rows, .replay = @intCast(st.m.cfg.window), .fine_grid = fine_grid, .kv_parts = kv_parts, .pair = pair, .quiet = quietFn };
 }
 
 // -- the broken-pair policy (robustness, docs/port/robustness.md) ------------------------------------------------

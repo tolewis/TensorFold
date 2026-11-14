@@ -494,3 +494,12 @@ test "past the learned-state cap the least recently used state is forgotten, and
     try std.testing.expectEqual(fresh(&p3), g.pass(&t, &p3, plan));
     try std.testing.expect(im.has(imprint.Imprint.keyOf(&two))); // learned again by that pass
 }
+
+test "TF_DS_TURN_KEEP Rules.fine_grid: replay-cut points are eligible in memory, not on chunk grid" {
+    const r = pc.Rules{ .grid = 2048, .window = 128, .fine_grid = 2, .lookahead = 0 };
+    try std.testing.expect(r.eligible(2772, 2900));
+    try std.testing.expect(r.eligible(2048, 2900));
+    try std.testing.expect(!r.eligible(2773, 2900));
+    try std.testing.expect(!r.eligible(2899, 2900));
+    try std.testing.expect(!r.eligible(2900, 2900));
+}
