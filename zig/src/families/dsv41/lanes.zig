@@ -396,6 +396,7 @@ pub const Profile = struct {
     parts_stage: [draft.max_stages]u64 = @splat(0),
     parts_markov: [draft.max_block]u64 = @splat(0),
     parts_conf: u64 = 0,
+    parts_step1: [draft.pass_step1_len]u64 = @splat(0),
     parts_passes: u64 = 0,
     parts_n_stages: usize = 0,
     parts_n_markov: usize = 0,
@@ -407,8 +408,25 @@ fn mergePassParts(p: *Profile, once: draft.PassPartsOnce) void {
     for (once.stages[0..once.n_stages], 0..) |v, i| p.parts_stage[i] += v;
     for (once.markov[0..once.n_markov], 0..) |v, i| p.parts_markov[i] += v;
     p.parts_conf += once.conf;
+    for (&p.parts_step1, &once.step1) |*d, s| d.* += s;
     p.parts_n_stages = @max(p.parts_n_stages, once.n_stages);
     p.parts_n_markov = @max(p.parts_n_markov, once.n_markov);
+}
+
+// pass_step1_ms (TF_DS_PASS_PARTS): collapse, norm, head_cols, bias, score, finish, gather, pick
+fn printPassStep1Ms(p: Profile) void {
+    if (p.parts_passes == 0) {
+        std.debug.print(", \"pass_step1_ms\": null", .{});
+        return;
+    }
+    const m = profileMs;
+    const n = p.parts_passes;
+    std.debug.print(", \"pass_step1_ms\": [", .{});
+    for (p.parts_step1, 0..) |v, i| {
+        if (i > 0) std.debug.print(", ", .{});
+        std.debug.print("{d:.3}", .{m(v, n)});
+    }
+    std.debug.print("]", .{});
 }
 
 fn profileMs(ns: u64, n: u64) f64 {
@@ -422,12 +440,14 @@ test "mergePassParts rolls per-pass part times into the profile" {
         .stages = .{ 10, 20, 30, 0 },
         .markov = .{ 5, 6, 0, 0, 0, 0, 0, 0 },
         .conf = 7,
+        .step1 = .{ 1, 2, 3, 4, 5, 6, 7, 8 },
         .n_stages = 3,
         .n_markov = 2,
     };
     mergePassParts(&p, once);
     try std.testing.expectEqual(@as(u64, 1), p.parts_passes);
     try std.testing.expectEqual(@as(u64, 10), p.parts_stage[1]);
+    try std.testing.expectEqual(@as(u64, 5), p.parts_step1[4]);
     try std.testing.expectEqual(@as(usize, 3), p.parts_n_stages);
 }
 
@@ -466,6 +486,7 @@ fn printServeProfile(p: Profile, period: u64, periods: u64) void {
         ms(p.prefill, p.prefills),
     });
     printPassPartsMs(p);
+    printPassStep1Ms(p);
     std.debug.print("}}}}\n", .{});
 }
 
