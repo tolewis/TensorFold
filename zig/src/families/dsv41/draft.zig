@@ -102,12 +102,16 @@ pub const PassSplit = struct {
     read: u64 = 0,
 };
 
+/// Sub-parts of Markov step 1 (index order for `pass_step1_ms`: collapse, norm, head_cols, bias, score, finish, gather, pick).
+pub const pass_step1_len = 8;
+
 /// One pass with TF_DS_PASS_PARTS: per-part device time after each synchronize (ns).
 pub const PassPartsOnce = struct {
     embed: u64 = 0,
     stages: [max_stages]u64 = @splat(0),
     markov: [max_block]u64 = @splat(0),
     conf: u64 = 0,
+    step1: [pass_step1_len]u64 = @splat(0),
     n_stages: usize = 0,
     n_markov: usize = 0,
 };
@@ -548,6 +552,48 @@ pub const Drafter = struct {
         m.part_t = t1;
     }
 
+    /// Markov step 1 only (`TF_DS_PASS_PARTS`): _bias, _score, _finish, gather, _pick — each followed by synchronize (step1[3..7]).
+    fn markovStep1Parts(dr: *Drafter, e: *const Engine, t: tri.Tri, lg: u64, out: u64, ts: usize, n: usize, block: usize, sc: tri_markov.Scratch, gather: tri_markov.Gather, measure: ?*PassMeasure) !void {
+        const mk = &dr.mk;
+        const parts = measure orelse return;
+        if (!parts.pass_parts or parts.parts == null) return;
+        const s1 = &parts.parts.?.step1;
+        if (n > tri_markov.np) return error.TooManyRows;
+        const aot = cuda.aot;
+        const intU = struct {
+            fn f(name: []const u8, v: usize) aot.Arg {
+                return aot.int(name, @intCast(v));
+            }
+        }.f;
+        const pArg = aot.ptr;
+        const ciArg = aot.ci;
+        const nc = mk.n_cols;
+        const lw = if (mk.lg_w != 0) mk.lg_w else nc;
+        const l_seg = if (mk.lg_w != 0) nc else n * block * nc;
+        const tok = out + 8 * 0;
+        try mk.bias(t, tok, ts, mk.slot, sc.stage, mk.cols, n);
+        try partTick(e, measure, &s1[3]);
+        try t.run("_score", .{ tri.u(mk.s_tiles), tri.u(mk.segs), 1 }, &.{
+            pArg("LG", "*fp32", lg + 4 * 0 * lw), intU("l_seg", l_seg), intU("l_row", block * lw), pArg("TOK", "*i64", tok),
+            intU("t_stride", ts), pArg("SLOT", "*i32", mk.slot), pArg("CACHE", "*fp16", mk.cache), intU("c_row", mk.cols),
+            pArg("STAGE", "*fp16", sc.stage), intU("s_row", mk.cols), pArg("PV", "*fp32", sc.pv), pArg("PI", "*i32", sc.pi),
+            intU("n_rows", n), intU("n_cols", nc), intU("seg0", mk.seg0), intU("n_part", mk.n_part),
+        }, &.{ ciArg("BC", @intCast(tri_markov.bc)), t.pdlConst() });
+        try partTick(e, measure, &s1[4]);
+        try t.run("_finish", .{ tri.u(n), 1, 1 }, &.{
+            pArg("PV", "*fp32", sc.pv), pArg("PI", "*i32", sc.pi), intU("n_part", mk.n_part), pArg("OUT", "*i64", out + 8 * (0 + 1)),
+            intU("o_stride", ts), pArg("SEND", "*fp32", sc.send), intU("send", @intFromBool(mk.split)),
+        }, &.{ ciArg("BP", @intCast(mk.bp)), t.pdlConst() });
+        try partTick(e, measure, &s1[5]);
+        const send = if (mk.split) sc.send else null;
+        if (send) |snd| {
+            const gathered = try gather.run(gather.ctx, snd, n);
+            try partTick(e, measure, &s1[6]);
+            try mk.pick(t, gathered, mk.world, out, ts, n, 0);
+            try partTick(e, measure, &s1[7]);
+        }
+    }
+
     /// The pass's device work for N streams of `steps` drafts, from the rows' embeddings to the confidence head (its
     /// inputs uploaded: the index rows, the pick lists, the Markov loop's first column): what a pass graph captures.
     fn body(dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, N: usize, steps: usize, probe: ?Probe, measure: ?*PassMeasure) !void {
@@ -597,8 +643,17 @@ pub const Drafter = struct {
         try Probe.check(probe, .stages_pre, S, pre);
         // the head on every row (this rank's columns: the Markov loop scores them without a gather)
         try tri_basic.collapse(t, h, pre, dr.xc, R, d);
+        if (measure) |m| {
+            if (m.pass_parts) if (m.parts) |p| try partTick(e, measure, &p.step1[0]);
+        }
         try tri_basic.rmsnorm(t, dr.xc, d, dr.ds.norm, dr.xn, d, c.eps, R, d);
+        if (measure) |m| {
+            if (m.pass_parts) if (m.parts) |p| try partTick(e, measure, &p.step1[1]);
+        }
         try prompt.grouped(e, ch, R, &.{e.w.head}, &.{dr.xn}, &.{d}, &.{dr.local}, &.{e.w.head.n}, &.{.f32});
+        if (measure) |m| {
+            if (m.pass_parts) if (m.parts) |p| try partTick(e, measure, &p.step1[2]);
+        }
         try Probe.check(probe, .local, S, dr.local);
         // the Markov loop: out [N, steps + 1], each stream's last token first
         const ts = steps + 1;
@@ -606,9 +661,13 @@ pub const Drafter = struct {
         const mk_gather: tri_markov.Gather = .{ .ctx = &g, .run = MarkovGather.run };
         if (measure != null and measure.?.pass_parts) {
             for (0..steps) |i| {
-                const send = try dr.mk.localBest(t, dr.local, dr.out, ts, N, n, i, dr.msc) orelse continue;
-                try dr.mk.pick(t, try mk_gather.run(mk_gather.ctx, send, N), dr.mk.world, dr.out, ts, N, i);
-                if (measure) |m| if (m.parts) |p| if (i < p.markov.len) try partTick(e, measure, &p.markov[i]);
+                if (i == 0) {
+                    try dr.markovStep1Parts(e, t, dr.local, dr.out, ts, N, n, dr.msc, mk_gather, measure);
+                } else {
+                    const send = try dr.mk.localBest(t, dr.local, dr.out, ts, N, n, i, dr.msc) orelse continue;
+                    try dr.mk.pick(t, try mk_gather.run(mk_gather.ctx, send, N), dr.mk.world, dr.out, ts, N, i);
+                    if (measure) |m| if (m.parts) |p| if (i < p.markov.len) try partTick(e, measure, &p.markov[i]);
+                }
             }
         } else try dr.mk.steps(t, dr.local, dr.out, ts, N, n, steps, dr.msc, mk_gather);
         try Probe.check(probe, .markov, S, dr.out);
@@ -768,6 +827,10 @@ pub fn chooseK(conf: []const f32, kmax: usize, live: usize, drafts: usize, round
         }
     }
     return best;
+}
+
+test "PassPartsOnce step1 has eight Markov-step-1 buckets" {
+    try std.testing.expectEqual(@as(usize, 8), pass_step1_len);
 }
 
 test "pass split buckets sum to the pass wall time" {
