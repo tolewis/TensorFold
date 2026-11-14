@@ -111,6 +111,7 @@ pub const PassPartsOnce = struct {
     stages: [max_stages]u64 = @splat(0),
     markov: [max_block]u64 = @splat(0),
     conf: u64 = 0,
+    head1: u64 = 0,
     step1: [pass_step1_len]u64 = @splat(0),
     n_stages: usize = 0,
     n_markov: usize = 0,
@@ -247,6 +248,7 @@ pub const Drafter = struct {
     xc: u64, // bf16 [R, D]: the collapsed streams (pre-norm: the confidence head reads them)
     xn: u64,
     local: u64, // fp32 [R, this rank's vocabulary columns]
+    head1_row: u64, // fp32 [head.n]: one-row head probe (TF_DS_PASS_PARTS; does not touch local)
     // the Markov loop
     mk: tri_markov.Markov,
     msc: tri_markov.Scratch,
@@ -351,6 +353,7 @@ pub const Drafter = struct {
         dr.xc = try a.take(R * d * 2);
         dr.xn = try a.take(R * d * 2);
         dr.local = try a.take(R * e.w.head.n * 4);
+        dr.head1_row = try a.take(e.w.head.n * 4);
         // the Markov loop: every token's slot -1 (none), then the cached rows of the first 256 frequent tokens
         const none = try a.take(c.vocab * 4);
         try e.d.check(e.d.api.cuMemsetD32Async(none, 0xffffffff, c.vocab, e.s.handle), "cuMemsetD32Async");
@@ -652,7 +655,13 @@ pub const Drafter = struct {
         }
         try prompt.grouped(e, ch, R, &.{e.w.head}, &.{dr.xn}, &.{d}, &.{dr.local}, &.{e.w.head.n}, &.{.f32});
         if (measure) |m| {
-            if (m.pass_parts) if (m.parts) |p| try partTick(e, measure, &p.step1[2]);
+            if (m.pass_parts) {
+                if (m.parts) |p| {
+                    try partTick(e, measure, &p.step1[2]);
+                    try prompt.grouped(e, ch, 1, &.{e.w.head}, &.{dr.xn}, &.{d}, &.{dr.head1_row}, &.{e.w.head.n}, &.{.f32});
+                    try partTick(e, measure, &p.head1);
+                }
+            }
         }
         try Probe.check(probe, .local, S, dr.local);
         // the Markov loop: out [N, steps + 1], each stream's last token first

@@ -396,6 +396,7 @@ pub const Profile = struct {
     parts_stage: [draft.max_stages]u64 = @splat(0),
     parts_markov: [draft.max_block]u64 = @splat(0),
     parts_conf: u64 = 0,
+    parts_head1: u64 = 0,
     parts_step1: [draft.pass_step1_len]u64 = @splat(0),
     parts_passes: u64 = 0,
     parts_n_stages: usize = 0,
@@ -408,6 +409,7 @@ fn mergePassParts(p: *Profile, once: draft.PassPartsOnce) void {
     for (once.stages[0..once.n_stages], 0..) |v, i| p.parts_stage[i] += v;
     for (once.markov[0..once.n_markov], 0..) |v, i| p.parts_markov[i] += v;
     p.parts_conf += once.conf;
+    p.parts_head1 += once.head1;
     for (&p.parts_step1, &once.step1) |*d, s| d.* += s;
     p.parts_n_stages = @max(p.parts_n_stages, once.n_stages);
     p.parts_n_markov = @max(p.parts_n_markov, once.n_markov);
@@ -440,6 +442,7 @@ test "mergePassParts rolls per-pass part times into the profile" {
         .stages = .{ 10, 20, 30, 0 },
         .markov = .{ 5, 6, 0, 0, 0, 0, 0, 0 },
         .conf = 7,
+        .head1 = 11,
         .step1 = .{ 1, 2, 3, 4, 5, 6, 7, 8 },
         .n_stages = 3,
         .n_markov = 2,
@@ -448,6 +451,7 @@ test "mergePassParts rolls per-pass part times into the profile" {
     try std.testing.expectEqual(@as(u64, 1), p.parts_passes);
     try std.testing.expectEqual(@as(u64, 10), p.parts_stage[1]);
     try std.testing.expectEqual(@as(u64, 5), p.parts_step1[4]);
+    try std.testing.expectEqual(@as(u64, 11), p.parts_head1);
     try std.testing.expectEqual(@as(usize, 3), p.parts_n_stages);
 }
 
@@ -487,6 +491,11 @@ fn printServeProfile(p: Profile, period: u64, periods: u64) void {
     });
     printPassPartsMs(p);
     printPassStep1Ms(p);
+    if (p.parts_passes == 0) {
+        std.debug.print(", \"pass_head1_ms\": null", .{});
+    } else {
+        std.debug.print(", \"pass_head1_ms\": {d:.3}", .{ms(p.parts_head1, p.parts_passes)});
+    }
     std.debug.print("}}}}\n", .{});
 }
 
