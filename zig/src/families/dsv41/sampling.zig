@@ -142,8 +142,6 @@ fn topCandidatesPass(row: []const f32, count: usize, id_bias: i64, values: []f32
 
 /// The row's first `count` (value, id) in that order: torch.topk's set (of equal values the lower ids) as np.lexsort
 /// orders it.
-/// The row's first `count` (value, id) in that order: torch.topk's set (of equal values the lower ids) as np.lexsort
-/// orders it.
 pub fn topCandidates(row: []const f32, count: usize, values: []f32, ids: []i64) usize {
     return topCandidatesPass(row, count, 0, values, ids);
 }
