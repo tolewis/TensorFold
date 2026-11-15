@@ -669,6 +669,27 @@ fn tokenLogCommitted(gpa: std.mem.Allocator, w: be.Window, held: []const u32, sa
     return n + 1;
 }
 
+const token_log_prompt_chunk = 400;
+
+/// TF_DS_TOKEN_LOG: prompt token ids for a request (`token_log_prompt `; chunks of 400 ids at most).
+fn printTokenLogPrompt(stream: []const u8, ids: []const u32) void {
+    var off: usize = 0;
+    var part: u32 = 0;
+    while (off < ids.len) {
+        const take = @min(token_log_prompt_chunk, ids.len - off);
+        var buf: [12 * 1024]u8 = undefined;
+        var at: usize = 0;
+        at += (std.fmt.bufPrint(buf[at..], "token_log_prompt {{\"stream\": \"{s}\", \"part\": {d}, \"ids\": [", .{ stream, part }) catch return).len;
+        for (ids[off .. off + take], 0..) |t, i| {
+            at += (std.fmt.bufPrint(buf[at..], "{s}{d}", .{ if (i > 0) ", " else "", t }) catch return).len;
+        }
+        at += (std.fmt.bufPrint(buf[at..], "]}}\n", .{}) catch return).len;
+        std.debug.print("{s}", .{buf[0..at]});
+        off += take;
+        part += 1;
+    }
+}
+
 /// TF_DS_TOKEN_LOG: one stderr line per stream verify (`token_log ` plus JSON: stream, tok, draft).
 fn printTokenLog(gpa: std.mem.Allocator, stream: []const u8, w: be.Window, draft_ids: []const u32, sampled: []const u32) void {
     var tok_buf: [window_rows]u32 = undefined;
@@ -1335,6 +1356,7 @@ pub const Lanes = struct {
         if (parted == null) self.staleOver(if (kept != null and !moved) base + kept.?.at else base, base + size, kept);
         try self.streams.put(gpa, s, .{ .slot = slot, .base = base, .end = base + size, .id = if (parted) |pp| pp.id else 0, .part = if (parted) |pp| pp.part else 0, .gen = if (parted) |pp| pp.gen else 0 });
         self.used[slot] = true;
+        if (self.token_log and self.m.rank == 0) printTokenLogPrompt(s.id, ids);
         const place_done = m.now();
         if (self.turn_prefill) |*tp| tp.cache_search_host_ns += place_done - open0;
         errdefer {
