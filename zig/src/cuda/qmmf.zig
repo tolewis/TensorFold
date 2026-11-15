@@ -6,6 +6,7 @@ const launch_ = @import("launch.zig");
 const stream_ = @import("stream.zig");
 const kernels = @import("kernels.zig");
 const abi = @import("abi.zig");
+const many = @import("qmmf_many.zig");
 
 const Driver = driver.Driver;
 const Module = module.Module;
@@ -185,6 +186,7 @@ pub const Lane = struct {
     half: [2][2][2]Function, // by halfModeIndex, Out, then plain / cluster
     half_below: usize = half_below_default,
     shared_down: [4]Function = undefined,
+    parts: ?[2]Function = null, // qmmf_many.zig: decode projections of one input in one launch, on sm_120
     prompt: ?[2][2]Function = null, // Out, then plain / fused; loadPrompt() fills it on sm_12x
     prompt_k32: ?[2]Function = null, // Out; unsplit BF16 prompt calls, loadPrompt() fills it on sm_12x
     prompt_sms: usize = 0, // the device's SMs: the tile runs when its blocks fill more than half of them
@@ -217,6 +219,9 @@ pub const Lane = struct {
             try f.allowDynamicShared(sharedBytes(.bf16, 64));
         }
         l.half_below = try halfBelow();
+        // one launch for the projections of one input saves a fixed cost a launch; measured on sm_120 only
+        const sm120 = capability_major == 12 and (try d.currentCapability()) == 120;
+        if (sm120 and try many.enabled()) l.parts = try many.load(mod);
         return l;
     }
 
@@ -265,6 +270,7 @@ pub const Lane = struct {
     }
 
     pub const matmulF32Strided = @import("qmmf_shared.zig").matmulF32Strided;
+    pub const matmulMany = many.matmulMany;
 
     /// The actual prompt selection: loaded tiles, the pinned slice plan, and blocks over half the SMs.
     pub fn usesPrompt(l: Lane, m: usize, w: Weight) bool {

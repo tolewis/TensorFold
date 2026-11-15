@@ -82,6 +82,45 @@ TF_SHARED_DOWN(tf_qmmf_shared32, 32, 64)
 TF_SHARED_DOWN(tf_qmmf_shared64, 64, 64)
 #undef TF_SHARED_DOWN
 
+// Up to 4 decode projections of one input in one launch. Part p owns the blocks first[p] to first[p + 1] - 1.
+struct Parts {
+    const unsigned char* w[4];
+    const uint8_t* bs[4];
+    void* out[4];
+    float scale[4];
+    int n[4], sk[4], first[4];
+};
+
+// One 16-row tile of a part. Its K slices add in this block, in the order a cluster adds them.
+template <int MODE, int BN>
+__device__ __forceinline__ void parts_body(
+        const __nv_bfloat16* __restrict__ x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,
+        float scale, void* __restrict__ out, int M, int N, int K, int SK, int ldx, unsigned block) {
+    constexpr int BM = 16, WM = 1, WN = 4, STAGES = 4, group = 1;
+    constexpr bool F32 = false, CLUSTER = false, FUSE = true;
+    [[maybe_unused]] float* const part = nullptr;
+#define TF_QMMF_BLOCK block
+#include "qmmf_body.cuh"
+#undef TF_QMMF_BLOCK
+}
+
+// Parts before `tail` are MODE at 64 columns a block. With TAIL, the parts from `tail` on are BF16 half tiles.
+template <int MODE, bool TAIL>
+__global__ void __launch_bounds__(128) parts_kernel(
+        const __nv_bfloat16* __restrict__ x, Parts a, int M, int K, int ldx, int tail) {
+    int p = 0;
+#pragma unroll
+    for (int i = 1; i < 4; ++i) p += static_cast<int>(blockIdx.x) >= a.first[i];
+    const unsigned block = blockIdx.x - static_cast<unsigned>(a.first[p]);
+    if constexpr (TAIL) {
+        if (p >= tail) {
+            parts_body<BF16, 32>(x, a.w[p], nullptr, a.scale[p], a.out[p], M, a.n[p], K, a.sk[p], ldx, block);
+            return;
+        }
+    }
+    parts_body<MODE, 64>(x, a.w[p], a.bs[p], a.scale[p], a.out[p], M, a.n[p], K, a.sk[p], ldx, block);
+}
+
 template <bool F32>
 __global__ void reduce_kernel(const float* __restrict__ part, void* __restrict__ out, long long total, int SK,
                               float scale) {
@@ -242,6 +281,8 @@ BF16_K32(true)
 
 template __global__ void reduce_kernel<true>(const float* __restrict__, void* __restrict__, long long, int, float);
 template __global__ void reduce_kernel<false>(const float* __restrict__, void* __restrict__, long long, int, float);
+template __global__ void parts_kernel<FP8G, false>(const __nv_bfloat16* __restrict__, Parts, int, int, int, int);
+template __global__ void parts_kernel<FP8G, true>(const __nv_bfloat16* __restrict__, Parts, int, int, int, int);
 
 }
 

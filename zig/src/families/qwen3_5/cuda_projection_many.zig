@@ -24,6 +24,8 @@ pub fn projectMany(e: *Engine, ls: []const Proj, x: u64, xs: u64, outs: []const 
         if (l != .a4 or l.inputs() != ls[0].inputs()) break false;
     } else true;
     if (!segmented) {
+        // ModelOpt lane formats at decode rows: one launch where the lane takes the group, with each call's bits
+        if (!(prompt and rows > 16) and try @import("cuda_modelopt_many.zig").decode(e, ls, x, outs, rows)) return;
         for (ls, outs, 0..) |l, out, i| try e.project(l, x, xs, out, rows, prompt, params, sums and i == 0);
         return;
     }
