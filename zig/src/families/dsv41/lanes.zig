@@ -214,16 +214,35 @@ fn markEnds(marks: []const u32, at: usize) bool {
     return false;
 }
 
-/// Even floor of `len - window` (WP-T1 replay-cut keep), then aligned so a split pass matches one prompt chunk:
-/// past the first 2,048 rows, floor to a chunk boundary; else floor to a 128-row fill tile.
-pub fn replayCutAt(len: usize, window: usize) usize {
+/// TF_DS_TURN_KEEP_ALIGN: how `replayCutAt` floors the even replay cut (0, 128, 2048; unset: 0).
+pub const TurnKeepAlign = enum(u16) { none = 0, tile128 = 128, chunk2048 = 2048 };
+
+/// `TF_DS_TURN_KEEP_ALIGN`: 0, 128, or 2048 (unset: 0).
+pub fn parseTurnKeepAlign(text: []const u8) !TurnKeepAlign {
+    const n = try std.fmt.parseInt(u16, std.mem.trim(u8, text, " "), 10);
+    return switch (n) {
+        0 => .none,
+        128 => .tile128,
+        2048 => .chunk2048,
+        else => error.BadTurnKeepAlign,
+    };
+}
+
+/// Even floor of `len - window` (WP-T1 replay-cut keep); optional align from `TF_DS_TURN_KEEP_ALIGN`.
+pub fn replayCutAt(len: usize, window: usize, cut_align: TurnKeepAlign) usize {
     const raw = len -| window;
     if (raw == 0) return 0;
     var at = raw & ~@as(usize, 1);
-    if (at > model.chunk_rows) {
-        at &= ~@as(usize, model.chunk_rows - 1);
-    } else {
-        at &= ~@as(usize, 127);
+    switch (cut_align) {
+        .none => {},
+        .tile128 => at &= ~@as(usize, 127),
+        .chunk2048 => {
+            if (at > model.chunk_rows) {
+                at &= ~@as(usize, model.chunk_rows - 1);
+            } else {
+                at &= ~@as(usize, 127);
+            }
+        },
     }
     return at;
 }
@@ -853,6 +872,8 @@ pub const Lanes = struct {
     rw: ?*rank_wire.Leader = null,
     /// TF_DS_TURN_KEEP=1: split the prompt pass at the replay cut, keep that state in memory only.
     turn_keep: bool = false,
+    /// TF_DS_TURN_KEEP_ALIGN: replay cut alignment (0, 128, 2048; unset: 0).
+    turn_keep_align: TurnKeepAlign = .none,
     /// TF_DS_FIRST_LOGITS=1..8: first row logits logged per request (0: off).
     first_logits: u8 = 0,
 
@@ -1519,7 +1540,7 @@ pub const Lanes = struct {
         // where this pass keeps states: the cache's marks and its last chunk end before the replay (the served lane's
         // kept prompt), each at the chunk end at or before it
         const last_end = @min(replay, len - 1) / model.chunk_rows * model.chunk_rows;
-        const replay_x = if (self.turn_keep) replayCutAt(len, m.cfg.window) else 0;
+        const replay_x = if (self.turn_keep) replayCutAt(len, m.cfg.window, self.turn_keep_align) else 0;
         self.fill = .{ .s = s, .slot = slot, .len = len, .replay = replay, .last_end = last_end, .replay_x = replay_x, .start = start, .base = base, .restored = if (kept) |sn| sn.restored else false, .part = if (parted) |pp| pp.id else null };
     }
 
@@ -3255,11 +3276,11 @@ test "spill + shard: an owner-sharded reserve lands only on the follower planner
     try std.testing.expectError(error.SpillNotAgreed, pf.reserve(h, other));
 }
 
-test "TF_DS_TURN_KEEP: replay cut X and the next turn's computed rows" {
+test "TF_DS_TURN_KEEP_ALIGN=0: replay cut X and the next turn's computed rows" {
     const window: usize = 128;
-    try std.testing.expectEqual(@as(usize, 2048), replayCutAt(2900, window));
-    const x = replayCutAt(2900, window);
-    try std.testing.expectEqual(@as(usize, 902), 2950 - x); // growth 49 + 128, realigned cut at the chunk grid
+    try std.testing.expectEqual(@as(usize, 2772), replayCutAt(2900, window, .none));
+    const x = replayCutAt(2900, window, .none);
+    try std.testing.expectEqual(@as(usize, 178), 2950 - x); // growth 49 + 128, +1 from align2 on the prior turn's end
     var m: Model = undefined;
     m.cfg.window = window;
     var ln = testLanes(&m);
@@ -3273,18 +3294,24 @@ test "TF_DS_TURN_KEEP: replay cut X and the next turn's computed rows" {
     try std.testing.expect(!ln.usable(&sn, x + window)); // at the prompt end boundary
 }
 
-test "TF_DS_TURN_KEEP: a partial prefill piece ends at the replay cut" {
+test "TF_DS_TURN_KEEP_ALIGN=0: a partial prefill piece ends at the replay cut" {
     const window: usize = 128;
     const len: usize = 2900;
-    const x = replayCutAt(len, window);
-    try std.testing.expectEqual(@as(usize, 2048), x);
-    var n: usize = @min(model.chunk_rows, len);
-    if (x > 0 and x < n) n = x;
-    try std.testing.expectEqual(x, n);
+    const x = replayCutAt(len, window, .none);
+    const start: usize = 2048;
+    var n: usize = @min(model.chunk_rows, len - start);
+    if (start + n > x) n = x - start;
+    try std.testing.expectEqual(x - start, n);
+    try std.testing.expect(n < model.chunk_rows);
 }
 
-test "TF_DS_TURN_KEEP: replay cut aligns to 128 rows inside the first chunk" {
-    const x = replayCutAt(2100, 128);
-    try std.testing.expect(x <= 2100 - 128);
+test "TF_DS_TURN_KEEP_ALIGN=128: replay cut is a 128-row tile" {
+    const x = replayCutAt(2900, 128, .tile128);
+    try std.testing.expectEqual(@as(usize, 2688), x);
     try std.testing.expectEqual(@as(usize, 0), x % 128);
+}
+
+test "TF_DS_TURN_KEEP_ALIGN=2048: replay cut is a chunk boundary when past 2048" {
+    try std.testing.expectEqual(@as(usize, 2048), replayCutAt(2900, 128, .chunk2048));
+    try std.testing.expectEqual(@as(usize, 902), 2950 - replayCutAt(2900, 128, .chunk2048));
 }

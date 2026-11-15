@@ -41,6 +41,8 @@
 //!   TF_DS_NO_COPIES=1                           a drafted stream proposes no suffix-lookup copy windows
 //!   TF_DS_TURN_KEEP=1                           after each prompt pass, keep one more state at the replay cut (even floor of
 //!                                               len - window, memory only); the next turn restores it and runs growth + window
+//!   TF_DS_TURN_KEEP_ALIGN=0|128|2048            with TURN_KEEP: floor the replay cut (0: even only; 128: fill tile; 2048: chunk;
+//!                                               unset: 0)
 //!   TF_DS_FIRST_LOGITS=n                        rank 0 logs the first row of each of the first n rounds of a request
 //!                                               (n 1..8; unset or 0: off): stderr line `first_logits` + JSON (prompt,
 //!                                               cached, round, pos, top-8 logits with bits, sum, FNV-1a hash)
@@ -284,6 +286,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     st.lanes.full_at = if (getenv("TF_DS_T25_FULL_AT")) |v| lanes_mod.parseFullAt(v) catch return error.BadFullAt else null;
     st.lanes.no_copies = if (getenv("TF_DS_NO_COPIES")) |v| !std.mem.eql(u8, v, "0") else false;
     st.lanes.turn_keep = if (getenv("TF_DS_TURN_KEEP")) |v| !std.mem.eql(u8, v, "0") else false;
+    st.lanes.turn_keep_align = if (getenv("TF_DS_TURN_KEEP_ALIGN")) |v| lanes_mod.parseTurnKeepAlign(v) catch return error.BadTurnKeepAlign else .none;
     st.lanes.first_logits = if (getenv("TF_DS_FIRST_LOGITS")) |v| lanes_mod.parseFirstLogits(v) catch return error.BadFirstLogits else 0;
     {
         // TF_DS_ROUND_MS_<n>: a round of n streams by its rows (unset: TF_DS_ROUND_MS's table)
@@ -690,6 +693,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.BadPromptGemmRows => rows_mod.gemm_hint,
         error.PromptRowsMismatch => "TF_DS_PROMPT_WINDOW_ROWS / TF_DS_PROMPT_GEMM_ROWS: the ranks run different prompt paths; set them alike on every rank (tf-dsv41-lanes reads them too)",
         error.BadFirstLogits => "TF_DS_FIRST_LOGITS: a whole number from 1 to 8 (unset or 0: off)",
+        error.BadTurnKeepAlign => "TF_DS_TURN_KEEP_ALIGN: 0 (even replay cut), 128 (fill tile), or 2048 (prompt chunk); unset: 0",
         error.BadServeProfile => "TF_DS_SERVE_PROFILE: the rounds between two profile lines, a whole number (0: off)",
         error.BadRoundRows => "TF_DS_ROUND_ROWS: a round's rows at most, 16 .. 48",
         error.BadGraphCap => "TF_DS_GRAPH_CAP: the captured CUDA graphs kept at most, a count (0: all)",
