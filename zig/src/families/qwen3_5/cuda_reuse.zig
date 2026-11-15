@@ -477,6 +477,7 @@ test "a failed restore's host copy stays through a drop until a wait, the restor
     const d: cuda.Driver = .{ .lib = undefined, .api = api };
     var e: Engine = undefined;
     e.kit = null;
+    e.pool = null; // no arena: restoreCache waits on no copy stream
     e.gpa = std.testing.allocator;
     e.d = &d;
     e.g = testGeometry(8, 4, 4);
@@ -562,6 +563,7 @@ test "a device save pins nothing: it copies on the device both ways, and its dro
     const d: cuda.Driver = .{ .lib = undefined, .api = api };
     var e: Engine = undefined;
     e.kit = null;
+    e.pool = null; // no arena: restoreCache waits on no copy stream
     e.gpa = std.testing.allocator;
     e.d = &d;
     e.g = testGeometry(8, 4, 4);
