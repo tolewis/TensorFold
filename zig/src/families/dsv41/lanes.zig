@@ -1283,6 +1283,11 @@ pub const Lanes = struct {
                 defer if (f.part) |id| self.kv.?.planner.setPartial(id, false);
                 m.turn_timing = self.turn_prefill != null;
                 defer m.turn_timing = false;
+                if (m.layer_hash) {
+                    m.layer_hash_prompt = f.len;
+                    m.layer_hash_cached = f.s.cached;
+                    m.layer_hash_replay_x = replayCutAt(f.len, m.cfg.window, .none);
+                }
                 const head = try m.fillChunk(seq[0 .. start + n], start, n, f.replay);
                 if (self.turn_prefill) |*tp| {
                     mergeTurnFillPass(tp, m.turn_pass);
