@@ -78,6 +78,18 @@ pub fn slices(w: Weight) u32 {
     return if (w.sk != 0) w.sk else splitK(w.n, w.k);
 }
 
+/// Rows `at` to `at + n - 1` of an FP8G weight, `at` a 64-row tile's first row, with the whole weight's K slices.
+pub fn rowsOf(w: Weight, at: u32, n: u32) error{BadSplit}!Weight {
+    if (w.mode != .fp8g or at % bn != 0 or n == 0 or n > w.n or at > w.n - n) return error.BadSplit;
+    const tiles: u64 = @as(u64, at / bn) * (w.k / group); // 64-row tiles of 64 inputs before the first row
+    var out = try pinned(w, slices(w));
+    out.codes += tiles * bn * group;
+    out.scales += tiles * bn * 4;
+    out.n = n;
+    out.npad = (n + 127) / 128 * 128;
+    return out;
+}
+
 /// plan() for a packed weight, on slices(w).
 pub fn planFor(m: usize, w: Weight, clusters: bool) Plan {
     return planSlices(m, slices(w), clusters);
@@ -521,6 +533,26 @@ test "prompt dispatch changes CTA geometry and output instance without changing 
     try lane.matmulF32(s, 0, w.k, 4218, w, 0, 0);
     try std.testing.expectEqual(@as(usize, 10), Trace.id);
     try std.testing.expectEqual(@as(i32, 4), Trace.sk);
+}
+
+test "rows of an FP8G weight start at their tile and plan as the whole weight" {
+    const head: Weight = .{ .mode = .fp8g, .codes = 1 << 32, .scales = 1 << 40, .n = 248320, .k = 5120, .npad = 248320 };
+    const first = try rowsOf(head, 0, 98304);
+    const tail = try rowsOf(head, 248000, 320);
+    try std.testing.expectEqual(@as(u32, 8), splitK(tail.n, tail.k)); // unpinned, the tail would sum eight slices
+    for ([_]Weight{ first, tail }) |v| for ([_]usize{ 1, 15, 16 }) |m| {
+        try std.testing.expectEqual(planFor(m, head, true), planFor(m, v, true));
+    };
+    try std.testing.expectEqual(head.codes, first.codes);
+    try std.testing.expectEqual(head.scales, first.scales);
+    try std.testing.expectEqual(head.codes + 248000 * 5120, tail.codes); // a code a weight
+    try std.testing.expectEqual(head.scales + 248000 * 5120 / 16, tail.scales); // an fp32 a row and 64 inputs
+    try std.testing.expectEqual(@as(u32, 384), tail.npad);
+    try std.testing.expectError(error.BadSplit, rowsOf(head, 248032, 288)); // not a tile's first row
+    try std.testing.expectError(error.BadSplit, rowsOf(head, 248000, 321));
+    var other = head;
+    other.mode = .bf16;
+    try std.testing.expectError(error.BadSplit, rowsOf(other, 0, 64));
 }
 
 test "a cut weight pinned to the whole weight's K slices plans as the whole one at every row count" {

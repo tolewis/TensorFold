@@ -42,9 +42,9 @@ pub const Ctx = struct {
     parents: [engine.most_window]i32 = undefined,
     own: [engine.most_window]f64 = undefined,
     grown: usize = 0,
-    // the stream's tokens draft_frame has read, and whether one lay outside its spans (then drafts take the whole head)
+    // the stream's tokens draft_frame has read, and how many lay outside its spans (cuda_draft_frame.zig narrowAt)
     scanned: usize = 0,
-    wide: bool = false,
+    outside: usize = 0,
     late: lazy.Pending = .{}, // prompt absorbs run when the window is next read (cuda_draft_lazy.zig)
 };
 

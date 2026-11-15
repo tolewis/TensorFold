@@ -62,6 +62,7 @@ const valid = [_]Case{
     .{ .name = "TF_DRAFT_NODES", .raw = "64", .n = 64 },
     .{ .name = "TF_QMMF_HALF_BELOW", .raw = "0", .n = 0 },
     .{ .name = "TF_QMMF_PARTS", .raw = "0", .n = 0 },
+    .{ .name = "TF_DRAFT_SPAN_PERMILLE", .raw = "5", .n = 5 },
     .{ .name = "TENSORFOLD_PROMPT_CACHE_KEEP_OTHERS", .raw = "0", .n = 0 },
     .{ .name = "TENSORFOLD_PROMPT_CACHE_KEEP_OTHERS", .raw = "1", .n = 1 },
     .{ .name = "TF_ROCE_GID_INDEX", .raw = "2147483647", .n = 2147483647 },

@@ -24,6 +24,7 @@ Diagnostics quote and escape the supplied text so it cannot create another termi
 | `TF_Q27_DRAFT_SLOTS` | Whole u32 count, clamped to 1 through the lane stream limit; default 8. DFlash2 can draft for at most the smaller of this count and the admitted streams, and none without a drafter. |
 | `TF_MTP_DRAFTS` | Whole u32 count, clamped to 1 through the drafter's window less one; existing depth when unset |
 | `TF_DRAFT_NODES` | Whole native-size nonnegative count, capped by the drafter's window; zero disables trees |
+| `TF_DRAFT_SPAN_PERMILLE` | Whole native-size nonnegative count; a stream's drafts read only the draft vocabulary's rows of the output head while at most this many of each 1,000 of its tokens lie outside them; default 0 (the first such token takes the whole head) |
 | `TF_QMMF_HALF_BELOW` | Whole native-size nonnegative block count; zero disables half tiles; default 96 |
 | `TF_QMMF_PARTS` | Whole native-size nonnegative count; zero keeps each decode projection in its own launch; default 1 (one launch for the FP8G and BF16 projections of one input on sm_120) |
 | `TENSORFOLD_PROMPT_CACHE_KEEP_OTHERS` | Exactly `0` or `1`, checked when the CUDA backend starts; default off ([profiles](profiles.md)) |

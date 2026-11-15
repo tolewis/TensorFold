@@ -128,18 +128,17 @@ pub fn forward(d: anytype, items: []const dr.Hold, contexts: []const *draft.Ctx)
     try publish(d, items, contexts);
 }
 
-/// A lane stream's prompt and reply tokens since the last scan: one outside the spans marks the stream wide.
+/// A lane stream's prompt and reply tokens since the last scan: counts the ones outside the spans.
 pub fn scan(ctx: *draft.Ctx, toks: []const u32) void {
-    if (!ctx.wide) for (toks[@min(ctx.scanned, toks.len)..]) |t| if (t >= spans[0][1] and t < spans[1][0]) {
-        ctx.wide = true;
-        break;
-    };
+    for (toks[@min(ctx.scanned, toks.len)..]) |t| ctx.outside += @intFromBool(t >= spans[0][1] and t < spans[1][0]);
     ctx.scanned = toks.len;
 }
 
 /// The rows' draft logits of x into `logits`: over the spans when every stream keeps to them (the packed rows).
 pub fn logitsOf(d: anytype, contexts: []const *draft.Ctx, x: u64, logits: u64, rows: usize) !?u64 {
-    return if (narrow(contexts)) try head(d, x, logits, rows) else try full(d, x, logits, rows);
+    comptime @import("sys").environment.registered("TF_DRAFT_SPAN_PERMILLE");
+    const share = try @import("sys").environment.read(usize, "TF_DRAFT_SPAN_PERMILLE", 0);
+    return if (narrowAt(contexts, share)) try head(d, x, logits, rows) else try full(d, x, logits, rows);
 }
 
 /// A top-k column's token id: past the first span, the tail's.
@@ -157,9 +156,10 @@ pub fn columns(spanned: bool, vocab: usize) usize {
     return if (spanned) span_width else vocab;
 }
 
-/// Whether every stream's tokens so far keep to the spans (a warmup's or standalone hold's context reads none).
-fn narrow(contexts: []const *draft.Ctx) bool {
-    for (contexts) |ctx| if (ctx.wide) return false;
+/// Whether every stream keeps to the spans: at most `share` of each 1,000 of its tokens so far lie outside them.
+/// The default share of 0 takes the whole head from the first such token. A warmup's context reads no token.
+fn narrowAt(contexts: []const *draft.Ctx, share: usize) bool {
+    for (contexts) |ctx| if (ctx.outside * 1000 > ctx.scanned * share) return false;
     return true;
 }
 
@@ -189,7 +189,17 @@ fn head(d: anytype, x: u64, logits: u64, rows: usize) !?u64 {
             const v = try x3Views(q);
             break :blk .{ .{ .x3 = v.first }, .{ .x3 = v.tail }, x3_tail_at };
         },
-        .an, .ql, .bf => return full(d, x, logits, rows),
+        .ql => |q| switch (q) {
+            .fp8g => |w| blk: {
+                if (w.n != spans[1][1]) return full(d, x, logits, rows);
+                const at: u32 = tail_tile;
+                const lo = try cuda.qmmf.rowsOf(w, 0, spans[0][1]);
+                const hi = try cuda.qmmf.rowsOf(w, at, w.n - at);
+                break :blk .{ .{ .ql = .{ .fp8g = lo } }, .{ .ql = .{ .fp8g = hi } }, tail_tile };
+            },
+            else => return full(d, x, logits, rows),
+        },
+        .an, .bf => return full(d, x, logits, rows),
     };
     const tail_n = spans[1][1] - tail_at;
     const a = logits; // rows x 98,304, then rows x the tail's columns, then the packed rows x 98,592
@@ -214,4 +224,28 @@ fn head(d: anytype, x: u64, logits: u64, rows: usize) !?u64 {
 fn full(d: anytype, x: u64, logits: u64, rows: usize) !?u64 {
     try draft.precision.project(d.e, d.e.head, x, d.xs, logits, rows, .proposal, draft.precision.dflash_projection_prompt_cutoff);
     return null;
+}
+
+test "a stream keeps to the spans while its share of tokens outside them stays at or under the limit" {
+    var ctx: draft.Ctx = undefined;
+    ctx.scanned = 0;
+    ctx.outside = 0;
+    const ctxs = [_]*draft.Ctx{&ctx};
+    try std.testing.expect(narrowAt(&ctxs, 0)); // a warmup: no token read
+    var toks: [2000]u32 = @splat(7);
+    toks[1999] = 248100; // the tail span
+    scan(&ctx, toks[0..1000]);
+    try std.testing.expect(narrowAt(&ctxs, 0));
+    toks[1500] = 98304; // the first token past the first span
+    toks[1501] = 248031; // the last one before the tail span
+    scan(&ctx, &toks);
+    try std.testing.expectEqual(@as(usize, 2), ctx.outside);
+    try std.testing.expectEqual(@as(usize, 2000), ctx.scanned);
+    try std.testing.expect(!narrowAt(&ctxs, 0)); // the default: one token outside takes the whole head
+    try std.testing.expect(narrowAt(&ctxs, 1)); // 2 of 2,000 is 1 of 1,000
+    scan(&ctx, &toks); // nothing new: no token counts twice
+    try std.testing.expectEqual(@as(usize, 2), ctx.outside);
+    var more: [2001]u32 = @splat(120000);
+    scan(&ctx, &more);
+    try std.testing.expect(!narrowAt(&ctxs, 1)); // 3 of 2,001
 }
