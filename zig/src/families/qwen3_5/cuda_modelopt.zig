@@ -247,7 +247,7 @@ pub const Kernels = struct {
     /// The checkpoint's own math for compressed-tensors FP8 weights: e4m3 rows under a per-row activation
     /// scale, times the weight's row scale. Prompt rows only.
     ck: ?cuda.ck.Ck = null,
-    ck_rows: ?DeviceBuffer = null, // e4m3 rows: max_rows * the widest k a row-scale weight takes
+    ck_rows: ?DeviceBuffer = null, // prompt rows as a weight takes them: max_rows * the most of ckRowBytes
     ck_sa: ?DeviceBuffer = null, // per-row activation scales [max_rows] f32
     experts: ?cuda.experts.Nvfp4Experts = null, // a MoE's routed experts (cuda_modelopt_experts.zig)
 
@@ -325,32 +325,20 @@ pub const Kernels = struct {
         }
         if (most > 0) k.part = try DeviceBuffer.alloc(e.d, most);
         if (k.ck != null) {
-            var widest: usize = 0;
-            const Widest = struct {
-                fn of(p: Proj) usize {
-                    return switch (p) {
-                        .ql => |w| switch (w) {
-                            .fp8g => |q| q.k,
-                            else => 0,
-                        },
-                        else => 0,
-                    };
-                }
-            };
-            widest = Widest.of(e.head);
+            var widest: usize = ckRowBytes(e.head);
             for (e.layers) |l| {
                 switch (l.mlp) {
                     .dense => |m| for ([_]Proj{ m.gate, m.up, m.down }) |p| {
-                        widest = @max(widest, Widest.of(p));
+                        widest = @max(widest, ckRowBytes(p));
                     },
                     .moe => {},
                 }
                 switch (l.mixer) {
                     .delta => |m| for ([_]Proj{ m.qkv, m.z, m.a, m.b, m.out }) |p| {
-                        widest = @max(widest, Widest.of(p));
+                        widest = @max(widest, ckRowBytes(p));
                     },
                     .attention => |m| for ([_]Proj{ m.q, m.k, m.v, m.o }) |p| {
-                        widest = @max(widest, Widest.of(p));
+                        widest = @max(widest, ckRowBytes(p));
                     },
                 }
             }
@@ -361,6 +349,30 @@ pub const Kernels = struct {
         }
     }
 };
+
+/// The bytes one prompt row of `p` takes in the checkpoint-math rows: e4m3 values for a row-scale FP8 weight, e2m1
+/// codes and their e4m3 block scales for an NVFP4 weight with an input scale. 0: `p` does not take that path.
+pub fn ckRowBytes(p: Proj) usize {
+    return switch (p) {
+        .ql => |w| switch (w) {
+            .fp8g => |q| q.k,
+            .nvfp4 => |q| if (q.act != 0) q.k / 2 + q.k / 16 else 0,
+            else => 0,
+        },
+        else => 0,
+    };
+}
+
+test "the checkpoint-math rows hold an NVFP4 weight's codes and block scales, not only an FP8 weight's values" {
+    const W = cuda.qmmf.Weight;
+    const w: W = .{ .mode = .fp4, .codes = 0, .scales = 0, .n = 5120, .k = 17408, .npad = 5120, .act = 0.5 };
+    try std.testing.expectEqual(@as(usize, 17408), ckRowBytes(.{ .ql = .{ .fp8g = w } }));
+    try std.testing.expectEqual(@as(usize, 8704 + 1088), ckRowBytes(.{ .ql = .{ .nvfp4 = w } }));
+    var bare = w;
+    bare.act = 0; // no input scale: the weight keeps to the bf16 prompt GEMM and needs no rows
+    try std.testing.expectEqual(@as(usize, 0), ckRowBytes(.{ .ql = .{ .nvfp4 = bare } }));
+    try std.testing.expectEqual(@as(usize, 0), ckRowBytes(.{ .ql = .{ .bf16 = w } }));
+}
 
 /// `name` unset or anything but "0": on. A prompt path behind one of these can be A/B'd with a restart.
 pub fn envOn(comptime name: [:0]const u8) bool {
