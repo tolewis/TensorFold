@@ -693,17 +693,18 @@ test "TF_DS_FIRST_LOGITS: 0 is off, 1..8 ok" {
     try std.testing.expectError(error.BadFirstLogits, parseFirstLogits("9"));
 }
 
-/// TF_DS_LAYER_HASH: 0 off; 1 layer_hash; 2 layer_hash + attn_in at layer 0 / cut row.
+/// TF_DS_LAYER_HASH: 0 off; 1 layer_hash; 2 layer_hash + attn_in at layer 0; 3 + layer 1 attn_in, engram, win_h.
 pub fn parseLayerHash(text: []const u8) !u8 {
     const n = try std.fmt.parseInt(u8, std.mem.trim(u8, text, " "), 10);
-    if (n > 2) return error.BadLayerHash;
+    if (n > 3) return error.BadLayerHash;
     return n;
 }
 
-test "TF_DS_LAYER_HASH: 0..2 ok" {
+test "TF_DS_LAYER_HASH: 0..3 ok" {
     try std.testing.expectEqual(@as(u8, 0), try parseLayerHash("0"));
     try std.testing.expectEqual(@as(u8, 2), try parseLayerHash(" 2 "));
-    try std.testing.expectError(error.BadLayerHash, parseLayerHash("3"));
+    try std.testing.expectEqual(@as(u8, 3), try parseLayerHash(" 3 "));
+    try std.testing.expectError(error.BadLayerHash, parseLayerHash("4"));
 }
 
 fn printPassPartsMs(p: Profile) void {
