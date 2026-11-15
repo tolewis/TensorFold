@@ -643,6 +643,50 @@ fn printServeProfile(p: Profile, period: u64, periods: u64) void {
     std.debug.print("}}}}\n", .{});
 }
 
+/// Reply token ids this verify would commit (same accept path as the round loop, before think-budget cuts).
+fn tokenLogCommitted(gpa: std.mem.Allocator, w: be.Window, held: []const u32, sampled: []const u32, out: []u32) !usize {
+    const rows = w.rows();
+    if (rows == 0) return 0;
+    if (rows == 1) {
+        out[0] = sampled[0];
+        return 1;
+    }
+    var rows_buf: [window_rows]u32 = undefined;
+    rows_buf[0] = w.pending;
+    @memcpy(rows_buf[1 .. 1 + w.held], held[0..w.held]);
+    @memcpy(rows_buf[1 + w.held ..][0..w.tokens.len], w.tokens);
+    const tokens = rows_buf[0..rows];
+    const parents = try lanes.accept.rowParents(gpa, rows, w.parents);
+    defer gpa.free(parents);
+    const path = try lanes.accept.acceptPath(gpa, tokens, parents, sampled);
+    defer gpa.free(path);
+    var n: usize = 0;
+    for (path[1..]) |r| {
+        out[n] = tokens[r];
+        n += 1;
+    }
+    out[n] = sampled[path[path.len - 1]];
+    return n + 1;
+}
+
+/// TF_DS_TOKEN_LOG: one stderr line per stream verify (`token_log ` plus JSON: stream, tok, draft).
+fn printTokenLog(gpa: std.mem.Allocator, stream: []const u8, w: be.Window, draft_ids: []const u32, sampled: []const u32) void {
+    var tok_buf: [window_rows]u32 = undefined;
+    const tok = tokenLogCommitted(gpa, w, draft_ids[0..w.held], sampled, &tok_buf) catch return;
+    var buf: [2048]u8 = undefined;
+    var at: usize = 0;
+    at += (std.fmt.bufPrint(buf[at..], "token_log {{\"stream\": \"{s}\", \"tok\": [", .{stream}) catch return).len;
+    for (tok_buf[0..tok], 0..) |t, i| {
+        at += (std.fmt.bufPrint(buf[at..], "{s}{d}", .{ if (i > 0) ", " else "", t }) catch return).len;
+    }
+    at += (std.fmt.bufPrint(buf[at..], "], \"draft\": [", .{}) catch return).len;
+    for (draft_ids, 0..) |t, i| {
+        at += (std.fmt.bufPrint(buf[at..], "{s}{d}", .{ if (i > 0) ", " else "", t }) catch return).len;
+    }
+    at += (std.fmt.bufPrint(buf[at..], "]}}\n", .{}) catch return).len;
+    std.debug.print("{s}", .{buf[0..at]});
+}
+
 /// A round-cost table "30.0,35.2,..." (TF_DS_ROUND_MS's form): ms by rows from 1.
 pub fn parseMs(a: std.mem.Allocator, text: []const u8) ![]const f64 {
     var out: std.ArrayList(f64) = .empty;
@@ -742,6 +786,7 @@ pub const Lanes = struct {
     cal_ceil: f64 = 1.0, // TF_DS_T25_CAL_CEIL: upper clamp of calScale (unset: 1.0)
     full_at: ?f64 = null, // TF_DS_T25_FULL_AT: full draft chances when kept share >= x (unset: off)
     no_copies: bool = false, // TF_DS_NO_COPIES=1: a drafted stream proposes no suffix-lookup copy windows
+    token_log: bool = false, // TF_DS_TOKEN_LOG=1: rank 0 prints token_log lines each stream verify (0: off)
     prof_every: u64 = 0, // TF_DS_SERVE_PROFILE=N: the served rank 0 prints `prof` every N rounds and starts it again (0: off)
     pass_parts: bool = false, // TF_DS_PASS_PARTS=1 with SERVE_PROFILE: per-part pass time (eager body, not the graph)
     prof_last: u64 = 0, // the last round's start (Model.now)
@@ -1476,8 +1521,17 @@ pub const Lanes = struct {
             const row0 = self.built.wins[k].row;
             for (0..w.rows()) |r| o.sampled[r] = if (greedy) tokens[row0 + r] else try draw(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling);
             const l = self.streams.getPtr(w.stream).?;
+            var draft_snap: [window_rows - 1]u32 = undefined;
+            const n_draft = w.held + w.tokens.len;
+            if (self.token_log and self.m.rank == 0 and n_draft > 0) {
+                @memcpy(draft_snap[0..w.held], l.held[0..w.held]);
+                @memcpy(draft_snap[w.held..][0..w.tokens.len], w.tokens);
+            }
             @memcpy(o.drafts[0..w.held], l.held[0..w.held]);
             @memcpy(o.drafts[w.held..][0..w.tokens.len], w.tokens);
+            if (self.token_log and self.m.rank == 0) {
+                printTokenLog(self.gpa, w.stream.id, w, if (n_draft > 0) draft_snap[0..n_draft] else &.{}, o.sampled[0..w.rows()]);
+            }
             l.nheld = 0;
         }
     }
