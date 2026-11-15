@@ -1492,7 +1492,8 @@ pub const Lanes = struct {
         var ids: [max_streams][max_rows]i32 = undefined;
         var wins: [max_streams]Win = undefined;
         try self.roundWins(windows, &ids, &wins);
-        const t0 = m.now();
+        const prof = self.prof != null;
+        const t0 = if (prof) m.now() else 0;
         if (self.prof_every != 0) {
             // a round's start to the next one's: what the backend's own times leave is the round loop's and the server's
             if (self.prof_last != 0 and t0 - self.prof_last < std.time.ns_per_s) {
@@ -1506,11 +1507,11 @@ pub const Lanes = struct {
             for (wins[0..windows.len]) |w| try writeWin(&self.wire, gpa, w, self.kv != null);
             try self.flush();
         }
-        const t1 = m.now();
+        const t1 = if (prof) m.now() else 0;
         if (self.spill) |t| for (wins[0..windows.len]) |w| t.bump(w.base + w.start, w.base + w.start + w.ids.len);
         const rows = try self.built.build(gpa, &self.seqs, wins[0..windows.len]);
         try m.verify(rows, self.built.absorb[0..windows.len]);
-        const t2 = m.now();
+        const t2 = if (prof) m.now() else 0;
         // every row greedy: the device's argmax (R tokens back); else the logits for the host's draws
         var greedy = true;
         for (windows) |w| {
@@ -1521,8 +1522,8 @@ pub const Lanes = struct {
         const tokens: []const u32 = if (greedy) try m.roundArgmax(rows.ids.len) else &.{};
         const logits: []const f32 = if (greedy) &.{} else try m.roundLogits(rows.ids.len);
         if (m.ringFailed()) return error.RingFailed; // (robustness: a graph's collect gave up on a dead peer's flags)
-        const t3 = m.now();
-        defer if (self.prof) |*p| {
+        const t3 = if (prof) m.now() else 0;
+        defer if (prof) if (self.prof) |*p| {
             p.send += t1 - t0;
             p.enqueue += m.t_enqueue;
             p.forward += m.t_forward;
@@ -1591,7 +1592,8 @@ pub const Lanes = struct {
         const self = of(ptr);
         const m = self.m;
         const gpa = self.gpa;
-        const host_start = m.now();
+        const prof = self.prof != null;
+        const host_start = if (prof) m.now() else 0;
         if (m.dr == null) return error.NoDraftHead;
         const block = m.dr.?.n;
         var tokens: [max_streams]i64 = undefined;
@@ -1631,7 +1633,7 @@ pub const Lanes = struct {
         var split: draft.PassSplit = .{};
         var parts_once: draft.PassPartsOnce = .{};
         var measure: draft.PassMeasure = undefined;
-        const meas: ?*draft.PassMeasure = if (self.prof != null) blk: {
+        const meas: ?*draft.PassMeasure = if (prof) blk: {
             measure = .{
                 .ctx = m,
                 .now = Model.passNow,
@@ -1644,7 +1646,7 @@ pub const Lanes = struct {
         } else null;
         try m.pass(tokens[0..n], q0[0..n], slots[0..n], steps, meas);
         const d = &m.dr.?;
-        const t_read = m.now();
+        const t_read = if (prof) m.now() else 0;
         for (asked[0..n], depths[0..n], 0..) |l, k, i| {
             for (0..k) |j| {
                 l.held[j] = @intCast(d.drafts[i][j]);
@@ -1652,7 +1654,7 @@ pub const Lanes = struct {
             }
             l.nheld = k;
         }
-        if (self.prof) |*p| {
+        if (prof) if (self.prof) |*p| {
             const held_copy = m.now() - t_read;
             p.pass_host += split.host;
             p.pass_run += split.run;
