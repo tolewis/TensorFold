@@ -172,6 +172,12 @@ pub const Model = struct {
     t_absorb: u64 = 0,
     turn_timing: bool = false,
     turn_pass: TurnFillPass = .{},
+    /// TF_DS_LAYER_HASH=1: stderr `layer_hash` lines (rank 0; does not change tokens).
+    layer_hash: bool = false,
+    layer_hash_prompt: usize = 0,
+    layer_hash_cached: u32 = 0,
+    layer_hash_replay_x: usize = 0,
+    layer_hash_row: []u8 = &.{},
     // world 4: the 2D split's exchanges (prompt2d.zig, TP4's), with the RDMA rings when asked
     two: ?prompt2d.Two = null,
     rdma_rings: ?ring2d.Rings = null,
@@ -446,6 +452,8 @@ pub const Model = struct {
         m.ids64 = try a.alloc(i64, chunk_rows);
         m.vocab = sp.world * (if (m.two) |t| t.hw[0] + t.hw[1] else m.w.head.n); // 2D: both pairs' vocabulary parts
         m.logits = try a.alloc(f32, round.max_rows * m.vocab);
+        m.layer_hash = if (std.c.getenv("TF_DS_LAYER_HASH")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+        m.layer_hash_row = if (m.layer_hash) try a.alloc(u8, c.hc * c.hidden * 2) else &.{};
         if (mode != .off or window != pool) m.notePlan(mode, pl);
         return m;
     }
@@ -1160,6 +1168,59 @@ pub const Model = struct {
         return m.now();
     }
 
+    const layer_hash_fnv_offset: u64 = 14695981039346656037;
+
+    fn layerHashFnv1a(data: []const u8) u64 {
+        var h = layer_hash_fnv_offset;
+        for (data) |b| {
+            h ^= b;
+            h *%= 1099511628211;
+        }
+        return h;
+    }
+
+    fn layerHashBf16SumF64(row: []const u8) f64 {
+        var s: f64 = 0;
+        var i: usize = 0;
+        while (i + 1 < row.len) : (i += 2) {
+            const bits = std.mem.readInt(u16, row[i..][0..2], .little);
+            const u = @as(u32, bits) << 16;
+            s += @as(f64, @floatCast(@as(f32, @bitCast(u))));
+        }
+        return s;
+    }
+
+    fn layerHashWantsPos(m: *const Model, pos: usize) bool {
+        if (!m.layer_hash or m.rank != 0) return false;
+        return pos == m.layer_hash_replay_x or pos + 1 == m.layer_hash_prompt;
+    }
+
+    fn layerHashMaxLayer(m: *const Model, pos: usize, total_layers: usize) usize {
+        if (pos + 1 == m.layer_hash_prompt) return @min(39, total_layers -| 1);
+        return @min(19, total_layers -| 1);
+    }
+
+    fn logLayerHashRow(m: *Model, ch: *const prompt.Chunk, c: *const Config, global_pos: usize, layer: i32) !void {
+        if (!layerHashWantsPos(m, global_pos)) return;
+        if (global_pos < ch.start or global_pos >= ch.start + ch.n) return;
+        const local = global_pos - ch.start;
+        const row_h = c.hc * c.hidden * 2;
+        const src = ch.h + local * row_h;
+        try m.stream.synchronize();
+        const d = m.ctx.d;
+        try d.check(d.api.cuMemcpyDtoH_v2(m.layer_hash_row.ptr, src, row_h), "cuMemcpyDtoH");
+        const hash = layerHashFnv1a(m.layer_hash_row);
+        const sum = layerHashBf16SumF64(m.layer_hash_row);
+        std.debug.print("layer_hash {{\"prompt\": {d}, \"cached\": {d}, \"pos\": {d}, \"layer\": {d}, \"hash\": \"0x{x:0>16}\", \"sum\": {e:.17}}}\n", .{
+            m.layer_hash_prompt,
+            m.layer_hash_cached,
+            global_pos,
+            layer,
+            hash,
+            sum,
+        });
+    }
+
     pub fn fillChunk(m: *Model, seq: []const i32, start: usize, n: usize, replay: usize) !bool {
         if (n == 0 or n > chunk_rows or seq.len != start + n) return error.BadChunk;
         const timing = m.turn_timing;
@@ -1190,6 +1251,10 @@ pub const Model = struct {
             const t1 = turnSyncedNow(m);
             turn.upload_ns = t1 - layers0;
             layers0 = t1;
+        }
+        if (m.layer_hash) {
+            const probe = [_]usize{ m.layer_hash_replay_x, m.layer_hash_prompt -| 1 };
+            for (probe) |pos| try logLayerHashRow(m, ch, c, pos, -1);
         }
         const taps = m.dr != null;
         var floor: usize = 0;
@@ -1284,6 +1349,13 @@ pub const Model = struct {
             try prompt.gather(e, ch, ch.pm, ch.gm);
             if (pt) |t| try t.mark(m.stream, .gather_m);
             prompt.endLayer(ch);
+            if (m.layer_hash) {
+                const probe = [_]usize{ m.layer_hash_replay_x, m.layer_hash_prompt -| 1 };
+                for (probe) |pos| {
+                    if (li > layerHashMaxLayer(m, pos, c.layers)) continue;
+                    try logLayerHashRow(m, ch, c, pos, @intCast(li));
+                }
+            }
         }
         try prompt.head(e, ch);
         if (pt) |t| try t.mark(m.stream, .head);
