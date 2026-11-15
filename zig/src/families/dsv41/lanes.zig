@@ -654,11 +654,17 @@ fn printFirstLogits(s: *const lanes.Stream, pos: u64, round_n: u8, row: []const 
     std.debug.print("], \"sum\": {e:.17}, \"hash\": \"0x{x:0>16}\"}}\n", .{ sum, hash });
 }
 
-/// TF_DS_FIRST_LOGITS: parse 1..8 (0: off).
+/// TF_DS_FIRST_LOGITS: parse 0..8 (0: off; 1..8: log that many rows a request).
 pub fn parseFirstLogits(text: []const u8) !u8 {
     const n = try std.fmt.parseInt(u8, std.mem.trim(u8, text, " "), 10);
-    if (n < 1 or n > 8) return error.BadFirstLogits;
+    if (n > 8) return error.BadFirstLogits;
     return n;
+}
+
+test "TF_DS_FIRST_LOGITS: 0 is off, 1..8 ok" {
+    try std.testing.expectEqual(@as(u8, 0), try parseFirstLogits("0"));
+    try std.testing.expectEqual(@as(u8, 8), try parseFirstLogits(" 8 "));
+    try std.testing.expectError(error.BadFirstLogits, parseFirstLogits("9"));
 }
 
 fn printPassPartsMs(p: Profile) void {
