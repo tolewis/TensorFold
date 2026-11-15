@@ -300,6 +300,7 @@ pub fn main(init: std.process.Init) !u8 {
     try ln.startKv();
     ln.fix_k = fix_k;
     ln.turn_keep = if (std.c.getenv("TF_DS_TURN_KEEP")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else false;
+    ln.turn_keep_align = if (std.c.getenv("TF_DS_TURN_KEEP_ALIGN")) |v| dsv41.lanes.parseTurnKeepAlign(std.mem.span(v)) catch return error.BadTurnKeepAlign else .none;
     var snap_vt: pcache.Snapshots.VTable = undefined;
     var store_v: pcache.Store = undefined;
     var store: ?*pcache.Store = null;
