@@ -599,6 +599,68 @@ test "mergePassParts rolls per-pass part times into the profile" {
     try std.testing.expectEqual(@as(usize, 3), p.parts_n_stages);
 }
 
+const fnv1a64_offset: u64 = 14695981039346656037;
+
+fn fnv1a64(data: []const u8) u64 {
+    var h = fnv1a64_offset;
+    for (data) |b| {
+        h ^= b;
+        h *%= 1099511628211;
+    }
+    return h;
+}
+
+fn rowSumF64(row: []const f32) f64 {
+    var s: f64 = 0;
+    for (row) |x| s += @as(f64, x);
+    return s;
+}
+
+const TopId = struct { id: u32, val: f32 };
+
+fn top8Logits(row: []const f32) [8]TopId {
+    const neg_inf: f32 = -std.math.inf(f32);
+    var top: [8]TopId = undefined;
+    for (&top) |*t| t.* = .{ .id = 0, .val = neg_inf };
+    for (row, 0..) |v, i| {
+        const id: u32 = @intCast(i);
+        if (v <= top[7].val) continue;
+        var slot: usize = 0;
+        while (slot < 8 and v <= top[slot].val) slot += 1;
+        if (slot >= 8) continue;
+        var j: usize = 7;
+        while (j > slot) : (j -= 1) top[j] = top[j - 1];
+        top[slot] = .{ .id = id, .val = v };
+    }
+    return top;
+}
+
+/// TF_DS_FIRST_LOGITS: one stderr line for a row's logits (same channel as serve_profile).
+fn printFirstLogits(s: *const lanes.Stream, pos: u64, round_n: u8, row: []const f32) void {
+    const top = top8Logits(row);
+    const sum = rowSumF64(row);
+    const hash = fnv1a64(std.mem.sliceAsBytes(row));
+    std.debug.print("first_logits {{\"prompt\": {d}, \"cached\": {d}, \"round\": {d}, \"pos\": {d}, \"top\": [", .{
+        s.prompt_len,
+        s.cached,
+        round_n,
+        pos,
+    });
+    for (top, 0..) |t, i| {
+        const bits: u32 = @bitCast(t.val);
+        if (i != 0) std.debug.print(", ", .{});
+        std.debug.print("{{\"id\": {d}, \"val\": {e:.9}, \"bits\": \"0x{x:0>8}\"}}", .{ t.id, t.val, bits });
+    }
+    std.debug.print("], \"sum\": {e:.17}, \"hash\": \"0x{x:0>16}\"}}\n", .{ sum, hash });
+}
+
+/// TF_DS_FIRST_LOGITS: parse 1..8 (0: off).
+pub fn parseFirstLogits(text: []const u8) !u8 {
+    const n = try std.fmt.parseInt(u8, std.mem.trim(u8, text, " "), 10);
+    if (n < 1 or n > 8) return error.BadFirstLogits;
+    return n;
+}
+
 fn printPassPartsMs(p: Profile) void {
     if (p.parts_passes == 0) {
         std.debug.print(", \"pass_parts_ms\": null", .{});
@@ -673,6 +735,7 @@ const Lane = struct {
     gen: u64 = 0,
     decoding: bool = false,
     first: u64 = 0, // the prompt's draw (a handle)
+    fl_logged: u8 = 0, // TF_DS_FIRST_LOGITS: rows logged this request (0..n)
     held: [draft.max_block]u32 = undefined,
     confs: [draft.max_block]f32 = undefined,
     nheld: usize = 0,
@@ -763,6 +826,8 @@ pub const Lanes = struct {
     rw: ?*rank_wire.Leader = null,
     /// TF_DS_TURN_KEEP=1: split the prompt pass at the replay cut, keep that state in memory only.
     turn_keep: bool = false,
+    /// TF_DS_FIRST_LOGITS=1..8: first row logits logged per request (0: off).
+    first_logits: u8 = 0,
 
     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
@@ -1177,6 +1242,13 @@ pub const Lanes = struct {
         if (self.spill != null and m.drafting() and done.restored) try m.spillCheckResumed(done.slot, done.len);
         const logit0 = if (self.turn_prefill != null) m.now() else 0;
         const logits = try m.promptLogitsHost();
+        if (self.first_logits > 0 and m.rank == 0) {
+            const ln = self.streams.getPtr(s) orelse return error.UnknownStream;
+            if (ln.fl_logged < self.first_logits) {
+                printFirstLogits(s, done.len, ln.fl_logged + 1, logits);
+                ln.fl_logged += 1;
+            }
+        }
         if (logits_sha) {
             var dg: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(logits), &dg, .{});
@@ -1288,7 +1360,7 @@ pub const Lanes = struct {
         };
         // the rows this stream writes are no other kept state's
         if (parted == null) self.staleOver(if (kept != null and !moved) base + kept.?.at else base, base + size, kept);
-        try self.streams.put(gpa, s, .{ .slot = slot, .base = base, .end = base + size, .id = if (parted) |pp| pp.id else 0, .part = if (parted) |pp| pp.part else 0, .gen = if (parted) |pp| pp.gen else 0 });
+        try self.streams.put(gpa, s, .{ .slot = slot, .base = base, .end = base + size, .id = if (parted) |pp| pp.id else 0, .part = if (parted) |pp| pp.part else 0, .gen = if (parted) |pp| pp.gen else 0, .fl_logged = 0 });
         self.used[slot] = true;
         const place_done = m.now();
         if (self.turn_prefill) |*tp| tp.cache_search_host_ns += place_done - open0;
@@ -1444,6 +1516,16 @@ pub const Lanes = struct {
         const rows = try self.built.build(gpa, &self.seqs, wins[0..windows.len]);
         try m.verify(rows, self.built.absorb[0..windows.len]);
         const t2 = m.now();
+        if (self.first_logits > 0 and m.rank == 0) {
+            for (windows, 0..) |w, k| {
+                const ln = self.streams.getPtr(w.stream) orelse continue;
+                if (ln.fl_logged >= self.first_logits) continue;
+                const row0 = self.built.wins[k].row;
+                const row_logits = try m.roundLogitsRow(row0);
+                printFirstLogits(w.stream, w.positions[0], ln.fl_logged + 1, row_logits);
+                ln.fl_logged += 1;
+            }
+        }
         // every row greedy: the device's argmax (R tokens back); else the logits for the host's draws
         var greedy = true;
         for (windows) |w| {
