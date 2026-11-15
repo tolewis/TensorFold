@@ -1400,6 +1400,15 @@ pub const Model = struct {
         return m.logits[0 .. R * m.vocab];
     }
 
+    /// One row of a verify round's logits on the host (TF_DS_FIRST_LOGITS; does not change sampling).
+    pub fn roundLogitsRow(m: *Model, row: usize) ![]const f32 {
+        const d = m.ctx.d;
+        try m.stream.synchronize();
+        const off = row * m.vocab * 4;
+        try d.check(d.api.cuMemcpyDtoH_v2(m.logits.ptr, m.rd.logits + off, m.vocab * 4), "cuMemcpyDtoH");
+        return m.logits[0..m.vocab];
+    }
+
     /// The prompt's logits on the host (after a fill's last chunk).
     pub fn promptLogitsHost(m: *Model) ![]const f32 {
         const d = m.ctx.d;
