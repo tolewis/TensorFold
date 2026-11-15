@@ -281,6 +281,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     st.lanes.full_at = if (getenv("TF_DS_T25_FULL_AT")) |v| lanes_mod.parseFullAt(v) catch return error.BadFullAt else null;
     st.lanes.no_copies = if (getenv("TF_DS_NO_COPIES")) |v| !std.mem.eql(u8, v, "0") else false;
     st.lanes.token_log = if (getenv("TF_DS_TOKEN_LOG")) |v| !std.mem.eql(u8, v, "0") else false;
+    st.m.eng.draft_head_cols = if (getenv("TF_DS_DRAFT_HEAD_COLS")) |v| std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch return error.BadDraftHeadCols else 0;
+    st.m.eng.draft_head_check = if (getenv("TF_DS_DRAFT_HEAD_CHECK")) |v| !std.mem.eql(u8, v, "0") else false;
     st.lanes.turn_keep = if (getenv("TF_DS_TURN_KEEP")) |v| !std.mem.eql(u8, v, "0") else false;
     {
         // TF_DS_ROUND_MS_<n>: a round of n streams by its rows (unset: TF_DS_ROUND_MS's table)

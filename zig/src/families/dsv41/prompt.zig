@@ -127,6 +127,7 @@ pub const Engine = struct {
     c: *const Config,
     w: *const weights.Weights,
     world: usize,
+    rank: u32 = 0,
     plain: Rope,
     compressed: Rope,
     round_rows: usize = 16, // a concurrent round's rows at most (TF_DS_ROUND_ROWS; round.max_rows at most)
@@ -136,6 +137,8 @@ pub const Engine = struct {
     two: ?*const prompt2d.Two = null, // a node of the four-node 2D split (prompt2d.zig); `world` stays TP2's
     ring: ?*rdma.Ring = null, // TP2: the decode-size all-gathers over the RDMA ring (the served lane's), else NCCL
     kv: ?*shard_ops.KvShard = null, // TF_DS_KV_SHARD: the parts, the decode mode, the fetch kernels (null: replicated)
+    draft_head_cols: u32 = 0, // TF_DS_DRAFT_HEAD_COLS: drafter head columns at most (0: full)
+    draft_head_check: bool = false, // TF_DS_DRAFT_HEAD_CHECK=1: compare short head to full on the prefix
 
     /// A decode-size all-gather of `count` fp32 a rank into `dst`, rank after rank: the RDMA ring when the engine has
     /// one and the slice fits a slot (whole float4s), else NCCL. The same bytes either way.

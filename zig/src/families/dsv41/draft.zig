@@ -546,6 +546,68 @@ pub const Drafter = struct {
         dr.steps = steps;
     }
 
+    fn narrowHead(l: weights.Linear, cols: u32) weights.Linear {
+        if (cols == 0 or cols >= l.n) return l;
+        var o = l;
+        const aligned = std.mem.alignForward(u32, cols, 128);
+        o.n = @min(aligned, l.n);
+        return o;
+    }
+
+    fn printDraftHeadCheck(e: *const Engine, dr: *Drafter, sn: u32) !void {
+        if (e.rank != 0) return;
+        try e.s.synchronize();
+        const n = @as(usize, sn);
+        const host = try std.heap.page_allocator.alloc(f32, n * 2);
+        defer std.heap.page_allocator.free(host);
+        const full_buf = host[0..n];
+        const short_buf = host[n..][0..n];
+        try e.d.check(e.d.api.cuMemcpyDtoH_v2(full_buf.ptr, dr.local, n * 4), "cuMemcpyDtoH");
+        try e.d.check(e.d.api.cuMemcpyDtoH_v2(short_buf.ptr, dr.head1_row, n * 4), "cuMemcpyDtoH");
+        var max_abs: f32 = 0;
+        for (full_buf, short_buf) |a, b| {
+            const d = @abs(a - b);
+            if (d > max_abs) max_abs = d;
+        }
+        std.debug.print("draft_head_check {{\"cols\": {d}, \"max_abs\": {d:.6}}}\n", .{ sn, max_abs });
+    }
+
+    fn draftHeadGrouped(dr: *Drafter, e: *const Engine, ch: *const Chunk, R: usize, measure: ?*PassMeasure) !void {
+        const full = e.w.head;
+        const hn = full.n;
+        const d = e.c.hidden;
+        const want = e.draft_head_cols;
+        if (want == 0 or want >= hn) {
+            try prompt.grouped(e, ch, R, &.{full}, &.{dr.xn}, &.{d}, &.{dr.local}, &.{hn}, &.{.f32});
+            try dr.draftHeadProbeRow(e, ch, full, hn, d, measure);
+            return;
+        }
+        const short = narrowHead(full, want);
+        const sn = short.n;
+        if (e.draft_head_check) {
+            try prompt.grouped(e, ch, R, &.{full}, &.{dr.xn}, &.{d}, &.{dr.local}, &.{hn}, &.{.f32});
+            try dr.draftHeadProbeRow(e, ch, full, hn, d, measure);
+            try prompt.grouped(e, ch, 1, &.{short}, &.{dr.xn}, &.{d}, &.{dr.head1_row}, &.{sn}, &.{.f32});
+            try printDraftHeadCheck(e, dr, sn);
+            return;
+        }
+        try prompt.grouped(e, ch, R, &.{short}, &.{dr.xn}, &.{d}, &.{dr.local}, &.{hn}, &.{.f32});
+        const neg_inf: u32 = 0xff800000;
+        for (0..R) |r| {
+            try e.d.check(e.d.api.cuMemsetD32Async(dr.local + r * hn * 4 + sn * 4, neg_inf, hn - sn, e.s.handle), "cuMemsetD32Async");
+        }
+        try dr.draftHeadProbeRow(e, ch, short, sn, d, measure);
+    }
+
+    fn draftHeadProbeRow(dr: *Drafter, e: *const Engine, ch: *const Chunk, head: weights.Linear, hn: u32, d: usize, measure: ?*PassMeasure) !void {
+        const m = measure orelse return;
+        if (!m.pass_parts) return;
+        const p = m.parts orelse return;
+        try partTick(e, measure, &p.step1[2]);
+        try prompt.grouped(e, ch, 1, &.{head}, &.{dr.xn}, &.{d}, &.{dr.head1_row}, &.{hn}, &.{.f32});
+        try partTick(e, measure, &p.head1);
+    }
+
     fn partTick(e: *const Engine, measure: ?*PassMeasure, dst: *u64) !void {
         const m = measure orelse return;
         if (!m.pass_parts or m.parts == null) return;
@@ -653,16 +715,7 @@ pub const Drafter = struct {
         if (measure) |m| {
             if (m.pass_parts) if (m.parts) |p| try partTick(e, measure, &p.step1[1]);
         }
-        try prompt.grouped(e, ch, R, &.{e.w.head}, &.{dr.xn}, &.{d}, &.{dr.local}, &.{e.w.head.n}, &.{.f32});
-        if (measure) |m| {
-            if (m.pass_parts) {
-                if (m.parts) |p| {
-                    try partTick(e, measure, &p.step1[2]);
-                    try prompt.grouped(e, ch, 1, &.{e.w.head}, &.{dr.xn}, &.{d}, &.{dr.head1_row}, &.{e.w.head.n}, &.{.f32});
-                    try partTick(e, measure, &p.head1);
-                }
-            }
-        }
+        try dr.draftHeadGrouped(e, ch, R, measure);
         try Probe.check(probe, .local, S, dr.local);
         // the Markov loop: out [N, steps + 1], each stream's last token first
         const ts = steps + 1;
