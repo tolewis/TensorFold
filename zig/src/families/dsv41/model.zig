@@ -180,6 +180,7 @@ pub const Model = struct {
     layer_hash_replay_x: usize = 0,
     layer_hash_row: []u8 = &.{},
     attn_in_buf: []u8 = &.{},
+    attn_in_picks: []u8 = &.{},
     // world 4: the 2D split's exchanges (prompt2d.zig, TP4's), with the RDMA rings when asked
     two: ?prompt2d.Two = null,
     rdma_rings: ?ring2d.Rings = null,
@@ -461,11 +462,14 @@ pub const Model = struct {
             const hd = c.head_dim;
             const cb = hd / 2;
             const sb = hd / 16;
-            const ib = cb + sb;
-            const idxb = c.index_head_dim / 2 + c.index_head_dim / 32;
-            const agg = c.index_topk * (ib + idxb) + c.index_topk * 8;
-            const need = @max(c.hc * c.hidden * 2, hl * hd * 2) + @max(c.hidden * 4, agg) + hd * 4;
+            const icb = c.index_head_dim / 2;
+            const isb = c.index_head_dim / 32;
+            const picks_bytes = ((c.index_topk + 15) / 16) * 16 * 8;
+            const agg = c.index_topk * (cb + sb + icb + isb);
+            const raw = prompt.raw_rows * hd * 4;
+            const need = @max(@max(c.hc * c.hidden * 2, hl * hd * 2), raw) + agg;
             m.attn_in_buf = try a.alloc(u8, need);
+            m.attn_in_picks = try a.alloc(u8, picks_bytes);
         }
         if (mode != .off or window != pool) m.notePlan(mode, pl);
         return m;
@@ -1216,12 +1220,14 @@ pub const Model = struct {
 
     fn attnInWantsCutRow(m: *const Model, li: usize, ch: *const prompt.Chunk) bool {
         const x = m.layer_hash_replay_x;
+        if (x == 0) return false;
         return m.layer_hash >= 2 and m.rank == 0 and li == 0 and x >= ch.start and x < ch.start + ch.n;
     }
 
-    fn layerHashDtoH(m: *Model, host: []u8, dev: u64) !void {
+    fn layerHashDtoH(m: *Model, buf: []u8, off: usize, len: usize, dev: u64) !void {
+        if (off +| len > buf.len) return error.AttnInBufOverflow;
         try m.stream.synchronize();
-        try m.ctx.d.check(m.ctx.d.api.cuMemcpyDtoH_v2(host.ptr, dev, host.len), "cuMemcpyDtoH");
+        try m.ctx.d.check(m.ctx.d.api.cuMemcpyDtoH_v2(buf.ptr + off, dev, len), "cuMemcpyDtoH");
     }
 
     fn layerHashFp32SumF64(row: []const u8) f64 {
@@ -1260,36 +1266,38 @@ pub const Model = struct {
         const q_row = hl * hd * 2;
         const kv_row = hd * 2;
 
+        const buf = m.attn_in_buf;
         // q
-        try layerHashDtoH(m, m.attn_in_buf[0..q_row], ch.q + local * q_row);
+        try layerHashDtoH(m, buf, 0, q_row, ch.q + local * q_row);
         std.debug.print("attn_in {{\"prompt\": {d}, \"cached\": {d}, \"pos\": {d}, \"part\": \"q\", \"hash\": \"0x{x:0>16}\", \"sum\": {e:.17}}}\n", .{
             m.layer_hash_prompt,
             m.layer_hash_cached,
             x,
-            layerHashFnv1a(m.attn_in_buf[0..q_row]),
-            layerHashBf16SumF64(m.attn_in_buf[0..q_row]),
+            layerHashFnv1a(buf[0..q_row]),
+            layerHashBf16SumF64(buf[0..q_row]),
         });
 
         const lo = @max(floor, start -| (c.window - 1));
         const win_lo = if (x >= c.window) x - c.window else 0;
-        const win_hi = x - 1;
+        const win_hi = x -| 1;
         const win_from = @max(win_lo, lo);
         var win_count: usize = 0;
-        if (win_hi >= win_from) win_count = win_hi - win_from + 1;
+        if (x > 0 and win_hi >= win_from) win_count = win_hi - win_from + 1;
         std.debug.print("attn_in {{\"prompt\": {d}, \"cached\": {d}, \"pos\": {d}, \"part\": \"win_count\", \"count\": {d}}}\n", .{
             m.layer_hash_prompt,
             m.layer_hash_cached,
             x,
             win_count,
         });
-        var p = win_from;
-        while (p <= win_hi) : (p += 1) {
-            if (p < lo or p >= x) continue;
-            const wi = p - lo;
-            const src = ch.wsrc + wi * kv_row;
-            try layerHashDtoH(m, m.attn_in_buf[0..kv_row], src);
-            const k_bytes = m.attn_in_buf[0..hd * 2];
-            const v_bytes = m.attn_in_buf[hd * 2 .. kv_row];
+        if (x > 0 and win_hi >= win_from) {
+            var p = win_from;
+            while (p <= win_hi) : (p += 1) {
+                if (p < lo or p >= x) continue;
+                const wi = p - lo;
+                const src = ch.wsrc + wi * kv_row;
+                try layerHashDtoH(m, buf, 0, kv_row, src);
+                const k_bytes = buf[0..hd * 2];
+                const v_bytes = buf[hd * 2 .. kv_row];
             std.debug.print("attn_in {{\"prompt\": {d}, \"cached\": {d}, \"pos\": {d}, \"part\": \"win\", \"win_pos\": {d}, \"k_hash\": \"0x{x:0>16}\", \"k_sum\": {e:.17}, \"v_hash\": \"0x{x:0>16}\", \"v_sum\": {e:.17}}}\n", .{
                 m.layer_hash_prompt,
                 m.layer_hash_cached,
@@ -1300,6 +1308,7 @@ pub const Model = struct {
                 layerHashFnv1a(v_bytes),
                 layerHashBf16SumF64(v_bytes),
             });
+            }
         }
 
         const lay = e.w.layers[li];
@@ -1311,57 +1320,59 @@ pub const Model = struct {
                 const kp = if (padded) (kk + 15) / 16 * 16 else kk;
                 const idx_dev = if (padded) ch.cidxp + local * kp * 8 else ch.cidx + local * kk * 8;
                 const idx_bytes = kk * 8;
-                try layerHashDtoH(m, m.attn_in_buf[0..idx_bytes], idx_dev);
+                const picks_buf = m.attn_in_picks;
+                if (idx_bytes > picks_buf.len) return error.AttnInBufOverflow;
+                try layerHashDtoH(m, picks_buf, 0, idx_bytes, idx_dev);
                 const src_layer = sh.kv_layer orelse li;
                 const cb = hd / 2;
                 const sb = hd / 16;
                 const icb = c.index_head_dim / 2;
                 const isb = c.index_head_dim / 32;
-                const picks = std.mem.bytesAsSlice(i64, m.attn_in_buf[0..idx_bytes]);
+                const picks = std.mem.bytesAsSlice(i64, picks_buf[0..idx_bytes]);
                 var comp_off: usize = 0;
                 var idx_off: usize = 0;
                 var valid: usize = 0;
                 for (picks[0..kk]) |pick| {
                     if (pick < 0) continue;
                     const pi = @as(usize, @intCast(pick));
-                    try layerHashDtoH(m, m.attn_in_buf[comp_off..][0..cb], cs.comp_codes[src_layer] + pi * cb);
+                    try layerHashDtoH(m, buf, comp_off, cb, cs.comp_codes[src_layer] + pi * cb);
                     comp_off += cb;
-                    try layerHashDtoH(m, m.attn_in_buf[comp_off..][0..sb], cs.comp_scales[src_layer] + pi * sb);
+                    try layerHashDtoH(m, buf, comp_off, sb, cs.comp_scales[src_layer] + pi * sb);
                     comp_off += sb;
                     valid += 1;
                 }
-                logAttnInSrc(m, "comp_fp4", m.attn_in_buf[0..comp_off], valid, x);
+                logAttnInSrc(m, "comp_fp4", buf[0..comp_off], valid, x);
                 if (lay.idx_wk != null) {
                     const idx_base = comp_off;
                     for (picks[0..kk]) |pick| {
                         if (pick < 0) continue;
                         const pi = @as(usize, @intCast(pick));
-                        try layerHashDtoH(m, m.attn_in_buf[idx_base + idx_off ..][0..icb], cs.idx_codes[src_layer] + pi * icb);
+                        try layerHashDtoH(m, buf, idx_base + idx_off, icb, cs.idx_codes[src_layer] + pi * icb);
                         idx_off += icb;
-                        try layerHashDtoH(m, m.attn_in_buf[idx_base + idx_off ..][0..isb], cs.idx_scales[src_layer] + pi * isb);
+                        try layerHashDtoH(m, buf, idx_base + idx_off, isb, cs.idx_scales[src_layer] + pi * isb);
                         idx_off += isb;
                     }
-                    if (idx_off > 0) logAttnInSrc(m, "index_fp4", m.attn_in_buf[idx_base .. idx_base + idx_off], valid, x);
+                    if (idx_off > 0) logAttnInSrc(m, "index_fp4", buf[idx_base .. idx_base + idx_off], valid, x);
                 }
             }
             if (lay.ratio > 1) {
                 const rb = prompt.raw_rows * hd * 4;
                 const raw_dev = cs.raw_kv[li] + m.fill_slot * rb;
-                try layerHashDtoH(m, m.attn_in_buf[0..rb], raw_dev);
-                logAttnInSrc(m, "raw_kv", m.attn_in_buf[0..rb], prompt.raw_rows, x);
+                try layerHashDtoH(m, buf, 0, rb, raw_dev);
+                logAttnInSrc(m, "raw_kv", buf[0..rb], prompt.raw_rows, x);
                 const raw_sc = cs.raw_score[li] + m.fill_slot * rb;
-                try layerHashDtoH(m, m.attn_in_buf[0..rb], raw_sc);
-                logAttnInSrc(m, "raw_score", m.attn_in_buf[0..rb], prompt.raw_rows, x);
+                try layerHashDtoH(m, buf, 0, rb, raw_sc);
+                logAttnInSrc(m, "raw_score", buf[0..rb], prompt.raw_rows, x);
             }
         }
 
-        try layerHashDtoH(m, m.attn_in_buf[0..q_row], ch.o + local * q_row);
+        try layerHashDtoH(m, buf, 0, q_row, ch.o + local * q_row);
         std.debug.print("attn_in {{\"prompt\": {d}, \"cached\": {d}, \"pos\": {d}, \"part\": \"attn_o\", \"hash\": \"0x{x:0>16}\", \"sum\": {e:.17}}}\n", .{
             m.layer_hash_prompt,
             m.layer_hash_cached,
             x,
-            layerHashFnv1a(m.attn_in_buf[0..q_row]),
-            layerHashBf16SumF64(m.attn_in_buf[0..q_row]),
+            layerHashFnv1a(buf[0..q_row]),
+            layerHashBf16SumF64(buf[0..q_row]),
         });
     }
 
@@ -1371,7 +1382,7 @@ pub const Model = struct {
         const local = x - ch.start;
         const c = e.c;
         const row_h = c.hc * c.hidden * 2;
-        try layerHashDtoH(m, m.attn_in_buf[0..row_h], ch.h + local * row_h);
+        try layerHashDtoH(m, m.attn_in_buf, 0, row_h, ch.h + local * row_h);
         std.debug.print("attn_in {{\"prompt\": {d}, \"cached\": {d}, \"pos\": {d}, \"part\": \"post_moe\", \"hash\": \"0x{x:0>16}\", \"sum\": {e:.17}}}\n", .{
             m.layer_hash_prompt,
             m.layer_hash_cached,
