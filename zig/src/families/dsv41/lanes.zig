@@ -214,11 +214,18 @@ fn markEnds(marks: []const u32, at: usize) bool {
     return false;
 }
 
-/// Even floor of `len - window` (WP-T1 replay-cut keep); 0 when that difference is 0.
+/// Even floor of `len - window` (WP-T1 replay-cut keep), then aligned so a split pass matches one prompt chunk:
+/// past the first 2,048 rows, floor to a chunk boundary; else floor to a 128-row fill tile.
 pub fn replayCutAt(len: usize, window: usize) usize {
     const raw = len -| window;
     if (raw == 0) return 0;
-    return raw & ~@as(usize, 1);
+    var at = raw & ~@as(usize, 1);
+    if (at > model.chunk_rows) {
+        at &= ~@as(usize, model.chunk_rows - 1);
+    } else {
+        at &= ~@as(usize, 127);
+    }
+    return at;
 }
 
 fn snapChunkEligible(at: usize, len: usize, window: usize) bool {
@@ -776,7 +783,21 @@ fn noteStale(sn: *const Snap, why: []const u8) void {
 }
 
 /// A prompt pass between its pieces: the chunk it runs next and what its chunk loop reads.
-const Fill = struct { s: *const lanes.Stream, slot: usize, len: usize, replay: usize, last_end: usize, replay_x: usize = 0, start: usize, head: bool = false, base: usize = 0, restored: bool = false, part: ?u64 = null };
+const Fill = struct {
+    s: *const lanes.Stream,
+    slot: usize,
+    len: usize,
+    replay: usize,
+    last_end: usize,
+    replay_x: usize = 0,
+    start: usize,
+    head: bool = false,
+    base: usize = 0,
+    restored: bool = false,
+    part: ?u64 = null,
+    /// TF_DS_TURN_KEEP: the replay-cut keep already ran; do not split again at `replay_x`.
+    past_replay_cut: bool = false,
+};
 
 /// How long a request waits for the live stream that holds the kept state it resumes from to end (then it resumes
 /// in place and every kept state stays) before other kept states give their room for a copy of it.
@@ -1162,6 +1183,29 @@ pub const Lanes = struct {
         return of(ptr).prefillPart(s, chunks);
     }
 
+    /// TF_DS_TURN_KEEP: after a replay-cut keep mid-prefill, reload rings and RAW from the snap just saved and clear Engram read-ahead (same small state as a cache restore at `at`).
+    fn afterReplayCutKeep(self: *Lanes, s: *const lanes.Stream, at: usize) !void {
+        const l = self.streams.getPtr(s) orelse return error.UnknownStream;
+        const sn = blk: {
+            for (self.snaps.items) |candidate| {
+                if (candidate.at == at and candidate.base == l.base and candidate.turn_cut and !candidate.stale) break :blk candidate;
+            }
+            return;
+        };
+        const m = self.m;
+        if (try self.begin(.snap_restore)) {
+            try self.wire.int(self.gpa, u64, sn.id);
+            try self.wire.int(self.gpa, u32, @intCast(l.slot));
+            try self.wire.int(self.gpa, u64, l.base);
+            try self.wire.int(self.gpa, u64, l.base);
+            try self.wire.int(self.gpa, u64, at);
+            try self.flush();
+        }
+        try m.snapCopy(l.slot, sn.buf.ptr, false);
+        try m.stream.synchronize();
+        m.resetEngramAhead();
+    }
+
     fn prefillPart(self: *Lanes, s: *lanes.Stream, chunks: usize) !bool {
         const m = self.m;
         // TF_DS_KV_SHARD: a pass in pieces keeps its extent and part between them (the planner moves decoding streams
@@ -1199,7 +1243,7 @@ pub const Lanes = struct {
             const len = f.len;
             if (start > 0 and s.isCancelled()) return error.Cancelled;
             var n: usize = @min(model.chunk_rows, len - start);
-            if (self.turn_keep and f.replay_x > start and start + n > f.replay_x) {
+            if (self.turn_keep and !f.past_replay_cut and f.replay_x > start and start + n > f.replay_x) {
                 n = f.replay_x - start;
                 if (n == 0) return error.FillUnfinished;
             }
@@ -1229,6 +1273,10 @@ pub const Lanes = struct {
             f.start += n;
             const replay_keep = self.turn_keep and f.replay_x > 0 and f.start == f.replay_x;
             if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and (f.start == f.last_end or markEnds(s.reuse.marks, f.start) or replay_keep)) k.at(k.ptr, s, @intCast(f.start));
+            if (replay_keep and f.start < f.len) {
+                try self.afterReplayCutKeep(s, f.replay_x);
+                f.past_replay_cut = true;
+            }
             // the host's work between this pass's chunks (Stream.between: the prefill interleave's rounds, parked work's
             // service): the read-ahead joined and the prompt's ids gone first, as at a piece's end and on rank 1, which
             // reads ahead again at the next chunk
@@ -3209,9 +3257,9 @@ test "spill + shard: an owner-sharded reserve lands only on the follower planner
 
 test "TF_DS_TURN_KEEP: replay cut X and the next turn's computed rows" {
     const window: usize = 128;
-    try std.testing.expectEqual(@as(usize, 2772), replayCutAt(2900, window));
+    try std.testing.expectEqual(@as(usize, 2048), replayCutAt(2900, window));
     const x = replayCutAt(2900, window);
-    try std.testing.expectEqual(@as(usize, 178), 2950 - x); // growth 49 + 128, +1 from align2 on the prior turn's end
+    try std.testing.expectEqual(@as(usize, 902), 2950 - x); // growth 49 + 128, realigned cut at the chunk grid
     var m: Model = undefined;
     m.cfg.window = window;
     var ln = testLanes(&m);
@@ -3229,9 +3277,14 @@ test "TF_DS_TURN_KEEP: a partial prefill piece ends at the replay cut" {
     const window: usize = 128;
     const len: usize = 2900;
     const x = replayCutAt(len, window);
-    const start: usize = 2048;
-    var n: usize = @min(model.chunk_rows, len - start);
-    if (start + n > x) n = x - start;
-    try std.testing.expectEqual(x - start, n);
-    try std.testing.expect(n < model.chunk_rows);
+    try std.testing.expectEqual(@as(usize, 2048), x);
+    var n: usize = @min(model.chunk_rows, len);
+    if (x > 0 and x < n) n = x;
+    try std.testing.expectEqual(x, n);
+}
+
+test "TF_DS_TURN_KEEP: replay cut aligns to 128 rows inside the first chunk" {
+    const x = replayCutAt(2100, 128);
+    try std.testing.expect(x <= 2100 - 128);
+    try std.testing.expectEqual(@as(usize, 0), x % 128);
 }
