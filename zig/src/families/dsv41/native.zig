@@ -46,10 +46,10 @@
 //!   TF_DS_FIRST_LOGITS=n                        rank 0 logs the first row of each of the first n rounds of a request
 //!                                               (n 1..8; unset or 0: off): stderr line `first_logits` + JSON (prompt,
 //!                                               cached, round, pos, top-8 logits with bits, sum, FNV-1a hash)
-//!   TF_DS_LAYER_HASH=0|1|2                      0 off. 1: stderr `layer_hash` (prompt, cached, pos, layer, hash, sum;
-//!                                               cut replayCutAt(len, window, 0) and len-1; layer -1 in, 0..19 at cut,
-//!                                               0..39 at last). 2: same plus `attn_in` at layer 0 for the cut row only
-//!                                               (q, each window key/value, other sources, attn_o, post_moe); no token change
+//!   TF_DS_LAYER_HASH=0|1|2|3                    0 off. 1: `layer_hash` at cut and last. 2: + `attn_in` at layer 0 cut row
+//!                                               (q, window k/v, compressed/index/RAW sources, attn_o, post_moe). 3: + layer 1
+//!                                               `attn_in` at cut, engram_eb/ek/kv/gate_h at layer 1, layer 0 `win_h` per
+//!                                               window row in-chunk; no token change
 //!   TF_DS_SERVE_PROFILE=N                       a measurement: rank 0 prints its backend's times (send, forward, absorb,
 //!                                               logits, sample, the drafter pass, the rest of a round) to stderr every N
 //!                                               rounds; the forward is synchronized apart, so the rounds are a little slower

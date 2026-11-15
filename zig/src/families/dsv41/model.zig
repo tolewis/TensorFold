@@ -173,7 +173,7 @@ pub const Model = struct {
     t_absorb: u64 = 0,
     turn_timing: bool = false,
     turn_pass: TurnFillPass = .{},
-    /// TF_DS_LAYER_HASH: 0 off; 1 layer_hash; 2 + attn_in (rank 0; does not change tokens).
+    /// TF_DS_LAYER_HASH: 0 off; 1 layer_hash; 2 attn_in L0; 3 + L1 attn_in, engram, win_h (rank 0; no token change).
     layer_hash: u8 = 0,
     layer_hash_prompt: usize = 0,
     layer_hash_cached: u32 = 0,
@@ -467,7 +467,11 @@ pub const Model = struct {
             const picks_bytes = ((c.index_topk + 15) / 16) * 16 * 8;
             const agg = c.index_topk * (cb + sb + icb + isb);
             const raw = prompt.raw_rows * hd * 4;
-            const need = @max(@max(c.hc * c.hidden * 2, hl * hd * 2), raw) + agg;
+            var max_engram: usize = 0;
+            for (m.w.layers) |lay| {
+                if (lay.engram_wkv) |ew| max_engram = @max(max_engram, @max(ew.k * 2, @max(ew.n * 4, ew.n * 2)));
+            }
+            const need = @max(@max(@max(c.hc * c.hidden * 2, hl * hd * 2), raw), max_engram) + agg;
             m.attn_in_buf = try a.alloc(u8, need);
             m.attn_in_picks = try a.alloc(u8, picks_bytes);
         }
@@ -1188,7 +1192,7 @@ pub const Model = struct {
     fn parseLayerHashEnv(v: ?[*:0]const u8) u8 {
         if (v == null) return 0;
         const n = std.fmt.parseInt(u8, std.mem.trim(u8, std.mem.span(v.?), " "), 10) catch return 0;
-        return @min(n, 2);
+        return @min(n, 3);
     }
 
     const layer_hash_fnv_offset: u64 = 14695981039346656037;
@@ -1221,7 +1225,10 @@ pub const Model = struct {
     fn attnInWantsCutRow(m: *const Model, li: usize, ch: *const prompt.Chunk) bool {
         const x = m.layer_hash_replay_x;
         if (x == 0) return false;
-        return m.layer_hash >= 2 and m.rank == 0 and li == 0 and x >= ch.start and x < ch.start + ch.n;
+        if (m.layer_hash < 2 or m.rank != 0) return false;
+        const layer_ok = li == 0 or (m.layer_hash >= 3 and li == 1);
+        if (!layer_ok) return false;
+        return x >= ch.start and x < ch.start + ch.n;
     }
 
     fn layerHashDtoH(m: *Model, buf: []u8, off: usize, len: usize, dev: u64) !void {
@@ -1240,18 +1247,98 @@ pub const Model = struct {
         return s;
     }
 
-    fn logAttnInSrc(m: *Model, name: []const u8, data: []const u8, count: usize, pos: usize) void {
+    fn logAttnInSrc(m: *Model, li: usize, name: []const u8, data: []const u8, count: usize, pos: usize) void {
         const hash = layerHashFnv1a(data);
         const sum = if (data.len > 0 and data.len % 4 == 0) layerHashFp32SumF64(data) else layerHashBf16SumF64(data);
-        std.debug.print("attn_in {{\"prompt\": {d}, \"cached\": {d}, \"pos\": {d}, \"part\": \"src\", \"name\": \"{s}\", \"count\": {d}, \"hash\": \"0x{x:0>16}\", \"sum\": {e:.17}}}\n", .{
+        std.debug.print("attn_in {{\"prompt\": {d}, \"cached\": {d}, \"pos\": {d}, \"layer\": {d}, \"part\": \"src\", \"name\": \"{s}\", \"count\": {d}, \"hash\": \"0x{x:0>16}\", \"sum\": {e:.17}}}\n", .{
             m.layer_hash_prompt,
             m.layer_hash_cached,
             pos,
+            li,
             name,
             count,
             hash,
             sum,
         });
+    }
+
+    fn logAttnInBf16(m: *Model, li: usize, pos: usize, part: []const u8, row: []const u8) void {
+        std.debug.print("attn_in {{\"prompt\": {d}, \"cached\": {d}, \"pos\": {d}, \"layer\": {d}, \"part\": \"{s}\", \"hash\": \"0x{x:0>16}\", \"sum\": {e:.17}}}\n", .{
+            m.layer_hash_prompt,
+            m.layer_hash_cached,
+            pos,
+            li,
+            part,
+            layerHashFnv1a(row),
+            layerHashBf16SumF64(row),
+        });
+    }
+
+    fn logAttnInFp32(m: *Model, li: usize, pos: usize, part: []const u8, row: []const u8) void {
+        std.debug.print("attn_in {{\"prompt\": {d}, \"cached\": {d}, \"pos\": {d}, \"layer\": {d}, \"part\": \"{s}\", \"hash\": \"0x{x:0>16}\", \"sum\": {e:.17}}}\n", .{
+            m.layer_hash_prompt,
+            m.layer_hash_cached,
+            pos,
+            li,
+            part,
+            layerHashFnv1a(row),
+            layerHashFp32SumF64(row),
+        });
+    }
+
+    fn tryLogWinHLayer0(m: *Model, e: *const prompt.Engine, ch: *const prompt.Chunk, li: usize, floor: usize) !void {
+        if (m.layer_hash < 3 or m.rank != 0 or li != 0) return;
+        const x = m.layer_hash_replay_x;
+        if (x == 0 or x < ch.start or x >= ch.start + ch.n) return;
+        const c = e.c;
+        const start = ch.start;
+        const hd = c.head_dim;
+        const hl = e.heads();
+        const q_row = hl * hd * 2;
+        const lo = @max(floor, start -| (c.window - 1));
+        const win_lo = if (x >= c.window) x - c.window else 0;
+        const win_hi = x -| 1;
+        const win_from = @max(win_lo, lo);
+        if (x == 0 or win_hi < win_from) return;
+        const buf = m.attn_in_buf;
+        var p = win_from;
+        while (p <= win_hi) : (p += 1) {
+            if (p < start or p >= x) continue;
+            const local_p = p - start;
+            try layerHashDtoH(m, buf, 0, q_row, ch.o + local_p * q_row);
+            std.debug.print("attn_in {{\"prompt\": {d}, \"cached\": {d}, \"pos\": {d}, \"layer\": 0, \"part\": \"win_h\", \"win_pos\": {d}, \"hash\": \"0x{x:0>16}\", \"sum\": {e:.17}}}\n", .{
+                m.layer_hash_prompt,
+                m.layer_hash_cached,
+                x,
+                p,
+                layerHashFnv1a(buf[0..q_row]),
+                layerHashBf16SumF64(buf[0..q_row]),
+            });
+        }
+    }
+
+    fn tryLogEngramIn(m: *Model, e: *const prompt.Engine, ch: *const prompt.Chunk, li: usize) !void {
+        if (m.layer_hash < 3 or m.rank != 0 or li != 1) return;
+        const x = m.layer_hash_replay_x;
+        if (x == 0 or x < ch.start or x >= ch.start + ch.n or ch.eb == 0) return;
+        const lay = e.w.layers[li];
+        const ew = lay.engram_wkv orelse return;
+        const c = e.c;
+        const local = x - ch.start;
+        const buf = m.attn_in_buf;
+        const eb_row = ew.k * 2;
+        try layerHashDtoH(m, buf, 0, eb_row, ch.eb + local * eb_row);
+        logAttnInBf16(m, li, x, "engram_eb", buf[0..eb_row]);
+        const ek_row = ew.n * 4;
+        try layerHashDtoH(m, buf, 0, ek_row, ch.ek + local * ek_row);
+        logAttnInFp32(m, li, x, "engram_ek", buf[0..ek_row]);
+        const en = if (e.two) |two| two.engramWidth() else ew.n;
+        const kv_row = en * 2;
+        try layerHashDtoH(m, buf, 0, kv_row, ch.kv + local * kv_row);
+        logAttnInBf16(m, li, x, "engram_kv", buf[0..kv_row]);
+        const row_h = c.hc * c.hidden * 2;
+        try layerHashDtoH(m, buf, 0, row_h, ch.h + local * row_h);
+        logAttnInBf16(m, li, x, "engram_gate_h", buf[0..row_h]);
     }
 
     fn tryLogAttnInAfterAttn(m: *Model, e: *const prompt.Engine, ch: *const prompt.Chunk, cs: *const prompt.Caches, sh: *const prompt.Shared, li: usize, floor: usize) !void {
@@ -1269,13 +1356,7 @@ pub const Model = struct {
         const buf = m.attn_in_buf;
         // q
         try layerHashDtoH(m, buf, 0, q_row, ch.q + local * q_row);
-        std.debug.print("attn_in {{\"prompt\": {d}, \"cached\": {d}, \"pos\": {d}, \"part\": \"q\", \"hash\": \"0x{x:0>16}\", \"sum\": {e:.17}}}\n", .{
-            m.layer_hash_prompt,
-            m.layer_hash_cached,
-            x,
-            layerHashFnv1a(buf[0..q_row]),
-            layerHashBf16SumF64(buf[0..q_row]),
-        });
+        logAttnInBf16(m, li, x, "q", buf[0..q_row]);
 
         const lo = @max(floor, start -| (c.window - 1));
         const win_lo = if (x >= c.window) x - c.window else 0;
@@ -1283,10 +1364,11 @@ pub const Model = struct {
         const win_from = @max(win_lo, lo);
         var win_count: usize = 0;
         if (x > 0 and win_hi >= win_from) win_count = win_hi - win_from + 1;
-        std.debug.print("attn_in {{\"prompt\": {d}, \"cached\": {d}, \"pos\": {d}, \"part\": \"win_count\", \"count\": {d}}}\n", .{
+        std.debug.print("attn_in {{\"prompt\": {d}, \"cached\": {d}, \"pos\": {d}, \"layer\": {d}, \"part\": \"win_count\", \"count\": {d}}}\n", .{
             m.layer_hash_prompt,
             m.layer_hash_cached,
             x,
+            li,
             win_count,
         });
         if (x > 0 and win_hi >= win_from) {
@@ -1298,16 +1380,17 @@ pub const Model = struct {
                 try layerHashDtoH(m, buf, 0, kv_row, src);
                 const k_bytes = buf[0..hd * 2];
                 const v_bytes = buf[hd * 2 .. kv_row];
-            std.debug.print("attn_in {{\"prompt\": {d}, \"cached\": {d}, \"pos\": {d}, \"part\": \"win\", \"win_pos\": {d}, \"k_hash\": \"0x{x:0>16}\", \"k_sum\": {e:.17}, \"v_hash\": \"0x{x:0>16}\", \"v_sum\": {e:.17}}}\n", .{
-                m.layer_hash_prompt,
-                m.layer_hash_cached,
-                x,
-                p,
-                layerHashFnv1a(k_bytes),
-                layerHashBf16SumF64(k_bytes),
-                layerHashFnv1a(v_bytes),
-                layerHashBf16SumF64(v_bytes),
-            });
+                std.debug.print("attn_in {{\"prompt\": {d}, \"cached\": {d}, \"pos\": {d}, \"layer\": {d}, \"part\": \"win\", \"win_pos\": {d}, \"k_hash\": \"0x{x:0>16}\", \"k_sum\": {e:.17}, \"v_hash\": \"0x{x:0>16}\", \"v_sum\": {e:.17}}}\n", .{
+                    m.layer_hash_prompt,
+                    m.layer_hash_cached,
+                    x,
+                    li,
+                    p,
+                    layerHashFnv1a(k_bytes),
+                    layerHashBf16SumF64(k_bytes),
+                    layerHashFnv1a(v_bytes),
+                    layerHashBf16SumF64(v_bytes),
+                });
             }
         }
 
@@ -1341,7 +1424,7 @@ pub const Model = struct {
                     comp_off += sb;
                     valid += 1;
                 }
-                logAttnInSrc(m, "comp_fp4", buf[0..comp_off], valid, x);
+                logAttnInSrc(m, li, "comp_fp4", buf[0..comp_off], valid, x);
                 if (lay.idx_wk != null) {
                     const idx_base = comp_off;
                     for (picks[0..kk]) |pick| {
@@ -1352,28 +1435,23 @@ pub const Model = struct {
                         try layerHashDtoH(m, buf, idx_base + idx_off, isb, cs.idx_scales[src_layer] + pi * isb);
                         idx_off += isb;
                     }
-                    if (idx_off > 0) logAttnInSrc(m, "index_fp4", buf[idx_base .. idx_base + idx_off], valid, x);
+                    if (idx_off > 0) logAttnInSrc(m, li, "index_fp4", buf[idx_base .. idx_base + idx_off], valid, x);
                 }
             }
             if (lay.ratio > 1) {
                 const rb = prompt.raw_rows * hd * 4;
                 const raw_dev = cs.raw_kv[li] + m.fill_slot * rb;
                 try layerHashDtoH(m, buf, 0, rb, raw_dev);
-                logAttnInSrc(m, "raw_kv", buf[0..rb], prompt.raw_rows, x);
+                logAttnInSrc(m, li, "raw_kv", buf[0..rb], prompt.raw_rows, x);
                 const raw_sc = cs.raw_score[li] + m.fill_slot * rb;
                 try layerHashDtoH(m, buf, 0, rb, raw_sc);
-                logAttnInSrc(m, "raw_score", buf[0..rb], prompt.raw_rows, x);
+                logAttnInSrc(m, li, "raw_score", buf[0..rb], prompt.raw_rows, x);
             }
         }
 
         try layerHashDtoH(m, buf, 0, q_row, ch.o + local * q_row);
-        std.debug.print("attn_in {{\"prompt\": {d}, \"cached\": {d}, \"pos\": {d}, \"part\": \"attn_o\", \"hash\": \"0x{x:0>16}\", \"sum\": {e:.17}}}\n", .{
-            m.layer_hash_prompt,
-            m.layer_hash_cached,
-            x,
-            layerHashFnv1a(buf[0..q_row]),
-            layerHashBf16SumF64(buf[0..q_row]),
-        });
+        logAttnInBf16(m, li, x, "attn_o", buf[0..q_row]);
+        try tryLogWinHLayer0(m, e, ch, li, floor);
     }
 
     fn tryLogAttnInAfterMoe(m: *Model, e: *const prompt.Engine, ch: *const prompt.Chunk, li: usize) !void {
@@ -1383,13 +1461,7 @@ pub const Model = struct {
         const c = e.c;
         const row_h = c.hc * c.hidden * 2;
         try layerHashDtoH(m, m.attn_in_buf, 0, row_h, ch.h + local * row_h);
-        std.debug.print("attn_in {{\"prompt\": {d}, \"cached\": {d}, \"pos\": {d}, \"part\": \"post_moe\", \"hash\": \"0x{x:0>16}\", \"sum\": {e:.17}}}\n", .{
-            m.layer_hash_prompt,
-            m.layer_hash_cached,
-            x,
-            layerHashFnv1a(m.attn_in_buf[0..row_h]),
-            layerHashBf16SumF64(m.attn_in_buf[0..row_h]),
-        });
+        logAttnInBf16(m, li, x, "post_moe", m.attn_in_buf[0..row_h]);
     }
 
     fn layerHashMaxLayer(m: *const Model, pos: usize, total_layers: usize) usize {
@@ -1511,6 +1583,7 @@ pub const Model = struct {
                 const j = std.mem.indexOfScalar(u16, c.engram_layers.slice(), @intCast(li)).?;
                 if (eh.lead_on) try m.lead.before(eh, j, start, n); // (TF_DS_ENGRAM_LEAD: this layer's reader)
                 try prompt.engramApply(e, ch, eh, li, seq);
+                try tryLogEngramIn(m, e, ch, li);
                 const ne = @min(2, c.engram_layers.slice().len);
                 if (eh.lead_on) {
                     // this layer's rows of the next chunk from now, a whole chunk ahead of their layer
