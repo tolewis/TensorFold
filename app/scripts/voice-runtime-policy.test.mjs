@@ -15,7 +15,7 @@ for (const name of ['@types/diff', '@types/qrcode']) {
   assert.equal(pkg.dependencies[name], undefined)
   assert.equal(lock.packages['node_modules/' + name].dev, true)
 }
-const minimatch = req('minimatch')
+const minimatch = createRequire(req.resolve('app-builder-lib/package.json'))('minimatch')
 const matches = typeof minimatch === 'function' ? minimatch : minimatch.minimatch
 for (const [name, files] of Object.entries(VOICE_REQUIRED_FILES)) {
   for (const file of files) {
