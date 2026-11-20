@@ -53,6 +53,9 @@
     "decode-uri-component": "$decode-uri-component",
     "braces": "$braces",
     "node-forge": "$node-forge",
-    "sprintf-js": "$sprintf-js"
+    "sprintf-js": "$sprintf-js",
+    "zod": "^4.6.6",
+    "glob@13": "^14.0.2",
+    "minimatch@10": "^11.0.1"
   }
 }
