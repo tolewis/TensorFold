@@ -108,6 +108,24 @@ pub const records = [_]Record{
         .launch = .{ .name = "planted attn_merge weighing past its last slice", .symbol = "tf_ctl_attn_merge_unguarded", .image = "contract_gate_controls", .format = glue, .threads = .{ 16, 1, 1 }, .sub_group = 16, .grf = 256 },
         .usage = .{.{ .threads = .{ 16, 1, 1 }, .sub_group = 16, .grf = 256 }},
     },
+    // Inkling 2 Mini loop (zig/kernels/xpu/inkling2/loop.cl): the production image, then the same source with one
+    // arithmetic anchor dropped for the contract's planted controls (zig/tests/xpu/inkling2_loop.zig).
+    .{
+        .launch = .{ .name = "inkling2 loop messages", .symbol = "tf_inkling2_loop_messages", .image = "contract_inkling2_loop", .format = glue, .threads = .{ 256, 1, 1 }, .slm = 64, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 256, 1, 1 }, .slm = 64, .sub_group = 16, .grf = 256 }},
+    },
+    .{
+        .launch = .{ .name = "inkling2 loop gates", .symbol = "tf_inkling2_loop_gates", .image = "contract_inkling2_loop", .format = glue, .threads = .{ 256, 1, 1 }, .slm = 9536, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 256, 1, 1 }, .slm = 9536, .sub_group = 16, .grf = 256 }},
+    },
+    .{
+        .launch = .{ .name = "planted inkling2 loop messages without the 1/48 scale", .symbol = "tf_inkling2_loop_messages", .image = "contract_inkling2_loop_controls", .format = glue, .threads = .{ 256, 1, 1 }, .slm = 64, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 256, 1, 1 }, .slm = 64, .sub_group = 16, .grf = 256 }},
+    },
+    .{
+        .launch = .{ .name = "planted inkling2 loop gates without the bf16 zeta", .symbol = "tf_inkling2_loop_gates", .image = "contract_inkling2_loop_controls", .format = glue, .threads = .{ 256, 1, 1 }, .slm = 9536, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 256, 1, 1 }, .slm = 9536, .sub_group = 16, .grf = 256 }},
+    },
 };
 
 /// Gate 5's planted XPU controls: one for each fit rule the audit must fire.

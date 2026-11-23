@@ -138,6 +138,13 @@ infinity of each sign in a row's last slice among them. Its two planted controls
 the old one-subgroup-a-head grid, and a copy that weighs the lanes past the last slice (it adds the last slice again).
 The tree table is the only row source; the multi-stream row positions are outside it.
 
+Inkling 2 Mini's loop (`zig/kernels/xpu/inkling2/loop.cl`, the port of `loop.metal`) registers `tf_inkling2_loop_messages`
+and `tf_inkling2_loop_gates` with the Metal specs and served shapes (1, 5 and 7 rows at hidden 2,304, rank 64, 48 messages
+a token). Gates 1 to 4 hold them to float64; each has a planted control in `contract_inkling2_loop_controls` (the same
+source built with `TF_CTL_LOOP_NO_SCALE` and `TF_CTL_LOOP_NO_ZETA_ROUND`: the messages without the post-dot 1/48, the
+gates without the bf16 rounding of zeta), red at `shapes`. The run also compares the device with the host float model
+of `zig/src/families/inkling2/loop_model.zig`. `tf-xpu-contract-run --only TEXT` runs the kernels whose name holds TEXT.
+
 On any host, with no device, `zig build cpu-contract` runs the CPU kernels (Qwen3.5-2B's affine projection and RMS
 norm on the host's cores) through gates 1 to 4 and their eight controls; a CPU kernel has no launch, so gate 5 has
 nothing to check. `zig build test-kernel-contract`, CI's no-device step, runs the same gates as a test, and `zig build
