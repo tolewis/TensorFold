@@ -2,6 +2,7 @@
 const std = @import("std");
 const core = @import("core");
 const rig_ = @import("contract_rig.zig");
+const dspark = @import("inkling2_dspark.zig");
 
 const limits = core.xpu_limits;
 const records = core.xpu_records;
@@ -47,6 +48,7 @@ fn argsOf(symbol: []const u8) u32 {
         .{ "tf_ctl_attn_merge_unguarded", 8 },
     };
     for (table) |e| if (std.mem.eql(u8, e[0], symbol)) return e[1];
+    if (dspark.argsOf(symbol)) |n| return n;
     return 1; // gate 5's controls take one output pointer
 }
 
@@ -89,12 +91,13 @@ pub fn live(a: std.mem.Allocator, dev: *rig_.Dev) !usize {
             if (out.items.len > 0) std.debug.print("{s}", .{out.items});
             continue;
         }
-        const img = imageOf(rec.launch.image) orelse return error.UnknownImage;
+        const img = imageOf(rec.launch.image);
+        if (img == null and dev.named(rec.launch.image) == null) return error.UnknownImage;
         if (!built and img == .controls) continue;
         const sym = try a.allocSentinel(u8, rec.launch.symbol.len, 0);
         defer a.free(sym);
         @memcpy(sym, rec.launch.symbol);
-        var k = try dev.probe(img, sym);
+        var k = if (img) |i| try dev.probe(i, sym) else try dev.named(rec.launch.image).?.kernelAt(sym);
         defer k.deinit();
         const kp = try dev.properties(k);
         const u = rec.usage[0];

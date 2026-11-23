@@ -9,6 +9,7 @@ const U = limits.XpuUsage;
 pub const Record = struct { launch: X, usage: [limits.xe.len]U, compiled: bool = true };
 
 const glue = limits.Format.native;
+const dspark = @import("inkling2_dspark_xpu_records.zig");
 
 /// Qwen3.8-27B glue and attention, including the replaced pair and the attention-specific shape control.
 pub const records = [_]Record{
@@ -108,7 +109,7 @@ pub const records = [_]Record{
         .launch = .{ .name = "planted attn_merge weighing past its last slice", .symbol = "tf_ctl_attn_merge_unguarded", .image = "contract_gate_controls", .format = glue, .threads = .{ 16, 1, 1 }, .sub_group = 16, .grf = 256 },
         .usage = .{.{ .threads = .{ 16, 1, 1 }, .sub_group = 16, .grf = 256 }},
     },
-};
+} ++ dspark.records;
 
 /// Gate 5's planted XPU controls: one for each fit rule the audit must fire.
 pub const controls = [_]Record{
