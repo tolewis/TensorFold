@@ -13,6 +13,7 @@ const tp_k = @import("contract_tp.zig");
 const controls_k = @import("contract_controls.zig");
 const attn_k = @import("contract_attn.zig");
 const merge_k = @import("contract_merge.zig");
+const ink2_k = @import("inkling2_experts.zig");
 
 const g = core.gates;
 
@@ -20,18 +21,24 @@ fn ms(io: std.Io) i96 {
     return @divTrunc(std.Io.Clock.awake.now(io).toNanoseconds(), std.time.ns_per_ms);
 }
 
+fn usage() u8 {
+    std.debug.print("usage: tf-xpu-contract-run [--device N] [--only NAME]\n", .{});
+    return 2;
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const a = init.gpa;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     var ordinal: ?u32 = null;
-    if (args.len == 3 and std.mem.eql(u8, args[1], "--device")) {
-        ordinal = std.fmt.parseInt(u32, args[2], 10) catch {
-            std.debug.print("usage: tf-xpu-contract-run [--device N]\n", .{});
-            return 2;
-        };
-    } else if (args.len != 1) {
-        std.debug.print("usage: tf-xpu-contract-run [--device N]\n", .{});
-        return 2;
+    var only: ?[]const u8 = null; // a part of a kernel's name: run just those kernels (limits still run)
+    var at: usize = 1;
+    while (at < args.len) : (at += 2) {
+        if (at + 1 >= args.len) return usage();
+        if (std.mem.eql(u8, args[at], "--device")) {
+            ordinal = std.fmt.parseInt(u32, args[at + 1], 10) catch return usage();
+        } else if (std.mem.eql(u8, args[at], "--only")) {
+            only = args[at + 1];
+        } else return usage();
     }
     var dev: rig_.Dev = undefined;
     dev.init(ordinal) catch |e| {
@@ -80,6 +87,17 @@ pub fn main(init: std.process.Init) !u8 {
     for (&controls, std.enums.values(controls_k.Which)) |*x, w| x.* = try controls_k.Control.init(a, &dev, w);
     defer for (&controls) |*x| x.deinit();
     for (&controls) |*x| try kernels.append(a, x.kernel());
+    var ink2 = ink2_k.Suite{ .a = a, .dev = &dev, .kernels = &kernels };
+    defer ink2.deinit();
+    try ink2.collect();
+    if (only) |needle| {
+        var keep: usize = 0;
+        for (kernels.items) |k| if (std.mem.indexOf(u8, k.spec.name, needle) != null) {
+            kernels.items[keep] = k;
+            keep += 1;
+        };
+        kernels.shrinkRetainingCapacity(keep);
+    }
     var t: g.Tally = .{};
     const t0 = ms(init.io);
     try g.runAll(a, kernels.items, 0x6b63, &t);

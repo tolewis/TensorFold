@@ -9,7 +9,7 @@ pub const guard = 256;
 const pattern = 0xa5;
 
 /// The image a kernel lives in: the Qwen3.8-27B glue, TP collectives, gate 5's controls, or gates 1 to 4's.
-pub const Image = enum { glue, tp, decode, attn_upstream, merge_upstream, controls, gate };
+pub const Image = enum { glue, tp, decode, attn_upstream, merge_upstream, controls, gate, inkling2, inkling2_ctl };
 
 fn blob(i: Image) []const u8 {
     return switch (i) {
@@ -20,6 +20,8 @@ fn blob(i: Image) []const u8 {
         .merge_upstream => &images.merge_upstream,
         .controls => &images.controls,
         .gate => &images.gate_controls,
+        .inkling2 => &images.inkling2_experts,
+        .inkling2_ctl => &images.inkling2_controls,
     };
 }
 
@@ -36,6 +38,8 @@ pub const Dev = struct {
     controls: ?xpu.Module, // the driver refuses the whole image when one control asks for more SLM than it has
     controls_err: ?anyerror = null,
     gate: xpu.Module,
+    inkling2: xpu.Module,
+    inkling2_ctl: xpu.Module,
 
     /// Opens the card `ordinal` names, else the first Arc card, and loads every image; `self` stays where it is.
     pub fn init(self: *Dev, ordinal: ?u32) !void {
@@ -52,9 +56,13 @@ pub const Dev = struct {
             break :blk null;
         };
         self.gate = try xpu.Module.loadNative(&self.ctx, blob(.gate));
+        self.inkling2 = try xpu.Module.loadNative(&self.ctx, blob(.inkling2));
+        self.inkling2_ctl = try xpu.Module.loadNative(&self.ctx, blob(.inkling2_ctl));
     }
 
     pub fn deinit(self: *Dev) void {
+        self.inkling2_ctl.unload();
+        self.inkling2.unload();
         self.gate.unload();
         if (self.controls) |*m| m.unload();
         self.tp.unload();
@@ -76,6 +84,8 @@ pub const Dev = struct {
             .merge_upstream => &self.merge_upstream,
             .controls => if (self.controls) |*m| m else error.ControlsNotBuilt,
             .gate => &self.gate,
+            .inkling2 => &self.inkling2,
+            .inkling2_ctl => &self.inkling2_ctl,
         };
     }
 

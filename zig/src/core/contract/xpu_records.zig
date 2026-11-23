@@ -1,6 +1,7 @@
 //! The XPU launches gate 5 checks: Qwen3.8-27B glue and decode attention, their recorded compiles, and controls.
 const std = @import("std");
 const limits = @import("xpu_limits.zig");
+const inkling2_experts = @import("inkling2_experts_xpu_records.zig");
 
 const X = limits.XpuLaunch;
 const U = limits.XpuUsage;
@@ -11,7 +12,7 @@ pub const Record = struct { launch: X, usage: [limits.xe.len]U, compiled: bool =
 const glue = limits.Format.native;
 
 /// Qwen3.8-27B glue and attention, including the replaced pair and the attention-specific shape control.
-pub const records = [_]Record{
+const base = [_]Record{
     .{
         .launch = .{ .name = "add_rmsnorm", .symbol = "add_rmsnorm", .image = "glue", .format = glue, .threads = .{ 128, 1, 1 }, .slm = 10272, .sub_group = 16, .grf = 256 },
         .usage = .{.{ .threads = .{ 128, 1, 1 }, .slm = 10272, .sub_group = 16, .grf = 256 }},
@@ -109,6 +110,9 @@ pub const records = [_]Record{
         .usage = .{.{ .threads = .{ 16, 1, 1 }, .sub_group = 16, .grf = 256 }},
     },
 };
+
+/// Every registered launch: the base list and Inkling 2's experts.
+pub const records = base ++ inkling2_experts.list(Record);
 
 /// Gate 5's planted XPU controls: one for each fit rule the audit must fire.
 pub const controls = [_]Record{
