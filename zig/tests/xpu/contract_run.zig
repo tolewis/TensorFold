@@ -13,6 +13,7 @@ const tp_k = @import("contract_tp.zig");
 const controls_k = @import("contract_controls.zig");
 const attn_k = @import("contract_attn.zig");
 const merge_k = @import("contract_merge.zig");
+const ink2_attn_k = @import("inkling2_attention.zig");
 
 const g = core.gates;
 
@@ -80,6 +81,9 @@ pub fn main(init: std.process.Init) !u8 {
     for (&controls, std.enums.values(controls_k.Which)) |*x, w| x.* = try controls_k.Control.init(a, &dev, w);
     defer for (&controls) |*x| x.deinit();
     for (&controls) |*x| try kernels.append(a, x.kernel());
+    var ink2_attn: ink2_attn_k.Suite = .{ .a = a, .dev = &dev, .kernels = &kernels };
+    defer ink2_attn.deinit();
+    try ink2_attn.collect();
     var t: g.Tally = .{};
     const t0 = ms(init.io);
     try g.runAll(a, kernels.items, 0x6b63, &t);

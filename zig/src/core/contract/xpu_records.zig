@@ -1,4 +1,4 @@
-//! The XPU launches gate 5 checks: Qwen3.8-27B glue and decode attention, their recorded compiles, and controls.
+//! The XPU launches gate 5 checks: Qwen3.8-27B glue and decode attention, Inkling 2 Mini attention, their recorded compiles, and controls.
 const std = @import("std");
 const limits = @import("xpu_limits.zig");
 
@@ -107,6 +107,26 @@ pub const records = [_]Record{
     .{
         .launch = .{ .name = "planted attn_merge weighing past its last slice", .symbol = "tf_ctl_attn_merge_unguarded", .image = "contract_gate_controls", .format = glue, .threads = .{ 16, 1, 1 }, .sub_group = 16, .grf = 256 },
         .usage = .{.{ .threads = .{ 16, 1, 1 }, .sub_group = 16, .grf = 256 }},
+    },
+    .{
+        .launch = .{ .name = "inkling2 attention prep", .symbol = "tf_ink2_prep", .image = "inkling2_attention", .format = glue, .threads = .{ 16, 1, 1 }, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 16, 1, 1 }, .sub_group = 16, .grf = 256 }},
+    },
+    .{
+        .launch = .{ .name = "inkling2 attention relative table", .symbol = "tf_ink2_rel_table", .image = "inkling2_attention", .format = glue, .threads = .{ 256, 1, 1 }, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 256, 1, 1 }, .sub_group = 16, .grf = 256 }},
+    },
+    .{
+        .launch = .{ .name = "inkling2 attention decode", .symbol = "tf_ink2_attn_decode", .image = "inkling2_attention", .format = glue, .threads = .{ 16, 1, 1 }, .slm = 1536, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 16, 1, 1 }, .slm = 1536, .sub_group = 16, .grf = 256 }},
+    },
+    .{
+        .launch = .{ .name = "inkling2 attention merge", .symbol = "tf_ink2_merge", .image = "inkling2_attention", .format = glue, .threads = .{ 128, 1, 1 }, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 128, 1, 1 }, .sub_group = 16, .grf = 256 }},
+    },
+    .{
+        .launch = .{ .name = "inkling2 prompt attention", .symbol = "tf_ink2_attn_prompt", .image = "inkling2_prompt", .format = glue, .threads = .{ 16, 1, 1 }, .slm = 1024, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 16, 1, 1 }, .slm = 1024, .sub_group = 16, .grf = 256 }},
     },
 };
 

@@ -9,7 +9,7 @@ pub const guard = 256;
 const pattern = 0xa5;
 
 /// The image a kernel lives in: the Qwen3.8-27B glue, TP collectives, gate 5's controls, or gates 1 to 4's.
-pub const Image = enum { glue, tp, decode, attn_upstream, merge_upstream, controls, gate };
+pub const Image = enum { glue, tp, decode, attn_upstream, merge_upstream, controls, gate, ink2_attention, ink2_prompt };
 
 fn blob(i: Image) []const u8 {
     return switch (i) {
@@ -20,6 +20,8 @@ fn blob(i: Image) []const u8 {
         .merge_upstream => &images.merge_upstream,
         .controls => &images.controls,
         .gate => &images.gate_controls,
+        .ink2_attention => &images.ink2_attention,
+        .ink2_prompt => &images.ink2_prompt,
     };
 }
 
@@ -36,6 +38,8 @@ pub const Dev = struct {
     controls: ?xpu.Module, // the driver refuses the whole image when one control asks for more SLM than it has
     controls_err: ?anyerror = null,
     gate: xpu.Module,
+    ink2_attention: xpu.Module,
+    ink2_prompt: xpu.Module,
 
     /// Opens the card `ordinal` names, else the first Arc card, and loads every image; `self` stays where it is.
     pub fn init(self: *Dev, ordinal: ?u32) !void {
@@ -52,9 +56,13 @@ pub const Dev = struct {
             break :blk null;
         };
         self.gate = try xpu.Module.loadNative(&self.ctx, blob(.gate));
+        self.ink2_attention = try xpu.Module.loadNative(&self.ctx, blob(.ink2_attention));
+        self.ink2_prompt = try xpu.Module.loadNative(&self.ctx, blob(.ink2_prompt));
     }
 
     pub fn deinit(self: *Dev) void {
+        self.ink2_prompt.unload();
+        self.ink2_attention.unload();
         self.gate.unload();
         if (self.controls) |*m| m.unload();
         self.tp.unload();
@@ -76,6 +84,8 @@ pub const Dev = struct {
             .merge_upstream => &self.merge_upstream,
             .controls => if (self.controls) |*m| m else error.ControlsNotBuilt,
             .gate => &self.gate,
+            .ink2_attention => &self.ink2_attention,
+            .ink2_prompt => &self.ink2_prompt,
         };
     }
 
