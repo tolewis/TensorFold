@@ -1,6 +1,7 @@
 //! The XPU launches gate 5 checks: Qwen3.8-27B glue and decode attention, Inkling 2 Mini attention, their recorded compiles, and controls.
 const std = @import("std");
 const limits = @import("xpu_limits.zig");
+const inkling2_experts = @import("inkling2_experts_xpu_records.zig");
 
 const X = limits.XpuLaunch;
 const U = limits.XpuUsage;
@@ -150,7 +151,7 @@ const qwen27_records = [_]Record{
 } ++ dspark.records;
 
 /// Every registered XPU launch: Qwen3.8-27B's, then Inkling 2 Mini's glue and runtime.
-pub const records = qwen27_records ++ @import("xpu_inkling2_records.zig").records;
+pub const records = qwen27_records ++ @import("xpu_inkling2_records.zig").records ++ inkling2_experts.list(Record);
 
 /// Gate 5's planted XPU controls: one for each fit rule the audit must fire.
 pub const controls = [_]Record{

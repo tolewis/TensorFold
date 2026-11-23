@@ -27,6 +27,8 @@ fn imageOf(name: []const u8) ?rig_.Image {
     if (std.mem.eql(u8, name, "inkling2_runtime_ctl")) return .ink2_runtime_ctl;
     if (std.mem.eql(u8, name, "inkling2_attention")) return .ink2_attention;
     if (std.mem.eql(u8, name, "inkling2_prompt")) return .ink2_prompt;
+    if (std.mem.eql(u8, name, "contract_inkling2_experts")) return .inkling2;
+    if (std.mem.eql(u8, name, "contract_inkling2_controls")) return .inkling2_ctl;
     return null;
 }
 
@@ -85,7 +87,29 @@ fn argsOf(planted: []const u8) u32 {
     };
     for (table) |e| if (std.mem.eql(u8, e[0], symbol)) return e[1];
     if (dspark.argsOf(symbol)) |n| return n;
+    if (inkling2Args(symbol)) |n| return n;
     return 1; // gate 5's controls take one output pointer
+}
+
+/// Inkling 2's experts: a symbol is an image prefix then the operation's name, so it is told by its ending.
+fn inkling2Args(symbol: []const u8) ?u32 {
+    const table = [_]struct { []const u8, u32 }{
+        .{ "nvfp4_gu", 11 },
+        .{ "nvfp4_down", 11 },
+        .{ "mxfp8_gu", 9 },
+        .{ "mxfp8_down", 9 },
+        .{ "nvfp4_quantize", 7 },
+        .{ "mxfp8_quantize", 5 },
+        .{ "combine", 7 },
+        .{ "plan", 7 },
+        .{ "nvfp4_gu_prompt", 12 },
+        .{ "nvfp4_down_prompt", 12 },
+        .{ "mxfp8_gu_prompt", 10 },
+        .{ "mxfp8_down_prompt", 10 },
+    };
+    if (!std.mem.startsWith(u8, symbol, "tf_ink2_") and !std.mem.startsWith(u8, symbol, "tf_ctl_i2_")) return null;
+    for (table) |e| if (std.mem.endsWith(u8, symbol, e[0])) return e[1];
+    return null;
 }
 
 /// Gate 5 on this card: the device's limits against its row, each loaded kernel against its record, each control red.

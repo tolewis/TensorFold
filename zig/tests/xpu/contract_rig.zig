@@ -9,7 +9,7 @@ pub const guard = 256;
 const pattern = 0xa5;
 
 /// The image a kernel lives in: the Qwen3.8-27B glue, TP collectives, gate 5's controls, or gates 1 to 4's.
-pub const Image = enum { glue, tp, decode, attn_upstream, merge_upstream, controls, gate, inkling2_loop, inkling2_loop_controls, ink2_glue, ink2_runtime, ink2_glue_ctl, ink2_runtime_ctl, ink2_attention, ink2_prompt };
+pub const Image = enum { glue, tp, decode, attn_upstream, merge_upstream, controls, gate, inkling2_loop, inkling2_loop_controls, ink2_glue, ink2_runtime, ink2_glue_ctl, ink2_runtime_ctl, ink2_attention, ink2_prompt, inkling2, inkling2_ctl };
 
 fn blob(i: Image) []const u8 {
     return switch (i) {
@@ -28,6 +28,8 @@ fn blob(i: Image) []const u8 {
         .ink2_runtime_ctl => &images.inkling2_runtime_ctl,
         .ink2_attention => &images.ink2_attention,
         .ink2_prompt => &images.ink2_prompt,
+        .inkling2 => &images.inkling2_experts,
+        .inkling2_ctl => &images.inkling2_controls,
     };
 }
 
@@ -52,6 +54,8 @@ pub const Dev = struct {
     ink2_runtime_ctl: xpu.Module,
     ink2_attention: xpu.Module,
     ink2_prompt: xpu.Module,
+    inkling2: xpu.Module,
+    inkling2_ctl: xpu.Module,
     /// Images a family's own contract file loads by the name its launch records give (`addImage`).
     extra: [max_extra]Extra = undefined,
     extra_n: usize = 0,
@@ -82,6 +86,8 @@ pub const Dev = struct {
         self.ink2_runtime_ctl = try xpu.Module.loadNative(&self.ctx, blob(.ink2_runtime_ctl));
         self.ink2_attention = try xpu.Module.loadNative(&self.ctx, blob(.ink2_attention));
         self.ink2_prompt = try xpu.Module.loadNative(&self.ctx, blob(.ink2_prompt));
+        self.inkling2 = try xpu.Module.loadNative(&self.ctx, blob(.inkling2));
+        self.inkling2_ctl = try xpu.Module.loadNative(&self.ctx, blob(.inkling2_ctl));
         self.extra_n = 0;
     }
 
@@ -100,6 +106,8 @@ pub const Dev = struct {
 
     pub fn deinit(self: *Dev) void {
         for (self.extra[0..self.extra_n]) |*e| e.module.unload();
+        self.inkling2_ctl.unload();
+        self.inkling2.unload();
         self.ink2_prompt.unload();
         self.ink2_attention.unload();
         self.ink2_runtime_ctl.unload();
@@ -137,6 +145,8 @@ pub const Dev = struct {
             .ink2_runtime_ctl => &self.ink2_runtime_ctl,
             .ink2_attention => &self.ink2_attention,
             .ink2_prompt => &self.ink2_prompt,
+            .inkling2 => &self.inkling2,
+            .inkling2_ctl => &self.inkling2_ctl,
         };
     }
 

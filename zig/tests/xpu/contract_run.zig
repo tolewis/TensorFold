@@ -18,11 +18,17 @@ const ink2_glue_k = @import("inkling2_glue.zig");
 const ink2_runtime_k = @import("inkling2_runtime.zig");
 const dspark_k = @import("inkling2_dspark.zig");
 const ink2_attn_k = @import("inkling2_attention.zig");
+const ink2_k = @import("inkling2_experts.zig");
 
 const g = core.gates;
 
 fn ms(io: std.Io) i96 {
     return @divTrunc(std.Io.Clock.awake.now(io).toNanoseconds(), std.time.ns_per_ms);
+}
+
+fn usage() u8 {
+    std.debug.print("usage: tf-xpu-contract-run [--device N] [--only NAME]\n", .{});
+    return 2;
 }
 
 pub fn main(init: std.process.Init) !u8 {
@@ -111,6 +117,9 @@ pub fn main(init: std.process.Init) !u8 {
     var ink2_attn: ink2_attn_k.Suite = .{ .a = a, .dev = &dev, .kernels = &kernels };
     defer ink2_attn.deinit();
     try ink2_attn.collect();
+    var ink2 = ink2_k.Suite{ .a = a, .dev = &dev, .kernels = &kernels };
+    defer ink2.deinit();
+    try ink2.collect();
     if (only) |text| {
         var keep: usize = 0;
         for (kernels.items) |k| {

@@ -75,7 +75,7 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
 
     const files = b.addWriteFiles();
     if (prebuilt) |dir| {
-        for ([_][]const u8{ "glue", "tp", "contract_controls", "contract_gate_controls", "decode", "contract_attn_upstream", "contract_merge_upstream", "contract_inkling2_loop", "contract_inkling2_loop_controls", "inkling2_dspark", "contract_inkling2_dspark_controls" } ++ inkling2.names) |name| {
+        for ([_][]const u8{ "glue", "tp", "contract_controls", "contract_gate_controls", "decode", "contract_attn_upstream", "contract_merge_upstream", "contract_inkling2_loop", "contract_inkling2_loop_controls", "inkling2_dspark", "contract_inkling2_dspark_controls", "contract_inkling2_experts", "contract_inkling2_controls" } ++ inkling2.names) |name| {
             _ = files.addCopyFile(.{ .cwd_relative = b.fmt("{s}/{s}.bin", .{ dir, name }) }, b.fmt("{s}.bin", .{name}));
         }
         for (ink2_attn_images ++ ink2_attn_controls) |src| {
@@ -90,14 +90,17 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         for ([_][]const u8{ "glue_attn.cl", "glue_quant.cl" }) |part| glue.addFileInput(b.path(b.fmt("zig/kernels/xpu/qwen27/{s}", .{part})));
         const glue_dir = glue.addOutputDirectoryArg("ocloc-glue-run");
         _ = files.addCopyFile(glue_dir.path(b, "glue.bin"), "glue.bin");
-        for ([_][2][]const u8{
-            .{ "tp", "zig/kernels/xpu/tp.cl" },
-            .{ "contract_controls", "zig/kernels/xpu/contract_controls.cl" },
-            .{ "contract_gate_controls", "zig/kernels/xpu/contract_gate_controls.cl" },
+        for ([_][3][]const u8{
+            .{ "tp", "zig/kernels/xpu/tp.cl", "" },
+            .{ "contract_controls", "zig/kernels/xpu/contract_controls.cl", "" },
+            .{ "contract_gate_controls", "zig/kernels/xpu/contract_gate_controls.cl", "" },
+            .{ "contract_inkling2_experts", "zig/kernels/xpu/inkling2/experts.cl", inkling2_options },
+            .{ "contract_inkling2_controls", "zig/kernels/xpu/inkling2/contract_experts_controls.cl", inkling2_options },
         }) |pair| {
             const run = b.addSystemCommand(&.{ ocloc, "compile", "-q", "-file" });
             run.addFileArg(b.path(pair[1]));
-            run.addArgs(&.{ "-device", device, "-options", opts, "-output_no_suffix", "-output", pair[0], "-out_dir" });
+            if (pair[2].len > 0) run.addFileInput(b.path("zig/kernels/xpu/inkling2/experts.cl"));
+            run.addArgs(&.{ "-device", device, "-options", b.fmt("{s}{s}", .{ opts, pair[2] }), "-output_no_suffix", "-output", pair[0], "-out_dir" });
             run.setCwd(b.path("."));
             const dir = run.addOutputDirectoryArg(b.fmt("ocloc-{s}-run", .{pair[0]}));
             _ = files.addCopyFile(dir.path(b, b.fmt("{s}.bin", .{pair[0]})), b.fmt("{s}.bin", .{pair[0]}));
@@ -131,6 +134,8 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         \\pub const ink2_attention_ctl4 align(8) = @embedFile("inkling2_attention_ctl4.bin").*;
         \\pub const ink2_attention_ctl5 align(8) = @embedFile("inkling2_attention_ctl5.bin").*;
         \\pub const ink2_prompt_ctl6 align(8) = @embedFile("inkling2_prompt_ctl6.bin").*;
+        \\pub const inkling2_experts align(8) = @embedFile("contract_inkling2_experts.bin").*;
+        \\pub const inkling2_controls align(8) = @embedFile("contract_inkling2_controls.bin").*;
     ), .target = target, .optimize = optimize });
     // Inkling 2 Mini's loop: the host wrapper, its pure launch plan, and the host float model the device is held to
     const loop_plan = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/metal/loop_plan.zig"), .target = target, .optimize = optimize });
@@ -147,6 +152,8 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         .link_libc = true,
         .imports = &.{.{ .name = "xpu", .module = xpu }},
     });
+    const experts_host = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/xpu/experts.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "xpu", .module = xpu }} });
+    b.step("test-inkling2-xpu-experts-host", "Inkling 2's XPU experts host wrapper: plan and call checks (no GPU)").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = experts_host })).step);
     const exe = b.addExecutable(.{ .name = "tf-xpu-contract-run", .root_module = b.createModule(.{
         .root_source_file = b.path("zig/tests/xpu/contract_run.zig"),
         .target = target,
@@ -155,6 +162,7 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         .imports = &.{
             .{ .name = "core", .module = core },
             .{ .name = "xpu", .module = xpu },
+            .{ .name = "inkling2_xpu_experts", .module = experts_host },
             .{ .name = "ze", .module = ze },
             .{ .name = "xpu_contract_images", .module = images },
             .{ .name = "inkling2_xpu_loop", .module = loop_host },
@@ -214,9 +222,24 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         },
     }) });
     b.step("test-inkling2-dspark-xpu-host", "Mini DSpark's XPU host files (kernels, state, weights, fold) without a card").dependOn(&b.addRunArtifact(dspark_tests).step);
+    const experts_bench = b.addExecutable(.{ .name = "tf-xpu-inkling2-experts-bench", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/xpu/inkling2_experts_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "xpu", .module = xpu },
+            .{ .name = "inkling2_xpu_experts", .module = experts_host },
+            .{ .name = "xpu_contract_images", .module = images },
+        },
+    }) });
+    b.step("tf-xpu-inkling2-experts-bench", "Build the Inkling 2 experts decode bandwidth bench (run it on a card under the GPU lock)").dependOn(&b.addInstallArtifact(experts_bench, .{}).step);
     const run = b.addRunArtifact(exe);
     b.step("xpu-contract-run", "Run the XPU kernel contract on this card (tf-xpu-contract-run [--device N])").dependOn(&run.step);
 }
+
+/// Inkling 2's experts: IEEE divides (the per-expert factor is a correctly rounded quotient) and its own include path.
+const inkling2_options = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2";
 
 /// `extra` is appended to ocloc's options; `inputs` are files the source includes, so a change rebuilds the object.
 const Source = struct { name: []const u8, path: []const u8, extra: []const u8 = "", inputs: []const []const u8 = &.{} };
@@ -229,6 +252,8 @@ const contract_images = [_]Source{
     // is the same source with the 1/48 scale and the bf16 zeta dropped.
     .{ .name = "contract_inkling2_loop", .path = "zig/kernels/xpu/inkling2/loop.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt" },
     .{ .name = "contract_inkling2_loop_controls", .path = "zig/kernels/xpu/inkling2/loop.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -DTF_CTL_LOOP_NO_SCALE -DTF_CTL_LOOP_NO_ZETA_ROUND" },
+    .{ .name = "contract_inkling2_experts", .path = "zig/kernels/xpu/inkling2/experts.cl", .extra = inkling2_options, .inputs = &.{"zig/kernels/xpu/inkling2/experts.cl"} },
+    .{ .name = "contract_inkling2_controls", .path = "zig/kernels/xpu/inkling2/contract_experts_controls.cl", .extra = inkling2_options, .inputs = &.{"zig/kernels/xpu/inkling2/experts.cl"} },
 };
 
 /// Inkling 2 Mini's DSpark kernels and their planted controls (the controls file includes the kernels).
