@@ -126,6 +126,25 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         },
     }) });
     b.step("tf-xpu-contract-run", "Build the XPU kernel-contract runner: gates 1 to 4 and gate 5 live on a card").dependOn(&b.addInstallArtifact(exe, .{}).step);
+    // The drafter's host files tested without a card; `core` here is only the safetensors reader they use.
+    const safetensors = b.createModule(.{ .root_source_file = b.path("zig/src/core/safetensors.zig"), .target = target, .optimize = optimize });
+    const core_reader = b.addWriteFiles();
+    const dspark_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/src/families/inkling2/xpu/dspark_host_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "xpu", .module = xpu },
+            .{ .name = "core", .module = b.createModule(.{
+                .root_source_file = core_reader.add("core_reader.zig", "pub const safetensors = @import(\"safetensors\");"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "safetensors", .module = safetensors }},
+            }) },
+        },
+    }) });
+    b.step("test-inkling2-dspark-xpu-host", "Mini DSpark's XPU host files (kernels, state, weights, fold) without a card").dependOn(&b.addRunArtifact(dspark_tests).step);
     const run = b.addRunArtifact(exe);
     b.step("xpu-contract-run", "Run the XPU kernel contract on this card (tf-xpu-contract-run [--device N])").dependOn(&run.step);
 }
