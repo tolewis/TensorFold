@@ -16,7 +16,8 @@ fn open(path: [*:0]const u8, flags: c_int) c_int {
 
 const chunk_bytes: usize = 64 << 20;
 
-pub const Info = struct { fd: c_int, off: u64, len: u64, dtype: []const u8 };
+/// A tensor's place in its shard: `dtype` is the header's spelling, `dt`, `shape` and `rank` are core's reading of it.
+pub const Info = struct { fd: c_int, off: u64, len: u64, dtype: []const u8, dt: st.DType = .u8, shape: [st.max_rank]usize = @splat(1), rank: usize = 0 };
 
 pub fn readExact(fd: c_int, buf: []u8, off: u64) !void {
     var done: usize = 0;
@@ -109,6 +110,21 @@ pub const Loader = struct {
         return l;
     }
 
+    /// Closes the shard files and frees the tensor index and the staging buffer; device buffers it made stay with their owners.
+    pub fn deinit(l: *Loader) void {
+        var fds: std.ArrayList(c_int) = .empty;
+        defer fds.deinit(l.gpa);
+        var it = l.map.iterator();
+        while (it.next()) |e| {
+            if (std.mem.indexOfScalar(c_int, fds.items, e.value_ptr.fd) == null) fds.append(l.gpa, e.value_ptr.fd) catch {};
+            l.gpa.free(e.key_ptr.*);
+        }
+        for (fds.items) |fd| _ = close(fd);
+        l.map.deinit(l.gpa);
+        l.gpa.free(l.stage);
+        l.* = undefined;
+    }
+
     /// The shard's tensors by name; its fd stays open for `load` once the header is read.
     pub fn addShard(l: *Loader, dir: []const u8, shard: []const u8) !void {
         const fd = try openPath(l.gpa, dir, shard);
@@ -120,7 +136,7 @@ pub const Loader = struct {
         };
         try l.map.ensureUnusedCapacity(l.gpa, @intCast(names.count()));
         for (names.keys(), names.values()) |name, e| {
-            const t: Info = .{ .fd = fd, .off = data + e.begin, .len = e.end - e.begin, .dtype = dtypeName(e.dtype) };
+            const t: Info = .{ .fd = fd, .off = data + e.begin, .len = e.end - e.begin, .dtype = dtypeName(e.dtype), .dt = e.dtype, .shape = e.shape, .rank = e.rank };
             l.map.putAssumeCapacity(try l.gpa.dupe(u8, name), t);
         }
     }

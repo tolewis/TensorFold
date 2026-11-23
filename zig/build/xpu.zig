@@ -221,6 +221,17 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     var runners = family(b, target, optimize, runtime(b, target, optimize, &nem.images, ze_mod, runner_core, dpas), runner_core, lanes);
     runners.images = nem.images;
     nemotronSteps(b, target, optimize, runners);
+    {
+        // Inkling 2 Mini's resident model, stream state and snapshots on the device; no kernels yet, so the runtime is host-only
+        const resident_xpu = runtime(b, target, optimize, &.{}, ze_mod, core, dpas);
+        const inkling2 = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/xpu.zig"), .target = target, .optimize = optimize, .link_libc = true });
+        inkling2.addImport("xpu", resident_xpu);
+        inkling2.addImport("core", core);
+        const resident = b.createModule(.{ .root_source_file = b.path("zig/tests/xpu/inkling2_resident.zig"), .target = target, .optimize = optimize, .link_libc = true });
+        resident.addImport("xpu", resident_xpu);
+        resident.addImport("inkling2_xpu", inkling2);
+        b.step("xpu-inkling2-tests", "Build the Inkling 2 Mini resident-model device test (tf-xpu-inkling2-resident-test)").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-xpu-inkling2-resident-test", .root_module = resident }), .{}).step);
+    }
     const with_contract = b.option(bool, "xpu-contract", "Build the XPU kernel contract's limits audit (needs ocloc for the objects)") orelse false;
     const images = b.option([]const u8, "xpu-images", "A directory of zebins made with xpu-kernel-contract-objects: glue, tp, decode, contract_attn_upstream, contract_merge_upstream, contract_controls, contract_gate_controls (.bin)");
     if (with_contract) xpu_contract.steps(b, target, optimize, ocloc, device, images);
@@ -411,6 +422,13 @@ pub fn hostTests(b: *std.Build, step: *std.Build.Step) void {
     const rope_tests = b.addRunArtifact(b.addTest(.{ .root_module = rope }));
     b.step("test-rope-xpu-host", "The XPU 27B runner's RoPE tables on core's rope_freq, without devices or ocloc").dependOn(&rope_tests.step);
     step.dependOn(&rope_tests.step);
+    // Inkling 2 Mini's XPU cache geometry, capacity math and snapshot sizes (host arithmetic only)
+    const inkling2_host = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/xpu.zig"), .target = host, .optimize = .debug, .link_libc = true });
+    inkling2_host.addImport("xpu", xpu);
+    inkling2_host.addImport("core", core);
+    const inkling2_tests = b.addRunArtifact(b.addTest(.{ .root_module = inkling2_host }));
+    b.step("test-inkling2-xpu-host", "Inkling 2 Mini's XPU stream state and snapshot geometry without devices").dependOn(&inkling2_tests.step);
+    step.dependOn(&inkling2_tests.step);
     // the Gemma 4 E4B runner's admission, over the family config (which takes `core` by name)
     const gemma4 = b.createModule(.{ .root_source_file = b.path("zig/src/families/gemma4/xpu_config.zig"), .target = host, .optimize = .debug });
     gemma4.addImport("core", core);
