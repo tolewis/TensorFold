@@ -7,7 +7,7 @@ pub const Error = ze.Error || error{ OutOfDeviceMemory, BuildFailed, OutOfMemory
 
 const out_of_device_memory: u32 = 0x70000002;
 
-/// Entries this runtime calls beyond ze.Api: teardown, fills and the SPIR-V build log.
+/// Entries this runtime calls beyond ze.Api: teardown, fills, kernel names and the SPIR-V build log.
 pub const Extra = struct {
     zeContextDestroy: *const fn (ze.H) callconv(.c) u32,
     zeCommandListDestroy: *const fn (ze.H) callconv(.c) u32,
@@ -16,6 +16,7 @@ pub const Extra = struct {
     zeModuleBuildLogGetString: *const fn (ze.H, *usize, ?[*]u8) callconv(.c) u32,
     zeModuleBuildLogDestroy: *const fn (ze.H) callconv(.c) u32,
     zeKernelDestroy: *const fn (ze.H) callconv(.c) u32,
+    zeKernelGetName: *const fn (ze.H, *usize, ?[*]u8) callconv(.c) u32,
 };
 
 /// The loader: ze.Api plus `Extra`, every symbol resolved or the whole loader refused.

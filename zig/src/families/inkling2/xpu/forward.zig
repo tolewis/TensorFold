@@ -361,6 +361,7 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     const logits = if (options.all) at(s.logits_all, 0) else at(segments[0].cache.logits, 0);
     try glue.logits(&p.glue, stream, at(s.mlp_normed, final.logits_row * state.hidden * 2), tensor(m.weights.unembed), logits, @intCast(final.logits_rows), m.config.text.unpadded_vocab);
     try g.commitFullHistories(segments);
+    if (xpu.profile.active) |prof| prof.enqueued();
     try stream.synchronize();
 }
 
