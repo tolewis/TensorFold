@@ -15,6 +15,8 @@ const snapshot = ink.snapshot;
 /// The desktop shares the card: its own use moves the free figure by this much between two readings.
 const tolerance: u64 = 256 << 20;
 const gib = 1024.0 * 1024.0 * 1024.0;
+/// The global capacity the scratch's attention partials are sized for.
+const scratch_capacity = 8192;
 
 fn gb(n: u64) f64 {
     return @as(f64, @floatFromInt(n)) / gib;
@@ -151,8 +153,8 @@ pub fn main(init: std.process.Init) !void {
     if (w.layers[6].controllers == null or w.layers[5].controllers != null) return error.Controllers;
     std.debug.print("weights: layer 0 experts NVFP4 ({d} bytes w13), layer 20 MXFP8 ({d} bytes w13), controllers on layers 6 to 17\n", .{ w.layers[0].gu.weight.bytes, w.layers[20].gu.weight.bytes });
 
-    const scratch_bytes = state.scratchBytes(state.max_rows);
-    var scratch = try state.Scratch.init(&r, state.max_rows);
+    const scratch_bytes = state.scratchBytes(state.max_rows, scratch_capacity);
+    var scratch = try state.Scratch.init(&r, state.max_rows, scratch_capacity);
     const with_scratch = try freeBytes(&ctx);
     std.debug.print("scratch for {d} rows: {d:.1} MiB (free now {d:.3} GiB)\n", .{ state.max_rows, @as(f64, @floatFromInt(scratch_bytes)) / (1 << 20), gb(with_scratch) });
 
