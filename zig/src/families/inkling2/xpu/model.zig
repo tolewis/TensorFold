@@ -5,6 +5,13 @@ const xpu = @import("xpu");
 const cfg = @import("../config.zig");
 const layer_plan = @import("../plan.zig");
 const st = @import("core").safetensors;
+const images = @import("inkling2_xpu_images");
+const attention = @import("attention.zig");
+const glue = @import("glue.zig");
+const experts = @import("experts.zig");
+const loop = @import("loop.zig");
+const runtime = @import("runtime.zig");
+const dense = @import("dense.zig");
 
 const rt = xpu.rt;
 const loader = xpu.loader;
@@ -83,19 +90,55 @@ pub const Weights = struct {
     layers: [24]LayerWeights,
 };
 
-/// Where the compiled kernels of the XPU slices go. The lead fills one field per slice when X1 to X4 land, each
-/// built from that slice's embedded image the way `metal/model.zig` builds its pipelines. Nothing here yet.
+/// The production kernels of every slice, built from the embedded images (`inkling2_xpu_images`): the modules own the
+/// code, each wrapper holds the kernels made from one of them.
 pub const Pipelines = struct {
-    /// X1: attention, decode and prompt paths.
-    attention: void = {},
-    /// X2: glue (embedding, block attention residual, convolutions, router, SwiGLU, pick, final cap).
-    glue: void = {},
-    /// X3: experts decoded as stored (NVFP4 and MXFP8).
-    experts: void = {},
-    /// X4: loop controllers and the cross-pass message.
-    loop: void = {},
-    /// X2: runtime copies, widen, partial sums and the tap capture.
-    runtime: void = {},
+    modules: [image_count]xpu.Module,
+    attention: attention.Kernels,
+    glue: glue.Pipelines,
+    experts: experts.Kernels,
+    loop: loop.Pipelines,
+    runtime: runtime.Pipelines,
+    dense: dense.Kernels,
+
+    const image_count = 7;
+
+    fn native(ctx: *const xpu.Context, comptime name: []const u8) !xpu.Module {
+        return xpu.Module.loadNative(ctx, &@field(images, name));
+    }
+
+    pub fn load(ctx: *const xpu.Context) !Pipelines {
+        var p: Pipelines = undefined;
+        var loaded: usize = 0;
+        errdefer for (p.modules[0..loaded]) |*mod| mod.unload();
+        inline for (.{ "attention", "prompt", "glue", "experts", "loop", "runtime", "dense" }, 0..) |name, i| {
+            p.modules[i] = try native(ctx, name);
+            loaded += 1;
+        }
+        p.attention = try attention.Kernels.init(p.modules[0], p.modules[1]);
+        errdefer p.attention.deinit();
+        p.glue = try glue.Pipelines.load(p.modules[2], false);
+        errdefer p.glue.deinit();
+        p.experts = try experts.Kernels.load(&p.modules[3], experts.default_prefix, null);
+        errdefer p.experts.deinit();
+        p.loop = try loop.Pipelines.load(p.modules[4]);
+        errdefer p.loop.deinit();
+        p.runtime = try runtime.Pipelines.load(p.modules[5], false);
+        errdefer p.runtime.deinit();
+        p.dense = try dense.Kernels.load(p.modules[6], false);
+        return p;
+    }
+
+    pub fn deinit(p: *Pipelines) void {
+        p.dense.deinit();
+        p.runtime.deinit();
+        p.loop.deinit();
+        p.experts.deinit();
+        p.glue.deinit();
+        p.attention.deinit();
+        for (&p.modules) |*mod| mod.unload();
+        p.* = undefined;
+    }
 };
 
 pub const Options = struct {
@@ -270,7 +313,9 @@ pub const Model = struct {
     config: cfg.Config,
     weights: Weights,
     weight_plan: layer_plan.Plan,
-    pipelines: Pipelines = .{},
+    /// The device context the kernels were made on; set with `pipelines` by `loadKernels`.
+    ctx: ?*const xpu.Context = null,
+    pipelines: ?Pipelines = null,
     options: Options,
     /// Every device or pinned host buffer the weights own, each once (shared tensors appear once).
     owned: std.ArrayList(rt.Buffer),
@@ -310,12 +355,20 @@ pub const Model = struct {
         return m;
     }
 
+    /// Builds the production kernels on `ctx` (the context `r` runs on); the forward needs them.
+    pub fn loadKernels(m: *Model, ctx: *const xpu.Context) !void {
+        if (m.pipelines != null) return;
+        m.pipelines = try Pipelines.load(ctx);
+        m.ctx = ctx;
+    }
+
     fn freeBuffers(m: *Model) void {
         for (m.owned.items) |*b| b.free();
         m.owned.deinit(m.gpa);
     }
 
     pub fn deinit(m: *Model) void {
+        if (m.pipelines) |*p| p.deinit();
         m.freeBuffers();
         m.gpa.destroy(m);
     }
