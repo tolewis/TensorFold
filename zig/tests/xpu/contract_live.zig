@@ -3,6 +3,7 @@ const std = @import("std");
 const core = @import("core");
 const rig_ = @import("contract_rig.zig");
 const dspark = @import("inkling2_dspark.zig");
+const dense = @import("inkling2_dense.zig");
 
 const limits = core.xpu_limits;
 const records = core.xpu_records;
@@ -87,6 +88,7 @@ fn argsOf(planted: []const u8) u32 {
     };
     for (table) |e| if (std.mem.eql(u8, e[0], symbol)) return e[1];
     if (dspark.argsOf(symbol)) |n| return n;
+    if (dense.argsOf(symbol)) |n| return n;
     if (inkling2Args(symbol)) |n| return n;
     return 1; // gate 5's controls take one output pointer
 }

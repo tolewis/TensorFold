@@ -37,7 +37,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     ctl.setCwd(b.path("."));
     const ctl_dir = ctl.addOutputDirectoryArg("ocloc-controls");
     _ = files.addCopyFile(ctl_dir.path(b, "contract_controls.bin"), b.fmt("{s}/contract_controls.bin", .{device}));
-    for (contract_images ++ inkling2_images ++ ink2_attn_images ++ ink2_attn_controls) |src| {
+    for (contract_images ++ inkling2_images ++ ink2_dense_images ++ ink2_attn_images ++ ink2_attn_controls) |src| {
         _ = files.addCopyFile(object(b, ocloc, device, src), b.fmt("{s}/{s}.bin", .{ device, src.name }));
     }
     for (inkling2.names, inkling2.images(b, ocloc, device)) |name, image| _ = files.addCopyFile(image, b.fmt("{s}/{s}.bin", .{ device, name }));
@@ -71,11 +71,14 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     // Inkling 2 Mini's DSpark: the host wrappers the contract file launches through, and the kernels' source text
     const dspark_host = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/xpu/dspark_kernels.zig"), .target = target, .optimize = optimize });
     dspark_host.addImport("xpu", xpu);
+    // Inkling 2 Mini's dense projections and norm: the host wrapper the contract file launches through
+    const dense_host = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/xpu/dense.zig"), .target = target, .optimize = optimize });
+    dense_host.addImport("xpu", xpu);
     const dspark_sources = b.createModule(.{ .root_source_file = b.path("zig/kernels/xpu/inkling2/dspark_sources.zig"), .target = target, .optimize = optimize });
 
     const files = b.addWriteFiles();
     if (prebuilt) |dir| {
-        for ([_][]const u8{ "glue", "tp", "contract_controls", "contract_gate_controls", "decode", "contract_attn_upstream", "contract_merge_upstream", "contract_inkling2_loop", "contract_inkling2_loop_controls", "inkling2_dspark", "contract_inkling2_dspark_controls", "contract_inkling2_experts", "contract_inkling2_controls" } ++ inkling2.names) |name| {
+        for ([_][]const u8{ "glue", "tp", "contract_controls", "contract_gate_controls", "decode", "contract_attn_upstream", "contract_merge_upstream", "contract_inkling2_loop", "contract_inkling2_loop_controls", "inkling2_dspark", "contract_inkling2_dspark_controls", "contract_inkling2_experts", "contract_inkling2_controls", "inkling2_dense", "contract_inkling2_dense_store", "contract_inkling2_dense_sums" } ++ inkling2.names) |name| {
             _ = files.addCopyFile(.{ .cwd_relative = b.fmt("{s}/{s}.bin", .{ dir, name }) }, b.fmt("{s}.bin", .{name}));
         }
         for (ink2_attn_images ++ ink2_attn_controls) |src| {
@@ -105,7 +108,7 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
             const dir = run.addOutputDirectoryArg(b.fmt("ocloc-{s}-run", .{pair[0]}));
             _ = files.addCopyFile(dir.path(b, b.fmt("{s}.bin", .{pair[0]})), b.fmt("{s}.bin", .{pair[0]}));
         }
-        for (contract_images[0..3] ++ contract_images[4..] ++ inkling2_images ++ ink2_attn_images ++ ink2_attn_controls) |src| {
+        for (contract_images[0..3] ++ contract_images[4..] ++ inkling2_images ++ ink2_dense_images ++ ink2_attn_images ++ ink2_attn_controls) |src| {
             _ = files.addCopyFile(object(b, ocloc, device, src), b.fmt("{s}.bin", .{src.name}));
         }
         for (inkling2.names, inkling2.images(b, ocloc, device)) |name, image| _ = files.addCopyFile(image, b.fmt("{s}.bin", .{name}));
@@ -136,6 +139,9 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         \\pub const ink2_prompt_ctl6 align(8) = @embedFile("inkling2_prompt_ctl6.bin").*;
         \\pub const inkling2_experts align(8) = @embedFile("contract_inkling2_experts.bin").*;
         \\pub const inkling2_controls align(8) = @embedFile("contract_inkling2_controls.bin").*;
+        \\pub const inkling2_dense align(8) = @embedFile("inkling2_dense.bin").*;
+        \\pub const contract_inkling2_dense_store align(8) = @embedFile("contract_inkling2_dense_store.bin").*;
+        \\pub const contract_inkling2_dense_sums align(8) = @embedFile("contract_inkling2_dense_sums.bin").*;
     ), .target = target, .optimize = optimize });
     // Inkling 2 Mini's loop: the host wrapper, its pure launch plan, and the host float model the device is held to
     const loop_plan = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/metal/loop_plan.zig"), .target = target, .optimize = optimize });
@@ -172,6 +178,7 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
             .{ .name = "inkling2_dspark_host", .module = dspark_host },
             .{ .name = "inkling2_dspark_sources", .module = dspark_sources },
             .{ .name = "inkling2_xpu_attention", .module = ink2_attention },
+            .{ .name = "inkling2_dense_host", .module = dense_host },
         },
     }) });
     const attn_bench = b.addExecutable(.{ .name = "tf-xpu-inkling2-attention-bench", .root_module = b.createModule(.{
@@ -222,6 +229,20 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         },
     }) });
     b.step("test-inkling2-dspark-xpu-host", "Mini DSpark's XPU host files (kernels, state, weights, fold) without a card").dependOn(&b.addRunArtifact(dspark_tests).step);
+    const dense_bench = b.addExecutable(.{ .name = "tf-xpu-inkling2-dense-bench", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/xpu/inkling2_dense_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "core", .module = core },
+            .{ .name = "xpu", .module = xpu },
+            .{ .name = "ze", .module = ze },
+            .{ .name = "xpu_contract_images", .module = images },
+            .{ .name = "inkling2_dense_host", .module = dense_host },
+        },
+    }) });
+    b.step("tf-xpu-inkling2-dense-bench", "Build the Mini dense and norm XPU timing (GB/s at the served shapes)").dependOn(&b.addInstallArtifact(dense_bench, .{}).step);
     const experts_bench = b.addExecutable(.{ .name = "tf-xpu-inkling2-experts-bench", .root_module = b.createModule(.{
         .root_source_file = b.path("zig/tests/xpu/inkling2_experts_bench.zig"),
         .target = target,
@@ -265,6 +286,14 @@ const inkling2_images = [_]Source{
         .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2",
         .inputs = &.{"zig/kernels/xpu/inkling2/dspark.cl"},
     },
+};
+
+/// Inkling 2 Mini's dense projections and norm, and the two images of their planted controls.
+const ink2_dense_options = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2";
+const ink2_dense_images = [_]Source{
+    .{ .name = "inkling2_dense", .path = "zig/kernels/xpu/inkling2/dense.cl", .extra = ink2_dense_options },
+    .{ .name = "contract_inkling2_dense_store", .path = "zig/kernels/xpu/inkling2/contract_dense_controls.cl", .extra = ink2_dense_options ++ " -DDENSE_CTL=1", .inputs = &.{"zig/kernels/xpu/inkling2/dense.cl"} },
+    .{ .name = "contract_inkling2_dense_sums", .path = "zig/kernels/xpu/inkling2/contract_dense_controls.cl", .extra = ink2_dense_options ++ " -DDENSE_CTL=2", .inputs = &.{"zig/kernels/xpu/inkling2/dense.cl"} },
 };
 
 /// Inkling 2 Mini attention (OpenCL C on bmg): the attention image and the prompt image.
