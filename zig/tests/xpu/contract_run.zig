@@ -19,6 +19,7 @@ const ink2_runtime_k = @import("inkling2_runtime.zig");
 const dspark_k = @import("inkling2_dspark.zig");
 const ink2_attn_k = @import("inkling2_attention.zig");
 const ink2_k = @import("inkling2_experts.zig");
+const dense_k = @import("inkling2_dense.zig");
 
 const g = core.gates;
 
@@ -120,6 +121,9 @@ pub fn main(init: std.process.Init) !u8 {
     var ink2 = ink2_k.Suite{ .a = a, .dev = &dev, .kernels = &kernels };
     defer ink2.deinit();
     try ink2.collect();
+    var dense = try dense_k.Suite.init(a, &dev);
+    defer dense.deinit();
+    try dense.collect(&kernels);
     if (only) |text| {
         var keep: usize = 0;
         for (kernels.items) |k| {
@@ -135,9 +139,13 @@ pub fn main(init: std.process.Init) !u8 {
     const t1 = ms(init.io);
     const lim = try gate5.table(a) + try live5.live(a, &dev);
     const model_problems = try loop_k.modelCheck(a, &dev);
+    const dense_problems = if (only == null or std.mem.indexOf(u8, only.?, "dense") != null)
+        try dense_k.report(a, &dev, &dense) + try dense_k.ldyCheck(a, &dev, &dense)
+    else
+        0;
     const t2 = ms(init.io);
     const tally = .{ t.kernels, t.passed, t.failed, t.known, t.controls, t.caught, t.missed, lim, t1 - t0, t2 - t1 };
     std.debug.print("SUMMARY bmg-g31 0x{x} {d} kernels: {d} pass gates 1-4, {d} fail, {d} known findings; {d} controls: " ++
         "{d} red as planted, {d} missed; {d} limit problems; gates {d} ms, limits {d} ms\n", .{dev.ctx.gpu.props.deviceId} ++ tally);
-    return @intCast(t.problems() + lim + model_problems);
+    return @intCast(t.problems() + lim + model_problems + dense_problems);
 }
