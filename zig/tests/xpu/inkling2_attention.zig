@@ -130,7 +130,7 @@ fn sigmoid(x: f64) f64 {
 /// The prompt kernel's P: rounded to bf16 against the running maximum after each tile of keys, rescaled in exact
 /// arithmetic after. `first` of each chunk restarts the maximum; the chunks fold in the merge. Returns the final maximum.
 fn promptWeights(score: []const f64, weights: []f64) f64 {
-    const tile_keys = 32;
+    const tile_keys = 16;
     const chunk = plan.prompt_chunk;
     var upper = -std.math.inf(f64);
     var base: usize = 0;

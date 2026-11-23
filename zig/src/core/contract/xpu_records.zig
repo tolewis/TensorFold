@@ -125,8 +125,8 @@ pub const records = [_]Record{
         .usage = .{.{ .threads = .{ 128, 1, 1 }, .sub_group = 16, .grf = 256 }},
     },
     .{
-        .launch = .{ .name = "inkling2 prompt attention", .symbol = "tf_ink2_attn_prompt", .image = "inkling2_prompt", .format = glue, .threads = .{ 16, 1, 1 }, .slm = 1024, .sub_group = 16, .grf = 256 },
-        .usage = .{.{ .threads = .{ 16, 1, 1 }, .slm = 1024, .sub_group = 16, .grf = 256 }},
+        .launch = .{ .name = "inkling2 prompt attention", .symbol = "tf_ink2_attn_prompt", .image = "inkling2_prompt", .format = glue, .threads = .{ 16, 1, 1 }, .slm = 512, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 16, 1, 1 }, .slm = 512, .sub_group = 16, .grf = 256 }},
     },
 };
 

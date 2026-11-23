@@ -8,7 +8,7 @@
 #define D 128
 #define EXTENT 1024
 #define GROUP 3  // query heads one K/V head serves
-#define KEYS 32  // keys a tile; the ring is a multiple of it
+#define KEYS 16  // keys a tile; the ring is a multiple of it. 32 spills 3,200 bytes a thread at 256 GRF
 #define PAIRS 16 // (row, query head) pairs a sub-group: one a lane, the DPAS columns
 
 #define LOG2E 1.4426950408889634f
@@ -63,7 +63,7 @@ kernel void tf_ink2_attn_prompt(global const ushort *q, global const ushort *kc,
     for (uint b = 0; b < KEYS / 8; ++b) sc[b] = 0.0f;
     for (uint ds = 0; ds < D / 16; ++ds) {
       ushort ka[KEYS];
-      intel_sub_group_2d_block_read_16b_32r16x1c((global void *)kt_k, D * 2, nv, D * 2, (int2)(ds * 16, 0), ka);
+      intel_sub_group_2d_block_read_16b_16r16x1c((global void *)kt_k, D * 2, nv, D * 2, (int2)(ds * 16, 0), ka);
       const int8 qb = live_pair ? as_int8(vload8(0, qrow + ds * 8)) : (int8)(0);
       UNROLL
       for (uint b = 0; b < KEYS / 8; ++b) {
