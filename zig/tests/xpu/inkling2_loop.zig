@@ -304,6 +304,37 @@ pub const Probe = struct {
         }
     }
 
+    /// What the host model's own summation order can move each output beyond the spec's allowance. A message's sums
+    /// (the rms, the two dots) carry gamma(depth) of their terms, which the output's two betas bound. A gate's zeta
+    /// is rounded to bf16, so an order that lands a sum across a rounding step moves one zeta by one bf16 step and
+    /// F and Gamma by that times a weight; two such steps are allowed.
+    pub fn hostSlack(self: *Probe, out: []f64) !void {
+        const hs = p.hidden;
+        const gamma = c.gamma(@floatFromInt(depth(self.shape)), 0x1p-24);
+        switch (self.kind) {
+            .messages => for (0..self.shape.rows) |row| {
+                const b0 = self.f[0][row * hs ..][0..hs];
+                const b1 = self.f[1][row * hs ..][0..hs];
+                const inv0 = p.rmsScale(b0);
+                const inv1 = p.rmsScale(b1);
+                var scale: f64 = 0;
+                for (b0, b1) |x, y| scale = @max(scale, @abs(@as(f64, x)) * inv0 + @abs(@as(f64, y)) * inv1);
+                @memset(out[row * p.message_entries * hs ..][0 .. p.message_entries * hs], 2 * gamma * scale);
+            },
+            .gates => for (0..self.shape.rows) |row| {
+                const hh = self.f[0][row * hs ..][0..hs];
+                const mm = self.f[1][row * hs ..][0..hs];
+                var zeta: [p.rank]f64 = undefined;
+                p.downProjection(hh, mm, self.f[2], &zeta);
+                for (0..hs) |d| {
+                    var step: f64 = 0;
+                    for (0..p.rank) |r| step = @max(step, @max(@abs(@as(f64, self.f[3][d * p.rank + r])), @abs(@as(f64, self.f[4][d * p.rank + r]))) * @abs(zeta[r]));
+                    out[row * hs + d] = (@abs(@as(f64, hh[d])) + @abs(@as(f64, mm[d]))) * 2 * 0x1p-7 * step;
+                }
+            },
+        }
+    }
+
     /// Every output of the prepared call through `loop_model.zig`: f64 values holding the model's binary32 results.
     pub fn hostModel(self: *Probe, a: std.mem.Allocator, out: []f64) !void {
         const hs = p.hidden;
@@ -340,8 +371,9 @@ pub const Probe = struct {
     }
 };
 
-/// The device's bytes against `loop_model.zig`'s host float model (ordered binary32 sums) at the served shapes: the two
-/// differ by summation order alone, so each output may differ by twice the spec's allowance at float64's value.
+/// The device's bytes against `loop_model.zig`'s host float model (ordered binary32 sums) at the served shapes. The two
+/// differ by summation order alone, so each output may differ by twice the spec's allowance at float64's value, plus
+/// what the model's own order can move: `hostSlack`.
 pub fn modelCheck(a: std.mem.Allocator, dev: *rig_.Dev) !usize {
     var problems: usize = 0;
     for (std.enums.values(p.Kind)) |kind| {
@@ -363,16 +395,18 @@ pub fn modelCheck(a: std.mem.Allocator, dev: *rig_.Dev) !usize {
             const mod = try a.alloc(f64, n);
             defer a.free(mod);
             try probe.hostModel(a, mod);
+            const slack = try a.alloc(f64, n);
+            defer a.free(slack);
+            try probe.hostSlack(slack);
             var worst: f64 = 0;
             var bad: usize = 0;
-            for (got, mod, want, mag) |x, y, w, m| {
+            for (got, mod, want, mag, slack) |x, y, w, m, extra| {
                 const d = @abs(@as(f64, x) - y);
-                const room = 2 * c.bound(spec, shape, w, m);
                 worst = @max(worst, d);
-                if (!(d <= room)) bad += 1;
+                if (!(d <= 2 * c.bound(spec, shape, w, m) + extra)) bad += 1;
             }
             problems += @intFromBool(bad != 0);
-            std.debug.print("{s} model {s} rows {d}: {d} of {d} outputs past twice the allowance, largest |device - loop_model| {e}\n", .{
+            std.debug.print("{s} model {s} rows {d}: {d} of {d} outputs past the allowance, largest |device - loop_model| {e}\n", .{
                 if (bad == 0) "PASS" else "FAIL", label(kind), shape.rows, bad, n, worst,
             });
         }

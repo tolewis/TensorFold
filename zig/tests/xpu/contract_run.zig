@@ -25,13 +25,19 @@ pub fn main(init: std.process.Init) !u8 {
     const a = init.gpa;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     var ordinal: ?u32 = null;
-    if (args.len == 3 and std.mem.eql(u8, args[1], "--device")) {
-        ordinal = std.fmt.parseInt(u32, args[2], 10) catch {
-            std.debug.print("usage: tf-xpu-contract-run [--device N]\n", .{});
-            return 2;
-        };
-    } else if (args.len != 1) {
-        std.debug.print("usage: tf-xpu-contract-run [--device N]\n", .{});
+    var only: ?[]const u8 = null; // gates 1 to 4 for the kernels whose name holds this text
+    var at: usize = 1;
+    while (at < args.len) : (at += 2) {
+        const ok = at + 1 < args.len;
+        if (ok and std.mem.eql(u8, args[at], "--device")) {
+            ordinal = std.fmt.parseInt(u32, args[at + 1], 10) catch null;
+            if (ordinal == null) break;
+        } else if (ok and std.mem.eql(u8, args[at], "--only")) {
+            only = args[at + 1];
+        } else break;
+    }
+    if (at < args.len) {
+        std.debug.print("usage: tf-xpu-contract-run [--device N] [--only TEXT]\n", .{});
         return 2;
     }
     var dev: rig_.Dev = undefined;
@@ -89,6 +95,14 @@ pub fn main(init: std.process.Init) !u8 {
         made += 1;
     };
     for (loops[0..made]) |*x| try kernels.append(a, x.kernel());
+    if (only) |text| {
+        var keep: usize = 0;
+        for (kernels.items) |k| if (std.mem.indexOf(u8, k.spec.name, text) != null) {
+            kernels.items[keep] = k;
+            keep += 1;
+        };
+        kernels.shrinkRetainingCapacity(keep);
+    }
     var t: g.Tally = .{};
     const t0 = ms(init.io);
     try g.runAll(a, kernels.items, 0x6b63, &t);
