@@ -13,6 +13,8 @@ const tp_k = @import("contract_tp.zig");
 const controls_k = @import("contract_controls.zig");
 const attn_k = @import("contract_attn.zig");
 const merge_k = @import("contract_merge.zig");
+const ink2_glue_k = @import("inkling2_glue.zig");
+const ink2_runtime_k = @import("inkling2_runtime.zig");
 
 const g = core.gates;
 
@@ -24,14 +26,20 @@ pub fn main(init: std.process.Init) !u8 {
     const a = init.gpa;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     var ordinal: ?u32 = null;
-    if (args.len == 3 and std.mem.eql(u8, args[1], "--device")) {
-        ordinal = std.fmt.parseInt(u32, args[2], 10) catch {
-            std.debug.print("usage: tf-xpu-contract-run [--device N]\n", .{});
+    var only: ?[]const u8 = null; // --only TEXT runs just the registrations whose name holds TEXT
+    var i: usize = 1;
+    while (i < args.len) : (i += 2) {
+        if (i + 1 < args.len and std.mem.eql(u8, args[i], "--device")) {
+            ordinal = std.fmt.parseInt(u32, args[i + 1], 10) catch {
+                std.debug.print("usage: tf-xpu-contract-run [--device N] [--only TEXT]\n", .{});
+                return 2;
+            };
+        } else if (i + 1 < args.len and std.mem.eql(u8, args[i], "--only")) {
+            only = args[i + 1];
+        } else {
+            std.debug.print("usage: tf-xpu-contract-run [--device N] [--only TEXT]\n", .{});
             return 2;
-        };
-    } else if (args.len != 1) {
-        std.debug.print("usage: tf-xpu-contract-run [--device N]\n", .{});
-        return 2;
+        }
     }
     var dev: rig_.Dev = undefined;
     dev.init(ordinal) catch |e| {
@@ -80,6 +88,21 @@ pub fn main(init: std.process.Init) !u8 {
     for (&controls, std.enums.values(controls_k.Which)) |*x, w| x.* = try controls_k.Control.init(a, &dev, w);
     defer for (&controls) |*x| x.deinit();
     for (&controls) |*x| try kernels.append(a, x.kernel());
+    var ink2_glue = ink2_glue_k.Suite{ .a = a, .dev = &dev, .kernels = &kernels };
+    defer ink2_glue.deinit();
+    try ink2_glue.collect(null);
+    var ink2_runtime = ink2_runtime_k.Suite{ .a = a, .dev = &dev, .kernels = &kernels };
+    defer ink2_runtime.deinit();
+    try ink2_runtime.collect(null);
+    if (only) |text| {
+        var keep: usize = 0;
+        for (kernels.items) |k| {
+            if (std.mem.indexOf(u8, k.spec.name, text) == null) continue;
+            kernels.items[keep] = k;
+            keep += 1;
+        }
+        kernels.shrinkRetainingCapacity(keep);
+    }
     var t: g.Tally = .{};
     const t0 = ms(init.io);
     try g.runAll(a, kernels.items, 0x6b63, &t);

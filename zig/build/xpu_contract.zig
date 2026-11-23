@@ -1,6 +1,7 @@
 //! The XPU kernel contract's limits audit: the compiled images' .ze_info and gate 5, with no GPU.
 const std = @import("std");
 const kernel_contract = @import("kernel_contract.zig");
+const inkling2 = @import("xpu_inkling2.zig");
 
 /// `-Dxpu-contract=true`: tf-xpu-kernel-contract, the objects it reads, and the no-GPU audit.
 pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, ocloc: []const u8, device: []const u8, prebuilt: ?[]const u8) void {
@@ -39,6 +40,8 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     for (contract_images) |src| {
         _ = files.addCopyFile(object(b, ocloc, device, src), b.fmt("{s}/{s}.bin", .{ device, src.name }));
     }
+    for (inkling2.names, inkling2.images(b, ocloc, device)) |name, image| _ = files.addCopyFile(image, b.fmt("{s}/{s}.bin", .{ device, name }));
+    inkling2.controlsTest(b);
     const install = b.addInstallDirectory(.{
         .source_dir = files.getDirectory(),
         .install_dir = .prefix,
@@ -67,7 +70,7 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
 
     const files = b.addWriteFiles();
     if (prebuilt) |dir| {
-        for ([_][]const u8{ "glue", "tp", "contract_controls", "contract_gate_controls", "decode", "contract_attn_upstream", "contract_merge_upstream" }) |name| {
+        for ([_][]const u8{ "glue", "tp", "contract_controls", "contract_gate_controls", "decode", "contract_attn_upstream", "contract_merge_upstream" } ++ inkling2.names) |name| {
             _ = files.addCopyFile(.{ .cwd_relative = b.fmt("{s}/{s}.bin", .{ dir, name }) }, b.fmt("{s}.bin", .{name}));
         }
     } else {
@@ -94,6 +97,7 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         for (contract_images[0..3]) |src| {
             _ = files.addCopyFile(object(b, ocloc, device, src), b.fmt("{s}.bin", .{src.name}));
         }
+        for (inkling2.names, inkling2.images(b, ocloc, device)) |name, image| _ = files.addCopyFile(image, b.fmt("{s}.bin", .{name}));
     }
     const images = b.createModule(.{ .root_source_file = files.add("xpu_contract_images.zig",
         \\pub const glue align(8) = @embedFile("glue.bin").*;
@@ -103,7 +107,12 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         \\pub const merge_upstream align(8) = @embedFile("contract_merge_upstream.bin").*;
         \\pub const controls align(8) = @embedFile("contract_controls.bin").*;
         \\pub const gate_controls align(8) = @embedFile("contract_gate_controls.bin").*;
+        \\pub const inkling2_glue align(8) = @embedFile("inkling2_glue.bin").*;
+        \\pub const inkling2_runtime align(8) = @embedFile("inkling2_runtime.bin").*;
+        \\pub const inkling2_glue_ctl align(8) = @embedFile("inkling2_glue_ctl.bin").*;
+        \\pub const inkling2_runtime_ctl align(8) = @embedFile("inkling2_runtime_ctl.bin").*;
     ), .target = target, .optimize = optimize });
+    const ink2_hosts = inkling2.hosts(b, target, optimize, xpu);
     const exe = b.addExecutable(.{ .name = "tf-xpu-contract-run", .root_module = b.createModule(.{
         .root_source_file = b.path("zig/tests/xpu/contract_run.zig"),
         .target = target,
@@ -114,6 +123,8 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
             .{ .name = "xpu", .module = xpu },
             .{ .name = "ze", .module = ze },
             .{ .name = "xpu_contract_images", .module = images },
+            .{ .name = "inkling2_xpu_glue", .module = ink2_hosts[0] },
+            .{ .name = "inkling2_xpu_runtime", .module = ink2_hosts[1] },
         },
     }) });
     b.step("tf-xpu-contract-run", "Build the XPU kernel-contract runner: gates 1 to 4 and gate 5 live on a card").dependOn(&b.addInstallArtifact(exe, .{}).step);

@@ -18,11 +18,21 @@ fn imageOf(name: []const u8) ?rig_.Image {
     if (std.mem.eql(u8, name, "contract_merge_upstream")) return .merge_upstream;
     if (std.mem.eql(u8, name, "contract_gate_controls")) return .gate;
     if (std.mem.eql(u8, name, "contract_controls")) return .controls;
+    if (std.mem.eql(u8, name, "inkling2_glue")) return .ink2_glue;
+    if (std.mem.eql(u8, name, "inkling2_runtime")) return .ink2_runtime;
+    if (std.mem.eql(u8, name, "inkling2_glue_ctl")) return .ink2_glue_ctl;
+    if (std.mem.eql(u8, name, "inkling2_runtime_ctl")) return .ink2_runtime_ctl;
     return null;
 }
 
 /// The arguments the launcher sets for a symbol, as the source's parameter list holds them.
-fn argsOf(symbol: []const u8) u32 {
+fn argsOf(planted: []const u8) u32 {
+    // an Inkling 2 control is the production kernel with one edit: tf_ctl_inkling2_ar takes tf_inkling2_ar's arguments
+    var buf: [64]u8 = undefined;
+    const symbol = if (std.mem.startsWith(u8, planted, "tf_ctl_inkling2_") or std.mem.startsWith(u8, planted, "tf_ctl_ink2_"))
+        std.fmt.bufPrint(&buf, "tf_{s}", .{planted["tf_ctl_".len..]}) catch planted
+    else
+        planted;
     const table = [_]struct { []const u8, u32 }{
         .{ "add_rmsnorm", 14 },
         .{ "add_rmsnorm_dec", 14 },
@@ -45,6 +55,21 @@ fn argsOf(symbol: []const u8) u32 {
         .{ "attn_merge", 8 },
         .{ "tf_ctl_attn_drop_slice", 8 },
         .{ "tf_ctl_attn_merge_unguarded", 8 },
+        .{ "tf_inkling2_embed_norm", 5 },
+        .{ "tf_inkling2_ar", 6 },
+        .{ "tf_inkling2_conv_static", 5 },
+        .{ "tf_inkling2_conv_dynamic", 7 },
+        .{ "tf_inkling2_router", 6 },
+        .{ "tf_inkling2_swiglu", 4 },
+        .{ "tf_inkling2_logits", 5 },
+        .{ "tf_inkling2_expert_pick", 5 },
+        .{ "tf_inkling2_expert_combine", 5 },
+        .{ "tf_ink2_copy_bf16", 4 },
+        .{ "tf_ink2_copy_f32", 4 },
+        .{ "tf_ink2_widen", 4 },
+        .{ "tf_ink2_attention_partial", 6 },
+        .{ "tf_ink2_mlp_partial", 5 },
+        .{ "tf_ink2_capture_tap", 4 },
     };
     for (table) |e| if (std.mem.eql(u8, e[0], symbol)) return e[1];
     return 1; // gate 5's controls take one output pointer
