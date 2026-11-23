@@ -126,6 +126,20 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         },
     }) });
     b.step("tf-xpu-contract-run", "Build the XPU kernel-contract runner: gates 1 to 4 and gate 5 live on a card").dependOn(&b.addInstallArtifact(exe, .{}).step);
+    const bench = b.addExecutable(.{ .name = "tf-xpu-dspark-bench", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/xpu/inkling2_dspark_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "core", .module = core },
+            .{ .name = "xpu", .module = xpu },
+            .{ .name = "ze", .module = ze },
+            .{ .name = "xpu_contract_images", .module = images },
+            .{ .name = "inkling2_dspark_host", .module = dspark_host },
+        },
+    }) });
+    b.step("tf-xpu-dspark-bench", "Build the Mini DSpark XPU kernel timing (GB/s at the served shapes)").dependOn(&b.addInstallArtifact(bench, .{}).step);
     // The drafter's host files tested without a card; `core` here is only the safetensors reader they use.
     const safetensors = b.createModule(.{ .root_source_file = b.path("zig/src/core/safetensors.zig"), .target = target, .optimize = optimize });
     const core_reader = b.addWriteFiles();
