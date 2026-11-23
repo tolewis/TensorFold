@@ -3,7 +3,7 @@
 const std = @import("std");
 const xpu = @import("xpu");
 const plan = @import("../plan.zig");
-const ap = @import("../metal/attention_plan.zig");
+const ap = @import("attention_plan.zig");
 
 const rt = xpu.rt;
 
@@ -12,7 +12,6 @@ pub const batch_rows = 32;
 pub const prompt_rows = 64;
 pub const max_rows = 64;
 pub const max_segments = batch_rows;
-pub const max_attention_stride = 64;
 pub const hidden = 2304;
 pub const feature_taps = 4;
 pub const feature_row_bytes = feature_taps * hidden * 2;
@@ -70,8 +69,12 @@ pub fn globalSlots(capacity: usize) usize {
     return std.mem.alignForward(usize, capacity, ap.tile_keys);
 }
 
-pub fn globalStride(capacity: usize) usize {
-    return @max(@as(usize, ap.sliding_chunk / ap.tile_keys + 2), std.math.divCeil(usize, capacity, ap.global_chunk) catch unreachable);
+/// Partial slots a row and head hold in `part_o` and `part_ml`: the most any visit of a stream with a global capacity of
+/// `capacity` positions needs, at the chunk each layer kind uses (the global chunk is 256, the sliding chunk 64).
+pub fn partialStride(capacity: usize) usize {
+    const sliding = ap.slotsFor(ap.Layer.sliding(1024, max_rows), 1024 + max_rows);
+    const global = ap.slotsFor(ap.Layer.global(@intCast(capacity)), capacity);
+    return @max(sliding, global);
 }
 
 /// Bytes of every visit's K and V (values and scales) for a global capacity of `capacity` positions.
@@ -300,29 +303,32 @@ pub const fields = [_][]const u8{
     "partial",  "ar",         "gated",      "mlp_ar",    "mlp_gated",  "q_norm",    "k_norm",        "v_norm",   "q_raw",   "k_raw",
     "v_raw",    "rel_raw",    "sink",       "gate",      "k_conv",     "v_conv",    "q_prep",        "rel_prep", "rel_tab", "part_o",
     "part_ml",  "att",        "attn_dense", "attn_conv", "mlp_normed", "route_ids", "route_weights", "gu",       "down",    "mlp_out",
-    "mlp_conv", "logits_all",
+    "mlp_conv", "logits_all", "members",    "items",     "count",
 };
 
-fn sizes(rows: usize) [fields.len]usize {
+fn sizes(rows: usize, capacity: usize) [fields.len]usize {
     const r = rows;
     const h = hidden;
     const q = query_width;
     const kv = kv_width;
     const bf = 2;
     const fp = 4;
+    const stride = partialStride(capacity);
+    const items = @min(r * experts_per_token, 128 + r * experts_per_token / 32);
     return .{
-        r * 4,                     r * 4,                                            r * 4,                                     max_segments * @sizeOf(ap.Seg), r * h * bf,     r * h * bf,     r * block_slots * h * bf,
-        r * h * bf,                r * h * bf,                                       r * message_entries * h * fp,              r * h * fp,                     3 * r * h * fp, 3 * r * h * fp, r * h * fp,
-        r * h * fp,                r * h * bf,                                       r * h * bf,                                r * h * bf,                     r * q * bf,     r * kv * bf,    r * kv * bf,
-        r * rel_width * bf,        r * 24 * bf,                                      r * q * bf,                                r * kv * bf,                    r * kv * bf,    r * q * bf,     r * rel_width * bf,
-        r * 24 * ap.extent * bf,   r * 24 * max_attention_stride * ap.head_dim * fp, r * 24 * max_attention_stride * 2 * fp,    r * q * bf,                     r * h * bf,     r * h * bf,     r * h * bf,
-        r * experts_per_token * 4, r * experts_per_token * fp,                       r * experts_per_token * intermediate * bf, r * experts_per_token * h * bf, r * h * bf,     r * h * bf,     r * vocabulary * fp,
+        r * 4,                     r * 4,                              r * 4,                                     max_segments * @sizeOf(ap.Seg), r * h * bf,     r * h * bf,     r * block_slots * h * bf,
+        r * h * bf,                r * h * bf,                         r * message_entries * h * fp,              r * h * fp,                     3 * r * h * fp, 3 * r * h * fp, r * h * fp,
+        r * h * fp,                r * h * bf,                         r * h * bf,                                r * h * bf,                     r * q * bf,     r * kv * bf,    r * kv * bf,
+        r * rel_width * bf,        r * 24 * bf,                        r * q * bf,                                r * kv * bf,                    r * kv * bf,    r * q * bf,     r * rel_width * bf,
+        r * 24 * ap.extent * bf,   r * 24 * stride * ap.head_dim * fp, r * 24 * stride * 2 * fp,                  r * q * bf,                     r * h * bf,     r * h * bf,     r * h * bf,
+        r * experts_per_token * 4, r * experts_per_token * fp,         r * experts_per_token * intermediate * bf, r * experts_per_token * h * bf, r * h * bf,     r * h * bf,     r * vocabulary * fp,
+        r * experts_per_token * 4, items * 3 * 4,                      4,
     };
 }
 
-pub fn scratchBytes(rows: usize) usize {
+pub fn scratchBytes(rows: usize, capacity: usize) usize {
     var out: usize = 0;
-    for (sizes(rows)) |n| out += @max(n, 16);
+    for (sizes(rows, capacity)) |n| out += @max(n, 16);
     return out;
 }
 
@@ -369,14 +375,22 @@ pub const Scratch = struct {
     mlp_out: rt.Buffer,
     mlp_conv: rt.Buffer,
     logits_all: rt.Buffer,
+    /// The prompt experts' grouping of the routes: members by expert, items (expert, first member, count), item count.
+    members: rt.Buffer,
+    items: rt.Buffer,
+    count: rt.Buffer,
     /// Opt-in DSpark features [row][tap][H], allocated by prepare_features.
     taps: ?rt.Buffer = null,
     rows: usize,
+    /// The largest global capacity the scratch was sized for, and the partial slots a row and head hold from it.
+    capacity: usize,
+    stride: u32,
 
-    pub fn init(r: *rt.Runtime, rows: usize) !Scratch {
+    /// `capacity` is the largest global capacity of any cache the scratch serves; it sizes the attention partials.
+    pub fn init(r: *rt.Runtime, rows: usize, capacity: usize) !Scratch {
         @setEvalBranchQuota(10_000);
-        if (rows == 0 or rows > max_rows) return error.Inkling2ScratchRows;
-        const ns = sizes(rows);
+        if (rows == 0 or rows > max_rows or capacity == 0 or capacity > max_capacity) return error.Inkling2ScratchRows;
+        const ns = sizes(rows, capacity);
         var s: Scratch = undefined;
         var made: usize = 0;
         errdefer inline for (fields, 0..) |f, i| if (i < made) @field(s, f).free();
@@ -386,6 +400,11 @@ pub const Scratch = struct {
         }
         s.taps = null;
         s.rows = rows;
+        s.capacity = capacity;
+        s.stride = @intCast(partialStride(capacity));
+        // a fresh allocation holds whatever the driver last left there; the forward reads only what it wrote, but zero is the safe start
+        inline for (fields) |f| try zero(r, @field(s, f), @field(s, f).len);
+        try r.sync();
         return s;
     }
 
