@@ -1,0 +1,241 @@
+// Inkling 2 Mini glue on Intel Xe2 (OpenCL C), the port of kernels/metal/inkling2/glue.metal.
+// Every reduction is FP32; bf16 values are ushort bits and every bf16 store rounds to nearest even.
+// Build with -cl-fp32-correctly-rounded-divide-sqrt so that `/` and sqrt are IEEE, as Metal's precise:: calls are.
+//
+// Layout rule for the contract's control generator: helpers come first, then one kernel at a time, each starting on
+// the line that holds its `void tf_inkling2_<name>(` and ending at the first `}` in column 0.
+
+#pragma OPENCL FP_CONTRACT OFF
+
+#define KERNEL(N) __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(N, 1, 1))) kernel
+
+#define INK_HIDDEN 2304
+#define INK_EPS 1e-6f
+#define INK_AR_SCALE 0x1.555556p-6f // binary32(1 / 48)
+#define INK_SQRT5 0x1.1e377ap+1f    // binary32(sqrt(5))
+
+static inline float bf2f(ushort h) { return as_float((uint)h << 16); }
+static inline ushort f2bf(float f) { return intel_convert_bfloat16_as_ushort(f); } // round to nearest even
+
+static inline float ink_sigmoid(float x) {
+  const float e = exp(-fabs(x));
+  return x < 0.0f ? e / (1.0f + e) : 1.0f / (1.0f + e);
+}
+static inline float ink_cap(float x, float c) { return c * tanh(x / c); }
+static inline float ink_value(global const ushort *blocks, global const float *partial, uint source, uint sources, uint d) {
+  return source + 1 == sources ? partial[d] : bf2f(blocks[(ulong)source * INK_HIDDEN + d]);
+}
+
+// The sum of one value a work-item over a work-group of 256: the 16 sub-group sums, added in order, in every item.
+static float ink_wg_sum(float v, local float *red) {
+  const float s = sub_group_reduce_add(v);
+  if (get_sub_group_local_id() == 0) red[get_sub_group_id()] = s;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float t = 0.0f;
+  for (int i = 0; i < 16; i++) t += red[i];
+  barrier(CLK_LOCAL_MEM_FENCE);
+  return t;
+}
+
+// Grid (rows). out[row] = bf16(weight * (table[ids[row]] * rsqrt(mean(table[ids[row]]^2) + eps))).
+KERNEL(256) void tf_inkling2_embed_norm(global const uint *ids, global const ushort *table, global const ushort *weight,
+                                        global ushort *out, uint rows) {
+  const uint row = get_group_id(0), t = get_local_id(0);
+  if (row >= rows) return;
+  local float red[16];
+  global const ushort *x = table + (ulong)ids[row] * INK_HIDDEN;
+  float part = 0.0f;
+  for (uint d = t; d < INK_HIDDEN; d += 256) {
+    const float v = bf2f(x[d]);
+    part += v * v;
+  }
+  const float total = ink_wg_sum(part, red);
+  const float inverse = rsqrt(total / 2304.0f + INK_EPS);
+  for (uint d = t; d < INK_HIDDEN; d += 256) out[(ulong)row * INK_HIDDEN + d] = f2bf(bf2f(weight[d]) * (bf2f(x[d]) * inverse));
+}
+
+// Grid (queries). sources are completed bf16 blocks plus one unrounded fp32 partial (the last source); one fp32 row a query.
+KERNEL(256) void tf_inkling2_ar(global const ushort *blocks, global const float *partial, global const float *queries,
+                                global float *out, uint sources, uint count) {
+  const uint q = get_group_id(0), t = get_local_id(0), sg = get_sub_group_id();
+  if (q >= count || sources == 0 || sources > 5) return;
+  local float red[160]; // 5 sources of 16 sub-group sums for the squares, then for the dots
+  for (uint s = 0; s < sources; ++s) {
+    float ss = 0.0f;
+    for (uint d = t; d < INK_HIDDEN; d += 256) {
+      const float x = ink_value(blocks, partial, s, sources, d);
+      ss += x * x;
+    }
+    const float reduced = sub_group_reduce_add(ss);
+    if (get_sub_group_local_id() == 0) red[s * 16 + sg] = reduced;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float means[5];
+  for (uint s = 0; s < sources; ++s) {
+    float ss = 0.0f;
+    for (uint j = 0; j < 16; ++j) ss += red[s * 16 + j];
+    means[s] = rsqrt(ss / 2304.0f + INK_EPS);
+  }
+  local float *dots = red + 80;
+  for (uint s = 0; s < sources; ++s) {
+    float dot = 0.0f;
+    for (uint d = t; d < INK_HIDDEN; d += 256) {
+      const float z = ink_value(blocks, partial, s, sources, d) * means[s];
+      dot += queries[(ulong)q * INK_HIDDEN + d] * z;
+    }
+    const float reduced = sub_group_reduce_add(dot);
+    if (get_sub_group_local_id() == 0) dots[s * 16 + sg] = reduced;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float weights[5];
+  float peak = -INFINITY;
+  for (uint s = 0; s < sources; ++s) {
+    float dot = 0.0f;
+    for (uint j = 0; j < 16; ++j) dot += dots[s * 16 + j];
+    weights[s] = dot * INK_AR_SCALE;
+    peak = peak < weights[s] ? weights[s] : peak;
+  }
+  float den = 0.0f;
+  for (uint s = 0; s < sources; ++s) {
+    weights[s] = exp(weights[s] - peak);
+    den += weights[s];
+  }
+  for (uint s = 0; s < sources; ++s) weights[s] = weights[s] / den;
+  for (uint d = t; d < INK_HIDDEN; d += 256) {
+    float acc = 0.0f;
+    for (uint s = 0; s < sources; ++s) acc += weights[s] * (ink_value(blocks, partial, s, sources, d) * means[s]);
+    out[(ulong)q * INK_HIDDEN + d] = acc;
+  }
+}
+
+// Grid (ceil(channels / 256), rows). taps holds three old rows, then `rows` current bf16 inputs; weight is [channel][4].
+KERNEL(256) void tf_inkling2_conv_static(global const ushort *taps, global const ushort *weight, global ushort *out,
+                                         uint rows, uint channels) {
+  const uint c = get_global_id(0), r = get_group_id(1);
+  if (c >= channels || r >= rows) return;
+  float sum = bf2f(taps[(ulong)(r + 3) * channels + c]);
+  for (uint tap = 0; tap < 4; ++tap) sum += bf2f(weight[c * 4 + tap]) * bf2f(taps[(ulong)(r + tap) * channels + c]);
+  out[(ulong)r * channels + c] = f2bf(sum / INK_SQRT5);
+}
+
+// Grid (rows). static_w is [lag][channel]; projection is [32][2304]; four lag weights a group of 128 channels.
+KERNEL(256) void tf_inkling2_conv_dynamic(global const ushort *taps, global const ushort *input, global const ushort *static_w,
+                                          global const ushort *projection, global ushort *out, uint rows, uint channels) {
+  const uint r = get_group_id(0), t = get_local_id(0);
+  if (r >= rows) return;
+  local float projected[32];
+  if (t < 32) {
+    float dot = 0.0f;
+    for (uint d = 0; d < INK_HIDDEN; ++d) dot += bf2f(projection[(ulong)t * INK_HIDDEN + d]) * bf2f(input[(ulong)r * INK_HIDDEN + d]);
+    projected[t] = bf2f(f2bf(dot));
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (uint c = t; c < channels; c += 256) {
+    float sum = bf2f(taps[(ulong)(r + 3) * channels + c]);
+    for (uint lag = 0; lag < 4; ++lag) {
+      const float w = bf2f(static_w[lag * channels + c]) + projected[4 * (c / 128) + lag];
+      sum += w * bf2f(taps[(ulong)(r + 3 - lag) * channels + c]);
+    }
+    out[(ulong)r * channels + c] = f2bf(sum / 3.0f);
+  }
+}
+
+// Grid (rows). Sigmoid scores of 128 experts; the top 8 by score + bias, sorted by ascending expert index.
+KERNEL(256) void tf_inkling2_router(global const ushort *x, global const ushort *weight, global const float *bias,
+                                    global uint *ids, global float *weights, uint rows) {
+  const uint row = get_group_id(0), t = get_local_id(0);
+  if (row >= rows) return;
+  local float scores[128], chosen[8];
+  local uint picked[8];
+  local uchar used[128];
+  if (t < 128) {
+    float dot = 0.0f;
+    for (uint d = 0; d < INK_HIDDEN; ++d) dot += bf2f(weight[(ulong)t * INK_HIDDEN + d]) * bf2f(x[(ulong)row * INK_HIDDEN + d]);
+    scores[t] = ink_sigmoid(dot);
+    used[t] = 0;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (t == 0) {
+    for (uint j = 0; j < 8; ++j) {
+      uint best = 128;
+      for (uint e = 0; e < 128; ++e)
+        if (!used[e]) {
+          if (best == 128 || scores[e] + bias[e] > scores[best] + bias[best]) best = e;
+        }
+      used[best] = 1;
+      picked[j] = best;
+      chosen[j] = scores[best];
+    }
+    // Combining, including the denominator, is in ascending expert index.
+    for (uint j = 1; j < 8; ++j) {
+      const uint id = picked[j];
+      const float score = chosen[j];
+      uint k = j;
+      while (k > 0 && picked[k - 1] > id) {
+        picked[k] = picked[k - 1];
+        chosen[k] = chosen[k - 1];
+        --k;
+      }
+      picked[k] = id;
+      chosen[k] = score;
+    }
+    float den = 1e-20f;
+    for (uint j = 0; j < 8; ++j) den += chosen[j];
+    for (uint j = 0; j < 8; ++j) {
+      ids[row * 8 + j] = picked[j];
+      weights[row * 8 + j] = chosen[j] / den * 8.0f;
+    }
+  }
+}
+
+// Grid (ceil(width / 256), rows). gu is [row][width][gate, up] bf16.
+KERNEL(256) void tf_inkling2_swiglu(global const ushort *gu, global ushort *out, uint rows, uint width) {
+  const uint j = get_global_id(0), r = get_group_id(1);
+  if (j >= width || r >= rows) return;
+  const float g = bf2f(gu[((ulong)r * width + j) * 2]);
+  const float u = bf2f(gu[((ulong)r * width + j) * 2 + 1]);
+  out[(ulong)r * width + j] = f2bf(ink_cap(g, 4.0f) * ink_sigmoid(g) * ink_cap(u, 25.0f));
+}
+
+// Grid (ceil(vocab / 16), rows). One sub-group a vocabulary row: the lanes take 8 values each in turn, the sum is FP32.
+KERNEL(256) void tf_inkling2_logits(global const ushort *h, global const ushort *unembed, global float *out, uint rows,
+                                    uint vocab) {
+  const uint v = get_group_id(0) * 16 + get_sub_group_id(), r = get_group_id(1), lane = get_sub_group_local_id();
+  if (v >= vocab || r >= rows) return;
+  global const ushort *w = unembed + (ulong)v * INK_HIDDEN;
+  global const ushort *x = h + (ulong)r * INK_HIDDEN;
+  float dot = 0.0f;
+  for (uint i = lane; i < INK_HIDDEN / 8; i += 16) {
+    const ushort8 a = vload8(i, w), b = vload8(i, x);
+    float part = bf2f(a.s0) * bf2f(b.s0);
+    part += bf2f(a.s1) * bf2f(b.s1);
+    part += bf2f(a.s2) * bf2f(b.s2);
+    part += bf2f(a.s3) * bf2f(b.s3);
+    part += bf2f(a.s4) * bf2f(b.s4);
+    part += bf2f(a.s5) * bf2f(b.s5);
+    part += bf2f(a.s6) * bf2f(b.s6);
+    part += bf2f(a.s7) * bf2f(b.s7);
+    dot += part;
+  }
+  dot = sub_group_reduce_add(dot);
+  // The unembedding rounds to bf16 before it widens for softcap30.
+  if (lane == 0) out[(ulong)r * vocab + v] = ink_cap(bf2f(f2bf(dot)), 30.0f);
+}
+
+// Grid (ceil(channels / 256), 8, rows). experts is [row][128][channels]; out is [row][8][channels].
+KERNEL(256) void tf_inkling2_expert_pick(global const ushort *experts, global const uint *ids, global ushort *out, uint rows,
+                                         uint channels) {
+  const uint d = get_global_id(0), j = get_group_id(1), r = get_group_id(2);
+  if (d >= channels || r >= rows) return;
+  out[((ulong)r * 8 + j) * channels + d] = experts[((ulong)r * 128 + ids[r * 8 + j]) * channels + d];
+}
+
+// Grid (ceil(channels / 256), rows). The eight picked rows are added in order j = 0 to 7 in FP32.
+KERNEL(256) void tf_inkling2_expert_combine(global const ushort *picked, global const float *weights, global ushort *out,
+                                            uint rows, uint channels) {
+  const uint d = get_global_id(0), r = get_group_id(1);
+  if (d >= channels || r >= rows) return;
+  float acc = 0.0f;
+  for (uint j = 0; j < 8; ++j) acc += weights[r * 8 + j] * bf2f(picked[((ulong)r * 8 + j) * channels + d]);
+  out[(ulong)r * channels + d] = f2bf(acc);
+}

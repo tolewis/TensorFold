@@ -9,7 +9,7 @@ pub const guard = 256;
 const pattern = 0xa5;
 
 /// The image a kernel lives in: the Qwen3.8-27B glue, TP collectives, gate 5's controls, or gates 1 to 4's.
-pub const Image = enum { glue, tp, decode, attn_upstream, merge_upstream, controls, gate, inkling2_loop, inkling2_loop_controls };
+pub const Image = enum { glue, tp, decode, attn_upstream, merge_upstream, controls, gate, inkling2_loop, inkling2_loop_controls, ink2_glue, ink2_runtime, ink2_glue_ctl, ink2_runtime_ctl };
 
 fn blob(i: Image) []const u8 {
     return switch (i) {
@@ -22,6 +22,10 @@ fn blob(i: Image) []const u8 {
         .gate => &images.gate_controls,
         .inkling2_loop => &images.inkling2_loop,
         .inkling2_loop_controls => &images.inkling2_loop_controls,
+        .ink2_glue => &images.inkling2_glue,
+        .ink2_runtime => &images.inkling2_runtime,
+        .ink2_glue_ctl => &images.inkling2_glue_ctl,
+        .ink2_runtime_ctl => &images.inkling2_runtime_ctl,
     };
 }
 
@@ -40,6 +44,10 @@ pub const Dev = struct {
     gate: xpu.Module,
     inkling2_loop: xpu.Module,
     inkling2_loop_controls: xpu.Module, // loop.cl with its two arithmetic anchors dropped
+    ink2_glue: xpu.Module,
+    ink2_runtime: xpu.Module,
+    ink2_glue_ctl: xpu.Module,
+    ink2_runtime_ctl: xpu.Module,
 
     /// Opens the card `ordinal` names, else the first Arc card, and loads every image; `self` stays where it is.
     pub fn init(self: *Dev, ordinal: ?u32) !void {
@@ -58,9 +66,17 @@ pub const Dev = struct {
         self.gate = try xpu.Module.loadNative(&self.ctx, blob(.gate));
         self.inkling2_loop = try xpu.Module.loadNative(&self.ctx, blob(.inkling2_loop));
         self.inkling2_loop_controls = try xpu.Module.loadNative(&self.ctx, blob(.inkling2_loop_controls));
+        self.ink2_glue = try xpu.Module.loadNative(&self.ctx, blob(.ink2_glue));
+        self.ink2_runtime = try xpu.Module.loadNative(&self.ctx, blob(.ink2_runtime));
+        self.ink2_glue_ctl = try xpu.Module.loadNative(&self.ctx, blob(.ink2_glue_ctl));
+        self.ink2_runtime_ctl = try xpu.Module.loadNative(&self.ctx, blob(.ink2_runtime_ctl));
     }
 
     pub fn deinit(self: *Dev) void {
+        self.ink2_runtime_ctl.unload();
+        self.ink2_glue_ctl.unload();
+        self.ink2_runtime.unload();
+        self.ink2_glue.unload();
         self.inkling2_loop_controls.unload();
         self.inkling2_loop.unload();
         self.gate.unload();
@@ -86,6 +102,10 @@ pub const Dev = struct {
             .gate => &self.gate,
             .inkling2_loop => &self.inkling2_loop,
             .inkling2_loop_controls => &self.inkling2_loop_controls,
+            .ink2_glue => &self.ink2_glue,
+            .ink2_runtime => &self.ink2_runtime,
+            .ink2_glue_ctl => &self.ink2_glue_ctl,
+            .ink2_runtime_ctl => &self.ink2_runtime_ctl,
         };
     }
 
