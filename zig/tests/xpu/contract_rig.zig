@@ -48,6 +48,12 @@ pub const Dev = struct {
     ink2_runtime: xpu.Module,
     ink2_glue_ctl: xpu.Module,
     ink2_runtime_ctl: xpu.Module,
+    /// Images a family's own contract file loads by the name its launch records give (`addImage`).
+    extra: [max_extra]Extra = undefined,
+    extra_n: usize = 0,
+
+    pub const max_extra = 8;
+    pub const Extra = struct { name: []const u8, module: xpu.Module };
 
     /// Opens the card `ordinal` names, else the first Arc card, and loads every image; `self` stays where it is.
     pub fn init(self: *Dev, ordinal: ?u32) !void {
@@ -70,9 +76,24 @@ pub const Dev = struct {
         self.ink2_runtime = try xpu.Module.loadNative(&self.ctx, blob(.ink2_runtime));
         self.ink2_glue_ctl = try xpu.Module.loadNative(&self.ctx, blob(.ink2_glue_ctl));
         self.ink2_runtime_ctl = try xpu.Module.loadNative(&self.ctx, blob(.ink2_runtime_ctl));
+        self.extra_n = 0;
+    }
+
+    /// Loads `bin` native under `name`, the `image` of the launch records that name it; `bin` outlives the device.
+    pub fn addImage(self: *Dev, name: []const u8, bin: []const u8) !void {
+        if (self.extra_n == max_extra) return error.TooManyImages;
+        self.extra[self.extra_n] = .{ .name = name, .module = try xpu.Module.loadNative(&self.ctx, bin) };
+        self.extra_n += 1;
+    }
+
+    /// The module `addImage` loaded under `name`.
+    pub fn named(self: *Dev, name: []const u8) ?*xpu.Module {
+        for (self.extra[0..self.extra_n]) |*e| if (std.mem.eql(u8, e.name, name)) return &e.module;
+        return null;
     }
 
     pub fn deinit(self: *Dev) void {
+        for (self.extra[0..self.extra_n]) |*e| e.module.unload();
         self.ink2_runtime_ctl.unload();
         self.ink2_glue_ctl.unload();
         self.ink2_runtime.unload();

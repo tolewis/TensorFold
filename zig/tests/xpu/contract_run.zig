@@ -16,6 +16,7 @@ const merge_k = @import("contract_merge.zig");
 const loop_k = @import("inkling2_loop.zig");
 const ink2_glue_k = @import("inkling2_glue.zig");
 const ink2_runtime_k = @import("inkling2_runtime.zig");
+const dspark_k = @import("inkling2_dspark.zig");
 
 const g = core.gates;
 
@@ -103,6 +104,9 @@ pub fn main(init: std.process.Init) !u8 {
     var ink2_runtime = ink2_runtime_k.Suite{ .a = a, .dev = &dev, .kernels = &kernels };
     defer ink2_runtime.deinit();
     try ink2_runtime.collect(null);
+    var dspark = try dspark_k.Suite.init(a, &dev);
+    defer dspark.deinit();
+    try dspark.collect(&kernels);
     if (only) |text| {
         var keep: usize = 0;
         for (kernels.items) |k| {

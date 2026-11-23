@@ -9,6 +9,7 @@ const U = limits.XpuUsage;
 pub const Record = struct { launch: X, usage: [limits.xe.len]U, compiled: bool = true };
 
 const glue = limits.Format.native;
+const dspark = @import("inkling2_dspark_xpu_records.zig");
 
 /// Qwen3.8-27B glue and attention, including the replaced pair and the attention-specific shape control.
 const qwen27_records = [_]Record{
@@ -126,7 +127,7 @@ const qwen27_records = [_]Record{
         .launch = .{ .name = "planted inkling2 loop gates without the bf16 zeta", .symbol = "tf_inkling2_loop_gates", .image = "contract_inkling2_loop_controls", .format = glue, .threads = .{ 256, 1, 1 }, .slm = 9536, .sub_group = 16, .grf = 256 },
         .usage = .{.{ .threads = .{ 256, 1, 1 }, .slm = 9536, .sub_group = 16, .grf = 256 }},
     },
-};
+} ++ dspark.records;
 
 /// Every registered XPU launch: Qwen3.8-27B's, then Inkling 2 Mini's glue and runtime.
 pub const records = qwen27_records ++ @import("xpu_inkling2_records.zig").records;
