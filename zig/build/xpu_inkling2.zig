@@ -64,3 +64,55 @@ pub fn controlsTest(b: *std.Build) void {
     m.addAnonymousImport("inkling2_runtime_cl", .{ .root_source_file = b.path("zig/kernels/xpu/inkling2/runtime.cl") });
     b.step("test-inkling2-xpu-controls", "Inkling 2 Mini's XPU source controls plant one fault each (no device, no ocloc)").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
 }
+
+/// One production image: the source, ocloc's options after the common ones, and the files the source includes.
+const Production = struct { name: []const u8, path: []const u8, extra: []const u8 = "", inputs: []const []const u8 = &.{} };
+
+/// The kernels the whole forward runs, built as the contract builds them (the same sources and options, no controls).
+const production_images = [_]Production{
+    .{ .name = "attention", .path = "zig/kernels/xpu/inkling2/attention.cl" },
+    .{ .name = "prompt", .path = "zig/kernels/xpu/inkling2/prompt_attention.cl" },
+    .{ .name = "glue", .path = "zig/kernels/xpu/inkling2/glue.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt" },
+    .{ .name = "experts", .path = "zig/kernels/xpu/inkling2/experts.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2" },
+    .{ .name = "loop", .path = "zig/kernels/xpu/inkling2/loop.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt" },
+    .{ .name = "runtime", .path = "zig/kernels/xpu/inkling2/runtime.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt" },
+    .{ .name = "dense", .path = "zig/kernels/xpu/inkling2/dense.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt" },
+};
+
+/// The module `inkling2_xpu_images`: every production kernel as a native zebin for `device`, one `align(8)` array each,
+/// named as in `production_images`. Pass `ocloc` null for a module of empty arrays (host tests build without a compiler).
+pub fn productionModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, ocloc: ?[]const u8, device: []const u8) *std.Build.Module {
+    const files = b.addWriteFiles();
+    var source: std.ArrayList(u8) = .empty;
+    for (production_images) |img| {
+        if (ocloc) |tool| {
+            const run = b.addSystemCommand(&.{ tool, "compile", "-q", "-file" });
+            run.addFileArg(b.path(img.path));
+            const opts = b.fmt("-cl-std=CL3.0 -cl-intel-256-GRF-per-thread -I zig/kernels/xpu/qwen27{s}", .{img.extra});
+            run.addArgs(&.{ "-device", device, "-options", opts, "-output_no_suffix", "-output", img.name, "-out_dir" });
+            run.setCwd(b.path("."));
+            run.addFileInput(b.path("zig/kernels/xpu/qwen27/shape.h"));
+            run.addFileInput(b.path("zig/kernels/xpu/inkling2/experts.cl"));
+            const dir = run.addOutputDirectoryArg(b.fmt("ocloc-production-{s}", .{img.name}));
+            _ = files.addCopyFile(dir.path(b, b.fmt("{s}.bin", .{img.name})), b.fmt("{s}.bin", .{img.name}));
+            source.print(b.allocator, "pub const {s} align(8) = @embedFile(\"{s}.bin\").*;\n", .{ img.name, img.name }) catch @panic("OOM");
+        } else {
+            source.print(b.allocator, "pub const {s} align(8) = [_]u8{{}};\n", .{img.name}) catch @panic("OOM");
+        }
+    }
+    return b.createModule(.{ .root_source_file = files.add("inkling2_xpu_images.zig", source.items), .target = target, .optimize = optimize });
+}
+
+/// The module `inkling2_xpu` and the pure launch plans it takes by name, over the xpu runtime `xpu` and `core`.
+pub fn familyModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, xpu: *std.Build.Module, core: *std.Build.Module, images_module: *std.Build.Module) *std.Build.Module {
+    const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/xpu.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    m.addImport("xpu", xpu);
+    m.addImport("core", core);
+    m.addImport("inkling2_xpu_images", images_module);
+    for ([_][2][]const u8{
+        .{ "inkling2_glue_plan", "zig/src/families/inkling2/metal/glue_plan.zig" },
+        .{ "inkling2_runtime_plan", "zig/src/families/inkling2/metal/runtime_plan.zig" },
+        .{ "inkling2_loop_plan", "zig/src/families/inkling2/metal/loop_plan.zig" },
+    }) |plan| m.addImport(plan[0], b.createModule(.{ .root_source_file = b.path(plan[1]), .target = target, .optimize = optimize }));
+    return m;
+}

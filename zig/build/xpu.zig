@@ -3,6 +3,7 @@
 const std = @import("std");
 const exlr8_build = @import("exlr8.zig");
 const xpu_contract = @import("xpu_contract.zig");
+const xpu_inkling2 = @import("xpu_inkling2.zig");
 
 /// ze.zig as its own module: the Qwen27 runner and the Nemotron runtime share one Level Zero table.
 fn zeModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
@@ -222,15 +223,19 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     runners.images = nem.images;
     nemotronSteps(b, target, optimize, runners);
     {
-        // Inkling 2 Mini's resident model, stream state and snapshots on the device; no kernels yet, so the runtime is host-only
+        // Inkling 2 Mini on the device: the resident model, the whole forward and their device tests. The runtime is host-only
+        // (the kernels are the family's own zebins, loaded by `inkling2_xpu`).
         const resident_xpu = runtime(b, target, optimize, &.{}, ze_mod, core, dpas);
-        const inkling2 = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/xpu.zig"), .target = target, .optimize = optimize, .link_libc = true });
-        inkling2.addImport("xpu", resident_xpu);
-        inkling2.addImport("core", core);
+        const inkling2 = xpu_inkling2.familyModule(b, target, optimize, resident_xpu, core, xpu_inkling2.productionModule(b, target, optimize, ocloc, device));
         const resident = b.createModule(.{ .root_source_file = b.path("zig/tests/xpu/inkling2_resident.zig"), .target = target, .optimize = optimize, .link_libc = true });
         resident.addImport("xpu", resident_xpu);
         resident.addImport("inkling2_xpu", inkling2);
-        b.step("xpu-inkling2-tests", "Build the Inkling 2 Mini resident-model device test (tf-xpu-inkling2-resident-test)").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-xpu-inkling2-resident-test", .root_module = resident }), .{}).step);
+        const logits = b.createModule(.{ .root_source_file = b.path("zig/tests/xpu/inkling2_logits.zig"), .target = target, .optimize = optimize, .link_libc = true });
+        logits.addImport("xpu", resident_xpu);
+        logits.addImport("inkling2_xpu", inkling2);
+        const tests = b.step("xpu-inkling2-tests", "Build the Inkling 2 Mini device tests (tf-xpu-inkling2-resident-test, tf-xpu-inkling2-logits)");
+        tests.dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-xpu-inkling2-resident-test", .root_module = resident }), .{}).step);
+        tests.dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-xpu-inkling2-logits", .root_module = logits }), .{}).step);
     }
     const with_contract = b.option(bool, "xpu-contract", "Build the XPU kernel contract's limits audit (needs ocloc for the objects)") orelse false;
     const images = b.option([]const u8, "xpu-images", "A directory of zebins made with xpu-kernel-contract-objects: glue, tp, decode, contract_attn_upstream, contract_merge_upstream, contract_controls, contract_gate_controls (.bin)");
@@ -427,9 +432,7 @@ pub fn hostTests(b: *std.Build, step: *std.Build.Step) void {
     b.step("test-rope-xpu-host", "The XPU 27B runner's RoPE tables on core's rope_freq, without devices or ocloc").dependOn(&rope_tests.step);
     step.dependOn(&rope_tests.step);
     // Inkling 2 Mini's XPU cache geometry, capacity math and snapshot sizes (host arithmetic only)
-    const inkling2_host = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/xpu.zig"), .target = host, .optimize = .debug, .link_libc = true });
-    inkling2_host.addImport("xpu", xpu);
-    inkling2_host.addImport("core", core);
+    const inkling2_host = xpu_inkling2.familyModule(b, host, .debug, xpu, core, xpu_inkling2.productionModule(b, host, .debug, null, "bmg"));
     const inkling2_tests = b.addRunArtifact(b.addTest(.{ .root_module = inkling2_host }));
     b.step("test-inkling2-xpu-host", "Inkling 2 Mini's XPU stream state and snapshot geometry without devices").dependOn(&inkling2_tests.step);
     step.dependOn(&inkling2_tests.step);
