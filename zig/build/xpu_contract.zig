@@ -174,7 +174,7 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
             .{ .name = "inkling2_xpu_attention", .module = ink2_attention },
         },
     }) });
-    const bench = b.addExecutable(.{ .name = "tf-xpu-inkling2-attention-bench", .root_module = b.createModule(.{
+    const attn_bench = b.addExecutable(.{ .name = "tf-xpu-inkling2-attention-bench", .root_module = b.createModule(.{
         .root_source_file = b.path("zig/tests/xpu/inkling2_attention_bench.zig"),
         .target = target,
         .optimize = optimize,
@@ -187,9 +187,9 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
             .{ .name = "inkling2_xpu_attention", .module = ink2_attention },
         },
     }) });
-    b.step("tf-xpu-inkling2-attention-bench", "Build the Inkling 2 Mini XPU attention bandwidth bench").dependOn(&b.addInstallArtifact(bench, .{}).step);
+    b.step("tf-xpu-inkling2-attention-bench", "Build the Inkling 2 Mini XPU attention bandwidth bench").dependOn(&b.addInstallArtifact(attn_bench, .{}).step);
     b.step("tf-xpu-contract-run", "Build the XPU kernel-contract runner: gates 1 to 4 and gate 5 live on a card").dependOn(&b.addInstallArtifact(exe, .{}).step);
-    const bench = b.addExecutable(.{ .name = "tf-xpu-dspark-bench", .root_module = b.createModule(.{
+    const dspark_bench = b.addExecutable(.{ .name = "tf-xpu-dspark-bench", .root_module = b.createModule(.{
         .root_source_file = b.path("zig/tests/xpu/inkling2_dspark_bench.zig"),
         .target = target,
         .optimize = optimize,
@@ -202,7 +202,7 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
             .{ .name = "inkling2_dspark_host", .module = dspark_host },
         },
     }) });
-    b.step("tf-xpu-dspark-bench", "Build the Mini DSpark XPU kernel timing (GB/s at the served shapes)").dependOn(&b.addInstallArtifact(bench, .{}).step);
+    b.step("tf-xpu-dspark-bench", "Build the Mini DSpark XPU kernel timing (GB/s at the served shapes)").dependOn(&b.addInstallArtifact(dspark_bench, .{}).step);
     // The drafter's host files tested without a card; `core` here is only the safetensors reader they use.
     const safetensors = b.createModule(.{ .root_source_file = b.path("zig/src/core/safetensors.zig"), .target = target, .optimize = optimize });
     const core_reader = b.addWriteFiles();
