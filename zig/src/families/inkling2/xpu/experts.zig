@@ -10,8 +10,14 @@ pub const intermediate: u32 = 1152;
 pub const expert_count: u32 = 128;
 pub const top_k: u32 = 8;
 
-/// The kernel's reduction split: one decode work-group holds this many sub-groups (INK2_KS in the source).
-pub const decode_subgroups: u32 = 4;
+/// The kernels' reduction split: one decode work-group holds this many sub-groups, each over a slice of k
+/// (INK2_KS_NV_GU, INK2_KS_NV_DOWN, INK2_KS_MX_GU and INK2_KS_MX_DOWN in the source).
+pub const decode_subgroups = struct {
+    pub const nvfp4_gu: u32 = 4;
+    pub const nvfp4_down: u32 = 3;
+    pub const mxfp8_gu: u32 = 4;
+    pub const mxfp8_down: u32 = 4;
+};
 /// The most routes of one expert in one prompt item (INK2_RUN in the source).
 pub const run_routes: u32 = 32;
 /// The most experts the plan kernel counts (INK2_MAX_EXPERTS in the source).
@@ -90,7 +96,10 @@ pub const Op = enum {
     /// The work-group the kernel is built for: its reqd_work_group_size.
     pub fn threads(o: Op) [3]u32 {
         return switch (o) {
-            .nvfp4_gu, .nvfp4_down, .mxfp8_gu, .mxfp8_down => .{ 16 * decode_subgroups, 1, 1 },
+            .nvfp4_gu => .{ 16 * decode_subgroups.nvfp4_gu, 1, 1 },
+            .nvfp4_down => .{ 16 * decode_subgroups.nvfp4_down, 1, 1 },
+            .mxfp8_gu => .{ 16 * decode_subgroups.mxfp8_gu, 1, 1 },
+            .mxfp8_down => .{ 16 * decode_subgroups.mxfp8_down, 1, 1 },
             .nvfp4_quantize, .mxfp8_quantize, .plan => .{ 256, 1, 1 },
             .combine => .{ 64, 1, 1 },
             .nvfp4_gu_prompt, .nvfp4_down_prompt, .mxfp8_gu_prompt, .mxfp8_down_prompt => .{ 16, 1, 1 },

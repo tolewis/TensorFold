@@ -19,7 +19,7 @@ fn rec(comptime R: type, comptime name: []const u8, comptime symbol: []const u8,
 pub fn list(comptime R: type) [24]R {
     return .{
     rec(R, "xpu inkling2 experts tf_ink2_nvfp4_gu", "tf_ink2_nvfp4_gu", "contract_inkling2_experts", 64, .{ .threads = .{ 64, 1, 1 }, .slm = 256, .sub_group = 16, .grf = 256 }),
-    rec(R, "xpu inkling2 experts tf_ink2_nvfp4_down", "tf_ink2_nvfp4_down", "contract_inkling2_experts", 64, .{ .threads = .{ 64, 1, 1 }, .slm = 256, .sub_group = 16, .grf = 256 }),
+    rec(R, "xpu inkling2 experts tf_ink2_nvfp4_down", "tf_ink2_nvfp4_down", "contract_inkling2_experts", 48, .{ .threads = .{ 48, 1, 1 }, .slm = 192, .sub_group = 16, .grf = 256 }),
     rec(R, "xpu inkling2 experts tf_ink2_mxfp8_gu", "tf_ink2_mxfp8_gu", "contract_inkling2_experts", 64, .{ .threads = .{ 64, 1, 1 }, .slm = 256, .sub_group = 16, .grf = 256 }),
     rec(R, "xpu inkling2 experts tf_ink2_mxfp8_down", "tf_ink2_mxfp8_down", "contract_inkling2_experts", 64, .{ .threads = .{ 64, 1, 1 }, .slm = 256, .sub_group = 16, .grf = 256 }),
     rec(R, "xpu inkling2 experts tf_ink2_nvfp4_quantize", "tf_ink2_nvfp4_quantize", "contract_inkling2_experts", 256, .{ .threads = .{ 256, 1, 1 }, .slm = 0, .sub_group = 16, .grf = 256 }),
@@ -31,7 +31,7 @@ pub fn list(comptime R: type) [24]R {
     rec(R, "xpu inkling2 experts tf_ink2_mxfp8_gu_prompt", "tf_ink2_mxfp8_gu_prompt", "contract_inkling2_experts", 16, .{ .threads = .{ 16, 1, 1 }, .slm = 0, .sub_group = 16, .grf = 256 }),
     rec(R, "xpu inkling2 experts tf_ink2_mxfp8_down_prompt", "tf_ink2_mxfp8_down_prompt", "contract_inkling2_experts", 16, .{ .threads = .{ 16, 1, 1 }, .slm = 0, .sub_group = 16, .grf = 256 }),
     rec(R, "planted xpu inkling2 experts tf_ink2_nvfp4_gu", "tf_ctl_i2_nvfp4_gu_nvfp4_gu", "contract_inkling2_controls", 64, .{ .threads = .{ 64, 1, 1 }, .slm = 256, .sub_group = 16, .grf = 256 }),
-    rec(R, "planted xpu inkling2 experts tf_ink2_nvfp4_down", "tf_ctl_i2_nvfp4_down_nvfp4_down", "contract_inkling2_controls", 64, .{ .threads = .{ 64, 1, 1 }, .slm = 256, .sub_group = 16, .grf = 256 }),
+    rec(R, "planted xpu inkling2 experts tf_ink2_nvfp4_down", "tf_ctl_i2_nvfp4_down_nvfp4_down", "contract_inkling2_controls", 48, .{ .threads = .{ 48, 1, 1 }, .slm = 192, .sub_group = 16, .grf = 256 }),
     rec(R, "planted xpu inkling2 experts tf_ink2_mxfp8_gu", "tf_ctl_i2_mxfp8_gu_mxfp8_gu", "contract_inkling2_controls", 64, .{ .threads = .{ 64, 1, 1 }, .slm = 256, .sub_group = 16, .grf = 256 }),
     rec(R, "planted xpu inkling2 experts tf_ink2_mxfp8_down", "tf_ctl_i2_mxfp8_down_mxfp8_down", "contract_inkling2_controls", 64, .{ .threads = .{ 64, 1, 1 }, .slm = 256, .sub_group = 16, .grf = 256 }),
     rec(R, "planted xpu inkling2 experts tf_ink2_nvfp4_quantize", "tf_ctl_i2_nvfp4_quantize_nvfp4_quantize", "contract_inkling2_controls", 256, .{ .threads = .{ 256, 1, 1 }, .slm = 0, .sub_group = 16, .grf = 256 }),

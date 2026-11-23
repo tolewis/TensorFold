@@ -23,6 +23,19 @@
 #ifndef INK2_KS
 #define INK2_KS 4 // sub-groups of a decode work-group, each over a slice of k
 #endif
+// Each decode kernel may take its own split: a slice of k should hold the same number of 64-byte lines in every sub-group.
+#ifndef INK2_KS_NV_GU
+#define INK2_KS_NV_GU 4
+#endif
+#ifndef INK2_KS_NV_DOWN
+#define INK2_KS_NV_DOWN 3
+#endif
+#ifndef INK2_KS_MX_GU
+#define INK2_KS_MX_GU INK2_KS
+#endif
+#ifndef INK2_KS_MX_DOWN
+#define INK2_KS_MX_DOWN INK2_KS
+#endif
 #define INK2_CAT_(a, b) a##b
 #define INK2_CAT(a, b) INK2_CAT_(a, b)
 #define P(name) INK2_CAT(INK2_PREFIX, name)
@@ -68,6 +81,10 @@ static inline float P(phi)(__global const float *amax, __global const float *den
 // One NVFP4 weight as the FP32 value before the BF16 rounding. `k1` is e4m3(scale) * 2^100 and `phi26` the factor *
 // 2^26: the nibble's bits under an FP32 exponent are e2m1 * 2^-126 (the FP32 denormal gives 0.5), so (t * k1) * phi26
 // is ((e2m1 * scale) * factor) with the first product exact and the one rounding in the second, as the reference.
+// `t` is the nibble at bits 4 * i of a dword, moved in one shift each for the magnitude and for the sign.
+#define INK2_NIBBLE_T(w, i) \
+  as_float((((i) < 6 ? ((w) << (22 - 4 * (i))) : ((w) >> (4 * (i) - 22))) & 0x01c00000u) | (((w) << (28 - 4 * (i))) & 0x80000000u))
+
 static inline float P(nv_value)(uint nibble, float k1, float phi26) {
   const float t = as_float(((nibble & 7u) << 22) | ((nibble & 8u) << 28));
   return (t * k1) * phi26;
@@ -77,13 +94,17 @@ static inline float P(nv_value)(uint nibble, float k1, float phi26) {
 static inline int8 P(nv_frag)(uint w0, uint w1, uint scale, float phi26) {
   const float k1 = P(e4m3)(scale) * 0x1p100f;
   int8 b;
-#pragma unroll
-  for (int j = 0; j < 8; j++) {
-    const uint byte = ((j < 4 ? w0 : w1) >> (8 * (j & 3))) & 255u;
-    const ushort lo = P(f_to_bf)(P(nv_value)(byte & 15u, k1, phi26));
-    const ushort hi = P(f_to_bf)(P(nv_value)(byte >> 4, k1, phi26));
-    b[j] = (int)((uint)lo | ((uint)hi << 16));
-  }
+#define INK2_NV_PAIR(j, w, i) \
+  b[j] = (int)as_uint(intel_convert_bfloat162_as_ushort2((float2)((INK2_NIBBLE_T(w, i) * k1) * phi26, (INK2_NIBBLE_T(w, (i) + 1) * k1) * phi26)))
+  INK2_NV_PAIR(0, w0, 0);
+  INK2_NV_PAIR(1, w0, 2);
+  INK2_NV_PAIR(2, w0, 4);
+  INK2_NV_PAIR(3, w0, 6);
+  INK2_NV_PAIR(4, w1, 0);
+  INK2_NV_PAIR(5, w1, 2);
+  INK2_NV_PAIR(6, w1, 4);
+  INK2_NV_PAIR(7, w1, 6);
+#undef INK2_NV_PAIR
   return b;
 }
 
@@ -111,9 +132,7 @@ static inline int8 P(mx_frag)(uint4 w, float f1, float f2) {
 #pragma unroll
   for (int p = 0; p < 8; p++) {
     const uint dw = w[p >> 1] >> (16 * (p & 1));
-    const ushort lo = P(f_to_bf)(P(mx_value)(dw & 255u, f1, f2));
-    const ushort hi = P(f_to_bf)(P(mx_value)((dw >> 8) & 255u, f1, f2));
-    b[p] = (int)((uint)lo | ((uint)hi << 16));
+    b[p] = (int)as_uint(intel_convert_bfloat162_as_ushort2((float2)(P(mx_value)(dw & 255u, f1, f2), P(mx_value)((dw >> 8) & 255u, f1, f2))));
   }
   return b;
 }
@@ -133,7 +152,7 @@ static inline ushort P(act)(float gate_dot, float up_dot) {
 #define INK2_DOT(a, b, c) intel_sub_group_bf16_bf16_matrix_mad_k16(a, b, c)
 
 // Sums the slices of k the work-group's sub-groups hold, in sub-group order, and writes the results of 16 rows.
-static inline void P(finish)(float acc, local float *part, __global ushort *Y, uint route, uint n, uint tile, uint rows_total, bool gu) {
+static inline void P(finish)(const uint ks, float acc, local float *part, __global ushort *Y, uint route, uint n, uint tile, uint rows_total, bool gu) {
   const uint lane = get_sub_group_local_id();
   const uint sg = get_sub_group_id();
   part[sg * INK2_SG + lane] = acc;
@@ -141,7 +160,7 @@ static inline void P(finish)(float acc, local float *part, __global ushort *Y, u
   if (sg != 0) return;
   float sum = part[lane];
 #pragma unroll
-  for (int s = 1; s < INK2_KS; s++) sum += part[s * INK2_SG + lane];
+  for (uint s = 1; s < ks; s++) sum += part[s * INK2_SG + lane];
   const uint row = tile * INK2_SG + lane;
   if (gu) {
     const float other = sub_group_shuffle_xor(sum, 1);
@@ -156,7 +175,7 @@ static inline void P(finish)(float acc, local float *part, __global ushort *Y, u
   }
 }
 
-static inline void P(nv_decode)(__global const ushort *X, __global const uchar *W, __global const uchar *S,
+static inline void P(nv_decode)(const uint ks, __global const ushort *X, __global const uchar *W, __global const uchar *S,
                                 __global const float *amax, __global const float *den, __global const int *ids,
                                 __global ushort *Y, uint k, uint n, uint topk, bool gu, local float *part) {
   const uint lane = get_sub_group_local_id();
@@ -174,7 +193,7 @@ static inline void P(nv_decode)(__global const ushort *X, __global const uchar *
   float acc = 0.0f;
   if ((nb & 7u) == 0) { // whole 64-byte lines a row: eight blocks, one line a lane
     const uint chunks = nb / 8u;
-    for (uint c = sg; c < chunks; c += INK2_KS) {
+    for (uint c = sg; c < chunks; c += ks) {
       const uint16 v = vload16(0, (__global const uint *)(wr + 64u * c));
       const uint2 s2 = vload2(0, (__global const uint *)(sr + 8u * c));
 #pragma unroll
@@ -186,17 +205,17 @@ static inline void P(nv_decode)(__global const ushort *X, __global const uchar *
       }
     }
   } else {
-    for (uint blk = sg; blk < nb; blk += INK2_KS) {
+    for (uint blk = sg; blk < nb; blk += ks) {
       const uint2 v = vload2(0, (__global const uint *)(wr + 8u * blk));
       const int8 b = P(nv_frag)(v.x, v.y, (uint)sr[blk], phi26);
       const short a = (short)intel_sub_group_block_read_us(xr + 16u * blk);
       acc = INK2_DOT(a, b, acc);
     }
   }
-  P(finish)(acc, part, Y, route, n, tile, rows_total, gu);
+  P(finish)(ks, acc, part, Y, route, n, tile, rows_total, gu);
 }
 
-static inline void P(mx_decode)(__global const ushort *X, __global const uchar *W, __global const uchar *S,
+static inline void P(mx_decode)(const uint ks, __global const ushort *X, __global const uchar *W, __global const uchar *S,
                                 __global const int *ids, __global ushort *Y, uint k, uint n, uint topk, bool gu,
                                 local float *part) {
   const uint lane = get_sub_group_local_id();
@@ -211,7 +230,7 @@ static inline void P(mx_decode)(__global const ushort *X, __global const uchar *
   __global const uchar *sr = S + ((ulong)e * rows_total + row) * nb;
   __global const ushort *xr = X + (ulong)(gu ? route / topk : route) * k;
   float acc = 0.0f;
-  for (uint blk = sg; blk < nb; blk += INK2_KS) {
+  for (uint blk = sg; blk < nb; blk += ks) {
     const uint8 v = vload8(0, (__global const uint *)(wr + 32u * blk));
     float f1, f2;
     P(mx_factors)((uint)sr[blk], &f1, &f2);
@@ -222,44 +241,44 @@ static inline void P(mx_decode)(__global const ushort *X, __global const uchar *
     acc = INK2_DOT(a0, b0, acc);
     acc = INK2_DOT(a1, b1, acc);
   }
-  P(finish)(acc, part, Y, route, n, tile, rows_total, gu);
+  P(finish)(ks, acc, part, Y, route, n, tile, rows_total, gu);
 }
 
 #if INK2_ONLY & INK2_NV_GU
-__attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(16 * INK2_KS, 1, 1)))
+__attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(16 * INK2_KS_NV_GU, 1, 1)))
 __kernel void P(nvfp4_gu)(__global const ushort *X, __global const uchar *W, __global const uchar *S,
                           __global const float *amax, __global const float *den, __global const int *ids,
                           __global ushort *Y, uint k, uint n, uint topk, uint experts) {
-  local float part[INK2_KS * INK2_SG];
-  P(nv_decode)(X, W, S, amax, den, ids, Y, k, n, topk, true, part);
+  local float part[INK2_KS_NV_GU * INK2_SG];
+  P(nv_decode)(INK2_KS_NV_GU, X, W, S, amax, den, ids, Y, k, n, topk, true, part);
 }
 #endif
 
 #if INK2_ONLY & INK2_NV_DOWN
-__attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(16 * INK2_KS, 1, 1)))
+__attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(16 * INK2_KS_NV_DOWN, 1, 1)))
 __kernel void P(nvfp4_down)(__global const ushort *X, __global const uchar *W, __global const uchar *S,
                             __global const float *amax, __global const float *den, __global const int *ids,
                             __global ushort *Y, uint k, uint n, uint topk, uint experts) {
-  local float part[INK2_KS * INK2_SG];
-  P(nv_decode)(X, W, S, amax, den, ids, Y, k, n, topk, false, part);
+  local float part[INK2_KS_NV_DOWN * INK2_SG];
+  P(nv_decode)(INK2_KS_NV_DOWN, X, W, S, amax, den, ids, Y, k, n, topk, false, part);
 }
 #endif
 
 #if INK2_ONLY & INK2_MX_GU
-__attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(16 * INK2_KS, 1, 1)))
+__attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(16 * INK2_KS_MX_GU, 1, 1)))
 __kernel void P(mxfp8_gu)(__global const ushort *X, __global const uchar *W, __global const uchar *S,
                           __global const int *ids, __global ushort *Y, uint k, uint n, uint topk, uint experts) {
-  local float part[INK2_KS * INK2_SG];
-  P(mx_decode)(X, W, S, ids, Y, k, n, topk, true, part);
+  local float part[INK2_KS_MX_GU * INK2_SG];
+  P(mx_decode)(INK2_KS_MX_GU, X, W, S, ids, Y, k, n, topk, true, part);
 }
 #endif
 
 #if INK2_ONLY & INK2_MX_DOWN
-__attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(16 * INK2_KS, 1, 1)))
+__attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(16 * INK2_KS_MX_DOWN, 1, 1)))
 __kernel void P(mxfp8_down)(__global const ushort *X, __global const uchar *W, __global const uchar *S,
                             __global const int *ids, __global ushort *Y, uint k, uint n, uint topk, uint experts) {
-  local float part[INK2_KS * INK2_SG];
-  P(mx_decode)(X, W, S, ids, Y, k, n, topk, false, part);
+  local float part[INK2_KS_MX_DOWN * INK2_SG];
+  P(mx_decode)(INK2_KS_MX_DOWN, X, W, S, ids, Y, k, n, topk, false, part);
 }
 #endif
 
