@@ -367,6 +367,10 @@ fn nemotronSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
 /// Host unit tests of the Intel GPU runtime, the Nemotron family on it and its CLI (no GPU, no ocloc), on any host.
 pub fn hostTests(b: *std.Build, step: *std.Build.Step) void {
     const host = b.graph.host;
+    // Inkling 2 Mini attention's launch geometry and ABI: pure host code
+    const ink2_plan = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/xpu/attention_plan.zig"), .target = host, .optimize = .debug }) }));
+    b.step("test-inkling2-xpu-attention-host", "Inkling 2 Mini XPU attention: ring, window and launch geometry, no device").dependOn(&ink2_plan.step);
+    step.dependOn(&ink2_plan.step);
     const core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = host, .optimize = .debug, .link_libc = true });
     core.addImport("gpu_memory", @import("gpu_memory.zig").module(b, host));
     const xpu = runtime(b, host, .debug, &.{}, zeModule(b, host, .debug), core, true);

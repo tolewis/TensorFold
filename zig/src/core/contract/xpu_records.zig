@@ -1,4 +1,4 @@
-//! The XPU launches gate 5 checks: Qwen3.8-27B glue and decode attention, their recorded compiles, and controls.
+//! The XPU launches gate 5 checks: Qwen3.8-27B glue and decode attention, Inkling 2 Mini attention, their recorded compiles, and controls.
 const std = @import("std");
 const limits = @import("xpu_limits.zig");
 
@@ -126,6 +126,26 @@ const qwen27_records = [_]Record{
     .{
         .launch = .{ .name = "planted inkling2 loop gates without the bf16 zeta", .symbol = "tf_inkling2_loop_gates", .image = "contract_inkling2_loop_controls", .format = glue, .threads = .{ 256, 1, 1 }, .slm = 9536, .sub_group = 16, .grf = 256 },
         .usage = .{.{ .threads = .{ 256, 1, 1 }, .slm = 9536, .sub_group = 16, .grf = 256 }},
+    },
+    .{
+        .launch = .{ .name = "inkling2 attention prep", .symbol = "tf_ink2_prep", .image = "inkling2_attention", .format = glue, .threads = .{ 16, 1, 1 }, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 16, 1, 1 }, .sub_group = 16, .grf = 256 }},
+    },
+    .{
+        .launch = .{ .name = "inkling2 attention relative table", .symbol = "tf_ink2_rel_table", .image = "inkling2_attention", .format = glue, .threads = .{ 256, 1, 1 }, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 256, 1, 1 }, .sub_group = 16, .grf = 256 }},
+    },
+    .{
+        .launch = .{ .name = "inkling2 attention decode", .symbol = "tf_ink2_attn_decode", .image = "inkling2_attention", .format = glue, .threads = .{ 16, 1, 1 }, .slm = 1536, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 16, 1, 1 }, .slm = 1536, .sub_group = 16, .grf = 256 }},
+    },
+    .{
+        .launch = .{ .name = "inkling2 attention merge", .symbol = "tf_ink2_merge", .image = "inkling2_attention", .format = glue, .threads = .{ 128, 1, 1 }, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 128, 1, 1 }, .sub_group = 16, .grf = 256 }},
+    },
+    .{
+        .launch = .{ .name = "inkling2 prompt attention", .symbol = "tf_ink2_attn_prompt", .image = "inkling2_prompt", .format = glue, .threads = .{ 16, 1, 1 }, .slm = 512, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 16, 1, 1 }, .slm = 512, .sub_group = 16, .grf = 256 }},
     },
 } ++ dspark.records;
 

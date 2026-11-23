@@ -37,7 +37,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     ctl.setCwd(b.path("."));
     const ctl_dir = ctl.addOutputDirectoryArg("ocloc-controls");
     _ = files.addCopyFile(ctl_dir.path(b, "contract_controls.bin"), b.fmt("{s}/contract_controls.bin", .{device}));
-    for (contract_images ++ inkling2_images) |src| {
+    for (contract_images ++ inkling2_images ++ ink2_attn_images ++ ink2_attn_controls) |src| {
         _ = files.addCopyFile(object(b, ocloc, device, src), b.fmt("{s}/{s}.bin", .{ device, src.name }));
     }
     for (inkling2.names, inkling2.images(b, ocloc, device)) |name, image| _ = files.addCopyFile(image, b.fmt("{s}/{s}.bin", .{ device, name }));
@@ -78,6 +78,9 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         for ([_][]const u8{ "glue", "tp", "contract_controls", "contract_gate_controls", "decode", "contract_attn_upstream", "contract_merge_upstream", "contract_inkling2_loop", "contract_inkling2_loop_controls", "inkling2_dspark", "contract_inkling2_dspark_controls" } ++ inkling2.names) |name| {
             _ = files.addCopyFile(.{ .cwd_relative = b.fmt("{s}/{s}.bin", .{ dir, name }) }, b.fmt("{s}.bin", .{name}));
         }
+        for (ink2_attn_images ++ ink2_attn_controls) |src| {
+            _ = files.addCopyFile(.{ .cwd_relative = b.fmt("{s}/{s}.bin", .{ dir, src.name }) }, b.fmt("{s}.bin", .{src.name}));
+        }
     } else {
         const opts = "-cl-std=CL3.0 -cl-intel-256-GRF-per-thread";
         const glue = b.addSystemCommand(&.{ ocloc, "compile", "-q", "-file" });
@@ -99,7 +102,7 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
             const dir = run.addOutputDirectoryArg(b.fmt("ocloc-{s}-run", .{pair[0]}));
             _ = files.addCopyFile(dir.path(b, b.fmt("{s}.bin", .{pair[0]})), b.fmt("{s}.bin", .{pair[0]}));
         }
-        for (contract_images[0..3] ++ contract_images[4..] ++ inkling2_images) |src| {
+        for (contract_images[0..3] ++ contract_images[4..] ++ inkling2_images ++ ink2_attn_images ++ ink2_attn_controls) |src| {
             _ = files.addCopyFile(object(b, ocloc, device, src), b.fmt("{s}.bin", .{src.name}));
         }
         for (inkling2.names, inkling2.images(b, ocloc, device)) |name, image| _ = files.addCopyFile(image, b.fmt("{s}.bin", .{name}));
@@ -120,6 +123,14 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         \\pub const inkling2_runtime_ctl align(8) = @embedFile("inkling2_runtime_ctl.bin").*;
         \\pub const inkling2_dspark align(8) = @embedFile("inkling2_dspark.bin").*;
         \\pub const contract_inkling2_dspark_controls align(8) = @embedFile("contract_inkling2_dspark_controls.bin").*;
+        \\pub const ink2_attention align(8) = @embedFile("inkling2_attention.bin").*;
+        \\pub const ink2_prompt align(8) = @embedFile("inkling2_prompt.bin").*;
+        \\pub const ink2_attention_ctl1 align(8) = @embedFile("inkling2_attention_ctl1.bin").*;
+        \\pub const ink2_attention_ctl2 align(8) = @embedFile("inkling2_attention_ctl2.bin").*;
+        \\pub const ink2_attention_ctl3 align(8) = @embedFile("inkling2_attention_ctl3.bin").*;
+        \\pub const ink2_attention_ctl4 align(8) = @embedFile("inkling2_attention_ctl4.bin").*;
+        \\pub const ink2_attention_ctl5 align(8) = @embedFile("inkling2_attention_ctl5.bin").*;
+        \\pub const ink2_prompt_ctl6 align(8) = @embedFile("inkling2_prompt_ctl6.bin").*;
     ), .target = target, .optimize = optimize });
     // Inkling 2 Mini's loop: the host wrapper, its pure launch plan, and the host float model the device is held to
     const loop_plan = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/metal/loop_plan.zig"), .target = target, .optimize = optimize });
@@ -128,6 +139,14 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     loop_host.addImport("xpu", xpu);
     loop_host.addImport("inkling2_loop_plan", loop_plan);
     const ink2_hosts = inkling2.hosts(b, target, optimize, xpu);
+
+    const ink2_attention = b.createModule(.{
+        .root_source_file = b.path("zig/src/families/inkling2/xpu/attention.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "xpu", .module = xpu }},
+    });
     const exe = b.addExecutable(.{ .name = "tf-xpu-contract-run", .root_module = b.createModule(.{
         .root_source_file = b.path("zig/tests/xpu/contract_run.zig"),
         .target = target,
@@ -144,8 +163,23 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
             .{ .name = "inkling2_xpu_runtime", .module = ink2_hosts[1] },
             .{ .name = "inkling2_dspark_host", .module = dspark_host },
             .{ .name = "inkling2_dspark_sources", .module = dspark_sources },
+            .{ .name = "inkling2_xpu_attention", .module = ink2_attention },
         },
     }) });
+    const bench = b.addExecutable(.{ .name = "tf-xpu-inkling2-attention-bench", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/xpu/inkling2_attention_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "core", .module = core },
+            .{ .name = "xpu", .module = xpu },
+            .{ .name = "ze", .module = ze },
+            .{ .name = "xpu_contract_images", .module = images },
+            .{ .name = "inkling2_xpu_attention", .module = ink2_attention },
+        },
+    }) });
+    b.step("tf-xpu-inkling2-attention-bench", "Build the Inkling 2 Mini XPU attention bandwidth bench").dependOn(&b.addInstallArtifact(bench, .{}).step);
     b.step("tf-xpu-contract-run", "Build the XPU kernel-contract runner: gates 1 to 4 and gate 5 live on a card").dependOn(&b.addInstallArtifact(exe, .{}).step);
     const bench = b.addExecutable(.{ .name = "tf-xpu-dspark-bench", .root_module = b.createModule(.{
         .root_source_file = b.path("zig/tests/xpu/inkling2_dspark_bench.zig"),
@@ -206,6 +240,21 @@ const inkling2_images = [_]Source{
         .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2",
         .inputs = &.{"zig/kernels/xpu/inkling2/dspark.cl"},
     },
+};
+
+/// Inkling 2 Mini attention (OpenCL C on bmg): the attention image and the prompt image.
+const ink2_attn_images = [_]Source{
+    .{ .name = "inkling2_attention", .path = "zig/kernels/xpu/inkling2/attention.cl" },
+    .{ .name = "inkling2_prompt", .path = "zig/kernels/xpu/inkling2/prompt_attention.cl" },
+};
+/// The same sources with one planted fault each (-DINK2_CTL=n), for the contract's controls.
+const ink2_attn_controls = [_]Source{
+    .{ .name = "inkling2_attention_ctl1", .path = "zig/kernels/xpu/inkling2/attention.cl", .extra = " -DINK2_CTL=1" },
+    .{ .name = "inkling2_attention_ctl2", .path = "zig/kernels/xpu/inkling2/attention.cl", .extra = " -DINK2_CTL=2" },
+    .{ .name = "inkling2_attention_ctl3", .path = "zig/kernels/xpu/inkling2/attention.cl", .extra = " -DINK2_CTL=3" },
+    .{ .name = "inkling2_attention_ctl4", .path = "zig/kernels/xpu/inkling2/attention.cl", .extra = " -DINK2_CTL=4" },
+    .{ .name = "inkling2_attention_ctl5", .path = "zig/kernels/xpu/inkling2/attention.cl", .extra = " -DINK2_CTL=5" },
+    .{ .name = "inkling2_prompt_ctl6", .path = "zig/kernels/xpu/inkling2/prompt_attention.cl", .extra = " -DINK2_CTL=6" },
 };
 
 fn object(b: *std.Build, ocloc: []const u8, device: []const u8, src: Source) std.Build.LazyPath {

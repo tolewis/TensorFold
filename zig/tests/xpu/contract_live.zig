@@ -25,6 +25,8 @@ fn imageOf(name: []const u8) ?rig_.Image {
     if (std.mem.eql(u8, name, "inkling2_runtime")) return .ink2_runtime;
     if (std.mem.eql(u8, name, "inkling2_glue_ctl")) return .ink2_glue_ctl;
     if (std.mem.eql(u8, name, "inkling2_runtime_ctl")) return .ink2_runtime_ctl;
+    if (std.mem.eql(u8, name, "inkling2_attention")) return .ink2_attention;
+    if (std.mem.eql(u8, name, "inkling2_prompt")) return .ink2_prompt;
     return null;
 }
 
@@ -75,6 +77,11 @@ fn argsOf(planted: []const u8) u32 {
         .{ "tf_ink2_attention_partial", 6 },
         .{ "tf_ink2_mlp_partial", 5 },
         .{ "tf_ink2_capture_tap", 4 },
+        .{ "tf_ink2_prep", 22 },
+        .{ "tf_ink2_rel_table", 3 },
+        .{ "tf_ink2_attn_decode", 17 },
+        .{ "tf_ink2_merge", 12 },
+        .{ "tf_ink2_attn_prompt", 14 },
     };
     for (table) |e| if (std.mem.eql(u8, e[0], symbol)) return e[1];
     if (dspark.argsOf(symbol)) |n| return n;
