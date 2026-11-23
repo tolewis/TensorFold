@@ -67,7 +67,7 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
 
     const files = b.addWriteFiles();
     if (prebuilt) |dir| {
-        for ([_][]const u8{ "glue", "tp", "contract_controls", "contract_gate_controls", "decode", "contract_attn_upstream", "contract_merge_upstream" }) |name| {
+        for ([_][]const u8{ "glue", "tp", "contract_controls", "contract_gate_controls", "decode", "contract_attn_upstream", "contract_merge_upstream", "contract_inkling2_loop", "contract_inkling2_loop_controls" }) |name| {
             _ = files.addCopyFile(.{ .cwd_relative = b.fmt("{s}/{s}.bin", .{ dir, name }) }, b.fmt("{s}.bin", .{name}));
         }
     } else {
@@ -91,7 +91,7 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
             const dir = run.addOutputDirectoryArg(b.fmt("ocloc-{s}-run", .{pair[0]}));
             _ = files.addCopyFile(dir.path(b, b.fmt("{s}.bin", .{pair[0]})), b.fmt("{s}.bin", .{pair[0]}));
         }
-        for (contract_images[0..3]) |src| {
+        for (contract_images[0..3] ++ contract_images[4..]) |src| {
             _ = files.addCopyFile(object(b, ocloc, device, src), b.fmt("{s}.bin", .{src.name}));
         }
     }
@@ -103,7 +103,15 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         \\pub const merge_upstream align(8) = @embedFile("contract_merge_upstream.bin").*;
         \\pub const controls align(8) = @embedFile("contract_controls.bin").*;
         \\pub const gate_controls align(8) = @embedFile("contract_gate_controls.bin").*;
+        \\pub const inkling2_loop align(8) = @embedFile("contract_inkling2_loop.bin").*;
+        \\pub const inkling2_loop_controls align(8) = @embedFile("contract_inkling2_loop_controls.bin").*;
     ), .target = target, .optimize = optimize });
+    // Inkling 2 Mini's loop: the host wrapper, its pure launch plan, and the host float model the device is held to
+    const loop_plan = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/metal/loop_plan.zig"), .target = target, .optimize = optimize });
+    const loop_model = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/loop_model.zig"), .target = target, .optimize = optimize });
+    const loop_host = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/xpu/loop.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    loop_host.addImport("xpu", xpu);
+    loop_host.addImport("inkling2_loop_plan", loop_plan);
     const exe = b.addExecutable(.{ .name = "tf-xpu-contract-run", .root_module = b.createModule(.{
         .root_source_file = b.path("zig/tests/xpu/contract_run.zig"),
         .target = target,
@@ -114,6 +122,8 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
             .{ .name = "xpu", .module = xpu },
             .{ .name = "ze", .module = ze },
             .{ .name = "xpu_contract_images", .module = images },
+            .{ .name = "inkling2_xpu_loop", .module = loop_host },
+            .{ .name = "inkling2_loop_model", .module = loop_model },
         },
     }) });
     b.step("tf-xpu-contract-run", "Build the XPU kernel-contract runner: gates 1 to 4 and gate 5 live on a card").dependOn(&b.addInstallArtifact(exe, .{}).step);
@@ -121,19 +131,23 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     b.step("xpu-contract-run", "Run the XPU kernel contract on this card (tf-xpu-contract-run [--device N])").dependOn(&run.step);
 }
 
-const Source = struct { name: []const u8, path: []const u8 };
+const Source = struct { name: []const u8, path: []const u8, options: []const u8 = "" };
 const contract_images = [_]Source{
     .{ .name = "decode", .path = "zig/kernels/xpu/qwen27/decode.cl" },
     .{ .name = "contract_attn_upstream", .path = "zig/kernels/xpu/contract_attn_upstream.cl" },
     .{ .name = "contract_merge_upstream", .path = "zig/kernels/xpu/contract_merge_upstream.cl" },
     .{ .name = "contract_gate_controls", .path = "zig/kernels/xpu/contract_gate_controls.cl" },
+    // Inkling 2 Mini's loop: divide and sqrt correctly rounded, as loop.metal's precise:: calls are; the controls image
+    // is the same source with the 1/48 scale and the bf16 zeta dropped.
+    .{ .name = "contract_inkling2_loop", .path = "zig/kernels/xpu/inkling2/loop.cl", .options = " -cl-fp32-correctly-rounded-divide-sqrt" },
+    .{ .name = "contract_inkling2_loop_controls", .path = "zig/kernels/xpu/inkling2/loop.cl", .options = " -cl-fp32-correctly-rounded-divide-sqrt -DTF_CTL_LOOP_NO_SCALE -DTF_CTL_LOOP_NO_ZETA_ROUND" },
 };
 
 fn object(b: *std.Build, ocloc: []const u8, device: []const u8, src: Source) std.Build.LazyPath {
     const run = b.addSystemCommand(&.{ ocloc, "compile", "-q", "-file" });
     run.addFileArg(b.path(src.path));
     const opts = "-cl-std=CL3.0 -cl-intel-256-GRF-per-thread -I zig/kernels/xpu/qwen27";
-    run.addArgs(&.{ "-device", device, "-options", opts, "-output_no_suffix", "-output", src.name, "-out_dir" });
+    run.addArgs(&.{ "-device", device, "-options", b.fmt("{s}{s}", .{ opts, src.options }), "-output_no_suffix", "-output", src.name, "-out_dir" });
     run.setCwd(b.path("."));
     run.addFileInput(b.path("zig/kernels/xpu/qwen27/shape.h"));
     const dir = run.addOutputDirectoryArg(b.fmt("ocloc-contract-{s}", .{src.name}));

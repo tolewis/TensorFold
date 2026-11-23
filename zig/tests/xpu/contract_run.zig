@@ -13,6 +13,7 @@ const tp_k = @import("contract_tp.zig");
 const controls_k = @import("contract_controls.zig");
 const attn_k = @import("contract_attn.zig");
 const merge_k = @import("contract_merge.zig");
+const loop_k = @import("inkling2_loop.zig");
 
 const g = core.gates;
 
@@ -80,14 +81,23 @@ pub fn main(init: std.process.Init) !u8 {
     for (&controls, std.enums.values(controls_k.Which)) |*x, w| x.* = try controls_k.Control.init(a, &dev, w);
     defer for (&controls) |*x| x.deinit();
     for (&controls) |*x| try kernels.append(a, x.kernel());
+    var loops: [2 * std.enums.values(loop_k.Kind).len]loop_k.Probe = undefined;
+    var made: usize = 0;
+    defer for (loops[0..made]) |*x| x.deinit();
+    for ([_]bool{ false, true }) |control| for (std.enums.values(loop_k.Kind)) |kind| {
+        loops[made] = try loop_k.Probe.init(a, &dev, kind, control);
+        made += 1;
+    };
+    for (loops[0..made]) |*x| try kernels.append(a, x.kernel());
     var t: g.Tally = .{};
     const t0 = ms(init.io);
     try g.runAll(a, kernels.items, 0x6b63, &t);
     const t1 = ms(init.io);
     const lim = try gate5.table(a) + try live5.live(a, &dev);
+    const model_problems = try loop_k.modelCheck(a, &dev);
     const t2 = ms(init.io);
     const tally = .{ t.kernels, t.passed, t.failed, t.known, t.controls, t.caught, t.missed, lim, t1 - t0, t2 - t1 };
     std.debug.print("SUMMARY bmg-g31 0x{x} {d} kernels: {d} pass gates 1-4, {d} fail, {d} known findings; {d} controls: " ++
         "{d} red as planted, {d} missed; {d} limit problems; gates {d} ms, limits {d} ms\n", .{dev.ctx.gpu.props.deviceId} ++ tally);
-    return @intCast(t.problems() + lim);
+    return @intCast(t.problems() + lim + model_problems);
 }
