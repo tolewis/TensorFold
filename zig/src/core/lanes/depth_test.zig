@@ -21,6 +21,17 @@ test "a depth's acceptance estimate moves by the configured weight of the newest
     try std.testing.expectApproxEqAbs(@as(f64, 0.46), st.?.p[1], 1e-12);
 }
 
+test "force_depth offers the most drafts even when the cost table is empty" {
+    const gpa = std.testing.allocator;
+    const empty: Table = .{};
+    var rule: Rule = .{ .gpa = gpa, .k = .{ .force_depth = true }, .prior = &.{ 0.5, 0.5 }, .most_drafts = 7, .family_costs = &empty, .shared_costs = &empty, .mtp_step_ms = 0, .plain_guard = true, .node_probabilities = false, .batch_rows = 8 };
+    defer rule.deinit();
+    var st: ?State = null;
+    defer if (st) |*s| s.deinit(gpa);
+    const who: Who = .{ .state = &st, .draft_room = 100, .finished = false, .forced = false, .sampled = true };
+    try std.testing.expectEqual(@as(i64, 7), try rule.depth(who));
+}
+
 test "depth picks the most tokens a ms and probes deeper" {
     const gpa = std.testing.allocator;
     var fc: Table = .{};

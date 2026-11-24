@@ -79,6 +79,8 @@ pub const Drafter = struct {
     embed_mode: EmbedMode = .normed,
     /// The most drafts a round may ask (block length minus one); `TF_DFLASH2_DEPTH=1..7` shortens the block for measurement.
     depth_cap: u32 = 7,
+    /// `TF_DFLASH2_FORCE=1`: seven drafts every round. Unset keeps the scheduler. Code wins, chat loses (2026-11-24).
+    force: bool = false,
     /// `TF_DFLASH2_FULL=1`: draw all seven positions of every block (the rest are not offered), and log how often each matches.
     full: bool = false,
     times: Times = .{},
@@ -118,6 +120,8 @@ pub const Drafter = struct {
             const n = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 7;
             d.depth_cap = std.math.clamp(n, 1, 7);
         }
+        if (std.c.getenv("TF_DFLASH2_FORCE")) |v| d.force = !std.mem.eql(u8, std.mem.span(v), "0") and !std.mem.eql(u8, std.mem.span(v), "");
+        std.log.info("dflash2: {s} drafts a round", .{if (d.force) "seven" else "the scheduler's"});
         if (std.c.getenv("TF_DFLASH2_EMBED")) |v| {
             if (std.mem.eql(u8, std.mem.span(v), "raw")) d.embed_mode = .raw;
         }
@@ -198,7 +202,7 @@ pub const Drafter = struct {
     }
 
     fn factsFn(ptr: *anyopaque) dr.Facts {
-        return .{ .fixed_block = true, .depth = cast(ptr).depth_cap, .step_ms = 0, .plain_guard = true, .stream_bytes = @intCast(state.laneBytes()) };
+        return .{ .fixed_block = true, .depth = cast(ptr).depth_cap, .step_ms = 0, .plain_guard = true, .force_depth = cast(ptr).force, .stream_bytes = @intCast(state.laneBytes()) };
     }
 
     fn openFn(ptr: *anyopaque, stream: *Stream) anyerror!void {
