@@ -102,11 +102,29 @@ pub fn drawTop(row: ?[]const f32, top: []const rule.Cand, s: Sampling, position:
     return raceTop(logits, top, p, s.seed, position);
 }
 
-/// `race` over a plan's kept tokens. When the nucleus ends inside the candidates every kept token is one of them, and the
-/// race reads those alone; the winner does not depend on the order the tokens are read in.
-fn raceTop(logits: []const f32, top: []const rule.Cand, p: Plan, seed: u64, position: u32) u32 {
-    const last = markOf(top[top.len - 1]);
-    if (!atOrBefore(p.cut.key, p.cut.id, last)) return race(logits, p, seed, position, null);
+/// `drawTop` for a row drawn with top_k off, when the device also summed the row's normalizer `z`: the row is not read.
+/// Null when the draw needs tokens past the candidates (the nucleus runs beyond them, or with no top_p a kept token may
+/// lie past them): the caller then fetches the row and calls `drawTop`. `top` holds the row's best 1,024 in kernel order.
+pub fn drawTopNorm(top: []const rule.Cand, z: f32, s: Sampling, position: u32) ?u32 {
+    std.debug.assert(s.top_k == 0 and top.len == top_max);
+    const r = rule.rule(s);
+    const m = top[0].v;
+    var p = Plan{ .inv_t = r.inv_t, .m = m, .lo = @max(m + r.min_log, m - never) };
+    if (r.top_p > 0.0 and r.top_p < 1.0) {
+        var cum: f32 = 0.0;
+        for (top) |c| {
+            cum += @exp(c.v - m) / z;
+            if (cum >= r.top_p) {
+                p.cut = markOf(c);
+                break;
+            }
+        } else return null;
+    } else if (!(top[top.len - 1].v < p.lo)) return null; // a kept token may lie past the candidates
+    return raceCandidates(top, p, s.seed, position);
+}
+
+/// The race over the candidates that a plan keeps; the winner does not depend on the order tokens are read in.
+fn raceCandidates(top: []const rule.Cand, p: Plan, seed: u64, position: u32) u32 {
     var bs = -std.math.inf(f32);
     var bk: u32 = 0;
     var bi: u32 = 0xFFFF_FFFF;
@@ -121,7 +139,15 @@ fn raceTop(logits: []const f32, top: []const rule.Cand, p: Plan, seed: u64, posi
             bi = c.i;
         }
     }
-    return @min(bi, @as(u32, @intCast(logits.len - 1)));
+    return bi;
+}
+
+/// `race` over a plan's kept tokens. When the nucleus ends inside the candidates every kept token is one of them, and the
+/// race reads those alone; the winner does not depend on the order the tokens are read in.
+fn raceTop(logits: []const f32, top: []const rule.Cand, p: Plan, seed: u64, position: u32) u32 {
+    const last = markOf(top[top.len - 1]);
+    if (!atOrBefore(p.cut.key, p.cut.id, last)) return race(logits, p, seed, position, null);
+    return @min(raceCandidates(top, p, seed, position), @as(u32, @intCast(logits.len - 1)));
 }
 
 /// The nucleus's last token: tf_gpu_sample's sequential sum over its 1,024 candidates, extended when it falls short.

@@ -45,6 +45,16 @@ fn hostTop(gpa: std.mem.Allocator, row: []const f32, inv_t: f32, n: usize) ![]Ca
     return gpa.dupe(Cand, all[0..n]);
 }
 
+/// The normalizer the kernel sums, in the host's lane order and with the host's exp.
+fn hostNorm(row: []const f32, m: f32, inv_t: f32) f64 {
+    var lane: [1024]f32 = @splat(0.0);
+    for (row, 0..) |l, i| {
+        const v = l * inv_t;
+        if (v >= -std.math.inf(f32)) lane[i % 1024] += @exp(v - m);
+    }
+    return lanes.gpu_rule.lanesSum(&lane);
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
@@ -113,6 +123,9 @@ pub fn main(init: std.process.Init) !void {
     };
     var draws: usize = 0;
     var differ: usize = 0;
+    var normed: usize = 0;
+    var needed_row: usize = 0;
+    var worst_z: f64 = 0;
     for (0..4) |kind| {
         for (0..rows) |j| fill(&prng, host[j * vocab ..][0..vocab], kind);
         try r.upload(device, std.mem.sliceAsBytes(host[0 .. rows * vocab]));
@@ -124,6 +137,11 @@ pub fn main(init: std.process.Init) !void {
             for (0..rows) |j| {
                 const row = host[j * vocab ..][0..vocab];
                 const top = set.list(j, picks[j].n, &buf);
+                if (picks[j].norm) {
+                    const want_z = hostNorm(row, top[0].v, picks[j].inv_t);
+                    const err = @abs(@as(f64, set.z[j]) - want_z) / want_z;
+                    worst_z = @max(worst_z, err);
+                }
                 for (0..24) |s| {
                     var rule = base;
                     rule.seed = 1000 + s * 7919 + j;
@@ -131,6 +149,16 @@ pub fn main(init: std.process.Init) !void {
                     const want = try lanes.gpu_full.draw(gpa, row, rule, position, null);
                     const got = lanes.gpu_full.drawTop(if (lanes.gpu_full.needsRow(rule)) row else null, top, rule, position);
                     draws += 1;
+                    if (rule.top_k == 0) {
+                        // the device's normalizer: the draw that does not read the row must equal the draw from the row
+                        if (lanes.gpu_full.drawTopNorm(top, set.z[j], rule, position)) |quick| {
+                            normed += 1;
+                            if (quick != want) {
+                                differ += 1;
+                                std.debug.print("NORM DRAW DIFFERS kind {d} row {d} top_p {d} min_p {d} seed {d}: device z {d} gives {d}, host {d}\n", .{ kind, j, rule.top_p, rule.min_p, rule.seed, set.z[j], quick, want });
+                            }
+                        } else needed_row += 1;
+                    }
                     if (got != want) {
                         differ += 1;
                         std.debug.print("DRAW DIFFERS kind {d} row {d} top_k {d} top_p {d} min_p {d} seed {d}: device {d} host {d}\n", .{ kind, j, rule.top_k, rule.top_p, rule.min_p, rule.seed, got, want });
@@ -140,6 +168,7 @@ pub fn main(init: std.process.Init) !void {
         }
         std.debug.print("draws, row kind {d}: checked so far {d}, differing {d}\n", .{ kind, draws, differ });
     }
-    std.debug.print("RESULT {s}: {d} candidate lists, {d} draws, {d} candidate mismatches, {d} draw differences\n", .{ if (failures == 0 and differ == 0) "PASS" else "FAIL", checked, draws, failures, differ });
-    if (failures != 0 or differ != 0) std.process.exit(1);
+    std.debug.print("normalizer: {d} draws answered from the device's sum without the row, {d} needed the row; worst relative error of z against the host's sum {e}\n", .{ normed, needed_row, worst_z });
+    std.debug.print("RESULT {s}: {d} candidate lists, {d} draws, {d} candidate mismatches, {d} draw differences\n", .{ if (failures == 0 and differ == 0 and worst_z < 1e-5) "PASS" else "FAIL", checked, draws, failures, differ });
+    if (failures != 0 or differ != 0 or worst_z >= 1e-5) std.process.exit(1);
 }
