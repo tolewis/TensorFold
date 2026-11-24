@@ -61,10 +61,16 @@ pub fn embedNorm(p: *const Pipelines, s: xpu.Stream, ids: Ref, table: Ref, weigh
     try xpu.launch.dispatch(p.embed_norm, s, .{ rows, 1, 1 }, .{ ids, table, weight, out, rows });
 }
 
-/// sources = completed BF16 blocks plus one unrounded F32 partial; output is one FP32 row per query.
+/// sources = completed BF16 blocks plus one unrounded F32 partial; output is one FP32 row per query and token. `rows` tokens:
+/// token t's blocks start `blocks_stride` BF16 values after token t - 1's, its partial is the next H floats, and its result
+/// for query q is row `q * rows + t` of `out`. One token (`ar1`) is the launch of a single row.
+pub fn arRows(p: *const Pipelines, s: xpu.Stream, blocks_: Ref, partial: Ref, queries: Ref, out: Ref, sources_: u32, queries_: u32, rows: u32, blocks_stride: u32) !void {
+    std.debug.assert(sources_ > 0 and sources_ <= 5 and queries_ > 0 and queries_ <= 3 and rows > 0);
+    try xpu.launch.dispatch(p.ar, s, .{ queries_, rows, 1 }, .{ blocks_, partial, queries, out, sources_, queries_, rows, blocks_stride });
+}
+
 pub fn ar(p: *const Pipelines, s: xpu.Stream, blocks_: Ref, partial: Ref, queries: Ref, out: Ref, sources_: u32, queries_: u32) !void {
-    std.debug.assert(sources_ > 0 and sources_ <= 5 and queries_ > 0 and queries_ <= 3);
-    try xpu.launch.dispatch(p.ar, s, .{ queries_, 1, 1 }, .{ blocks_, partial, queries, out, sources_, queries_ });
+    try arRows(p, s, blocks_, partial, queries, out, sources_, queries_, 1, 0);
 }
 
 /// The window of a row is three old rows (`history`) and then the current rows; the kernel stages that window in `taps`

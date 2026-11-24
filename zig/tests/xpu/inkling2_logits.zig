@@ -233,6 +233,7 @@ pub fn main(init: std.process.Init) !void {
     var profile_steps: usize = 0;
     var profile_all = false;
     var verify_bench = false;
+    var route_union = false;
     var bench_context: ?usize = null;
     var options: ink.model.Options = .{ .embed_host = false };
     var dump_prefix: ?[]const u8 = null;
@@ -285,6 +286,9 @@ pub fn main(init: std.process.Init) !void {
             // the first --ref prompt prefilled, then windows of 1, 2, 3, 4, 6, 8, 12 and 16 real rows run as the server's verify
             // does (every row's logits, the DSpark taps, the cache transaction), timed; then stop
             verify_bench = true;
+        } else if (std.mem.eql(u8, a, "--route-union")) {
+            // with --verify-bench: also count the distinct experts a window of real rows reads in each visit
+            route_union = true;
         } else if (std.mem.eql(u8, a, "--profile-all")) {
             // the first --ref prompt prefilled in --chunk row chunks (last row's logits only, as the server does), profiled per
             // chunk; then plain decode profiled greedy and sampled; then stop
@@ -345,7 +349,7 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(host_logits);
 
     if (verify_bench) {
-        try verifyBench(init.io, &ctx, m, &scratch, &r, &schedule, capacity, loaded_refs.items[0].ids, host_logits, profile_steps > 0);
+        try verifyBench(gpa, init.io, &ctx, m, &scratch, &r, &schedule, capacity, loaded_refs.items[0].ids, host_logits, profile_steps > 0, route_union);
         return;
     }
     if (profile_all) {
@@ -666,7 +670,7 @@ fn profileAll(gpa: std.mem.Allocator, io: std.Io, ctx: *xpu.Context, m: *const i
 /// Windows of n real rows (the prompt's own next tokens, so the routing is real) through `runShared` the way the backend's
 /// verify runs them: all rows' logits, the taps, begin and rollback around each. Median of the reps, in ms: the forward,
 /// then the forward and the host argmax of every row's downloaded logits (the greedy verify today).
-fn verifyBench(io: std.Io, ctx: *xpu.Context, m: *const ink.model.Model, scratch: *state.Scratch, r: *xpu.rt.Runtime, schedule: anytype, capacity: usize, ids: []const u32, host: []f32, profile: bool) !void {
+fn verifyBench(gpa: std.mem.Allocator, io: std.Io, ctx: *xpu.Context, m: *const ink.model.Model, scratch: *state.Scratch, r: *xpu.rt.Runtime, schedule: anytype, capacity: usize, ids: []const u32, host: []f32, profile: bool, route_union: bool) !void {
     var cache = try state.Cache.init(r, capacity, schedule, .bf16);
     defer cache.deinit();
     scratch.taps = try r.alloc(state.captureBytes(state.max_rows));
@@ -707,6 +711,7 @@ fn verifyBench(io: std.Io, ctx: *xpu.Context, m: *const ink.model.Model, scratch
         if (n == 1) base_ms = fw[reps / 2];
         std.debug.print("{d:4}   {d:10.2}   {d:9.2}   {d:22.2}   {d:9.2}\n", .{ n, fw[reps / 2], fw[reps / 2] / base_ms, tot[reps / 2], tot[reps / 2] / base_ms });
     }
+    if (route_union) try routeUnion(gpa, m, scratch, r, &cache, ids, prefix);
     if (profile) {
         var prof = try xpu.profile.Profile.init(ctx, 8192, true);
         defer prof.deinit();
@@ -723,6 +728,46 @@ fn verifyBench(io: std.Io, ctx: *xpu.Context, m: *const ink.model.Model, scratch
             std.debug.print("\nPROFILE of a verify window of {d} rows (mean of 4 windows, per window)\n", .{n});
             prof.print();
         }
+    }
+}
+
+/// The distinct experts a window of n real rows reads in a visit, averaged over the visits of the same precision and over
+/// windows that slide through the prompt, against the random-routing model 128 (1 - (120/128)^n) of PLAN section 3.
+fn routeUnion(gpa: std.mem.Allocator, m: *const ink.model.Model, scratch: *state.Scratch, r: *xpu.rt.Runtime, cache: *state.Cache, ids: []const u32, prefix: usize) !void {
+    const visits = 48;
+    const trace = try r.alloc(visits * 16 * 32);
+    defer trace.free();
+    ink.forward.route_trace = trace;
+    defer ink.forward.route_trace = null;
+    const host = try gpa.alloc(i32, visits * 16 * 8);
+    defer gpa.free(host);
+    std.debug.print("\nROUTE UNION: distinct experts of a window of n real rows, mean over visits and windows (NVFP4 visits 0 to 43, MXFP8 visits 44 to 47)\n", .{});
+    std.debug.print("rows   nvfp4 measured   random model   ratio   mxfp8 measured   random model\n", .{});
+    const windows = 40;
+    for ([_]usize{ 1, 2, 3, 4, 6, 8, 12, 16 }) |n| {
+        var sum_nv: f64 = 0;
+        var sum_mx: f64 = 0;
+        for (0..windows) |w| {
+            const from = prefix + (w * 13) % 400;
+            try cache.begin(n);
+            try ink.forward.runShared(m, scratch, &.{.{ .cache = cache, .rows = n }}, ids[from..][0..n], .{ .all = true });
+            try r.download(std.mem.sliceAsBytes(host[0 .. visits * n * 8]), trace);
+            try r.sync();
+            try cache.rollback();
+            for (0..visits) |v| {
+                var seen: [128]bool = @splat(false);
+                var count: f64 = 0;
+                for (host[v * n * 8 ..][0 .. n * 8]) |e| {
+                    const ei: usize = @intCast(e);
+                    if (!seen[ei]) count += 1;
+                    seen[ei] = true;
+                }
+                if (v < 44) sum_nv += count else sum_mx += count;
+            }
+        }
+        const w: f64 = @floatFromInt(windows);
+        const model_u = 128.0 * (1.0 - std.math.pow(f64, 120.0 / 128.0, @floatFromInt(n)));
+        std.debug.print("{d:4}   {d:14.2}   {d:12.2}   {d:5.2}   {d:14.2}   {d:12.2}\n", .{ n, sum_nv / (44 * w), model_u, sum_nv / (44 * w) / model_u, sum_mx / (4 * w), model_u });
     }
 }
 

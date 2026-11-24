@@ -54,13 +54,18 @@ KERNEL(256) void tf_inkling2_embed_norm(global const uint *ids, global const ush
   for (uint d = t; d < INK_HIDDEN; d += 256) out[(ulong)row * INK_HIDDEN + d] = f2bf(bf2f(weight[d]) * (bf2f(x[d]) * inverse));
 }
 
-// Grid (queries). sources are completed bf16 blocks plus one unrounded fp32 partial (the last source); one fp32 row a query.
+// Grid (queries, rows). sources are completed bf16 blocks plus one unrounded fp32 partial (the last source); one fp32 row a
+// query and token. Row r reads its blocks at blocks + r * blocks_stride (values) and its partial at partial + r * 2304, and
+// writes out[(q * rows + r) * 2304], so a launch for many tokens is the single-token launch run once a token (rows 1:
+// blocks_stride is not read).
 // Every source value of a work-item (its 9 channels of each source) is loaded once, up front, and kept in registers;
 // the source loops have constant bounds so the arrays stay in registers, and a source past `sources` is skipped.
-KERNEL(256) void tf_inkling2_ar(global const ushort *blocks, global const float *partial, global const float *queries,
-                                global float *out, uint sources, uint count) {
-  const uint q = get_group_id(0), t = get_local_id(0), sg = get_sub_group_id();
-  if (q >= count || sources == 0 || sources > 5) return;
+KERNEL(256) void tf_inkling2_ar(global const ushort *blocks_in, global const float *partial_in, global const float *queries,
+                                global float *out, uint sources, uint count, uint rows, uint blocks_stride) {
+  const uint q = get_group_id(0), r = get_group_id(1), t = get_local_id(0), sg = get_sub_group_id();
+  if (q >= count || r >= rows || sources == 0 || sources > 5) return;
+  global const ushort *blocks = blocks_in + (ulong)r * blocks_stride;
+  global const float *partial = partial_in + (ulong)r * INK_HIDDEN;
   local float red[160]; // 5 sources of 16 sub-group sums for the squares, then for the dots
   float v[5][INK_HIDDEN / 256];
   float query[INK_HIDDEN / 256];
@@ -119,7 +124,7 @@ KERNEL(256) void tf_inkling2_ar(global const ushort *blocks, global const float 
 #pragma unroll
     for (uint s = 0; s < 5; ++s)
       if (s < sources) acc += weights[s] * (v[s][i] * means[s]);
-    out[(ulong)q * INK_HIDDEN + t + 256 * i] = acc;
+    out[((ulong)q * rows + r) * INK_HIDDEN + t + 256 * i] = acc;
   }
 }
 
