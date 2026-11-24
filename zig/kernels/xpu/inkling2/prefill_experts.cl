@@ -203,10 +203,10 @@ __kernel void P(gather)(__global const ushort *x, __global const int *order, __g
       ushort8 o;                                                                                                    \
       _Pragma("unroll") for (uint r = 0; r < 8; r++) {                                                              \
         const float g0 = acc[i][0][r], g1 = acc[i][1][r];                                                           \
-        const ushort a0 = P(act)(g0, sub_group_shuffle_xor(g0, 1));                                                 \
-        const ushort a1 = P(act)(g1, sub_group_shuffle_xor(g1, 1));                                                 \
-        const ushort s0 = sub_group_shuffle(a0, 2u * lane), s1 = sub_group_shuffle(a1, 2u * (lane & 7u));           \
-        o[r] = lane < 8 ? s0 : s1;                                                                                  \
+        const float p0 = sub_group_shuffle_xor(g0, 1), p1 = sub_group_shuffle_xor(g1, 1);                           \
+        const bool even = (lane & 1u) == 0;                                                                         \
+        const ushort a = P(act)(even ? g0 : p1, even ? p0 : g1);                                                    \
+        o[r] = sub_group_shuffle(a, lane < 8 ? 2u * lane : 2u * (lane - 8u) + 1u);                                  \
       }                                                                                                             \
       intel_sub_group_2d_block_write_16b_8r16x1c((global void *)(ys), (n) * 2, height, (n) * 2, (int2)(col0 / 2u, first + 8u * i), (private ushort *)&o); \
     }                                                                                                               \

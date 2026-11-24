@@ -484,3 +484,135 @@ KERNEL(16) void tf_ink2_pf_attn_window(global const ushort *q, global const usho
     }
   if (live_pair) part_ml[prow] = (float2)(top, mass);
 }
+
+// y[row][n] = bf16(x[row][k] . W[n][k]) for BF16 W, any number of rows: dense.cl's 32-row matvec with the row groups on the
+// grid's second axis, so a row's result is bit for bit the one a 32-row launch gives. Grid (ceil(n / 8), ceil(rows / 32)).
+// A sub-group owns one column; lane l sums the 8-wide chunks l, l + 16, ... each as one serial chain; k a multiple of 8.
+KERNEL(128) void tf_ink2_pf_dense(global const ushort *x, global const ushort *w, global ushort *y, uint rows, uint n, uint k, uint ldy) {
+  const uint j = get_group_id(0) * 8 + get_sub_group_id();
+  if (j >= n) return;
+  const uint base = get_group_id(1) * 32, rem = min(32u, rows - base);
+  const uint lane = get_sub_group_local_id(), chunks = k / 8;
+  global const uint4 *wr = (global const uint4 *)(w + (ulong)j * k);
+  global const ushort *xb = x + (ulong)base * k;
+  float acc[32];
+  #pragma unroll
+  for (uint r = 0; r < 32; ++r) acc[r] = 0.0f;
+  for (uint c = lane; c < chunks; c += 16) {
+    const uint4 wv = wr[c];
+    #pragma unroll
+    for (uint r = 0; r < 32; ++r) {
+      const uint4 xv = ((global const uint4 *)(xb + (ulong)min(r, rem - 1) * k))[c];
+      float part = as_float(wv.x << 16) * as_float(xv.x << 16);
+      part += as_float(wv.x & 0xffff0000u) * as_float(xv.x & 0xffff0000u);
+      part += as_float(wv.y << 16) * as_float(xv.y << 16);
+      part += as_float(wv.y & 0xffff0000u) * as_float(xv.y & 0xffff0000u);
+      part += as_float(wv.z << 16) * as_float(xv.z << 16);
+      part += as_float(wv.z & 0xffff0000u) * as_float(xv.z & 0xffff0000u);
+      part += as_float(wv.w << 16) * as_float(xv.w << 16);
+      part += as_float(wv.w & 0xffff0000u) * as_float(xv.w & 0xffff0000u);
+      acc[r] += part;
+    }
+  }
+  #pragma unroll
+  for (uint r = 0; r < 32; ++r) {
+    const float s = sub_group_reduce_add(acc[r]);
+    if (lane == 0 && r < rem) y[(ulong)(base + r) * ldy + j] = f2bf(s);
+  }
+}
+
+static inline float pf_sigmoid(float x) {
+  const float e = exp(-fabs(x));
+  return x < 0.0f ? e / (1.0f + e) : 1.0f / (1.0f + e);
+}
+
+// glue.cl's router for 4 rows a work-group: the same sums in the same order (so the scores, the picks and the weights are bit
+// for bit a one-row launch's), but each expert's weight row is read once for four independent chains. Grid (ceil(rows / 4)).
+// Work-item e < 128 sums expert e's products; sub-group r of the group then picks the top 8 of row r.
+KERNEL(256) void tf_ink2_pf_router(global const ushort *x, global const ushort *weight, global const float *bias,
+                                   global uint *ids, global float *weights, uint rows) {
+  const uint row0 = get_group_id(0) * 4, t = get_local_id(0);
+  local float4 xs[4][PF_HIDDEN / 4];
+  local float scores[4][128], keys[4][128], chosen[4][8];
+  local uint picked[4][8];
+  for (uint r = 0; r < 4; ++r) {
+    global const uint2 *xg = (global const uint2 *)(x + (ulong)min(row0 + r, rows - 1) * PF_HIDDEN);
+    for (uint i = t; i < PF_HIDDEN / 4; i += 256) {
+      const uint2 v = xg[i];
+      xs[r][i] = (float4)(as_float(v.x << 16), as_float(v.x & 0xffff0000u), as_float(v.y << 16), as_float(v.y & 0xffff0000u));
+    }
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (t < 128) {
+    global const uint4 *w = (global const uint4 *)(weight + (ulong)t * PF_HIDDEN);
+    float dot[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint i = 0; i < PF_HIDDEN / 8; i += 4) {
+      uint4 a[4];
+      for (uint u = 0; u < 4; ++u) a[u] = w[i + u];
+      for (uint u = 0; u < 4; ++u) {
+        for (uint r = 0; r < 4; ++r) {
+          const float4 b0 = xs[r][2 * (i + u)], b1 = xs[r][2 * (i + u) + 1];
+          dot[r] += as_float(a[u].x << 16) * b0.x;
+          dot[r] += as_float(a[u].x & 0xffff0000u) * b0.y;
+          dot[r] += as_float(a[u].y << 16) * b0.z;
+          dot[r] += as_float(a[u].y & 0xffff0000u) * b0.w;
+          dot[r] += as_float(a[u].z << 16) * b1.x;
+          dot[r] += as_float(a[u].z & 0xffff0000u) * b1.y;
+          dot[r] += as_float(a[u].w << 16) * b1.z;
+          dot[r] += as_float(a[u].w & 0xffff0000u) * b1.w;
+        }
+      }
+    }
+    for (uint r = 0; r < 4; ++r) {
+      scores[r][t] = pf_sigmoid(dot[r]);
+      keys[r][t] = scores[r][t] + bias[t];
+    }
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const uint r = get_sub_group_id(), row = row0 + r;
+  if (r < 4 && row < rows) {
+    const uint lane = get_sub_group_local_id();
+    float mine[8];
+    for (uint j = 0; j < 8; ++j) mine[j] = keys[r][lane * 8 + j];
+    uint taken = 0;
+    for (uint j = 0; j < 8; ++j) {
+      uint first_here = 128u;
+      for (int e = 7; e >= 0; --e)
+        if (!(taken & (1u << e))) first_here = lane * 8 + e;
+      const uint first = sub_group_reduce_min(first_here);
+      uint local_best = 8;
+      for (uint e = 0; e < 8; ++e)
+        if (!(taken & (1u << e)) && !isnan(mine[e]) && (local_best == 8 || mine[e] > mine[local_best])) local_best = e;
+      const float local_key = local_best == 8 ? -INFINITY : mine[local_best];
+      const float top = sub_group_reduce_max(local_key);
+      const uint candidate = (local_best != 8 && local_key == top) ? lane * 8 + local_best : 128u;
+      const uint largest = sub_group_reduce_min(candidate);
+      const uint best = isnan(keys[r][first]) || largest == 128u ? first : largest;
+      if (best / 8 == lane) taken |= 1u << (best % 8);
+      if (lane == 0) {
+        picked[r][j] = best;
+        chosen[r][j] = scores[r][best];
+      }
+    }
+    if (lane == 0) {
+      for (uint j = 1; j < 8; ++j) {
+        const uint id = picked[r][j];
+        const float score = chosen[r][j];
+        uint k = j;
+        while (k > 0 && picked[r][k - 1] > id) {
+          picked[r][k] = picked[r][k - 1];
+          chosen[r][k] = chosen[r][k - 1];
+          --k;
+        }
+        picked[r][k] = id;
+        chosen[r][k] = score;
+      }
+      float den = 1e-20f;
+      for (uint j = 0; j < 8; ++j) den += chosen[r][j];
+      for (uint j = 0; j < 8; ++j) {
+        ids[row * 8 + j] = picked[r][j];
+        weights[row * 8 + j] = chosen[r][j] / den * 8.0f;
+      }
+    }
+  }
+}

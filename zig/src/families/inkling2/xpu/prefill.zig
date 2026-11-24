@@ -99,6 +99,7 @@ const Run = struct {
         const n: u32 = @intCast(weight.shape[weight.rank - 2]);
         if (weight.q8 and !g.old_dense and n % 8 == 0 and k % 256 == 0) return pk.denseQ8(&g.p.prefill, g.s, tensor(weight), input, at(g.sc.xp, 0), out, @intCast(rows), n, k);
         if (weight.q8) return dense_q8_kernels.dense(&g.p.dense_q8, g.s, tensor(weight), input, out, @intCast(rows), n, k);
+        if (!g.old_dense and k % 8 == 0) return pk.denseBf16(&g.p.prefill, g.s, tensor(weight), input, out, @intCast(rows), n, k);
         try dense_kernels.dense(&g.p.dense, g.s, tensor(weight), input, out, @intCast(rows), n, k);
     }
 
@@ -378,7 +379,7 @@ const Run = struct {
             try g.gates(at(s.mlp_ar, 0), g.messageBlock(v.layer - 6, 3), w.controllers.?[3], at(s.mlp_gated, 0));
             try g.norm(at(s.mlp_gated, 0), w.mlp_norm, at(s.mlp_normed, 0), rows);
         } else try g.norm(at(s.mlp_ar, 0), w.mlp_norm, at(s.mlp_normed, 0), rows);
-        try glue.router(&g.p.glue, g.s, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.route_ids, 0), at(s.route_weights, 0), @intCast(rows));
+        if (g.old_experts) try glue.router(&g.p.glue, g.s, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.route_ids, 0), at(s.route_weights, 0), @intCast(rows)) else try pk.router(&g.p.prefill, g.s, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.route_ids, 0), at(s.route_weights, 0), @intCast(rows));
         try g.routedExperts(v.layer);
         try g.staticPostConv(cache, v.cache_slot, 3, s.mlp_out, w.mlp_conv, s.mlp_conv);
         try pointwise(&g.p.runtime, g.s, .mlp_partial, rows, 0, .{ at(s.partial, 0), at(s.mlp_conv, 0), at(s.p, 0) });

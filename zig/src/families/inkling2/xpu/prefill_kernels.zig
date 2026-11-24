@@ -19,6 +19,8 @@ pub const Kernels = struct {
     gates: xpu.Kernel,
     kv_copy: xpu.Kernel,
     attn_window: xpu.Kernel,
+    dense: xpu.Kernel,
+    router: xpu.Kernel,
 
     pub fn load(module: xpu.Module) !Kernels {
         var k_ar = try module.kernel("tf_ink2_pf_ar", .{ 256, 1, 1 });
@@ -39,11 +41,17 @@ pub const Kernels = struct {
         errdefer k_gates.deinit();
         var k_kv = try module.kernel("tf_ink2_pf_kv_copy", .{ 16, 1, 1 });
         errdefer k_kv.deinit();
-        const k_win = try module.kernel("tf_ink2_pf_attn_window", .{ 16, 1, 1 });
-        return .{ .ar = k_ar, .messages = k_messages, .copy_rows = k_copy, .perm = k_perm, .q8 = k_q8, .zeta_norm = k_zn, .zeta = k_zeta, .gates = k_gates, .kv_copy = k_kv, .attn_window = k_win };
+        var k_win = try module.kernel("tf_ink2_pf_attn_window", .{ 16, 1, 1 });
+        errdefer k_win.deinit();
+        var k_dense = try module.kernel("tf_ink2_pf_dense", .{ 128, 1, 1 });
+        errdefer k_dense.deinit();
+        const k_router = try module.kernel("tf_ink2_pf_router", .{ 256, 1, 1 });
+        return .{ .ar = k_ar, .messages = k_messages, .copy_rows = k_copy, .perm = k_perm, .q8 = k_q8, .zeta_norm = k_zn, .zeta = k_zeta, .gates = k_gates, .kv_copy = k_kv, .attn_window = k_win, .dense = k_dense, .router = k_router };
     }
 
     pub fn deinit(k: *Kernels) void {
+        k.router.deinit();
+        k.dense.deinit();
         k.attn_window.deinit();
         k.kv_copy.deinit();
         k.gates.deinit();
@@ -87,6 +95,18 @@ pub fn denseQ8(k_: *const Kernels, s: xpu.Stream, weight: Ref, x: Ref, xp: Ref, 
     std.debug.assert(rows > 0 and n % 8 == 0 and k % 256 == 0);
     try xpu.launch.dispatch(k_.perm, s, .{ k / 256, rows, 1 }, .{ x, xp, rows, k });
     try xpu.launch.dispatch(k_.q8, s, .{ (n + q8_cols - 1) / q8_cols, (rows + q8_rows - 1) / q8_rows, 1 }, .{ xp, weight, out, rows, n, k, n });
+}
+
+/// out[r][0..n] = bf16(x[r][0..k] . weight[n][k]) for BF16 weights, bit for bit the rows of dense.zig's 32-row launches, all rows in one launch.
+pub fn denseBf16(k_: *const Kernels, s: xpu.Stream, weight: Ref, x: Ref, out: Ref, rows: u32, n: u32, k: u32) !void {
+    std.debug.assert(rows > 0 and n > 0 and k % 8 == 0);
+    try xpu.launch.dispatch(k_.dense, s, .{ (n + 7) / 8, (rows + 31) / 32, 1 }, .{ x, weight, out, rows, n, k, n });
+}
+
+/// The router of glue.cl for `rows` rows, 4 a work-group; ids and weights are the same bit for bit.
+pub fn router(k: *const Kernels, s: xpu.Stream, x: Ref, weight: Ref, bias: Ref, ids: Ref, weights: Ref, rows: u32) !void {
+    std.debug.assert(rows > 0);
+    try xpu.launch.dispatch(k.router, s, .{ (rows + 3) / 4, 1, 1 }, .{ x, weight, bias, ids, weights, rows });
 }
 
 /// The controller tuple for every row: zn is a scratch of `rows * 2 * hidden` bf16 values, zeta one of `rows * 64`.
