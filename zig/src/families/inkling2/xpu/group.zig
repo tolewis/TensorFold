@@ -123,7 +123,7 @@ pub const Group = struct {
     pub fn wait(g: *Group) !Rec {
         const want = g.rec_seq + 1;
         const deadline = now() + 180.0;
-        while (g.counter().load(.acquire) < want) {
+        while (g.peerCounter().load(.acquire) < want) {
             if (now() > deadline) return error.PeerLost;
             std.atomic.spinLoopHint();
         }
