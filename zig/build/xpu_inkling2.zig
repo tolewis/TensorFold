@@ -82,6 +82,7 @@ const production_images = [_]Production{
     // the drafter's kernels: the engine loads this one only with a drafter
     .{ .name = "dspark", .path = "zig/kernels/xpu/inkling2/dspark.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2" },
     .{ .name = "dense_q8", .path = "zig/kernels/xpu/inkling2/dense_q8.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2" },
+    .{ .name = "tp", .path = "zig/kernels/xpu/inkling2/tp.cl" },
 };
 
 /// The module `inkling2_xpu_images`: every production kernel as a native zebin for `device`, one `align(8)` array each,

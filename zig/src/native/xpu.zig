@@ -255,6 +255,14 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     return null;
 }
 
+pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !bool {
+    if (!std.mem.eql(u8, o.model_type, "inkling2_loop")) {
+        problem.* = "this XPU build follows a tensor-parallel rank for Inkling 2 Mini only";
+        return false;
+    }
+    return @import("xpu_inkling2.zig").follow(a, gpa, io, o, problem);
+}
+
 fn openQwen27(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
     if (o.tp != 1 and o.tp != 2 and o.tp != 4) {
         problem.* = try std.fmt.allocPrint(a, "the XPU engine supports --tp 1, 2 or 4 for Qwen3.8-27B, not {d}", .{o.tp});

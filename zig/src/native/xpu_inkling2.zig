@@ -60,7 +60,7 @@ pub fn refusal(o: api.Open) ?[]const u8 {
     if (o.mtp_drafts != null or o.mtp_confidence != null) return "inkling2_loop: use --drafter for the checkpoint's DSpark head; external draft controls remain unsupported";
     if (o.precision != null) return "inkling2_loop: the checkpoint's NVFP4, MXFP8 and BF16 arithmetic is fixed; serve without --precision";
     if (o.speed_up != null) return "inkling2_loop: this XPU engine serves one card; --speed-up is unsupported";
-    if (o.tp != 1) return "inkling2_loop: this XPU engine serves one card; --tp is unsupported";
+    if (o.tp != 1 and o.tp != 2) return "inkling2_loop: --tp is 1 or 2";
     if (o.learn != null or o.learn_conversations) return "inkling2_loop: learned disk states are not implemented; serve without --learn and --learn-conversations";
     if (o.prompt_cache_gib) |g| if (!std.math.isFinite(g) or g < 0 or g > 1024 * 1024) return "inkling2_loop: --prompt-cache-gib must be a finite, nonnegative budget";
     return null;
@@ -157,7 +157,16 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     };
     errdefer h.rt.deinit();
     const embed_host = if (getenv("XPU_EMBED_HOST")) |v| std.mem.eql(u8, v, "1") else false;
-    h.model = Model.load(gpa, &h.rt, o.dir, .{ .embed_host = embed_host }) catch |err| {
+    const place = ink.place.Place.parse(o.tp, o.rank) catch {
+        problem.* = "inkling2_loop: --tp is 1 or 2, and --rank is below --tp";
+        h.rt.deinit();
+        h.stream.deinit();
+        h.ctx.deinit();
+        h.driver.close();
+        gpa.destroy(h);
+        return null;
+    };
+    h.model = Model.load(gpa, &h.rt, o.dir, .{ .embed_host = embed_host, .place = place }) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "the native Inkling 2 Mini engine cannot load this checkpoint ({s})", .{@errorName(err)});
         h.rt.deinit();
         h.stream.deinit();
@@ -177,6 +186,18 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         gpa.destroy(h);
         return null;
     };
+    if (place.split() and place.rank == 0) {
+        _ = ink.group.Group.open(gpa, &h.rt, &h.ctx, place) catch |err| {
+            problem.* = try std.fmt.allocPrint(a, "inkling2_loop: the TP group did not open ({s})", .{@errorName(err)});
+            h.model.deinit();
+            h.rt.deinit();
+            h.stream.deinit();
+            h.ctx.deinit();
+            h.driver.close();
+            gpa.destroy(h);
+            return null;
+        };
+    }
     const drafter_dir = drafterDirectory(o);
     h.drafter = null;
     if (drafter_dir) |dir| {
@@ -279,4 +300,74 @@ test "Inkling XPU longest context accounts the scratch, the streams and the draf
     try std.testing.expect(contextBytes(fits + 1, 4, true) > 8 * gib or fits == 1048576);
     try std.testing.expect(longest(8 * gib, 1048576, 4, false) > fits);
     try std.testing.expectEqual(@as(usize, 0), longest(1 << 20, 1048576, 1, false));
+}
+
+/// Rank 1 loads its half and replays rank 0's forwards. It serves no HTTP.
+pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !bool {
+    _ = io;
+    const place = ink.place.Place.parse(o.tp, o.rank) catch {
+        problem.* = "inkling2_loop: --tp is 1 or 2, and --rank is below --tp";
+        return false;
+    };
+    if (!place.split() or place.rank == 0) {
+        problem.* = "inkling2_loop: rank 1 is the follower";
+        return false;
+    }
+    var driver = xpu.Driver.open() catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "cannot open the Level Zero driver ({s})", .{@errorName(e)});
+        return false;
+    };
+    defer driver.close();
+    var ctx = xpu.Context.init(&driver, o.device) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "no Intel GPU device ({s})", .{@errorName(e)});
+        return false;
+    };
+    defer ctx.deinit();
+    var stream = xpu.Stream.init(&ctx) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "the XPU engine cannot start: {s}", .{@errorName(e)});
+        return false;
+    };
+    defer stream.deinit();
+    var rt = xpu.rt.Runtime.init(&ctx, stream) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "the XPU engine cannot start: {s}", .{@errorName(e)});
+        return false;
+    };
+    defer rt.deinit();
+    var model = Model.load(gpa, &rt, o.dir, .{ .place = place }) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "the native Inkling 2 Mini engine cannot load this checkpoint ({s})", .{@errorName(e)});
+        return false;
+    };
+    defer model.deinit();
+    model.loadKernels(&ctx) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "the native Inkling 2 Mini engine cannot build its kernels ({s})", .{@errorName(e)});
+        return false;
+    };
+    var gp = ink.group.Group.open(gpa, &rt, &ctx, place) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "inkling2_loop: the TP group did not open ({s})", .{@errorName(e)});
+        return false;
+    };
+    defer gpa.destroy(gp);
+    const cap: usize = @intCast(o.context orelse 8192);
+    var scratch = st.Scratch.init(&rt, st.max_rows, cap) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "inkling2_loop: scratch ({s})", .{@errorName(e)});
+        return false;
+    };
+    defer scratch.deinit();
+    var cache = st.Cache.init(&rt, cap, &model.weight_plan, .bf16) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "inkling2_loop: cache ({s})", .{@errorName(e)});
+        return false;
+    };
+    defer cache.deinit();
+    std.log.info("inkling2_loop: TP rank 1 following", .{});
+    while (true) {
+        const rec = gp.wait() catch |e| {
+            std.log.err("inkling2_loop: rank 1 stopped ({s})", .{@errorName(e)});
+            return false;
+        };
+        if (rec.op == .close) return true;
+        ink.forward.run(model, &scratch, &cache, rec.ids[0..rec.n], .{}) catch |e| {
+            std.log.err("inkling2_loop: rank 1 forward ({s})", .{@errorName(e)});
+            return false;
+        };
+    }
 }

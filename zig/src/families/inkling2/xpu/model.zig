@@ -14,6 +14,7 @@ const runtime = @import("runtime.zig");
 const dense = @import("dense.zig");
 const dense_q8 = @import("dense_q8.zig");
 const q8 = @import("q8.zig");
+const place_mod = @import("place.zig");
 
 const rt = xpu.rt;
 const loader = xpu.loader;
@@ -169,6 +170,8 @@ pub const Options = struct {
     /// With `.q8`, keep the checkpoint's bf16 head on the device as well. DSpark's drafter reads that head (its base
     /// kernel and its one-time fold), so a drafter needs it; without one, `false` gives back about 0.93 GB.
     keep_bf16_head: bool = true,
+    /// TP 1 is the full checkpoint. A rank above that loads only its heads and experts.
+    place: place_mod.Place = .{},
 };
 
 /// `options` with the `XPU_DENSE` environment override applied.
@@ -292,6 +295,74 @@ const Source = struct {
         }
     }
 
+    /// A row range of a bf16 or raw matrix, packed at the start of the device buffer. TP 1 does not call this.
+    fn getRows(s: *Source, comptime fmt: []const u8, args: anytype, dtype: DType, dims: []const usize, row0: usize, rows: usize) !Tensor {
+        var buf: [256]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buf, fmt, args);
+        const inf = try s.require(name, dtype, dims);
+        const k = if (dims.len > 1) dims[1] else 1;
+        const stride = k * dtype.size();
+        const nbytes = rows * stride;
+        var t: Tensor = .{ .buf = .{ .rt = s.l.r, .ptr = null, .len = 0 }, .bytes = nbytes, .dtype = dtype, .shape = inf.shape, .rank = inf.rank };
+        t.shape[0] = rows;
+        if (s.dry) return t;
+        try s.owned.ensureUnusedCapacity(s.gpa, 1);
+        t.buf = try s.l.empty(nbytes);
+        errdefer t.buf.free();
+        const host = try s.gpa.alloc(u8, nbytes);
+        defer s.gpa.free(host);
+        try loader.readExact(inf.fd, host, inf.off + @as(u64, row0) * stride);
+        try s.l.r.upload(t.buf, host);
+        s.owned.appendAssumeCapacity(t.buf);
+        return t;
+    }
+
+    /// Q8 of rows [row0, row0+n) of a bf16 matrix. The stored shape stays the checkpoint's; the device shape is the slice.
+    fn getDenseAt(s: *Source, comptime fmt: []const u8, args: anytype, dims: []const usize, row0: usize, n: usize) !Tensor {
+        if (s.options.dense == .bf16) return s.getRows(fmt, args, .bf16, dims, row0, n);
+        var buf: [256]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buf, fmt, args);
+        const inf = try s.require(name, .bf16, dims);
+        const k = dims[1];
+        if (!q8.admits(k)) return error.UnexpectedInkling2Tensor;
+        var t: Tensor = .{ .buf = .{ .rt = s.l.r, .ptr = null, .len = 0 }, .bytes = q8.bytes(n, k), .dtype = .u8, .shape = inf.shape, .rank = inf.rank, .q8 = true };
+        t.shape[0] = n;
+        if (s.dry) return t;
+        try s.owned.ensureUnusedCapacity(s.gpa, 1);
+        t.buf = try s.l.empty(t.bytes);
+        errdefer t.buf.free();
+        try s.encodeRange(t.buf, inf, row0, n, k);
+        s.owned.appendAssumeCapacity(t.buf);
+        return t;
+    }
+
+    fn encodeRange(s: *Source, dst: rt.Buffer, inf: loader.Info, row0: usize, n: usize, k: usize) !void {
+        if (s.scratch == null) {
+            const sc = try s.gpa.create(Scratch);
+            errdefer s.gpa.destroy(sc);
+            sc.raw = try s.gpa.alloc(u16, Scratch.values);
+            errdefer s.gpa.free(sc.raw);
+            sc.codes = try s.gpa.alloc(u8, Scratch.values);
+            errdefer s.gpa.free(sc.codes);
+            sc.scales = try s.gpa.alloc(u16, Scratch.values / q8.block);
+            s.scratch = sc;
+        }
+        const sc = s.scratch.?;
+        const nb = k / q8.block;
+        const per = @max(1, Scratch.values / k);
+        const base: [*]u8 = @ptrCast(dst.ptr.?);
+        var row: usize = 0;
+        while (row < n) {
+            const m = @min(per, n - row);
+            try loader.readExact(inf.fd, std.mem.sliceAsBytes(sc.raw[0 .. m * k]), inf.off + @as(u64, row0 + row) * k * 2);
+            q8.encodeRows(sc.raw[0 .. m * k], m, k, sc.codes[0 .. m * k], sc.scales[0 .. m * nb]);
+            try s.l.r.upload(.{ .rt = dst.rt, .ptr = base + row * k, .len = m * k }, sc.codes[0 .. m * k]);
+            try s.l.r.upload(.{ .rt = dst.rt, .ptr = base + q8.scaleOffset(n, k) + row * nb * 2, .len = m * nb * 2 }, std.mem.sliceAsBytes(sc.scales[0 .. m * nb]));
+            try s.l.r.sync();
+            row += m;
+        }
+    }
+
     fn freeScratch(s: *Source) void {
         if (s.scratch) |sc| {
             s.gpa.free(sc.raw);
@@ -318,6 +389,95 @@ const Source = struct {
     }
 };
 
+fn getCols(s: *Source, comptime fmt: []const u8, args: anytype, dims: []const usize, c0: usize, kc: usize) !Tensor {
+    var buf: [256]u8 = undefined;
+    const name = try std.fmt.bufPrint(&buf, fmt, args);
+    const inf = try s.require(name, .bf16, dims);
+    const n = dims[0];
+    const k = dims[1];
+    if (s.options.dense == .bf16) {
+        var t: Tensor = .{ .buf = .{ .rt = s.l.r, .ptr = null, .len = 0 }, .bytes = n * kc * 2, .dtype = .bf16, .shape = inf.shape, .rank = inf.rank };
+        t.shape[1] = kc;
+        if (s.dry) return t;
+        try s.owned.ensureUnusedCapacity(s.gpa, 1);
+        t.buf = try s.l.empty(t.bytes);
+        errdefer t.buf.free();
+        const row = try s.gpa.alloc(u16, k);
+        defer s.gpa.free(row);
+        const out = try s.gpa.alloc(u16, n * kc);
+        defer s.gpa.free(out);
+        for (0..n) |i| {
+            try loader.readExact(inf.fd, std.mem.sliceAsBytes(row), inf.off + @as(u64, i) * k * 2);
+            @memcpy(out[i * kc ..][0..kc], row[c0 .. c0 + kc]);
+        }
+        try s.l.r.upload(t.buf, std.mem.sliceAsBytes(out));
+        s.owned.appendAssumeCapacity(t.buf);
+        return t;
+    }
+    if (!q8.admits(kc)) return error.UnexpectedInkling2Tensor;
+    var t: Tensor = .{ .buf = .{ .rt = s.l.r, .ptr = null, .len = 0 }, .bytes = q8.bytes(n, kc), .dtype = .u8, .shape = inf.shape, .rank = inf.rank, .q8 = true };
+    t.shape[1] = kc;
+    if (s.dry) return t;
+    try s.owned.ensureUnusedCapacity(s.gpa, 1);
+    t.buf = try s.l.empty(t.bytes);
+    errdefer t.buf.free();
+    const row = try s.gpa.alloc(u16, k);
+    defer s.gpa.free(row);
+    const slim = try s.gpa.alloc(u16, kc);
+    defer s.gpa.free(slim);
+    const codes = try s.gpa.alloc(u8, kc);
+    defer s.gpa.free(codes);
+    const scales = try s.gpa.alloc(u16, kc / q8.block);
+    defer s.gpa.free(scales);
+    const base: [*]u8 = @ptrCast(t.buf.ptr.?);
+    for (0..n) |i| {
+        try loader.readExact(inf.fd, std.mem.sliceAsBytes(row), inf.off + @as(u64, i) * k * 2);
+        @memcpy(slim, row[c0 .. c0 + kc]);
+        q8.encodeRows(slim, 1, kc, codes, scales);
+        try s.l.r.upload(.{ .rt = t.buf.rt, .ptr = base + i * kc, .len = kc }, codes);
+        try s.l.r.upload(.{ .rt = t.buf.rt, .ptr = base + q8.scaleOffset(n, kc) + i * (kc / q8.block) * 2, .len = (kc / q8.block) * 2 }, std.mem.sliceAsBytes(scales));
+    }
+    try s.l.r.sync();
+    s.owned.appendAssumeCapacity(t.buf);
+    return t;
+}
+
+fn expertAt(s: *Source, comptime fmt: []const u8, args: anytype, dtype: DType, dims: []const usize, e0: usize, nexp: usize) !Tensor {
+    var buf: [256]u8 = undefined;
+    const name = try std.fmt.bufPrint(&buf, fmt, args);
+    const inf = try s.require(name, dtype, dims);
+    const one: usize = if (dims.len == 1) dtype.size() else dims[1] * dims[2] * dtype.size();
+    const nbytes = nexp * one;
+    var t: Tensor = .{ .buf = .{ .rt = s.l.r, .ptr = null, .len = 0 }, .bytes = nbytes, .dtype = dtype, .shape = inf.shape, .rank = inf.rank };
+    t.shape[0] = nexp;
+    if (s.dry) return t;
+    try s.owned.ensureUnusedCapacity(s.gpa, 1);
+    t.buf = try s.l.empty(nbytes);
+    errdefer t.buf.free();
+    const host = try s.gpa.alloc(u8, nbytes);
+    defer s.gpa.free(host);
+    try loader.readExact(inf.fd, host, inf.off + @as(u64, e0) * one);
+    try s.l.r.upload(t.buf, host);
+    s.owned.appendAssumeCapacity(t.buf);
+    return t;
+}
+
+fn matrixAt(s: *Source, layer: u32, comptime suffix: []const u8, precision: layer_plan.Precision, rows: usize, k: usize, e0: usize, nexp: usize) !ExpertMatrix {
+    const base = "model.llm.layers.{d}.mlp.experts." ++ suffix;
+    switch (precision) {
+        .nvfp4 => return .{
+            .weight = try expertAt(s, base ++ "_weight", .{layer}, .u8, &.{ 128, rows, k / 2 }, e0, nexp),
+            .scale = try expertAt(s, base ++ "_weight_scale", .{layer}, .f8_e4m3, &.{ 128, rows, k / 16 }, e0, nexp),
+            .amax = try expertAt(s, base ++ "_weight_amax", .{layer}, .f32, &.{128}, e0, nexp),
+            .denominator = try s.get(base ++ "_weight_outer_scale_denominator", .{layer}, .f32, &.{1}),
+        },
+        .mxfp8 => return .{
+            .weight = try expertAt(s, base ++ "_weight", .{layer}, .f8_e4m3, &.{ 128, rows, k }, e0, nexp),
+            .scale = try expertAt(s, base ++ "_weight_scale", .{layer}, .u8, &.{ 128, rows, k / 32 }, e0, nexp),
+        },
+    }
+}
+
 fn matrix(s: *Source, layer: u32, comptime suffix: []const u8, precision: layer_plan.Precision, rows: usize, k: usize) !ExpertMatrix {
     const base = "model.llm.layers.{d}.mlp.experts." ++ suffix;
     const e = 128;
@@ -343,19 +503,82 @@ fn loadConv(s: *Source, layer: u32, comptime role: []const u8, global: bool) !Co
     } };
 }
 
+fn loadConvSplit(s: *Source, layer: u32, comptime role: []const u8, global: bool, pl: place_mod.Place) !Conv {
+    const kv0: usize = pl.rank * pl.kvWidth();
+    const kvn: usize = pl.kvWidth();
+    if (!global) {
+        const t = try byteSlice(s, "model.llm.layers.{d}.attn." ++ role ++ "_sconv.weight", .{layer}, .bf16, &.{ 1024, 1, 4 }, kv0 * 8, kvn * 8);
+        return .{ .static = t };
+    }
+    const proj0: usize = @as(usize, pl.rank) * 16;
+    return .{ .dynamic = .{
+        .static_w = try colSlice(s, "model.llm.layers.{d}.attn." ++ role ++ "_sconv.static_w", .{layer}, &.{ 4, 1024 }, kv0, kvn),
+        .projection = try s.getRows("model.llm.layers.{d}.attn." ++ role ++ "_sconv.weight_proj", .{layer}, .bf16, &.{ 32, 2304 }, proj0, 16),
+    } };
+}
+
+fn byteSlice(s: *Source, comptime fmt: []const u8, args: anytype, dtype: DType, dims: []const usize, off: usize, nbytes: usize) !Tensor {
+    var buf: [256]u8 = undefined;
+    const name = try std.fmt.bufPrint(&buf, fmt, args);
+    const inf = try s.require(name, dtype, dims);
+    var t: Tensor = .{ .buf = .{ .rt = s.l.r, .ptr = null, .len = 0 }, .bytes = nbytes, .dtype = dtype, .shape = inf.shape, .rank = inf.rank };
+    t.shape[0] = nbytes / (dims[1] * dims[2] * dtype.size());
+    if (s.dry) return t;
+    try s.owned.ensureUnusedCapacity(s.gpa, 1);
+    t.buf = try s.l.empty(nbytes);
+    errdefer t.buf.free();
+    const host = try s.gpa.alloc(u8, nbytes);
+    defer s.gpa.free(host);
+    try loader.readExact(inf.fd, host, inf.off + off);
+    try s.l.r.upload(t.buf, host);
+    s.owned.appendAssumeCapacity(t.buf);
+    return t;
+}
+
+fn colSlice(s: *Source, comptime fmt: []const u8, args: anytype, dims: []const usize, c0: usize, kc: usize) !Tensor {
+    var buf: [256]u8 = undefined;
+    const name = try std.fmt.bufPrint(&buf, fmt, args);
+    const inf = try s.require(name, .bf16, dims);
+    const n = dims[0];
+    const k = dims[1];
+    var t: Tensor = .{ .buf = .{ .rt = s.l.r, .ptr = null, .len = 0 }, .bytes = n * kc * 2, .dtype = .bf16, .shape = inf.shape, .rank = inf.rank };
+    t.shape[1] = kc;
+    if (s.dry) return t;
+    try s.owned.ensureUnusedCapacity(s.gpa, 1);
+    t.buf = try s.l.empty(t.bytes);
+    errdefer t.buf.free();
+    const row = try s.gpa.alloc(u16, k);
+    defer s.gpa.free(row);
+    const out = try s.gpa.alloc(u16, n * kc);
+    defer s.gpa.free(out);
+    for (0..n) |i| {
+        try loader.readExact(inf.fd, std.mem.sliceAsBytes(row), inf.off + @as(u64, i) * k * 2);
+        @memcpy(out[i * kc ..][0..kc], row[c0 .. c0 + kc]);
+    }
+    try s.l.r.upload(t.buf, std.mem.sliceAsBytes(out));
+    s.owned.appendAssumeCapacity(t.buf);
+    return t;
+}
+
 fn loadWeights(s: *Source, config: *const cfg.Config, wp: *const layer_plan.Plan) !Weights {
     var w: Weights = undefined;
     w.embed = try s.getEmbed("model.llm.embed.weight", .bf16, &.{ 201024, 2304 });
     w.embed_norm = try s.get("model.llm.embed_norm.weight", .{}, .bf16, &.{2304});
     w.norm = try s.get("model.llm.norm.weight", .{}, .bf16, &.{2304});
     w.unembed_q8 = null;
+    const pl = s.options.place;
     if (s.options.dense == .q8) {
-        w.unembed_q8 = try s.getDense("model.llm.unembed.weight", .{}, &.{ 201024, 2304 }, config.text.unpadded_vocab);
+        w.unembed_q8 = if (pl.split())
+            try s.getDenseAt("model.llm.unembed.weight", .{}, &.{ 201024, 2304 }, pl.vocabBase(), pl.vocabCount())
+        else
+            try s.getDense("model.llm.unembed.weight", .{}, &.{ 201024, 2304 }, config.text.unpadded_vocab);
     }
     if (s.options.dense == .q8 and !s.options.keep_bf16_head) {
         // the head's BF16 is validated, not uploaded
         _ = try s.require("model.llm.unembed.weight", .bf16, &.{ 201024, 2304 });
         w.unembed = .{ .buf = .{ .rt = s.l.r, .ptr = null, .len = 0 }, .bytes = 0, .dtype = .bf16 };
+    } else if (pl.split()) {
+        w.unembed = try s.getRows("model.llm.unembed.weight", .{}, .bf16, &.{ 201024, 2304 }, pl.vocabBase(), pl.vocabCount());
     } else w.unembed = try s.get("model.llm.unembed.weight", .{}, .bf16, &.{ 201024, 2304 });
     w.output_query = try s.get("model.llm.attn_res.output_query", .{}, .f32, &.{2304});
     w.cross_queries = try s.get("model.llm.middle_cycle_cross_pass_queries", .{}, .f32, &.{ 24, 2304 });
@@ -371,21 +594,27 @@ fn loadWeights(s: *Source, config: *const cfg.Config, wp: *const layer_plan.Plan
         const p = wp.at(layer);
         const global = p.kind == .global;
         const q_width: usize = @as(usize, p.heads.q) * p.heads.dim;
+        const q0: usize = if (pl.split()) pl.rank * pl.qWidth() else 0;
+        const qn: usize = if (pl.split()) pl.qWidth() else q_width;
+        const kv0: usize = if (pl.split()) pl.rank * pl.kvWidth() else 0;
+        const kvn: usize = if (pl.split()) pl.kvWidth() else 1024;
+        const h0: usize = if (pl.split()) pl.rank * pl.qHeads() else 0;
+        const hn: usize = if (pl.split()) pl.qHeads() else 24;
         // a sliding layer's three input norms are one stored tensor: uploaded once, shared by q, k and v
         const local_norm = if (!global) try s.get("model.llm.layers.{d}.attn_norm.weight", .{layer}, .bf16, &.{2304}) else undefined;
         l.attn = .{
-            .wq = try s.getDense("model.llm.layers.{d}.attn.wq_du.weight", .{layer}, &.{ q_width, 2304 }, null),
-            .wk = try s.getDense("model.llm.layers.{d}.attn.wk_dv.weight", .{layer}, &.{ 1024, 2304 }, null),
-            .wv = try s.getDense("model.llm.layers.{d}.attn.wv_dv.weight", .{layer}, &.{ 1024, 2304 }, null),
-            .wr = try s.getDense("model.llm.layers.{d}.attn.wr_du.weight", .{layer}, &.{ 384, 2304 }, null),
-            .wo = try s.getDense("model.llm.layers.{d}.attn.wo_ud.weight", .{layer}, &.{ 2304, q_width }, null),
-            .gate = try s.getDense("model.llm.layers.{d}.attn.gate_attn.weight", .{layer}, &.{ q_width, 2304 }, null),
-            .sink = try s.get("model.llm.layers.{d}.attn.attn_sink_proj.weight", .{layer}, .bf16, &.{ 24, 2304 }),
-            .q_scale = try s.get("model.llm.layers.{d}.attn.q_l2_clip.scale", .{layer}, .bf16, &.{ 24, 128 }),
-            .rel_scale = try s.get("model.llm.layers.{d}.attn.rel_l2_clip.scale", .{layer}, .bf16, &.{ 24, 16 }),
+            .wq = if (pl.split()) try s.getDenseAt("model.llm.layers.{d}.attn.wq_du.weight", .{layer}, &.{ q_width, 2304 }, q0, qn) else try s.getDense("model.llm.layers.{d}.attn.wq_du.weight", .{layer}, &.{ q_width, 2304 }, null),
+            .wk = if (pl.split()) try s.getDenseAt("model.llm.layers.{d}.attn.wk_dv.weight", .{layer}, &.{ 1024, 2304 }, kv0, kvn) else try s.getDense("model.llm.layers.{d}.attn.wk_dv.weight", .{layer}, &.{ 1024, 2304 }, null),
+            .wv = if (pl.split()) try s.getDenseAt("model.llm.layers.{d}.attn.wv_dv.weight", .{layer}, &.{ 1024, 2304 }, kv0, kvn) else try s.getDense("model.llm.layers.{d}.attn.wv_dv.weight", .{layer}, &.{ 1024, 2304 }, null),
+            .wr = if (pl.split()) try s.getDenseAt("model.llm.layers.{d}.attn.wr_du.weight", .{layer}, &.{ 384, 2304 }, pl.rank * pl.relWidth(), pl.relWidth()) else try s.getDense("model.llm.layers.{d}.attn.wr_du.weight", .{layer}, &.{ 384, 2304 }, null),
+            .wo = if (pl.split()) try getCols(s, "model.llm.layers.{d}.attn.wo_ud.weight", .{layer}, &.{ 2304, q_width }, q0, qn) else try s.getDense("model.llm.layers.{d}.attn.wo_ud.weight", .{layer}, &.{ 2304, q_width }, null),
+            .gate = if (pl.split()) try s.getDenseAt("model.llm.layers.{d}.attn.gate_attn.weight", .{layer}, &.{ q_width, 2304 }, q0, qn) else try s.getDense("model.llm.layers.{d}.attn.gate_attn.weight", .{layer}, &.{ q_width, 2304 }, null),
+            .sink = if (pl.split()) try s.getRows("model.llm.layers.{d}.attn.attn_sink_proj.weight", .{layer}, .bf16, &.{ 24, 2304 }, h0, hn) else try s.get("model.llm.layers.{d}.attn.attn_sink_proj.weight", .{layer}, .bf16, &.{ 24, 2304 }),
+            .q_scale = if (pl.split()) try s.getRows("model.llm.layers.{d}.attn.q_l2_clip.scale", .{layer}, .bf16, &.{ 24, 128 }, h0, hn) else try s.get("model.llm.layers.{d}.attn.q_l2_clip.scale", .{layer}, .bf16, &.{ 24, 128 }),
+            .rel_scale = if (pl.split()) try s.getRows("model.llm.layers.{d}.attn.rel_l2_clip.scale", .{layer}, .bf16, &.{ 24, 16 }, h0, hn) else try s.get("model.llm.layers.{d}.attn.rel_l2_clip.scale", .{layer}, .bf16, &.{ 24, 16 }),
             .rel_projection = try s.get("model.llm.layers.{d}.attn.rel_logits_proj.proj", .{layer}, .bf16, &.{ 16, p.extent }),
-            .k_conv = try loadConv(s, layer, "k", global),
-            .v_conv = try loadConv(s, layer, "v", global),
+            .k_conv = if (pl.split()) try loadConvSplit(s, layer, "k", global, pl) else try loadConv(s, layer, "k", global),
+            .v_conv = if (pl.split()) try loadConvSplit(s, layer, "v", global, pl) else try loadConv(s, layer, "v", global),
             .q_norm = if (global) try s.get("model.llm.layers.{d}.q_input_norm.weight", .{layer}, .bf16, &.{2304}) else local_norm,
             .k_norm = if (global) try s.get("model.llm.layers.{d}.k_input_norm.weight", .{layer}, .bf16, &.{2304}) else local_norm,
             .v_norm = if (global) try s.get("model.llm.layers.{d}.v_input_norm.weight", .{layer}, .bf16, &.{2304}) else local_norm,
@@ -395,8 +624,8 @@ fn loadWeights(s: *Source, config: *const cfg.Config, wp: *const layer_plan.Plan
         l.mlp_conv = try s.get("model.llm.layers.{d}.mlp_sconv.weight", .{layer}, .bf16, &.{ 2304, 1, 4 });
         l.router_weight = try s.get("model.llm.layers.{d}.mlp.gate.weight", .{layer}, .bf16, &.{ 128, 2304 });
         l.router_bias = try s.get("model.llm.layers.{d}.mlp.gate.bias", .{layer}, .f32, &.{128});
-        l.gu = try matrix(s, layer, "w13", p.precision, 2304, 2304);
-        l.down = try matrix(s, layer, "w2", p.precision, 2304, 1152);
+        l.gu = if (pl.split()) try matrixAt(s, layer, "w13", p.precision, 2304, 2304, pl.expertBase(), pl.expertCount()) else try matrix(s, layer, "w13", p.precision, 2304, 2304);
+        l.down = if (pl.split()) try matrixAt(s, layer, "w2", p.precision, 2304, 1152, pl.expertBase(), pl.expertCount()) else try matrix(s, layer, "w2", p.precision, 2304, 1152);
         l.controllers = null;
         if (config.text.loop) |lp| if (layer >= lp.core_start and layer < lp.core_end) {
             var controllers: [4]Controller = undefined;

@@ -16,6 +16,8 @@ const state = @import("state.zig");
 const model_file = @import("model.zig");
 const Model = model_file.Model;
 const Tensor = model_file.Tensor;
+const place_mod = @import("place.zig");
+const group = @import("group.zig");
 
 const rt = xpu.rt;
 
@@ -172,8 +174,8 @@ const Run = struct {
         const history = cache.history(v.cache_slot, conv_state).ptr();
         const taps = cache.staged(v.cache_slot, conv_state, 0).ptr();
         switch (if (key) w.attn.k_conv else w.attn.v_conv) {
-            .static => |weight| try glue.convStatic(&g.p.glue, g.s, history, projected, taps, tensor(weight), raw, @intCast(rows), state.kv_width),
-            .dynamic => |d| try glue.convDynamic(&g.p.glue, g.s, history, projected, taps, at(normalized, base * state.hidden * 2), tensor(d.static_w), tensor(d.projection), raw, @intCast(rows), state.kv_width),
+            .static => |weight| try glue.convStatic(&g.p.glue, g.s, history, projected, taps, tensor(weight), raw, @intCast(rows), g.m.options.place.kvWidth()),
+            .dynamic => |d| try glue.convDynamic(&g.p.glue, g.s, history, projected, taps, at(normalized, base * state.hidden * 2), tensor(d.static_w), tensor(d.projection), raw, @intCast(rows), g.m.options.place.kvWidth()),
         }
     }
 
@@ -187,7 +189,8 @@ const Run = struct {
             const cache = seg.cache;
             const layer = cache.attentionLayer(&m.weight_plan, v.cache_slot, rows);
             const start = cache.len;
-            const rr = ap.Rows{ .rows = @intCast(rows), .heads = 24, .kv_heads = 8, .last_pos = @intCast(start + rows - 1), .streams = 1 };
+            const pl = g.m.options.place;
+            const rr = ap.Rows{ .rows = @intCast(rows), .heads = pl.qHeads(), .kv_heads = pl.kvHeads(), .last_pos = @intCast(start + rows - 1), .streams = 1 };
             const prep = ap.Prep{ .qk_clip = m.config.text.qk_clip, .rel_clip = m.config.text.rel_clip, .floor = @floatFromInt(m.config.text.log_floor), .alpha = m.config.text.log_alpha, .eps = m.config.text.eps };
             const meta = attention.RowMeta{
                 .pos = aref(s.pos, base * 4),
@@ -223,6 +226,31 @@ const Run = struct {
         const ids = at(s.route_ids, 0);
         const act = at(s.gu, 0);
         const down = at(s.down, 0);
+        const pl = g.m.options.place;
+        if (pl.split()) {
+            if (group.live) |gp| {
+                try xpu.launch.dispatch(gp.zero, g.s, .{ @intCast((rows * 8 + 255) / 256), 1, 1 }, .{ ids, at(s.route_weights, 0), @as(u32, @intCast(rows * 8)), pl.expertBase(), pl.expertCount() });
+            }
+            const members = at(s.members, 0);
+            const items = at(s.items, 0);
+            const count = at(s.count, 0);
+            var call = gu_call;
+            call.experts = 128;
+            try ex.plan(g.s, ids, members, items, count, call);
+            if (group.live) |gp| try xpu.launch.dispatch(gp.filter, g.s, .{ 1, 1, 1 }, .{ items, count, pl.expertBase(), pl.expertCount() });
+            const local = experts.Call{ .rows = @intCast(rows), .k = state.hidden, .n = state.intermediate, .format = precision, .experts = pl.expertCount() };
+            const down_local = experts.Call{ .rows = @intCast(rows), .k = state.intermediate, .n = state.hidden, .format = precision, .experts = pl.expertCount() };
+            switch (precision) {
+                .nvfp4 => try ex.nvfp4GuPrompt(g.s, x, tensor(w.gu.weight), tensor(w.gu.scale), tensor(w.gu.amax.?), tensor(w.gu.denominator.?), items, count, members, act, local),
+                .mxfp8 => try ex.mxfp8GuPrompt(g.s, x, tensor(w.gu.weight), tensor(w.gu.scale), items, count, members, act, local),
+            }
+            switch (precision) {
+                .nvfp4 => try ex.nvfp4DownPrompt(g.s, act, tensor(w.down.weight), tensor(w.down.scale), tensor(w.down.amax.?), tensor(w.down.denominator.?), items, count, members, down, down_local),
+                .mxfp8 => try ex.mxfp8DownPrompt(g.s, act, tensor(w.down.weight), tensor(w.down.scale), items, count, members, down, down_local),
+            }
+            try ex.combine(g.s, down, ids, at(s.route_weights, 0), at(s.mlp_out, 0), down_call);
+            return;
+        }
         if (rows <= decode_rows) {
             switch (precision) {
                 .nvfp4 => try ex.nvfp4Gu(g.s, x, tensor(w.gu.weight), tensor(w.gu.scale), tensor(w.gu.amax.?), tensor(w.gu.denominator.?), ids, act, gu_call),
@@ -278,6 +306,7 @@ const Run = struct {
         try g.dense(w.attn.gate, at(s.q_norm, 0), at(s.gate, 0), rows);
         try g.attendSegments(v, segments);
         try g.dense(w.attn.wo, at(s.att, 0), at(s.attn_dense, 0), rows);
+        if (g.m.options.place.split()) if (group.live) |gp| try gp.allReduce(at(s.attn_dense, 0).?, @intCast(rows));
         var base: usize = 0;
         for (segments) |seg| {
             try g.staticPostConv(seg.cache, v.cache_slot, 2, s.attn_dense, w.attn_conv, s.attn_conv, base, seg.rows);
@@ -293,6 +322,7 @@ const Run = struct {
         } else try g.norm(at(s.mlp_ar, 0), w.mlp_norm, at(s.mlp_normed, 0), rows);
         try glue.router(&g.p.glue, g.s, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.route_ids, 0), at(s.route_weights, 0), @intCast(rows));
         try g.routedExperts(v.layer, rows);
+        if (g.m.options.place.split()) if (group.live) |gp| try gp.allReduce(at(s.mlp_out, 0).?, @intCast(rows));
         base = 0;
         for (segments) |seg| {
             try g.staticPostConv(seg.cache, v.cache_slot, 3, s.mlp_out, w.mlp_conv, s.mlp_conv, base, seg.rows);
@@ -350,6 +380,7 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     try m.r.upload(s.seg_of, std.mem.sliceAsBytes(seg_of[0..rows]));
     try m.r.upload(s.segs, std.mem.sliceAsBytes(segs[0..segments.len]));
     const g = Run{ .m = m, .p = p, .s = stream, .sc = s };
+    if (m.options.place.rank == 0) if (group.live) |gp| try gp.note(.forward, ids);
     try glue.embedNorm(&p.glue, stream, at(s.ids, 0), tensor(m.weights.embed), tensor(m.weights.embed_norm), at(s.p, 0), @intCast(rows));
     for (m.weight_plan.visits[0..m.weight_plan.n_visits]) |*v| try g.visit(v, segments, rows, options.taps);
     try g.widen(at(s.p, 0), at(s.partial, 0), rows);
@@ -362,9 +393,15 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     if (options.taps) |to| try g.captureTap(at(s.mlp_normed, 0), to, final.capture_rows, 3);
     const logits = if (options.all) at(s.logits_all, 0) else at(segments[0].cache.logits, 0);
     const head_input = at(s.mlp_normed, final.logits_row * state.hidden * 2);
+    const vocab_n: u32 = m.options.place.vocabCount();
     if (m.weights.unembed_q8) |head| {
-        try dense_q8_kernels.head(&p.dense_q8, stream, tensor(head), head_input, logits, @intCast(final.logits_rows), m.config.text.unpadded_vocab);
-    } else try glue.logits(&p.glue, stream, head_input, tensor(m.weights.unembed), logits, @intCast(final.logits_rows), m.config.text.unpadded_vocab);
+        try dense_q8_kernels.head(&p.dense_q8, stream, tensor(head), head_input, logits, @intCast(final.logits_rows), vocab_n);
+    } else try glue.logits(&p.glue, stream, head_input, tensor(m.weights.unembed), logits, @intCast(final.logits_rows), vocab_n);
+    if (m.options.place.split()) if (group.live) |gp| {
+        const src = if (m.options.place.rank == 0) logits else logits;
+        const dst = plus(logits, @as(usize, m.options.place.vocabBase()) * 4);
+        try gp.headPull(src.?, dst.?, if (m.options.place.rank == 0) m.options.place.vocabCount() else vocab_n);
+    };
     try g.commitFullHistories(segments);
     if (xpu.profile.active) |prof| prof.enqueued();
     try stream.synchronize();

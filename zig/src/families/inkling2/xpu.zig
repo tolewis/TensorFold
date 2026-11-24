@@ -7,6 +7,8 @@ pub const forward = @import("xpu/forward.zig");
 pub const backend = @import("xpu/backend.zig");
 pub const dspark = @import("xpu/dspark.zig");
 pub const sampler = @import("xpu/sampler.zig");
+pub const place = @import("xpu/place.zig");
+pub const group = @import("xpu/group.zig");
 
 test {
     _ = state;
