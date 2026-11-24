@@ -64,6 +64,7 @@ fn argsOf(planted: []const u8) u32 {
         .{ "tf_ctl_attn_drop_slice", 8 },
         .{ "tf_ctl_attn_merge_unguarded", 8 },
         .{ "tf_inkling2_loop_messages", 6 },
+        .{ "tf_inkling2_loop_zeta", 5 },
         .{ "tf_inkling2_loop_gates", 7 },
         .{ "tf_inkling2_embed_norm", 5 },
         .{ "tf_inkling2_ar", 6 },

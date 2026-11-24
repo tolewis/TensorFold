@@ -190,6 +190,7 @@ pub const Probe = struct {
                 self.refs[2] = try self.input(self.f[2], true);
                 self.refs[3] = try self.input(self.f[3], true);
                 self.refs[4] = try self.input(self.f[4], true);
+                self.refs[5] = try self.rig.scratch(r * p.rank * @sizeOf(f32));
             },
         }
         self.out = try self.rig.output(self.count() * @sizeOf(f32));
@@ -201,7 +202,7 @@ pub const Probe = struct {
         const s = self.rig.dev.s;
         switch (self.kind) {
             .messages => try host.crossPassMessageAttention(&self.pipes, s, self.refs[0], self.refs[1], self.refs[2], self.refs[3], self.out, rows),
-            .gates => try host.gates(&self.pipes, s, self.refs[0], self.refs[1], self.refs[2], self.refs[3], self.refs[4], self.out, rows),
+            .gates => try host.gates(&self.pipes, s, self.refs[0], self.refs[1], self.refs[2], self.refs[3], self.refs[4], self.refs[5], self.out, rows),
         }
         try s.synchronize();
     }

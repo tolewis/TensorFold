@@ -139,7 +139,7 @@ const Run = struct {
             for (0..3) |role| for (0..rows) |i| {
                 const c = controllers[role];
                 const source_role = if (lp.kind == .local) 0 else role;
-                try loop.gates(&g.p.loop, g.s, arRow(s, source_role, rows, i, false), messageRow(s, core, role, i), tensor(c.down), tensor(c.forget), tensor(c.gain), arRow(s, role, rows, i, true), 1);
+                try loop.gates(&g.p.loop, g.s, arRow(s, source_role, rows, i, false), messageRow(s, core, role, i), tensor(c.down), tensor(c.forget), tensor(c.gain), row(s.zeta, i, 64 * 4), arRow(s, role, rows, i, true), 1);
             };
         }
         const gated = v.hasMessages();
@@ -285,7 +285,7 @@ const Run = struct {
         if (gated) {
             const c = w.controllers.?[3];
             const core = v.layer - 6;
-            for (0..rows) |i| try loop.gates(&g.p.loop, g.s, row(s.mlp_ar, i, state.hidden * 4), messageRow(s, core, 3, i), tensor(c.down), tensor(c.forget), tensor(c.gain), row(s.mlp_gated, i, state.hidden * 4), 1);
+            for (0..rows) |i| try loop.gates(&g.p.loop, g.s, row(s.mlp_ar, i, state.hidden * 4), messageRow(s, core, 3, i), tensor(c.down), tensor(c.forget), tensor(c.gain), row(s.zeta, i, 64 * 4), row(s.mlp_gated, i, state.hidden * 4), 1);
             try g.norm(at(s.mlp_gated, 0), w.mlp_norm, at(s.mlp_normed, 0), rows);
         } else try g.norm(at(s.mlp_ar, 0), w.mlp_norm, at(s.mlp_normed, 0), rows);
         try glue.router(&g.p.glue, g.s, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.route_ids, 0), at(s.route_weights, 0), @intCast(rows));
