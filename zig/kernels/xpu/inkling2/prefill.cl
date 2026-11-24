@@ -639,6 +639,94 @@ KERNEL(256) void tf_ink2_pf_router(global const ushort *x, global const ushort *
   }
 }
 
+// wt[d * 128 + e] = weight[e * 2304 + d]. One work-group an expert. The read is contiguous; the write is the transposed form the 16-row router reads.
+KERNEL(256) void tf_ink2_pf_router_xt(global const ushort *weight, global ushort *wt) {
+  const uint e = get_group_id(0), t = get_local_id(0);
+  if (e >= 128) return;
+  global const ushort *src = weight + (ulong)e * PF_HIDDEN;
+  for (uint d = t; d < PF_HIDDEN; d += 256) wt[(ulong)d * 128u + e] = src[d];
+}
+
+// 16 rows a work-group, 128 work-items. Work-item e reads expert e from the transposed weight (one value, shared by the 16 rows) and adds the products in index order, the same order as the 4-row router. Sub-groups then pick the top 8 with that router's tie break. Grid (ceil(rows / 16)).
+KERNEL(128) void tf_ink2_pf_router16(global const ushort *x, global const ushort *wt, global const float *bias,
+                                     global uint *ids, global float *weights, uint rows) {
+  const uint row0 = get_group_id(0) * 16, e = get_local_id(0);
+  local ushort xs[16][32];
+  local float scores[16][128], keys[16][128], chosen[16][8];
+  local uint picked[16][8];
+  float dot[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  for (uint base = 0; base < PF_HIDDEN; base += 32) {
+    for (uint k = 0; k < 4; ++k) {
+      const uint i = e + k * 128;
+      const uint r = i >> 5, c = i & 31u;
+      const uint row = min(row0 + r, rows - 1);
+      xs[r][c] = x[(ulong)row * PF_HIDDEN + base + c];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint c = 0; c < 32; ++c) {
+      const float w = bf2f(wt[((ulong)base + c) * 128u + e]);
+      #pragma unroll
+      for (uint r = 0; r < 16; ++r) dot[r] += w * bf2f(xs[r][c]);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  #pragma unroll
+  for (uint r = 0; r < 16; ++r) {
+    scores[r][e] = pf_sigmoid(dot[r]);
+    keys[r][e] = scores[r][e] + bias[e];
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (uint pass = 0; pass < 2; ++pass) {
+    const uint r = pass * 8 + get_sub_group_id();
+    const uint row = row0 + r;
+    if (row < rows) {
+      const uint lane = get_sub_group_local_id();
+      float mine[8];
+      for (uint j = 0; j < 8; ++j) mine[j] = keys[r][lane * 8 + j];
+      uint taken = 0;
+      for (uint j = 0; j < 8; ++j) {
+        uint first_here = 128u;
+        for (int ee = 7; ee >= 0; --ee)
+          if (!(taken & (1u << ee))) first_here = lane * 8 + (uint)ee;
+        const uint first = sub_group_reduce_min(first_here);
+        uint local_best = 8;
+        for (uint ee = 0; ee < 8; ++ee)
+          if (!(taken & (1u << ee)) && !isnan(mine[ee]) && (local_best == 8 || mine[ee] > mine[local_best])) local_best = ee;
+        const float local_key = local_best == 8 ? -INFINITY : mine[local_best];
+        const float top = sub_group_reduce_max(local_key);
+        const uint candidate = (local_best != 8 && local_key == top) ? lane * 8 + local_best : 128u;
+        const uint largest = sub_group_reduce_min(candidate);
+        const uint best = isnan(keys[r][first]) || largest == 128u ? first : largest;
+        if (best / 8 == lane) taken |= 1u << (best % 8);
+        if (lane == 0) {
+          picked[r][j] = best;
+          chosen[r][j] = scores[r][best];
+        }
+      }
+      if (lane == 0) {
+        for (uint j = 1; j < 8; ++j) {
+          const uint id = picked[r][j];
+          const float score = chosen[r][j];
+          uint k = j;
+          while (k > 0 && picked[r][k - 1] > id) {
+            picked[r][k] = picked[r][k - 1];
+            chosen[r][k] = chosen[r][k - 1];
+            --k;
+          }
+          picked[r][k] = id;
+          chosen[r][k] = score;
+        }
+        float den = 1e-20f;
+        for (uint j = 0; j < 8; ++j) den += chosen[r][j];
+        for (uint j = 0; j < 8; ++j) {
+          ids[row * 8 + j] = picked[r][j];
+          weights[row * 8 + j] = chosen[r][j] / den * 8.0f;
+        }
+      }
+    }
+  }
+}
+
 // glue.cl's static convolution, four channels a work-item: the same arithmetic a channel, so the result is bit for bit.
 // Grid (ceil(channels / 4 / 256), rows); channels a multiple of 4.
 KERNEL(256) void tf_ink2_pf_conv_static(global const ushort *history, global const ushort *current, global ushort *taps,
@@ -680,5 +768,134 @@ KERNEL(256) void tf_ink2_pf_rel_table(global const ushort *rel, global const ush
     float4 acc = (float4)(0.0f);
     for (uint j = 0; j < PF_REL; ++j) acc += bf2f(rr[j]) * pj[j];
     vstore4((ushort4)(f2bf(acc.x), f2bf(acc.y), f2bf(acc.z), f2bf(acc.w)), 0, tab + rh * PF_EXTENT + d);
+  }
+}
+
+// One work-group a row. The two RMS norms are computed once and kept in local memory; each of the 48 entries then dots in the same order as the one-entry kernel.
+KERNEL(256) void tf_ink2_pf_messages_row(global const ushort *bank0, global const ushort *bank1, global const float *q_mlp,
+                                         global const float *kv, global float *out, uint rows) {
+  local float red[PF_LOOP_SGS];
+  local float beta0[PF_HIDDEN];
+  local float beta1[PF_HIDDEN];
+  const uint t = get_local_id(0), row = get_group_id(0);
+  if (row >= rows) return;
+  global const ushort *b0 = bank0 + (size_t)row * PF_HIDDEN;
+  global const ushort *b1 = bank1 + (size_t)row * PF_HIDDEN;
+  float ss0 = 0.0f, ss1 = 0.0f;
+  for (uint d = t; d < PF_HIDDEN; d += 256) {
+    const float x0 = bf2f(b0[d]), x1 = bf2f(b1[d]);
+    ss0 += x0 * x0;
+    ss1 += x1 * x1;
+  }
+  const float inv0 = pf_rms_inverse(pf_group_sum(ss0, red));
+  const float inv1 = pf_rms_inverse(pf_group_sum(ss1, red));
+  for (uint d = t; d < PF_HIDDEN; d += 256) {
+    beta0[d] = bf2f(b0[d]) * inv0;
+    beta1[d] = bf2f(b1[d]) * inv1;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (uint entry = 0; entry < PF_MESSAGES; ++entry) {
+    const uint layer = entry / 4;
+    const uint role = entry - 4 * layer;
+    const global float *query = ((role == 0 || role == 3) ? q_mlp : kv) + (size_t)(2 * layer + (role >= 2 ? 1 : 0)) * PF_HIDDEN;
+    float dot0 = 0.0f, dot1 = 0.0f;
+    for (uint d = t; d < PF_HIDDEN; d += 256) {
+      dot0 += query[d] * beta0[d];
+      dot1 += query[d] * beta1[d];
+    }
+    const float l0 = pf_group_sum(dot0, red) * PF_AR_SCALE;
+    const float l1 = pf_group_sum(dot1, red) * PF_AR_SCALE;
+    const float peak = fmax(fmax(-INFINITY, l0), l1);
+    float w0 = exp(l0 - peak);
+    float w1 = exp(l1 - peak);
+    float den = w0 + w1;
+    w0 = w0 / den;
+    w1 = w1 / den;
+    global float *dst = out + ((size_t)entry * rows + row) * PF_HIDDEN;
+    for (uint d = t; d < PF_HIDDEN; d += 256) dst[d] = w0 * beta0[d] + w1 * beta1[d];
+  }
+}
+
+// The same permutation as tf_ink2_pf_perm, with the 256 source values staged in local memory so the read and the write are contiguous.
+KERNEL(256) void tf_ink2_pf_perm_c(global const ushort *x, global ushort *xp, uint rows, uint k) {
+  local ushort tile[256];
+  const uint plane = get_group_id(0), row = get_group_id(1), o = get_local_id(0);
+  if (row >= rows) return;
+  tile[o] = x[(ulong)row * k + plane * 256 + o];
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const uint s = o >> 4, l = o & 15u;
+  xp[(ulong)row * k + plane * 256 + o] = tile[(s >> 1) * 32 + 2 * l + (s & 1)];
+}
+// Four columns a work-item and eight (row, head) pairs a work-group (two sub-groups a pair). Each column follows
+// tf_ink2_merge, so the stored bf16 matches. Grid (ceil(npairs / 8)).
+KERNEL(256) void tf_ink2_pf_merge(global const float *part_o, global const float2 *part_ml, global const ushort *sink, global const ushort *gate,
+                                  global const int *rpos, global ushort *out, uint npairs, uint heads, uint window, uint chunk, uint c0, uint chunks, uint subs) {
+  const uint sg = get_sub_group_id();
+  const uint pair = get_group_id(0) * 8u + sg / 2u;
+  if (pair >= npairs) return;
+  const uint lane = get_sub_group_local_id() + (sg & 1u) * 16u;
+  const uint d0 = lane * 4u;
+  const uint row = pair / heads;
+  const uint pos = (uint)rpos[row];
+  const uint lo = window && pos + 1 > window ? pos + 1 - window : 0;
+  float4 mm = (float4)(-INFINITY), ll = (float4)(0.0f), o = (float4)(0.0f);
+  for (uint c = lo / chunk; c <= pos / chunk; ++c) {
+    float4 cm, cl, co;
+    if (subs > 1) {
+      float4 sm = (float4)(-INFINITY), sl = (float4)(0.0f), so = (float4)(0.0f);
+      const uint last = min(subs - 1u, (pos - c * chunk) / 1024u);
+      for (uint u = 0; u <= last; ++u) {
+        const size_t at = (size_t)pair * chunks + (c - c0) * subs + u;
+        const float2 ml = part_ml[at];
+        const float4 mn = fmax(sm, (float4)(ml.x));
+        const float4 x = exp2(sm - mn), y = exp2((float4)(ml.x) - mn);
+        sl = sl * x + (float4)(ml.y) * y;
+        so = so * x + vload4(0, part_o + at * 128 + d0) * y;
+        sm = mn;
+      }
+      cm = sm;
+      cl = sl;
+      co = so;
+    } else {
+      const size_t at = (size_t)pair * chunks + c - (window ? lo / chunk : c0);
+      const float2 ml = part_ml[at];
+      cm = (float4)(ml.x);
+      cl = (float4)(ml.y);
+      co = vload4(0, part_o + at * 128 + d0);
+    }
+    const float4 mn = fmax(mm, cm), x = exp2(mm - mn), y = exp2(cm - mn);
+    ll = ll * x + cl * y;
+    o = o * x + co * y;
+    mm = mn;
+  }
+  const float sk = bf2f(sink[pair]) * PF_LOG2E;
+  const float4 mf = fmax(mm, (float4)(sk)), a0 = exp2(mm - mf);
+  const float4 yv = o * a0 / (ll * a0 + exp2((float4)(sk) - mf));
+  const ushort4 gv = vload4(0, gate + (size_t)pair * 128 + d0);
+  const float4 g = (float4)(bf2f(gv.x), bf2f(gv.y), bf2f(gv.z), bf2f(gv.w));
+  const float4 h = yv * ((float4)(1.0f) / ((float4)(1.0f) + exp(-g)));
+  vstore4((ushort4)(f2bf(h.x), f2bf(h.y), f2bf(h.z), f2bf(h.w)), 0, out + (size_t)pair * 128 + d0);
+}
+
+// Eight rows a work-group, 32 threads a row. The RMS sum is a contiguous chain a thread, then the two sub-groups of the row, so it is not the 256-thread order.
+KERNEL(256) void tf_ink2_pf_norm(global const float *x, global const ushort *w, global ushort *out, uint rows) {
+  local float red[16];
+  const uint r = get_local_id(0) >> 5;
+  const uint t = get_local_id(0) & 31u;
+  const uint row0 = get_group_id(0) * 8u;
+  const uint row = min(row0 + r, rows - 1u);
+  global const float *xr = x + (ulong)row * PF_HIDDEN;
+  float sum = 0.0f;
+  for (uint d = t; d < PF_HIDDEN; d += 32) sum = fma(xr[d], xr[d], sum);
+  const float sg = sub_group_reduce_add(sum);
+  if (get_sub_group_local_id() == 0) red[get_sub_group_id()] = sg;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const uint sg0 = (get_local_id(0) >> 5) * 2u;
+  const float total = red[sg0] + red[sg0 + 1u];
+  const float inverse = 1.0f / sqrt(total / 2304.0f + PF_EPS);
+  if (row0 + r < rows) {
+    for (uint d = t; d < PF_HIDDEN; d += 32) {
+      out[(ulong)row * PF_HIDDEN + d] = f2bf(bf2f(w[d]) * (xr[d] * inverse));
+    }
   }
 }
