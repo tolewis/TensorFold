@@ -71,6 +71,10 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     // Inkling 2 Mini's DSpark: the host wrappers the contract file launches through, and the kernels' source text
     const dspark_host = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/xpu/dspark_kernels.zig"), .target = target, .optimize = optimize });
     dspark_host.addImport("xpu", xpu);
+    // Mini's DFlash 2: the same two modules
+    const dflash2_host = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/xpu/dflash2_kernels.zig"), .target = target, .optimize = optimize });
+    dflash2_host.addImport("xpu", xpu);
+    const dflash2_sources = b.createModule(.{ .root_source_file = b.path("zig/kernels/xpu/inkling2/dflash2_sources.zig"), .target = target, .optimize = optimize });
     // Inkling 2 Mini's dense projections and norm: the host wrapper the contract file launches through
     const dense_host = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/xpu/dense.zig"), .target = target, .optimize = optimize });
     dense_host.addImport("xpu", xpu);
@@ -82,7 +86,7 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
 
     const files = b.addWriteFiles();
     if (prebuilt) |dir| {
-        for ([_][]const u8{ "glue", "tp", "contract_controls", "contract_gate_controls", "decode", "contract_attn_upstream", "contract_merge_upstream", "contract_inkling2_loop", "contract_inkling2_loop_controls", "inkling2_dspark", "contract_inkling2_dspark_controls", "contract_inkling2_experts", "contract_inkling2_controls", "inkling2_dense", "contract_inkling2_dense_store", "contract_inkling2_dense_sums", "inkling2_dense_q8", "contract_inkling2_dense_q8_store", "contract_inkling2_dense_q8_sums", "contract_inkling2_dense_q8_scale" } ++ inkling2.names) |name| {
+        for ([_][]const u8{ "glue", "tp", "contract_controls", "contract_gate_controls", "decode", "contract_attn_upstream", "contract_merge_upstream", "contract_inkling2_loop", "contract_inkling2_loop_controls", "inkling2_dspark", "contract_inkling2_dspark_controls", "inkling2_dflash2", "contract_inkling2_dflash2_controls", "contract_inkling2_experts", "contract_inkling2_controls", "inkling2_dense", "contract_inkling2_dense_store", "contract_inkling2_dense_sums", "inkling2_dense_q8", "contract_inkling2_dense_q8_store", "contract_inkling2_dense_q8_sums", "contract_inkling2_dense_q8_scale" } ++ inkling2.names) |name| {
             _ = files.addCopyFile(.{ .cwd_relative = b.fmt("{s}/{s}.bin", .{ dir, name }) }, b.fmt("{s}.bin", .{name}));
         }
         for (ink2_attn_images ++ ink2_attn_controls) |src| {
@@ -133,6 +137,8 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         \\pub const inkling2_runtime_ctl align(8) = @embedFile("inkling2_runtime_ctl.bin").*;
         \\pub const inkling2_dspark align(8) = @embedFile("inkling2_dspark.bin").*;
         \\pub const contract_inkling2_dspark_controls align(8) = @embedFile("contract_inkling2_dspark_controls.bin").*;
+        \\pub const inkling2_dflash2 align(8) = @embedFile("inkling2_dflash2.bin").*;
+        \\pub const contract_inkling2_dflash2_controls align(8) = @embedFile("contract_inkling2_dflash2_controls.bin").*;
         \\pub const ink2_attention align(8) = @embedFile("inkling2_attention.bin").*;
         \\pub const ink2_prompt align(8) = @embedFile("inkling2_prompt.bin").*;
         \\pub const ink2_attention_ctl1 align(8) = @embedFile("inkling2_attention_ctl1.bin").*;
@@ -185,6 +191,8 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
             .{ .name = "inkling2_xpu_runtime", .module = ink2_hosts[1] },
             .{ .name = "inkling2_dspark_host", .module = dspark_host },
             .{ .name = "inkling2_dspark_sources", .module = dspark_sources },
+            .{ .name = "inkling2_dflash2_host", .module = dflash2_host },
+            .{ .name = "inkling2_dflash2_sources", .module = dflash2_sources },
             .{ .name = "inkling2_xpu_attention", .module = ink2_attention },
             .{ .name = "inkling2_dense_host", .module = dense_host },
             .{ .name = "inkling2_dense_q8_host", .module = dense_q8_host },
@@ -310,6 +318,13 @@ const inkling2_images = [_]Source{
         .path = "zig/kernels/xpu/inkling2/contract_dspark_controls.cl",
         .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2",
         .inputs = &.{"zig/kernels/xpu/inkling2/dspark.cl"},
+    },
+    .{ .name = "inkling2_dflash2", .path = "zig/kernels/xpu/inkling2/dflash2.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2" },
+    .{
+        .name = "contract_inkling2_dflash2_controls",
+        .path = "zig/kernels/xpu/inkling2/contract_dflash2_controls.cl",
+        .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2",
+        .inputs = &.{"zig/kernels/xpu/inkling2/dflash2.cl"},
     },
 };
 

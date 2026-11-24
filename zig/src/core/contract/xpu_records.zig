@@ -11,6 +11,7 @@ pub const Record = struct { launch: X, usage: [limits.xe.len]U, compiled: bool =
 
 const glue = limits.Format.native;
 const dspark = @import("inkling2_dspark_xpu_records.zig");
+const dflash2 = @import("inkling2_dflash2_xpu_records.zig");
 const inkling2_dense = @import("inkling2_dense_xpu_records.zig");
 const inkling2_dense_q8 = @import("inkling2_dense_q8_xpu_records.zig");
 
@@ -158,7 +159,7 @@ const qwen27_records = [_]Record{
         .launch = .{ .name = "inkling2 prompt attention", .symbol = "tf_ink2_attn_prompt", .image = "inkling2_prompt", .format = glue, .threads = .{ 16, 1, 1 }, .slm = 512, .sub_group = 16, .grf = 256 },
         .usage = .{.{ .threads = .{ 16, 1, 1 }, .slm = 512, .sub_group = 16, .grf = 256 }},
     },
-} ++ dspark.records;
+} ++ dspark.records ++ dflash2.records;
 
 /// Every registered XPU launch: Qwen3.8-27B's, then Inkling 2 Mini's glue and runtime.
 pub const records = qwen27_records ++ @import("xpu_inkling2_records.zig").records ++ inkling2_experts.list(Record) ++ inkling2_dense.records ++ inkling2_dense_q8.records;

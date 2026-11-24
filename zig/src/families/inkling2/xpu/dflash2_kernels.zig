@@ -132,12 +132,23 @@ pub fn commitContext(k: *const Kernels, s: xpu.Stream, k_raw: Ref, v_raw: Ref, k
     try xpu.launch.dispatch(k.context_kv, s, .{ rows * kv_heads, 1, 1 }, .{ k_raw, v_raw, k_weight, keys, values, base_position, ring });
 }
 
+/// The block's attention, first pass: one partial per (row, key/value head, chunk of 128 keys).
+pub fn attendPartial(k: *const Kernels, s: xpu.Stream, q: Ref, block_k: Ref, block_v: Ref, context_k: Ref, context_v: Ref, part: Ref, committed: u32, ring: u32, from: u32) !void {
+    const chunks = chunksFor(committed, from);
+    std.debug.assert(ring > 0 and chunks <= max_chunks and from <= committed);
+    try xpu.launch.dispatch(k.attention, s, .{ chunks, kv_heads, block_rows }, .{ q, block_k, block_v, context_k, context_v, part, committed, ring, from, chunks });
+}
+
+/// Second pass: the partials merge to BF16 [8][4096].
+pub fn attendMerge(k: *const Kernels, s: xpu.Stream, part: Ref, out: Ref, committed: u32, from: u32) !void {
+    try xpu.launch.dispatch(k.merge, s, .{ block_rows, q_heads, 1 }, .{ part, out, committed, from, chunksFor(committed, from) });
+}
+
 /// The block's attention in two passes: partials per 128-key chunk, then the merge to BF16 [8][4096].
 pub fn attend(k: *const Kernels, s: xpu.Stream, q: Ref, block_k: Ref, block_v: Ref, context_k: Ref, context_v: Ref, part: Ref, out: Ref, committed: u32, ring: u32, from: u32) !void {
-    const chunks = chunksFor(committed, from);
-    std.debug.assert(ring >= window and chunks <= max_chunks and from <= committed);
-    try xpu.launch.dispatch(k.attention, s, .{ chunks, kv_heads, block_rows }, .{ q, block_k, block_v, context_k, context_v, part, committed, ring, from, chunks });
-    try xpu.launch.dispatch(k.merge, s, .{ block_rows, q_heads, 1 }, .{ part, out, committed, from, chunks });
+    std.debug.assert(ring >= window);
+    try attendPartial(k, s, q, block_k, block_v, context_k, context_v, part, committed, ring, from);
+    try attendMerge(k, s, part, out, committed, from);
 }
 
 /// The 16 best of the first `valid` logits of each row: per row 256 sorted lists of 16 (values f32, ids i32).

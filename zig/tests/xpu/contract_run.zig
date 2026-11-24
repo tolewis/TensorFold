@@ -17,6 +17,7 @@ const loop_k = @import("inkling2_loop.zig");
 const ink2_glue_k = @import("inkling2_glue.zig");
 const ink2_runtime_k = @import("inkling2_runtime.zig");
 const dspark_k = @import("inkling2_dspark.zig");
+const dflash2_k = @import("inkling2_dflash2.zig");
 const ink2_attn_k = @import("inkling2_attention.zig");
 const ink2_k = @import("inkling2_experts.zig");
 const dense_k = @import("inkling2_dense.zig");
@@ -116,6 +117,9 @@ pub fn main(init: std.process.Init) !u8 {
     var dspark = try dspark_k.Suite.init(a, &dev);
     defer dspark.deinit();
     try dspark.collect(&kernels);
+    var dflash2 = try dflash2_k.Suite.init(a, &dev);
+    defer dflash2.deinit();
+    try dflash2.collect(&kernels);
     var ink2_attn: ink2_attn_k.Suite = .{ .a = a, .dev = &dev, .kernels = &kernels };
     defer ink2_attn.deinit();
     try ink2_attn.collect();

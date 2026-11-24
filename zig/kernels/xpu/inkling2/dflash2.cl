@@ -43,15 +43,27 @@ static inline float rbf(float f) { return bf2f(f2bf(f)); }
 #ifndef DF_CONV_KERNEL
 #define DF_CONV_KERNEL(base, dyn) ((base) + (dyn))
 #endif
-#ifndef DF_ROPE_HI
-#define DF_ROPE_HI(x, other, cs, sn) ((other) * (sn) + (x) * (cs))
+#ifndef DF_QK_ROPE_HI
+#define DF_QK_ROPE_HI(x, other, cs, sn) ((other) * (sn) + (x) * (cs))
+#endif
+#ifndef DF_CTX_ROPE_HI
+#define DF_CTX_ROPE_HI(x, other, cs, sn) ((other) * (sn) + (x) * (cs))
 #endif
 #ifndef DF_FIRST
-#define DF_FIRST(from, position, row) max((from), (position) + (row) > 2047u ? (position) + (row) - 2047u : 0u)
+#define DF_FIRST(from, position, row) df_first((from), (position), (row))
 #endif
 #ifndef DF_MERGE_WEIGHT
 #define DF_MERGE_WEIGHT(m, mx) exp((m) - (mx))
 #endif
+#ifndef DF_TOPK_VALUE
+#define DF_TOPK_VALUE(v) (v)
+#endif
+
+// The first context row a block row at position committed + row sees: the window is 2,048 positions.
+static inline uint df_first(uint from, uint committed, uint row) {
+  const uint low = committed + row > 2047u ? committed + row - 2047u : 0u;
+  return max(from, low);
+}
 
 static inline float df_angle(uint d, uint position) {
   const float frequency = pow(DF_THETA, -(float)(d % 64) / 64.0f);
@@ -99,7 +111,7 @@ KERNEL(128) void DF_NAME(block_qk)(global const ushort *q_raw, global const usho
   const float other = rbf(bf2f(raw[partner]) * scale * bf2f(weight[partner]));
   const float angle = df_angle(d, base + row);
   const float cs = cos(angle), sn = sin(angle);
-  const float rotated = d < 64 ? x * cs - other * sn : DF_ROPE_HI(x, other, cs, sn);
+  const float rotated = d < 64 ? x * cs - other * sn : DF_QK_ROPE_HI(x, other, cs, sn);
   if (query) q[row * DF_Q + h * DF_HEAD + d] = f2bf(rotated);
   else k[row * DF_KV + h * DF_HEAD + d] = f2bf(rotated);
 }
@@ -127,7 +139,7 @@ KERNEL(128) void DF_NAME(context_kv)(global const ushort *k_raw, global const us
   const float other = rbf(bf2f(k_raw[src + partner]) * scale * bf2f(weight[partner]));
   const float angle = df_angle(d, position);
   const float cs = cos(angle), sn = sin(angle);
-  keys[at] = f2bf(d < 64 ? x * cs - other * sn : DF_ROPE_HI(x, other, cs, sn));
+  keys[at] = f2bf(d < 64 ? x * cs - other * sn : DF_CTX_ROPE_HI(x, other, cs, sn));
   values[at] = v_raw[src + d];
 }
 
@@ -210,7 +222,7 @@ KERNEL(128) void DF_NAME(attention)(global const ushort *q, global const ushort 
 KERNEL(128) void DF_NAME(merge)(global const float *part, global ushort *out, uint committed, uint from, uint chunks) {
   const uint d = get_local_id(0);
   const uint row = get_group_id(0), h = get_group_id(1), kv = h / 4, a = h % 4;
-  const uint first = DF_FIRST(from, committed, row);
+  const uint first = df_first(from, committed, row);
   const uint retained = committed > first ? committed - first : 0u;
   const uint used = (retained + DF_BLOCK + DF_CHUNK - 1) / DF_CHUNK;
   global const float *base = part + (ulong)(row * DF_KVHEADS + kv) * chunks * 520;
@@ -239,7 +251,7 @@ KERNEL(16) void DF_NAME(topk)(global const ushort *logits, uint stride, uint val
   }
   if (lane == 0) {
     for (uint j = a; j < b; ++j) {
-      const float v = bf2f(logits[(ulong)row * stride + j]);
+      const float v = DF_TOPK_VALUE(bf2f(logits[(ulong)row * stride + j]));
       if (!(v > bv[DF_TOPK - 1])) continue;
       uint k = DF_TOPK - 1;
       while (k > 0 && v > bv[k - 1]) {
