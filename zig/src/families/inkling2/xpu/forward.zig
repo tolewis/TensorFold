@@ -29,9 +29,11 @@ fn dumpBytes(g: *const Run, visit_i: usize, tag: []const u8, src: ?*anyopaque, b
     defer g.m.gpa.free(host);
     try g.m.r.download(host, .{ .rt = g.m.r, .ptr = ptr, .len = bytes });
     try g.m.r.sync();
-    var path_buf: [512]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "{s}/v{d}-{s}-r{d}.bin", .{ std.mem.span(dir_z), visit_i, tag, g.m.options.place.rank }) catch return;
-    const f = std.fs.createFileAbsolute(path, .{}) catch return;
+    var name_buf: [128]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "v{d}-{s}-r{d}.bin", .{ visit_i, tag, g.m.options.place.rank }) catch return;
+    var dir = std.fs.openDirAbsolute(std.mem.span(dir_z), .{}) catch return;
+    defer dir.close();
+    const f = dir.createFile(name, .{}) catch return;
     defer f.close();
     f.writeAll(host) catch return;
 }
