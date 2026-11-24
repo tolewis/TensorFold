@@ -523,7 +523,7 @@ pub const Probe = struct {
                 const k_at = if (j < retained) ((first_kept + j) % slots) * KV + kv * 128 else (j - retained) * KV + kv * 128;
                 const keys = if (j < retained) self.f[3] else self.f[1];
                 for (0..128) |d| dot += @as(F, self.f[0][q_at + d]) * @as(F, keys[k_at + d]);
-                scores[j] = dot * @as(F, 0x1.6a09e6p-7);
+                scores[j] = dot * @as(F, 0x1.6a09e6p-4);
                 peak = @max(peak, scores[j]);
             }
             var den: F = 0;

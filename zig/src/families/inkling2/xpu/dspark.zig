@@ -28,6 +28,27 @@ fn r(t: weight_loader.Tensor) Ref {
     return t.buf.ptr;
 }
 
+fn nowNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+/// Where a drafted round's drafter time goes (`TF_DSPARK_TIMES=1` logs a line every 50 holds).
+const Times = struct {
+    on: bool = false,
+    holds: u64 = 0,
+    drafts: u64 = 0,
+    absorbs: u64 = 0,
+    absorb: u64 = 0,
+    block: u64 = 0,
+    step: u64 = 0,
+    download: u64 = 0,
+    sample: u64 = 0,
+};
+
+extern "c" fn fflush(stream: ?*std.c.FILE) c_int;
+
 pub const Drafter = struct {
     gpa: std.mem.Allocator,
     target: *const Model,
@@ -43,6 +64,11 @@ pub const Drafter = struct {
     /// The pending token's host copy, and one row of bf16 logits.
     host_id: [1]u32 = .{0},
     host_logits: []u16,
+    /// Diagnostic trace (`TF_DSPARK_TRACE=file`): every absorb and the first blocks' intermediates, for replay against a reference.
+    trace: ?*std.c.FILE = null,
+    trace_blocks: u32 = 0,
+    trace_absorbs: u32 = 0,
+    times: Times = .{},
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, target: *const Model, drafter_dir: []const u8) !*Drafter {
         const ctx = target.ctx orelse return error.Inkling2NoKernels;
@@ -82,11 +108,16 @@ pub const Drafter = struct {
         d.scratch = try state.Scratch.init(ctx);
         errdefer d.scratch.deinit();
         d.host_logits = try gpa.alloc(u16, state.vocabulary);
+        d.trace = null;
+        d.trace_blocks = 0;
+        d.times = .{ .on = std.c.getenv("TF_DSPARK_TIMES") != null };
+        if (std.c.getenv("TF_DSPARK_TRACE")) |path| d.trace = std.c.fopen(path, "wb");
         return d;
     }
 
     pub fn deinit(d: *Drafter) void {
         d.stream.synchronize() catch {};
+        if (d.trace) |f| _ = std.c.fclose(f);
         var it = d.contexts.valueIterator();
         while (it.next()) |lane| lane.deinit();
         d.contexts.deinit(d.gpa);
@@ -97,6 +128,29 @@ pub const Drafter = struct {
         d.module.unload();
         d.weights.deinit();
         d.gpa.destroy(d);
+    }
+
+    fn traceRecord(d: *Drafter, tag: u8, parts: []const []const u8) void {
+        const f = d.trace orelse return;
+        const n: u32 = @intCast(parts.len);
+        _ = std.c.fwrite(@ptrCast(&tag), 1, 1, f);
+        _ = std.c.fwrite(@ptrCast(&n), 4, 1, f);
+        for (parts) |part| {
+            const len: u64 = part.len;
+            _ = std.c.fwrite(@ptrCast(&len), 8, 1, f);
+            if (part.len > 0) _ = std.c.fwrite(part.ptr, 1, part.len, f);
+        }
+        _ = fflush(f);
+    }
+
+    /// Copies `n` device bytes to the host (waits), then writes them as the record's second part after `head`.
+    fn traceDevice(d: *Drafter, tag: u8, head: []const u8, src: Ref, n: usize) void {
+        if (d.trace == null) return;
+        const host = d.gpa.alloc(u8, n) catch return;
+        defer d.gpa.free(host);
+        d.stream.copy(host.ptr, src, n) catch return;
+        d.stream.synchronize() catch return;
+        d.traceRecord(tag, &.{ head, host });
     }
 
     pub fn fixedBytes(d: *const Drafter) u64 {
@@ -180,10 +234,15 @@ pub const Drafter = struct {
         const s = d.stream;
         const n: u32 = @intCast(rows);
         try k.fuseTaps(&d.kernels, s, taps, r(d.weights.weights.fuse), at(d.weights.dflare, 0), at(d.scratch.fused, 0), at(lane.newest, 0), n);
+        if (d.trace != null and d.trace_absorbs < 2) d.traceDevice('M', std.mem.asBytes(&start), at(d.scratch.fused, 0), 4 * rows * state.hidden * 2);
         for (d.weights.weights.layers, 0..) |layer, i| {
             const c = at(d.scratch.fused, i * rows * state.hidden * 2);
             try d.project(layer.k_ctx, c, at(d.scratch.ck, 0), rows);
             try d.project(layer.v_ctx, c, at(d.scratch.cv, 0), rows);
+            if (d.trace != null and d.trace_absorbs < 2 and i == 0) {
+                d.traceDevice('C', std.mem.asBytes(&start), at(d.scratch.ck, 0), rows * state.kv * 2);
+                d.traceDevice('D', std.mem.asBytes(&start), at(d.scratch.cv, 0), rows * state.kv * 2);
+            }
             try k.commitContext(&d.kernels, s, at(d.scratch.ck, 0), at(d.scratch.cv, 0), r(layer.k_norm_ctx), at(lane.k[i], 0), at(lane.v[i], 0), @intCast(start), n, @intCast(lane.rings[i]));
         }
     }
@@ -192,6 +251,11 @@ pub const Drafter = struct {
         const d = cast(ptr);
         if (items.len == 0) return;
         errdefer d.stream.synchronize() catch {};
+        const t_absorb = nowNs();
+        defer if (d.times.on) {
+            d.times.absorb += nowNs() - t_absorb;
+            d.times.absorbs += 1;
+        };
         const row_bytes = 4 * state.hidden * 2;
         for (items) |item| {
             const lane = d.contexts.getPtr(item.stream) orelse return error.DraftStreamUnknown;
@@ -204,6 +268,11 @@ pub const Drafter = struct {
             const end = item.start + features.rows;
             if (end > 1048576) return error.DraftContextGap;
             const source: Ref = @ptrFromInt(features.buffer);
+            if (d.trace != null) {
+                const meta = [_]u64{ item.start, features.rows, lane.from, lane.end };
+                d.traceRecord('F', &.{ std.mem.sliceAsBytes(&meta), std.mem.sliceAsBytes(item.follow) });
+                d.traceDevice('G', std.mem.asBytes(&item.start), offset(source, features.offset), @as(usize, features.rows) * row_bytes);
+            }
             var position = item.start;
             while (position < end) {
                 const rows: usize = @intCast(@min(state.absorb_rows, end - position));
@@ -213,11 +282,12 @@ pub const Drafter = struct {
             }
             lane.end = end;
             lane.held_len = 0;
+            d.trace_absorbs += 1;
         }
         try d.stream.synchronize();
     }
 
-    fn encodeBlock(d: *Drafter, lane: *const state.Lane, pending: u32, anchor: u64) !void {
+    fn encodeBlock(d: *Drafter, lane: *const state.Lane, pending: u32, anchor: u64, depth: usize, debug: bool) !void {
         const s = d.stream;
         const sc = &d.scratch;
         const target = d.target;
@@ -227,12 +297,20 @@ pub const Drafter = struct {
         try glue.embedNorm(&p.glue, s, at(sc.ids, 0), target.weights.embed.buf.ptr, target.weights.embed_norm.buf.ptr, at(sc.x, 0), 1);
         try k.initializeRows(&d.kernels, s, at(sc.x, 0), r(d.weights.weights.mask), at(sc.x, 0));
         try k.residualNorm(&d.kernels, s, at(sc.x, 0), at(sc.resid, 0), r(d.weights.weights.layers[0].input_norm), at(sc.resid, 0), at(sc.x, 0), 8, true);
+        if (debug) d.traceDevice('X', &.{0xff}, at(sc.x, 0), 8 * state.hidden * 2);
         for (d.weights.weights.layers, 0..) |layer, i| {
             try d.project(layer.q, at(sc.x, 0), at(sc.q_raw, 0), 8);
             try d.project(layer.k, at(sc.x, 0), at(sc.k_raw, 0), 8);
             try d.project(layer.v, at(sc.x, 0), at(sc.v_raw, 0), 8);
             try k.blockQkv(&d.kernels, s, at(sc.q_raw, 0), at(sc.k_raw, 0), at(sc.v_raw, 0), r(layer.q_norm), r(layer.k_norm), at(sc.q, 0), at(sc.kb, 0), at(sc.vb, 0), @intCast(anchor));
             try k.attend(&d.kernels, s, at(sc.q, 0), at(sc.kb, 0), at(sc.vb, 0), at(lane.k[i], 0), at(lane.v[i], 0), at(d.scores.?, 0), at(sc.attn, 0), @intCast(lane.end), @intCast(lane.rings[i]), i != 1, @intCast(lane.from));
+            if (debug) {
+                const tag: [2]u8 = .{ @intCast(i), 0 };
+                d.traceDevice('Q', &tag, at(sc.q, 0), 8 * state.query * 2);
+                d.traceDevice('K', &tag, at(sc.kb, 0), 8 * state.kv * 2);
+                d.traceDevice('V', &tag, at(sc.vb, 0), 8 * state.kv * 2);
+                d.traceDevice('T', &tag, at(sc.attn, 0), 8 * state.query * 2);
+            }
             try d.project(layer.o, at(sc.attn, 0), at(sc.y, 0), 8);
             try k.residualNorm(&d.kernels, s, at(sc.y, 0), at(sc.resid, 0), r(layer.post_norm), at(sc.next_resid, 0), at(sc.x, 0), 8, false);
             try d.project(layer.gate, at(sc.x, 0), at(sc.gate, 0), 8);
@@ -241,9 +319,14 @@ pub const Drafter = struct {
             try d.project(layer.down, at(sc.act, 0), at(sc.y, 0), 8);
             const next_norm = if (i + 1 < d.weights.weights.layers.len) d.weights.weights.layers[i + 1].input_norm else d.weights.weights.norm;
             try k.residualNorm(&d.kernels, s, at(sc.y, 0), at(sc.next_resid, 0), r(next_norm), at(sc.resid, 0), at(sc.x, 0), 8, false);
+            if (debug) {
+                const tag: [2]u8 = .{ @intCast(i), 0 };
+                d.traceDevice('R', &tag, at(sc.resid, 0), 8 * state.hidden * 2);
+                d.traceDevice('N', &tag, at(sc.x, 0), 8 * state.hidden * 2);
+            }
         }
-        try k.base(&d.kernels, s, target.weights.unembed.buf.ptr, at(sc.x, state.hidden * 2), at(sc.base, 0), 7, state.vocabulary);
-        try k.kappa(&d.kernels, s, at(sc.x, state.hidden * 2), at(lane.newest, 0), r(d.weights.weights.rnn), r(d.weights.weights.rnn_bias), at(sc.kappa, 0), 7);
+        try k.base(&d.kernels, s, target.weights.unembed.buf.ptr, at(sc.x, state.hidden * 2), at(sc.base, 0), @intCast(depth), state.vocabulary);
+        try k.kappa(&d.kernels, s, at(sc.x, state.hidden * 2), at(lane.newest, 0), r(d.weights.weights.rnn), r(d.weights.weights.rnn_bias), at(sc.kappa, 0), @intCast(depth));
     }
 
     fn recurrent(d: *Drafter, step: usize, previous: u32, second_bank: bool) !void {
@@ -262,30 +345,94 @@ pub const Drafter = struct {
             if (item.depth == 0 or item.position == 0) return error.DraftDepth;
             const anchor = item.position - 1;
             if (lane.end != anchor) return error.DraftContextGap;
-            const depth: usize = @min(item.depth, 7);
+            const offered: usize = @min(item.depth, 7);
+            // A trace computes the whole block so the replay can score every draft position; the lane keeps `offered`.
+            const depth: usize = if (d.trace != null) 7 else offered;
             try d.scratch.state.fill8(d.stream, 0);
-            try d.encodeBlock(lane, item.pending, anchor);
+            const debug = d.trace != null and d.trace_blocks < 3;
+            if (debug) {
+                for (0..3) |i| {
+                    const tag: [2]u8 = .{ @intCast(i), 0 };
+                    const bytes = lane.rings[i] * state.kv * 2;
+                    d.traceDevice('k', &tag, at(lane.k[i], 0), bytes);
+                    d.traceDevice('v', &tag, at(lane.v[i], 0), bytes);
+                }
+                d.traceDevice('f', &.{0}, at(lane.newest, 0), state.hidden * 2);
+            }
+            const t0 = nowNs();
+            try d.encodeBlock(lane, item.pending, anchor, depth, debug);
             try d.recurrent(0, item.pending, false);
             try d.stream.synchronize();
+            if (d.times.on) d.times.block += nowNs() - t0;
+            if (debug) d.traceDevice('a', &.{0}, at(d.scratch.kappa, 0), depth * 3 * state.rank * 4);
             const values = try d.gpa.alloc(f32, state.vocabulary);
             defer d.gpa.free(values);
             var previous = item.pending;
             var second_bank = false;
             for (0..depth) |step| {
+                var t1 = nowNs();
                 if (step != 0) {
                     second_bank = !second_bank;
                     try d.recurrent(step, previous, second_bank);
                     try d.stream.synchronize();
                 }
+                if (d.times.on) {
+                    const t = nowNs();
+                    d.times.step += t - t1;
+                    t1 = t;
+                }
                 try d.scratch.logits.download(d.stream, 0, std.mem.sliceAsBytes(d.host_logits[0..state.vocabulary]));
+                if (d.times.on) {
+                    const t = nowNs();
+                    d.times.download += t - t1;
+                    t1 = t;
+                }
+                defer if (d.times.on) {
+                    d.times.sample += nowNs() - t1;
+                    d.times.drafts += 1;
+                };
                 for (d.host_logits[0..state.vocabulary], values) |bits, *value| value.* = @bitCast(@as(u32, bits) << 16);
                 const base_position = std.math.cast(u32, item.position) orelse return error.DraftDepth;
                 const position = std.math.add(u32, base_position, @intCast(step)) catch return error.DraftDepth;
                 previous = try gpu_rule.sample(d.gpa, values, item.sampling, position, null);
                 if (previous >= state.vocabulary) return error.DraftNonfinite;
                 lane.held[step] = previous;
+                if (d.trace != null) {
+                    var top: [8]u32 = @splat(0);
+                    var topv: [8]f32 = @splat(-std.math.inf(f32));
+                    for (values, 0..) |value, id| {
+                        if (value <= topv[7]) continue;
+                        var at_: usize = 7;
+                        while (at_ > 0 and topv[at_ - 1] < value) : (at_ -= 1) {
+                            topv[at_] = topv[at_ - 1];
+                            top[at_] = top[at_ - 1];
+                        }
+                        topv[at_] = value;
+                        top[at_] = @intCast(id);
+                    }
+                    const head = [_]u64{ item.position, item.pending, step, previous };
+                    d.traceRecord('S', &.{ std.mem.sliceAsBytes(&head), std.mem.sliceAsBytes(&top), std.mem.sliceAsBytes(&topv) });
+                    if (debug and step == 0) d.traceRecord('L', &.{std.mem.sliceAsBytes(d.host_logits[0..state.vocabulary])});
+                }
             }
-            lane.held_len = @intCast(depth);
+            lane.held_len = @intCast(offered);
+            if (d.times.on) {
+                d.times.holds += 1;
+                if (d.times.holds % 50 == 0) {
+                    const t = d.times;
+                    const ms = struct {
+                        fn of(ns: u64, n: u64) f64 {
+                            return @as(f64, @floatFromInt(ns)) / 1e6 / @as(f64, @floatFromInt(@max(n, 1)));
+                        }
+                    }.of;
+                    std.log.info("dspark times: holds {d} drafts/hold {d:.2} | per hold: block {d:.2} ms; per draft: step {d:.2} download {d:.2} sample {d:.2} ms | absorb {d:.2} ms each ({d})", .{ t.holds, @as(f64, @floatFromInt(t.drafts)) / @as(f64, @floatFromInt(t.holds)), ms(t.block, t.holds), ms(t.step, t.drafts), ms(t.download, t.drafts), ms(t.sample, t.drafts), ms(t.absorb, t.absorbs), t.absorbs });
+                }
+            }
+            if (d.trace != null) {
+                const head = [_]u64{ item.position, item.pending, depth, lane.end, lane.from, offered };
+                d.traceRecord('B', &.{ std.mem.sliceAsBytes(&head), std.mem.sliceAsBytes(lane.held[0..depth]) });
+                d.trace_blocks += 1;
+            }
         }
     }
 };
