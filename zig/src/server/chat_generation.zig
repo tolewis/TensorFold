@@ -154,7 +154,7 @@ pub const Generation = struct {
         const text = try @import("tool_minimax.zig").dsml(g.a, raw_visible, g.tools); // MiniMax-M3's calls as DSML
         var answer = text;
         var thought: []const u8 = "";
-        if (g.thinking or g.recipient != null) {
+        if (g.thinking or g.recipient != null or g.srv.markers.answer_end.len > 0) {
             const split = if (g.recipient) |*r| try r.split(g.a, text, .streaming) else blk: {
                 const original_close = try g.visible.closeOf(g.a, reply_text.decodeText, g.srv.text, g.srv.close_id);
                 const close = try @import("tool_minimax.zig").closeAfterRewrite(g.a, raw_visible, g.tools, original_close);
@@ -311,7 +311,9 @@ pub const Generation = struct {
         const native = if (g.srv.text.vtable.format == .kimi) try @import("chat_kimi.zig").read(g, content_tokens, true) else null;
         const raw_visible = g.stops.visible(raw, false);
         const visible = if (native) |n| n.content else try @import("tool_minimax.zig").dsml(a, raw_visible, g.tools);
-        const close_at: ?reply_text.Close = if (native == null and g.thinking)
+        // a reply of messages (Inkling 2) is split even with thinking off: the model still writes a thinking message
+        const messages = g.srv.markers.answer_end.len > 0;
+        const close_at: ?reply_text.Close = if (native == null and (g.thinking or messages))
             try @import("tool_minimax.zig").closeAfterRewrite(a, raw_visible, g.tools, try reply_text.closeWhere(a, reply_text.decodeText, g.srv.text, content_tokens, g.srv.close_id))
         else
             null;
@@ -321,7 +323,7 @@ pub const Generation = struct {
         const text = if (close.len > 0) try std.mem.concat(a, u8, &.{ visible, close }) else visible;
         var content: []const u8 = text;
         var reasoning: ?[]const u8 = null;
-        const read = g.thinking or g.recipient != null; // the reply's split text is its content
+        const read = g.thinking or g.recipient != null or messages; // the reply's split text is its content
         if (native) |n| {
             const r = reply_text.pyStrip(n.reasoning);
             reasoning = if (r.len > 0) r else null;
@@ -421,8 +423,8 @@ pub const Generation = struct {
             .ok => |v| try spec.put(a, "proposer", v),
             .err => {},
         };
-        const think_end: ?u32 = if (reasons) g.srv.close_id else null;
-        const think_open: ?u32 = if (reasons and g.srv.markers.answer_end.len > 0) g.srv.text.tokenId("<|content_thinking|>") else null;
+        const think_end: ?u32 = if (reasons or messages) g.srv.close_id else null;
+        const think_open: ?u32 = if (messages) g.srv.text.tokenId("<|content_thinking|>") else null;
         var reply: Reply = .{
             .content = content,
             .stop_sequence = g.stops.matched(raw),

@@ -164,6 +164,11 @@ pub const Server = struct {
         // MiniMax-M3's template decides on its own; thinking off closes the block in the prompt (prompt.zig)
         srv.thinking_switch = minimax or std.mem.indexOf(u8, source, "enable_thinking") != null or
             std.mem.indexOf(u8, source, "thinking_mode") != null;
+        // Inkling 2's template switches thinking with its reasoning_effort: "none" renders effort level 0
+        if (srv.markers.answer_end.len > 0 and std.mem.indexOf(u8, source, "reasoning_effort") != null) {
+            srv.thinking_switch = true;
+            srv.off_effort = "none";
+        }
         srv.late_system = try lateSystem(a, text);
         srv.needs_user_after_tool = needsUserAfterTool(source);
         if (srv.info.vision != null) {

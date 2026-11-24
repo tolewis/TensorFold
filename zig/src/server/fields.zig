@@ -220,6 +220,10 @@ pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8) errors.R
     if (effort == null and kw_object) if (kwargs) |k| {
         effort = k.field("reasoning_effort");
     };
+    // a template that takes its effort as a number reads 0 as no thinking: the same as "none"
+    if (effort) |e| if ((e == .int and std.mem.eql(u8, e.int, "0")) or (e == .float and e.float == 0)) {
+        effort = .{ .string = "none" };
+    };
     if (effort) |e| {
         if (e != .string or !isEffort(e.string)) return cx.refuse("reasoning_effort must be none, minimal, low, medium, high, xhigh or max");
         out.effort = coerceEffort(e.string, levels);
