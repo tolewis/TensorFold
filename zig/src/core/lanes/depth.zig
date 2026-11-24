@@ -16,6 +16,7 @@ pub const State = struct {
     probe: ?i64 = null, // a probe's depth for the next round (a lone window keeps it)
     plain: ?u64 = null,
     wait: ?u64 = null,
+    block_wait: u64 = 0, // full-block probe gap; doubles when the block cannot pay, resets when a run exceeds the held depth
     ms: ?Table = null, // plain_guard: the stream's own round times
     copy_ms: ?Table = null, // opt-in copy prices, independent of the head depth rule
     copy_plain: ?u64 = null,
@@ -111,6 +112,15 @@ pub const Rule = struct {
             const at: usize = @intCast(j);
             p[at] += r.k.depth_rate * (hit - p[at]);
         }
+        noteRun(who.state, accepted);
+    }
+
+    fn noteRun(slot: *?State, accepted: i64) void {
+        var st = slot.* orelse return;
+        const held = st.last orelse return;
+        if (accepted <= held) return;
+        st.block_wait = 0;
+        slot.* = st;
     }
 
     /// Round times by depth: the stream's own under `plain_guard`, else greedy rounds' for a greedy stream.
@@ -189,13 +199,41 @@ pub const Rule = struct {
         st.wait = r.k.depth_probe_every;
         st.last = best;
         st.probe = null;
-        if (best < most and st.rounds % r.k.depth_probe_every == 0) {
-            // Re-test the full block only while the first draft still lands often. A low first-draft rate stays on the +1 probe.
-            const deep = r.k.fixed_draft_block and p.len > 0 and p[0] >= 0.82;
-            best = if (deep) most else best + 1;
+        // The old rule offered two drafts once the first one landed. Never ask past the tokens still allowed.
+        if (r.k.fixed_draft_block and best < 2 and most >= 2 and p.len > 0 and p[0] >= 0.80) best = 2;
+        if (r.k.fixed_draft_block and best < most) {
+            const wait = if (st.block_wait == 0) r.k.depth_probe_every else st.block_wait;
+            const full = rateAt(r, who, p, most);
+            const held = rateAt(r, who, p, best);
+            const pays = if (full) |f| (if (held) |h| f >= h else true) else false;
+            if (pays) st.block_wait = 0;
+            if (st.rounds % wait == 0) {
+                best = most;
+                st.probe = best;
+                if (!pays) st.block_wait = @min(wait * 2, 128);
+            }
+        } else if (best < most and st.rounds % r.k.depth_probe_every == 0) {
+            best += 1;
             st.probe = best;
         }
         return best;
+    }
+
+    /// Expected tokens a ms at `drafts`, from the stream's acceptance and the round-cost table.
+    fn rateAt(r: *Rule, who: Who, chances: []const f64, drafts: i64) ?f64 {
+        const cost = r.roundCost(drafts, who) catch return null;
+        const ms = cost orelse return null;
+        if (ms == 0) return null;
+        if (drafts <= 0) return 1.0 / ms;
+        var run: f64 = 1.0;
+        var expected: f64 = 1.0;
+        var d: i64 = 1;
+        while (d <= drafts) : (d += 1) {
+            const at: usize = @intCast(d - 1);
+            run *= if (at < chances.len) chances[at] else chances[chances.len - 1];
+            expected += run;
+        }
+        return expected / ms;
     }
 
     /// The stream's estimate state, allocated from its prior on first use.
