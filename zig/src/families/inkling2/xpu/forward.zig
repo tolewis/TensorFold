@@ -125,7 +125,10 @@ const Run = struct {
             try g.widen(at(s.p, 0), at(s.ar, 0), rows);
         } else {
             const q = m.weights.attn_queries[v.layer - 1];
-            for (0..lp.attn_queries) |role| {
+            // One row: the queries and their results are contiguous, so one launch serves every role.
+            if (rows == 1) {
+                try glue.ar(&g.p.glue, g.s, at(s.blocks, 0), row(s.partial, 0, state.hidden * 4), at(q.buf, 0), arRow(s, 0, 1, 0, false), lp.attn_sources, @intCast(lp.attn_queries));
+            } else for (0..lp.attn_queries) |role| {
                 const query = at(q.buf, role * state.hidden * 4);
                 for (0..rows) |i| try glue.ar(&g.p.glue, g.s, at(s.blocks, i * state.block_slots * state.hidden * 2), row(s.partial, i, state.hidden * 4), query, arRow(s, role, rows, i, false), lp.attn_sources, 1);
             }
