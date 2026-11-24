@@ -303,7 +303,7 @@ pub const fields = [_][]const u8{
     "partial",  "ar",         "gated",      "mlp_ar",    "mlp_gated",  "q_norm",    "k_norm",        "v_norm",   "q_raw",   "k_raw",
     "v_raw",    "rel_raw",    "sink",       "gate",      "k_conv",     "v_conv",    "q_prep",        "rel_prep", "rel_tab", "part_o",
     "part_ml",  "att",        "attn_dense", "attn_conv", "mlp_normed", "route_ids", "route_weights", "gu",       "down",    "mlp_out",
-    "mlp_conv", "logits_all", "members",    "items",     "count",
+    "mlp_conv", "logits_all", "members",    "items",     "count",     "zeta",
 };
 
 fn sizes(rows: usize, capacity: usize) [fields.len]usize {
@@ -322,7 +322,7 @@ fn sizes(rows: usize, capacity: usize) [fields.len]usize {
         r * rel_width * bf,        r * 24 * bf,                        r * q * bf,                                r * kv * bf,                    r * kv * bf,    r * q * bf,     r * rel_width * bf,
         r * 24 * ap.extent * bf,   r * 24 * stride * ap.head_dim * fp, r * 24 * stride * 2 * fp,                  r * q * bf,                     r * h * bf,     r * h * bf,     r * h * bf,
         r * experts_per_token * 4, r * experts_per_token * fp,         r * experts_per_token * intermediate * bf, r * experts_per_token * h * bf, r * h * bf,     r * h * bf,     r * vocabulary * fp,
-        r * experts_per_token * 4, items * 3 * 4,                      4,
+        r * experts_per_token * 4, items * 3 * 4,                      4,                                         r * 64 * fp,
     };
 }
 
@@ -379,6 +379,8 @@ pub const Scratch = struct {
     members: rt.Buffer,
     items: rt.Buffer,
     count: rt.Buffer,
+    /// The message gates' D projection [row][64] binary32, written by one launch and read by the next.
+    zeta: rt.Buffer,
     /// Opt-in DSpark features [row][tap][H], allocated by prepare_features.
     taps: ?rt.Buffer = null,
     rows: usize,

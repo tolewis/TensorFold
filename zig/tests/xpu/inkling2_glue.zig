@@ -49,7 +49,7 @@ pub const Probe = struct {
     f: [4][]f32 = @splat(&.{}),
     ids: []u32 = &.{},
     route_ids: ?*anyopaque = null,
-    refs: [5]?*anyopaque = @splat(null),
+    refs: [6]?*anyopaque = @splat(null),
     out: ?*anyopaque = null,
 
     pub fn init(a: std.mem.Allocator, dev: *rig_.Dev, kind: p.Kind, control: bool) !Probe {
@@ -176,8 +176,11 @@ pub const Probe = struct {
                 self.f[0] = try self.floats((r + 3) * n, rng);
                 self.f[1] = try self.floats(4 * n, rng);
                 if (nf) self.f[0][0] = std.math.nan(f32);
-                self.refs[0] = try self.input(self.f[0], true);
-                self.refs[1] = try self.input(self.f[1], true);
+                // the window is three old rows (history) then the current rows; the kernel stages it in R[2]
+                self.refs[0] = try self.input(self.f[0][0 .. 3 * n], true);
+                self.refs[1] = try self.input(self.f[0][3 * n ..], true);
+                self.refs[2] = try self.rig.scratch((r + 3) * n * 2);
+                self.refs[3] = try self.input(self.f[1], true);
             },
             .conv_dynamic => {
                 self.f[0] = try self.floats((r + 3) * n, rng);
@@ -185,7 +188,10 @@ pub const Probe = struct {
                 self.f[2] = try self.floats(4 * n, rng);
                 self.f[3] = try self.floats(32 * p.hidden, rng);
                 if (nf) self.f[1][0] = std.math.nan(f32);
-                for (0..4) |j| self.refs[j] = try self.input(self.f[j], true);
+                self.refs[0] = try self.input(self.f[0][0 .. 3 * n], true);
+                self.refs[1] = try self.input(self.f[0][3 * n ..], true);
+                self.refs[2] = try self.rig.scratch((r + 3) * n * 2);
+                for (1..4) |j| self.refs[2 + j] = try self.input(self.f[j], true);
             },
             .router => {
                 self.f[0] = try self.floats(r * p.hidden, rng);
@@ -248,8 +254,8 @@ pub const Probe = struct {
         switch (self.kind) {
             .embed_norm => try host.embedNorm(pl, s, R[0], R[1], R[2], y, r),
             .ar => try host.ar(pl, s, R[0], R[1], R[2], y, r, 2),
-            .conv_static => try host.convStatic(pl, s, R[0], R[1], y, r, n),
-            .conv_dynamic => try host.convDynamic(pl, s, R[0], R[1], R[2], R[3], y, r, n),
+            .conv_static => try host.convStatic(pl, s, R[0], R[1], R[2], R[3], y, r, n),
+            .conv_dynamic => try host.convDynamic(pl, s, R[0], R[1], R[2], R[3], R[4], R[5], y, r, n),
             .router => try host.router(pl, s, R[0], R[1], R[2], self.route_ids, y, r),
             .swiglu => try host.swiglu(pl, s, R[0], y, r, n),
             .logits => try host.logits(pl, s, R[0], R[1], y, r, n),

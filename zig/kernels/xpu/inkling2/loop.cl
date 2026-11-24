@@ -14,6 +14,7 @@
 #define LOOP_RANK 64
 #define LOOP_MESSAGES 48
 #define LOOP_SGS 16 // sub-groups in a work-group of 256
+#define LOOP_RANKS_A_GROUP 2 // ranks a work-group of the zeta launch owns, one a sub-group
 
 // Planted controls (the contract image `contract_inkling2_loop_controls` is this file built with both defined).
 #ifdef TF_CTL_LOOP_NO_SCALE
@@ -93,59 +94,93 @@ KERNEL(256) void tf_inkling2_loop_messages(global const ushort *bank0, global co
 }
 
 // One controller tuple of a token: h and m are [row][H] binary32, down [64][2H], forget and gain [H][64] bf16.
-KERNEL(256) void tf_inkling2_loop_gates(global const float *h, global const float *m, global const ushort *down,
-                                        global const ushort *forget, global const ushort *gain, global float *out,
-                                        uint rows) {
+// Two launches, so that more than one work-group streams the weights (about 1.2 MB a tuple).
+//
+// First, zeta (the D projection, rounded to bf16): work-group (part, row) norms the row's h and m, as every work-group
+// of the row does in the same order, then sub-group s of it owns rank LOOP_RANKS_A_GROUP * part + s. A lane adds its 8-wide chunks in
+// order, four chunks' loads in flight at a time, then the 16 lanes reduce.
+KERNEL(256) void tf_inkling2_loop_zeta(global const float *h, global const float *m, global const ushort *down,
+                                       global float *zeta, uint rows) {
   local float red[LOOP_SGS];
-  local float zeta[LOOP_RANK];
   local ushort normalized[2 * LOOP_H];
-  const uint t = get_local_id(0), row = get_group_id(0);
+  const uint t = get_local_id(0), part = get_group_id(0), row = get_group_id(1);
   if (row >= rows) return;
   const uint lane = get_sub_group_local_id(), sg = get_sub_group_id();
   global const float *hr = h + (size_t)row * LOOP_H;
   global const float *mr = m + (size_t)row * LOOP_H;
+  float hv[LOOP_H / 256], mv[LOOP_H / 256];
   float ss0 = 0.0f, ss1 = 0.0f;
-  for (uint d = t; d < LOOP_H; d += 256) {
-    const float x0 = hr[d], x1 = mr[d];
-    ss0 += x0 * x0;
-    ss1 += x1 * x1;
+#pragma unroll
+  for (uint i = 0; i < LOOP_H / 256; ++i) {
+    hv[i] = hr[t + 256 * i];
+    mv[i] = mr[t + 256 * i];
+  }
+#pragma unroll
+  for (uint i = 0; i < LOOP_H / 256; ++i) {
+    ss0 += hv[i] * hv[i];
+    ss1 += mv[i] * mv[i];
   }
   const float inv0 = rms_inverse(group_sum(ss0, red));
   const float inv1 = rms_inverse(group_sum(ss1, red));
-  for (uint d = t; d < LOOP_H; d += 256) {
-    normalized[d] = f2bf(hr[d] * inv0);
-    normalized[LOOP_H + d] = f2bf(mr[d] * inv1);
+#pragma unroll
+  for (uint i = 0; i < LOOP_H / 256; ++i) {
+    normalized[t + 256 * i] = f2bf(hv[i] * inv0);
+    normalized[LOOP_H + t + 256 * i] = f2bf(mv[i] * inv1);
   }
   barrier(CLK_LOCAL_MEM_FENCE);
-  // D: sub-group s owns ranks 4s to 4s + 3; a lane adds its 8-wide chunks in order, then the 16 lanes reduce.
-  for (uint r = 4 * sg; r < 4 * sg + 4; ++r) {
+  if (sg < LOOP_RANKS_A_GROUP) {
+    const uint r = LOOP_RANKS_A_GROUP * part + sg;
     global const ushort *dr = down + (size_t)r * (2 * LOOP_H);
     float dot = 0.0f;
-    for (uint d = 8 * lane; d < 2 * LOOP_H; d += 128) {
-      const ushort8 w = vload8(0, dr + d);
-      const ushort8 x = vload8(0, normalized + d);
-      for (int j = 0; j < 8; ++j) dot += bf2f(w[j]) * bf2f(x[j]);
+    for (uint d = 8 * lane; d < 2 * LOOP_H; d += 512) {
+      const ushort8 w0 = vload8(0, dr + d), w1 = vload8(0, dr + d + 128), w2 = vload8(0, dr + d + 256), w3 = vload8(0, dr + d + 384);
+      const ushort8 x0 = vload8(0, normalized + d), x1 = vload8(0, normalized + d + 128);
+      const ushort8 x2 = vload8(0, normalized + d + 256), x3 = vload8(0, normalized + d + 384);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) dot += bf2f(w0[j]) * bf2f(x0[j]);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) dot += bf2f(w1[j]) * bf2f(x1[j]);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) dot += bf2f(w2[j]) * bf2f(x2[j]);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) dot += bf2f(w3[j]) * bf2f(x3[j]);
     }
     dot = sub_group_reduce_add(dot);
-    if (lane == 0) zeta[r] = LOOP_ZETA(dot);
+    if (lane == 0) zeta[(size_t)row * LOOP_RANK + r] = LOOP_ZETA(dot);
+  }
+}
+
+// Second, the gates: work-item d of a work-group of 64 owns output d. F and Gamma add their 64 rank terms in order,
+// all sixteen weight loads issued first.
+KERNEL(64) void tf_inkling2_loop_gates(global const float *h, global const float *m, global const ushort *forget,
+                                       global const ushort *gain, global const float *zeta, global float *out,
+                                       uint rows) {
+  local float z[LOOP_RANK];
+  const uint t = get_local_id(0), row = get_group_id(1);
+  const uint d = get_group_id(0) * 64 + t;
+  if (row >= rows) return;
+  z[t] = zeta[(size_t)row * LOOP_RANK + t];
+  ushort8 fw[LOOP_RANK / 8], gw[LOOP_RANK / 8];
+#pragma unroll
+  for (uint r = 0; r < LOOP_RANK / 8; ++r) {
+    fw[r] = vload8(0, forget + (size_t)d * LOOP_RANK + 8 * r);
+    gw[r] = vload8(0, gain + (size_t)d * LOOP_RANK + 8 * r);
   }
   barrier(CLK_LOCAL_MEM_FENCE);
-  for (uint d = t; d < LOOP_H; d += 256) {
-    float fdot = 0.0f, gdot = 0.0f;
-    for (uint r = 0; r < LOOP_RANK; r += 8) {
-      const ushort8 fw = vload8(0, forget + (size_t)d * LOOP_RANK + r);
-      const ushort8 gw = vload8(0, gain + (size_t)d * LOOP_RANK + r);
-      for (int j = 0; j < 8; ++j) {
-        fdot += bf2f(fw[j]) * zeta[r + j];
-        gdot += bf2f(gw[j]) * zeta[r + j];
-      }
+  float fdot = 0.0f, gdot = 0.0f;
+#pragma unroll
+  for (uint r = 0; r < LOOP_RANK / 8; ++r) {
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      fdot += bf2f(fw[r][j]) * z[8 * r + j];
+      gdot += bf2f(gw[r][j]) * z[8 * r + j];
     }
-    const float f = tanh(fdot);
-    const float g = tanh(gdot);
-    // Four separately rounded binary32 steps; do not fold these into one expression.
-    const float keep = 1.0f - f;
-    const float left = keep * hr[d];
-    const float right = g * mr[d];
-    out[(size_t)row * LOOP_H + d] = left + right;
   }
+  const float f = tanh(fdot);
+  const float g = tanh(gdot);
+  // Four separately rounded binary32 steps; do not fold these into one expression.
+  const float keep = 1.0f - f;
+  const float left = keep * h[(size_t)row * LOOP_H + d];
+  const float right = g * m[(size_t)row * LOOP_H + d];
+  out[(size_t)row * LOOP_H + d] = left + right;
 }
