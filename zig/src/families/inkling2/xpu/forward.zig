@@ -20,6 +20,25 @@ const place_mod = @import("place.zig");
 const group = @import("group.zig");
 
 var first_dump_done = false;
+var slice_own_dumped = false;
+var slice_pulled_dumped = false;
+
+fn dumpF32(r: *xpu.rt.Runtime, rank: u32, name: []const u8, src: ?*anyopaque, n: u32) !void {
+    const dir_z = std.c.getenv("TF_TP_DUMP") orelse return;
+    const ptr = src orelse return;
+    const bytes: usize = @as(usize, n) * 4;
+    const host = try std.heap.page_allocator.alloc(u8, bytes);
+    defer std.heap.page_allocator.free(host);
+    try r.download(host, .{ .rt = r, .ptr = ptr, .len = bytes });
+    try r.sync();
+    var path_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}-r{d}.bin", .{ std.mem.span(dir_z), name, rank }) catch return;
+    path_buf[path.len] = 0;
+    const fd = open(path_buf[0..path.len :0], 1 | 64 | 512, 0o644);
+    if (fd < 0) return;
+    _ = write(fd, host.ptr, host.len);
+    _ = close(fd);
+}
 
 fn dumpBytes(g: *const Run, visit_i: usize, tag: []const u8, src: ?*anyopaque, bytes: usize) !void {
     if (first_dump_done) return;
@@ -446,12 +465,22 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
         if (m.weights.unembed_q8) |head| {
             try dense_q8_kernels.head(&p.dense_q8, stream, tensor(head), head_input, tight.ptr, @intCast(n_rows), vocab_n);
         } else try glue.logits(&p.glue, stream, head_input, tensor(m.weights.unembed), tight.ptr, @intCast(n_rows), vocab_n);
+        try stream.synchronize();
+        if (!slice_own_dumped) {
+            try dumpF32(m.r, m.options.place.rank, "slice-own", tight.ptr, vocab_n);
+            slice_own_dumped = true;
+        }
         const full: usize = m.config.text.unpadded_vocab;
         const own: usize = m.options.place.vocabBase();
         const other: usize = (full + 1) / 2;
         for (0..n_rows) |r| {
             const off = r * @as(usize, vocab_n) * 4;
             try gp.headPull(plus(tight.ptr, off).?, plus(peer.ptr, off).?, vocab_n);
+            if (r == 0 and !slice_pulled_dumped) {
+                try stream.synchronize();
+                if (m.options.place.rank == 0) try dumpF32(m.r, 0, "slice-pulled", peer.ptr, vocab_n);
+                slice_pulled_dumped = true;
+            }
             if (m.options.place.rank == 0) {
                 try copyF32(m.r, plus(logits, (r * full + own) * 4), plus(tight.ptr, off), vocab_n);
                 try copyF32(m.r, plus(logits, (r * full + other) * 4), plus(peer.ptr, off), vocab_n);

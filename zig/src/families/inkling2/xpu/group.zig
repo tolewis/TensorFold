@@ -108,6 +108,7 @@ pub const Group = struct {
         const flag = blk_flag + 16;
         if (g.rank != 0) {
             try g.r.stream(g.ctx).copy(g.peer_head.?, src, bytes);
+            if (std.c.getenv("TF_TP_HEAD_SYNC")) |v| if (v[0] != '0') try g.r.sync();
             try g.writeFlag(off(g.peer_blk.?, flag));
         } else try g.writeFlag(off(g.peer_blk.?, flag));
         try g.waitFlag(off(g.blk.?, flag));
