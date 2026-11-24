@@ -437,7 +437,8 @@ pub fn run(m: *const Model, s: *state.Scratch, cache: *state.Cache, ids: []const
         try pk.ar(&p.prefill, stream, at(s.blocks, i * state.block_slots * state.hidden * 2), at(s.partial, i * state.hidden * 4), tensor(m.weights.output_query), at(s.mlp_ar, 0), @intCast(m.weight_plan.final_sources), 1, 1);
     }
     try g.norm(at(s.mlp_ar, 0), m.weights.norm, at(s.mlp_normed, 0), final.work_rows);
-    if (options.taps) |to| try runtime.captureTap(&p.runtime, stream, at(s.mlp_normed, 0), to, final.capture_rows, 3);
+    // runtime.captureTap takes at most 64 rows; a prompt chunk has up to 2048, so launch the kernel over all of them.
+    if (options.taps) |to| try pointwise(&p.runtime, stream, .capture_tap, final.capture_rows, 3, .{ at(s.mlp_normed, 0), to });
     if (!options.defer_head) {
         const logits = if (options.all) at(s.logits_all, 0) else at(cache.logits, 0);
         try head(m, p, stream, at(s.mlp_normed, final.logits_row * state.hidden * 2), logits, final.logits_rows);
