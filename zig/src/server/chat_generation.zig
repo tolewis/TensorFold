@@ -421,7 +421,8 @@ pub const Generation = struct {
             .ok => |v| try spec.put(a, "proposer", v),
             .err => {},
         };
-        const think_end: ?u32 = if (reasons) g.srv.text.tokenId(g.srv.markers.close) else null;
+        const think_end: ?u32 = if (reasons) g.srv.close_id else null;
+        const think_open: ?u32 = if (reasons and g.srv.markers.answer_end.len > 0) g.srv.text.tokenId("<|content_thinking|>") else null;
         var reply: Reply = .{
             .content = content,
             .stop_sequence = g.stops.matched(raw),
@@ -433,7 +434,7 @@ pub const Generation = struct {
             .prompt_tokens = prompt_len,
             .cached_tokens = cached_tokens.within(m.cached, prompt_len),
             .completion_tokens = g.collected.items.len,
-            .reasoning_tokens = if (native) |n| n.reasoning_tokens else reply_text.reasoningCount(g.collected.items, think_end),
+            .reasoning_tokens = if (native) |n| n.reasoning_tokens else reply_text.reasoningCountOpened(g.collected.items, think_open, think_end),
             .runtime = .{ .object = runtime },
             .speculative = .{ .object = spec },
             .thinking = thinking,
