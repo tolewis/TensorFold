@@ -11,6 +11,7 @@ pub const Stream = @import("stream.zig").Stream;
 pub const Module = @import("module.zig").Module;
 pub const Kernel = @import("module.zig").Kernel;
 pub const launch = @import("launch.zig");
+pub const profile = @import("profile.zig");
 pub const rt = @import("rt.zig");
 pub const loader = @import("loader.zig");
 pub const Pool = @import("pool.zig").Pool;

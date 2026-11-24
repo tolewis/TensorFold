@@ -125,7 +125,10 @@ const Run = struct {
             try g.widen(at(s.p, 0), at(s.ar, 0), rows);
         } else {
             const q = m.weights.attn_queries[v.layer - 1];
-            for (0..lp.attn_queries) |role| {
+            // One row: the queries and their results are contiguous, so one launch serves every role.
+            if (rows == 1) {
+                try glue.ar(&g.p.glue, g.s, at(s.blocks, 0), row(s.partial, 0, state.hidden * 4), at(q.buf, 0), arRow(s, 0, 1, 0, false), lp.attn_sources, @intCast(lp.attn_queries));
+            } else for (0..lp.attn_queries) |role| {
                 const query = at(q.buf, role * state.hidden * 4);
                 for (0..rows) |i| try glue.ar(&g.p.glue, g.s, at(s.blocks, i * state.block_slots * state.hidden * 2), row(s.partial, i, state.hidden * 4), query, arRow(s, role, rows, i, false), lp.attn_sources, 1);
             }
@@ -136,7 +139,7 @@ const Run = struct {
             for (0..3) |role| for (0..rows) |i| {
                 const c = controllers[role];
                 const source_role = if (lp.kind == .local) 0 else role;
-                try loop.gates(&g.p.loop, g.s, arRow(s, source_role, rows, i, false), messageRow(s, core, role, i), tensor(c.down), tensor(c.forget), tensor(c.gain), arRow(s, role, rows, i, true), 1);
+                try loop.gates(&g.p.loop, g.s, arRow(s, source_role, rows, i, false), messageRow(s, core, role, i), tensor(c.down), tensor(c.forget), tensor(c.gain), row(s.zeta, i, 64 * 4), arRow(s, role, rows, i, true), 1);
             };
         }
         const gated = v.hasMessages();
@@ -152,10 +155,7 @@ const Run = struct {
 
     fn staticPostConv(g: Run, cache: *state.Cache, slot: usize, conv_state: usize, raw: rt.Buffer, weight: Tensor, out: rt.Buffer, base: usize, rows: usize) !void {
         const channels = state.convWidth(conv_state);
-        const taps = cache.staged(slot, conv_state, 0).ptr();
-        try g.copyBf16(cache.history(slot, conv_state).ptr(), taps, 3 * channels);
-        try g.copyBf16(at(raw, base * channels * 2), cache.staged(slot, conv_state, 3).ptr(), rows * channels);
-        try glue.convStatic(&g.p.glue, g.s, taps, tensor(weight), at(out, base * channels * 2), @intCast(rows), @intCast(channels));
+        try glue.convStatic(&g.p.glue, g.s, cache.history(slot, conv_state).ptr(), at(raw, base * channels * 2), cache.staged(slot, conv_state, 0).ptr(), tensor(weight), at(out, base * channels * 2), @intCast(rows), @intCast(channels));
     }
 
     fn convInputForAttention(g: Run, cache: *state.Cache, v: *const layer_plan.Visit, base: usize, rows: usize, key: bool) !void {
@@ -166,12 +166,11 @@ const Run = struct {
         const projected = at(if (key) s.k_raw else s.v_raw, base * state.kv_width * 2);
         const normalized = if (key) s.k_norm else if (v.hasMessages() or lp.kind == .global) s.v_norm else s.q_norm;
         const conv_state: usize = if (key) 0 else 1;
+        const history = cache.history(v.cache_slot, conv_state).ptr();
         const taps = cache.staged(v.cache_slot, conv_state, 0).ptr();
-        try g.copyBf16(cache.history(v.cache_slot, conv_state).ptr(), taps, 3 * state.kv_width);
-        try g.copyBf16(projected, cache.staged(v.cache_slot, conv_state, 3).ptr(), rows * state.kv_width);
         switch (if (key) w.attn.k_conv else w.attn.v_conv) {
-            .static => |weight| try glue.convStatic(&g.p.glue, g.s, taps, tensor(weight), raw, @intCast(rows), state.kv_width),
-            .dynamic => |d| try glue.convDynamic(&g.p.glue, g.s, taps, at(normalized, base * state.hidden * 2), tensor(d.static_w), tensor(d.projection), raw, @intCast(rows), state.kv_width),
+            .static => |weight| try glue.convStatic(&g.p.glue, g.s, history, projected, taps, tensor(weight), raw, @intCast(rows), state.kv_width),
+            .dynamic => |d| try glue.convDynamic(&g.p.glue, g.s, history, projected, taps, at(normalized, base * state.hidden * 2), tensor(d.static_w), tensor(d.projection), raw, @intCast(rows), state.kv_width),
         }
     }
 
@@ -286,7 +285,7 @@ const Run = struct {
         if (gated) {
             const c = w.controllers.?[3];
             const core = v.layer - 6;
-            for (0..rows) |i| try loop.gates(&g.p.loop, g.s, row(s.mlp_ar, i, state.hidden * 4), messageRow(s, core, 3, i), tensor(c.down), tensor(c.forget), tensor(c.gain), row(s.mlp_gated, i, state.hidden * 4), 1);
+            for (0..rows) |i| try loop.gates(&g.p.loop, g.s, row(s.mlp_ar, i, state.hidden * 4), messageRow(s, core, 3, i), tensor(c.down), tensor(c.forget), tensor(c.gain), row(s.zeta, i, 64 * 4), row(s.mlp_gated, i, state.hidden * 4), 1);
             try g.norm(at(s.mlp_gated, 0), w.mlp_norm, at(s.mlp_normed, 0), rows);
         } else try g.norm(at(s.mlp_ar, 0), w.mlp_norm, at(s.mlp_normed, 0), rows);
         try glue.router(&g.p.glue, g.s, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.route_ids, 0), at(s.route_weights, 0), @intCast(rows));
@@ -361,6 +360,7 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     const logits = if (options.all) at(s.logits_all, 0) else at(segments[0].cache.logits, 0);
     try glue.logits(&p.glue, stream, at(s.mlp_normed, final.logits_row * state.hidden * 2), tensor(m.weights.unembed), logits, @intCast(final.logits_rows), m.config.text.unpadded_vocab);
     try g.commitFullHistories(segments);
+    if (xpu.profile.active) |prof| prof.enqueued();
     try stream.synchronize();
 }
 
