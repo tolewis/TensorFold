@@ -117,7 +117,7 @@ test "encode: values come back within half a step, zeros stay zero, the largest 
         const d: f64 = @floatCast(@as(f16, @bitCast(scales[b])));
         try std.testing.expect(@abs(got - want) <= d * 0.5 + 1e-12);
     };
-    var top: i32 = 0;
+    var top: u32 = 0;
     for (0..32) |e| top = @max(top, @abs(@as(i32, @as(i8, @bitCast(codes[codeOffset(3, e)])))));
     try std.testing.expect(top >= 126 and top <= 127);
 }

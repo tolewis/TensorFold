@@ -11,6 +11,7 @@ const experts = @import("experts.zig");
 const loop = @import("loop.zig");
 const runtime = @import("runtime.zig");
 const dense_kernels = @import("dense.zig");
+const dense_q8_kernels = @import("dense_q8.zig");
 const state = @import("state.zig");
 const model_file = @import("model.zig");
 const Model = model_file.Model;
@@ -91,10 +92,12 @@ const Run = struct {
         try dense_kernels.norm(&g.p.dense, g.s, input, tensor(weight), out, @intCast(rows));
     }
 
-    /// Every projection uses the shared BF16 matvec's FP32 reduction and one BF16 store.
+    /// Every projection uses the shared matvec's FP32 reduction and one BF16 store: over BF16 weights, or over Q8_0 blocks
+    /// (q8.zig) when the model loaded them re-encoded.
     fn dense(g: Run, weight: Tensor, input: Ptr, out: Ptr, rows: usize) !void {
         const k: u32 = @intCast(weight.shape[weight.rank - 1]);
         const n: u32 = @intCast(weight.shape[weight.rank - 2]);
+        if (weight.q8) return dense_q8_kernels.dense(&g.p.dense_q8, g.s, tensor(weight), input, out, @intCast(rows), n, k);
         try dense_kernels.dense(&g.p.dense, g.s, tensor(weight), input, out, @intCast(rows), n, k);
     }
 
@@ -358,7 +361,10 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     try g.norm(at(s.mlp_ar, 0), m.weights.norm, at(s.mlp_normed, 0), final.work_rows);
     if (options.taps) |to| try g.captureTap(at(s.mlp_normed, 0), to, final.capture_rows, 3);
     const logits = if (options.all) at(s.logits_all, 0) else at(segments[0].cache.logits, 0);
-    try glue.logits(&p.glue, stream, at(s.mlp_normed, final.logits_row * state.hidden * 2), tensor(m.weights.unembed), logits, @intCast(final.logits_rows), m.config.text.unpadded_vocab);
+    const head_input = at(s.mlp_normed, final.logits_row * state.hidden * 2);
+    if (m.weights.unembed_q8) |head| {
+        try dense_q8_kernels.head(&p.dense_q8, stream, tensor(head), head_input, logits, @intCast(final.logits_rows), m.config.text.unpadded_vocab);
+    } else try glue.logits(&p.glue, stream, head_input, tensor(m.weights.unembed), logits, @intCast(final.logits_rows), m.config.text.unpadded_vocab);
     try g.commitFullHistories(segments);
     if (xpu.profile.active) |prof| prof.enqueued();
     try stream.synchronize();
