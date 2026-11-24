@@ -13,6 +13,8 @@ const loop = @import("loop.zig");
 const runtime = @import("runtime.zig");
 const dense = @import("dense.zig");
 const dense_q8 = @import("dense_q8.zig");
+const prefill_kernels = @import("prefill_kernels.zig");
+const prefill_experts = @import("prefill_experts.zig");
 const q8 = @import("q8.zig");
 
 const rt = xpu.rt;
@@ -108,8 +110,10 @@ pub const Pipelines = struct {
     runtime: runtime.Pipelines,
     dense: dense.Kernels,
     dense_q8: dense_q8.Kernels,
+    prefill: prefill_kernels.Kernels,
+    prefill_experts: prefill_experts.Kernels,
 
-    const image_count = 8;
+    const image_count = 10;
 
     fn native(ctx: *const xpu.Context, comptime name: []const u8) !xpu.Module {
         return xpu.Module.loadNative(ctx, &@field(images, name));
@@ -119,7 +123,7 @@ pub const Pipelines = struct {
         var p: Pipelines = undefined;
         var loaded: usize = 0;
         errdefer for (p.modules[0..loaded]) |*mod| mod.unload();
-        inline for (.{ "attention", "prompt", "glue", "experts", "loop", "runtime", "dense", "dense_q8" }, 0..) |name, i| {
+        inline for (.{ "attention", "prompt", "glue", "experts", "loop", "runtime", "dense", "dense_q8", "prefill", "prefill_experts" }, 0..) |name, i| {
             p.modules[i] = try native(ctx, name);
             loaded += 1;
         }
@@ -136,10 +140,16 @@ pub const Pipelines = struct {
         p.dense = try dense.Kernels.load(p.modules[6], false);
         errdefer p.dense.deinit();
         p.dense_q8 = try dense_q8.Kernels.load(p.modules[7], false);
+        errdefer p.dense_q8.deinit();
+        p.prefill = try prefill_kernels.Kernels.load(p.modules[8]);
+        errdefer p.prefill.deinit();
+        p.prefill_experts = try prefill_experts.Kernels.load(p.modules[9]);
         return p;
     }
 
     pub fn deinit(p: *Pipelines) void {
+        p.prefill_experts.deinit();
+        p.prefill.deinit();
         p.dense_q8.deinit();
         p.dense.deinit();
         p.runtime.deinit();

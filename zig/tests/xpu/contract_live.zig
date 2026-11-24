@@ -6,6 +6,7 @@ const dspark = @import("inkling2_dspark.zig");
 const dflash2 = @import("inkling2_dflash2.zig");
 const dense = @import("inkling2_dense.zig");
 const dense_q8 = @import("inkling2_dense_q8.zig");
+const pf_experts = @import("inkling2_prefill_experts.zig");
 
 const limits = core.xpu_limits;
 const records = core.xpu_records;
@@ -94,6 +95,7 @@ fn argsOf(planted: []const u8) u32 {
     if (dflash2.argsOf(symbol)) |n| return n;
     if (dense.argsOf(symbol)) |n| return n;
     if (dense_q8.argsOf(symbol)) |n| return n;
+    if (pf_experts.argsOf(symbol)) |n| return n;
     if (inkling2Args(symbol)) |n| return n;
     return 1; // gate 5's controls take one output pointer
 }

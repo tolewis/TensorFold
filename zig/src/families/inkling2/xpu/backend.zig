@@ -6,6 +6,7 @@ const xpu = @import("xpu");
 const lanes = @import("lanes");
 const st = @import("state.zig");
 const fwd = @import("forward.zig");
+const prefill = @import("prefill.zig");
 const Model = @import("model.zig").Model;
 const snapshot = @import("snapshot.zig");
 const sampler = @import("sampler.zig");
@@ -35,7 +36,7 @@ pub fn streamBytes(positions: usize) u64 {
 
 /// Device bytes the backend's scratch holds for good, for a context of `capacity` positions.
 pub fn scratchBytes(capacity: usize) u64 {
-    return st.scratchBytes(st.max_rows, capacity);
+    return st.scratchBytes(st.prompt_rows, capacity);
 }
 
 pub const Xpu = struct {
@@ -61,7 +62,7 @@ pub const Xpu = struct {
     pub fn init(gpa: std.mem.Allocator, model: *Model, options: Options) !*Xpu {
         const out = try gpa.create(Xpu);
         errdefer gpa.destroy(out);
-        var scratch = try st.Scratch.init(model.r, st.max_rows, options.capacity);
+        var scratch = try st.Scratch.init(model.r, st.prompt_rows, options.capacity);
         errdefer scratch.deinit();
         const tokens = try gpa.alloc(u32, ring);
         errdefer gpa.free(tokens);
@@ -110,7 +111,7 @@ pub const Xpu = struct {
         const self = cast(ptr);
         try validateTaps(&self.model.config, taps);
         if (self.prepared) return;
-        if (self.scratch.taps == null) self.scratch.taps = try self.model.r.alloc(st.captureBytes(st.max_rows));
+        if (self.scratch.taps == null) self.scratch.taps = try self.model.r.alloc(st.captureBytes(st.prompt_rows));
         self.prepared = true;
     }
 
@@ -227,7 +228,7 @@ pub const Xpu = struct {
             }
             const capture = self.prepared and stream != null;
             if (capture) _ = self.nextTapGeneration();
-            try fwd.run(self.model, &self.scratch, cache, ids[at..end], .{ .taps = if (capture) self.scratch.taps.?.ptr else null });
+            try prefill.run(self.model, &self.scratch, cache, ids[at..end], .{ .taps = if (capture) self.scratch.taps.?.ptr else null });
             if (capture) {
                 const rows = end - at;
                 const taps = self.scratch.taps.?;

@@ -123,6 +123,7 @@ const Stats = struct {
     /// |our log-sum-exp over the vocabulary - the reference's|: sum and max
     lse_sum: f64 = 0,
     lse_max: f64 = 0,
+    kl16_sum: f64 = 0,
     /// next-token loss summed over the rows whose next token is in the reference's top 16, ours and the reference's
     nll_ours: f64 = 0,
     nll_ref: f64 = 0,
@@ -235,6 +236,7 @@ pub fn main(init: std.process.Init) !void {
     var verify_bench = false;
     var route_union = false;
     var bench_context: ?usize = null;
+    var bench_prefill: usize = 0;
     var options: ink.model.Options = .{ .embed_host = false };
     var dump_prefix: ?[]const u8 = null;
     var compare_prefix: ?[]const u8 = null;
@@ -275,6 +277,21 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--compare-logits")) {
             i += 1;
             compare_prefix = argv[i];
+        } else if (std.mem.eql(u8, a, "--old-forward")) {
+            // the forward of 64-row chunks, every launch a row at a time (the control of an A/B)
+            old_forward = true;
+        } else if (std.mem.eql(u8, a, "--old-experts")) {
+            // the prompt chunk with the decode path's expert kernels (the control of an A/B)
+            old_experts = true;
+        } else if (std.mem.eql(u8, a, "--old-global")) {
+            old_global = true;
+        } else if (std.mem.eql(u8, a, "--old-sliding")) {
+            old_sliding = true;
+        } else if (std.mem.eql(u8, a, "--old-loop")) {
+            old_loop = true;
+        } else if (std.mem.eql(u8, a, "--old-dense")) {
+            // the prompt chunk with the decode path's dense projections (the control of an A/B)
+            old_dense = true;
         } else if (std.mem.eql(u8, a, "--digest")) {
             digest = true;
         } else if (std.mem.eql(u8, a, "--profile")) {
@@ -294,6 +311,10 @@ pub fn main(init: std.process.Init) !void {
             // chunk; then plain decode profiled greedy and sampled; then stop
             profile_all = true;
             if (profile_steps == 0) profile_steps = 8;
+        } else if (std.mem.eql(u8, a, "--bench-prefill")) {
+            // the first --ref prompt, repeated to N rows, prefilled in --chunk row chunks with the last row's logits only; cold first token
+            i += 1;
+            bench_prefill = try std.fmt.parseInt(usize, argv[i], 10);
         } else if (std.mem.eql(u8, a, "--bench-context")) {
             i += 1;
             bench_context = try std.fmt.parseInt(usize, argv[i], 10);
@@ -303,7 +324,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("skipped: no model directory (argument or TF_XPU_INKLING2)\n", .{});
         return;
     };
-    if (chunk == 0 or chunk > state.max_rows) return error.BadChunk;
+    if (chunk == 0 or chunk > state.max_prefill_rows) return error.BadChunk;
     if (refs.items.len == 0 and ids_path == null and bench_context == null) return error.NothingToDo;
 
     // inputs first, so a bad file fails before the model loads
@@ -320,6 +341,15 @@ pub fn main(init: std.process.Init) !void {
         longest = @max(longest, prompt.len + generate);
     }
     if (bench_context) |c| longest = @max(longest, c + decode_steps + 4 * profile_steps + 8);
+    if (bench_prefill > 0) {
+        if (loaded_refs.items.len == 0) return error.NothingToDo;
+        const src = loaded_refs.items[0].ids;
+        const cycled = try gpa.alloc(u32, bench_prefill);
+        for (cycled, 0..) |*x, k| x.* = src[k % src.len];
+        loaded_refs.items[0].ids = cycled;
+        loaded_refs.items[0].rows = bench_prefill;
+        longest = @max(longest, bench_prefill + decode_steps + 4 * profile_steps + 8);
+    }
     const capacity = std.mem.alignForward(usize, longest, 64);
 
     xpu.stop.install();
@@ -340,7 +370,7 @@ pub fn main(init: std.process.Init) !void {
     defer m.deinit();
     try m.loadKernels(&ctx);
     std.debug.print("loaded {d:.2} GiB and built the kernels in {d:.1} s\n", .{ @as(f64, @floatFromInt(m.device_bytes)) / (1 << 30), secs(nowNs(init.io) - t_load) });
-    var scratch = try state.Scratch.init(&r, state.max_rows, capacity);
+    var scratch = try state.Scratch.init(&r, @max(chunk, state.max_rows), capacity);
     defer scratch.deinit();
     var prec = ink.model.precisions();
     const schedule = try ink.plan.build(&m.config.text, &prec);
@@ -350,6 +380,23 @@ pub fn main(init: std.process.Init) !void {
 
     if (verify_bench) {
         try verifyBench(gpa, init.io, &ctx, m, &scratch, &r, &schedule, capacity, loaded_refs.items[0].ids, host_logits, profile_steps > 0, route_union);
+        return;
+    }
+    if (bench_prefill > 0 and !profile_all) {
+        var cache = try state.Cache.init(&r, capacity, &schedule, .bf16);
+        defer cache.deinit();
+        const ids = loaded_refs.items[0].ids;
+        var pos: usize = 0;
+        const t0 = nowNs(init.io);
+        while (pos < ids.len) {
+            const n = @min(chunk, ids.len - pos);
+            try promptRun(m, &scratch, &cache, ids[pos..][0..n], .{});
+            cache.len += n;
+            pos += n;
+        }
+        _ = try lastLogits(&r, &cache, host_logits[0..vocab]);
+        const dt = secs(nowNs(init.io) - t0);
+        std.debug.print("\nBENCH prefill {d} rows in chunks of {d}: {d:.3} s, {d:.1} tok/s (cold first token)\n", .{ ids.len, chunk, dt, @as(f64, @floatFromInt(ids.len)) / dt });
         return;
     }
     if (profile_all) {
@@ -383,13 +430,20 @@ pub fn main(init: std.process.Init) !void {
         var pos: usize = 0;
         while (pos < ref.rows) {
             const n = @min(chunk, ref.rows - pos);
-            try ink.forward.run(m, &scratch, &cache, ref.ids[pos..][0..n], .{ .all = true });
+            if (old_forward) {
+                if (n > state.max_rows) return error.BadChunk;
+                try ink.forward.run(m, &scratch, &cache, ref.ids[pos..][0..n], .{ .all = true });
+            } else try ink.prefill.run(m, &scratch, &cache, ref.ids[pos..][0..n], .{ .defer_head = true, .old_experts = old_experts, .old_dense = old_dense, .old_loop = old_loop, .old_global = old_global, .old_sliding = old_sliding });
             cache.len += n;
-            try r.download(std.mem.sliceAsBytes(host_logits[0 .. n * vocab]), scratch.logits_all);
+            var sub: usize = 0;
+            while (sub < n) : (sub += state.max_rows) {
+            const sn: usize = @min(state.max_rows, n - sub);
+            if (!old_forward) try ink.prefill.headRows(m, &scratch, sub, sn);
+            try r.download(std.mem.sliceAsBytes(host_logits[0 .. sn * vocab]), scratch.logits_all);
             try r.sync();
-            if (digest) prefill_digest.update(std.mem.sliceAsBytes(host_logits[0 .. n * vocab]));
-            for (0..n) |j| {
-                const p = pos + j;
+            if (digest) prefill_digest.update(std.mem.sliceAsBytes(host_logits[0 .. sn * vocab]));
+            for (0..sn) |j| {
+                const p = pos + sub + j;
                 const row = host_logits[j * vocab ..][0..vocab];
                 const t = top2(row);
                 st.rows += 1;
@@ -422,6 +476,12 @@ pub fn main(init: std.process.Init) !void {
                         st.nll_n += 1;
                     };
                     st.lse_max = @max(st.lse_max, dl);
+                    // KL of the reference to ours over the reference's top 16 (the tail is left out)
+                    for (ref_top, ref_logit) |id, want| {
+                        const lp: f64 = @as(f64, want) - @as(f64, ref.lse[p]);
+                        const lq: f64 = @as(f64, row[@intCast(id)]) - lse;
+                        st.kl16_sum += @exp(lp) * (lp - lq);
+                    }
                     mx = 0;
                 }
                 row_max[p] = 0;
@@ -440,12 +500,14 @@ pub fn main(init: std.process.Init) !void {
                     st.count_abs += 1;
                 }
             }
+            }
             pos += n;
         }
         const prefill_s = secs(nowNs(init.io) - t0);
         std.debug.print("\n{s}: {d} rows in chunks of {d}, {d:.1} s ({d:.1} tok/s with every row's logits)\n", .{ std.fs.path.basename(ref_path), st.rows, chunk, prefill_s, @as(f64, @floatFromInt(st.rows)) / prefill_s });
         std.debug.print("  top-1 agreement {d}/{d} ({d:.3} %), top-1 differences {d}, non-finite rows {d}\n", .{ st.agree, st.rows, 100.0 * @as(f64, @floatFromInt(st.agree)) / @as(f64, @floatFromInt(st.rows)), diffs.items.len, st.nan });
         std.debug.print("  reference top-16 logits: max abs difference {d:.4} (at position {d}), mean {d:.5}, max on the top-1 logit {d:.4}\n", .{ st.max_abs, st.max_abs_row, st.sum_abs / @as(f64, @floatFromInt(st.count_abs)), st.max_top1_abs });
+        std.debug.print("  KL16 reference to ours over the reference top 16: mean {d:.6}\n", .{st.kl16_sum / @as(f64, @floatFromInt(st.rows))});
         std.debug.print("  log-sum-exp difference: mean {d:.4}, max {d:.4}\n", .{ st.lse_sum / @as(f64, @floatFromInt(st.rows)), st.lse_max });
         std.debug.print("  next-token loss over {d} rows with the token in the reference top 16: ours {d:.4}, reference {d:.4}\n", .{ st.nll_n, st.nll_ours / @as(f64, @floatFromInt(@max(st.nll_n, 1))), st.nll_ref / @as(f64, @floatFromInt(@max(st.nll_n, 1))) });
         if (compare_file != null) kl.print(std.fs.path.basename(ref_path));
@@ -484,7 +546,7 @@ pub fn main(init: std.process.Init) !void {
         while (pos < prompt.len) {
             var n = @min(chunk, prompt.len - pos);
             if (pos < resume_at) n = @min(n, resume_at - pos);
-            try ink.forward.run(m, &scratch, &fresh, prompt[pos..][0..n], .{});
+            try promptRun(m, &scratch, &fresh, prompt[pos..][0..n], .{});
             fresh.len += n;
             pos += n;
             if (pos == resume_at) snap = try ink.snapshot.save(&r, &fresh);
@@ -498,7 +560,7 @@ pub fn main(init: std.process.Init) !void {
         pos = resume_at;
         while (pos < prompt.len) {
             const n = @min(chunk, prompt.len - pos);
-            try ink.forward.run(m, &scratch, &resumed, prompt[pos..][0..n], .{});
+            try promptRun(m, &scratch, &resumed, prompt[pos..][0..n], .{});
             resumed.len += n;
             pos += n;
         }
@@ -522,7 +584,7 @@ pub fn main(init: std.process.Init) !void {
         const t0 = nowNs(init.io);
         while (pos < prompt.len) {
             const n = @min(chunk, prompt.len - pos);
-            try ink.forward.run(m, &scratch, &cache, prompt[pos..][0..n], .{});
+            try promptRun(m, &scratch, &cache, prompt[pos..][0..n], .{});
             cache.len += n;
             pos += n;
         }
@@ -625,6 +687,21 @@ fn profileDecode(ctx: *xpu.Context, io: std.Io, m: *const ink.model.Model, scrat
     }
 }
 
+/// The old forward (64-row chunks, a launch a row) with `--old-forward`, else the prompt-chunk forward.
+var old_forward = false;
+var old_experts = false;
+var old_dense = false;
+var old_loop = false;
+var old_global = false;
+var old_sliding = false;
+fn promptRun(m: *const ink.model.Model, scratch: *state.Scratch, cache: *state.Cache, ids: []const u32, _: anytype) !void {
+    if (old_forward) {
+        if (ids.len > state.max_rows) return error.BadChunk;
+        return ink.forward.run(m, scratch, cache, ids, .{});
+    }
+    return ink.prefill.run(m, scratch, cache, ids, .{ .old_experts = old_experts, .old_dense = old_dense, .old_loop = old_loop, .old_global = old_global, .old_sliding = old_sliding });
+}
+
 /// The first reference prompt in chunks of `chunk` rows with the last row's logits only (the server's prompt path), a
 /// profile of every chunk (the table after the first 512 rows, then after the whole prompt), then decode at that context.
 fn profileAll(gpa: std.mem.Allocator, io: std.Io, ctx: *xpu.Context, m: *const ink.model.Model, scratch: *state.Scratch, r: *xpu.rt.Runtime, schedule: anytype, capacity: usize, ids: []const u32, chunk: usize, logits: []f32, steps: usize) !void {
@@ -637,10 +714,11 @@ fn profileAll(gpa: std.mem.Allocator, io: std.Io, ctx: *xpu.Context, m: *const i
     var chunks: usize = 0;
     var wall: i96 = 0;
     const first_rows: usize = 512;
+    var first_done = false;
     while (pos < ids.len) {
         const n = @min(chunk, ids.len - pos);
         const f0 = nowNs(io);
-        try ink.forward.run(m, scratch, &cache, ids[pos..][0..n], .{});
+        try promptRun(m, scratch, &cache, ids[pos..][0..n], .{});
         const dt = nowNs(io) - f0;
         wall += dt;
         try prof.collect();
@@ -649,7 +727,8 @@ fn profileAll(gpa: std.mem.Allocator, io: std.Io, ctx: *xpu.Context, m: *const i
         chunks += 1;
         if (pos <= first_rows) {
         }
-        if (pos == first_rows) {
+        if (!first_done and pos >= first_rows) {
+            first_done = true;
             std.debug.print("\nPREFILL first {d} rows (context 0 to {d}), {d} chunks of {d}: forward wall {d:.2} ms, {d:.1} tok/s; the table is per chunk (a pass)\n", .{ pos, pos, chunks, chunk, 1000 * secs(wall), @as(f64, @floatFromInt(pos)) / secs(wall) });
             prof.print();
             prof.reset();
@@ -677,7 +756,7 @@ fn verifyBench(gpa: std.mem.Allocator, io: std.Io, ctx: *xpu.Context, m: *const 
     const prefix: usize = @min(ids.len / 2, 512);
     var pos: usize = 0;
     while (pos < prefix) {
-        const n = @min(state.prompt_rows, prefix - pos);
+        const n = @min(state.max_rows, prefix - pos);
         try ink.forward.run(m, scratch, &cache, ids[pos..][0..n], .{});
         cache.len += n;
         pos += n;
