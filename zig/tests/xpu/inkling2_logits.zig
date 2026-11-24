@@ -232,6 +232,7 @@ pub fn main(init: std.process.Init) !void {
     var digest = false;
     var profile_steps: usize = 0;
     var profile_all = false;
+    var verify_bench = false;
     var bench_context: ?usize = null;
     var options: ink.model.Options = .{ .embed_host = false };
     var dump_prefix: ?[]const u8 = null;
@@ -280,6 +281,10 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--profile-steps")) {
             i += 1;
             profile_steps = try std.fmt.parseInt(usize, argv[i], 10);
+        } else if (std.mem.eql(u8, a, "--verify-bench")) {
+            // the first --ref prompt prefilled, then windows of 1, 2, 3, 4, 6, 8, 12 and 16 real rows run as the server's verify
+            // does (every row's logits, the DSpark taps, the cache transaction), timed; then stop
+            verify_bench = true;
         } else if (std.mem.eql(u8, a, "--profile-all")) {
             // the first --ref prompt prefilled in --chunk row chunks (last row's logits only, as the server does), profiled per
             // chunk; then plain decode profiled greedy and sampled; then stop
@@ -339,6 +344,10 @@ pub fn main(init: std.process.Init) !void {
     const host_logits = try gpa.alloc(f32, state.max_rows * vocab);
     defer gpa.free(host_logits);
 
+    if (verify_bench) {
+        try verifyBench(init.io, &ctx, m, &scratch, &r, &schedule, capacity, loaded_refs.items[0].ids, host_logits, profile_steps > 0);
+        return;
+    }
     if (profile_all) {
         try profileAll(gpa, init.io, &ctx, m, &scratch, &r, &schedule, capacity, loaded_refs.items[0].ids, chunk, host_logits[0..vocab], profile_steps);
         return;
@@ -652,6 +661,69 @@ fn profileAll(gpa: std.mem.Allocator, io: std.Io, ctx: *xpu.Context, m: *const i
     defer smp.deinit();
     token = argmax(try lastLogits(r, &cache, logits));
     try profileDecode(ctx, io, m, scratch, &cache, r, logits, token, steps, &smp);
+}
+
+/// Windows of n real rows (the prompt's own next tokens, so the routing is real) through `runShared` the way the backend's
+/// verify runs them: all rows' logits, the taps, begin and rollback around each. Median of the reps, in ms: the forward,
+/// then the forward and the host argmax of every row's downloaded logits (the greedy verify today).
+fn verifyBench(io: std.Io, ctx: *xpu.Context, m: *const ink.model.Model, scratch: *state.Scratch, r: *xpu.rt.Runtime, schedule: anytype, capacity: usize, ids: []const u32, host: []f32, profile: bool) !void {
+    var cache = try state.Cache.init(r, capacity, schedule, .bf16);
+    defer cache.deinit();
+    scratch.taps = try r.alloc(state.captureBytes(state.max_rows));
+    const prefix: usize = @min(ids.len / 2, 512);
+    var pos: usize = 0;
+    while (pos < prefix) {
+        const n = @min(state.prompt_rows, prefix - pos);
+        try ink.forward.run(m, scratch, &cache, ids[pos..][0..n], .{});
+        cache.len += n;
+        pos += n;
+    }
+    const sizes = [_]usize{ 1, 2, 3, 4, 6, 8, 12, 16 };
+    const reps = 15;
+    var base_ms: f64 = 0;
+    std.debug.print("\nVERIFY BENCH at context {d}: windows of real rows, all rows' logits and taps; median of {d}\n", .{ cache.len, reps });
+    std.debug.print("rows   forward ms   x one row   forward+host argmax ms   x one row\n", .{});
+    for (sizes) |n| {
+        var fw: [reps]f64 = undefined;
+        var tot: [reps]f64 = undefined;
+        for (0..reps) |rep| {
+            const from = prefix + (rep * 7) % 64;
+            try cache.begin(n);
+            const t0 = nowNs(io);
+            try ink.forward.runShared(m, scratch, &.{.{ .cache = &cache, .rows = n }}, ids[from..][0..n], .{ .all = true, .taps = scratch.taps.?.ptr });
+            const t1 = nowNs(io);
+            try r.download(std.mem.sliceAsBytes(host[0 .. n * vocab]), scratch.logits_all);
+            try r.sync();
+            var sink: u32 = 0;
+            for (0..n) |j| sink +%= argmax(host[j * vocab ..][0..vocab]);
+            std.mem.doNotOptimizeAway(sink);
+            const t2 = nowNs(io);
+            fw[rep] = 1000 * secs(t1 - t0);
+            tot[rep] = 1000 * secs(t2 - t0);
+            try cache.rollback();
+        }
+        std.mem.sort(f64, &fw, {}, std.sort.asc(f64));
+        std.mem.sort(f64, &tot, {}, std.sort.asc(f64));
+        if (n == 1) base_ms = fw[reps / 2];
+        std.debug.print("{d:4}   {d:10.2}   {d:9.2}   {d:22.2}   {d:9.2}\n", .{ n, fw[reps / 2], fw[reps / 2] / base_ms, tot[reps / 2], tot[reps / 2] / base_ms });
+    }
+    if (profile) {
+        var prof = try xpu.profile.Profile.init(ctx, 8192, true);
+        defer prof.deinit();
+        for ([_]usize{ 2, 8 }) |n| {
+            xpu.profile.active = &prof;
+            prof.reset();
+            for (0..4) |rep| {
+                try cache.begin(n);
+                try ink.forward.runShared(m, scratch, &.{.{ .cache = &cache, .rows = n }}, ids[prefix + rep * 5 ..][0..n], .{ .all = true, .taps = scratch.taps.?.ptr });
+                try prof.collect();
+                try cache.rollback();
+            }
+            xpu.profile.active = null;
+            std.debug.print("\nPROFILE of a verify window of {d} rows (mean of 4 windows, per window)\n", .{n});
+            prof.print();
+        }
+    }
 }
 
 fn lastLogits(r: *xpu.rt.Runtime, cache: *state.Cache, out: []f32) ![]f32 {
