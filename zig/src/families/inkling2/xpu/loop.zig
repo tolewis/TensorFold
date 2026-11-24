@@ -20,7 +20,7 @@ pub const zeta_symbol: [:0]const u8 = "tf_inkling2_loop_zeta";
 pub const threads: u32 = 256;
 /// Work-items a work-group of the gates launch, and the ranks a work-group of the zeta launch covers.
 pub const gate_threads: u32 = 64;
-pub const zeta_ranks: u32 = 4;
+pub const zeta_ranks: u32 = 2;
 
 comptime {
     std.debug.assert(std.mem.eql(u8, messages_symbol, plan.Kind.messages.symbol()));

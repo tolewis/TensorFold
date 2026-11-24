@@ -14,7 +14,7 @@
 #define LOOP_RANK 64
 #define LOOP_MESSAGES 48
 #define LOOP_SGS 16 // sub-groups in a work-group of 256
-#define LOOP_RANKS_A_GROUP 4 // ranks a work-group of the zeta launch owns, one a sub-group
+#define LOOP_RANKS_A_GROUP 2 // ranks a work-group of the zeta launch owns, one a sub-group
 
 // Planted controls (the contract image `contract_inkling2_loop_controls` is this file built with both defined).
 #ifdef TF_CTL_LOOP_NO_SCALE
@@ -97,7 +97,7 @@ KERNEL(256) void tf_inkling2_loop_messages(global const ushort *bank0, global co
 // Two launches, so that more than one work-group streams the weights (about 1.2 MB a tuple).
 //
 // First, zeta (the D projection, rounded to bf16): work-group (part, row) norms the row's h and m, as every work-group
-// of the row does in the same order, then sub-group s of it owns rank 4 part + s. A lane adds its 8-wide chunks in
+// of the row does in the same order, then sub-group s of it owns rank LOOP_RANKS_A_GROUP * part + s. A lane adds its 8-wide chunks in
 // order, four chunks' loads in flight at a time, then the 16 lanes reduce.
 KERNEL(256) void tf_inkling2_loop_zeta(global const float *h, global const float *m, global const ushort *down,
                                        global float *zeta, uint rows) {
@@ -108,17 +108,24 @@ KERNEL(256) void tf_inkling2_loop_zeta(global const float *h, global const float
   const uint lane = get_sub_group_local_id(), sg = get_sub_group_id();
   global const float *hr = h + (size_t)row * LOOP_H;
   global const float *mr = m + (size_t)row * LOOP_H;
+  float hv[LOOP_H / 256], mv[LOOP_H / 256];
   float ss0 = 0.0f, ss1 = 0.0f;
-  for (uint d = t; d < LOOP_H; d += 256) {
-    const float x0 = hr[d], x1 = mr[d];
-    ss0 += x0 * x0;
-    ss1 += x1 * x1;
+#pragma unroll
+  for (uint i = 0; i < LOOP_H / 256; ++i) {
+    hv[i] = hr[t + 256 * i];
+    mv[i] = mr[t + 256 * i];
+  }
+#pragma unroll
+  for (uint i = 0; i < LOOP_H / 256; ++i) {
+    ss0 += hv[i] * hv[i];
+    ss1 += mv[i] * mv[i];
   }
   const float inv0 = rms_inverse(group_sum(ss0, red));
   const float inv1 = rms_inverse(group_sum(ss1, red));
-  for (uint d = t; d < LOOP_H; d += 256) {
-    normalized[d] = f2bf(hr[d] * inv0);
-    normalized[LOOP_H + d] = f2bf(mr[d] * inv1);
+#pragma unroll
+  for (uint i = 0; i < LOOP_H / 256; ++i) {
+    normalized[t + 256 * i] = f2bf(hv[i] * inv0);
+    normalized[LOOP_H + t + 256 * i] = f2bf(mv[i] * inv1);
   }
   barrier(CLK_LOCAL_MEM_FENCE);
   if (sg < LOOP_RANKS_A_GROUP) {
