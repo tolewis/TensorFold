@@ -60,7 +60,7 @@ pub const Dev = struct {
     extra: [max_extra]Extra = undefined,
     extra_n: usize = 0,
 
-    pub const max_extra = 8;
+    pub const max_extra = 16;
     pub const Extra = struct { name: []const u8, module: xpu.Module };
 
     /// Opens the card `ordinal` names, else the first Arc card, and loads every image; `self` stays where it is.
