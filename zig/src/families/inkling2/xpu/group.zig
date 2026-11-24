@@ -107,6 +107,7 @@ pub const Group = struct {
         // A flag word of its own. The all-reduce flag sits at blk_flag and would release this wait early.
         const flag = blk_flag + 16;
         if (g.rank != 0) {
+            g.logRange("head-src", src);
             try g.r.stream(g.ctx).copy(g.peer_head.?, src, bytes);
             if (std.c.getenv("TF_TP_HEAD_SYNC")) |v| if (v[0] != '0') try g.r.sync();
             try g.writeFlag(off(g.peer_blk.?, flag));
@@ -233,7 +234,16 @@ pub const Group = struct {
         std.mem.writeInt(i32, t2.data[0..4], tf2[0], .little);
         var ph: ?*anyopaque = null;
         try g.r.drv.check(openipc(g.r.ctx, g.r.device, t2, 0, &ph), "zeMemOpenIpcHandle");
-        g.peer_head = ph;
+        _ = g.rangeOff(g.blk.?);
+        const head_off = g.rangeOff(g.head.?);
+        var off_bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &off_bytes, head_off, .little);
+        if (linux.write(g.conn, &off_bytes, 8) != 8) return error.ByteSend;
+        off_bytes = @splat(0);
+        if (linux.read(g.conn, &off_bytes, 8) != 8) return error.ByteRecv;
+        const peer_off = std.mem.readInt(u64, &off_bytes, .little);
+        g.peer_head = if (peer_off == 0) ph else off(ph.?, @intCast(peer_off));
+        std.log.info("inkling2: head IPC base offset {d}, peer offset {d}", .{ head_off, peer_off });
         g.zex = g.lookupZex();
         g.cb = @constCast(&g.r.drv.lib).lookup(CbCreate, "zeEventCounterBasedCreate");
         const mode: u8 = if (g.zex != null and g.cb != null) 5 else 2;
@@ -241,6 +251,28 @@ pub const Group = struct {
         try sendByte(g.conn, mode);
         try recvByte(g.conn, &peer_mode);
         if (mode == 5 and peer_mode == 5) g.ex = 3;
+    }
+
+    fn rangeOff(g: *Group, ptr: *anyopaque) u64 {
+        const GetRange = *const fn (ze.H, *const anyopaque, *?*anyopaque, *usize) callconv(.c) u32;
+        const get = @constCast(&g.r.drv.lib).lookup(GetRange, "zeMemGetAddressRange") orelse {
+            std.log.err("inkling2: zeMemGetAddressRange missing", .{});
+            return 0;
+        };
+        var base: ?*anyopaque = null;
+        var size: usize = 0;
+        if (get(g.r.ctx, ptr, &base, &size) != 0 or base == null) {
+            std.log.err("inkling2: address range failed for {*} size {d}", .{ ptr, size });
+            return 0;
+        }
+        const off_b = @intFromPtr(ptr) - @intFromPtr(base.?);
+        std.log.info("inkling2: range ptr {*} base {*} size {d} offset {d}", .{ ptr, base.?, size, off_b });
+        return @intCast(off_b);
+    }
+
+    fn logRange(g: *Group, tag: []const u8, ptr: *anyopaque) void {
+        std.log.info("inkling2: {s} is the head-kernel buffer, not the handshake export", .{tag});
+        _ = g.rangeOff(ptr);
     }
 
     fn lookupZex(g: *Group) ?ZexWrite {
