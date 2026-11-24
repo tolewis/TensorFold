@@ -287,7 +287,17 @@ fn mapShm(name: [:0]const u8, rank: u32) ![]align(4096) u8 {
     const bytes = 256 + 4 * slot_bytes + 8 * @sizeOf(Rec) + 4096;
     const rdwr: u32 = 2;
     const creat: u32 = 64;
-    const fd = if (rank == 0) std.c.shm_open(name, creat | rdwr, 0o600) else std.c.shm_open(name, rdwr, 0);
+    var fd: c_int = if (rank == 0) std.c.shm_open(name, creat | rdwr, 0o600) else -1;
+    if (rank != 0) {
+        var n: u32 = 0;
+        while (fd < 0) : (n += 1) {
+            fd = std.c.shm_open(name, rdwr, 0);
+            if (fd >= 0) break;
+            if (n > 300) return error.ShmOpen;
+            var ts: linux.timespec = .{ .sec = 0, .nsec = 100_000_000 };
+            _ = linux.nanosleep(&ts, null);
+        }
+    }
     if (fd < 0) return error.ShmOpen;
     if (rank == 0 and linux.ftruncate(fd, @intCast(bytes)) != 0) return error.ShmOpen;
     const p = c_mmap(null, bytes, 3, 1, fd, 0);
