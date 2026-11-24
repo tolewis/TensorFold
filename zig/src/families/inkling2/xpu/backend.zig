@@ -8,6 +8,7 @@ const st = @import("state.zig");
 const fwd = @import("forward.zig");
 const Model = @import("model.zig").Model;
 const snapshot = @import("snapshot.zig");
+const sampler = @import("sampler.zig");
 const cfg = @import("../config.zig");
 const be = lanes.backend;
 
@@ -51,6 +52,8 @@ pub const Xpu = struct {
     values: []f32,
     row: []f32,
     window: []f32,
+    /// Selects a sampled row's candidates on the device, so a draw copies back the candidates and not the row.
+    sampler: sampler.Sampler,
     prepared: bool = false,
     sink: ?be.FeatureSink = null,
     tap_gen: u64 = 0,
@@ -69,7 +72,10 @@ pub const Xpu = struct {
         errdefer gpa.free(row);
         const window = try gpa.alloc(f32, st.batch_rows * vocab_size);
         errdefer gpa.free(window);
-        out.* = .{ .gpa = gpa, .model = model, .options = options, .scratch = scratch, .tokens = tokens, .values = values, .row = row, .window = window };
+        const ctx = model.ctx orelse return error.Inkling2NoKernels;
+        var select = try sampler.Sampler.init(gpa, model.r, ctx, st.batch_rows);
+        errdefer select.deinit();
+        out.* = .{ .gpa = gpa, .model = model, .options = options, .scratch = scratch, .tokens = tokens, .values = values, .row = row, .window = window, .sampler = select };
         return out;
     }
 
@@ -80,6 +86,7 @@ pub const Xpu = struct {
             self.gpa.destroy(cache.*);
         }
         self.caches.deinit(self.gpa);
+        self.sampler.deinit();
         self.scratch.deinit();
         self.gpa.free(self.tokens);
         self.gpa.free(self.values);
@@ -167,6 +174,19 @@ pub const Xpu = struct {
             break :blk self.values;
         };
         return lanes.gpu_full.draw(self.gpa, values, t, @intCast(position), null);
+    }
+
+    /// The next token of `cache`'s last row. A sampled row's candidates are selected on the device and only they come back,
+    /// with the whole row too where the draw sums every token (top_k off); greedy and masked rows are drawn from the row.
+    fn drawLast(self: *Xpu, cache: *st.Cache, sampling: ?lanes.Sampling, position: u64, mask: []const u32) !u32 {
+        const t = sampled(sampling) orelse return self.draw(try self.logits(cache), sampling, position, mask);
+        if (mask.len > 0 or !sampler.Row.supported(t)) return self.draw(try self.logits(cache), sampling, position, mask);
+        const row = sampler.Row.of(t);
+        const set = try self.sampler.select(cache.logits.ptr, @intCast(self.vocab()), &.{row});
+        var buf: [sampler.top_max]lanes.gpu_rule.Cand = undefined;
+        const top = set.list(0, row.n, &buf);
+        const whole: ?[]const f32 = if (lanes.gpu_full.needsRow(t)) try self.logits(cache) else null;
+        return lanes.gpu_full.drawTop(whole, top, t, @intCast(position));
     }
 
     fn sampled(sampling: ?lanes.Sampling) ?lanes.Sampling {
@@ -282,7 +302,7 @@ pub const Xpu = struct {
     fn firstSlot(self: *Xpu, stream: *lanes.Stream, position: u64, mask: []const u32) !u64 {
         const cache = try self.cacheOf(stream);
         if (position != cache.len or cache.pending != null) return error.InvalidInklingPosition;
-        return self.put(try self.draw(try self.logits(cache), stream.sampling, position, mask));
+        return self.put(try self.drawLast(cache, stream.sampling, position, mask));
     }
 
     fn queueFn(ptr: *anyopaque, stream: *lanes.Stream, what: be.Feed, position: u64) !u64 {
@@ -298,7 +318,7 @@ pub const Xpu = struct {
         try fwd.run(self.model, &self.scratch, cache, &.{token}, .{ .taps = self.tapPtr() });
         if (self.prepared) cache.tap = .{ .buf = self.scratch.taps, .start = @intCast(cache.len), .rows = 1, .gen = generation };
         cache.len += 1;
-        return self.put(try self.draw(try self.logits(cache), stream.sampling, position, &.{}));
+        return self.put(try self.drawLast(cache, stream.sampling, position, &.{}));
     }
 
     fn read(self: *Xpu, handle: u64) !u32 {
@@ -347,8 +367,29 @@ pub const Xpu = struct {
         try fwd.runShared(self.model, &self.scratch, segments[0..windows.len], ids[0..total], .{ .all = true, .taps = self.tapPtr() });
         const v = self.vocab();
         const all = self.window[0 .. total * v];
-        try r.download(std.mem.sliceAsBytes(all), self.scratch.logits_all);
-        try r.sync();
+        // A sampled row without a mask or logprobs is selected on the device; the rest of the window is drawn from the host rows.
+        var picks: [st.batch_rows]sampler.Row = undefined;
+        var device: [st.batch_rows]bool = undefined;
+        var whole = false;
+        var any = false;
+        var at: usize = 0;
+        for (windows, out) |w, o| {
+            const t = sampled(w.stream.sampling);
+            for (0..w.rows()) |k| {
+                const masked = w.masks.len >= (k + 1) * words;
+                const ok = t != null and !masked and o.rows.len != w.rows() and sampler.Row.supported(t.?);
+                device[at + k] = ok;
+                any = any or ok;
+                picks[at + k] = if (ok) sampler.Row.of(t.?) else .{ .inv_t = 1.0, .n = 1 };
+                if (!ok or lanes.gpu_full.needsRow(t.?)) whole = true;
+            }
+            at += w.rows();
+        }
+        const set = if (any) try self.sampler.select(self.scratch.logits_all.ptr, @intCast(v), picks[0..total]) else undefined;
+        if (whole) {
+            try r.download(std.mem.sliceAsBytes(all), self.scratch.logits_all);
+            try r.sync();
+        }
         var base: usize = 0;
         for (windows, out, segments[0..windows.len]) |w, o, seg| {
             if (self.prepared) seg.cache.tap = .{ .buf = self.scratch.taps, .off = base * st.feature_row_bytes, .start = @intCast(seg.cache.len), .rows = seg.rows, .gen = generation };
@@ -356,7 +397,14 @@ pub const Xpu = struct {
             for (0..seg.rows) |k| {
                 const l = all[(base + k) * v ..][0..v];
                 const mask = if (w.masks.len >= (k + 1) * words) w.masks[k * words ..][0..words] else &.{};
-                o.sampled[k] = try self.draw(l, w.stream.sampling, w.positions[k], mask);
+                if (device[base + k]) {
+                    const t = sampled(w.stream.sampling).?;
+                    var buf: [sampler.top_max]lanes.gpu_rule.Cand = undefined;
+                    const top = set.list(base + k, picks[base + k].n, &buf);
+                    o.sampled[k] = lanes.gpu_full.drawTop(if (lanes.gpu_full.needsRow(t)) l else null, top, t, @intCast(w.positions[k]));
+                } else {
+                    o.sampled[k] = try self.draw(l, w.stream.sampling, w.positions[k], mask);
+                }
                 if (o.rows.len == seg.rows) o.rows[k] = logprobRow(l, o.sampled[k], w.stream.logprobs orelse 0);
             }
             try r.copy(seg.cache.logits, st.view(self.scratch.logits_all, (base + seg.rows - 1) * v * 4, v * 4), v * 4);

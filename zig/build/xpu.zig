@@ -234,9 +234,14 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         const logits = b.createModule(.{ .root_source_file = b.path("zig/tests/xpu/inkling2_logits.zig"), .target = target, .optimize = optimize, .link_libc = true });
         logits.addImport("xpu", resident_xpu);
         logits.addImport("inkling2_xpu", inkling2);
-        const tests = b.step("xpu-inkling2-tests", "Build the Inkling 2 Mini device tests (tf-xpu-inkling2-resident-test, tf-xpu-inkling2-logits)");
+        const sample = b.createModule(.{ .root_source_file = b.path("zig/tests/xpu/inkling2_sample.zig"), .target = target, .optimize = optimize, .link_libc = true });
+        sample.addImport("xpu", resident_xpu);
+        sample.addImport("inkling2_xpu", inkling2);
+        sample.addImport("lanes", lanes);
+        const tests = b.step("xpu-inkling2-tests", "Build the Inkling 2 Mini device tests (tf-xpu-inkling2-resident-test, tf-xpu-inkling2-logits, tf-xpu-inkling2-sample)");
         tests.dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-xpu-inkling2-resident-test", .root_module = resident }), .{}).step);
         tests.dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-xpu-inkling2-logits", .root_module = logits }), .{}).step);
+        tests.dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-xpu-inkling2-sample", .root_module = sample }), .{}).step);
     }
     const with_contract = b.option(bool, "xpu-contract", "Build the XPU kernel contract's limits audit (needs ocloc for the objects)") orelse false;
     const images = b.option([]const u8, "xpu-images", "A directory of zebins made with xpu-kernel-contract-objects: glue, tp, decode, contract_attn_upstream, contract_merge_upstream, contract_controls, contract_gate_controls (.bin)");

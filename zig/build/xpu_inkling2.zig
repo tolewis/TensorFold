@@ -77,6 +77,8 @@ const production_images = [_]Production{
     .{ .name = "loop", .path = "zig/kernels/xpu/inkling2/loop.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt" },
     .{ .name = "runtime", .path = "zig/kernels/xpu/inkling2/runtime.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt" },
     .{ .name = "dense", .path = "zig/kernels/xpu/inkling2/dense.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2" },
+    // the sampler's candidate selection
+    .{ .name = "sample", .path = "zig/kernels/xpu/inkling2/sample.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt" },
     // the drafter's kernels: the engine loads this one only with a drafter
     .{ .name = "dspark", .path = "zig/kernels/xpu/inkling2/dspark.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2" },
 };
