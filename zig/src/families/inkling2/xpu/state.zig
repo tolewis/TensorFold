@@ -169,6 +169,8 @@ pub const Cache = struct {
     backup: rt.Buffer,
     logits: rt.Buffer,
     kv: KvDtype,
+    /// Key and value convolution taps are written at this width. One card uses 1024. A split rank uses 512.
+    kv_channels: usize = kv_width,
     tap: Tap = .{},
     last_tap: ?rt.Buffer = null,
     capacity: usize,
@@ -256,10 +258,14 @@ pub const Cache = struct {
         if (accepted > rows) return error.Inkling2CacheTransaction;
         if (accepted < rows) {
             try c.r.copy(c.conv, c.backup, conv_bytes);
-            for (0..visit_slots) |slot| for (0..conv_states) |state| {
-                const bytes = 3 * convWidth(state) * 2;
-                const from = convByteOffset(slot, state, accepted, 3 + max_rows);
-                const to = convByteOffset(slot, state, 0, 3);
+            for (0..visit_slots) |slot| for (0..conv_states) |cs| {
+                // KV taps are packed at the rank width. The slot stride is the full width, so a full-width
+                // offset reads the wrong rows after the first accepted prefix.
+                const kv = cs < 2;
+                const channels: usize = if (kv) c.kv_channels else convWidth(cs);
+                const bytes = 3 * channels * 2;
+                const from = if (kv) convByteOffset(slot, cs, 0, 3 + max_rows) + accepted * channels * 2 else convByteOffset(slot, cs, accepted, 3 + max_rows);
+                const to = convByteOffset(slot, cs, 0, 3);
                 try c.r.copy(view(c.conv, to, bytes), view(c.taps, from, bytes), bytes);
             };
             try c.r.sync();

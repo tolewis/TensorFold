@@ -99,6 +99,7 @@ pub const Xpu = struct {
         const cache = try self.gpa.create(st.Cache);
         errdefer self.gpa.destroy(cache);
         cache.* = try st.Cache.init(self.model.r, capacity, &self.model.weight_plan, kv);
+        cache.kv_channels = self.model.options.place.kvWidth();
         return cache;
     }
 
@@ -284,6 +285,7 @@ pub const Xpu = struct {
     /// One prompt chunk and one window through every kernel, so the first request pays for neither.
     pub fn warm(self: *Xpu) !void {
         var cache = try st.Cache.init(self.model.r, st.prompt_rows + st.window_rows, &self.model.weight_plan, kv);
+        cache.kv_channels = self.model.options.place.kvWidth();
         defer cache.deinit();
         var ids: [st.prompt_rows]u32 = undefined;
         for (&ids, 0..) |*t, i| t.* = @intCast(1000 + i * 37 % 20000);
