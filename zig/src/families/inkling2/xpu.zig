@@ -6,6 +6,7 @@ pub const snapshot = @import("xpu/snapshot.zig");
 pub const forward = @import("xpu/forward.zig");
 pub const backend = @import("xpu/backend.zig");
 pub const dspark = @import("xpu/dspark.zig");
+pub const dflash2 = @import("xpu/dflash2.zig");
 pub const sampler = @import("xpu/sampler.zig");
 
 test {
@@ -14,6 +15,10 @@ test {
     _ = forward;
     _ = backend;
     _ = dspark;
+    _ = dflash2;
+    _ = @import("xpu/dflash2_kernels.zig");
+    _ = @import("xpu/dflash2_state.zig");
+    _ = @import("xpu/dflash2_weights.zig");
     _ = sampler;
     _ = @import("xpu/dspark_fold.zig");
     _ = @import("xpu/dspark_kernels.zig");

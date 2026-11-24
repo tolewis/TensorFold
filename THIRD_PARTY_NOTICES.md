@@ -277,7 +277,10 @@ In the Python engine, frozen at 0.6.6, `src/tensorfold/drafters/vendor/z_lab_dfl
 `dflash/model_mlx.py` from
 [z-lab/dflash](https://github.com/z-lab/dflash), MIT License, Copyright © 2026 Z Lab.
 The native engine vendors no copy. Its DFlash2 drafter, `zig/src/families/qwen27/dflash/`, implements z-lab's
-architecture under that attribution.
+architecture under that attribution. The Inkling 2 Mini XPU DFlash 2 drafter, `zig/src/families/inkling2/xpu/dflash2*.zig`
+and `zig/kernels/xpu/inkling2/dflash2.cl`, implements the same architecture with the grouped dynamic convolutions and
+candidate selector of the `incoai/Inkling-2-Mini-DFlash2` model card and its SGLang patch (Apache-2.0). It shares no source
+with either.
 
 In the Python engine, frozen at 0.6.6, `src/tensorfold/families/deepseek_v4/vendor/encoding_dsv4.py` is the
 unmodified `encoding/encoding_dsv4.py` of
@@ -292,7 +295,7 @@ below); `tools/zig/bolt_ggml.py` reads them from that file. The IQ2_XXS and Q8_0
 Bolt's GGML checkpoints (`zig/kernels/cuda/ggml.cu`, `zig/src/cuda/ggml.zig`) are TensorFold's own.
 
 TensorFold ships no model weights. The `z-lab/Qwen3.8-27B-DFlash2` model card states Apache-2.0.
-The optional `incoai/GLM-5.3-Flash-DFlash2` model card states Apache-2.0 too. Each checkpoint keeps its own license.
+The optional `incoai/GLM-5.3-Flash-DFlash2` and `incoai/Inkling-2-Mini-DFlash2` model cards state Apache-2.0 too. Each checkpoint keeps its own license.
 
 ## Structured output: libtfgrammar
 
