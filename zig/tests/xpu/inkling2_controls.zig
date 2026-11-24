@@ -12,7 +12,7 @@ pub const glue = [_]Entry{
     .{ .symbol = "tf_inkling2_ar", .from = "weights[s] = dot * INK_AR_SCALE;", .to = "weights[s] = dot;" },
     .{ .symbol = "tf_inkling2_conv_static", .from = "bf2f(weight[c * 4 + tap])", .to = "bf2f(weight[c * 4 + 3 - tap])" },
     .{ .symbol = "tf_inkling2_conv_dynamic", .from = "bf2f(static_w[lag * channels + c])", .to = "bf2f(static_w[(3 - lag) * channels + c])" },
-    .{ .symbol = "tf_inkling2_router", .from = "keys[t] = scores[t] + bias[t];", .to = "keys[t] = scores[t];" },
+    .{ .symbol = "tf_inkling2_router", .from = "keys[expert] = scores[expert] + bias[expert];", .to = "keys[expert] = scores[expert];" },
     .{ .symbol = "tf_inkling2_swiglu", .from = "ink_cap(u, 25.0f)", .to = "ink_cap(g, 25.0f)" },
     .{ .symbol = "tf_inkling2_logits", .from = "ink_cap(bf2f(f2bf(dot)), 30.0f)", .to = "ink_cap(dot, 30.0f)" },
     .{ .symbol = "tf_inkling2_expert_pick", .from = "ids[r * 8 + j]", .to = "ids[r * 8 + 7 - j]" },

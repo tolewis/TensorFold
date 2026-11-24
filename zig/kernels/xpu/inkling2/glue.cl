@@ -204,14 +204,17 @@ KERNEL(256) void tf_inkling2_conv_dynamic(global const ushort *history, global c
 }
 
 // Grid (rows). Sigmoid scores of 128 experts; the top 8 by score + bias, sorted by ascending expert index.
-// Work-item e < 128 adds the products of expert e's row in order d = 0 to 2303 (each product rounded, then added), so
-// the score of an expert does not depend on how many work-items run. The row of x is staged once in local memory.
+// A sub-group of 16 owns 8 experts. Its lanes split an expert's row of 2,304 weights in 8-weight pieces (lane l takes
+// pieces l, l + 16, ... in order, each product rounded and added to the lane's running sum), and the 16 lane sums are added
+// by the sub-group tree. The score of an expert does not depend on how many work-groups run. The row of x is staged once in
+// local memory. (The first version of this kernel summed one expert in one work-item, a 2,304 long add chain, 30 us a row.)
 KERNEL(256) void tf_inkling2_router(global const ushort *x, global const ushort *weight, global const float *bias,
                                     global uint *ids, global float *weights, uint rows) {
   const uint row = get_group_id(0), t = get_local_id(0);
   if (row >= rows) return;
   local float4 xs[INK_HIDDEN / 4];
-  local float scores[128], keys[128], chosen[8];
+  local float scores[128], chosen[8];
+  local float keys[128] __attribute__((aligned(16)));
   local uint picked[8];
   global const uint2 *xg = (global const uint2 *)(x + (ulong)row * INK_HIDDEN);
   for (uint i = t; i < INK_HIDDEN / 4; i += 256) {
@@ -219,14 +222,24 @@ KERNEL(256) void tf_inkling2_router(global const ushort *x, global const ushort 
     xs[i] = (float4)(as_float(v.x << 16), as_float(v.x & 0xffff0000u), as_float(v.y << 16), as_float(v.y & 0xffff0000u));
   }
   barrier(CLK_LOCAL_MEM_FENCE);
-  if (t < 128) {
-    global const uint4 *w = (global const uint4 *)(weight + (ulong)t * INK_HIDDEN);
+  {
+    const uint lane = get_sub_group_local_id(), sg = get_sub_group_id();
+    global const uint4 *w = (global const uint4 *)(weight + (ulong)(sg * 8) * INK_HIDDEN);
+    // 16 chunks of 9 loads: expert e is chunks 2e and 2e + 1. The next chunk is loaded before the current one is used.
+    float dots[8];
     float dot = 0.0f;
-    for (uint i = 0; i < INK_HIDDEN / 8; i += 4) {
-      uint4 a[4];
-      for (uint u = 0; u < 4; ++u) a[u] = w[i + u];
-      for (uint u = 0; u < 4; ++u) {
-        const float4 b0 = xs[2 * (i + u)], b1 = xs[2 * (i + u) + 1];
+    uint4 a[9], nx[9];
+    for (uint u = 0; u < 9; ++u) a[u] = w[u * 16 + lane];
+    for (uint u = 0; u < 9; ++u) nx[u] = a[u];
+    for (uint c = 0; c < 16; ++c) {
+      const uint e = c >> 1, part = c & 1u;
+      if (c + 1 < 16) {
+        const uint e2 = (c + 1) >> 1, part2 = (c + 1) & 1u;
+        for (uint u = 0; u < 9; ++u) nx[u] = w[(ulong)e2 * (INK_HIDDEN / 8) + (part2 * 9 + u) * 16 + lane];
+      }
+      for (uint u = 0; u < 9; ++u) {
+        const uint at = (part * 9 + u) * 16 + lane;
+        const float4 b0 = xs[2 * at], b1 = xs[2 * at + 1];
         dot += as_float(a[u].x << 16) * b0.x;
         dot += as_float(a[u].x & 0xffff0000u) * b0.y;
         dot += as_float(a[u].y << 16) * b0.z;
@@ -236,11 +249,59 @@ KERNEL(256) void tf_inkling2_router(global const ushort *x, global const ushort 
         dot += as_float(a[u].w << 16) * b1.z;
         dot += as_float(a[u].w & 0xffff0000u) * b1.w;
       }
+      if (part == 1) {
+        dots[e] = dot;
+        dot = 0.0f;
+      }
+      for (uint u = 0; u < 9; ++u) a[u] = nx[u];
     }
-    scores[t] = ink_sigmoid(dot);
-    keys[t] = scores[t] + bias[t];
+    for (uint e = 0; e < 8; ++e) {
+      const uint expert = sg * 8 + e;
+      const float total = sub_group_reduce_add(dots[e]);
+      if (lane == 0) {
+        scores[expert] = ink_sigmoid(total);
+        keys[expert] = scores[expert] + bias[expert];
+      }
+    }
   }
   barrier(CLK_LOCAL_MEM_FENCE);
+  // No NaN key: an expert is picked when fewer than 8 experts beat it (a larger key, or an equal key at a lower index), the
+  // same eight the serial picks below give. Each of the 128 work-items ranks one expert; a picked expert finds its place
+  // in ascending index order by counting the picked below it. The serial picks stay for a row with a NaN key.
+  local float4 *keys4 = (local float4 *)keys;
+  local uint flag[128];
+  const bool nan_key = work_group_any(t < 128 && isnan(keys[t < 128 ? t : 0]));
+  if (!nan_key) {
+    if (t < 128) {
+      const float ke = keys[t];
+      uint rank = 0;
+      for (uint j = 0; j < 32; ++j) {
+        const float4 kj = keys4[j];
+        rank += (kj.x > ke || (kj.x == ke && 4 * j < t)) ? 1u : 0u;
+        rank += (kj.y > ke || (kj.y == ke && 4 * j + 1 < t)) ? 1u : 0u;
+        rank += (kj.z > ke || (kj.z == ke && 4 * j + 2 < t)) ? 1u : 0u;
+        rank += (kj.w > ke || (kj.w == ke && 4 * j + 3 < t)) ? 1u : 0u;
+      }
+      flag[t] = rank < 8 ? 1u : 0u;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (t < 128 && flag[t]) {
+      uint at = 0;
+      for (uint j = 0; j < t; ++j) at += flag[j];
+      picked[at] = t;
+      chosen[at] = scores[t];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (t == 0) {
+      float den = 1e-20f;
+      for (uint j = 0; j < 8; ++j) den += chosen[j];
+      for (uint j = 0; j < 8; ++j) {
+        ids[row * 8 + j] = picked[j];
+        weights[row * 8 + j] = chosen[j] / den * 8.0f;
+      }
+    }
+    return;
+  }
   // The first sub-group picks: lane l owns experts 8l to 8l + 7. A pick is the largest key, the lowest index on a tie;
   // a NaN key never beats another, so it is picked only when it is the first expert left (as a scan in index order does).
   if (get_sub_group_id() == 0) {
