@@ -9,6 +9,7 @@ const attention = @import("attention.zig");
 const glue = @import("glue.zig");
 const experts = @import("experts.zig");
 const loop = @import("loop.zig");
+const fuse = @import("fuse.zig");
 const runtime = @import("runtime.zig");
 const dense_kernels = @import("dense.zig");
 const dense_q8_kernels = @import("dense_q8.zig");
@@ -122,6 +123,55 @@ const Run = struct {
         try loop.crossPassMessageAttention(&g.p.loop, g.s, at(s.bank0, 0), at(s.bank1, 0), tensor(g.m.weights.cross_queries), tensor(g.m.weights.cross_kv_queries), at(s.messages, 0), @intCast(rows));
         // The prelude p is restored, but every visit's KV and convolution state remains live.
         try g.copyBf16(at(s.prelude, 0), at(s.p, 0), rows * state.hidden);
+    }
+
+    /// Widen, the attention residual, the three controller gates and the norms, in one launch.
+    fn phaseA(g: Run, v: *const layer_plan.Visit, rows: usize) !void {
+        const s = g.sc;
+        const m = g.m;
+        const lp = m.weight_plan.at(v.layer);
+        const w = &m.weights.layers[v.layer];
+        const gated = v.hasMessages();
+        const nq: u32 = if (v.layer == 0) 0 else lp.attn_queries;
+        var down: [3]fuse.Ref = .{ null, null, null };
+        var forget: [3]fuse.Ref = .{ null, null, null };
+        var gain: [3]fuse.Ref = .{ null, null, null };
+        if (gated) {
+            const controllers = w.controllers orelse return error.Inkling2NoKernels;
+            for (0..3) |role| {
+                down[role] = tensor(controllers[role].down);
+                forget[role] = tensor(controllers[role].forget);
+                gain[role] = tensor(controllers[role].gain);
+            }
+        }
+        try fuse.phaseA(&g.p.fuse, g.s, .{
+            .p = at(s.p, 0),
+            .partial = at(s.partial, 0),
+            .blocks = at(s.blocks, 0),
+            .queries = if (v.layer == 0) null else at(m.weights.attn_queries[v.layer - 1].buf, 0),
+            .ar = at(s.ar, 0),
+            .messages = if (gated) at(s.messages, 0) else null,
+            .down = down,
+            .forget = forget,
+            .gain = gain,
+            .zeta = at(s.zeta, 0),
+            .gated = at(s.gated, 0),
+            .wq = tensor(w.attn.q_norm),
+            .wk = tensor(w.attn.k_norm),
+            .wv = tensor(w.attn.v_norm),
+            .q_norm = at(s.q_norm, 0),
+            .k_norm = at(s.k_norm, 0),
+            .v_norm = at(s.v_norm, 0),
+            .rows = @intCast(rows),
+            .blocks_stride = state.block_slots * state.hidden,
+            .sources = lp.attn_sources,
+            .n_queries = nq,
+            .roles = if (gated) 3 else 0,
+            .local_src = if (lp.kind == .local) 1 else 0,
+            .core = if (gated) v.layer - 6 else 0,
+            .msg_entries = state.message_entries,
+            .norm_n = if (!gated and lp.kind == .local) 1 else 3,
+        });
     }
 
     fn prepareAttentionInputs(g: Run, v: *const layer_plan.Visit, rows: usize) !void {
@@ -266,8 +316,10 @@ const Run = struct {
         if (v.pass > 1 and v.layer == 6) try g.bankAndReset(rows);
         const w = &m.weights.layers[v.layer];
         // The running BF16 p is the partial AR source before attention replaces it with t.
-        try g.widen(at(s.p, 0), at(s.partial, 0), rows);
-        try g.prepareAttentionInputs(v, rows);
+        if (fuse.enabled()) try g.phaseA(v, rows) else {
+            try g.widen(at(s.p, 0), at(s.partial, 0), rows);
+            try g.prepareAttentionInputs(v, rows);
+        }
         const knorm = if (gated or lp.kind == .global) at(s.k_norm, 0) else at(s.q_norm, 0);
         const vnorm = if (gated or lp.kind == .global) at(s.v_norm, 0) else at(s.q_norm, 0);
         xpu.profile.label = "wq";
@@ -318,6 +370,96 @@ const Run = struct {
         };
     }
 };
+
+fn bf16bits(x: f32) u16 {
+    const bits: u32 = @bitCast(x);
+    return @truncate((bits +% 0x7fff +% ((bits >> 16) & 1)) >> 16);
+}
+
+/// One row, three visit kinds, fused phase A against the unfused launches. Prints the first mismatch. Returns the mismatch count.
+pub fn checkPhaseA(m: *const Model, s: *state.Scratch, r: *xpu.rt.Runtime) !usize {
+    if (m.pipelines == null or m.ctx == null) return error.Inkling2NoKernels;
+    const pipes = &m.pipelines.?;
+    const stream = m.r.stream(m.ctx.?);
+    const H = state.hidden;
+    var p_bits: [H]u16 = undefined;
+    var blk: [state.block_slots * H]u16 = undefined;
+    var msg: [state.message_entries * H]f32 = undefined;
+    for (0..H) |d| {
+        p_bits[d] = bf16bits(0.01 * @as(f32, @floatFromInt((d * 3) % 97)) - 0.2);
+        msg[d] = 0.02 * @as(f32, @floatFromInt((d * 5) % 53)) - 0.4;
+    }
+    for (0..blk.len) |d| blk[d] = bf16bits(0.005 * @as(f32, @floatFromInt(d % 113)) - 0.1);
+    for (H..msg.len) |d| msg[d] = msg[d % H] * 0.5;
+    try r.upload(s.p, std.mem.sliceAsBytes(&p_bits));
+    try r.upload(s.blocks, std.mem.sliceAsBytes(&blk));
+    try r.upload(s.messages, std.mem.sliceAsBytes(&msg));
+    const g = Run{ .m = m, .p = pipes, .s = stream, .sc = s };
+    var bad: usize = 0;
+    var part_a: [H]f32 = undefined;
+    var part_b: [H]f32 = undefined;
+    var ar_a: [3 * H]f32 = undefined;
+    var ar_b: [3 * H]f32 = undefined;
+    var gate_a: [3 * H]f32 = undefined;
+    var gate_b: [3 * H]f32 = undefined;
+    var nq_a: [H]u16 = undefined;
+    var nq_b: [H]u16 = undefined;
+    var nk_a: [H]u16 = undefined;
+    var nk_b: [H]u16 = undefined;
+    var nv_a: [H]u16 = undefined;
+    var nv_b: [H]u16 = undefined;
+    for (m.weight_plan.visits[0..m.weight_plan.n_visits]) |*v| {
+        const kind = m.weight_plan.at(v.layer).kind;
+        const want = (v.layer == 0) or (v.layer == 5 and !v.hasMessages()) or (v.hasMessages() and v.layer == 6);
+        if (!want) continue;
+        fuse.force = false;
+        try g.widen(at(s.p, 0), at(s.partial, 0), 1);
+        try g.prepareAttentionInputs(v, 1);
+        try stream.synchronize();
+        try r.download(std.mem.sliceAsBytes(&part_a), s.partial);
+        try r.download(std.mem.sliceAsBytes(&ar_a), s.ar);
+        try r.download(std.mem.sliceAsBytes(&gate_a), s.gated);
+        try r.download(std.mem.sliceAsBytes(&nq_a), s.q_norm);
+        try r.download(std.mem.sliceAsBytes(&nk_a), s.k_norm);
+        try r.download(std.mem.sliceAsBytes(&nv_a), s.v_norm);
+        try r.sync();
+        fuse.force = true;
+        try g.phaseA(v, 1);
+        try stream.synchronize();
+        try r.download(std.mem.sliceAsBytes(&part_b), s.partial);
+        try r.download(std.mem.sliceAsBytes(&ar_b), s.ar);
+        try r.download(std.mem.sliceAsBytes(&gate_b), s.gated);
+        try r.download(std.mem.sliceAsBytes(&nq_b), s.q_norm);
+        try r.download(std.mem.sliceAsBytes(&nk_b), s.k_norm);
+        try r.download(std.mem.sliceAsBytes(&nv_b), s.v_norm);
+        try r.sync();
+        var row_bad: usize = 0;
+        for (part_a, part_b) |x, y| if (x != y) {
+            row_bad += 1;
+        };
+        for (ar_a, ar_b) |x, y| if (x != y) {
+            row_bad += 1;
+        };
+        for (gate_a, gate_b) |x, y| if (x != y) {
+            row_bad += 1;
+        };
+        for (nq_a, nq_b) |x, y| if (x != y) {
+            row_bad += 1;
+        };
+        if (kind == .global or v.hasMessages()) {
+            for (nk_a, nk_b) |x, y| if (x != y) {
+                row_bad += 1;
+            };
+            for (nv_a, nv_b) |x, y| if (x != y) {
+                row_bad += 1;
+            };
+        }
+        std.debug.print("fuse-a layer {d} pass {d} gated {} mismatches {d}\n", .{ v.layer, v.pass, v.hasMessages(), row_bad });
+        bad += row_bad;
+    }
+    fuse.force = null;
+    return bad;
+}
 
 pub fn run(m: *const Model, s: *state.Scratch, cache: *state.Cache, ids: []const u32, options: Options) !void {
     return runShared(m, s, &.{.{ .cache = cache, .rows = ids.len }}, ids, options);

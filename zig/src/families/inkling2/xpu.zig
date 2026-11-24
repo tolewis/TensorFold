@@ -4,6 +4,7 @@ pub const model = @import("xpu/model.zig");
 pub const state = @import("xpu/state.zig");
 pub const snapshot = @import("xpu/snapshot.zig");
 pub const forward = @import("xpu/forward.zig");
+pub const fuse = @import("xpu/fuse.zig");
 pub const prefill = @import("xpu/prefill.zig");
 pub const experts = @import("xpu/experts.zig");
 pub const backend = @import("xpu/backend.zig");

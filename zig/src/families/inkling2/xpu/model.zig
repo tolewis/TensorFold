@@ -10,6 +10,7 @@ const attention = @import("attention.zig");
 const glue = @import("glue.zig");
 const experts = @import("experts.zig");
 const loop = @import("loop.zig");
+const fuse = @import("fuse.zig");
 const runtime = @import("runtime.zig");
 const dense = @import("dense.zig");
 const dense_q8 = @import("dense_q8.zig");
@@ -107,13 +108,14 @@ pub const Pipelines = struct {
     glue: glue.Pipelines,
     experts: experts.Kernels,
     loop: loop.Pipelines,
+    fuse: fuse.Pipelines,
     runtime: runtime.Pipelines,
     dense: dense.Kernels,
     dense_q8: dense_q8.Kernels,
     prefill: prefill_kernels.Kernels,
     prefill_experts: prefill_experts.Kernels,
 
-    const image_count = 10;
+    const image_count = 11;
 
     fn native(ctx: *const xpu.Context, comptime name: []const u8) !xpu.Module {
         return xpu.Module.loadNative(ctx, &@field(images, name));
@@ -123,7 +125,7 @@ pub const Pipelines = struct {
         var p: Pipelines = undefined;
         var loaded: usize = 0;
         errdefer for (p.modules[0..loaded]) |*mod| mod.unload();
-        inline for (.{ "attention", "prompt", "glue", "experts", "loop", "runtime", "dense", "dense_q8", "prefill", "prefill_experts" }, 0..) |name, i| {
+        inline for (.{ "attention", "prompt", "glue", "experts", "loop", "fuse", "runtime", "dense", "dense_q8", "prefill", "prefill_experts" }, 0..) |name, i| {
             p.modules[i] = try native(ctx, name);
             loaded += 1;
         }
@@ -135,15 +137,17 @@ pub const Pipelines = struct {
         errdefer p.experts.deinit();
         p.loop = try loop.Pipelines.load(p.modules[4]);
         errdefer p.loop.deinit();
-        p.runtime = try runtime.Pipelines.load(p.modules[5], false);
+        p.fuse = try fuse.Pipelines.load(p.modules[5]);
+        errdefer p.fuse.deinit();
+        p.runtime = try runtime.Pipelines.load(p.modules[6], false);
         errdefer p.runtime.deinit();
-        p.dense = try dense.Kernels.load(p.modules[6], false);
+        p.dense = try dense.Kernels.load(p.modules[7], false);
         errdefer p.dense.deinit();
-        p.dense_q8 = try dense_q8.Kernels.load(p.modules[7], false);
+        p.dense_q8 = try dense_q8.Kernels.load(p.modules[8], false);
         errdefer p.dense_q8.deinit();
-        p.prefill = try prefill_kernels.Kernels.load(p.modules[8]);
+        p.prefill = try prefill_kernels.Kernels.load(p.modules[9]);
         errdefer p.prefill.deinit();
-        p.prefill_experts = try prefill_experts.Kernels.load(p.modules[9]);
+        p.prefill_experts = try prefill_experts.Kernels.load(p.modules[10]);
         return p;
     }
 
@@ -154,6 +158,7 @@ pub const Pipelines = struct {
         p.dense.deinit();
         p.runtime.deinit();
         p.loop.deinit();
+        p.fuse.deinit();
         p.experts.deinit();
         p.glue.deinit();
         p.attention.deinit();
