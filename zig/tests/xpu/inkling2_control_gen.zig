@@ -1,5 +1,5 @@
 //! Build tool: writes an Inkling 2 Mini XPU control image's OpenCL source from the production source.
-//! Usage: inkling2-control-gen glue|runtime PRODUCTION.cl OUT.cl
+//! Usage: inkling2-control-gen glue|runtime|prefill PRODUCTION.cl OUT.cl
 const std = @import("std");
 const controls = @import("inkling2_controls.zig");
 
@@ -7,10 +7,10 @@ pub fn main(init: std.process.Init) !u8 {
     const a = init.gpa;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len != 4) {
-        std.debug.print("usage: inkling2-control-gen glue|runtime PRODUCTION.cl OUT.cl\n", .{});
+        std.debug.print("usage: inkling2-control-gen glue|runtime|prefill PRODUCTION.cl OUT.cl\n", .{});
         return 2;
     }
-    const entries: []const controls.Entry = if (std.mem.eql(u8, args[1], "glue")) &controls.glue else if (std.mem.eql(u8, args[1], "runtime")) &controls.runtime else {
+    const entries: []const controls.Entry = if (std.mem.eql(u8, args[1], "glue")) &controls.glue else if (std.mem.eql(u8, args[1], "runtime")) &controls.runtime else if (std.mem.eql(u8, args[1], "prefill")) &controls.prefill else {
         std.debug.print("inkling2-control-gen: unknown part {s}\n", .{args[1]});
         return 2;
     };
