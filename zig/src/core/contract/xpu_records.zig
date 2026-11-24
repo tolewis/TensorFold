@@ -15,6 +15,7 @@ const dflash2 = @import("inkling2_dflash2_xpu_records.zig");
 const inkling2_dense = @import("inkling2_dense_xpu_records.zig");
 const inkling2_dense_q8 = @import("inkling2_dense_q8_xpu_records.zig");
 const inkling2_prefill_experts = @import("inkling2_prefill_experts_xpu_records.zig");
+const inkling2_prefill = @import("inkling2_prefill_xpu_records.zig");
 
 /// Qwen3.8-27B glue and attention, including the replaced pair and the attention-specific shape control.
 const qwen27_records = [_]Record{
@@ -163,7 +164,7 @@ const qwen27_records = [_]Record{
 } ++ dspark.records ++ dflash2.records;
 
 /// Every registered XPU launch: Qwen3.8-27B's, then Inkling 2 Mini's glue and runtime.
-pub const records = qwen27_records ++ @import("xpu_inkling2_records.zig").records ++ inkling2_experts.list(Record) ++ inkling2_dense.records ++ inkling2_dense_q8.records ++ inkling2_prefill_experts.records;
+pub const records = qwen27_records ++ @import("xpu_inkling2_records.zig").records ++ inkling2_experts.list(Record) ++ inkling2_dense.records ++ inkling2_dense_q8.records ++ inkling2_prefill_experts.records ++ inkling2_prefill.records;
 
 /// Gate 5's planted XPU controls: one for each fit rule the audit must fire.
 pub const controls = [_]Record{

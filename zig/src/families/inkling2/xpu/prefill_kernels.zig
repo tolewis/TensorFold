@@ -55,6 +55,27 @@ pub const Kernels = struct {
         return .{ .ar = k_ar, .messages = k_messages, .copy_rows = k_copy, .perm = k_perm, .q8 = k_q8, .zeta_norm = k_zn, .zeta = k_zeta, .gates = k_gates, .kv_copy = k_kv, .attn_window = k_win, .dense = k_dense, .router = k_router, .conv_static = k_conv, .rel_table = k_rel };
     }
 
+    /// The contract's planted twin: replaces the kernel `name` (one of this struct's fields) by its control, `tf_ctl_ink2_pf_<name>`.
+    pub fn swap(k: *Kernels, module: xpu.Module, name: []const u8) !void {
+        const table = [_]struct { []const u8, u32 }{
+            .{ "ar", 256 },       .{ "messages", 256 }, .{ "copy_rows", 256 }, .{ "perm", 256 },     .{ "q8", 128 },     .{ "zeta_norm", 256 }, .{ "zeta", 64 },
+            .{ "gates", 16 },     .{ "kv_copy", 16 },   .{ "attn_window", 16 }, .{ "dense", 128 },   .{ "router", 256 }, .{ "conv_static", 256 }, .{ "rel_table", 256 },
+        };
+        var buf: [64]u8 = undefined;
+        for (table) |e| {
+            if (!std.mem.eql(u8, e[0], name)) continue;
+            const text = try std.fmt.bufPrint(&buf, "tf_ctl_ink2_pf_{s}", .{name});
+            buf[text.len] = 0;
+            var made = try module.kernel(buf[0..text.len :0], .{ e[1], 1, 1 });
+            errdefer made.deinit();
+            const slot: *xpu.Kernel = if (std.mem.eql(u8, name, "ar")) &k.ar else if (std.mem.eql(u8, name, "messages")) &k.messages else if (std.mem.eql(u8, name, "copy_rows")) &k.copy_rows else if (std.mem.eql(u8, name, "perm")) &k.perm else if (std.mem.eql(u8, name, "q8")) &k.q8 else if (std.mem.eql(u8, name, "zeta_norm")) &k.zeta_norm else if (std.mem.eql(u8, name, "zeta")) &k.zeta else if (std.mem.eql(u8, name, "gates")) &k.gates else if (std.mem.eql(u8, name, "kv_copy")) &k.kv_copy else if (std.mem.eql(u8, name, "attn_window")) &k.attn_window else if (std.mem.eql(u8, name, "dense")) &k.dense else if (std.mem.eql(u8, name, "router")) &k.router else if (std.mem.eql(u8, name, "conv_static")) &k.conv_static else &k.rel_table;
+            slot.deinit();
+            slot.* = made;
+            return;
+        }
+        return error.UnknownKernel;
+    }
+
     pub fn deinit(k: *Kernels) void {
         k.rel_table.deinit();
         k.conv_static.deinit();
@@ -91,6 +112,12 @@ pub fn messages(k: *const Kernels, s: xpu.Stream, bank0: Ref, bank1: Ref, q_mlp:
 pub fn copyRows(k: *const Kernels, s: xpu.Stream, x: Ref, y: Ref, rows: u32, n: u32, ldx: u32, ldy: u32) !void {
     std.debug.assert(rows > 0 and n > 0);
     try xpu.launch.dispatch(k.copy_rows, s, .{ (n + 255) / 256, rows, 1 }, .{ x, y, rows, n, ldx, ldy });
+}
+
+/// xp[row][plane][s][l] = x[row][plane * 256 + (s / 2) * 32 + 2 l + (s & 1)] for `rows` rows of `k` bf16 values, `k` a multiple of 256.
+pub fn permute(k_: *const Kernels, s: xpu.Stream, x: Ref, xp: Ref, rows: u32, k: u32) !void {
+    std.debug.assert(rows > 0 and k % 256 == 0);
+    try xpu.launch.dispatch(k_.perm, s, .{ k / 256, rows, 1 }, .{ x, xp, rows, k });
 }
 
 /// Weight rows a work-group covers in `q8` (8 sub-groups of PF_WA weight tiles of 8 rows) and rows of x a group covers (PF_TB tiles of 16).

@@ -48,6 +48,19 @@ pub const runtime = [_]Entry{
     },
 };
 
+/// prefill.cl's row-batched kernels. The edits break only the kernel they sit in.
+pub const prefill = [_]Entry{
+    .{ .symbol = "tf_ink2_pf_copy_rows", .from = "y[(ulong)r * ldy + i] = x[(ulong)r * ldx + i];", .to = "y[(ulong)r * ldy + i] = x[(ulong)r * ldx + (i ^ 1u)];" },
+    .{ .symbol = "tf_ink2_pf_perm", .from = "+ 2 * l + (s & 1)];", .to = "+ 2 * l + (1u - (s & 1))];" },
+    .{ .symbol = "tf_ink2_pf_kv_copy", .from = "vstore8(v, 0, dst + ((ulong)h * dst_ring + p % dst_ring) * PF_D + lane * 8);", .to = "vstore8(v, 0, dst + ((ulong)h * dst_ring + p % src_ring) * PF_D + lane * 8);" },
+    .{ .symbol = "tf_ink2_pf_conv_static", .from = "const float4 q = sum / PF_SQRT5;", .to = "const float4 q = sum;" },
+    .{ .symbol = "tf_ink2_pf_router", .from = "keys[r][t] = scores[r][t] + bias[t];", .to = "keys[r][t] = scores[r][t];" },
+    .{ .symbol = "tf_ink2_pf_ar", .from = "weights[s] = dot * PF_AR_SCALE;", .to = "weights[s] = dot;" },
+    .{ .symbol = "tf_ink2_pf_dense", .from = "float part = as_float(wv.x << 16) * as_float(xv.x << 16);", .to = "float part = as_float(wv.x << 16) * as_float(xv.x & 0xffff0000u);" },
+    .{ .symbol = "tf_ink2_pf_messages", .from = "const float l0 = pf_group_sum(dot0, red) * PF_AR_SCALE;", .to = "const float l0 = pf_group_sum(dot0, red);" },
+    .{ .symbol = "tf_ink2_pf_rel_table", .from = "acc += bf2f(rr[j]) * pj[j];", .to = "acc += bf2f(rr[15 - j]) * pj[j];" },
+};
+
 /// The control kernel's symbol: `tf_` becomes `tf_ctl_`.
 pub fn controlSymbol(a: std.mem.Allocator, symbol: []const u8) ![]u8 {
     std.debug.assert(std.mem.startsWith(u8, symbol, "tf_"));
@@ -91,10 +104,11 @@ pub fn source(a: std.mem.Allocator, production: []const u8, entries: []const Ent
 
 const glue_cl = @embedFile("inkling2_glue_cl");
 const runtime_cl = @embedFile("inkling2_runtime_cl");
+const prefill_cl = @embedFile("inkling2_prefill_cl");
 
 test "every glue and runtime control applies once, inside its own kernel, and renames only that kernel" {
     const a = std.testing.allocator;
-    for ([_]struct { []const u8, []const Entry }{ .{ glue_cl, &glue }, .{ runtime_cl, &runtime } }) |pair| {
+    for ([_]struct { []const u8, []const Entry }{ .{ glue_cl, &glue }, .{ runtime_cl, &runtime }, .{ prefill_cl, &prefill } }) |pair| {
         const production, const entries = pair;
         const text = try source(a, production, entries);
         defer a.free(text);
