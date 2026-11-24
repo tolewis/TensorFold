@@ -38,6 +38,11 @@ fn dumpBytes(g: *const Run, visit_i: usize, tag: []const u8, src: ?*anyopaque, b
     _ = close(fd);
 }
 
+fn copyF32(r: *xpu.rt.Runtime, dst: Ptr, src: Ptr, n: u32) !void {
+    const bytes: usize = @as(usize, n) * 4;
+    try r.copy(.{ .rt = r, .ptr = dst, .len = bytes }, .{ .rt = r, .ptr = src, .len = bytes }, bytes);
+}
+
 extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern "c" fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
 extern "c" fn close(fd: c_int) c_int;
@@ -409,7 +414,7 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     try m.r.upload(s.seg_of, std.mem.sliceAsBytes(seg_of[0..rows]));
     try m.r.upload(s.segs, std.mem.sliceAsBytes(segs[0..segments.len]));
     const g = Run{ .m = m, .p = p, .s = stream, .sc = s };
-    if (m.options.place.rank == 0) if (group.live) |gp| try gp.note(.forward, ids);
+    if (m.options.place.rank == 0) if (group.live) |gp| try gp.note(.forward, ids, if (options.all) 1 else 0);
     try glue.embedNorm(&p.glue, stream, at(s.ids, 0), tensor(m.weights.embed), tensor(m.weights.embed_norm), at(s.p, 0), @intCast(rows));
     for (m.weight_plan.visits[0..m.weight_plan.n_visits], 0..) |*v, vi| try g.visit(v, segments, rows, options.taps, vi);
     if (std.c.getenv("TF_TP_DUMP") != null) first_dump_done = true;
@@ -423,15 +428,36 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     if (options.taps) |to| try g.captureTap(at(s.mlp_normed, 0), to, final.capture_rows, 3);
     const logits = if (options.all) at(s.logits_all, 0) else at(segments[0].cache.logits, 0);
     const head_input = at(s.mlp_normed, final.logits_row * state.hidden * 2);
-    const vocab_n: u32 = m.options.place.vocabCount();
-    if (m.weights.unembed_q8) |head| {
-        try dense_q8_kernels.head(&p.dense_q8, stream, tensor(head), head_input, logits, @intCast(final.logits_rows), vocab_n);
-    } else try glue.logits(&p.glue, stream, head_input, tensor(m.weights.unembed), logits, @intCast(final.logits_rows), vocab_n);
-    if (m.options.place.split()) if (group.live) |gp| {
-        const src = if (m.options.place.rank == 0) logits else logits;
-        const dst = plus(logits, @as(usize, m.options.place.vocabBase()) * 4);
-        try gp.headPull(src.?, dst.?, if (m.options.place.rank == 0) m.options.place.vocabCount() else vocab_n);
-    };
+    if (!m.options.place.split()) {
+        const vocab_n: u32 = m.config.text.unpadded_vocab;
+        if (m.weights.unembed_q8) |head| {
+            try dense_q8_kernels.head(&p.dense_q8, stream, tensor(head), head_input, logits, @intCast(final.logits_rows), vocab_n);
+        } else try glue.logits(&p.glue, stream, head_input, tensor(m.weights.unembed), logits, @intCast(final.logits_rows), vocab_n);
+    } else if (group.live) |gp| {
+        // The head kernel stores [row][slice]. The logit buffer is [row][full vocab]. Write the slice aside, pull the
+        // other rank's slice, then place both at the full stride. The kernel itself is unchanged.
+        const vocab_n = m.options.place.vocabCount();
+        const n_rows: usize = final.logits_rows;
+        const tight_bytes = n_rows * @as(usize, vocab_n) * 4;
+        var tight = try m.r.alloc(tight_bytes);
+        defer tight.free();
+        var peer = try m.r.alloc(tight_bytes);
+        defer peer.free();
+        if (m.weights.unembed_q8) |head| {
+            try dense_q8_kernels.head(&p.dense_q8, stream, tensor(head), head_input, tight.ptr, @intCast(n_rows), vocab_n);
+        } else try glue.logits(&p.glue, stream, head_input, tensor(m.weights.unembed), tight.ptr, @intCast(n_rows), vocab_n);
+        const full: usize = m.config.text.unpadded_vocab;
+        const own: usize = m.options.place.vocabBase();
+        const other: usize = (full + 1) / 2;
+        for (0..n_rows) |r| {
+            const off = r * @as(usize, vocab_n) * 4;
+            try gp.headPull(plus(tight.ptr, off).?, plus(peer.ptr, off).?, vocab_n);
+            if (m.options.place.rank == 0) {
+                try copyF32(m.r, plus(logits, (r * full + own) * 4), plus(tight.ptr, off), vocab_n);
+                try copyF32(m.r, plus(logits, (r * full + other) * 4), plus(peer.ptr, off), vocab_n);
+            }
+        }
+    }
     try g.commitFullHistories(segments);
     if (xpu.profile.active) |prof| prof.enqueued();
     try stream.synchronize();
