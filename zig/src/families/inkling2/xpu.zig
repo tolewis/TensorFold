@@ -4,6 +4,8 @@ pub const model = @import("xpu/model.zig");
 pub const state = @import("xpu/state.zig");
 pub const snapshot = @import("xpu/snapshot.zig");
 pub const forward = @import("xpu/forward.zig");
+pub const prefill = @import("xpu/prefill.zig");
+pub const experts = @import("xpu/experts.zig");
 pub const backend = @import("xpu/backend.zig");
 pub const dspark = @import("xpu/dspark.zig");
 pub const sampler = @import("xpu/sampler.zig");
@@ -12,6 +14,7 @@ test {
     _ = state;
     _ = snapshot;
     _ = forward;
+    _ = prefill;
     _ = backend;
     _ = dspark;
     _ = sampler;
