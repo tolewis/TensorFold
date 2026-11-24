@@ -55,62 +55,79 @@ KERNEL(256) void tf_inkling2_embed_norm(global const uint *ids, global const ush
 }
 
 // Grid (queries). sources are completed bf16 blocks plus one unrounded fp32 partial (the last source); one fp32 row a query.
+// Every source value of a work-item (its 9 channels of each source) is loaded once, up front, and kept in registers;
+// the source loops have constant bounds so the arrays stay in registers, and a source past `sources` is skipped.
 KERNEL(256) void tf_inkling2_ar(global const ushort *blocks, global const float *partial, global const float *queries,
                                 global float *out, uint sources, uint count) {
   const uint q = get_group_id(0), t = get_local_id(0), sg = get_sub_group_id();
   if (q >= count || sources == 0 || sources > 5) return;
   local float red[160]; // 5 sources of 16 sub-group sums for the squares, then for the dots
-  for (uint s = 0; s < sources; ++s) {
+  float v[5][INK_HIDDEN / 256];
+  float query[INK_HIDDEN / 256];
+#pragma unroll
+  for (uint s = 0; s < 5; ++s)
+#pragma unroll
+    for (uint i = 0; i < INK_HIDDEN / 256; ++i) v[s][i] = s < sources ? ink_value(blocks, partial, s, sources, t + 256 * i) : 0.0f;
+#pragma unroll
+  for (uint i = 0; i < INK_HIDDEN / 256; ++i) query[i] = queries[(ulong)q * INK_HIDDEN + t + 256 * i];
+#pragma unroll
+  for (uint s = 0; s < 5; ++s) {
     float ss = 0.0f;
-    for (uint d = t; d < INK_HIDDEN; d += 256) {
-      const float x = ink_value(blocks, partial, s, sources, d);
-      ss += x * x;
-    }
+#pragma unroll
+    for (uint i = 0; i < INK_HIDDEN / 256; ++i) ss += v[s][i] * v[s][i];
     const float reduced = sub_group_reduce_add(ss);
-    if (get_sub_group_local_id() == 0) red[s * 16 + sg] = reduced;
+    if (s < sources && get_sub_group_local_id() == 0) red[s * 16 + sg] = reduced;
   }
   barrier(CLK_LOCAL_MEM_FENCE);
   float means[5];
-  for (uint s = 0; s < sources; ++s) {
+#pragma unroll
+  for (uint s = 0; s < 5; ++s) {
     float ss = 0.0f;
     for (uint j = 0; j < 16; ++j) ss += red[s * 16 + j];
     means[s] = rsqrt(ss / 2304.0f + INK_EPS);
   }
   local float *dots = red + 80;
-  for (uint s = 0; s < sources; ++s) {
+#pragma unroll
+  for (uint s = 0; s < 5; ++s) {
     float dot = 0.0f;
-    for (uint d = t; d < INK_HIDDEN; d += 256) {
-      const float z = ink_value(blocks, partial, s, sources, d) * means[s];
-      dot += queries[(ulong)q * INK_HIDDEN + d] * z;
-    }
+#pragma unroll
+    for (uint i = 0; i < INK_HIDDEN / 256; ++i) dot += query[i] * (v[s][i] * means[s]);
     const float reduced = sub_group_reduce_add(dot);
-    if (get_sub_group_local_id() == 0) dots[s * 16 + sg] = reduced;
+    if (s < sources && get_sub_group_local_id() == 0) dots[s * 16 + sg] = reduced;
   }
   barrier(CLK_LOCAL_MEM_FENCE);
   float weights[5];
   float peak = -INFINITY;
-  for (uint s = 0; s < sources; ++s) {
+#pragma unroll
+  for (uint s = 0; s < 5; ++s) {
     float dot = 0.0f;
     for (uint j = 0; j < 16; ++j) dot += dots[s * 16 + j];
     weights[s] = dot * INK_AR_SCALE;
-    peak = peak < weights[s] ? weights[s] : peak;
+    if (s < sources) peak = peak < weights[s] ? weights[s] : peak;
   }
   float den = 0.0f;
-  for (uint s = 0; s < sources; ++s) {
+#pragma unroll
+  for (uint s = 0; s < 5; ++s) {
     weights[s] = exp(weights[s] - peak);
-    den += weights[s];
+    if (s < sources) den += weights[s];
   }
-  for (uint s = 0; s < sources; ++s) weights[s] = weights[s] / den;
-  for (uint d = t; d < INK_HIDDEN; d += 256) {
+#pragma unroll
+  for (uint s = 0; s < 5; ++s) weights[s] = weights[s] / den;
+#pragma unroll
+  for (uint i = 0; i < INK_HIDDEN / 256; ++i) {
     float acc = 0.0f;
-    for (uint s = 0; s < sources; ++s) acc += weights[s] * (ink_value(blocks, partial, s, sources, d) * means[s]);
-    out[(ulong)q * INK_HIDDEN + d] = acc;
+#pragma unroll
+    for (uint s = 0; s < 5; ++s)
+      if (s < sources) acc += weights[s] * (v[s][i] * means[s]);
+    out[(ulong)q * INK_HIDDEN + t + 256 * i] = acc;
   }
 }
 
-// Grid (ceil(channels / 256), rows). taps holds three old rows, then `rows` current bf16 inputs; weight is [channel][4].
-KERNEL(256) void tf_inkling2_conv_static(global const ushort *taps, global const ushort *weight, global ushort *out,
-                                         uint rows, uint channels) {
+// Grid (ceil(channels / 256), rows). The window of a row is three old rows (history) and then the current rows, as the
+// cache stages them: the kernel also writes that window to `taps` (rows 0 to 2 from the work-items of row 0), so no
+// separate copies are needed. weight is [channel][4].
+KERNEL(256) void tf_inkling2_conv_static(global const ushort *history, global const ushort *current, global ushort *taps,
+                                         global const ushort *weight, global ushort *out, uint rows, uint channels) {
   const uint c = get_global_id(0), r = get_group_id(1);
   if (c >= channels || r >= rows) return;
   float sum = bf2f(taps[(ulong)(r + 3) * channels + c]);
