@@ -28,6 +28,25 @@ fn r(t: weight_loader.Tensor) Ref {
     return t.buf.ptr;
 }
 
+fn nowNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+/// Where a drafted round's drafter time goes (`TF_DSPARK_TIMES=1` logs a line every 50 holds).
+const Times = struct {
+    on: bool = false,
+    holds: u64 = 0,
+    drafts: u64 = 0,
+    absorbs: u64 = 0,
+    absorb: u64 = 0,
+    block: u64 = 0,
+    step: u64 = 0,
+    download: u64 = 0,
+    sample: u64 = 0,
+};
+
 extern "c" fn fflush(stream: ?*std.c.FILE) c_int;
 
 pub const Drafter = struct {
@@ -49,6 +68,7 @@ pub const Drafter = struct {
     trace: ?*std.c.FILE = null,
     trace_blocks: u32 = 0,
     trace_absorbs: u32 = 0,
+    times: Times = .{},
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, target: *const Model, drafter_dir: []const u8) !*Drafter {
         const ctx = target.ctx orelse return error.Inkling2NoKernels;
@@ -90,6 +110,7 @@ pub const Drafter = struct {
         d.host_logits = try gpa.alloc(u16, state.vocabulary);
         d.trace = null;
         d.trace_blocks = 0;
+        d.times = .{ .on = std.c.getenv("TF_DSPARK_TIMES") != null };
         if (std.c.getenv("TF_DSPARK_TRACE")) |path| d.trace = std.c.fopen(path, "wb");
         return d;
     }
@@ -230,6 +251,11 @@ pub const Drafter = struct {
         const d = cast(ptr);
         if (items.len == 0) return;
         errdefer d.stream.synchronize() catch {};
+        const t_absorb = nowNs();
+        defer if (d.times.on) {
+            d.times.absorb += nowNs() - t_absorb;
+            d.times.absorbs += 1;
+        };
         const row_bytes = 4 * state.hidden * 2;
         for (items) |item| {
             const lane = d.contexts.getPtr(item.stream) orelse return error.DraftStreamUnknown;
@@ -261,7 +287,7 @@ pub const Drafter = struct {
         try d.stream.synchronize();
     }
 
-    fn encodeBlock(d: *Drafter, lane: *const state.Lane, pending: u32, anchor: u64, debug: bool) !void {
+    fn encodeBlock(d: *Drafter, lane: *const state.Lane, pending: u32, anchor: u64, depth: usize, debug: bool) !void {
         const s = d.stream;
         const sc = &d.scratch;
         const target = d.target;
@@ -299,8 +325,8 @@ pub const Drafter = struct {
                 d.traceDevice('N', &tag, at(sc.x, 0), 8 * state.hidden * 2);
             }
         }
-        try k.base(&d.kernels, s, target.weights.unembed.buf.ptr, at(sc.x, state.hidden * 2), at(sc.base, 0), 7, state.vocabulary);
-        try k.kappa(&d.kernels, s, at(sc.x, state.hidden * 2), at(lane.newest, 0), r(d.weights.weights.rnn), r(d.weights.weights.rnn_bias), at(sc.kappa, 0), 7);
+        try k.base(&d.kernels, s, target.weights.unembed.buf.ptr, at(sc.x, state.hidden * 2), at(sc.base, 0), @intCast(depth), state.vocabulary);
+        try k.kappa(&d.kernels, s, at(sc.x, state.hidden * 2), at(lane.newest, 0), r(d.weights.weights.rnn), r(d.weights.weights.rnn_bias), at(sc.kappa, 0), @intCast(depth));
     }
 
     fn recurrent(d: *Drafter, step: usize, previous: u32, second_bank: bool) !void {
@@ -319,7 +345,9 @@ pub const Drafter = struct {
             if (item.depth == 0 or item.position == 0) return error.DraftDepth;
             const anchor = item.position - 1;
             if (lane.end != anchor) return error.DraftContextGap;
-            const depth: usize = @min(item.depth, 7);
+            const offered: usize = @min(item.depth, 7);
+            // A trace computes the whole block so the replay can score every draft position; the lane keeps `offered`.
+            const depth: usize = if (d.trace != null) 7 else offered;
             try d.scratch.state.fill8(d.stream, 0);
             const debug = d.trace != null and d.trace_blocks < 3;
             if (debug) {
@@ -331,21 +359,38 @@ pub const Drafter = struct {
                 }
                 d.traceDevice('f', &.{0}, at(lane.newest, 0), state.hidden * 2);
             }
-            try d.encodeBlock(lane, item.pending, anchor, debug);
+            const t0 = nowNs();
+            try d.encodeBlock(lane, item.pending, anchor, depth, debug);
             try d.recurrent(0, item.pending, false);
             try d.stream.synchronize();
-            if (debug) d.traceDevice('a', &.{0}, at(d.scratch.kappa, 0), 7 * 3 * state.rank * 4);
+            if (d.times.on) d.times.block += nowNs() - t0;
+            if (debug) d.traceDevice('a', &.{0}, at(d.scratch.kappa, 0), depth * 3 * state.rank * 4);
             const values = try d.gpa.alloc(f32, state.vocabulary);
             defer d.gpa.free(values);
             var previous = item.pending;
             var second_bank = false;
             for (0..depth) |step| {
+                var t1 = nowNs();
                 if (step != 0) {
                     second_bank = !second_bank;
                     try d.recurrent(step, previous, second_bank);
                     try d.stream.synchronize();
                 }
+                if (d.times.on) {
+                    const t = nowNs();
+                    d.times.step += t - t1;
+                    t1 = t;
+                }
                 try d.scratch.logits.download(d.stream, 0, std.mem.sliceAsBytes(d.host_logits[0..state.vocabulary]));
+                if (d.times.on) {
+                    const t = nowNs();
+                    d.times.download += t - t1;
+                    t1 = t;
+                }
+                defer if (d.times.on) {
+                    d.times.sample += nowNs() - t1;
+                    d.times.drafts += 1;
+                };
                 for (d.host_logits[0..state.vocabulary], values) |bits, *value| value.* = @bitCast(@as(u32, bits) << 16);
                 const base_position = std.math.cast(u32, item.position) orelse return error.DraftDepth;
                 const position = std.math.add(u32, base_position, @intCast(step)) catch return error.DraftDepth;
@@ -370,9 +415,21 @@ pub const Drafter = struct {
                     if (debug and step == 0) d.traceRecord('L', &.{std.mem.sliceAsBytes(d.host_logits[0..state.vocabulary])});
                 }
             }
-            lane.held_len = @intCast(depth);
+            lane.held_len = @intCast(offered);
+            if (d.times.on) {
+                d.times.holds += 1;
+                if (d.times.holds % 50 == 0) {
+                    const t = d.times;
+                    const ms = struct {
+                        fn of(ns: u64, n: u64) f64 {
+                            return @as(f64, @floatFromInt(ns)) / 1e6 / @as(f64, @floatFromInt(@max(n, 1)));
+                        }
+                    }.of;
+                    std.log.info("dspark times: holds {d} drafts/hold {d:.2} | per hold: block {d:.2} ms; per draft: step {d:.2} download {d:.2} sample {d:.2} ms | absorb {d:.2} ms each ({d})", .{ t.holds, @as(f64, @floatFromInt(t.drafts)) / @as(f64, @floatFromInt(t.holds)), ms(t.block, t.holds), ms(t.step, t.drafts), ms(t.download, t.drafts), ms(t.sample, t.drafts), ms(t.absorb, t.absorbs), t.absorbs });
+                }
+            }
             if (d.trace != null) {
-                const head = [_]u64{ item.position, item.pending, depth, lane.end, lane.from };
+                const head = [_]u64{ item.position, item.pending, depth, lane.end, lane.from, offered };
                 d.traceRecord('B', &.{ std.mem.sliceAsBytes(&head), std.mem.sliceAsBytes(lane.held[0..depth]) });
                 d.trace_blocks += 1;
             }
