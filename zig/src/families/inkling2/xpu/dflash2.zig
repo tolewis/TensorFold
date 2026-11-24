@@ -81,6 +81,8 @@ pub const Drafter = struct {
     depth_cap: u32 = 7,
     /// `TF_DFLASH2_FORCE=1`: seven drafts every round. Unset keeps the scheduler. Code wins, chat loses (2026-11-24).
     force: bool = false,
+    /// `TF_DFLASH2_PRICE=0`: the old 1/2/3 scheduler, for a control run.
+    price: bool = true,
     /// `TF_DFLASH2_FULL=1`: draw all seven positions of every block (the rest are not offered), and log how often each matches.
     full: bool = false,
     times: Times = .{},
@@ -121,7 +123,8 @@ pub const Drafter = struct {
             d.depth_cap = std.math.clamp(n, 1, 7);
         }
         if (std.c.getenv("TF_DFLASH2_FORCE")) |v| d.force = !std.mem.eql(u8, std.mem.span(v), "0") and std.mem.span(v).len != 0;
-        std.log.info("dflash2: {s}", .{if (d.force) "seven drafts a round" else "priced depth from this request's acceptance"});
+        if (std.c.getenv("TF_DFLASH2_PRICE")) |v| d.price = !std.mem.eql(u8, std.mem.span(v), "0");
+        std.log.info("dflash2: {s}", .{if (d.force) "seven drafts a round" else if (d.price) "scheduler depth, deeper only when this request pays" else "scheduler depth"});
         if (std.c.getenv("TF_DFLASH2_EMBED")) |v| {
             if (std.mem.eql(u8, std.mem.span(v), "raw")) d.embed_mode = .raw;
         }
@@ -223,7 +226,7 @@ pub const Drafter = struct {
             .plain_guard = true,
             .force_depth = cast(ptr).force,
             .prior = &accept_prior,
-            .window_costs = &round_ms,
+            .window_costs = if (cast(ptr).price) &round_ms else &.{},
             .stream_bytes = @intCast(state.laneBytes()),
         };
     }

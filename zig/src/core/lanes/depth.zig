@@ -16,7 +16,8 @@ pub const State = struct {
     probe: ?i64 = null, // a probe's depth for the next round (a lone window keeps it)
     plain: ?u64 = null,
     wait: ?u64 = null,
-    block_wait: u64 = 0, // full-block probe gap; doubles when the block cannot pay, resets when a run exceeds the held depth
+    sched: i64 = 0, // the 1/2/3 depth the old rule would offer this round
+    fallback: bool = false, // last deep round did not beat that depth: the next round stays on it
     ms: ?Table = null, // plain_guard: the stream's own round times
     copy_ms: ?Table = null, // opt-in copy prices, independent of the head depth rule
     copy_plain: ?u64 = null,
@@ -112,15 +113,24 @@ pub const Rule = struct {
             const at: usize = @intCast(j);
             p[at] += r.k.depth_rate * (hit - p[at]);
         }
-        noteRun(who.state, accepted);
+        noteRun(who.state, proposed, accepted);
     }
 
-    fn noteRun(slot: *?State, accepted: i64) void {
+    /// A deep offer that did not keep more drafts than the scheduler's depth falls back next round.
+    fn noteRun(slot: *?State, proposed: i64, accepted: i64) void {
+        _ = proposed;
         var st = slot.* orelse return;
-        const held = st.last orelse return;
-        if (accepted <= held) return;
-        st.block_wait = 0;
-        slot.* = st;
+        // A miss is the first draft failing. A short accept of a deep block still beat the scheduler depth.
+        if (accepted == 0) {
+            st.fallback = true;
+            slot.* = st;
+        }
+    }
+
+    /// The old empty-table rule: one draft below 0.8, two below 0.9, else three.
+    fn schedulerDepth(p: []const f64, most: i64) i64 {
+        const want: i64 = if (p.len == 0 or p[0] < 0.8) 1 else if (p[0] < 0.9) 2 else 3;
+        return @max(1, @min(most, want));
     }
 
     /// Round times by depth: the stream's own under `plain_guard`, else greedy rounds' for a greedy stream.
@@ -188,6 +198,21 @@ pub const Rule = struct {
             return @max(1, @min(most, want));
         }
         const st = try r.state(who);
+        if (r.k.fixed_draft_block) {
+            const sched = schedulerDepth(p, most);
+            st.sched = sched;
+            st.rounds += 1;
+            if (st.fallback) {
+                st.fallback = false;
+                st.last = sched;
+                return sched;
+            }
+            // The full block, or the scheduler depth. Nothing between: a local optimum of 4 never reaches 7.
+            const upgrade = most > sched and marginPays(rateAt(r, who, p, most), rateAt(r, who, p, sched));
+            const chosen: i64 = if (upgrade) most else sched;
+            st.last = chosen;
+            return chosen;
+        }
         var best = (try r.bestRows(who, p, most, st.last)).rows;
         st.rounds += 1;
         if (best == 0) {
@@ -199,24 +224,19 @@ pub const Rule = struct {
         st.wait = r.k.depth_probe_every;
         st.last = best;
         st.probe = null;
-        // The old rule offered two drafts once the first one landed. Never ask past the tokens still allowed.
-        if (r.k.fixed_draft_block and best < 2 and most >= 2 and p.len > 0 and p[0] >= 0.80) best = 2;
-        if (r.k.fixed_draft_block and best < most) {
-            const wait = if (st.block_wait == 0) r.k.depth_probe_every else st.block_wait;
-            const full = rateAt(r, who, p, most);
-            const held = rateAt(r, who, p, best);
-            const pays = if (full) |f| (if (held) |h| f >= h else true) else false;
-            if (pays) st.block_wait = 0;
-            if (st.rounds % wait == 0) {
-                best = most;
-                st.probe = best;
-                if (!pays) st.block_wait = @min(wait * 2, 128);
-            }
-        } else if (best < most and st.rounds % r.k.depth_probe_every == 0) {
+        if (best < most and st.rounds % r.k.depth_probe_every == 0) {
             best += 1;
             st.probe = best;
         }
         return best;
+    }
+
+    /// A deeper block must beat the scheduler depth by 10 percent in expected tokens a ms.
+    fn marginPays(deep: ?f64, sched: ?f64) bool {
+        const d = deep orelse return false;
+        const s = sched orelse return true;
+        if (!(s > 0)) return true;
+        return d >= s * 1.10;
     }
 
     /// Expected tokens a ms at `drafts`, from the stream's acceptance and the round-cost table.
