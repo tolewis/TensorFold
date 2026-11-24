@@ -112,8 +112,10 @@ pub const Loader = struct {
 
     /// Closes the shard files and frees the tensor index and the staging buffer; device buffers it made stay with their owners.
     pub fn deinit(l: *Loader) void {
+        // `l` is overwritten at the end, so the allocator is read first: a defer would read it back from the poisoned struct
+        const gpa = l.gpa;
         var fds: std.ArrayList(c_int) = .empty;
-        defer fds.deinit(l.gpa);
+        defer fds.deinit(gpa);
         var it = l.map.iterator();
         while (it.next()) |e| {
             if (std.mem.indexOfScalar(c_int, fds.items, e.value_ptr.fd) == null) fds.append(l.gpa, e.value_ptr.fd) catch {};
