@@ -283,15 +283,21 @@ fn gpaBytes(n: usize) ![]u8 {
     return std.heap.c_allocator.alloc(u8, n * 2);
 }
 
+extern "c" fn c_open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
+
 fn mapShm(name: [:0]const u8, rank: u32) ![]align(4096) u8 {
     const bytes = 256 + 4 * slot_bytes + 8 * @sizeOf(Rec) + 4096;
-    const rdwr: u32 = 2;
-    const creat: u32 = 64;
-    var fd: c_int = if (rank == 0) std.c.shm_open(name, creat | rdwr, 0o600) else -1;
-    if (rank != 0) {
+    const rdwr: c_int = 2;
+    const creat: c_int = 64;
+    const excl: c_int = 128;
+    var fd: c_int = -1;
+    if (rank == 0) {
+        _ = linux.unlink(name);
+        fd = c_open(name, rdwr | creat | excl, 0o600);
+    } else {
         var n: u32 = 0;
         while (fd < 0) : (n += 1) {
-            fd = std.c.shm_open(name, rdwr, 0);
+            fd = c_open(name, rdwr, 0);
             if (fd >= 0) break;
             if (n > 300) return error.ShmOpen;
             var ts: linux.timespec = .{ .sec = 0, .nsec = 100_000_000 };
