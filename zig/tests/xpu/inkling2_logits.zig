@@ -320,7 +320,9 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("skipped: no Level Zero loader\n", .{});
         return;
     };
-    if (device == null) if (std.c.getenv("XPU_DEVICE")) |v| device = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+    if (device == null) {
+        if (std.c.getenv("XPU_DEVICE")) |v| device = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+    }
     options.place = try ink.place.Place.parse(tp, rank);
     var ctx = try xpu.Context.init(&drv, device);
     const stream = try xpu.Stream.init(&ctx);
