@@ -179,13 +179,7 @@ pub const Xpu = struct {
     /// The next token of `cache`'s last row. A sampled row's candidates are selected on the device and only they come back,
     /// with the whole row too where the draw sums every token (top_k off); greedy and masked rows are drawn from the row.
     fn drawLast(self: *Xpu, cache: *st.Cache, sampling: ?lanes.Sampling, position: u64, mask: []const u32) !u32 {
-        const t = sampled(sampling) orelse {
-            // A greedy row is the best candidate of a one-entry selection on the device: no row comes back.
-            if (mask.len > 0) return self.draw(try self.logits(cache), sampling, position, mask);
-            const set = try self.sampler.select(cache.logits.ptr, @intCast(self.vocab()), &.{.{ .inv_t = 1.0, .n = 1 }});
-            var one: [1]lanes.gpu_rule.Cand = undefined;
-            return set.list(0, 1, &one)[0].i;
-        };
+        const t = sampled(sampling) orelse return self.draw(try self.logits(cache), sampling, position, mask);
         if (mask.len > 0 or !sampler.Row.supported(t)) return self.draw(try self.logits(cache), sampling, position, mask);
         const row = sampler.Row.of(t);
         const set = try self.sampler.select(cache.logits.ptr, @intCast(self.vocab()), &.{row});
@@ -383,12 +377,11 @@ pub const Xpu = struct {
             const t = sampled(w.stream.sampling);
             for (0..w.rows()) |k| {
                 const masked = w.masks.len >= (k + 1) * words;
-                // A greedy row is the best of a one-entry selection (inv_t 1); a sampled row selects its candidates.
-                const ok = !masked and o.rows.len != w.rows() and (t == null or sampler.Row.supported(t.?));
+                const ok = t != null and !masked and o.rows.len != w.rows() and sampler.Row.supported(t.?);
                 device[at + k] = ok;
                 any = any or ok;
-                picks[at + k] = if (ok and t != null) sampler.Row.of(t.?) else .{ .inv_t = 1.0, .n = 1 };
-                if (!ok or (t != null and lanes.gpu_full.needsRow(t.?))) whole = true;
+                picks[at + k] = if (ok) sampler.Row.of(t.?) else .{ .inv_t = 1.0, .n = 1 };
+                if (!ok or lanes.gpu_full.needsRow(t.?)) whole = true;
             }
             at += w.rows();
         }
@@ -405,13 +398,10 @@ pub const Xpu = struct {
                 const l = all[(base + k) * v ..][0..v];
                 const mask = if (w.masks.len >= (k + 1) * words) w.masks[k * words ..][0..words] else &.{};
                 if (device[base + k]) {
+                    const t = sampled(w.stream.sampling).?;
                     var buf: [sampler.top_max]lanes.gpu_rule.Cand = undefined;
                     const top = set.list(base + k, picks[base + k].n, &buf);
-                    if (sampled(w.stream.sampling)) |t| {
-                        o.sampled[k] = lanes.gpu_full.drawTop(if (lanes.gpu_full.needsRow(t)) l else null, top, t, @intCast(w.positions[k]));
-                    } else {
-                        o.sampled[k] = top[0].i;
-                    }
+                    o.sampled[k] = lanes.gpu_full.drawTop(if (lanes.gpu_full.needsRow(t)) l else null, top, t, @intCast(w.positions[k]));
                 } else {
                     o.sampled[k] = try self.draw(l, w.stream.sampling, w.positions[k], mask);
                 }
