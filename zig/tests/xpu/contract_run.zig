@@ -20,6 +20,7 @@ const dspark_k = @import("inkling2_dspark.zig");
 const ink2_attn_k = @import("inkling2_attention.zig");
 const ink2_k = @import("inkling2_experts.zig");
 const dense_k = @import("inkling2_dense.zig");
+const dense_q8_k = @import("inkling2_dense_q8.zig");
 
 const g = core.gates;
 
@@ -124,6 +125,9 @@ pub fn main(init: std.process.Init) !u8 {
     var dense = try dense_k.Suite.init(a, &dev);
     defer dense.deinit();
     try dense.collect(&kernels);
+    var dense_q8 = try dense_q8_k.Suite.init(a, &dev);
+    defer dense_q8.deinit();
+    try dense_q8.collect(&kernels);
     if (only) |text| {
         var keep: usize = 0;
         for (kernels.items) |k| {
@@ -139,8 +143,8 @@ pub fn main(init: std.process.Init) !u8 {
     const t1 = ms(init.io);
     const lim = try gate5.table(a) + try live5.live(a, &dev);
     const model_problems = try loop_k.modelCheck(a, &dev);
-    const dense_problems = if (only == null or std.mem.indexOf(u8, only.?, "dense") != null)
-        try dense_k.report(a, &dev, &dense) + try dense_k.ldyCheck(a, &dev, &dense)
+    const dense_problems = if (only == null or std.mem.indexOf(u8, only.?, "dense") != null or std.mem.indexOf(u8, only.?, "q8") != null)
+        try dense_k.report(a, &dev, &dense) + try dense_k.ldyCheck(a, &dev, &dense) + try dense_q8_k.report(a, &dev, &dense_q8) + try dense_q8_k.ldyCheck(a, &dev, &dense_q8)
     else
         0;
     const t2 = ms(init.io);

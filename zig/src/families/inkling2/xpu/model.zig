@@ -12,6 +12,8 @@ const experts = @import("experts.zig");
 const loop = @import("loop.zig");
 const runtime = @import("runtime.zig");
 const dense = @import("dense.zig");
+const dense_q8 = @import("dense_q8.zig");
+const q8 = @import("q8.zig");
 
 const rt = xpu.rt;
 const loader = xpu.loader;
@@ -26,6 +28,8 @@ pub const Tensor = struct {
     shape: [st.max_rank]usize = @splat(1),
     rank: usize = 0,
     host: bool = false,
+    /// A dense matrix re-encoded at load to q8.zig's blocks (`dtype` is u8, `shape` the matrix's [n][k]); `bytes` is the codes then the scales.
+    q8: bool = false,
 
     pub fn count(self: Tensor) usize {
         return self.bytes / self.dtype.size();
@@ -81,7 +85,10 @@ pub const Weights = struct {
     embed: Tensor,
     embed_norm: Tensor,
     norm: Tensor,
+    /// The checkpoint's BF16 head; empty (no buffer) when the Q8 head replaced it (`Options.keep_bf16_head` false).
     unembed: Tensor,
+    /// The head's first `unpadded_vocab` rows as Q8_0 blocks, when `Options.dense` is `.q8`.
+    unembed_q8: ?Tensor,
     output_query: Tensor,
     cross_queries: Tensor,
     cross_kv_queries: Tensor,
@@ -100,8 +107,9 @@ pub const Pipelines = struct {
     loop: loop.Pipelines,
     runtime: runtime.Pipelines,
     dense: dense.Kernels,
+    dense_q8: dense_q8.Kernels,
 
-    const image_count = 7;
+    const image_count = 8;
 
     fn native(ctx: *const xpu.Context, comptime name: []const u8) !xpu.Module {
         return xpu.Module.loadNative(ctx, &@field(images, name));
@@ -111,7 +119,7 @@ pub const Pipelines = struct {
         var p: Pipelines = undefined;
         var loaded: usize = 0;
         errdefer for (p.modules[0..loaded]) |*mod| mod.unload();
-        inline for (.{ "attention", "prompt", "glue", "experts", "loop", "runtime", "dense" }, 0..) |name, i| {
+        inline for (.{ "attention", "prompt", "glue", "experts", "loop", "runtime", "dense", "dense_q8" }, 0..) |name, i| {
             p.modules[i] = try native(ctx, name);
             loaded += 1;
         }
@@ -126,10 +134,13 @@ pub const Pipelines = struct {
         p.runtime = try runtime.Pipelines.load(p.modules[5], false);
         errdefer p.runtime.deinit();
         p.dense = try dense.Kernels.load(p.modules[6], false);
+        errdefer p.dense.deinit();
+        p.dense_q8 = try dense_q8.Kernels.load(p.modules[7], false);
         return p;
     }
 
     pub fn deinit(p: *Pipelines) void {
+        p.dense_q8.deinit();
         p.dense.deinit();
         p.runtime.deinit();
         p.loop.deinit();
@@ -141,10 +152,34 @@ pub const Pipelines = struct {
     }
 };
 
+/// How the dense weights (attention projections, the gate, the unembedding head) are held on the device.
+pub const DenseFormat = enum {
+    /// Re-encoded at load to Q8_0 blocks (q8.zig): int8 codes and one fp16 scale a 32 values, about half the bytes of bf16.
+    q8,
+    /// As stored: bf16.
+    bf16,
+};
+
 pub const Options = struct {
     /// Keep the token embedding in pinned host memory instead of VRAM (the plan's S2). Default: on the device.
     embed_host: bool = false,
+    /// The dense weights' format on the device. `XPU_DENSE=bf16` (or `q8`) in the environment overrides this at load,
+    /// so the format A/B is one flag on any binary.
+    dense: DenseFormat = .q8,
+    /// With `.q8`, keep the checkpoint's bf16 head on the device as well. DSpark's drafter reads that head (its base
+    /// kernel and its one-time fold), so a drafter needs it; without one, `false` gives back about 0.93 GB.
+    keep_bf16_head: bool = true,
 };
+
+/// `options` with the `XPU_DENSE` environment override applied.
+fn withEnvironment(options: Options) Options {
+    var out = options;
+    if (std.c.getenv("XPU_DENSE")) |v| {
+        const text = std.mem.span(v);
+        if (std.mem.eql(u8, text, "bf16")) out.dense = .bf16 else if (std.mem.eql(u8, text, "q8")) out.dense = .q8;
+    }
+    return out;
+}
 
 pub fn admitConfig(c: *const cfg.Config) !void {
     const t = c.text;
@@ -170,6 +205,16 @@ const Source = struct {
     gpa: std.mem.Allocator,
     dry: bool,
     embed_host: bool,
+    options: Options = .{},
+    scratch: ?*Scratch = null,
+
+    /// Host buffers one matrix chunk is read into and encoded in.
+    const Scratch = struct {
+        raw: []u16,
+        codes: []u8,
+        scales: []u16,
+        const values = 2 << 20;
+    };
 
     fn require(s: *const Source, name: []const u8, dtype: DType, dims: []const usize) !loader.Info {
         const inf = s.l.map.get(name) orelse {
@@ -197,6 +242,64 @@ const Source = struct {
         t.buf = try s.l.load(name);
         s.owned.appendAssumeCapacity(t.buf);
         return t;
+    }
+
+    /// A bf16 matrix [n][k] as the options say: as stored, or (`.q8`) re-encoded to Q8_0 blocks as it streams in.
+    /// `rows` limits the encoding to the matrix's first rows (the head's padding rows are never read).
+    fn getDense(s: *Source, comptime fmt: []const u8, args: anytype, dims: []const usize, rows: ?usize) !Tensor {
+        if (s.options.dense == .bf16) return s.get(fmt, args, .bf16, dims);
+        var buf: [256]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buf, fmt, args);
+        const inf = try s.require(name, .bf16, dims);
+        if (dims.len != 2 or !q8.admits(dims[1])) return error.UnexpectedInkling2Tensor;
+        const n = rows orelse dims[0];
+        const k = dims[1];
+        var t: Tensor = .{ .buf = .{ .rt = s.l.r, .ptr = null, .len = 0 }, .bytes = q8.bytes(n, k), .dtype = .u8, .shape = inf.shape, .rank = inf.rank, .q8 = true };
+        t.shape[0] = n;
+        if (s.dry) return t;
+        try s.owned.ensureUnusedCapacity(s.gpa, 1);
+        t.buf = try s.l.empty(t.bytes);
+        errdefer t.buf.free();
+        try s.encodeInto(t.buf, inf, n, k);
+        s.owned.appendAssumeCapacity(t.buf);
+        return t;
+    }
+
+    fn encodeInto(s: *Source, dst: rt.Buffer, inf: loader.Info, n: usize, k: usize) !void {
+        if (s.scratch == null) {
+            const sc = try s.gpa.create(Scratch);
+            errdefer s.gpa.destroy(sc);
+            sc.raw = try s.gpa.alloc(u16, Scratch.values);
+            errdefer s.gpa.free(sc.raw);
+            sc.codes = try s.gpa.alloc(u8, Scratch.values);
+            errdefer s.gpa.free(sc.codes);
+            sc.scales = try s.gpa.alloc(u16, Scratch.values / q8.block);
+            s.scratch = sc;
+        }
+        const sc = s.scratch.?;
+        const nb = k / q8.block;
+        const per = @max(1, Scratch.values / k);
+        const base: [*]u8 = @ptrCast(dst.ptr.?);
+        var row: usize = 0;
+        while (row < n) {
+            const m = @min(per, n - row);
+            try loader.readExact(inf.fd, std.mem.sliceAsBytes(sc.raw[0 .. m * k]), inf.off + @as(u64, row) * k * 2);
+            q8.encodeRows(sc.raw[0 .. m * k], m, k, sc.codes[0 .. m * k], sc.scales[0 .. m * nb]);
+            try s.l.r.upload(.{ .rt = dst.rt, .ptr = base + row * k, .len = m * k }, sc.codes[0 .. m * k]);
+            try s.l.r.upload(.{ .rt = dst.rt, .ptr = base + q8.scaleOffset(n, k) + row * nb * 2, .len = m * nb * 2 }, std.mem.sliceAsBytes(sc.scales[0 .. m * nb]));
+            try s.l.r.sync();
+            row += m;
+        }
+    }
+
+    fn freeScratch(s: *Source) void {
+        if (s.scratch) |sc| {
+            s.gpa.free(sc.raw);
+            s.gpa.free(sc.codes);
+            s.gpa.free(sc.scales);
+            s.gpa.destroy(sc);
+            s.scratch = null;
+        }
     }
 
     /// As `get`, in pinned host memory when `embed_host` (the table the kernels read a row at a time over PCIe).
@@ -245,7 +348,15 @@ fn loadWeights(s: *Source, config: *const cfg.Config, wp: *const layer_plan.Plan
     w.embed = try s.getEmbed("model.llm.embed.weight", .bf16, &.{ 201024, 2304 });
     w.embed_norm = try s.get("model.llm.embed_norm.weight", .{}, .bf16, &.{2304});
     w.norm = try s.get("model.llm.norm.weight", .{}, .bf16, &.{2304});
-    w.unembed = try s.get("model.llm.unembed.weight", .{}, .bf16, &.{ 201024, 2304 });
+    w.unembed_q8 = null;
+    if (s.options.dense == .q8) {
+        w.unembed_q8 = try s.getDense("model.llm.unembed.weight", .{}, &.{ 201024, 2304 }, config.text.unpadded_vocab);
+    }
+    if (s.options.dense == .q8 and !s.options.keep_bf16_head) {
+        // the head's BF16 is validated, not uploaded
+        _ = try s.require("model.llm.unembed.weight", .bf16, &.{ 201024, 2304 });
+        w.unembed = .{ .buf = .{ .rt = s.l.r, .ptr = null, .len = 0 }, .bytes = 0, .dtype = .bf16 };
+    } else w.unembed = try s.get("model.llm.unembed.weight", .{}, .bf16, &.{ 201024, 2304 });
     w.output_query = try s.get("model.llm.attn_res.output_query", .{}, .f32, &.{2304});
     w.cross_queries = try s.get("model.llm.middle_cycle_cross_pass_queries", .{}, .f32, &.{ 24, 2304 });
     w.cross_kv_queries = try s.get("model.llm.middle_cycle_cross_pass_kv_queries", .{}, .f32, &.{ 24, 2304 });
@@ -263,12 +374,12 @@ fn loadWeights(s: *Source, config: *const cfg.Config, wp: *const layer_plan.Plan
         // a sliding layer's three input norms are one stored tensor: uploaded once, shared by q, k and v
         const local_norm = if (!global) try s.get("model.llm.layers.{d}.attn_norm.weight", .{layer}, .bf16, &.{2304}) else undefined;
         l.attn = .{
-            .wq = try s.get("model.llm.layers.{d}.attn.wq_du.weight", .{layer}, .bf16, &.{ q_width, 2304 }),
-            .wk = try s.get("model.llm.layers.{d}.attn.wk_dv.weight", .{layer}, .bf16, &.{ 1024, 2304 }),
-            .wv = try s.get("model.llm.layers.{d}.attn.wv_dv.weight", .{layer}, .bf16, &.{ 1024, 2304 }),
-            .wr = try s.get("model.llm.layers.{d}.attn.wr_du.weight", .{layer}, .bf16, &.{ 384, 2304 }),
-            .wo = try s.get("model.llm.layers.{d}.attn.wo_ud.weight", .{layer}, .bf16, &.{ 2304, q_width }),
-            .gate = try s.get("model.llm.layers.{d}.attn.gate_attn.weight", .{layer}, .bf16, &.{ q_width, 2304 }),
+            .wq = try s.getDense("model.llm.layers.{d}.attn.wq_du.weight", .{layer}, &.{ q_width, 2304 }, null),
+            .wk = try s.getDense("model.llm.layers.{d}.attn.wk_dv.weight", .{layer}, &.{ 1024, 2304 }, null),
+            .wv = try s.getDense("model.llm.layers.{d}.attn.wv_dv.weight", .{layer}, &.{ 1024, 2304 }, null),
+            .wr = try s.getDense("model.llm.layers.{d}.attn.wr_du.weight", .{layer}, &.{ 384, 2304 }, null),
+            .wo = try s.getDense("model.llm.layers.{d}.attn.wo_ud.weight", .{layer}, &.{ 2304, q_width }, null),
+            .gate = try s.getDense("model.llm.layers.{d}.attn.gate_attn.weight", .{layer}, &.{ q_width, 2304 }, null),
             .sink = try s.get("model.llm.layers.{d}.attn.attn_sink_proj.weight", .{layer}, .bf16, &.{ 24, 2304 }),
             .q_scale = try s.get("model.llm.layers.{d}.attn.q_l2_clip.scale", .{layer}, .bf16, &.{ 24, 128 }),
             .rel_scale = try s.get("model.llm.layers.{d}.attn.rel_l2_clip.scale", .{layer}, .bf16, &.{ 24, 16 }),
@@ -324,7 +435,8 @@ pub const Model = struct {
     host_bytes: u64,
 
     /// Reads `dir`'s config and checkpoint, admits Mini, validates every tensor, then uploads. `r` must outlive the model.
-    pub fn load(gpa: std.mem.Allocator, r: *rt.Runtime, dir: []const u8, options: Options) !*Model {
+    pub fn load(gpa: std.mem.Allocator, r: *rt.Runtime, dir: []const u8, requested: Options) !*Model {
+        const options = withEnvironment(requested);
         const m = try gpa.create(Model);
         errdefer gpa.destroy(m);
         m.* = .{ .gpa = gpa, .r = r, .config = undefined, .weights = undefined, .weight_plan = undefined, .options = options, .owned = .empty, .device_bytes = 0, .host_bytes = 0 };
@@ -342,7 +454,8 @@ pub const Model = struct {
         var prec = precisions();
         m.weight_plan = try layer_plan.build(&m.config.text, &prec);
         if (m.weight_plan.n_visits != 48) return error.UnsupportedInkling2Loop;
-        var src: Source = .{ .l = &l, .owned = &m.owned, .gpa = gpa, .dry = true, .embed_host = options.embed_host };
+        var src: Source = .{ .l = &l, .owned = &m.owned, .gpa = gpa, .dry = true, .embed_host = options.embed_host, .options = options };
+        defer src.freeScratch();
         _ = try loadWeights(&src, &m.config, &m.weight_plan);
         src.dry = false;
         m.weights = try loadWeights(&src, &m.config, &m.weight_plan);
