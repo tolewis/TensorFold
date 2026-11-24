@@ -145,45 +145,82 @@ KERNEL(256) void tf_inkling2_router(global const ushort *x, global const ushort 
                                     global uint *ids, global float *weights, uint rows) {
   const uint row = get_group_id(0), t = get_local_id(0);
   if (row >= rows) return;
-  local float scores[128], chosen[8];
+  local float4 xs[INK_HIDDEN / 4];
+  local float scores[128], keys[128], chosen[8];
   local uint picked[8];
-  local uchar used[128];
-  if (t < 128) {
-    float dot = 0.0f;
-    for (uint d = 0; d < INK_HIDDEN; ++d) dot += bf2f(weight[(ulong)t * INK_HIDDEN + d]) * bf2f(x[(ulong)row * INK_HIDDEN + d]);
-    scores[t] = ink_sigmoid(dot);
-    used[t] = 0;
+  global const uint2 *xg = (global const uint2 *)(x + (ulong)row * INK_HIDDEN);
+  for (uint i = t; i < INK_HIDDEN / 4; i += 256) {
+    const uint2 v = xg[i];
+    xs[i] = (float4)(as_float(v.x << 16), as_float(v.x & 0xffff0000u), as_float(v.y << 16), as_float(v.y & 0xffff0000u));
   }
   barrier(CLK_LOCAL_MEM_FENCE);
-  if (t == 0) {
-    for (uint j = 0; j < 8; ++j) {
-      uint best = 128;
-      for (uint e = 0; e < 128; ++e)
-        if (!used[e]) {
-          if (best == 128 || scores[e] + bias[e] > scores[best] + bias[best]) best = e;
-        }
-      used[best] = 1;
-      picked[j] = best;
-      chosen[j] = scores[best];
-    }
-    // Combining, including the denominator, is in ascending expert index.
-    for (uint j = 1; j < 8; ++j) {
-      const uint id = picked[j];
-      const float score = chosen[j];
-      uint k = j;
-      while (k > 0 && picked[k - 1] > id) {
-        picked[k] = picked[k - 1];
-        chosen[k] = chosen[k - 1];
-        --k;
+  if (t < 128) {
+    float dot = 0.0f;
+    for (uint i = 0; i < INK_HIDDEN / 8; i += 4) {
+      uint4 a[4];
+      for (uint u = 0; u < 4; ++u) a[u] = w[i + u];
+      for (uint u = 0; u < 4; ++u) {
+        const float4 b0 = xs[2 * (i + u)], b1 = xs[2 * (i + u) + 1];
+        dot += as_float(a[u].x << 16) * b0.x;
+        dot += as_float(a[u].x & 0xffff0000u) * b0.y;
+        dot += as_float(a[u].y << 16) * b0.z;
+        dot += as_float(a[u].y & 0xffff0000u) * b0.w;
+        dot += as_float(a[u].z << 16) * b1.x;
+        dot += as_float(a[u].z & 0xffff0000u) * b1.y;
+        dot += as_float(a[u].w << 16) * b1.z;
+        dot += as_float(a[u].w & 0xffff0000u) * b1.w;
       }
-      picked[k] = id;
-      chosen[k] = score;
     }
-    float den = 1e-20f;
-    for (uint j = 0; j < 8; ++j) den += chosen[j];
+    scores[t] = ink_sigmoid(dot);
+    keys[t] = scores[t] + bias[t];
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  // The first sub-group picks: lane l owns experts 8l to 8l + 7. A pick is the largest key, the lowest index on a tie;
+  // a NaN key never beats another, so it is picked only when it is the first expert left (as a scan in index order does).
+  if (get_sub_group_id() == 0) {
+    const uint lane = get_sub_group_local_id();
+    float mine[8];
+    for (uint j = 0; j < 8; ++j) mine[j] = keys[lane * 8 + j];
+    uint taken = 0;
     for (uint j = 0; j < 8; ++j) {
-      ids[row * 8 + j] = picked[j];
-      weights[row * 8 + j] = chosen[j] / den * 8.0f;
+      uint first_here = 128u;
+      for (int e = 7; e >= 0; --e)
+        if (!(taken & (1u << e))) first_here = lane * 8 + e;
+      const uint first = sub_group_reduce_min(first_here);
+      uint local_best = 8;
+      for (uint e = 0; e < 8; ++e)
+        if (!(taken & (1u << e)) && !isnan(mine[e]) && (local_best == 8 || mine[e] > mine[local_best])) local_best = e;
+      const float local_key = local_best == 8 ? -INFINITY : mine[local_best];
+      const float top = sub_group_reduce_max(local_key);
+      const uint candidate = (local_best != 8 && local_key == top) ? lane * 8 + local_best : 128u;
+      const uint largest = sub_group_reduce_min(candidate);
+      const uint best = isnan(keys[first]) || largest == 128u ? first : largest;
+      if (best / 8 == lane) taken |= 1u << (best % 8);
+      if (lane == 0) {
+        picked[j] = best;
+        chosen[j] = scores[best];
+      }
+    }
+    if (lane == 0) {
+      // Combining, including the denominator, is in ascending expert index.
+      for (uint j = 1; j < 8; ++j) {
+        const uint id = picked[j];
+        const float score = chosen[j];
+        uint k = j;
+        while (k > 0 && picked[k - 1] > id) {
+          picked[k] = picked[k - 1];
+          chosen[k] = chosen[k - 1];
+          --k;
+        }
+        picked[k] = id;
+        chosen[k] = score;
+      }
+      float den = 1e-20f;
+      for (uint j = 0; j < 8; ++j) den += chosen[j];
+      for (uint j = 0; j < 8; ++j) {
+        ids[row * 8 + j] = picked[j];
+        weights[row * 8 + j] = chosen[j] / den * 8.0f;
+      }
     }
   }
 }
@@ -209,6 +246,7 @@ KERNEL(256) void tf_inkling2_logits(global const ushort *h, global const ushort 
     const ushort8 a = vload8(i, w), b = vload8(i, x);
     float part = bf2f(a.s0) * bf2f(b.s0);
     part += bf2f(a.s1) * bf2f(b.s1);
+    global const uint4 *w = (global const uint4 *)(weight + (ulong)t * INK_HIDDEN);
     part += bf2f(a.s2) * bf2f(b.s2);
     part += bf2f(a.s3) * bf2f(b.s3);
     part += bf2f(a.s4) * bf2f(b.s4);
