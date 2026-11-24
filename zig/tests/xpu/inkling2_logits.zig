@@ -735,7 +735,7 @@ fn verifyBench(gpa: std.mem.Allocator, io: std.Io, ctx: *xpu.Context, m: *const 
 /// windows that slide through the prompt, against the random-routing model 128 (1 - (120/128)^n) of PLAN section 3.
 fn routeUnion(gpa: std.mem.Allocator, m: *const ink.model.Model, scratch: *state.Scratch, r: *xpu.rt.Runtime, cache: *state.Cache, ids: []const u32, prefix: usize) !void {
     const visits = 48;
-    const trace = try r.alloc(visits * 16 * 32);
+    var trace = try r.alloc(visits * 16 * 32);
     defer trace.free();
     ink.forward.route_trace = trace;
     defer ink.forward.route_trace = null;
