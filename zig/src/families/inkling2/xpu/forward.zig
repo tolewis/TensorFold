@@ -155,10 +155,7 @@ const Run = struct {
 
     fn staticPostConv(g: Run, cache: *state.Cache, slot: usize, conv_state: usize, raw: rt.Buffer, weight: Tensor, out: rt.Buffer, base: usize, rows: usize) !void {
         const channels = state.convWidth(conv_state);
-        const taps = cache.staged(slot, conv_state, 0).ptr();
-        try g.copyBf16(cache.history(slot, conv_state).ptr(), taps, 3 * channels);
-        try g.copyBf16(at(raw, base * channels * 2), cache.staged(slot, conv_state, 3).ptr(), rows * channels);
-        try glue.convStatic(&g.p.glue, g.s, taps, tensor(weight), at(out, base * channels * 2), @intCast(rows), @intCast(channels));
+        try glue.convStatic(&g.p.glue, g.s, cache.history(slot, conv_state).ptr(), at(raw, base * channels * 2), cache.staged(slot, conv_state, 0).ptr(), tensor(weight), at(out, base * channels * 2), @intCast(rows), @intCast(channels));
     }
 
     fn convInputForAttention(g: Run, cache: *state.Cache, v: *const layer_plan.Visit, base: usize, rows: usize, key: bool) !void {
@@ -169,12 +166,11 @@ const Run = struct {
         const projected = at(if (key) s.k_raw else s.v_raw, base * state.kv_width * 2);
         const normalized = if (key) s.k_norm else if (v.hasMessages() or lp.kind == .global) s.v_norm else s.q_norm;
         const conv_state: usize = if (key) 0 else 1;
+        const history = cache.history(v.cache_slot, conv_state).ptr();
         const taps = cache.staged(v.cache_slot, conv_state, 0).ptr();
-        try g.copyBf16(cache.history(v.cache_slot, conv_state).ptr(), taps, 3 * state.kv_width);
-        try g.copyBf16(projected, cache.staged(v.cache_slot, conv_state, 3).ptr(), rows * state.kv_width);
         switch (if (key) w.attn.k_conv else w.attn.v_conv) {
-            .static => |weight| try glue.convStatic(&g.p.glue, g.s, taps, tensor(weight), raw, @intCast(rows), state.kv_width),
-            .dynamic => |d| try glue.convDynamic(&g.p.glue, g.s, taps, at(normalized, base * state.hidden * 2), tensor(d.static_w), tensor(d.projection), raw, @intCast(rows), state.kv_width),
+            .static => |weight| try glue.convStatic(&g.p.glue, g.s, history, projected, taps, tensor(weight), raw, @intCast(rows), state.kv_width),
+            .dynamic => |d| try glue.convDynamic(&g.p.glue, g.s, history, projected, taps, at(normalized, base * state.hidden * 2), tensor(d.static_w), tensor(d.projection), raw, @intCast(rows), state.kv_width),
         }
     }
 

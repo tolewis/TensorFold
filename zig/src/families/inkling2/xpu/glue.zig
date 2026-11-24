@@ -67,16 +67,17 @@ pub fn ar(p: *const Pipelines, s: xpu.Stream, blocks_: Ref, partial: Ref, querie
     try xpu.launch.dispatch(p.ar, s, .{ queries_, 1, 1 }, .{ blocks_, partial, queries, out, sources_, queries_ });
 }
 
-/// taps contains three old rows followed by `rows` current BF16 inputs.
-pub fn convStatic(p: *const Pipelines, s: xpu.Stream, taps: Ref, weight: Ref, out: Ref, rows: u32, channels: u32) !void {
+/// The window of a row is three old rows (`history`) and then the current rows; the kernel stages that window in `taps`
+/// ([3 + rows][channels]) as it reads it, so the cache needs no separate copies.
+pub fn convStatic(p: *const Pipelines, s: xpu.Stream, history: Ref, current: Ref, taps: Ref, weight: Ref, out: Ref, rows: u32, channels: u32) !void {
     std.debug.assert(rows > 0 and channels > 0);
-    try xpu.launch.dispatch(p.conv_static, s, .{ blocks(channels), rows, 1 }, .{ taps, weight, out, rows, channels });
+    try xpu.launch.dispatch(p.conv_static, s, .{ blocks(channels), rows, 1 }, .{ history, current, taps, weight, out, rows, channels });
 }
 
-/// Dynamic static_w is [lag][channel], the opposite orientation to static convolution taps.
-pub fn convDynamic(p: *const Pipelines, s: xpu.Stream, taps: Ref, input: Ref, static_w: Ref, projection: Ref, out: Ref, rows: u32, channels: u32) !void {
+/// Dynamic static_w is [lag][channel], the opposite orientation to static convolution taps. `taps` is staged as in `convStatic`.
+pub fn convDynamic(p: *const Pipelines, s: xpu.Stream, history: Ref, current: Ref, taps: Ref, input: Ref, static_w: Ref, projection: Ref, out: Ref, rows: u32, channels: u32) !void {
     std.debug.assert(rows > 0 and channels > 0 and channels <= 1024);
-    try xpu.launch.dispatch(p.conv_dynamic, s, .{ rows, 1, 1 }, .{ taps, input, static_w, projection, out, rows, channels });
+    try xpu.launch.dispatch(p.conv_dynamic, s, .{ rows, 1, 1 }, .{ history, current, taps, input, static_w, projection, out, rows, channels });
 }
 
 /// Router IDs and weights are sorted by ascending expert index for the deterministic expert sum.

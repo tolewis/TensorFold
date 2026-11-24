@@ -130,34 +130,77 @@ KERNEL(256) void tf_inkling2_conv_static(global const ushort *history, global co
                                          global const ushort *weight, global ushort *out, uint rows, uint channels) {
   const uint c = get_global_id(0), r = get_group_id(1);
   if (c >= channels || r >= rows) return;
-  float sum = bf2f(taps[(ulong)(r + 3) * channels + c]);
-  for (uint tap = 0; tap < 4; ++tap) sum += bf2f(weight[c * 4 + tap]) * bf2f(taps[(ulong)(r + tap) * channels + c]);
+  float window[4];
+  for (uint tap = 0; tap < 4; ++tap) {
+    const uint k = r + tap;
+    window[tap] = bf2f(k < 3 ? history[(ulong)k * channels + c] : current[(ulong)(k - 3) * channels + c]);
+  }
+  if (r == 0)
+    for (uint k = 0; k < 3; ++k) taps[(ulong)k * channels + c] = history[(ulong)k * channels + c];
+  taps[(ulong)(r + 3) * channels + c] = current[(ulong)r * channels + c];
+  float sum = bf2f(current[(ulong)r * channels + c]);
+  for (uint tap = 0; tap < 4; ++tap) sum += bf2f(weight[c * 4 + tap]) * window[tap];
   out[(ulong)r * channels + c] = f2bf(sum / INK_SQRT5);
 }
 
-// Grid (rows). static_w is [lag][channel]; projection is [32][2304]; four lag weights a group of 128 channels.
-KERNEL(256) void tf_inkling2_conv_dynamic(global const ushort *taps, global const ushort *input, global const ushort *static_w,
-                                          global const ushort *projection, global ushort *out, uint rows, uint channels) {
+// Grid (rows). static_w is [lag][channel]; projection is [32][2304]; four lag weights a group of 128 channels. history,
+// current and taps are as in the static convolution: the window is written to `taps`.
+KERNEL(256) void tf_inkling2_conv_dynamic(global const ushort *history, global const ushort *current, global ushort *taps,
+                                          global const ushort *input, global const ushort *static_w, global const ushort *projection,
+                                          global ushort *out, uint rows, uint channels) {
   const uint r = get_group_id(0), t = get_local_id(0);
   if (r >= rows) return;
   local float projected[32];
+  local float4 xs[INK_HIDDEN / 4];
+  global const uint2 *xg = (global const uint2 *)(input + (ulong)r * INK_HIDDEN);
+  for (uint i = t; i < INK_HIDDEN / 4; i += 256) {
+    const uint2 v = xg[i];
+    xs[i] = (float4)(as_float(v.x << 16), as_float(v.x & 0xffff0000u), as_float(v.y << 16), as_float(v.y & 0xffff0000u));
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
   if (t < 32) {
+    // One work-item adds one projected value's products in order d = 0 to 2303, each product rounded, then added.
+    global const uint4 *w = (global const uint4 *)(projection + (ulong)t * INK_HIDDEN);
     float dot = 0.0f;
-    for (uint d = 0; d < INK_HIDDEN; ++d) dot += bf2f(projection[(ulong)t * INK_HIDDEN + d]) * bf2f(input[(ulong)r * INK_HIDDEN + d]);
+    for (uint i = 0; i < INK_HIDDEN / 8; i += 4) {
+      uint4 a[4];
+      for (uint u = 0; u < 4; ++u) a[u] = w[i + u];
+      for (uint u = 0; u < 4; ++u) {
+        const float4 b0 = xs[2 * (i + u)], b1 = xs[2 * (i + u) + 1];
+        dot += as_float(a[u].x << 16) * b0.x;
+        dot += as_float(a[u].x & 0xffff0000u) * b0.y;
+        dot += as_float(a[u].y << 16) * b0.z;
+        dot += as_float(a[u].y & 0xffff0000u) * b0.w;
+        dot += as_float(a[u].z << 16) * b1.x;
+        dot += as_float(a[u].z & 0xffff0000u) * b1.y;
+        dot += as_float(a[u].w << 16) * b1.z;
+        dot += as_float(a[u].w & 0xffff0000u) * b1.w;
+      }
+    }
     projected[t] = bf2f(f2bf(dot));
   }
   barrier(CLK_LOCAL_MEM_FENCE);
   for (uint c = t; c < channels; c += 256) {
-    float sum = bf2f(taps[(ulong)(r + 3) * channels + c]);
+    float window[4]; // window[j] is the row r + 3 - j of the history-then-current rows
+    for (uint lag = 0; lag < 4; ++lag) {
+      const uint k = r + 3 - lag;
+      window[lag] = bf2f(k < 3 ? history[(ulong)k * channels + c] : current[(ulong)(k - 3) * channels + c]);
+    }
+    if (r == 0)
+      for (uint k = 0; k < 3; ++k) taps[(ulong)k * channels + c] = history[(ulong)k * channels + c];
+    taps[(ulong)(r + 3) * channels + c] = current[(ulong)r * channels + c];
+    float sum = bf2f(current[(ulong)r * channels + c]);
     for (uint lag = 0; lag < 4; ++lag) {
       const float w = bf2f(static_w[lag * channels + c]) + projected[4 * (c / 128) + lag];
-      sum += w * bf2f(taps[(ulong)(r + 3 - lag) * channels + c]);
+      sum += w * window[lag];
     }
     out[(ulong)r * channels + c] = f2bf(sum / 3.0f);
   }
 }
 
 // Grid (rows). Sigmoid scores of 128 experts; the top 8 by score + bias, sorted by ascending expert index.
+// Work-item e < 128 adds the products of expert e's row in order d = 0 to 2303 (each product rounded, then added), so
+// the score of an expert does not depend on how many work-items run. The row of x is staged once in local memory.
 KERNEL(256) void tf_inkling2_router(global const ushort *x, global const ushort *weight, global const float *bias,
                                     global uint *ids, global float *weights, uint rows) {
   const uint row = get_group_id(0), t = get_local_id(0);
@@ -172,6 +215,7 @@ KERNEL(256) void tf_inkling2_router(global const ushort *x, global const ushort 
   }
   barrier(CLK_LOCAL_MEM_FENCE);
   if (t < 128) {
+    global const uint4 *w = (global const uint4 *)(weight + (ulong)t * INK_HIDDEN);
     float dot = 0.0f;
     for (uint i = 0; i < INK_HIDDEN / 8; i += 4) {
       uint4 a[4];
@@ -263,7 +307,6 @@ KERNEL(256) void tf_inkling2_logits(global const ushort *h, global const ushort 
     const ushort8 a = vload8(i, w), b = vload8(i, x);
     float part = bf2f(a.s0) * bf2f(b.s0);
     part += bf2f(a.s1) * bf2f(b.s1);
-    global const uint4 *w = (global const uint4 *)(weight + (ulong)t * INK_HIDDEN);
     part += bf2f(a.s2) * bf2f(b.s2);
     part += bf2f(a.s3) * bf2f(b.s3);
     part += bf2f(a.s4) * bf2f(b.s4);
