@@ -21,6 +21,8 @@ pub const Kernels = struct {
     attn_window: xpu.Kernel,
     dense: xpu.Kernel,
     router: xpu.Kernel,
+    conv_static: xpu.Kernel,
+    rel_table: xpu.Kernel,
 
     pub fn load(module: xpu.Module) !Kernels {
         var k_ar = try module.kernel("tf_ink2_pf_ar", .{ 256, 1, 1 });
@@ -45,11 +47,17 @@ pub const Kernels = struct {
         errdefer k_win.deinit();
         var k_dense = try module.kernel("tf_ink2_pf_dense", .{ 128, 1, 1 });
         errdefer k_dense.deinit();
-        const k_router = try module.kernel("tf_ink2_pf_router", .{ 256, 1, 1 });
-        return .{ .ar = k_ar, .messages = k_messages, .copy_rows = k_copy, .perm = k_perm, .q8 = k_q8, .zeta_norm = k_zn, .zeta = k_zeta, .gates = k_gates, .kv_copy = k_kv, .attn_window = k_win, .dense = k_dense, .router = k_router };
+        var k_router = try module.kernel("tf_ink2_pf_router", .{ 256, 1, 1 });
+        errdefer k_router.deinit();
+        var k_conv = try module.kernel("tf_ink2_pf_conv_static", .{ 256, 1, 1 });
+        errdefer k_conv.deinit();
+        const k_rel = try module.kernel("tf_ink2_pf_rel_table", .{ 256, 1, 1 });
+        return .{ .ar = k_ar, .messages = k_messages, .copy_rows = k_copy, .perm = k_perm, .q8 = k_q8, .zeta_norm = k_zn, .zeta = k_zeta, .gates = k_gates, .kv_copy = k_kv, .attn_window = k_win, .dense = k_dense, .router = k_router, .conv_static = k_conv, .rel_table = k_rel };
     }
 
     pub fn deinit(k: *Kernels) void {
+        k.rel_table.deinit();
+        k.conv_static.deinit();
         k.router.deinit();
         k.dense.deinit();
         k.attn_window.deinit();
@@ -107,6 +115,17 @@ pub fn denseBf16(k_: *const Kernels, s: xpu.Stream, weight: Ref, x: Ref, out: Re
 pub fn router(k: *const Kernels, s: xpu.Stream, x: Ref, weight: Ref, bias: Ref, ids: Ref, weights: Ref, rows: u32) !void {
     std.debug.assert(rows > 0);
     try xpu.launch.dispatch(k.router, s, .{ (rows + 3) / 4, 1, 1 }, .{ x, weight, bias, ids, weights, rows });
+}
+
+/// glue.zig's static convolution (same arguments), four channels a work-item; `channels` a multiple of 4.
+pub fn convStatic(k: *const Kernels, s: xpu.Stream, history: Ref, current: Ref, taps: Ref, weight: Ref, out: Ref, rows: u32, channels: u32) !void {
+    std.debug.assert(rows > 0 and channels > 0 and channels % 4 == 0);
+    try xpu.launch.dispatch(k.conv_static, s, .{ (channels / 4 + 255) / 256, rows, 1 }, .{ history, current, taps, weight, out, rows, channels });
+}
+
+/// attention.zig's relative-bias table for `rows * heads` (row, head) pairs; bit for bit the same.
+pub fn relTable(k: *const Kernels, s: xpu.Stream, pairs: u32, rel: Ref, proj: Ref, tab: Ref) !void {
+    try xpu.launch.dispatch(k.rel_table, s, .{ pairs, 1, 1 }, .{ rel, proj, tab });
 }
 
 /// The controller tuple for every row: zn is a scratch of `rows * 2 * hidden` bf16 values, zeta one of `rows * 64`.

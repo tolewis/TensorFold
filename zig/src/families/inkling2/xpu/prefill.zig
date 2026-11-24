@@ -171,7 +171,7 @@ const Run = struct {
 
     fn staticPostConv(g: Run, cache: *state.Cache, slot: usize, conv_state: usize, raw: rt.Buffer, weight: Tensor, out: rt.Buffer) !void {
         const channels = state.convWidth(conv_state);
-        try glue.convStatic(&g.p.glue, g.s, cache.history(slot, conv_state).ptr(), at(raw, 0), at(g.sc.staging, 0), tensor(weight), at(out, 0), @intCast(g.rows), @intCast(channels));
+        try pk.convStatic(&g.p.prefill, g.s, cache.history(slot, conv_state).ptr(), at(raw, 0), at(g.sc.staging, 0), tensor(weight), at(out, 0), @intCast(g.rows), @intCast(channels));
         try g.commitHistory(cache, slot, conv_state);
     }
 
@@ -187,7 +187,7 @@ const Run = struct {
         const taps = at(s.staging, 0);
         const rows: u32 = @intCast(g.rows);
         switch (if (key) w.attn.k_conv else w.attn.v_conv) {
-            .static => |weight| try glue.convStatic(&g.p.glue, g.s, history, projected, taps, tensor(weight), raw, rows, state.kv_width),
+            .static => |weight| try pk.convStatic(&g.p.prefill, g.s, history, projected, taps, tensor(weight), raw, rows, state.kv_width),
             .dynamic => |d| try glue.convDynamic(&g.p.glue, g.s, history, projected, taps, at(normalized, 0), tensor(d.static_w), tensor(d.projection), raw, rows, state.kv_width),
         }
         try g.commitHistory(cache, v.cache_slot, conv_state);
@@ -223,7 +223,7 @@ const Run = struct {
             try pk.kvCopy(&g.p.prefill, g.s, kv.v.at(), into.v.at(), start - history, layer.ring, stage, history, 8);
         }
         try attention.prep(k, g.s, all, prep_layer, prep, meta_all, .{ aref(s.q_raw, 0), aref(s.k_conv, 0), aref(s.v_conv, 0), aref(s.rel_raw, 0) }, .{ aref(w.attn.q_scale.buf, 0), aref(w.attn.rel_scale.buf, 0) }, aref(s.q_prep, 0), aref(s.rel_prep, 0), into);
-        try attention.relTable(k, g.s, all, aref(s.rel_prep, 0), aref(w.attn.rel_projection.buf, 0), aref(s.rel_tab, 0));
+        try pk.relTable(&g.p.prefill, g.s, all.rows * all.heads, aref(s.rel_prep, 0).at(), aref(w.attn.rel_projection.buf, 0).at(), aref(s.rel_tab, 0).at());
         const step: usize = if (sliding) g.sl_slice else g.gl_slice;
         var base: usize = 0;
         var si: usize = if (sliding) g.sl_seg0 else 0;

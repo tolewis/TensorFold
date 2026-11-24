@@ -36,7 +36,7 @@ pub const Kernels = struct {
         errdefer mx_gu.deinit();
         var mx_down = try module.kernel("tf_ink2_pf_mxfp8_down", .{ 128, 1, 1 });
         errdefer mx_down.deinit();
-        const combine_k = try module.kernel("tf_ink2_pf_combine", .{ 64, 1, 1 });
+        const combine_k = try module.kernel("tf_ink2_pf_combine", .{ 256, 1, 1 });
         return .{ .plan = plan_k, .gather = gather_k, .nvfp4_gu = nv_gu, .nvfp4_down = nv_down, .mxfp8_gu = mx_gu, .mxfp8_down = mx_down, .combine = combine_k };
     }
 
@@ -96,5 +96,5 @@ pub fn down(k: *const Kernels, s: xpu.Stream, format: Format, act: Ref, w: Weigh
 
 /// y[token][n] = BF16(sum over the token's routes in ascending expert order of weight * ds[inv[route]][n]).
 pub fn combine(k: *const Kernels, s: xpu.Stream, ds: Ref, inv: Ref, ids: Ref, weights: Ref, y: Ref, rows: u32, n: u32) !void {
-    try xpu.launch.dispatch(k.combine, s, .{ (n + 63) / 64, rows, 1 }, .{ ds, inv, ids, weights, y, n, top_k });
+    try xpu.launch.dispatch(k.combine, s, .{ (n + 255) / 256, rows, 1 }, .{ ds, inv, ids, weights, y, n, top_k });
 }

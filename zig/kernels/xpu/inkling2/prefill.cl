@@ -616,3 +616,48 @@ KERNEL(256) void tf_ink2_pf_router(global const ushort *x, global const ushort *
     }
   }
 }
+
+#define PF_SQRT5 0x1.1e377ap+1f // binary32(sqrt(5))
+
+// glue.cl's static convolution, four channels a work-item: the same arithmetic a channel, so the result is bit for bit.
+// Grid (ceil(channels / 4 / 256), rows); channels a multiple of 4.
+KERNEL(256) void tf_ink2_pf_conv_static(global const ushort *history, global const ushort *current, global ushort *taps,
+                                        global const ushort *weight, global ushort *out, uint rows, uint channels) {
+  const uint c = get_global_id(0) * 4, r = get_group_id(1);
+  if (c >= channels || r >= rows) return;
+  float4 window[4];
+  for (uint tap = 0; tap < 4; ++tap) {
+    const uint k = r + tap;
+    const ushort4 v = k < 3 ? vload4(0, history + (ulong)k * channels + c) : vload4(0, current + (ulong)(k - 3) * channels + c);
+    window[tap] = (float4)(bf2f(v.x), bf2f(v.y), bf2f(v.z), bf2f(v.w));
+  }
+  if (r == 0)
+    for (uint k = 0; k < 3; ++k) vstore4(vload4(0, history + (ulong)k * channels + c), 0, taps + (ulong)k * channels + c);
+  const ushort4 cur = vload4(0, current + (ulong)r * channels + c);
+  vstore4(cur, 0, taps + (ulong)(r + 3) * channels + c);
+  float4 sum = (float4)(bf2f(cur.x), bf2f(cur.y), bf2f(cur.z), bf2f(cur.w));
+  const ushort16 wt = vload16(0, weight + (ulong)c * 4);
+  for (uint tap = 0; tap < 4; ++tap) {
+    const float4 wv = (float4)(bf2f(wt[tap]), bf2f(wt[4 + tap]), bf2f(wt[8 + tap]), bf2f(wt[12 + tap]));
+    sum += wv * window[tap];
+  }
+  const float4 q = sum / PF_SQRT5;
+  vstore4((ushort4)(f2bf(q.x), f2bf(q.y), f2bf(q.z), f2bf(q.w)), 0, out + (ulong)r * channels + c);
+}
+
+#define PF_REL 16
+#define PF_EXTENT 1024
+
+// attention.cl's relative-bias table, four distances a work-item (one work-group a (row, head)): each distance's 16 taps add in
+// the same order, so the table is bit for bit the same. Grid (rows * heads).
+KERNEL(256) void tf_ink2_pf_rel_table(global const ushort *rel, global const ushort *proj, global ushort *tab) {
+  const uint rh = get_group_id(0), d = get_local_id(0) * 4;
+  float r[PF_REL];
+  for (uint j = 0; j < PF_REL; ++j) r[j] = bf2f(rel[rh * PF_REL + j]);
+  float4 acc = (float4)(0.0f);
+  for (uint j = 0; j < PF_REL; ++j) {
+    const ushort4 p = vload4(0, proj + j * PF_EXTENT + d);
+    acc += r[j] * (float4)(bf2f(p.x), bf2f(p.y), bf2f(p.z), bf2f(p.w));
+  }
+  vstore4((ushort4)(f2bf(acc.x), f2bf(acc.y), f2bf(acc.z), f2bf(acc.w)), 0, tab + (ulong)rh * PF_EXTENT + d);
+}
