@@ -158,6 +158,8 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         \\pub const contract_inkling2_dense_q8_scale align(8) = @embedFile("contract_inkling2_dense_q8_scale.bin").*;
         \\pub const inkling2_prefill_experts align(8) = @embedFile("inkling2_prefill_experts.bin").*;
         \\pub const contract_inkling2_prefill_experts_controls align(8) = @embedFile("contract_inkling2_prefill_experts_controls.bin").*;
+        \\pub const inkling2_prefill align(8) = @embedFile("inkling2_prefill.bin").*;
+        \\pub const inkling2_prefill_ctl align(8) = @embedFile("inkling2_prefill_ctl.bin").*;
     ), .target = target, .optimize = optimize });
     // Inkling 2 Mini's loop: the host wrapper, its pure launch plan, and the host float model the device is held to
     const loop_plan = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/metal/loop_plan.zig"), .target = target, .optimize = optimize });
@@ -175,6 +177,7 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         .imports = &.{.{ .name = "xpu", .module = xpu }},
     });
     const experts_host = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/xpu/experts.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "xpu", .module = xpu }} });
+    const prefill_host = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/xpu/prefill_kernels.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "xpu", .module = xpu }} });
     const prefill_experts_host = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/xpu/prefill_experts.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "xpu", .module = xpu }} });
     b.step("test-inkling2-xpu-experts-host", "Inkling 2's XPU experts host wrapper: plan and call checks (no GPU)").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = experts_host })).step);
     const exe = b.addExecutable(.{ .name = "tf-xpu-contract-run", .root_module = b.createModule(.{
@@ -187,6 +190,7 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
             .{ .name = "xpu", .module = xpu },
             .{ .name = "inkling2_xpu_experts", .module = experts_host },
             .{ .name = "inkling2_prefill_experts_host", .module = prefill_experts_host },
+            .{ .name = "inkling2_prefill_host", .module = prefill_host },
             .{ .name = "ze", .module = ze },
             .{ .name = "xpu_contract_images", .module = images },
             .{ .name = "inkling2_xpu_loop", .module = loop_host },

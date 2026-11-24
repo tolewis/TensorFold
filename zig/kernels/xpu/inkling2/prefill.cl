@@ -44,7 +44,7 @@ static inline float pf_rms_inverse(float ss) { return 1.0f / sqrt(ss / 2304.0f +
 //
 // y[row][n] = bf16(x[row][k] . dequant(W)[n][k]) for the Q8 weights of q8.zig, any number of rows, FP32 sums. The weights are
 // the A operand (8 weight rows a tile, lane = k) and the rows of x the B operand (lane = row), so one fragment of codes feeds
-// every row tile of the sub-group. `tf_ink2_pf_perm` first reorders each 256-value plane of x so that a k16 step (block b,
+// every row tile of the sub-group. `pf_perm` first reorders each 256-value plane of x so that a k16 step (block b,
 // parity p) is 16 contiguous values: step s = 2 b + p holds the block's values 2 l + p for l = 0 to 15, which are the values
 // lane l of the weights' plane holds (q8.zig). A block's 32 products go through DPAS into a fresh sum, which the block's fp16
 // scale then weighs into the running sum: acc += scale * (sum of 32 code * x). A row's result does not depend on the other
