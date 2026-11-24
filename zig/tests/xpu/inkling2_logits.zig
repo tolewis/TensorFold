@@ -232,6 +232,9 @@ pub fn main(init: std.process.Init) !void {
     var profile_steps: usize = 0;
     var bench_context: ?usize = null;
     var options: ink.model.Options = .{ .embed_host = false };
+    var tp: u32 = 1;
+    var rank: u32 = 0;
+    var device: ?u32 = null;
     var dump_prefix: ?[]const u8 = null;
     var compare_prefix: ?[]const u8 = null;
     var i: usize = 1;
@@ -278,6 +281,15 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--bench-context")) {
             i += 1;
             bench_context = try std.fmt.parseInt(usize, argv[i], 10);
+        } else if (std.mem.eql(u8, a, "--tp")) {
+            i += 1;
+            tp = try std.fmt.parseInt(u32, argv[i], 10);
+        } else if (std.mem.eql(u8, a, "--rank")) {
+            i += 1;
+            rank = try std.fmt.parseInt(u32, argv[i], 10);
+        } else if (std.mem.eql(u8, a, "--device")) {
+            i += 1;
+            device = try std.fmt.parseInt(u32, argv[i], 10);
         } else dir = a;
     }
     const path = dir orelse {
@@ -308,7 +320,9 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("skipped: no Level Zero loader\n", .{});
         return;
     };
-    var ctx = try xpu.Context.init(&drv, null);
+    if (device == null) if (std.c.getenv("XPU_DEVICE")) |v| device = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+    options.place = try ink.place.Place.parse(tp, rank);
+    var ctx = try xpu.Context.init(&drv, device);
     const stream = try xpu.Stream.init(&ctx);
     var r = try xpu.rt.Runtime.init(&ctx, stream);
     std.debug.print("{s}\n", .{ctx.name()});
@@ -320,6 +334,7 @@ pub fn main(init: std.process.Init) !void {
     });
     defer m.deinit();
     try m.loadKernels(&ctx);
+    if (m.options.place.split()) _ = try ink.group.Group.open(gpa, &r, &ctx, m.options.place);
     std.debug.print("loaded {d:.2} GiB and built the kernels in {d:.1} s\n", .{ @as(f64, @floatFromInt(m.device_bytes)) / (1 << 30), secs(nowNs(init.io) - t_load) });
     var scratch = try state.Scratch.init(&r, state.max_rows, capacity);
     defer scratch.deinit();

@@ -65,7 +65,22 @@ pub const Group = struct {
         try g.handshake(name);
         std.log.info("inkling2: TP {d} rank {d}: all-reduce {s}", .{ g.tp, g.rank, if (g.ex == 3) "EX flag 3" else "host-staged" });
         live = g;
+        if (std.c.getenv("TF_TP_EXBENCH")) |v| if (v[0] != '0') try g.exchangeBench();
         return g;
+    }
+
+    /// 128 exchanges at 1 row of 2304 bf16. Both ranks must call it. Prints the Qwen bench line shape.
+    fn exchangeBench(g: *Group) !void {
+        var buf = try g.r.alloc(D * 2);
+        defer buf.free();
+        try g.r.stream(g.ctx).fill8(buf.ptr, 0, D * 2);
+        try g.allReduce(buf.ptr.?, 1);
+        try g.r.sync();
+        const t0 = now();
+        for (0..128) |_| try g.allReduce(buf.ptr.?, 1);
+        try g.r.sync();
+        const ms = (now() - t0) * 1e3;
+        std.log.info("inkling2: exchange ms a round (128 exchanges) by rows: 1 {d:.2}", .{ms});
     }
 
     /// `partial` holds `rows` x 2304 fp16. On return it holds the sum. Both ranks call this in the same order.
