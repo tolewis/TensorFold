@@ -4,6 +4,11 @@
 //!   tf-xpu-inkling2-logits <model dir> --ids <ids file> --generate N [--stop ID]
 //!   tf-xpu-inkling2-logits <model dir> --bench-context C [--decode N]
 //!
+//! `--dense bf16|q8` picks the dense weights' device format (default: the model's, Q8_0; `XPU_DENSE` in the environment
+//! does the same) and `--drop-bf16-head` leaves the BF16 head off the device in Q8 mode. `--dump-logits PREFIX` writes every
+//! row's full logits (raw f32) of each reference prompt to PREFIX.<reference file name>.f32; `--compare-logits PREFIX`
+//! reads those files back and prints, per prompt, KL(dumped || ours) per row (mean, max) and top-1 agreement with the dump.
+//!
 //! `--digest` prints SHA-256 digests of the bits of every logit row computed (prompt rows, then decode steps), to compare
 //! two builds for bit identity. `--profile` adds eight profiled decode steps: launches by kernel, host and device time.
 //! `--bench-context C` times N decode steps (default 32) at context C with no prompt: K/V is zeroed, only the cost is real.
@@ -158,6 +163,50 @@ fn rowSpread(gpa: std.mem.Allocator, row_max: []const f32) !void {
     std.debug.print("  rows over 2.0: {d}; worst rows {d} ({d:.2}), {d} ({d:.2}), {d} ({d:.2})\n", .{ count_over, worst[0], row_max[worst[0]], worst[1], row_max[worst[1]], worst[2], row_max[worst[2]] });
 }
 
+fn openDump(gpa: std.mem.Allocator, prefix: []const u8, ref_path: []const u8, mode: [*:0]const u8) !*std.c.FILE {
+    const name = try std.fmt.allocPrintSentinel(gpa, "{s}.{s}.f32", .{ prefix, std.fs.path.basename(ref_path) }, 0);
+    defer gpa.free(name);
+    return std.c.fopen(name, mode) orelse error.DumpOpen;
+}
+
+/// KL(p || q) of the softmax of a dumped row `p` against ours `q`, and whether the arg-max agrees, over a prompt's rows.
+const KlStats = struct {
+    rows: usize = 0,
+    agree: usize = 0,
+    sum: f64 = 0,
+    max: f64 = 0,
+    max_row: usize = 0,
+
+    fn add(k: *KlStats, p: []const f32, q: []const f32) void {
+        const tp = top2(p);
+        const tq = top2(q);
+        var zp: f64 = 0;
+        var zq: f64 = 0;
+        for (p, q) |a, b| {
+            zp += @exp(@as(f64, a - tp.first));
+            zq += @exp(@as(f64, b - tq.first));
+        }
+        const lp = @log(zp) + @as(f64, tp.first);
+        const lq = @log(zq) + @as(f64, tq.first);
+        var d: f64 = 0;
+        for (p, q) |a, b| {
+            const lpi = @as(f64, a) - lp;
+            d += @exp(lpi) * (lpi - (@as(f64, b) - lq));
+        }
+        k.sum += d;
+        if (d > k.max) {
+            k.max = d;
+            k.max_row = k.rows;
+        }
+        k.rows += 1;
+        if (tp.id == tq.id) k.agree += 1;
+    }
+
+    fn print(k: KlStats, name: []const u8) void {
+        std.debug.print("  vs dump of {s}: KL(dump || ours) mean {e:.4}, max {e:.4} (row {d}); top-1 agreement with the dump {d}/{d} ({d:.3} %)\n", .{ name, k.sum / @as(f64, @floatFromInt(@max(k.rows, 1))), k.max, k.max_row, k.agree, k.rows, 100.0 * @as(f64, @floatFromInt(k.agree)) / @as(f64, @floatFromInt(@max(k.rows, 1))) });
+    }
+};
+
 fn nowNs(io: std.Io) i96 {
     return std.Io.Clock.awake.now(io).toNanoseconds();
 }
@@ -180,6 +229,9 @@ pub fn main(init: std.process.Init) !void {
     var digest = false;
     var profile_steps: usize = 0;
     var bench_context: ?usize = null;
+    var options: ink.model.Options = .{ .embed_host = false };
+    var dump_prefix: ?[]const u8 = null;
+    var compare_prefix: ?[]const u8 = null;
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
@@ -203,6 +255,17 @@ pub fn main(init: std.process.Init) !void {
             stop = try std.fmt.parseInt(u32, argv[i], 10);
         } else if (std.mem.eql(u8, a, "--embed-host")) {
             embed_host = true;
+        } else if (std.mem.eql(u8, a, "--dense")) {
+            i += 1;
+            options.dense = std.meta.stringToEnum(ink.model.DenseFormat, argv[i]) orelse return error.BadDense;
+        } else if (std.mem.eql(u8, a, "--drop-bf16-head")) {
+            options.keep_bf16_head = false;
+        } else if (std.mem.eql(u8, a, "--dump-logits")) {
+            i += 1;
+            dump_prefix = argv[i];
+        } else if (std.mem.eql(u8, a, "--compare-logits")) {
+            i += 1;
+            compare_prefix = argv[i];
         } else if (std.mem.eql(u8, a, "--digest")) {
             digest = true;
         } else if (std.mem.eql(u8, a, "--profile")) {
@@ -246,7 +309,10 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("{s}\n", .{ctx.name()});
 
     const t_load = nowNs(init.io);
-    var m = try ink.model.Model.load(gpa, &r, path, .{ .embed_host = embed_host });
+    var m = try ink.model.Model.load(gpa, &r, path, blk: {
+        options.embed_host = embed_host;
+        break :blk options;
+    });
     defer m.deinit();
     try m.loadKernels(&ctx);
     std.debug.print("loaded {d:.2} GiB and built the kernels in {d:.1} s\n", .{ @as(f64, @floatFromInt(m.device_bytes)) / (1 << 30), secs(nowNs(init.io) - t_load) });
@@ -270,6 +336,17 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(row_max);
         var diffs: std.ArrayList(Diff) = .empty;
         defer diffs.deinit(gpa);
+        var dump_file: ?*std.c.FILE = null;
+        var compare_file: ?*std.c.FILE = null;
+        defer {
+            if (dump_file) |f| _ = std.c.fclose(f);
+            if (compare_file) |f| _ = std.c.fclose(f);
+        }
+        if (dump_prefix) |pre| dump_file = try openDump(gpa, pre, ref_path, "wb");
+        if (compare_prefix) |pre| compare_file = try openDump(gpa, pre, ref_path, "rb");
+        var kl: KlStats = .{};
+        const other = try gpa.alloc(f32, if (compare_file != null) vocab else 0);
+        defer gpa.free(other);
         const t0 = nowNs(init.io);
         var pos: usize = 0;
         while (pos < ref.rows) {
@@ -284,6 +361,11 @@ pub fn main(init: std.process.Init) !void {
                 const row = host_logits[j * vocab ..][0..vocab];
                 const t = top2(row);
                 st.rows += 1;
+                if (dump_file) |f| if (std.c.fwrite(@ptrCast(row.ptr), 4, vocab, f) != vocab) return error.DumpWrite;
+                if (compare_file) |f| {
+                    if (std.c.fread(@ptrCast(other.ptr), 4, vocab, f) != vocab) return error.DumpRead;
+                    kl.add(other, row);
+                }
                 const ref_top = ref.top_ids[p * top_n ..][0..top_n];
                 const ref_logit = ref.top_logits[p * top_n ..][0..top_n];
                 if (!std.math.isFinite(t.first)) st.nan += 1;
@@ -334,6 +416,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("  reference top-16 logits: max abs difference {d:.4} (at position {d}), mean {d:.5}, max on the top-1 logit {d:.4}\n", .{ st.max_abs, st.max_abs_row, st.sum_abs / @as(f64, @floatFromInt(st.count_abs)), st.max_top1_abs });
         std.debug.print("  log-sum-exp difference: mean {d:.4}, max {d:.4}\n", .{ st.lse_sum / @as(f64, @floatFromInt(st.rows)), st.lse_max });
         std.debug.print("  next-token loss over {d} rows with the token in the reference top 16: ours {d:.4}, reference {d:.4}\n", .{ st.nll_n, st.nll_ours / @as(f64, @floatFromInt(@max(st.nll_n, 1))), st.nll_ref / @as(f64, @floatFromInt(@max(st.nll_n, 1))) });
+        if (compare_file != null) kl.print(std.fs.path.basename(ref_path));
         try rowSpread(gpa, row_max);
         for (diffs.items) |d| std.debug.print("  diff at {d}: reference token {d}, ours {d}, reference margin {d:.4}, our logit gap {d:.4}\n", .{ d.pos, d.ref_id, d.our_id, d.margin, d.our_gap });
         if (diffs.items.len > 0) std.debug.print("  largest reference margin among the differences: {d:.4}\n", .{st.max_diff_margin});
