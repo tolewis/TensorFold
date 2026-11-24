@@ -10,7 +10,7 @@ const rt = xpu.rt;
 pub const window_rows = 16;
 pub const batch_rows = 32;
 /// Rows of one prompt chunk (prefill.zig); the scratch is sized for them.
-pub const prompt_rows = 512;
+pub const prompt_rows = 2048;
 pub const max_rows = 64;
 /// The most rows a prompt chunk takes: the scratch rows beyond `max_rows` serve only the prompt path of prefill.zig.
 pub const max_prefill_rows = 2048;
@@ -333,7 +333,7 @@ fn sizes(rows: usize, capacity: usize) [fields.len]usize {
         r * h * bf,                r * h * bf,                         r * message_entries * h * fp,              r * h * fp,                     3 * r * h * fp, 3 * r * h * fp, r * h * fp,
         r * h * fp,                r * h * bf,                         r * h * bf,                                r * h * bf,                     r * q * bf,     r * kv * bf,    r * kv * bf,
         r * rel_width * bf,        r * 24 * bf,                        r * q * bf,                                r * kv * bf,                    r * kv * bf,    r * q * bf,     r * rel_width * bf,
-        r * 24 * ap.extent * bf,   a * 24 * stride * ap.head_dim * fp, a * 24 * stride * 2 * fp,                  r * q * bf,                     r * h * bf,     r * h * bf,     r * h * bf,
+        r * 24 * ap.extent * bf,   @max(a * stride, r) * 24 * ap.head_dim * fp, @max(a * stride, r) * 24 * 2 * fp,                  r * q * bf,                     r * h * bf,     r * h * bf,     r * h * bf,
         r * experts_per_token * 4, r * experts_per_token * fp,         r * experts_per_token * intermediate * bf, r * experts_per_token * h * bf, r * h * bf,     r * h * bf,     a * vocabulary * fp,
         r * experts_per_token * 4, items * 3 * 4,                      4,                                         r * 64 * fp,                    (3 + r) * hidden * bf,
         r * experts_per_token * 4, r * experts_per_token * h * bf, r * 2 * h * bf,
