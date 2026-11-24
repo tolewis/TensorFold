@@ -372,7 +372,8 @@ pub const Drafter = struct {
                 d.traceDevice('f', &.{0}, at(lane.newest, 0), state.hidden * 2);
             }
             const t0 = nowNs();
-            const on_device = d.trace == null and (item.sampling == null or item.sampling.?.top_k <= 1024);
+            // Sampled drafts draw on the device (the host sort of a 200058-wide row took 9 to 11 ms a draft). A greedy draft is a download and an argmax on the host, about 0.2 ms, and the single-group device draw costs more than that.
+            const on_device = d.trace == null and item.sampling != null and item.sampling.?.top_k <= 1024;
             if (on_device) {
                 // Every draft is drawn on the device and the next recurrent step reads it there: one sync a block.
                 const rule: gpu_rule.Rule = if (item.sampling) |sm| gpu_rule.rule(sm) else .{ .seed = 0, .inv_t = 1.0, .top_p = 1.0, .min_log = -std.math.inf(f32), .top_k = 0 };
