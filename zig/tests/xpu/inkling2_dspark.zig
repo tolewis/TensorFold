@@ -66,8 +66,12 @@ fn anchor(kind: host.Kind) []const u8 {
         .recurrent => "DSP_LEFT",
         .base => "DSP_BASE_OUT",
         .logits => "DSP_BIAS",
+        .draw => "DSP_DRAW_SCORE",
     };
 }
+
+const draw_rule = "a draft is a guess: with a NaN or infinite logit the draw still returns a token id below the vocabulary; on finite " ++
+    "rows it returns the token the host sampler draws, and the greedy pick is the lowest id of the largest value";
 
 fn controlName(kind: host.Kind) []const u8 {
     return switch (kind) {
@@ -167,6 +171,8 @@ pub const Probe = struct {
             // the last shape is the served one: seven draft rows against the whole vocabulary, checked at sampled ids
             .base => self.setServed(&.{ .{ .rows = 5, .n = 5, .k = 0 }, .{ .rows = 1, .n = 1, .k = 0 }, .{ .rows = 3, .n = 17, .k = 0 }, .{ .rows = 7, .n = 129, .k = 0 }, .{ .rows = 7, .n = host.vocab, .k = 0 } }),
             .logits => self.setServed(&.{.{ .rows = 8, .n = host.vocab, .k = 0 }}),
+            // rows is the draw rule: 1 greedy, 2 T 0.8 top_p 0.95 top_k 40, 3 T 1 top_k off, 4 T 0.7 top_p 0.9 top_k off, 5 T 0.8 min_p 0.05
+            .draw => self.setServed(&.{ .{ .rows = 1, .n = host.vocab, .k = 0 }, .{ .rows = 2, .n = host.vocab, .k = 0 }, .{ .rows = 3, .n = host.vocab, .k = 0 }, .{ .rows = 4, .n = host.vocab, .k = 0 }, .{ .rows = 5, .n = host.vocab, .k = 0 } }),
         }
         return self;
     }
@@ -187,7 +193,8 @@ pub const Probe = struct {
             .depth = depth,
             .ops = 0,
             .mids = 0,
-            .out = if (self.kind == .kappa) .f32 else .bf16,
+            .out = if (self.kind == .kappa) .f32 else if (self.kind == .draw) .raw else .bf16,
+            .nan = if (self.kind == .draw) .{ .stated = draw_rule } else .propagate,
             .served = self.served[0..self.served_len],
             .sums = .{ .f16 = 0, .bf16 = 0, .why = "explicit serial FP32 reference and required BF16 nodes are checked directly" },
         } };
@@ -210,6 +217,7 @@ pub const Probe = struct {
             .recurrent => RNN + 2 * RANK,
             .base => self.shape.rows * self.shape.n,
             .logits => host.vocab,
+            .draw => 1,
         };
     }
 
@@ -367,6 +375,7 @@ pub const Probe = struct {
                 if (nf) self.f[0][0] = std.math.nan(f32);
                 // kappa is the FP32 output of the kappa kernel, as the engine passes it
                 for (0..4) |j| self.refs[j] = try self.input(self.f[j], j != 1);
+                self.refs[4] = try self.rig.input(std.mem.asBytes(&@as(u32, 1))); // the Markov row is read from device memory
                 try self.output(0, RNN, .bf16);
                 try self.output(1, RANK, .bf16);
                 try self.output(2, RANK, .bf16);
@@ -407,8 +416,124 @@ pub const Probe = struct {
                 self.refs[1] = try self.input(self.f[1], true);
                 try self.output(0, rows * shape.n, .bf16);
             },
+            .draw => {
+                // BF16 logits with many ties at the top; the nonfinite fill plants a NaN and both infinities
+                self.f[0] = try self.floats(host.vocab, rng);
+                for (self.f[0]) |*v| v.* = rng.float(f32) * 24 - 12;
+                rounded(self.f[0]);
+                if (nf) {
+                    self.f[0][7] = std.math.nan(f32);
+                    self.f[0][11] = std.math.inf(f32);
+                    self.f[0][13] = -std.math.inf(f32);
+                }
+                const rule = self.drawRule();
+                var cfg: [8]u32 = .{ @bitCast(@as(f32, @floatCast(1.0 / rule.temperature))), @bitCast(@as(f32, @floatCast(rule.top_p))), @bitCast(rule.min_log), rule.top_k, @truncate(rule.seed), @truncate(rule.seed >> 32), 0, @intFromBool(rule.greedy) };
+                self.refs[0] = try self.input(self.f[0], true);
+                self.refs[1] = try self.rig.input(std.mem.sliceAsBytes(&cfg));
+                self.outs[0] = try self.rig.output(4);
+            },
         }
         return true;
+    }
+
+    const DrawRule = struct { greedy: bool = false, seed: u64 = 0, temperature: f32 = 1, top_k: u32 = 0, top_p: f32 = 1, min_log: f32 = -std.math.inf(f32) };
+
+    /// The sampling rule of a draw shape.
+    fn drawRule(self: *const Probe) DrawRule {
+        return switch (self.shape.rows) {
+            1 => .{ .greedy = true },
+            2 => .{ .seed = 7, .temperature = 0.8, .top_k = 40, .top_p = 0.95 },
+            3 => .{ .seed = 8, .temperature = 1.0, .top_k = 0, .top_p = 1.0 },
+            4 => .{ .seed = 9, .temperature = 0.7, .top_k = 0, .top_p = 0.9 },
+            else => .{ .seed = 11, .temperature = 0.8, .top_k = 0, .top_p = 1.0, .min_log = @floatCast(@log(@as(f64, 0.05))) },
+        };
+    }
+
+    const draw_position: u32 = 12345;
+
+    fn mix(v: u64) u64 {
+        var x = v;
+        x ^= x >> 30;
+        x *%= 0xBF58476D1CE4E5B9;
+        x ^= x >> 27;
+        x *%= 0x94D049BB133111EB;
+        return x ^ (x >> 31);
+    }
+
+    const Cand = struct { v: f32, i: u32 };
+    fn orderKey(v: f32) u32 {
+        const b: u32 = @bitCast(v);
+        return if (b & 0x8000_0000 != 0) ~b else b | 0x8000_0000;
+    }
+    fn better(_: void, a: Cand, b: Cand) bool {
+        const ka = orderKey(a.v);
+        const kb = orderKey(b.v);
+        return ka > kb or (ka == kb and a.i < b.i);
+    }
+
+    /// The host sampler's draw (the rule of gpu_rule.sample, with float64 sums) over the probe's BF16 row.
+    fn drawReference(self: *Probe) !u32 {
+        const rule = self.drawRule();
+        const logits = self.f[0];
+        const inv_t: f32 = if (rule.greedy) 1.0 else @floatCast(1.0 / @as(f64, rule.temperature));
+        const all = try self.a.alloc(Cand, logits.len);
+        defer self.a.free(all);
+        var m = -std.math.inf(f32);
+        for (all, logits, 0..) |*cand, l, i| {
+            cand.* = .{ .v = l * inv_t, .i = @intCast(i) };
+            m = @max(m, cand.v);
+        }
+        std.mem.sort(Cand, all, {}, better);
+        if (rule.greedy) return all[0].i;
+        const n: usize = if (rule.top_k == 0 or rule.top_k > 1024) 1024 else rule.top_k;
+        var norm: f64 = 0;
+        if (rule.top_k == 0) {
+            for (all) |cand| norm += @exp(@as(f64, cand.v) - m);
+        } else for (all[0..n]) |cand| {
+            norm += @exp(@as(f64, cand.v) - m);
+        }
+        var keep: usize = n;
+        if (rule.top_p > 0 and rule.top_p < 1) {
+            var cum: f64 = 0;
+            for (all[0..n], 0..) |cand, j| {
+                cum += @exp(@as(f64, cand.v) - m) / norm;
+                if (cum >= rule.top_p) {
+                    keep = j + 1;
+                    break;
+                }
+            }
+        }
+        if (rule.min_log > -std.math.inf(f32)) {
+            var j: usize = 0;
+            while (j < keep and all[j].v >= m + rule.min_log) j += 1;
+            keep = j;
+        }
+        const base = mix(mix(rule.seed +% 0x9E3779B97F4A7C15) ^ (@as(u64, draw_position) *% 0xD1B54A32D192ED03));
+        var best: usize = 0;
+        var best_score = -std.math.inf(f64);
+        for (all[0..keep], 0..) |cand, t| {
+            const x = mix(base ^ cand.i);
+            const u = (@as(f64, @floatFromInt(@as(u32, @intCast(x >> 40)))) + 0.5) / 16777216.0;
+            const score = @as(f64, cand.v) - @log(-@log(u));
+            if (t == 0 or score > best_score) {
+                best = t;
+                best_score = score;
+            }
+        }
+        return all[best].i;
+    }
+
+    fn drawCheck(self: *Probe, gate: g.Gate) !?[]const u8 {
+        const bytes = try self.rig.outputBytes();
+        const got = std.mem.readInt(u32, bytes[0..4], .little);
+        if (got >= host.vocab) return "the draw returned a token past the vocabulary";
+        if (gate == .nonfinite) return null;
+        const want = self.drawReference() catch return "the host reference failed";
+        if (got != want) {
+            if (!self.control) std.debug.print("DSPARK draw rule {d}: got {d} want {d}\n", .{ self.shape.rows, got, want });
+            return "the drawn token differs from the host sampler's";
+        }
+        return null;
     }
 
     pub fn run(self: *Probe) !void {
@@ -426,9 +551,10 @@ pub const Probe = struct {
             .residual_norm => try host.residualNorm(k, s, R[0], R[1], R[2], O[0], O[1], 8, self.shape.k != 0),
             .swiglu => try host.swiglu(k, s, R[0], R[1], O[0], 8 * INTER),
             .kappa => try host.kappa(k, s, R[0], R[1], R[2], R[3], O[0], n),
-            .recurrent => try host.recurrentStep(k, s, R[0], R[1], R[2], R[3], O[0], O[1], O[2], 1),
+            .recurrent => try host.recurrentStep(k, s, R[0], R[1], R[2], R[3], O[0], O[1], O[2], R[4]),
             .base => try host.base(k, s, R[0], R[1], O[0], n, @intCast(self.shape.n)),
             .logits => try host.finalLogits(k, s, R[0], R[1], R[2], R[3], O[0]),
+            .draw => try host.draw(k, s, R[0], R[1], O[0], host.vocab, draw_position),
         }
         try s.synchronize();
     }
@@ -610,6 +736,7 @@ pub const Probe = struct {
                 for (0..H) |d| dot += @as(F, self.f[0][id * H + d]) * @as(F, self.f[1][row * H + d]);
                 want[row * self.shape.n + id] = bf(dot);
             },
+            .draw => {},
             .logits => for (0..host.vocab) |i| {
                 var dot: F = 0;
                 for (0..RANK) |d| dot += @as(F, c.fromBf16(self.phi[i * RANK + d])) * @as(F, self.f[2][d]);
@@ -672,6 +799,7 @@ pub const Probe = struct {
 
     pub fn check(self: *Probe, gate: g.Gate) !?[]const u8 {
         if (gate != .shapes and gate != .nonfinite) return "numeric hooks must be used";
+        if (self.kind == .draw) return self.drawCheck(gate);
         const want = try self.a.alloc(f64, self.count());
         defer self.a.free(want);
         @memset(want, 0);
@@ -694,6 +822,8 @@ pub const Probe = struct {
                     const relative: f64 = switch (self.kind) {
                         .fuse_taps, .block_qkv, .context_kv, .swiglu, .logits => 0.02,
                         .attention => 0.03,
+                        // the DPAS adds 16 products at a time, not the serial chain: within an FP32 rounding, so one BF16 unit
+                        .base => 0.0079,
                         else => 0,
                     };
                     const got = c.fromBf16(bits);

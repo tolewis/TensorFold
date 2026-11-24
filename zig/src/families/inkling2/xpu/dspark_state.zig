@@ -24,7 +24,7 @@ fn sizes() [fields.len]usize {
     const a = absorb_rows;
     const b = 2;
     return .{
-        r * 4,                r * hidden * b,     r * hidden * b,       r * hidden * b,       r * hidden * b,
+        r * 8,                r * hidden * b,     r * hidden * b,       r * hidden * b,       r * hidden * b,
         r * query * b,        r * kv * b,         r * kv * b,           r * query * b,        r * kv * b,
         r * kv * b,           r * query * b,      r * intermediate * b, r * intermediate * b, r * intermediate * b,
         (r - 1) * 201024 * b, 4 * a * hidden * b, a * kv * b,           a * kv * b,           (r - 1) * 3 * rank * 4,

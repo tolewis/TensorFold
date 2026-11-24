@@ -1,5 +1,5 @@
 // The kernel contract's planted controls for Mini DSpark on XPU: dspark.cl with one arithmetic mistake in each of its
-// eleven kernels, under the names tf_ctl_ink2_dspark_*. Each mistake must turn gate 3 red at that kernel's shapes.
+// twelve kernels, under the names tf_ctl_ink2_dspark_*. Each mistake must turn gate 3 red at that kernel's shapes.
 
 #define DSP_NAME(x) tf_ctl_ink2_dspark_##x
 
@@ -24,5 +24,8 @@
 #define DSP_BASE_OUT(dot) (30.0f * tanh((dot) / 30.0f))
 // logits: the folded bias keeps FP32 instead of rounding to BF16.
 #define DSP_BIAS(beta, dot) ((beta) + (dot))
+
+// draw: the Gumbel noise is added instead of subtracted, so a sampled draw takes the wrong token.
+#define DSP_DRAW_SCORE(v, u) ((v) + log(-log(u)))
 
 #include "dspark.cl"

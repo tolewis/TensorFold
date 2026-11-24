@@ -58,6 +58,7 @@ pub const Kind = enum {
     recurrent,
     base,
     logits,
+    draw,
 
     /// The kernel's name in the production image.
     pub fn symbol(k: Kind) [:0]const u8 {
@@ -97,6 +98,7 @@ pub const Kind = enum {
             .recurrent => 8,
             .base => 5,
             .logits => 6,
+            .draw => 5,
         };
     }
 };
@@ -122,6 +124,7 @@ pub const Kernels = struct {
     recurrent: xpu.Kernel,
     base: xpu.Kernel,
     logits: xpu.Kernel,
+    draw: xpu.Kernel,
 
     /// Creates every kernel of `module`, the production one or the control image's planted copy.
     pub fn load(module: xpu.Module, control: bool) !Kernels {
@@ -195,8 +198,9 @@ pub fn kappa(k: *const Kernels, s: xpu.Stream, y: Ref, newest_f: Ref, rnn_weight
     try xpu.launch.dispatch(k.kappa, s, .{ blocks(@as(usize, rows) * rnn_width, 256), 1, 1 }, .{ y, newest_f, rnn_weight, rnn_bias, out, rows });
 }
 
-/// One recurrent step writes rounded Z, the next BF16 state and BF16 lambda for rows 1..7 in turn.
-pub fn recurrentStep(k: *const Kernels, s: xpu.Stream, state: Ref, kappa_row: Ref, rnn_weight: Ref, markov_w1: Ref, z: Ref, next_state: Ref, lambda: Ref, previous_token: u32) !void {
+/// One recurrent step writes rounded Z, the next BF16 state and BF16 lambda for rows 1..7 in turn. `previous_token` is the
+/// device address of the one u32 the Markov row is read from.
+pub fn recurrentStep(k: *const Kernels, s: xpu.Stream, state: Ref, kappa_row: Ref, rnn_weight: Ref, markov_w1: Ref, z: Ref, next_state: Ref, lambda: Ref, previous_token: Ref) !void {
     try xpu.launch.dispatch(k.recurrent, s, .{ 1, 1, 1 }, .{ state, kappa_row, rnn_weight, markov_w1, z, next_state, lambda, previous_token });
 }
 
@@ -209,6 +213,13 @@ pub fn base(k: *const Kernels, s: xpu.Stream, unembed: Ref, y: Ref, out: Ref, ro
 /// Folded Phi/beta correction and target-style 30 tanh softcap, restricted to Mini's 200058 logits.
 pub fn finalLogits(k: *const Kernels, s: xpu.Stream, base_values: Ref, phi: Ref, beta: Ref, lambda: Ref, out: Ref) !void {
     try xpu.launch.dispatch(k.logits, s, .{ blocks(vocab, 256), 1, 1 }, .{ base_values, phi, beta, lambda, out, vocab });
+}
+
+/// The draft draw: one work-group reads a row of BF16 logits (`vocabulary_count` of them) and writes the token it draws to
+/// `token_out`. `cfg` is 8 u32: 1/T bits, top_p bits, ln(min_p) bits, top_k, seed low, seed high, 0, greedy.
+pub fn draw(k: *const Kernels, s: xpu.Stream, logits: Ref, cfg: Ref, token_out: Ref, vocabulary_count: u32, position: u32) !void {
+    std.debug.assert(vocabulary_count > 0 and vocabulary_count <= vocab);
+    try xpu.launch.dispatch(k.draw, s, .{ 1, 1, 1 }, .{ logits, cfg, token_out, vocabulary_count, position });
 }
 
 test "every kernel has its own symbol in both images, and its argument count is listed" {
