@@ -199,6 +199,9 @@ const KlStats = struct {
             k.max = d;
             k.max_row = k.rows;
         }
+        if (std.c.getenv("TF_TP_ROWKL") != null) {
+            std.debug.print("row {d} kl {e:.4} top1 {d} dump {d} ours {d}\n", .{ k.rows, d, @intFromBool(tp.id == tq.id), tp.id, tq.id });
+        }
         k.rows += 1;
         if (tp.id == tq.id) k.agree += 1;
     }
