@@ -167,8 +167,9 @@ const Run = struct {
         const s = g.sc;
         const lp = g.m.weight_plan.at(v.layer);
         const w = &g.m.weights.layers[v.layer];
-        const raw = at(if (key) s.k_conv else s.v_conv, base * state.kv_width * 2);
-        const projected = at(if (key) s.k_raw else s.v_raw, base * state.kv_width * 2);
+        const kv_stride = g.m.options.place.kvWidth() * 2;
+        const raw = at(if (key) s.k_conv else s.v_conv, base * kv_stride);
+        const projected = at(if (key) s.k_raw else s.v_raw, base * kv_stride);
         const normalized = if (key) s.k_norm else if (v.hasMessages() or lp.kind == .global) s.v_norm else s.q_norm;
         const conv_state: usize = if (key) 0 else 1;
         const history = cache.history(v.cache_slot, conv_state).ptr();
@@ -201,13 +202,13 @@ const Run = struct {
             try g.convInputForAttention(cache, v, base, rows, true);
             try g.convInputForAttention(cache, v, base, rows, false);
             const k = &g.p.attention;
-            const q_at = base * state.query_width * 2;
-            const tab_at = base * 24 * ap.extent * 2;
-            try attention.prep(k, g.s, rr, layer, prep, meta, .{ aref(s.q_raw, q_at), aref(s.k_conv, base * state.kv_width * 2), aref(s.v_conv, base * state.kv_width * 2), aref(s.rel_raw, base * state.rel_width * 2) }, .{ aref(w.attn.q_scale.buf, 0), aref(w.attn.rel_scale.buf, 0) }, aref(s.q_prep, q_at), aref(s.rel_prep, tab_at), kv);
+            const q_at = base * pl.qWidth() * 2;
+            const tab_at = base * pl.qHeads() * ap.extent * 2;
+            try attention.prep(k, g.s, rr, layer, prep, meta, .{ aref(s.q_raw, q_at), aref(s.k_conv, base * state.kv_width * 2), aref(s.v_conv, base * state.kv_width * 2), aref(s.rel_raw, base * pl.relWidth() * 2) }, .{ aref(w.attn.q_scale.buf, 0), aref(w.attn.rel_scale.buf, 0) }, aref(s.q_prep, q_at), aref(s.rel_prep, tab_at), kv);
             try attention.relTable(k, g.s, rr, aref(s.rel_prep, tab_at), aref(w.attn.rel_projection.buf, 0), aref(s.rel_tab, tab_at));
-            const part = base * 24 * s.stride * ap.head_dim * 4;
-            const part_ml = base * 24 * s.stride * 8;
-            try attention.attend(k, g.s, rr, layer, s.stride, meta, aref(s.q_prep, q_at), kv, aref(s.rel_tab, tab_at), aref(s.part_o, part), aref(s.part_ml, part_ml), aref(s.sink, base * 24 * 2), aref(s.gate, q_at), aref(s.att, q_at));
+            const part = base * pl.qHeads() * s.stride * ap.head_dim * 4;
+            const part_ml = base * pl.qHeads() * s.stride * 8;
+            try attention.attend(k, g.s, rr, layer, s.stride, meta, aref(s.q_prep, q_at), kv, aref(s.rel_tab, tab_at), aref(s.part_o, part), aref(s.part_ml, part_ml), aref(s.sink, base * pl.qHeads() * 2), aref(s.gate, q_at), aref(s.att, q_at));
             base += rows;
         }
     }
