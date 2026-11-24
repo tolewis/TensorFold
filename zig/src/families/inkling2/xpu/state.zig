@@ -9,9 +9,19 @@ const rt = xpu.rt;
 
 pub const window_rows = 16;
 pub const batch_rows = 32;
-pub const prompt_rows = 64;
+/// Rows of one prompt chunk (prefill.zig); the scratch is sized for them.
+pub const prompt_rows = 2048;
 pub const max_rows = 64;
+/// The most rows a prompt chunk takes: the scratch rows beyond `max_rows` serve only the prompt path of prefill.zig.
+pub const max_prefill_rows = 2048;
 pub const max_segments = batch_rows;
+/// Segment slots of a prompt chunk: its global-layer slices of at least `max_rows` rows, then its sliding-layer slices.
+pub const prefill_segments = max_segments + 8;
+/// Positions of the staging ring of a sliding layer in a chunk of `rows` rows: the window before the chunk and the chunk.
+pub fn stageRows(rows: usize) usize {
+    // 16 positions of slack: a ring of exactly window + chunk positions made the prep launch fault at 1,020 rows and more
+    return std.mem.alignForward(usize, 1023 + rows, 16) + 16;
+}
 pub const hidden = 2304;
 pub const feature_taps = 4;
 pub const feature_row_bytes = feature_taps * hidden * 2;
@@ -303,11 +313,14 @@ pub const fields = [_][]const u8{
     "partial",  "ar",         "gated",      "mlp_ar",    "mlp_gated",  "q_norm",    "k_norm",        "v_norm",   "q_raw",   "k_raw",
     "v_raw",    "rel_raw",    "sink",       "gate",      "k_conv",     "v_conv",    "q_prep",        "rel_prep", "rel_tab", "part_o",
     "part_ml",  "att",        "attn_dense", "attn_conv", "mlp_normed", "route_ids", "route_weights", "gu",       "down",    "mlp_out",
-    "mlp_conv", "logits_all", "members",    "items",     "count",     "zeta",
+    "mlp_conv", "logits_all", "members",    "items",     "count",     "zeta",          "staging",
+    "inv",      "xs",        "xp",        "kstage",    "vstage",
 };
 
 fn sizes(rows: usize, capacity: usize) [fields.len]usize {
     const r = rows;
+    // the decode-style attention partials and the all-rows logits serve at most `max_rows` rows a launch
+    const a: usize = @min(rows, max_rows);
     const h = hidden;
     const q = query_width;
     const kv = kv_width;
@@ -316,13 +329,15 @@ fn sizes(rows: usize, capacity: usize) [fields.len]usize {
     const stride = partialStride(capacity);
     const items = @min(r * experts_per_token, 128 + r * experts_per_token / 32);
     return .{
-        r * 4,                     r * 4,                              r * 4,                                     max_segments * @sizeOf(ap.Seg), r * h * bf,     r * h * bf,     r * block_slots * h * bf,
+        r * 4,                     r * 4,                              r * 4,                                     prefill_segments * @sizeOf(ap.Seg), r * h * bf,     r * h * bf,     r * block_slots * h * bf,
         r * h * bf,                r * h * bf,                         r * message_entries * h * fp,              r * h * fp,                     3 * r * h * fp, 3 * r * h * fp, r * h * fp,
         r * h * fp,                r * h * bf,                         r * h * bf,                                r * h * bf,                     r * q * bf,     r * kv * bf,    r * kv * bf,
         r * rel_width * bf,        r * 24 * bf,                        r * q * bf,                                r * kv * bf,                    r * kv * bf,    r * q * bf,     r * rel_width * bf,
-        r * 24 * ap.extent * bf,   r * 24 * stride * ap.head_dim * fp, r * 24 * stride * 2 * fp,                  r * q * bf,                     r * h * bf,     r * h * bf,     r * h * bf,
-        r * experts_per_token * 4, r * experts_per_token * fp,         r * experts_per_token * intermediate * bf, r * experts_per_token * h * bf, r * h * bf,     r * h * bf,     r * vocabulary * fp,
-        r * experts_per_token * 4, items * 3 * 4,                      4,                                         r * 64 * fp,
+        r * 24 * ap.extent * bf,   @max(a * stride, r) * 24 * ap.head_dim * fp, @max(a * stride, r) * 24 * 2 * fp,                  r * q * bf,                     r * h * bf,     r * h * bf,     r * h * bf,
+        r * experts_per_token * 4, r * experts_per_token * fp,         r * experts_per_token * intermediate * bf, r * experts_per_token * h * bf, r * h * bf,     r * h * bf,     a * vocabulary * fp,
+        r * experts_per_token * 4, items * 3 * 4,                      4,                                         r * 64 * fp,                    (3 + r) * hidden * bf,
+        r * experts_per_token * 4, r * experts_per_token * h * bf, r * 2 * h * bf,
+        8 * stageRows(r) * ap.head_dim * bf, 8 * stageRows(r) * ap.head_dim * bf,
     };
 }
 
@@ -381,6 +396,16 @@ pub const Scratch = struct {
     count: rt.Buffer,
     /// The message gates' D projection [row][64] binary32, written by one launch and read by the next.
     zeta: rt.Buffer,
+    /// The prompt path's convolution window [3 + row][channel] bf16, in place of the cache's staged taps.
+    staging: rt.Buffer,
+    /// The prompt experts' sorted routes: the sorted row of each route, and the activation rows in sorted order.
+    inv: rt.Buffer,
+    xs: rt.Buffer,
+    /// The dense projections' reordered input rows [row][k] bf16 (k at most `2 * hidden`).
+    xp: rt.Buffer,
+    /// The sliding layers' K and V of the window before a chunk and of the chunk, in a ring of `stageRows(rows)` positions.
+    kstage: rt.Buffer,
+    vstage: rt.Buffer,
     /// Opt-in DSpark features [row][tap][H], allocated by prepare_features.
     taps: ?rt.Buffer = null,
     rows: usize,
@@ -391,7 +416,7 @@ pub const Scratch = struct {
     /// `capacity` is the largest global capacity of any cache the scratch serves; it sizes the attention partials.
     pub fn init(r: *rt.Runtime, rows: usize, capacity: usize) !Scratch {
         @setEvalBranchQuota(10_000);
-        if (rows == 0 or rows > max_rows or capacity == 0 or capacity > max_capacity) return error.Inkling2ScratchRows;
+        if (rows == 0 or rows > max_prefill_rows or capacity == 0 or capacity > max_capacity) return error.Inkling2ScratchRows;
         const ns = sizes(rows, capacity);
         var s: Scratch = undefined;
         var made: usize = 0;

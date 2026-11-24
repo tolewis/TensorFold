@@ -334,7 +334,7 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     const p: *const model_file.Pipelines = if (m.pipelines) |*x| x else return error.Inkling2NoKernels;
     const ctx = m.ctx orelse return error.Inkling2NoKernels;
     const rows = ids.len;
-    if (rows == 0 or rows > s.rows or segments.len == 0 or segments.len > state.max_segments or (!options.all and segments.len != 1)) return error.Inkling2RowsExceeded;
+    if (rows == 0 or rows > s.rows or rows > state.max_rows or segments.len == 0 or segments.len > state.max_segments or (!options.all and segments.len != 1)) return error.Inkling2RowsExceeded;
     var pos: [state.max_rows]i32 = undefined;
     var seg_of: [state.max_rows]i32 = undefined;
     var segs: [state.max_segments]ap.Seg = undefined;
