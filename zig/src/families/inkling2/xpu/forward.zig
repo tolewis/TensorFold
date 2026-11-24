@@ -46,6 +46,23 @@ fn dumpF32(r: *xpu.rt.Runtime, rank: u32, name: []const u8, src: ?*anyopaque, n:
     _ = close(fd);
 }
 
+fn dumpNamed(g: *const Run, row_tag: []const u8, what: []const u8, src: Ptr, bytes: usize) !void {
+    const dir_z = std.c.getenv("TF_TP_DUMP") orelse return;
+    const ptr = src orelse return;
+    try g.m.r.sync();
+    const host = try g.m.gpa.alloc(u8, bytes);
+    defer g.m.gpa.free(host);
+    try g.m.r.download(host, .{ .rt = g.m.r, .ptr = ptr, .len = bytes });
+    try g.m.r.sync();
+    var path_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}-{s}-r{d}.bin", .{ std.mem.span(dir_z), row_tag, what, g.m.options.place.rank }) catch return;
+    path_buf[path.len] = 0;
+    const fd = open(path_buf[0..path.len :0], 1 | 64 | 512, 0o644);
+    if (fd < 0) return;
+    _ = write(fd, host.ptr, host.len);
+    _ = close(fd);
+}
+
 fn dumpBytes(g: *const Run, visit_i: usize, tag: []const u8, src: ?*anyopaque, bytes: usize) !void {
     if (!dumpWanted()) return;
     const dir_z = std.c.getenv("TF_TP_DUMP") orelse return;
@@ -363,6 +380,16 @@ fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) 
         try g.dense(w.attn.sink, at(s.q_norm, 0), at(s.sink, 0), rows);
         try g.dense(w.attn.gate, at(s.q_norm, 0), at(s.gate, 0), rows);
         try g.attendSegments(v, segments);
+        if (visit_i == 0 and std.c.getenv("TF_TP_HEAD") != null and (dump_fwd == 0 or dump_fwd == 15)) {
+            const local: usize = if (dump_fwd == 0) 10 else 0;
+            const tag = if (dump_fwd == 0) "r10" else "r960";
+            const pl = g.m.options.place;
+            try dumpNamed(&g, tag, "att", plus(at(s.att, 0), local * pl.qWidth() * 2), pl.qWidth() * 2);
+            try dumpNamed(&g, tag, "q", plus(at(s.q_prep, 0), local * pl.qWidth() * 2), pl.qWidth() * 2);
+            try dumpNamed(&g, tag, "rel", plus(at(s.rel_tab, 0), local * pl.qHeads() * ap.extent * 2), pl.qHeads() * ap.extent * 2);
+            try dumpNamed(&g, tag, "sink", plus(at(s.sink, 0), local * pl.qHeads() * 2), pl.qHeads() * 2);
+            try dumpNamed(&g, tag, "k", plus(at(s.k_conv, 0), local * pl.kvWidth() * 2), pl.kvWidth() * 2);
+        }
         try g.dense(w.attn.wo, at(s.att, 0), at(s.attn_dense, 0), rows);
         if (g.m.options.place.split()) if (group.live) |gp| try gp.allReduce(at(s.attn_dense, 0).?, @intCast(rows));
         try dumpBytes(&g, visit_i, "wo", at(s.attn_dense, 0), 2 * state.hidden * 2);
@@ -396,8 +423,14 @@ fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) 
     }
 
     fn commitFullHistories(g: Run, segments: []const Segment) !void {
+        const pl = g.m.options.place;
         for (segments) |seg| for (0..state.visit_slots) |slot| for (0..state.conv_states) |cs| {
-            try g.copyBf16(seg.cache.staged(slot, cs, seg.rows).ptr(), seg.cache.history(slot, cs).ptr(), 3 * state.convWidth(cs));
+            // KV convolution writes taps at the rank width. The slot stride is the full width, so a full-width
+            // copy reads the wrong rows after the first chunk.
+            const kv = cs < 2;
+            const channels: usize = if (kv) pl.kvWidth() else state.convWidth(cs);
+            const src = if (kv) plus(seg.cache.staged(slot, cs, 0).ptr(), seg.rows * channels * 2) else seg.cache.staged(slot, cs, seg.rows).ptr();
+            try g.copyBf16(src, seg.cache.history(slot, cs).ptr(), 3 * channels);
         };
     }
 };
