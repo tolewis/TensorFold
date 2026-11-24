@@ -21,6 +21,7 @@ const ink2_attn_k = @import("inkling2_attention.zig");
 const ink2_k = @import("inkling2_experts.zig");
 const dense_k = @import("inkling2_dense.zig");
 const dense_q8_k = @import("inkling2_dense_q8.zig");
+const pf_experts_k = @import("inkling2_prefill_experts.zig");
 
 const g = core.gates;
 
@@ -128,6 +129,9 @@ pub fn main(init: std.process.Init) !u8 {
     var dense_q8 = try dense_q8_k.Suite.init(a, &dev);
     defer dense_q8.deinit();
     try dense_q8.collect(&kernels);
+    var pf_experts = try pf_experts_k.Suite.init(a, &dev);
+    defer pf_experts.deinit();
+    try pf_experts.collect(&kernels);
     if (only) |text| {
         var keep: usize = 0;
         for (kernels.items) |k| {

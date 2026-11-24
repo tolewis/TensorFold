@@ -82,7 +82,7 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
 
     const files = b.addWriteFiles();
     if (prebuilt) |dir| {
-        for ([_][]const u8{ "glue", "tp", "contract_controls", "contract_gate_controls", "decode", "contract_attn_upstream", "contract_merge_upstream", "contract_inkling2_loop", "contract_inkling2_loop_controls", "inkling2_dspark", "contract_inkling2_dspark_controls", "contract_inkling2_experts", "contract_inkling2_controls", "inkling2_dense", "contract_inkling2_dense_store", "contract_inkling2_dense_sums", "inkling2_dense_q8", "contract_inkling2_dense_q8_store", "contract_inkling2_dense_q8_sums", "contract_inkling2_dense_q8_scale" } ++ inkling2.names) |name| {
+        for ([_][]const u8{ "glue", "tp", "contract_controls", "contract_gate_controls", "decode", "contract_attn_upstream", "contract_merge_upstream", "contract_inkling2_loop", "contract_inkling2_loop_controls", "inkling2_dspark", "contract_inkling2_dspark_controls", "contract_inkling2_experts", "contract_inkling2_controls", "inkling2_dense", "contract_inkling2_dense_store", "contract_inkling2_dense_sums", "inkling2_dense_q8", "contract_inkling2_dense_q8_store", "contract_inkling2_dense_q8_sums", "contract_inkling2_dense_q8_scale", "inkling2_prefill_experts", "contract_inkling2_prefill_experts_controls" } ++ inkling2.names) |name| {
             _ = files.addCopyFile(.{ .cwd_relative = b.fmt("{s}/{s}.bin", .{ dir, name }) }, b.fmt("{s}.bin", .{name}));
         }
         for (ink2_attn_images ++ ink2_attn_controls) |src| {
@@ -150,6 +150,8 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         \\pub const contract_inkling2_dense_q8_store align(8) = @embedFile("contract_inkling2_dense_q8_store.bin").*;
         \\pub const contract_inkling2_dense_q8_sums align(8) = @embedFile("contract_inkling2_dense_q8_sums.bin").*;
         \\pub const contract_inkling2_dense_q8_scale align(8) = @embedFile("contract_inkling2_dense_q8_scale.bin").*;
+        \\pub const inkling2_prefill_experts align(8) = @embedFile("inkling2_prefill_experts.bin").*;
+        \\pub const contract_inkling2_prefill_experts_controls align(8) = @embedFile("contract_inkling2_prefill_experts_controls.bin").*;
     ), .target = target, .optimize = optimize });
     // Inkling 2 Mini's loop: the host wrapper, its pure launch plan, and the host float model the device is held to
     const loop_plan = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/metal/loop_plan.zig"), .target = target, .optimize = optimize });
@@ -167,6 +169,7 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         .imports = &.{.{ .name = "xpu", .module = xpu }},
     });
     const experts_host = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/xpu/experts.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "xpu", .module = xpu }} });
+    const prefill_experts_host = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/xpu/prefill_experts.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "xpu", .module = xpu }} });
     b.step("test-inkling2-xpu-experts-host", "Inkling 2's XPU experts host wrapper: plan and call checks (no GPU)").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = experts_host })).step);
     const exe = b.addExecutable(.{ .name = "tf-xpu-contract-run", .root_module = b.createModule(.{
         .root_source_file = b.path("zig/tests/xpu/contract_run.zig"),
@@ -177,6 +180,7 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
             .{ .name = "core", .module = core },
             .{ .name = "xpu", .module = xpu },
             .{ .name = "inkling2_xpu_experts", .module = experts_host },
+            .{ .name = "inkling2_prefill_experts_host", .module = prefill_experts_host },
             .{ .name = "ze", .module = ze },
             .{ .name = "xpu_contract_images", .module = images },
             .{ .name = "inkling2_xpu_loop", .module = loop_host },
@@ -304,6 +308,14 @@ const contract_images = [_]Source{
 
 /// Inkling 2 Mini's DSpark kernels and their planted controls (the controls file includes the kernels).
 const inkling2_images = [_]Source{
+    // The prompt chunk's grouped expert GEMMs (plan, gather, four GEMMs, combine) and their planted twins (the controls file includes the source).
+    .{ .name = "inkling2_prefill_experts", .path = "zig/kernels/xpu/inkling2/prefill_experts.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2" },
+    .{
+        .name = "contract_inkling2_prefill_experts_controls",
+        .path = "zig/kernels/xpu/inkling2/contract_prefill_experts_controls.cl",
+        .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2",
+        .inputs = &.{"zig/kernels/xpu/inkling2/prefill_experts.cl"},
+    },
     .{ .name = "inkling2_dspark", .path = "zig/kernels/xpu/inkling2/dspark.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2" },
     .{
         .name = "contract_inkling2_dspark_controls",

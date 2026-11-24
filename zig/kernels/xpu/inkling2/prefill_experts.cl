@@ -24,6 +24,18 @@
 #define PF_CAT(a, b) PF_CAT_(a, b)
 #define P(name) PF_CAT(PF_PREFIX, name)
 
+// The contract builds one kernel of this file under its own prefix with one fault planted (PF_PLANT_*); PF_ONLY picks the kernels.
+#ifndef PF_ONLY
+#define PF_ONLY 0xff
+#endif
+#define PF_K_PLAN 1
+#define PF_K_GATHER 2
+#define PF_K_NV_GU 4
+#define PF_K_NV_DOWN 8
+#define PF_K_MX_GU 16
+#define PF_K_MX_DOWN 32
+#define PF_K_COMBINE 64
+
 #define PF_MT 64        // sorted rows of one item: eight DPAS row tiles
 #define PF_NSG 8        // sub-groups of a work-group, each over 32 weight rows
 #define PF_EXPERTS 128
@@ -40,7 +52,11 @@ static inline float P(e4m3)(uint c) {
 }
 
 static inline float P(phi)(__global const float *amax, __global const float *den, uint expert) {
+#ifdef PF_PLANT_PHI
+  const float a = 2.0f * P(bf_to_f)(P(f_to_bf)(amax[expert]));
+#else
   const float a = P(bf_to_f)(P(f_to_bf)(amax[expert]));
+#endif
   const float d = P(bf_to_f)(P(f_to_bf)(den[0]));
   return a / d;
 }
@@ -74,6 +90,9 @@ static inline float P(mx_value)(uint code, float f1, float f2) {
 }
 
 static inline void P(mx_factors)(uint scale, float *f1, float *f2) {
+#ifdef PF_PLANT_SCALE
+  scale ^= 1u;
+#endif
   const int e = (int)scale - 7;
   const int a = e >> 1;
   *f1 = as_float((uint)(a + 127) << 23);
@@ -102,6 +121,7 @@ static inline ushort P(act)(float gate_dot, float up_dot) {
 // ---- plan: stable counting sort of the routes by expert, items of at most `mt` sorted rows --------------------------
 // One work-group of 256. Thread t counts its own run of routes, the runs' counts become offsets in thread order (so the
 // sort is stable), thread 0 lists the items, every thread places its run. order[sorted] = route, inv[route] = sorted.
+#if PF_ONLY & PF_K_PLAN
 __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(256, 1, 1)))
 __kernel void P(plan)(__global const int *ids, __global int *order, __global int *inv, __global int *items, __global int *item_count,
                       uint routes, uint mt) {
@@ -148,21 +168,32 @@ __kernel void P(plan)(__global const int *ids, __global int *order, __global int
     const uint e = (uint)ids[p];
     if (e < PF_EXPERTS) {
       const int pos = eoff[e] + (int)cnt[t * PF_EXPERTS + e]++;
+#ifdef PF_PLANT_PLAN
+      order[pos] = (int)(p ^ 1u);
+#else
       order[pos] = (int)p;
+#endif
       inv[p] = pos;
     }
   }
 }
+#endif
 
 // Grid (sorted rows), work-group 256: xs[sorted] = x[order[sorted] / topk], `k` BF16 values a row, a multiple of 8.
+#if PF_ONLY & PF_K_GATHER
 __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(256, 1, 1)))
 __kernel void P(gather)(__global const ushort *x, __global const int *order, __global ushort *xs, uint k, uint topk) {
   const uint sp = get_group_id(0);
+#ifdef PF_PLANT_GATHER
+  const uint src = (uint)order[sp] % topk;
+#else
   const uint src = (uint)order[sp] / topk;
+#endif
   global const uint4 *from = (global const uint4 *)(x + (ulong)src * k);
   global uint4 *to = (global uint4 *)(xs + (ulong)sp * k);
   for (uint i = get_local_id(0); i < k / 8; i += 256) to[i] = from[i];
 }
+#endif
 
 // ---- GEMM kernels --------------------------------------------------------------------------------------------------
 
@@ -196,6 +227,13 @@ __kernel void P(gather)(__global const ushort *x, __global const int *order, __g
     acc[i][1] = 0.0f;                                                                                               \
   }
 
+#undef PF_GU_ACT
+#ifdef PF_PLANT_UP
+#define PF_GU_ACT const ushort a = P(act)(even ? g0 : p1, even ? g0 : g1);
+#else
+#define PF_GU_ACT const ushort a = P(act)(even ? g0 : p1, even ? p0 : g1);
+#endif
+
 // gate/up rows are interleaved (2c gate, 2c + 1 up); 32 weight rows make 16 activation columns, one block write a tile.
 #define PF_STORE_GU(ys, n)                                                                                          \
   _Pragma("unroll") for (uint i = 0; i < 8; i++) {                                                                  \
@@ -205,7 +243,7 @@ __kernel void P(gather)(__global const ushort *x, __global const int *order, __g
         const float g0 = acc[i][0][r], g1 = acc[i][1][r];                                                           \
         const float p0 = sub_group_shuffle_xor(g0, 1), p1 = sub_group_shuffle_xor(g1, 1);                           \
         const bool even = (lane & 1u) == 0;                                                                         \
-        const ushort a = P(act)(even ? g0 : p1, even ? p0 : g1);                                                    \
+        PF_GU_ACT                                                                                                  \
         o[r] = sub_group_shuffle(a, lane < 8 ? 2u * lane : 2u * (lane - 8u) + 1u);                                  \
       }                                                                                                             \
       intel_sub_group_2d_block_write_16b_8r16x1c((global void *)(ys), (n) * 2, height, (n) * 2, (int2)(col0 / 2u, first + 8u * i), (private ushort *)&o); \
@@ -303,27 +341,36 @@ static inline void P(mx_gemm)(__global const ushort *xs, __global const uchar *w
 
 #define PF_GEMM_ATTR __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(16 * PF_NSG, 1, 1)))
 
+#if PF_ONLY & PF_K_NV_GU
 PF_GEMM_ATTR __kernel void P(nvfp4_gu)(__global const ushort *xs, __global const uchar *w, __global const uchar *s, __global const float *amax,
                                        __global const float *den, __global const int *items, __global const int *item_count,
                                        __global ushort *ys, uint k, uint n) {
   P(nv_gemm)(xs, w, s, amax, den, items, item_count, ys, k, n, true);
 }
+#endif
+#if PF_ONLY & PF_K_NV_DOWN
 PF_GEMM_ATTR __kernel void P(nvfp4_down)(__global const ushort *xs, __global const uchar *w, __global const uchar *s, __global const float *amax,
                                          __global const float *den, __global const int *items, __global const int *item_count,
                                          __global ushort *ds, uint k, uint n) {
   P(nv_gemm)(xs, w, s, amax, den, items, item_count, ds, k, n, false);
 }
+#endif
+#if PF_ONLY & PF_K_MX_GU
 PF_GEMM_ATTR __kernel void P(mxfp8_gu)(__global const ushort *xs, __global const uchar *w, __global const uchar *s, __global const int *items,
                                        __global const int *item_count, __global ushort *ys, uint k, uint n) {
   P(mx_gemm)(xs, w, s, items, item_count, ys, k, n, true);
 }
+#endif
+#if PF_ONLY & PF_K_MX_DOWN
 PF_GEMM_ATTR __kernel void P(mxfp8_down)(__global const ushort *xs, __global const uchar *w, __global const uchar *s, __global const int *items,
                                          __global const int *item_count, __global ushort *ds, uint k, uint n) {
   P(mx_gemm)(xs, w, s, items, item_count, ds, k, n, false);
 }
+#endif
 
 // ---- combine: the route outputs of a token weigh in ascending expert order, then round once to BF16 -----------------
 // Grid (ceil(n / 256), rows). ds is in sorted order; inv maps a route to its sorted row.
+#if PF_ONLY & PF_K_COMBINE
 __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(256, 1, 1)))
 __kernel void P(combine)(__global const ushort *ds, __global const int *inv, __global const int *ids, __global const float *weights,
                          __global ushort *y, uint n, uint topk) {
@@ -339,6 +386,9 @@ __kernel void P(combine)(__global const ushort *ds, __global const int *inv, __g
       const int id = ids[token * topk + slot];
       rank += (id < mine || (id == mine && slot < lid)) ? 1u : 0u;
     }
+#ifdef PF_PLANT_ORDER
+    rank = lid;
+#endif
     rows[rank] = inv[token * topk + lid];
     wts[rank] = weights[token * topk + lid];
   }
@@ -350,3 +400,4 @@ __kernel void P(combine)(__global const ushort *ds, __global const int *inv, __g
   for (uint t = 0; t < 8; t++) sum += wts[t] * P(bf_to_f)(v[t]);
   y[(ulong)token * n + col] = P(f_to_bf)(sum);
 }
+#endif

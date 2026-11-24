@@ -11,6 +11,8 @@ pub const item_rows: u32 = 64;
 /// The weight rows one work-group covers (PF_NSG sub-groups of 32 rows).
 const group_cols: u32 = 256;
 pub const Ref = ?*anyopaque;
+/// The symbol prefix of the production kernels (PF_PREFIX in the source).
+pub const default_prefix = "tf_ink2_pf_";
 
 pub const Format = enum { nvfp4, mxfp8 };
 
@@ -23,21 +25,54 @@ pub const Kernels = struct {
     mxfp8_down: xpu.Kernel,
     combine: xpu.Kernel,
 
-    pub fn load(module: xpu.Module) !Kernels {
-        var plan_k = try module.kernel("tf_ink2_pf_plan", .{ 256, 1, 1 });
+    /// The kernels of `module` under `prefix` (the contract's planted twins carry their own).
+    pub fn loadPrefixed(module: xpu.Module, prefix: []const u8) !Kernels {
+        var plan_k = try one(module, prefix, "plan", 256);
         errdefer plan_k.deinit();
-        var gather_k = try module.kernel("tf_ink2_pf_gather", .{ 256, 1, 1 });
+        var gather_k = try one(module, prefix, "gather", 256);
         errdefer gather_k.deinit();
-        var nv_gu = try module.kernel("tf_ink2_pf_nvfp4_gu", .{ 128, 1, 1 });
+        var nv_gu = try one(module, prefix, "nvfp4_gu", 128);
         errdefer nv_gu.deinit();
-        var nv_down = try module.kernel("tf_ink2_pf_nvfp4_down", .{ 128, 1, 1 });
+        var nv_down = try one(module, prefix, "nvfp4_down", 128);
         errdefer nv_down.deinit();
-        var mx_gu = try module.kernel("tf_ink2_pf_mxfp8_gu", .{ 128, 1, 1 });
+        var mx_gu = try one(module, prefix, "mxfp8_gu", 128);
         errdefer mx_gu.deinit();
-        var mx_down = try module.kernel("tf_ink2_pf_mxfp8_down", .{ 128, 1, 1 });
+        var mx_down = try one(module, prefix, "mxfp8_down", 128);
         errdefer mx_down.deinit();
-        const combine_k = try module.kernel("tf_ink2_pf_combine", .{ 256, 1, 1 });
+        const combine_k = try one(module, prefix, "combine", 256);
         return .{ .plan = plan_k, .gather = gather_k, .nvfp4_gu = nv_gu, .nvfp4_down = nv_down, .mxfp8_gu = mx_gu, .mxfp8_down = mx_down, .combine = combine_k };
+    }
+
+    pub fn load(module: xpu.Module) !Kernels {
+        return loadPrefixed(module, default_prefix);
+    }
+
+    fn one(module: xpu.Module, prefix: []const u8, name: []const u8, group: u32) !xpu.Kernel {
+        var buf: [96]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "{s}{s}", .{ prefix, name });
+        buf[text.len] = 0;
+        return module.kernel(buf[0..text.len :0], .{ group, 1, 1 });
+    }
+
+    pub const Which = enum { plan, gather, nvfp4_gu, nvfp4_down, mxfp8_gu, mxfp8_down, combine };
+
+    /// Replaces one kernel by its namesake in another image (the contract's planted twin: one kernel of the production set).
+    pub fn swap(k: *Kernels, module: xpu.Module, prefix: []const u8, which: Which) !void {
+        const name = @tagName(which);
+        switch (which) {
+            .plan => try replace(&k.plan, try one(module, prefix, name, 256)),
+            .gather => try replace(&k.gather, try one(module, prefix, name, 256)),
+            .nvfp4_gu => try replace(&k.nvfp4_gu, try one(module, prefix, name, 128)),
+            .nvfp4_down => try replace(&k.nvfp4_down, try one(module, prefix, name, 128)),
+            .mxfp8_gu => try replace(&k.mxfp8_gu, try one(module, prefix, name, 128)),
+            .mxfp8_down => try replace(&k.mxfp8_down, try one(module, prefix, name, 128)),
+            .combine => try replace(&k.combine, try one(module, prefix, name, 256)),
+        }
+    }
+
+    fn replace(slot: *xpu.Kernel, with: xpu.Kernel) !void {
+        slot.deinit();
+        slot.* = with;
     }
 
     pub fn deinit(k: *Kernels) void {
