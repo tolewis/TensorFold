@@ -104,16 +104,19 @@ pub const Group = struct {
         const bytes: usize = @as(usize, n_f32) * 4;
         if (bytes > head_bytes) return error.Inkling2Tp;
         g.seq += 1;
-        // A flag word of its own. The all-reduce flag sits at blk_flag and would release this wait early.
-        const flag = blk_flag + 16;
+        // The handshake holds one row. Rank 1 must not write the next row until rank 0 has finished reading this one.
+        const ready = blk_flag + 16;
+        const consumed = blk_flag + 24;
         if (g.rank != 0) {
-            g.logRange("head-src", src);
             try g.r.stream(g.ctx).copy(g.peer_head.?, src, bytes);
-            if (std.c.getenv("TF_TP_HEAD_SYNC")) |v| if (v[0] != '0') try g.r.sync();
-            try g.writeFlag(off(g.peer_blk.?, flag));
-        } else try g.writeFlag(off(g.peer_blk.?, flag));
-        try g.waitFlag(off(g.blk.?, flag));
-        if (g.rank == 0) try g.r.stream(g.ctx).copy(dst, g.head, bytes);
+            try g.writeFlag(off(g.peer_blk.?, ready));
+            try g.waitFlag(off(g.blk.?, consumed));
+        } else {
+            try g.waitFlag(off(g.blk.?, ready));
+            try g.r.stream(g.ctx).copy(dst, g.head, bytes);
+            try g.r.sync();
+            try g.writeFlag(off(g.peer_blk.?, consumed));
+        }
     }
 
     pub fn note(g: *Group, op: Op, ids: []const u32, flags: u32) !void {
