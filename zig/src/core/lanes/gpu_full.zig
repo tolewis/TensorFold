@@ -70,12 +70,58 @@ pub fn plan(gpa: Allocator, logits: []const f32, s: Sampling) !Plan {
         m = @max(m, c.v);
     }
     std.mem.sort(rule.Cand, order, {}, rule.better);
-    const min_log = r.min_log;
-    var p = Plan{ .inv_t = inv_t, .m = m, .lo = @max(m + min_log, m - never) };
+    return planSorted(logits, order, m, s);
+}
+
+/// The plan from the row's best candidates in kernel order (at least 1,024, or top_k of them) and its largest scaled logit.
+fn planSorted(logits: []const f32, order: []const rule.Cand, m: f32, s: Sampling) Plan {
+    const r = rule.rule(s);
+    var p = Plan{ .inv_t = r.inv_t, .m = m, .lo = @max(m + r.min_log, m - never) };
     if (s.top_k != 0 and s.top_k < logits.len) p.top = markOf(order[s.top_k - 1]);
     const top_p = r.top_p;
     if (top_p > 0.0 and top_p < 1.0) p.cut = nucleus(logits, p, order, top_p);
     return p;
+}
+
+/// Whether `drawTop` reads the whole row: the draw is tf_sample_full's, whose normalizer sums every token.
+pub fn needsRow(s: Sampling) bool {
+    return fullVocabulary(s);
+}
+
+/// The most candidates `drawTop` takes, and needs when top_k is off or above them.
+pub const top_max = rule.candidates;
+
+/// `draw` from candidates a device selected: `top` is the row's best min(top_k, 1,024) tokens in kernel order (1,024 with
+/// top_k off), their scaled logits as `logits * inv_t` computed in float32. `row` is the row's logits, read only where
+/// `needsRow`. The draw is the one `draw` makes: the same arithmetic on the same values, without the sort of the row.
+pub fn drawTop(row: ?[]const f32, top: []const rule.Cand, s: Sampling, position: u32) u32 {
+    if (!needsRow(s)) return rule.pick(top, top[0].v, 0.0, s, position, null);
+    const logits = row.?;
+    std.debug.assert(s.top_k == 0 and top.len == top_max);
+    const p = planSorted(logits, top, top[0].v, s);
+    return raceTop(logits, top, p, s.seed, position);
+}
+
+/// `race` over a plan's kept tokens. When the nucleus ends inside the candidates every kept token is one of them, and the
+/// race reads those alone; the winner does not depend on the order the tokens are read in.
+fn raceTop(logits: []const f32, top: []const rule.Cand, p: Plan, seed: u64, position: u32) u32 {
+    const last = markOf(top[top.len - 1]);
+    if (!atOrBefore(p.cut.key, p.cut.id, last)) return race(logits, p, seed, position, null);
+    var bs = -std.math.inf(f32);
+    var bk: u32 = 0;
+    var bi: u32 = 0xFFFF_FFFF;
+    for (top) |c| {
+        if (!(c.v >= p.lo)) continue;
+        const k = rule.key(c.v);
+        if (!atOrBefore(k, c.i, p.top) or !atOrBefore(k, c.i, p.cut)) continue;
+        const score = c.v - @log(-@log(raceUniform(seed, position, c.i)));
+        if (beats(score, k, c.i, bs, bk, bi)) {
+            bs = score;
+            bk = k;
+            bi = c.i;
+        }
+    }
+    return @min(bi, @as(u32, @intCast(logits.len - 1)));
 }
 
 /// The nucleus's last token: tf_gpu_sample's sequential sum over its 1,024 candidates, extended when it falls short.
