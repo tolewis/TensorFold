@@ -327,26 +327,25 @@ PF_GEMM_ATTR __kernel void P(mxfp8_down)(__global const ushort *xs, __global con
 __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(64, 1, 1)))
 __kernel void P(combine)(__global const ushort *ds, __global const int *inv, __global const int *ids, __global const float *weights,
                          __global ushort *y, uint n, uint topk) {
+  local int order[8];
   const uint col = get_global_id(0), token = get_group_id(1);
-  if (col >= n) return;
-  float sum = 0.0f;
-  int last_id = INT_MIN;
-  int last_slot = -1;
-  for (uint t = 0; t < topk; t++) {
-    int best_id = INT_MAX;
-    int best_slot = -1;
+  const uint lid = get_local_id(0);
+  // slot `lid` takes the place its (expert, slot) pair holds in ascending order
+  if (lid < topk) {
+    const int mine = ids[token * topk + lid];
+    uint rank = 0;
     for (uint slot = 0; slot < topk; slot++) {
       const int id = ids[token * topk + slot];
-      const bool after = id > last_id || (id == last_id && (int)slot > last_slot);
-      if (after && (best_slot < 0 || id < best_id)) {
-        best_id = id;
-        best_slot = (int)slot;
-      }
+      rank += (id < mine || (id == mine && slot < lid)) ? 1u : 0u;
     }
-    if (best_slot < 0) break;
-    sum += weights[token * topk + best_slot] * P(bf_to_f)(ds[(ulong)inv[token * topk + best_slot] * n + col]);
-    last_id = best_id;
-    last_slot = best_slot;
+    order[rank] = (int)lid;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (col >= n) return;
+  float sum = 0.0f;
+  for (uint t = 0; t < topk; t++) {
+    const int slot = order[t];
+    sum += weights[token * topk + slot] * P(bf_to_f)(ds[(ulong)inv[token * topk + slot] * n + col]);
   }
   y[(ulong)token * n + col] = P(f_to_bf)(sum);
 }
