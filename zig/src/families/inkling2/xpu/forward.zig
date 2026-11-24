@@ -45,6 +45,10 @@ pub fn finalPlan(rows: usize, all: bool, taps: bool) FinalPlan {
 /// Rows the decode gather experts take in one call; more go through the grouped prompt kernels.
 pub const decode_rows = 16;
 
+/// Diagnostic, off by default: when set, every visit copies its routes (rows x 8 int32 expert ids) here, visit-major
+/// (`visit * rows * 8` ids), for the measurement of how many distinct experts a window reads.
+pub var route_trace: ?rt.Buffer = null;
+
 fn at(b: rt.Buffer, off: usize) Ptr {
     return @ptrFromInt(@intFromPtr(b.ptr.?) + off);
 }
@@ -101,10 +105,11 @@ const Run = struct {
         try dense_kernels.dense(&g.p.dense, g.s, tensor(weight), input, out, @intCast(rows), n, k);
     }
 
-    /// One row because M2's AR ABI is [sources,H] -> [queries,H]. Batch composition never mixes rows.
+    /// One launch for every row: the AR of a row reads that row's blocks and partial and nothing of another row's, so batch
+    /// composition never mixes rows (the arithmetic of a row is the single-row launch's, bit for bit).
     fn residual(g: Run, queries: Tensor, sources: usize, rows: usize) !void {
         const s = g.sc;
-        for (0..rows) |i| try glue.ar(&g.p.glue, g.s, at(s.blocks, i * state.block_slots * state.hidden * 2), row(s.partial, i, state.hidden * 4), tensor(queries), row(s.mlp_ar, i, state.hidden * 4), @intCast(sources), 1);
+        try glue.arRows(&g.p.glue, g.s, at(s.blocks, 0), at(s.partial, 0), tensor(queries), at(s.mlp_ar, 0), @intCast(sources), 1, @intCast(rows), state.block_slots * state.hidden);
     }
 
     fn bankAndReset(g: Run, rows: usize) !void {
@@ -128,22 +133,17 @@ const Run = struct {
             try g.widen(at(s.p, 0), at(s.ar, 0), rows);
         } else {
             const q = m.weights.attn_queries[v.layer - 1];
-            // One row: the queries and their results are contiguous, so one launch serves every role.
-            if (rows == 1) {
-                try glue.ar(&g.p.glue, g.s, at(s.blocks, 0), row(s.partial, 0, state.hidden * 4), at(q.buf, 0), arRow(s, 0, 1, 0, false), lp.attn_sources, @intCast(lp.attn_queries));
-            } else for (0..lp.attn_queries) |role| {
-                const query = at(q.buf, role * state.hidden * 4);
-                for (0..rows) |i| try glue.ar(&g.p.glue, g.s, at(s.blocks, i * state.block_slots * state.hidden * 2), row(s.partial, i, state.hidden * 4), query, arRow(s, role, rows, i, false), lp.attn_sources, 1);
-            }
+            // One launch serves every role and every row: result (role, row) is `arRow(role, rows, row)`.
+            try glue.arRows(&g.p.glue, g.s, at(s.blocks, 0), at(s.partial, 0), at(q.buf, 0), arRow(s, 0, rows, 0, false), lp.attn_sources, @intCast(lp.attn_queries), @intCast(rows), state.block_slots * state.hidden);
         }
         if (v.hasMessages()) {
             const controllers = w.controllers.?;
             const core = v.layer - 6;
-            for (0..3) |role| for (0..rows) |i| {
+            for (0..3) |role| {
                 const c = controllers[role];
                 const source_role = if (lp.kind == .local) 0 else role;
-                try loop.gates(&g.p.loop, g.s, arRow(s, source_role, rows, i, false), messageRow(s, core, role, i), tensor(c.down), tensor(c.forget), tensor(c.gain), row(s.zeta, i, 64 * 4), arRow(s, role, rows, i, true), 1);
-            };
+                try loop.gates(&g.p.loop, g.s, arRow(s, source_role, rows, 0, false), messageRow(s, core, role, 0), tensor(c.down), tensor(c.forget), tensor(c.gain), at(s.zeta, 0), arRow(s, role, rows, 0, true), @intCast(rows), state.message_entries * state.hidden);
+            }
         }
         const gated = v.hasMessages();
         // An ungated local visit has exactly one AR result and one norm result; Q/K/V alias.
@@ -270,14 +270,23 @@ const Run = struct {
         try g.prepareAttentionInputs(v, rows);
         const knorm = if (gated or lp.kind == .global) at(s.k_norm, 0) else at(s.q_norm, 0);
         const vnorm = if (gated or lp.kind == .global) at(s.v_norm, 0) else at(s.q_norm, 0);
+        xpu.profile.label = "wq";
         try g.dense(w.attn.wq, at(s.q_norm, 0), at(s.q_raw, 0), rows);
+        xpu.profile.label = "wk";
         try g.dense(w.attn.wk, knorm, at(s.k_raw, 0), rows);
+        xpu.profile.label = "wv";
         try g.dense(w.attn.wv, vnorm, at(s.v_raw, 0), rows);
+        xpu.profile.label = "wr";
         try g.dense(w.attn.wr, at(s.q_norm, 0), at(s.rel_raw, 0), rows);
+        xpu.profile.label = "sink";
         try g.dense(w.attn.sink, at(s.q_norm, 0), at(s.sink, 0), rows);
+        xpu.profile.label = "gate";
         try g.dense(w.attn.gate, at(s.q_norm, 0), at(s.gate, 0), rows);
+        xpu.profile.label = "";
         try g.attendSegments(v, segments);
+        xpu.profile.label = "wo";
         try g.dense(w.attn.wo, at(s.att, 0), at(s.attn_dense, 0), rows);
+        xpu.profile.label = "";
         var base: usize = 0;
         for (segments) |seg| {
             try g.staticPostConv(seg.cache, v.cache_slot, 2, s.attn_dense, w.attn_conv, s.attn_conv, base, seg.rows);
@@ -288,10 +297,11 @@ const Run = struct {
         if (gated) {
             const c = w.controllers.?[3];
             const core = v.layer - 6;
-            for (0..rows) |i| try loop.gates(&g.p.loop, g.s, row(s.mlp_ar, i, state.hidden * 4), messageRow(s, core, 3, i), tensor(c.down), tensor(c.forget), tensor(c.gain), row(s.zeta, i, 64 * 4), row(s.mlp_gated, i, state.hidden * 4), 1);
+            try loop.gates(&g.p.loop, g.s, at(s.mlp_ar, 0), messageRow(s, core, 3, 0), tensor(c.down), tensor(c.forget), tensor(c.gain), at(s.zeta, 0), at(s.mlp_gated, 0), @intCast(rows), state.message_entries * state.hidden);
             try g.norm(at(s.mlp_gated, 0), w.mlp_norm, at(s.mlp_normed, 0), rows);
         } else try g.norm(at(s.mlp_ar, 0), w.mlp_norm, at(s.mlp_normed, 0), rows);
         try glue.router(&g.p.glue, g.s, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.route_ids, 0), at(s.route_weights, 0), @intCast(rows));
+        if (route_trace) |tb| try g.s.copy(plus(tb.ptr, v.cache_slot * rows * 32), at(s.route_ids, 0), rows * 32);
         try g.routedExperts(v.layer, rows);
         base = 0;
         for (segments) |seg| {
@@ -354,9 +364,11 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     for (m.weight_plan.visits[0..m.weight_plan.n_visits]) |*v| try g.visit(v, segments, rows, options.taps);
     try g.widen(at(s.p, 0), at(s.partial, 0), rows);
     const final = finalPlan(rows, options.all, options.taps != null);
-    for (0..final.work_rows) |j| {
-        const i = if (final.work_rows == rows) j else rows - 1;
-        try glue.ar(&p.glue, stream, at(s.blocks, i * state.block_slots * state.hidden * 2), row(s.partial, i, state.hidden * 4), tensor(m.weights.output_query), row(s.mlp_ar, j, state.hidden * 4), m.weight_plan.final_sources, 1);
+    if (final.work_rows == rows) {
+        try glue.arRows(&p.glue, stream, at(s.blocks, 0), at(s.partial, 0), tensor(m.weights.output_query), at(s.mlp_ar, 0), m.weight_plan.final_sources, 1, @intCast(rows), state.block_slots * state.hidden);
+    } else {
+        // the last row only
+        try glue.ar(&p.glue, stream, at(s.blocks, (rows - 1) * state.block_slots * state.hidden * 2), row(s.partial, rows - 1, state.hidden * 4), tensor(m.weights.output_query), at(s.mlp_ar, 0), m.weight_plan.final_sources, 1);
     }
     try g.norm(at(s.mlp_ar, 0), m.weights.norm, at(s.mlp_normed, 0), final.work_rows);
     if (options.taps) |to| try g.captureTap(at(s.mlp_normed, 0), to, final.capture_rows, 3);

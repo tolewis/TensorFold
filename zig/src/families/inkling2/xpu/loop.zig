@@ -56,10 +56,11 @@ pub fn crossPassMessageAttention(p: *const Pipelines, s: xpu.Stream, bank0: Ref,
     try xpu.launch.dispatch(p.messages, s, .{ rows * message_entries, 1, 1 }, .{ bank0, bank1, q_mlp, kv, out, rows });
 }
 
-/// One controller tuple; h, m and output are [token][H] binary32 tensors, down is bf16 [64][2H], forget and gain
-/// are bf16 [H][64]. `zeta` is scratch for [token][64] binary32: the first launch writes it, the second reads it.
-pub fn gates(p: *const Pipelines, s: xpu.Stream, h: Ref, m: Ref, down: Ref, forget: Ref, gain: Ref, zeta: Ref, out: Ref, rows: u32) !void {
+/// One controller tuple; h and output are [token][H] binary32 tensors, m's token rows are `m_stride` binary32 values apart
+/// (H for a [token][H] tensor), down is bf16 [64][2H], forget and gain are bf16 [H][64]. `zeta` is scratch for [token][64]
+/// binary32: the first launch writes it, the second reads it.
+pub fn gates(p: *const Pipelines, s: xpu.Stream, h: Ref, m: Ref, down: Ref, forget: Ref, gain: Ref, zeta: Ref, out: Ref, rows: u32, m_stride: u32) !void {
     std.debug.assert(rows > 0 and rows <= 64);
-    try xpu.launch.dispatch(p.zeta, s, .{ rank / zeta_ranks, rows, 1 }, .{ h, m, down, zeta, rows });
-    try xpu.launch.dispatch(p.gates, s, .{ hidden / gate_threads, rows, 1 }, .{ h, m, forget, gain, zeta, out, rows });
+    try xpu.launch.dispatch(p.zeta, s, .{ rank / zeta_ranks, rows, 1 }, .{ h, m, down, zeta, rows, m_stride });
+    try xpu.launch.dispatch(p.gates, s, .{ hidden / gate_threads, rows, 1 }, .{ h, m, forget, gain, zeta, out, rows, m_stride });
 }

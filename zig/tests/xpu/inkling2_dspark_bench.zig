@@ -85,6 +85,8 @@ pub fn main(init: std.process.Init) !u8 {
     const kvbuf = try b.buf(8 * KV * 2);
     const kvbuf2 = try b.buf(8 * KV * 2);
     const kvout = try b.buf(8 * KV * 2);
+    const tokbuf = try b.buf(64);
+    try b.bufs.items[b.bufs.items.len - 1].fill8(dev.s, 0); // token 0: the step gathers that token's row of the Markov table; the 0x3c fill would be an id past the table
     const taps = try b.buf(64 * 4 * H * 2);
     const fused = try b.buf(4 * 64 * H * 2);
     const fuse_w = try b.buf(4 * H * H * 2);
@@ -97,7 +99,7 @@ pub fn main(init: std.process.Init) !u8 {
     b.line("base", "1 row x 200058", try b.time(host.base, .{ unembed, rows_a, base_out, @as(u32, 1), @as(u32, host.vocab) }), @floatFromInt(V * H * 2), 0);
     b.line("logits", "200058", try b.time(host.finalLogits, .{ vecv, phi, vecv, small, vecv }), @floatFromInt(V * host.rank * 2 + V * 6), 7);
     b.line("kappa", "7 rows x 768", try b.time(host.kappa, .{ rows_a, rows_b, rnn, small, kappa_out, @as(u32, 7) }), @floatFromInt(host.rnn_width * 4608 * 2), 1);
-    b.line("recurrent", "256", try b.time(host.recurrentStep, .{ small2, kappa_out, rnn, markov, small, small2, small, @as(u32, 1) }), 0, 7);
+    b.line("recurrent", "256", try b.time(host.recurrentStep, .{ small2, kappa_out, rnn, markov, small, small2, small, tokbuf }), 0, 7);
     b.line("init_rows", "8 x 2304", try b.time(host.initializeRows, .{ rows_a, rows_b, rows_c }), 0, 1);
     b.line("residual_norm", "8 x 2304", try b.time(host.residualNorm, .{ rows_a, rows_b, rows_c, rows_d, rows_a, @as(u32, 8), false }), 0, 7);
     b.line("swiglu", "8 x 9216", try b.time(host.swiglu, .{ inter_a, inter_b, inter_c, @as(u32, 8 * host.intermediate) }), @floatFromInt(2 * 8 * host.intermediate * 2), 3);
