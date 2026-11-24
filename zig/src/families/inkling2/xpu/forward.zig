@@ -22,21 +22,25 @@ const group = @import("group.zig");
 var first_dump_done = false;
 
 fn dumpBytes(g: *const Run, visit_i: usize, tag: []const u8, src: ?*anyopaque, bytes: usize) !void {
-    if (first_dump_done or visit_i > 1) return;
+    if (first_dump_done) return;
     const dir_z = std.c.getenv("TF_TP_DUMP") orelse return;
     const ptr = src orelse return;
     const host = try g.m.gpa.alloc(u8, bytes);
     defer g.m.gpa.free(host);
     try g.m.r.download(host, .{ .rt = g.m.r, .ptr = ptr, .len = bytes });
     try g.m.r.sync();
-    var name_buf: [128]u8 = undefined;
-    const name = std.fmt.bufPrint(&name_buf, "v{d}-{s}-r{d}.bin", .{ visit_i, tag, g.m.options.place.rank }) catch return;
-    var dir = std.fs.openDirAbsolute(std.mem.span(dir_z), .{}) catch return;
-    defer dir.close();
-    const f = dir.createFile(name, .{}) catch return;
-    defer f.close();
-    f.writeAll(host) catch return;
+    var path_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/v{d}-{s}-r{d}.bin", .{ std.mem.span(dir_z), visit_i, tag, g.m.options.place.rank }) catch return;
+    path_buf[path.len] = 0;
+    const fd = open(path_buf[0..path.len :0], 1 | 64 | 512, 0o644);
+    if (fd < 0) return;
+    _ = write(fd, host.ptr, host.len);
+    _ = close(fd);
 }
+
+extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
+extern "c" fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
+extern "c" fn close(fd: c_int) c_int;
 
 const rt = xpu.rt;
 
