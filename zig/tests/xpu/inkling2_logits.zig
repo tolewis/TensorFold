@@ -5,7 +5,7 @@
 //!   tf-xpu-inkling2-logits <model dir> --ids <ids file> --resume AT   (a snapshot at AT against one prefill pass)
 //!   tf-xpu-inkling2-logits <model dir> --bench-context C [--decode N]
 //!
-//! `--dense bf16|q8` picks the dense weights' device format (default: the model's, Q8_0; `XPU_DENSE` in the environment
+//! `--dense bf16|q8|nv4|q4` picks the dense weights' device format (default: the model's, Q8_0; `XPU_DENSE` in the environment
 //! does the same) and `--drop-bf16-head` leaves the BF16 head off the device in Q8 mode. `--dump-logits PREFIX` writes every
 //! row's full logits (raw f32) of each reference prompt to PREFIX.<reference file name>.f32; `--compare-logits PREFIX`
 //! reads those files back and prints, per prompt, KL(dumped || ours) per row (mean, max) and top-1 agreement with the dump.
@@ -339,7 +339,7 @@ pub fn main(init: std.process.Init) !void {
     });
     defer m.deinit();
     try m.loadKernels(&ctx);
-    std.debug.print("loaded {d:.2} GiB and built the kernels in {d:.1} s\n", .{ @as(f64, @floatFromInt(m.device_bytes)) / (1 << 30), secs(nowNs(init.io) - t_load) });
+    std.debug.print("loaded {d:.2} GiB dense {s} and built the kernels in {d:.1} s\n", .{ @as(f64, @floatFromInt(m.device_bytes)) / (1 << 30), @tagName(m.options.dense), secs(nowNs(init.io) - t_load) });
     var scratch = try state.Scratch.init(&r, state.max_rows, capacity);
     defer scratch.deinit();
     var prec = ink.model.precisions();

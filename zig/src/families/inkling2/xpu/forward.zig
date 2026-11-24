@@ -12,6 +12,8 @@ const loop = @import("loop.zig");
 const runtime = @import("runtime.zig");
 const dense_kernels = @import("dense.zig");
 const dense_q8_kernels = @import("dense_q8.zig");
+const dense_nv4 = @import("dense_nv4.zig");
+const dense_q4_kernels = @import("dense_q4.zig");
 const state = @import("state.zig");
 const model_file = @import("model.zig");
 const Model = model_file.Model;
@@ -96,11 +98,13 @@ const Run = struct {
         try dense_kernels.norm(&g.p.dense, g.s, input, tensor(weight), out, @intCast(rows));
     }
 
-    /// Every projection uses the shared matvec's FP32 reduction and one BF16 store: over BF16 weights, or over Q8_0 blocks
-    /// (q8.zig) when the model loaded them re-encoded.
+    /// Every projection uses the shared matvec's FP32 reduction and one BF16 store: over BF16 weights, over Q8_0 blocks
+    /// (q8.zig), or over NVFP4 blocks (nv4.zig) through the expert kernels.
     fn dense(g: Run, weight: Tensor, input: Ptr, out: Ptr, rows: usize) !void {
         const k: u32 = @intCast(weight.shape[weight.rank - 1]);
         const n: u32 = @intCast(weight.shape[weight.rank - 2]);
+        if (weight.nv4) return dense_nv4.dense(&g.p.experts, g.s, g.m.nv4_aux.?.ptr, tensor(weight), input, out, @intCast(rows), n, k);
+        if (weight.q4) return dense_q4_kernels.dense(&g.p.dense_q4, g.s, tensor(weight), input, out, @intCast(rows), n, k);
         if (weight.q8) return dense_q8_kernels.dense(&g.p.dense_q8, g.s, tensor(weight), input, out, @intCast(rows), n, k);
         try dense_kernels.dense(&g.p.dense, g.s, tensor(weight), input, out, @intCast(rows), n, k);
     }
