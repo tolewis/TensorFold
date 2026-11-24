@@ -123,6 +123,7 @@ const Stats = struct {
     /// |our log-sum-exp over the vocabulary - the reference's|: sum and max
     lse_sum: f64 = 0,
     lse_max: f64 = 0,
+    kl16_sum: f64 = 0,
     /// next-token loss summed over the rows whose next token is in the reference's top 16, ours and the reference's
     nll_ours: f64 = 0,
     nll_ref: f64 = 0,
@@ -422,6 +423,12 @@ pub fn main(init: std.process.Init) !void {
                         st.nll_n += 1;
                     };
                     st.lse_max = @max(st.lse_max, dl);
+                    // KL of the reference to ours over the reference's top 16 (the tail is left out)
+                    for (ref_top, ref_logit) |id, want| {
+                        const lp: f64 = @as(f64, want) - @as(f64, ref.lse[p]);
+                        const lq: f64 = @as(f64, row[@intCast(id)]) - lse;
+                        st.kl16_sum += @exp(lp) * (lp - lq);
+                    }
                     mx = 0;
                 }
                 row_max[p] = 0;
@@ -446,6 +453,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("\n{s}: {d} rows in chunks of {d}, {d:.1} s ({d:.1} tok/s with every row's logits)\n", .{ std.fs.path.basename(ref_path), st.rows, chunk, prefill_s, @as(f64, @floatFromInt(st.rows)) / prefill_s });
         std.debug.print("  top-1 agreement {d}/{d} ({d:.3} %), top-1 differences {d}, non-finite rows {d}\n", .{ st.agree, st.rows, 100.0 * @as(f64, @floatFromInt(st.agree)) / @as(f64, @floatFromInt(st.rows)), diffs.items.len, st.nan });
         std.debug.print("  reference top-16 logits: max abs difference {d:.4} (at position {d}), mean {d:.5}, max on the top-1 logit {d:.4}\n", .{ st.max_abs, st.max_abs_row, st.sum_abs / @as(f64, @floatFromInt(st.count_abs)), st.max_top1_abs });
+        std.debug.print("  KL16 reference to ours over the reference top 16: mean {d:.6}\n", .{st.kl16_sum / @as(f64, @floatFromInt(st.rows))});
         std.debug.print("  log-sum-exp difference: mean {d:.4}, max {d:.4}\n", .{ st.lse_sum / @as(f64, @floatFromInt(st.rows)), st.lse_max });
         std.debug.print("  next-token loss over {d} rows with the token in the reference top 16: ours {d:.4}, reference {d:.4}\n", .{ st.nll_n, st.nll_ours / @as(f64, @floatFromInt(@max(st.nll_n, 1))), st.nll_ref / @as(f64, @floatFromInt(@max(st.nll_n, 1))) });
         if (compare_file != null) kl.print(std.fs.path.basename(ref_path));
