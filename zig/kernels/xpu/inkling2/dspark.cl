@@ -18,7 +18,7 @@
 #define DSP_RANK 256
 #define DSP_RNN 768
 #define DSP_EPS 1e-6f
-#define DSP_SCALE 0x1.6a09e6p-7f
+#define DSP_SCALE 0x1.6a09e6p-4f
 #define DSP_ROWS_MAX 8
 
 #define KERNEL(N) __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(N, 1, 1))) kernel
