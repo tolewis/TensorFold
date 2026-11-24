@@ -270,14 +270,23 @@ const Run = struct {
         try g.prepareAttentionInputs(v, rows);
         const knorm = if (gated or lp.kind == .global) at(s.k_norm, 0) else at(s.q_norm, 0);
         const vnorm = if (gated or lp.kind == .global) at(s.v_norm, 0) else at(s.q_norm, 0);
+        xpu.profile.label = "wq";
         try g.dense(w.attn.wq, at(s.q_norm, 0), at(s.q_raw, 0), rows);
+        xpu.profile.label = "wk";
         try g.dense(w.attn.wk, knorm, at(s.k_raw, 0), rows);
+        xpu.profile.label = "wv";
         try g.dense(w.attn.wv, vnorm, at(s.v_raw, 0), rows);
+        xpu.profile.label = "wr";
         try g.dense(w.attn.wr, at(s.q_norm, 0), at(s.rel_raw, 0), rows);
+        xpu.profile.label = "sink";
         try g.dense(w.attn.sink, at(s.q_norm, 0), at(s.sink, 0), rows);
+        xpu.profile.label = "gate";
         try g.dense(w.attn.gate, at(s.q_norm, 0), at(s.gate, 0), rows);
+        xpu.profile.label = "";
         try g.attendSegments(v, segments);
+        xpu.profile.label = "wo";
         try g.dense(w.attn.wo, at(s.att, 0), at(s.attn_dense, 0), rows);
+        xpu.profile.label = "";
         var base: usize = 0;
         for (segments) |seg| {
             try g.staticPostConv(seg.cache, v.cache_slot, 2, s.attn_dense, w.attn_conv, s.attn_conv, base, seg.rows);

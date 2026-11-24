@@ -24,6 +24,7 @@
 const std = @import("std");
 const xpu = @import("xpu");
 const ink = @import("inkling2_xpu");
+const lanes = @import("lanes");
 
 pub const panic = std.debug.FullPanic(xpu.rt.panicDrain);
 
@@ -230,6 +231,7 @@ pub fn main(init: std.process.Init) !void {
     var embed_host = false;
     var digest = false;
     var profile_steps: usize = 0;
+    var profile_all = false;
     var bench_context: ?usize = null;
     var options: ink.model.Options = .{ .embed_host = false };
     var dump_prefix: ?[]const u8 = null;
@@ -274,7 +276,15 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--digest")) {
             digest = true;
         } else if (std.mem.eql(u8, a, "--profile")) {
-            profile_steps = 8;
+            if (profile_steps == 0) profile_steps = 8;
+        } else if (std.mem.eql(u8, a, "--profile-steps")) {
+            i += 1;
+            profile_steps = try std.fmt.parseInt(usize, argv[i], 10);
+        } else if (std.mem.eql(u8, a, "--profile-all")) {
+            // the first --ref prompt prefilled in --chunk row chunks (last row's logits only, as the server does), profiled per
+            // chunk; then plain decode profiled greedy and sampled; then stop
+            profile_all = true;
+            if (profile_steps == 0) profile_steps = 8;
         } else if (std.mem.eql(u8, a, "--bench-context")) {
             i += 1;
             bench_context = try std.fmt.parseInt(usize, argv[i], 10);
@@ -300,7 +310,7 @@ pub fn main(init: std.process.Init) !void {
         prompt = try loadIds(gpa, p);
         longest = @max(longest, prompt.len + generate);
     }
-    if (bench_context) |c| longest = @max(longest, c + decode_steps + profile_steps + 2);
+    if (bench_context) |c| longest = @max(longest, c + decode_steps + 4 * profile_steps + 8);
     const capacity = std.mem.alignForward(usize, longest, 64);
 
     xpu.stop.install();
@@ -329,6 +339,10 @@ pub fn main(init: std.process.Init) !void {
     const host_logits = try gpa.alloc(f32, state.max_rows * vocab);
     defer gpa.free(host_logits);
 
+    if (profile_all) {
+        try profileAll(gpa, init.io, &ctx, m, &scratch, &r, &schedule, capacity, loaded_refs.items[0].ids, chunk, host_logits[0..vocab], profile_steps);
+        return;
+    }
     var overall_diffs: usize = 0;
     var prefill_digest = std.crypto.hash.sha2.Sha256.init(.{});
     var decode_digest = std.crypto.hash.sha2.Sha256.init(.{});
@@ -442,7 +456,7 @@ pub fn main(init: std.process.Init) !void {
             }
             const total = secs(nowNs(init.io) - t1);
             std.debug.print("  decode: {d} steps at context {d}: {d:.2} tok/s ({d:.2} ms a token, {d:.2} ms of it the forward)\n", .{ decode_steps, ref.rows, @as(f64, @floatFromInt(decode_steps)) / total, 1000 * total / @as(f64, @floatFromInt(decode_steps)), 1000 * secs(fwd_ns) / @as(f64, @floatFromInt(decode_steps)) });
-            if (profile_steps > 0 and ref_path.ptr == refs.items[0].ptr) try profileDecode(&ctx, init.io, m, &scratch, &cache, &r, host_logits[0..vocab], token, profile_steps);
+            if (profile_steps > 0 and ref_path.ptr == refs.items[0].ptr) try profileDecode(&ctx, init.io, m, &scratch, &cache, &r, host_logits[0..vocab], token, profile_steps, null);
         }
     }
 
@@ -537,7 +551,12 @@ pub fn main(init: std.process.Init) !void {
         }
         const total = secs(nowNs(init.io) - t1);
         std.debug.print("\nbench: {d} decode steps at context {d} (no prompt): {d:.2} tok/s, {d:.2} ms a token\n", .{ decode_steps, context, @as(f64, @floatFromInt(decode_steps)) / total, 1000 * total / @as(f64, @floatFromInt(decode_steps)) });
-        if (profile_steps > 0) try profileDecode(&ctx, init.io, m, &scratch, &cache, &r, host_logits[0..vocab], token, profile_steps);
+        if (profile_steps > 0) try profileDecode(&ctx, init.io, m, &scratch, &cache, &r, host_logits[0..vocab], token, profile_steps, null);
+        if (profile_steps > 0) {
+            var smp = try ink.sampler.Sampler.init(gpa, &r, &ctx, 1);
+            defer smp.deinit();
+            try profileDecode(&ctx, init.io, m, &scratch, &cache, &r, host_logits[0..vocab], token, profile_steps, &smp);
+        }
     }
     if (digest) {
         var a: [32]u8 = undefined;
@@ -550,8 +569,11 @@ pub fn main(init: std.process.Init) !void {
 }
 
 /// Plain decode steps again, once with launch counts and host times only and once with a device timestamp on every kernel.
-fn profileDecode(ctx: *xpu.Context, io: std.Io, m: *const ink.model.Model, scratch: *state.Scratch, cache: *state.Cache, r: *xpu.rt.Runtime, logits: []f32, first: u32, steps: usize) !void {
+/// `smp` null: the token is the host argmax of the downloaded row (the check tool's loop). Else the server's sampled path: the
+/// device selects the candidates of the last row (tf_ink2_sample_top) and the host draws (T 0.8, top_k 20, top_p 0.95).
+fn profileDecode(ctx: *xpu.Context, io: std.Io, m: *const ink.model.Model, scratch: *state.Scratch, cache: *state.Cache, r: *xpu.rt.Runtime, logits: []f32, first: u32, steps: usize, smp: ?*ink.sampler.Sampler) !void {
     var token = first;
+    const rule: lanes.Sampling = .{ .seed = 7, .temperature = 0.8, .top_k = 20, .top_p = 0.95 };
     for ([_]bool{ false, true }) |device| {
         var prof = try xpu.profile.Profile.init(ctx, 8192, device);
         defer prof.deinit();
@@ -559,20 +581,77 @@ fn profileDecode(ctx: *xpu.Context, io: std.Io, m: *const ink.model.Model, scrat
         defer xpu.profile.active = null;
         var wall: i96 = 0;
         var enqueue: i96 = 0;
+        var draw: i96 = 0;
         for (0..steps) |_| {
             const f0 = nowNs(io);
             const e0 = xpu.profile.nowNs();
             try ink.forward.run(m, scratch, cache, &.{token}, .{});
             wall += nowNs(io) - f0;
             enqueue += @as(i96, prof.enqueued_at) - e0;
-            try prof.collect();
             cache.len += 1;
-            token = argmax(try lastLogits(r, cache, logits));
+            if (smp == null) {
+                try prof.collect();
+                const d0 = nowNs(io);
+                token = argmax(try lastLogits(r, cache, logits));
+                draw += nowNs(io) - d0;
+            } else {
+                const d0 = nowNs(io);
+                const row = ink.sampler.Row.of(rule);
+                const set = try smp.?.select(cache.logits.ptr, @intCast(vocab), &.{row});
+                var buf: [ink.sampler.top_max]lanes.gpu_rule.Cand = undefined;
+                const top = set.list(0, row.n, &buf);
+                const whole: ?[]const f32 = if (lanes.gpu_full.needsRow(rule)) try lastLogits(r, cache, logits) else null;
+                token = lanes.gpu_full.drawTop(whole, top, rule, @intCast(cache.len));
+                draw += nowNs(io) - d0;
+                try prof.collect();
+            }
         }
         const n: f64 = @floatFromInt(steps);
-        std.debug.print("\nprofile, {s}: {d} decode steps, {d:.0} launches a token, forward {d:.2} ms a token, of it queueing on the host {d:.2} ms, waiting {d:.2} ms\n", .{ if (device) "with a timestamp event on every launch" else "host timing only", steps, @as(f64, @floatFromInt(prof.launches)) / n, 1000 * secs(wall) / n, 1000 * secs(enqueue) / n, 1000 * secs(wall - enqueue) / n });
+        std.debug.print("\nprofile ({s}), {s}: {d} decode steps, {d:.0} launches a token, forward {d:.3} ms a token, of it queueing on the host {d:.3} ms, waiting {d:.3} ms; draw {d:.3} ms a token (needsRow {})\n", .{ if (smp == null) "greedy, host argmax" else "sampled T 0.8 top_k 20 top_p 0.95, device candidates", if (device) "with a timestamp event on every launch" else "host timing only", steps, @as(f64, @floatFromInt(prof.launches)) / n, 1000 * secs(wall) / n, 1000 * secs(enqueue) / n, 1000 * secs(wall - enqueue) / n, 1000 * secs(draw) / n, lanes.gpu_full.needsRow(rule) });
         prof.print();
     }
+}
+
+/// The first reference prompt in chunks of `chunk` rows with the last row's logits only (the server's prompt path), a
+/// profile of every chunk (the table after the first 512 rows, then after the whole prompt), then decode at that context.
+fn profileAll(gpa: std.mem.Allocator, io: std.Io, ctx: *xpu.Context, m: *const ink.model.Model, scratch: *state.Scratch, r: *xpu.rt.Runtime, schedule: anytype, capacity: usize, ids: []const u32, chunk: usize, logits: []f32, steps: usize) !void {
+    var cache = try state.Cache.init(r, capacity, schedule, .bf16);
+    defer cache.deinit();
+    var prof = try xpu.profile.Profile.init(ctx, 131072, true);
+    defer prof.deinit();
+    xpu.profile.active = &prof;
+    var pos: usize = 0;
+    var chunks: usize = 0;
+    var wall: i96 = 0;
+    const first_rows: usize = 512;
+    while (pos < ids.len) {
+        const n = @min(chunk, ids.len - pos);
+        const f0 = nowNs(io);
+        try ink.forward.run(m, scratch, &cache, ids[pos..][0..n], .{});
+        const dt = nowNs(io) - f0;
+        wall += dt;
+        try prof.collect();
+        cache.len += n;
+        pos += n;
+        chunks += 1;
+        if (pos <= first_rows) {
+        }
+        if (pos == first_rows) {
+            std.debug.print("\nPREFILL first {d} rows (context 0 to {d}), {d} chunks of {d}: forward wall {d:.2} ms, {d:.1} tok/s; the table is per chunk (a pass)\n", .{ pos, pos, chunks, chunk, 1000 * secs(wall), @as(f64, @floatFromInt(pos)) / secs(wall) });
+            prof.print();
+            prof.reset();
+        }
+    }
+    std.debug.print("\nPREFILL rows {d} to {d} ({d} chunks of {d}, wall of the whole prompt {d:.2} s = {d:.1} tok/s): table per chunk (a pass) over the chunks after the first 512 rows\n", .{ first_rows, pos, chunks, chunk, secs(wall), @as(f64, @floatFromInt(pos)) / secs(wall) });
+    prof.print();
+    xpu.profile.active = null;
+    var token = argmax(try lastLogits(r, &cache, logits));
+    std.debug.print("\nDECODE at context {d}\n", .{cache.len});
+    try profileDecode(ctx, io, m, scratch, &cache, r, logits, token, steps, null);
+    var smp = try ink.sampler.Sampler.init(gpa, r, ctx, 1);
+    defer smp.deinit();
+    token = argmax(try lastLogits(r, &cache, logits));
+    try profileDecode(ctx, io, m, scratch, &cache, r, logits, token, steps, &smp);
 }
 
 fn lastLogits(r: *xpu.rt.Runtime, cache: *state.Cache, out: []f32) ![]f32 {
