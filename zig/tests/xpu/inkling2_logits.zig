@@ -2,6 +2,7 @@
 //!
 //!   tf-xpu-inkling2-logits <model dir> --ref <ref.bin> [--ref <ref.bin> ...] [--chunk N] [--decode N]
 //!   tf-xpu-inkling2-logits <model dir> --ids <ids file> --generate N [--stop ID]
+//!   tf-xpu-inkling2-logits <model dir> --ids <ids file> --resume AT   (a snapshot at AT against one prefill pass)
 //!
 //! A reference file holds the token ids of a prompt and, for every position, the reference's top 16 token ids and
 //! logits, its log-sum-exp and its top-1 margin (flat little-endian layout of ref_to_bin.py: "IKRF", u32 version 1,
@@ -171,6 +172,7 @@ pub fn main(init: std.process.Init) !void {
     var decode_steps: usize = 32;
     var chunk: usize = state.max_rows;
     var stop: ?u32 = null;
+    var resume_at: usize = 0;
     var embed_host = false;
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
@@ -190,6 +192,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--chunk")) {
             i += 1;
             chunk = try std.fmt.parseInt(usize, argv[i], 10);
+        } else if (std.mem.eql(u8, a, "--resume")) {
+            i += 1;
+            resume_at = try std.fmt.parseInt(usize, argv[i], 10);
         } else if (std.mem.eql(u8, a, "--stop")) {
             i += 1;
             stop = try std.fmt.parseInt(u32, argv[i], 10);
@@ -335,6 +340,48 @@ pub fn main(init: std.process.Init) !void {
             const total = secs(nowNs(init.io) - t1);
             std.debug.print("  decode: {d} steps at context {d}: {d:.2} tok/s ({d:.2} ms a token, {d:.2} ms of it the forward)\n", .{ decode_steps, ref.rows, @as(f64, @floatFromInt(decode_steps)) / total, 1000 * total / @as(f64, @floatFromInt(decode_steps)), 1000 * secs(fwd_ns) / @as(f64, @floatFromInt(decode_steps)) });
         }
+    }
+
+    if (ids_path != null and resume_at > 0) {
+        // A prompt prefilled in one pass, against the same prompt resumed from a snapshot taken at `resume_at`.
+        if (resume_at >= prompt.len) return error.BadResume;
+        var fresh = try state.Cache.init(&r, capacity, &schedule, .bf16);
+        defer fresh.deinit();
+        var snap: ?ink.snapshot.Snap = null;
+        defer if (snap) |*sn| sn.free();
+        var pos: usize = 0;
+        while (pos < prompt.len) {
+            var n = @min(chunk, prompt.len - pos);
+            if (pos < resume_at) n = @min(n, resume_at - pos);
+            try ink.forward.run(m, &scratch, &fresh, prompt[pos..][0..n], .{});
+            fresh.len += n;
+            pos += n;
+            if (pos == resume_at) snap = try ink.snapshot.save(&r, &fresh);
+        }
+        const logits_fresh = try gpa.alloc(f32, vocab);
+        defer gpa.free(logits_fresh);
+        try fresh.readLogits(logits_fresh);
+        var resumed = try state.Cache.init(&r, capacity, &schedule, .bf16);
+        defer resumed.deinit();
+        try ink.snapshot.restore(&resumed, &snap.?);
+        pos = resume_at;
+        while (pos < prompt.len) {
+            const n = @min(chunk, prompt.len - pos);
+            try ink.forward.run(m, &scratch, &resumed, prompt[pos..][0..n], .{});
+            resumed.len += n;
+            pos += n;
+        }
+        const logits_resumed = try gpa.alloc(f32, vocab);
+        defer gpa.free(logits_resumed);
+        try resumed.readLogits(logits_resumed);
+        var differing: usize = 0;
+        var worst: f32 = 0;
+        for (logits_fresh, logits_resumed) |a, b| {
+            if (@as(u32, @bitCast(a)) != @as(u32, @bitCast(b))) differing += 1;
+            worst = @max(worst, @abs(a - b));
+        }
+        std.debug.print("resume at {d} of {d}: {d} of {d} logits differ, largest {d:.6}, top-1 {d} against {d}\n", .{ resume_at, prompt.len, differing, vocab, worst, argmax(logits_fresh), argmax(logits_resumed) });
+        return;
     }
 
     if (ids_path != null) {
