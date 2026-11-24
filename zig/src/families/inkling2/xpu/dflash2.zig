@@ -120,8 +120,8 @@ pub const Drafter = struct {
             const n = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 7;
             d.depth_cap = std.math.clamp(n, 1, 7);
         }
-        if (std.c.getenv("TF_DFLASH2_FORCE")) |v| d.force = !std.mem.eql(u8, std.mem.span(v), "0") and !std.mem.eql(u8, std.mem.span(v), "");
-        std.log.info("dflash2: {s} drafts a round", .{if (d.force) "seven" else "the scheduler's"});
+        if (std.c.getenv("TF_DFLASH2_FORCE")) |v| d.force = !std.mem.eql(u8, std.mem.span(v), "0") and std.mem.span(v).len != 0;
+        std.log.info("dflash2: {s}", .{if (d.force) "seven drafts a round" else "priced depth from this request's acceptance"});
         if (std.c.getenv("TF_DFLASH2_EMBED")) |v| {
             if (std.mem.eql(u8, std.mem.span(v), "raw")) d.embed_mode = .raw;
         }
@@ -201,8 +201,31 @@ pub const Drafter = struct {
         return &weight_loader.tap_list;
     }
 
+    /// Round ms by window rows on 968102c8a (plain 15.8, 27 at 1.5 drafts, 44 at 7). The depth rule prices expected tokens a ms from these.
+    const round_ms = [_]lanes.config.Cost{
+        .{ .width = 1, .ms = 15.8 },
+        .{ .width = 2, .ms = 25.4 },
+        .{ .width = 3, .ms = 28.0 },
+        .{ .width = 4, .ms = 30.1 },
+        .{ .width = 5, .ms = 35.8 },
+        .{ .width = 6, .ms = 39.1 },
+        .{ .width = 7, .ms = 41.5 },
+        .{ .width = 8, .ms = 42.6 },
+    };
+    /// Card code acceptance is about 4.8 to 5.0 tokens a round. This seed starts at seven drafts. Chat's lower rate learns down to about three.
+    const accept_prior = [_]f64{ 0.90, 0.88, 0.86, 0.84, 0.82, 0.80, 0.78 };
+
     fn factsFn(ptr: *anyopaque) dr.Facts {
-        return .{ .fixed_block = true, .depth = cast(ptr).depth_cap, .step_ms = 0, .plain_guard = true, .force_depth = cast(ptr).force, .stream_bytes = @intCast(state.laneBytes()) };
+        return .{
+            .fixed_block = true,
+            .depth = cast(ptr).depth_cap,
+            .step_ms = 0,
+            .plain_guard = true,
+            .force_depth = cast(ptr).force,
+            .prior = &accept_prior,
+            .window_costs = &round_ms,
+            .stream_bytes = @intCast(state.laneBytes()),
+        };
     }
 
     fn openFn(ptr: *anyopaque, stream: *Stream) anyerror!void {

@@ -143,6 +143,10 @@ pub const Rule = struct {
 
     /// Measured round time when there is one, else the load-time forward cost plus head steps.
     pub fn roundCost(r: *Rule, drafts: i64, who: ?Who) !?f64 {
+        // A fixed block's round cost is the load-time table. One noisy round must not replace it and pin a shallow depth.
+        if (r.k.fixed_draft_block) {
+            if (r.family_costs.get(drafts + 1)) |forward| return forward;
+        }
         const table = try r.costs(who);
         if (table.get(drafts)) |v| return v;
         const forward = r.family_costs.get(drafts + 1) orelse return null;
@@ -186,7 +190,9 @@ pub const Rule = struct {
         st.last = best;
         st.probe = null;
         if (best < most and st.rounds % r.k.depth_probe_every == 0) {
-            best += 1;
+            // Re-test the full block only while the first draft still lands often. A low first-draft rate stays on the +1 probe.
+            const deep = r.k.fixed_draft_block and p.len > 0 and p[0] >= 0.82;
+            best = if (deep) most else best + 1;
             st.probe = best;
         }
         return best;
