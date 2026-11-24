@@ -9,6 +9,24 @@ __kernel void tp_add(__global ushort *out, __global const ushort *a, __global co
   out[i] = f_to_bf(bf_to_f(a[i]) + bf_to_f(b[i]));
 }
 
+__kernel void tp_up(__global float *out, __global const ushort *a, int n) {
+  const int i = get_global_id(0);
+  if (i >= n) return;
+  out[i] = bf_to_f(a[i]);
+}
+
+__kernel void tp_add_f32(__global float *out, __global const float *a, __global const float *b, int n) {
+  const int i = get_global_id(0);
+  if (i >= n) return;
+  out[i] = a[i] + b[i];
+}
+
+__kernel void tp_down(__global ushort *out, __global const float *a, int n) {
+  const int i = get_global_id(0);
+  if (i >= n) return;
+  out[i] = f_to_bf(a[i]);
+}
+
 // Zero the route weight when the expert is not in this rank's half. The expert kernels are not changed.
 __kernel void tp_zero_unowned(__global int *ids, __global float *weights, int routes, int base, int count) {
   const int i = get_global_id(0);

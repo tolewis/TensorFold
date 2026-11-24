@@ -374,6 +374,8 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(other);
         const t0 = nowNs(init.io);
         var pos: usize = 0;
+        var chunk_agree: usize = 0;
+        var chunk_rows: usize = 0;
         while (pos < ref.rows) {
             const n = @min(chunk, ref.rows - pos);
             try ink.forward.run(m, &scratch, &cache, ref.ids[pos..][0..n], .{ .all = true });
@@ -396,6 +398,7 @@ pub fn main(init: std.process.Init) !void {
                 if (!std.math.isFinite(t.first)) st.nan += 1;
                 if (t.id == @as(u32, @intCast(ref_top[0]))) {
                     st.agree += 1;
+                    chunk_agree += 1;
                 } else {
                     const gap = row[@intCast(ref_top[0])] - t.first;
                     st.max_diff_margin = @max(st.max_diff_margin, ref.margin[p]);
@@ -433,6 +436,10 @@ pub fn main(init: std.process.Init) !void {
                     st.count_abs += 1;
                 }
             }
+            chunk_rows += n;
+            std.debug.print("ref chunk {d}-{d} agree {d}/{d}\n", .{ pos, pos + n - 1, chunk_agree, chunk_rows });
+            chunk_agree = 0;
+            chunk_rows = 0;
             pos += n;
         }
         const prefill_s = secs(nowNs(init.io) - t0);

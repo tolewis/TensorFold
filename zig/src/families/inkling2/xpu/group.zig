@@ -36,6 +36,10 @@ pub const Group = struct {
     r: *rt.Runtime,
     ctx: *const xpu.Context,
     add: xpu.Kernel = undefined,
+    up: xpu.Kernel = undefined,
+    add_f32: xpu.Kernel = undefined,
+    down: xpu.Kernel = undefined,
+    f32row: ?*anyopaque = null,
     zero: xpu.Kernel = undefined,
     filter: xpu.Kernel = undefined,
     mod: xpu.Module = undefined,
@@ -58,6 +62,15 @@ pub const Group = struct {
         errdefer gpa.destroy(g);
         g.mod = try xpu.Module.loadNative(ctx, &images.tp);
         g.add = try g.mod.kernel("tp_add", .{ 256, 1, 1 });
+        g.up = try g.mod.kernel("tp_up", .{ 256, 1, 1 });
+        g.add_f32 = try g.mod.kernel("tp_add_f32", .{ 256, 1, 1 });
+        g.down = try g.mod.kernel("tp_down", .{ 256, 1, 1 });
+        if (std.c.getenv("TF_TP_F32")) |v| {
+            if (v[0] != '0') {
+                const buf = try r.alloc(D * 4);
+                g.f32row = buf.ptr;
+            }
+        }
         g.zero = try g.mod.kernel("tp_zero_unowned", .{ 256, 1, 1 });
         g.filter = try g.mod.kernel("tp_filter_items", .{ 1, 1, 1 });
         const name = shmName();
@@ -88,6 +101,7 @@ pub const Group = struct {
     pub fn allReduce(g: *Group, partial: *anyopaque, rows: u32) !void {
         if (rows == 0 or rows > rows_max) return error.Inkling2Tp;
         const n: usize = @as(usize, rows) * D;
+        if (g.ex == 3 and g.f32row != null) return g.allReduceF32(partial, rows);
         g.seq += 1;
         if (g.ex == 3) {
             const peer = try g.exPush(partial, n * 2);
@@ -128,7 +142,7 @@ pub const Group = struct {
         const slot = g.recSlot(g.rec_seq);
         @memcpy(slot[0..@sizeOf(Rec)], std.mem.asBytes(&rec));
         g.recWord().* = g.rec_seq;
-        std.log.info("inkling2: note seq {d}", .{g.rec_seq});
+        std.log.info("inkling2: note seq {d} base {d} n {d}", .{ g.rec_seq, base, ids.len });
     }
 
     pub fn wait(g: *Group) !Rec {
@@ -145,6 +159,21 @@ pub const Group = struct {
         var rec: Rec = undefined;
         @memcpy(std.mem.asBytes(&rec), g.recSlot(want)[0..@sizeOf(Rec)]);
         return rec;
+    }
+
+    /// Promote each bf16 row, exchange the f32 values, add in f32, store bf16. One row fits the slot.
+    fn allReduceF32(g: *Group, partial: *anyopaque, rows: u32) !void {
+        const s = g.r.stream(g.ctx);
+        for (0..rows) |r| {
+            g.seq += 1;
+            const src: ?*anyopaque = off(partial, r * D * 2);
+            const wide: ?*anyopaque = g.f32row;
+            try xpu.launch.dispatch(g.up, s, .{ (D + 255) / 256, 1, 1 }, .{ wide, src, @as(u32, D) });
+            const peer = try g.exPush(g.f32row.?, D * 4);
+            const got: ?*anyopaque = peer;
+            try xpu.launch.dispatch(g.add_f32, s, .{ (D + 255) / 256, 1, 1 }, .{ wide, wide, got, @as(u32, D) });
+            try xpu.launch.dispatch(g.down, s, .{ (D + 255) / 256, 1, 1 }, .{ src, wide, @as(u32, D) });
+        }
     }
 
     /// Production exPush (e5506ae): copy into the peer slot, store the flag on the peer, wait for the peer's flag.

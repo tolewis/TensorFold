@@ -365,6 +365,7 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
             return false;
         };
         if (rec.op == .close) return true;
+        std.log.info("inkling2: follow base {d} n {d}", .{ rec.base, rec.n });
         cache.len = rec.base;
         ink.forward.run(model, &scratch, &cache, rec.ids[0..rec.n], .{ .all = rec.flags != 0 }) catch |e| {
             std.log.err("inkling2_loop: rank 1 forward ({s})", .{@errorName(e)});
