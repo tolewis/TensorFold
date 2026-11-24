@@ -117,14 +117,18 @@ pub const Group = struct {
         @memcpy(rec.ids[0..ids.len], ids);
         const slot = g.recSlot(g.rec_seq);
         @memcpy(slot[0..@sizeOf(Rec)], std.mem.asBytes(&rec));
-        g.counter().store(g.rec_seq, .release);
+        g.recWord().* = g.rec_seq;
+        std.log.info("inkling2: note seq {d}", .{g.rec_seq});
     }
 
     pub fn wait(g: *Group) !Rec {
         const want = g.rec_seq + 1;
         const deadline = now() + 180.0;
-        while (g.peerCounter().load(.acquire) < want) {
-            if (now() > deadline) return error.PeerLost;
+        while (g.recWord().* < want) {
+            if (now() > deadline) {
+                std.log.err("inkling2: wait saw seq {d}, wanted {d}", .{ g.recWord().*, want });
+                return error.PeerLost;
+            }
             std.atomic.spinLoopHint();
         }
         g.rec_seq = want;
@@ -250,6 +254,9 @@ pub const Group = struct {
         }
     }
 
+    fn recWord(g: *Group) *volatile u64 {
+        return @ptrCast(@alignCast(g.map.ptr + 128));
+    }
     fn counter(g: *Group) *std.atomic.Value(u64) {
         return @ptrCast(@alignCast(g.map.ptr + 128 + @as(usize, g.rank) * 64));
     }
