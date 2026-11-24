@@ -182,9 +182,33 @@ pub const pool_kernel_timestamp: u32 = 1 << 2;
 pub const EventDesc = extern struct { stype: u32 = 0x11, pNext: ?*const anyopaque = null, index: u32, signal: u32 = 1 << 2, wait: u32 = 1 << 2 };
 pub const KernelTimestampResult = extern struct { global_start: u64 = 0, global_end: u64 = 0, context_start: u64 = 0, context_end: u64 = 0 };
 
+/// ZE_RESULT_ERROR_DEVICE_LOST and ZE_RESULT_ERROR_DEVICE_REQUIRES_RESET: the card was reset or wedged under the process.
+/// Every later call fails and device memory is gone, so no request can finish and no queue is safe to reuse.
+pub const device_lost: u32 = 0x70000001;
+pub const device_requires_reset: u32 = 0x70000006;
+
+pub fn isDeviceLost(r: u32) bool {
+    return r == device_lost or r == device_requires_reset;
+}
+
+/// Runs when a call reports the device lost (tests swap it). The default ends the process with a non-zero status,
+/// so a supervisor (systemd Restart=on-failure) starts a fresh one that opens the device again.
+pub var on_lost: *const fn (r: u32, what: []const u8) void = exitLost;
+
+fn exitLost(r: u32, what: []const u8) void {
+    std.log.err("Level Zero device lost in {s} (0x{x}): the engine cannot recover, the process ends so it can be restarted", .{ what, r });
+    std.process.exit(1);
+}
+
+/// Call on every Level Zero result before it becomes an error: a lost device does not return to the caller.
+pub fn noteLost(r: u32, what: []const u8) void {
+    if (isDeviceLost(r)) on_lost(r, what);
+}
+
 pub fn check(r: u32) Error!void {
     if (r != 0) {
         std.debug.print("Level Zero : 0x{x}\n", .{r});
+        noteLost(r, "a Level Zero call");
         return error.ZeFailed;
     }
 }
@@ -546,4 +570,31 @@ test "close drains every list before it destroys anything, and destroys nothing 
     try std.testing.expect(Gpu.release(&api, null, &o));
     // both lists drained, then the kernel, both lists, the memory and the context
     try std.testing.expectEqualStrings("ssdddfd", Fake.calls[0..Fake.n]);
+}
+
+test "a device lost result ends the process through on_lost, other failures only return ZeFailed" {
+    const log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = log_level;
+    const Hook = struct {
+        var rc: u32 = 0;
+        var calls: usize = 0;
+        fn lost(r: u32, _: []const u8) void {
+            rc = r;
+            calls += 1;
+        }
+    };
+    const keep = on_lost;
+    defer on_lost = keep;
+    on_lost = Hook.lost; // the process would end here; the hook returns so the test can look
+    try std.testing.expectError(error.ZeFailed, check(1));
+    try std.testing.expectError(error.ZeFailed, check(0x70000003)); // out of device memory: the request fails, the engine lives
+    try std.testing.expectEqual(@as(usize, 0), Hook.calls);
+    try check(0);
+    try std.testing.expectEqual(@as(usize, 0), Hook.calls);
+    try std.testing.expectError(error.ZeFailed, check(device_lost));
+    try std.testing.expectEqual(@as(usize, 1), Hook.calls);
+    try std.testing.expectEqual(device_lost, Hook.rc);
+    try std.testing.expectError(error.ZeFailed, check(device_requires_reset));
+    try std.testing.expectEqual(@as(usize, 2), Hook.calls);
 }
