@@ -77,6 +77,8 @@ const production_images = [_]Production{
     .{ .name = "loop", .path = "zig/kernels/xpu/inkling2/loop.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt" },
     .{ .name = "runtime", .path = "zig/kernels/xpu/inkling2/runtime.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt" },
     .{ .name = "dense", .path = "zig/kernels/xpu/inkling2/dense.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2" },
+    // the drafter's kernels: the engine loads this one only with a drafter
+    .{ .name = "dspark", .path = "zig/kernels/xpu/inkling2/dspark.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2" },
 };
 
 /// The module `inkling2_xpu_images`: every production kernel as a native zebin for `device`, one `align(8)` array each,
@@ -103,11 +105,12 @@ pub fn productionModule(b: *std.Build, target: std.Build.ResolvedTarget, optimiz
     return b.createModule(.{ .root_source_file = files.add("inkling2_xpu_images.zig", source.items), .target = target, .optimize = optimize });
 }
 
-/// The module `inkling2_xpu` and the pure launch plans it takes by name, over the xpu runtime `xpu` and `core`.
-pub fn familyModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, xpu: *std.Build.Module, core: *std.Build.Module, images_module: *std.Build.Module) *std.Build.Module {
+/// The module `inkling2_xpu` and the pure launch plans it takes by name, over the xpu runtime `xpu`, `core` and the lane core.
+pub fn familyModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, xpu: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, images_module: *std.Build.Module) *std.Build.Module {
     const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/xpu.zig"), .target = target, .optimize = optimize, .link_libc = true });
     m.addImport("xpu", xpu);
     m.addImport("core", core);
+    m.addImport("lanes", lanes);
     m.addImport("inkling2_xpu_images", images_module);
     for ([_][2][]const u8{
         .{ "inkling2_glue_plan", "zig/src/families/inkling2/metal/glue_plan.zig" },
