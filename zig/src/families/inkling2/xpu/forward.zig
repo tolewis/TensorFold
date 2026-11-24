@@ -302,7 +302,7 @@ const Run = struct {
                 .nvfp4 => try ex.nvfp4DownPrompt(g.s, act, tensor(w.down.weight), tensor(w.down.scale), tensor(w.down.amax.?), tensor(w.down.denominator.?), items, count, members, down, down_local),
                 .mxfp8 => try ex.mxfp8DownPrompt(g.s, act, tensor(w.down.weight), tensor(w.down.scale), items, count, members, down, down_local),
             }
-            try ex.combine(g.s, down, ids, at(s.route_weights, 0), at(s.mlp_out, 0), down_call);
+            try finishExperts(g, down, ids, at(s.route_weights, 0), down_call);
             return;
         }
         if (rows <= decode_rows) {
@@ -328,8 +328,12 @@ const Run = struct {
                 .mxfp8 => try ex.mxfp8DownPrompt(g.s, act, tensor(w.down.weight), tensor(w.down.scale), items, count, members, down, down_call),
             }
         }
-        try ex.combine(g.s, down, ids, at(s.route_weights, 0), at(s.mlp_out, 0), down_call);
+        try finishExperts(g, down, ids, at(s.route_weights, 0), down_call);
     }
+
+fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) !void {
+    try experts.Kernels.combine(&g.p.experts, g.s, down, ids, weights, at(g.sc.mlp_out, 0), call);
+}
 
     fn visit(g: Run, v: *const layer_plan.Visit, segments: []const Segment, rows: usize, taps: ?Ptr, visit_i: usize) !void {
         const s = g.sc;
@@ -360,8 +364,8 @@ const Run = struct {
         try g.dense(w.attn.gate, at(s.q_norm, 0), at(s.gate, 0), rows);
         try g.attendSegments(v, segments);
         try g.dense(w.attn.wo, at(s.att, 0), at(s.attn_dense, 0), rows);
-        try dumpBytes(&g, visit_i, "wo", at(s.attn_dense, 0), 2 * state.hidden * 2);
         if (g.m.options.place.split()) if (group.live) |gp| try gp.allReduce(at(s.attn_dense, 0).?, @intCast(rows));
+        try dumpBytes(&g, visit_i, "wo", at(s.attn_dense, 0), 2 * state.hidden * 2);
         try dumpBytes(&g, visit_i, "attn-red", at(s.attn_dense, 0), 2 * state.hidden * 2);
         var base: usize = 0;
         for (segments) |seg| {
