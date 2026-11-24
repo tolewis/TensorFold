@@ -19,6 +19,23 @@ const Tensor = model_file.Tensor;
 const place_mod = @import("place.zig");
 const group = @import("group.zig");
 
+var first_dump_done = false;
+
+fn dumpBytes(g: *const Run, visit_i: usize, tag: []const u8, src: ?*anyopaque, bytes: usize) !void {
+    if (first_dump_done or visit_i > 1) return;
+    const dir_z = std.c.getenv("TF_TP_DUMP") orelse return;
+    const ptr = src orelse return;
+    const host = try g.m.gpa.alloc(u8, bytes);
+    defer g.m.gpa.free(host);
+    try g.m.r.download(host, .{ .rt = g.m.r, .ptr = ptr, .len = bytes });
+    try g.m.r.sync();
+    var path_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/v{d}-{s}-r{d}.bin", .{ std.mem.span(dir_z), visit_i, tag, g.m.options.place.rank }) catch return;
+    const f = std.fs.createFileAbsolute(path, .{}) catch return;
+    defer f.close();
+    f.writeAll(host) catch return;
+}
+
 const rt = xpu.rt;
 
 /// A device address, offset already applied.
@@ -278,7 +295,7 @@ const Run = struct {
         try ex.combine(g.s, down, ids, at(s.route_weights, 0), at(s.mlp_out, 0), down_call);
     }
 
-    fn visit(g: Run, v: *const layer_plan.Visit, segments: []const Segment, rows: usize, taps: ?Ptr) !void {
+    fn visit(g: Run, v: *const layer_plan.Visit, segments: []const Segment, rows: usize, taps: ?Ptr, visit_i: usize) !void {
         const s = g.sc;
         const m = g.m;
         const lp = m.weight_plan.at(v.layer);
@@ -307,7 +324,9 @@ const Run = struct {
         try g.dense(w.attn.gate, at(s.q_norm, 0), at(s.gate, 0), rows);
         try g.attendSegments(v, segments);
         try g.dense(w.attn.wo, at(s.att, 0), at(s.attn_dense, 0), rows);
+        try dumpBytes(&g, visit_i, "wo", at(s.attn_dense, 0), 2 * state.hidden * 2);
         if (g.m.options.place.split()) if (group.live) |gp| try gp.allReduce(at(s.attn_dense, 0).?, @intCast(rows));
+        try dumpBytes(&g, visit_i, "attn-red", at(s.attn_dense, 0), 2 * state.hidden * 2);
         var base: usize = 0;
         for (segments) |seg| {
             try g.staticPostConv(seg.cache, v.cache_slot, 2, s.attn_dense, w.attn_conv, s.attn_conv, base, seg.rows);
@@ -322,8 +341,11 @@ const Run = struct {
             try g.norm(at(s.mlp_gated, 0), w.mlp_norm, at(s.mlp_normed, 0), rows);
         } else try g.norm(at(s.mlp_ar, 0), w.mlp_norm, at(s.mlp_normed, 0), rows);
         try glue.router(&g.p.glue, g.s, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.route_ids, 0), at(s.route_weights, 0), @intCast(rows));
+        try dumpBytes(&g, visit_i, "router", at(s.mlp_normed, 0), 2 * state.hidden * 2);
+        try dumpBytes(&g, visit_i, "route-ids", at(s.route_ids, 0), 2 * 8 * 4);
         try g.routedExperts(v.layer, rows);
         if (g.m.options.place.split()) if (group.live) |gp| try gp.allReduce(at(s.mlp_out, 0).?, @intCast(rows));
+        try dumpBytes(&g, visit_i, "exp-red", at(s.mlp_out, 0), 2 * state.hidden * 2);
         base = 0;
         for (segments) |seg| {
             try g.staticPostConv(seg.cache, v.cache_slot, 3, s.mlp_out, w.mlp_conv, s.mlp_conv, base, seg.rows);
@@ -383,7 +405,8 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     const g = Run{ .m = m, .p = p, .s = stream, .sc = s };
     if (m.options.place.rank == 0) if (group.live) |gp| try gp.note(.forward, ids);
     try glue.embedNorm(&p.glue, stream, at(s.ids, 0), tensor(m.weights.embed), tensor(m.weights.embed_norm), at(s.p, 0), @intCast(rows));
-    for (m.weight_plan.visits[0..m.weight_plan.n_visits]) |*v| try g.visit(v, segments, rows, options.taps);
+    for (m.weight_plan.visits[0..m.weight_plan.n_visits], 0..) |*v, vi| try g.visit(v, segments, rows, options.taps, vi);
+    if (std.c.getenv("TF_TP_DUMP") != null) first_dump_done = true;
     try g.widen(at(s.p, 0), at(s.partial, 0), rows);
     const final = finalPlan(rows, options.all, options.taps != null);
     for (0..final.work_rows) |j| {
