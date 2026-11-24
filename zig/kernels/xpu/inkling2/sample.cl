@@ -10,9 +10,10 @@
 // ids l, l + 1,024, ... in id order), a 32-lane butterfly inside each group of 32 lanes, then the 32 groups in order. The
 // exp is the device's, not the host libm's, so z can differ from the host's sum in the last bits.
 //
-// The cut is found by a radix select over the order-preserving key of v (four passes of eight bits). The entries above
-// the cut and the first of the entries equal to it, in id order, are gathered by a chunked scan and then sorted in
-// local memory with a bitonic network.
+// The cut is found by a radix select over the order-preserving key of v (four passes of eight bits, the counts split over 64
+// copies of the histogram because most of a row falls in a few bins). The entries above the cut are gathered in one pass
+// by a counter, the entries equal to it too when all of them are kept, else the first of them in id order by a chunked
+// scan; the list is then sorted in local memory with a bitonic network.
 
 #pragma OPENCL FP_CONTRACT OFF
 
@@ -33,11 +34,11 @@ static inline uint order_key(float v) {
 // out[row * stride + j] = { bits of v, token id } for j below the row's n; cfg[2 * row] holds inv_t's bits, cfg[2 * row + 1] n
 // (with SMP_WANT_Z set when zout[row] is wanted).
 KERNEL(SMP_W) void tf_ink2_sample_top(global const float *logits, global const uint *cfg, global uint *out, global float *zout, uint vocab, uint stride) {
-  local uint hist[256];
+  local uint hist[64 * 256]; // 64 copies (a sub-group's lanes in four sets): the counts of one hot bin do not queue on one address
   local float lane_sum[SMP_LANES];
   local float group_sum[32];
   local ulong order[SMP_TOP];
-  local uint cut_s, need_s, base_g, base_e, tot_g, tot_e;
+  local uint cut_s, need_s, eq_s, base_g, base_e, tot_g, tot_e;
   const uint t = get_local_id(0);
   const uint row = get_group_id(0);
   const float inv_t = as_float(cfg[2 * row]);
@@ -45,15 +46,32 @@ KERNEL(SMP_W) void tf_ink2_sample_top(global const float *logits, global const u
   const bool want_z = (cfg[2 * row + 1] & SMP_WANT_Z) != 0;
   global const float *l = logits + (ulong)row * vocab;
 
+  const uint sgh = (get_sub_group_id() * 4 + (get_sub_group_local_id() & 3u)) * 256;
   uint cut = 0;
   uint need = n;
   for (int p = 0; p < 4; p++) {
     const int shift = 24 - 8 * p;
-    if (t < 256) hist[t] = 0;
+    for (uint b = t; b < 64 * 256; b += SMP_W) hist[b] = 0;
     barrier(CLK_LOCAL_MEM_FENCE);
-    for (uint i = t; i < vocab; i += SMP_W) {
+    // eight loads in flight, then the counts
+    uint i = t;
+    for (; i + 7 * SMP_W < vocab; i += 8 * SMP_W) {
+      float v[8];
+      for (uint u = 0; u < 8; u++) v[u] = l[i + u * SMP_W];
+      for (uint u = 0; u < 8; u++) {
+        const uint k = order_key(v[u] * inv_t);
+        if (p == 0 || (k >> (shift + 8)) == (cut >> (shift + 8))) atomic_inc(&hist[sgh + ((k >> shift) & 0xFFu)]);
+      }
+    }
+    for (; i < vocab; i += SMP_W) {
       const uint k = order_key(l[i] * inv_t);
-      if (p == 0 || (k >> (shift + 8)) == (cut >> (shift + 8))) atomic_inc(&hist[(k >> shift) & 0xFFu]);
+      if (p == 0 || (k >> (shift + 8)) == (cut >> (shift + 8))) atomic_inc(&hist[sgh + ((k >> shift) & 0xFFu)]);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint b = t; b < 256; b += SMP_W) {
+      uint c = 0;
+      for (uint g = 0; g < 64; g++) c += hist[g * 256 + b];
+      hist[b] = c;
     }
     barrier(CLK_LOCAL_MEM_FENCE);
     if (t == 0) {
@@ -65,6 +83,7 @@ KERNEL(SMP_W) void tf_ink2_sample_top(global const float *logits, global const u
       }
       cut_s = cut | (d << shift);
       need_s = need - s;
+      eq_s = hist[d]; // after the last pass: how many keys equal the cut
     }
     barrier(CLK_LOCAL_MEM_FENCE);
     cut = cut_s;
@@ -80,43 +99,63 @@ KERNEL(SMP_W) void tf_ink2_sample_top(global const float *logits, global const u
     base_e = 0;
   }
   barrier(CLK_LOCAL_MEM_FENCE);
-  for (uint c = 0; c < vocab; c += SMP_W * SMP_PER) {
-    // each work-item owns SMP_PER consecutive ids, so the scan over work-items follows id order
-    uint keys[SMP_PER];
-    uint tg = 0;
-    uint te = 0;
-    for (uint j = 0; j < SMP_PER; j++) {
-      const uint i = c + t * SMP_PER + j;
-      keys[j] = i < vocab ? order_key(l[i] * inv_t) : 0u;
-      tg += (i < vocab && keys[j] > cut) ? 1u : 0u;
-      te += (i < vocab && keys[j] == cut) ? 1u : 0u;
-    }
-    const uint sg = work_group_scan_exclusive_add(tg);
-    const uint se = work_group_scan_exclusive_add(te);
-    if (t == SMP_W - 1) {
-      tot_g = sg + tg;
-      tot_e = se + te;
-    }
-    uint pg = base_g + sg;
-    uint pe = base_e + se;
-    for (uint j = 0; j < SMP_PER; j++) {
-      const uint i = c + t * SMP_PER + j;
-      if (i >= vocab) break;
-      const ulong w = ((ulong)keys[j] << 32) | (ulong)(0xFFFFFFFFu - i);
-      if (keys[j] > cut) {
-        order[pg++] = w;
-      } else if (keys[j] == cut) {
-        if (pe < need) order[above + pe] = w;
-        pe++;
+  // The entries above the cut go to the list in any order (the sort below orders them), by a counter. The entries equal to the
+  // cut are kept the same way when all of them are kept; when only the first `need` of them are, the chunked scan below places
+  // them in id order.
+  const bool all_eq = eq_s == need;
+  {
+    uint i = t;
+    for (; i + 7 * SMP_W < vocab; i += 8 * SMP_W) {
+      float v[8];
+      for (uint u = 0; u < 8; u++) v[u] = l[i + u * SMP_W];
+      for (uint u = 0; u < 8; u++) {
+        const uint k = order_key(v[u] * inv_t);
+        if (k > cut) {
+          order[atomic_inc(&base_g)] = ((ulong)k << 32) | (ulong)(0xFFFFFFFFu - (i + u * SMP_W));
+        } else if (all_eq && k == cut) {
+          order[above + atomic_inc(&base_e)] = ((ulong)k << 32) | (ulong)(0xFFFFFFFFu - (i + u * SMP_W));
+        }
       }
     }
-    barrier(CLK_LOCAL_MEM_FENCE);
-    if (t == 0) {
-      base_g += tot_g;
-      base_e += tot_e;
+    for (; i < vocab; i += SMP_W) {
+      const uint k = order_key(l[i] * inv_t);
+      if (k > cut) {
+        order[atomic_inc(&base_g)] = ((ulong)k << 32) | (ulong)(0xFFFFFFFFu - i);
+      } else if (all_eq && k == cut) {
+        order[above + atomic_inc(&base_e)] = ((ulong)k << 32) | (ulong)(0xFFFFFFFFu - i);
+      }
     }
-    barrier(CLK_LOCAL_MEM_FENCE);
   }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (!all_eq) {
+    if (t == 0) base_e = 0;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint c = 0; c < vocab; c += SMP_W * SMP_PER) {
+      // each work-item owns SMP_PER consecutive ids, so the scan over work-items follows id order
+      uint keys[SMP_PER];
+      uint te = 0;
+      for (uint j = 0; j < SMP_PER; j++) {
+        const uint i = c + t * SMP_PER + j;
+        keys[j] = i < vocab ? order_key(l[i] * inv_t) : 0u;
+        te += (i < vocab && keys[j] == cut) ? 1u : 0u;
+      }
+      const uint se = work_group_scan_exclusive_add(te);
+      if (t == SMP_W - 1) tot_e = se + te;
+      uint pe = base_e + se;
+      for (uint j = 0; j < SMP_PER; j++) {
+        const uint i = c + t * SMP_PER + j;
+        if (i >= vocab) break;
+        if (keys[j] == cut) {
+          if (pe < need) order[above + pe] = ((ulong)keys[j] << 32) | (ulong)(0xFFFFFFFFu - i);
+          pe++;
+        }
+      }
+      barrier(CLK_LOCAL_MEM_FENCE);
+      if (t == 0) base_e += tot_e;
+      barrier(CLK_LOCAL_MEM_FENCE);
+    }
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
 
   // Bitonic sort, larger first: a larger key wins, and for one key the larger 0xFFFFFFFF - id, which is the lower id.
   for (uint size = 2; size <= SMP_TOP; size <<= 1) {

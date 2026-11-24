@@ -3,7 +3,9 @@
 //! the whole row (value descending, ties to the lower id), for every candidate count and temperature tried. No model is
 //! loaded. Then the draws: `drawTop` from the device's candidates must equal `draw` from the row, for many seeds, positions
 //! and sampling rules (top_k set and off, top_p, min_p).
-//!   tf-xpu-inkling2-sample [--rows N]
+//!   tf-xpu-inkling2-sample [--rows N] [--bench]
+//! `--bench` only times `select` (host wall time, launch to the downloaded list) on a peaked row: one row and `--rows` rows,
+//! top 20 without the normalizer, and top 1,024 with it.
 const std = @import("std");
 const xpu = @import("xpu");
 const ink = @import("inkling2_xpu");
@@ -55,12 +57,20 @@ fn hostNorm(row: []const f32, m: f32, inv_t: f32) f64 {
     return lanes.gpu_rule.lanesSum(&lane);
 }
 
+fn nowNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     var rows: usize = 4;
+    var bench = false;
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
+        if (std.mem.eql(u8, argv[i], "--bench")) bench = true;
         if (std.mem.eql(u8, argv[i], "--rows")) {
             i += 1;
             rows = try std.fmt.parseInt(usize, argv[i], 10);
@@ -81,6 +91,25 @@ pub fn main(init: std.process.Init) !void {
     var device = try r.alloc(16 * vocab * 4);
     defer device.free();
     var prng = std.Random.DefaultPrng.init(20261123);
+    if (bench) {
+        for ([_]usize{ 0, 3 }) |kind| {
+            for (0..rows) |j| fill(&prng, host[j * vocab ..][0..vocab], kind);
+            try r.upload(device, std.mem.sliceAsBytes(host[0 .. rows * vocab]));
+            for ([_]usize{ 1, rows }) |nrows| {
+                for ([_]struct { n: u32, norm: bool }{ .{ .n = 20, .norm = false }, .{ .n = 1024, .norm = true } }) |c| {
+                    var picks: [16]ink.sampler.Row = undefined;
+                    for (picks[0..nrows]) |*p| p.* = .{ .inv_t = 1.25, .n = c.n, .norm = c.norm };
+                    for (0..3) |_| _ = try sampler.select(device.ptr, vocab, picks[0..nrows]);
+                    const reps = 50;
+                    const t0 = nowNs();
+                    for (0..reps) |_| _ = try sampler.select(device.ptr, vocab, picks[0..nrows]);
+                    const us = @as(f64, @floatFromInt(nowNs() - t0)) / reps / 1000.0;
+                    std.debug.print("bench kind {d} rows {d} n {d} z {}: {d:.1} us a select\n", .{ kind, nrows, c.n, c.norm, us });
+                }
+            }
+        }
+        return;
+    }
     var failures: usize = 0;
     var checked: usize = 0;
     for (0..4) |kind| {
