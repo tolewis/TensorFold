@@ -369,14 +369,16 @@ PF_GEMM_ATTR __kernel void P(mxfp8_down)(__global const ushort *xs, __global con
 #endif
 
 // ---- combine: the route outputs of a token weigh in ascending expert order, then round once to BF16 -----------------
-// Grid (ceil(n / 256), rows). ds is in sorted order; inv maps a route to its sorted row.
+// Grid (ceil(n / 1024), rows), 256 work-items, four columns each. n is a multiple of 4. The eight routes of a column add in
+// the same order as the one-column kernel, so a column's BF16 result is the same. ds is in sorted order; inv maps a route
+// to its sorted row.
 #if PF_ONLY & PF_K_COMBINE
 __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(256, 1, 1)))
 __kernel void P(combine)(__global const ushort *ds, __global const int *inv, __global const int *ids, __global const float *weights,
                          __global ushort *y, uint n, uint topk) {
   local int rows[8];
   local float wts[8];
-  const uint col = get_global_id(0), token = get_group_id(1);
+  const uint col = get_global_id(0) * 4, token = get_group_id(1);
   const uint lid = get_local_id(0);
   // slot `lid` takes the place its (expert, slot) pair holds in ascending order
   if (lid < topk) {
@@ -394,10 +396,15 @@ __kernel void P(combine)(__global const ushort *ds, __global const int *inv, __g
   }
   barrier(CLK_LOCAL_MEM_FENCE);
   if (col >= n) return;
-  ushort v[8];
-  for (uint t = 0; t < 8; t++) v[t] = ds[(ulong)rows[t] * n + col];
-  float sum = 0.0f;
-  for (uint t = 0; t < 8; t++) sum += wts[t] * P(bf_to_f)(v[t]);
-  y[(ulong)token * n + col] = P(f_to_bf)(sum);
+  float4 sum = (float4)(0.0f);
+  for (uint t = 0; t < 8; t++) {
+    const ushort4 v = vload4(0, ds + (ulong)rows[t] * n + col);
+    const float w = wts[t];
+    sum.x += w * P(bf_to_f)(v.x);
+    sum.y += w * P(bf_to_f)(v.y);
+    sum.z += w * P(bf_to_f)(v.z);
+    sum.w += w * P(bf_to_f)(v.w);
+  }
+  vstore4((ushort4)(P(f_to_bf)(sum.x), P(f_to_bf)(sum.y), P(f_to_bf)(sum.z), P(f_to_bf)(sum.w)), 0, y + (ulong)token * n + col);
 }
 #endif
