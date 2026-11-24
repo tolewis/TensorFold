@@ -71,12 +71,7 @@ pub fn sample(gpa: Allocator, logits: []const f32, s: ?Sampling, position: u32, 
         const at = argmax(logits);
         return if (ids) |m| m[at] else at;
     };
-    const r = rule(st);
-    const inv_t = r.inv_t;
-    const top_p = r.top_p;
-    const min_log = r.min_log;
-    const kc = r.top_k;
-    const cap: usize = if (kc == 0 or kc > candidates) candidates else kc;
+    const inv_t = rule(st).inv_t;
     const all = try gpa.alloc(Cand, logits.len);
     defer gpa.free(all);
     var m = -std.math.inf(f32);
@@ -86,6 +81,19 @@ pub fn sample(gpa: Allocator, logits: []const f32, s: ?Sampling, position: u32, 
     }
     const z = threadSum(all, m);
     std.mem.sort(Cand, all, {}, better);
+    return pick(all, m, z, st, position, ids);
+}
+
+/// The draw from a row's best candidates, in the kernel's order, when the rest of the row is not at hand: `top` holds at
+/// least min(top_k, 1024) of them (1,024 with top_k off), `m` is the row's largest scaled logit and `z` its normalizer,
+/// which is read only with top_k off. `sample` is this after its sort; a device that selects the candidates calls it alone.
+pub fn pick(top: []const Cand, m: f32, z: f32, st: Sampling, position: u32, ids: ?[]const u32) u32 {
+    const r = rule(st);
+    const top_p = r.top_p;
+    const min_log = r.min_log;
+    const kc = r.top_k;
+    const cap: usize = if (kc == 0 or kc > candidates) candidates else kc;
+    const all = top;
     const n: usize = @min(@min(all.len, candidates), cap);
     var norm = z;
     if (kc != 0) {
@@ -119,8 +127,8 @@ pub fn sample(gpa: Allocator, logits: []const f32, s: ?Sampling, position: u32, 
             best_score = score;
         }
     }
-    const pick = all[best].i;
-    return if (ids) |map| map[pick] else pick;
+    const chosen = all[best].i;
+    return if (ids) |map| map[chosen] else chosen;
 }
 
 /// The row's normalizer in the kernel's order: 1024 strided thread sums, a 32-lane butterfly, simdgroups in order.

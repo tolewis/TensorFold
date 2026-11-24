@@ -152,6 +152,11 @@ pub const Server = struct {
         const minimax = text.tokenId(reply_text.mm_markers.close) != null;
         if (minimax) srv.markers = reply_text.mm_markers else if (srv.info.reasoning_optional and std.mem.eql(u8, srv.markers.close, reply_text.think_markers.close)) srv.markers.optional = true;
         srv.close_id = text.tokenId(srv.markers.close);
+        // Inkling 2's replies are messages: the reply's first `<|end_message|>` closes the thinking message
+        if (text.tokenId("<|content_thinking|>") != null) if (text.tokenId("<|end_message|>")) |end| {
+            srv.markers = reply_text.inkling_markers;
+            srv.close_id = end;
+        };
         srv.recipients = recipient_reply.detect(text);
         const source = text.templateSource();
         srv.effort_levels = try fields.effortLevels(a, source);
@@ -159,6 +164,11 @@ pub const Server = struct {
         // MiniMax-M3's template decides on its own; thinking off closes the block in the prompt (prompt.zig)
         srv.thinking_switch = minimax or std.mem.indexOf(u8, source, "enable_thinking") != null or
             std.mem.indexOf(u8, source, "thinking_mode") != null;
+        // Inkling 2's template switches thinking with its reasoning_effort: "none" renders effort level 0
+        if (srv.markers.answer_end.len > 0 and std.mem.indexOf(u8, source, "reasoning_effort") != null) {
+            srv.thinking_switch = true;
+            srv.off_effort = "none";
+        }
         srv.late_system = try lateSystem(a, text);
         srv.needs_user_after_tool = needsUserAfterTool(source);
         if (srv.info.vision != null) {

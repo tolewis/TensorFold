@@ -160,3 +160,47 @@ test "a uniform that rounds to 1.0 does not win the race from the tail" {
     const p = try full.plan(a, &logits, .{ .seed = 7, .temperature = 1.0, .top_k = 0, .top_p = 1.0 });
     try expect(full.race(&logits, p, 7, 66903620, null) < 1024);
 }
+
+/// The row's best `n` tokens in the kernel's order, as a device that selects candidates returns them.
+fn bestOf(logits: []const f32, inv_t: f32, n: usize) ![]rule.Cand {
+    const all = try a.alloc(rule.Cand, logits.len);
+    defer a.free(all);
+    for (all, logits, 0..) |*c, l, i| c.* = .{ .v = l * inv_t, .i = @intCast(i) };
+    std.mem.sort(rule.Cand, all, {}, rule.better);
+    return a.dupe(rule.Cand, all[0..n]);
+}
+
+test "drawTop from the best candidates draws what draw draws from the whole row" {
+    var prng = std.Random.DefaultPrng.init(31);
+    const r = prng.random();
+    const row = try a.alloc(f32, 6000);
+    defer a.free(row);
+    const rules = [_]Sampling{
+        .{ .seed = 0, .temperature = 0.8, .top_k = 20, .top_p = 0.95 },
+        .{ .seed = 0, .temperature = 1.0, .top_k = 1024, .top_p = 1.0, .min_p = 0.01 },
+        .{ .seed = 0, .temperature = 0.8, .top_k = 0, .top_p = 0.95 },
+        .{ .seed = 0, .temperature = 1.0, .top_k = 0, .top_p = 1.0 },
+        .{ .seed = 0, .temperature = 0.5, .top_k = 0, .top_p = 0.9, .min_p = 0.05 },
+        // a flat row's nucleus runs past the 1,024 candidates, so the race reads the row
+        .{ .seed = 0, .temperature = 4.0, .top_k = 0, .top_p = 0.999 },
+    };
+    for (0..3) |kind| {
+        for (row, 0..) |*x, i| x.* = switch (kind) {
+            0 => r.floatNorm(f32) * 3.0,
+            1 => @floatFromInt(@as(i32, @intCast(r.uintLessThan(u32, 9))) - 4),
+            else => r.floatNorm(f32) * 0.2 + (if (i % 1000 == 0) @as(f32, 2.0) else 0.0),
+        };
+        for (rules) |base| {
+            const n: usize = if (base.top_k == 0) full.top_max else base.top_k;
+            const top = try bestOf(row, @floatCast(1.0 / base.temperature), n);
+            defer a.free(top);
+            for (0..16) |k| {
+                var s = base;
+                s.seed = 500 + k * 13;
+                const pos: u32 = @intCast(k * 5);
+                const want = try full.draw(a, row, s, pos, null);
+                try expectEqual(want, full.drawTop(if (full.needsRow(s)) row else null, top, s, pos));
+            }
+        }
+    }
+}

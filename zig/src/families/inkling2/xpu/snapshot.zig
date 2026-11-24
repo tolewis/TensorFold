@@ -33,7 +33,11 @@ pub const Snap = struct {
 
 const Direction = enum { save, restore };
 
-/// One queued pass over every slot, K then V, values then scales: the layout `bytes` counts.
+/// Key-value heads of a visit; the XPU attention kernels keep each head's ring contiguous, [head][ring position][value].
+const kv_heads = 8;
+
+/// One queued pass over every slot, K then V, values then scales: the layout `bytes` counts. Inside a piece the live
+/// positions of head 0 come first, then head 1, and so on, so the device's head-major rings are copied head by head.
 fn encode(cache: *const state.Cache, snap_buf: rt.Buffer, rows: usize, comptime dir: Direction) !void {
     const r = cache.r;
     var at: usize = 0;
@@ -47,12 +51,15 @@ fn encode(cache: *const state.Cache, snap_buf: rt.Buffer, rows: usize, comptime 
             .{ .off = s.value_scale_at, .per = cache.kv.scaleBytes() },
         };
         for (pieces) |p| {
-            const n = live * p.per;
+            const per_head = p.per / kv_heads;
+            const n = live * per_head;
             if (n == 0) continue;
-            const device = state.view(s.buf, p.off, n);
-            const packed_ = state.view(snap_buf, at, n);
-            if (dir == .save) try r.copy(packed_, device, n) else try r.copy(device, packed_, n);
-            at += n;
+            for (0..kv_heads) |h| {
+                const device = state.view(s.buf, p.off + h * @as(usize, s.ring) * per_head, n);
+                const packed_ = state.view(snap_buf, at, n);
+                if (dir == .save) try r.copy(packed_, device, n) else try r.copy(device, packed_, n);
+                at += n;
+            }
         }
     }
     const conv = state.view(snap_buf, at, state.conv_bytes);

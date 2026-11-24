@@ -4,7 +4,17 @@ const json = @import("json");
 const Value = json.Value;
 const Allocator = std.mem.Allocator;
 
-pub const Markers = struct { open: []const u8, close: []const u8, optional: bool = false };
+/// `answer_open` and `answer_end` are for replies written as messages (Inkling 2): the reply's answer message opens with
+/// `answer_open` when no thinking message comes first, and ends at `answer_end`.
+pub const Markers = struct { open: []const u8, close: []const u8, optional: bool = false, answer_open: []const u8 = "", answer_end: []const u8 = "" };
+/// Inkling 2 writes a reply as messages: a thinking message, then the answer message, each closed by `<|end_message|>`.
+/// The close token is `<|end_message|>` (server.zig); the answer starts after the whole sequence.
+pub const inkling_markers: Markers = .{
+    .open = "<|message_model|><|content_thinking|>",
+    .close = "<|end_message|><|message_model|><|content_text|>",
+    .answer_open = "<|message_model|><|content_text|>",
+    .answer_end = "<|end_message|>",
+};
 /// Qwen's prompt opens the think block; Gemma 4's reply opens its thought channel.
 pub const think_markers: Markers = .{ .open = "", .close = "</think>" };
 /// MiniMax-M3's adaptive thinking: the reply writes `<mm:think>...</mm:think>` itself, or `</mm:think>` alone.
@@ -119,6 +129,27 @@ pub fn splitThinkingTokens(a: Allocator, decode: anytype, ctx: anytype, full: []
 
 /// As `splitThinking`, but the close marker is the model's own close token: the reasoning ends at that token's bytes.
 pub fn splitThinkingAt(a: Allocator, full: []const u8, finished: bool, m: Markers, close: Close) Allocator.Error!Split {
+    if (m.answer_end.len == 0) return splitBlock(a, full, finished, m, close);
+    // a reply of messages: an answer message with no thinking before it, else the thinking block and then the answer
+    if (std.mem.startsWith(u8, full, m.answer_open)) return .{ .reasoning = "", .answer = untilAnswerEnd(full[m.answer_open.len..], finished, m) };
+    if (!finished and std.mem.startsWith(u8, m.answer_open, full)) return .{ .reasoning = "", .answer = "" };
+    const s = try splitBlock(a, full, finished, m, close);
+    return .{ .reasoning = s.reasoning, .answer = untilAnswerEnd(s.answer, finished, m) };
+}
+
+/// The answer message's text: it ends where the message does, and a partial end tag is held while the reply streams.
+fn untilAnswerEnd(answer: []const u8, finished: bool, m: Markers) []const u8 {
+    if (find(answer, m.answer_end)) |at| return answer[0..at];
+    return if (finished) answer else answer[0 .. answer.len - partialTag(answer, m.answer_end)];
+}
+
+/// Tokens of the reasoning, the close token included; none when a reply of messages opens with its answer.
+pub fn reasoningCountOpened(tokens: []const u32, open_id: ?u32, think_end: ?u32) usize {
+    if (open_id) |id| if (std.mem.indexOfScalar(u32, tokens[0..@min(tokens.len, 2)], id) == null) return 0;
+    return reasoningCount(tokens, think_end);
+}
+
+fn splitBlock(a: Allocator, full: []const u8, finished: bool, m: Markers, close: Close) Allocator.Error!Split {
     const o = openersOf(m);
     var text = full;
     var at: ?usize = switch (close) {
@@ -129,7 +160,7 @@ pub fn splitThinkingAt(a: Allocator, full: []const u8, finished: bool, m: Marker
         if (find(text, m.open)) |start| if (start > 0) {
             var prefix = text[0..start];
             prefix = prefix[0 .. prefix.len - partialTag(prefix, m.open)]; // a stray partial opener
-            const inner = try splitThinkingAt(a, text[start..], finished, m, switch (close) {
+            const inner = try splitBlock(a, text[start..], finished, m, switch (close) {
                 .spelled, .pending => close,
                 .token => |v| .{ .token = if (v >= start) v - start else 0 },
             });
@@ -596,4 +627,33 @@ pub fn deltaOf(a: Allocator, key: []const u8, text: []const u8) Allocator.Error!
     const o = try json.newObject(a);
     try o.put(a, key, .{ .string = text });
     return .{ .object = o };
+}
+
+test "reply text: Inkling 2's messages split into reasoning and answer, with the message tags removed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const m = inkling_markers;
+    const reply = "<|message_model|><|content_thinking|>Compute 17*23.<|end_message|><|message_model|><|content_text|>391<|end_message|><|message_model|><|content_thinking|>more";
+    const s = try splitThinkingAt(a, reply, true, m, .spelled);
+    try std.testing.expectEqualStrings("Compute 17*23.", s.reasoning);
+    try std.testing.expectEqualStrings("391", s.answer);
+    // streamed: the close and the end tag are held while they may still complete
+    const held = try splitThinkingAt(a, "<|message_model|><|content_thinking|>Compute.<|end_message|><|message_mo", false, m, .{ .token = 45 });
+    try std.testing.expectEqualStrings("Compute.", held.reasoning);
+    try std.testing.expectEqualStrings("", held.answer);
+    const streaming = try splitThinkingAt(a, "<|message_model|><|content_thinking|>Compute.<|end_message|><|message_model|><|content_text|>39<|end", false, m, .{ .token = 45 });
+    try std.testing.expectEqualStrings("39", streaming.answer);
+    // an answer message with no thinking before it
+    const plain = try splitThinkingAt(a, "<|message_model|><|content_text|>Hello<|end_message|>", true, m, .{ .token = 40 });
+    try std.testing.expectEqualStrings("", plain.reasoning);
+    try std.testing.expectEqualStrings("Hello", plain.answer);
+    const opening = try splitThinkingAt(a, "<|message_model|>", false, m, .pending);
+    try std.testing.expectEqualStrings("", opening.reasoning);
+    try std.testing.expectEqualStrings("", opening.answer);
+    // a reply cut inside its thinking is all reasoning
+    const cut = try splitThinkingAt(a, "<|message_model|><|content_thinking|>Compute 17", true, m, .pending);
+    try std.testing.expectEqualStrings("Compute 17", cut.reasoning);
+    try std.testing.expectEqual(@as(usize, 0), reasoningCountOpened(&.{ 5, 6, 7 }, 99, 7));
+    try std.testing.expectEqual(@as(usize, 3), reasoningCountOpened(&.{ 1, 99, 7, 8 }, 99, 7));
 }
