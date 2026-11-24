@@ -19,7 +19,13 @@ const Tensor = model_file.Tensor;
 const place_mod = @import("place.zig");
 const group = @import("group.zig");
 
-var first_dump_done = false;
+var dump_fwd: u32 = 0;
+
+fn dumpWanted() bool {
+    const z = std.c.getenv("TF_TP_DUMP_FWD") orelse return dump_fwd == 0;
+    const want = std.fmt.parseInt(u32, std.mem.span(z), 10) catch return dump_fwd == 0;
+    return dump_fwd == want;
+}
 var slice_own_dumped = false;
 var slice_pulled_dumped = false;
 
@@ -41,7 +47,7 @@ fn dumpF32(r: *xpu.rt.Runtime, rank: u32, name: []const u8, src: ?*anyopaque, n:
 }
 
 fn dumpBytes(g: *const Run, visit_i: usize, tag: []const u8, src: ?*anyopaque, bytes: usize) !void {
-    if (first_dump_done) return;
+    if (!dumpWanted()) return;
     const dir_z = std.c.getenv("TF_TP_DUMP") orelse return;
     const ptr = src orelse return;
     const host = try g.m.gpa.alloc(u8, bytes);
@@ -433,10 +439,10 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     try m.r.upload(s.seg_of, std.mem.sliceAsBytes(seg_of[0..rows]));
     try m.r.upload(s.segs, std.mem.sliceAsBytes(segs[0..segments.len]));
     const g = Run{ .m = m, .p = p, .s = stream, .sc = s };
-    if (m.options.place.rank == 0) if (group.live) |gp| try gp.note(.forward, ids, if (options.all) 1 else 0);
+    if (m.options.place.rank == 0) if (group.live) |gp| try gp.note(.forward, ids, if (options.all) 1 else 0, @intCast(segments[0].cache.len));
     try glue.embedNorm(&p.glue, stream, at(s.ids, 0), tensor(m.weights.embed), tensor(m.weights.embed_norm), at(s.p, 0), @intCast(rows));
     for (m.weight_plan.visits[0..m.weight_plan.n_visits], 0..) |*v, vi| try g.visit(v, segments, rows, options.taps, vi);
-    if (std.c.getenv("TF_TP_DUMP") != null) first_dump_done = true;
+    if (std.c.getenv("TF_TP_DUMP") != null) dump_fwd += 1;
     try g.widen(at(s.p, 0), at(s.partial, 0), rows);
     const final = finalPlan(rows, options.all, options.taps != null);
     for (0..final.work_rows) |j| {
@@ -467,7 +473,7 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
         } else try glue.logits(&p.glue, stream, head_input, tensor(m.weights.unembed), tight.ptr, @intCast(n_rows), vocab_n);
         try stream.synchronize();
         if (!slice_own_dumped) {
-            try dumpF32(m.r, m.options.place.rank, "slice-own", tight.ptr, vocab_n);
+            try dumpF32(m.r, m.options.place.rank, "slice-all", tight.ptr, vocab_n * @as(u32, @intCast(n_rows)));
             slice_own_dumped = true;
         }
         const full: usize = m.config.text.unpadded_vocab;
@@ -476,9 +482,9 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
         for (0..n_rows) |r| {
             const off = r * @as(usize, vocab_n) * 4;
             try gp.headPull(plus(tight.ptr, off).?, plus(peer.ptr, off).?, vocab_n);
-            if (r == 0 and !slice_pulled_dumped) {
+            if (r + 1 == n_rows and m.options.place.rank == 0 and !slice_pulled_dumped) {
                 try stream.synchronize();
-                if (m.options.place.rank == 0) try dumpF32(m.r, 0, "slice-pulled", peer.ptr, vocab_n);
+                try dumpF32(m.r, 0, "slice-pulled-all", peer.ptr, vocab_n * @as(u32, @intCast(n_rows)));
                 slice_pulled_dumped = true;
             }
             if (m.options.place.rank == 0) {

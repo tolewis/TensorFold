@@ -28,7 +28,7 @@ const GetIpc = *const fn (ze.H, *const anyopaque, *IpcHandle) callconv(.c) u32;
 const OpenIpc = *const fn (ze.H, ze.H, IpcHandle, u32, *?*anyopaque) callconv(.c) u32;
 
 pub const Op = enum(u32) { forward = 1, close = 2 };
-pub const Rec = extern struct { seq: u64, op: Op, n: u32, flags: u32, ids: [64]u32 };
+pub const Rec = extern struct { seq: u64, op: Op, n: u32, flags: u32, base: u32, ids: [64]u32 };
 
 pub const Group = struct {
     tp: u32,
@@ -119,11 +119,11 @@ pub const Group = struct {
         }
     }
 
-    pub fn note(g: *Group, op: Op, ids: []const u32, flags: u32) !void {
+    pub fn note(g: *Group, op: Op, ids: []const u32, flags: u32, base: u32) !void {
         if (g.rank != 0) return;
         if (ids.len > 64) return error.Inkling2Tp;
         g.rec_seq += 1;
-        var rec: Rec = .{ .seq = g.rec_seq, .op = op, .n = @intCast(ids.len), .flags = flags, .ids = @splat(0) };
+        var rec: Rec = .{ .seq = g.rec_seq, .op = op, .n = @intCast(ids.len), .flags = flags, .base = base, .ids = @splat(0) };
         @memcpy(rec.ids[0..ids.len], ids);
         const slot = g.recSlot(g.rec_seq);
         @memcpy(slot[0..@sizeOf(Rec)], std.mem.asBytes(&rec));
