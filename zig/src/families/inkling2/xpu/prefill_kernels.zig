@@ -125,7 +125,8 @@ pub fn convStatic(k: *const Kernels, s: xpu.Stream, history: Ref, current: Ref, 
 
 /// attention.zig's relative-bias table for `rows * heads` (row, head) pairs; bit for bit the same.
 pub fn relTable(k: *const Kernels, s: xpu.Stream, pairs: u32, rel: Ref, proj: Ref, tab: Ref) !void {
-    try xpu.launch.dispatch(k.rel_table, s, .{ pairs, 1, 1 }, .{ rel, proj, tab });
+    std.debug.assert(pairs % 8 == 0); // PF_REL_BATCH
+    try xpu.launch.dispatch(k.rel_table, s, .{ pairs / 8, 1, 1 }, .{ rel, proj, tab });
 }
 
 /// The controller tuple for every row: zn is a scratch of `rows * 2 * hidden` bf16 values, zeta one of `rows * 64`.

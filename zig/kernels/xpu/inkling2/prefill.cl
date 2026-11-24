@@ -36,6 +36,79 @@ static float pf_group_sum(float v, local float *red) {
 
 static inline float pf_rms_inverse(float ss) { return 1.0f / sqrt(ss / 2304.0f + PF_EPS); }
 
+
+
+
+
+// ---- dense projections of a chunk on DPAS --------------------------------------------------------------------------
+//
+// y[row][n] = bf16(x[row][k] . dequant(W)[n][k]) for the Q8 weights of q8.zig, any number of rows, FP32 sums. The weights are
+// the A operand (8 weight rows a tile, lane = k) and the rows of x the B operand (lane = row), so one fragment of codes feeds
+// every row tile of the sub-group. `tf_ink2_pf_perm` first reorders each 256-value plane of x so that a k16 step (block b,
+// parity p) is 16 contiguous values: step s = 2 b + p holds the block's values 2 l + p for l = 0 to 15, which are the values
+// lane l of the weights' plane holds (q8.zig). A block's 32 products go through DPAS into a fresh sum, which the block's fp16
+// scale then weighs into the running sum: acc += scale * (sum of 32 code * x). A row's result does not depend on the other
+// rows of the launch.
+
+#define PF_WA 2 // weight tiles of a sub-group (8 rows each)
+#define PF_TB 2 // row tiles of a sub-group (16 rows each)
+
+
+static inline ushort pf_code_bf16(uint word, uint shift) {
+  const int c = (int)(word << (24 - shift)) >> 24; // the signed byte at `shift`
+  return (ushort)(as_uint((float)c) >> 16);        // an integer of 7 bits is exact in bf16
+}
+
+
+// ---- the message controllers of a chunk on DPAS --------------------------------------------------------------------
+//
+// The controller tuple of tf_inkling2_loop_zeta and _gates for every row at once. `zeta_norm` writes each row's h and m
+// normed to bf16 (h first, then m: 2 * 2304 values); `zeta` is the D projection, zeta[row][r] = bf16(normed . down[r]), on
+// DPAS (the rows of x the A operand); `gates` makes F and Gamma from zeta and the weights, also on DPAS, and ends in the
+// blend out = (1 - tanh F) h + tanh Gamma m with every step rounded in binary32, as the per-row kernel does.
+
+
+
+
+// ---- sliding-window prompt attention on DPAS -------------------------------------------------------------------------
+//
+// The kernel is prompt_attention.cl's, cut for a window: a sub-group owns 16 (row, query head) pairs of one K/V head and
+// walks the keys of its rows' windows in tiles of 16, S = Q.K and O = P.V on DPAS, every P rounded to bf16 against the
+// running maximum before it enters the denominator and the product. Keys come from a staging ring (position % ring) that
+// holds the window before the chunk and the chunk itself, so a chunk longer than the cache ring never overwrites a key a
+// row still needs. One partial (max, sum, P.V) a (row, head) is left for the merge of attention.cl, which is launched with a
+// key chunk too large to split a window.
+
+#define PF_D 128
+#define PF_GROUP 3
+#define PF_KEYS 16
+#define PF_PAIRS 16
+#define PF_WINDOW 1024
+#define PF_LOG2E 1.4426950408889634f
+
+typedef struct {
+  int row0, n, p0, pad;
+  long off;
+} PfSeg;
+
+
+
+
+static inline float pf_sigmoid(float x) {
+  const float e = exp(-fabs(x));
+  return x < 0.0f ? e / (1.0f + e) : 1.0f / (1.0f + e);
+}
+
+
+#define PF_SQRT5 0x1.1e377ap+1f // binary32(sqrt(5))
+
+
+#define PF_REL 16
+#define PF_REL_BATCH 8 // (row, head) pairs a work-group
+#define PF_EXTENT 1024
+
+
+
 // Grid (queries, rows): the attention residual of tf_inkling2_ar for every row at once. Row r reads its sources at
 // blocks[r][0..sources - 1] (a row holds 4 block slots) and partial[r], and writes out[q][r], one fp32 row a (query, row).
 KERNEL(256) void tf_ink2_pf_ar(global const ushort *blocks, global const float *partial, global const float *queries,
@@ -160,30 +233,12 @@ KERNEL(256) void tf_ink2_pf_copy_rows(global const ushort *x, global ushort *y, 
   if (i < n && r < rows) y[(ulong)r * ldy + i] = x[(ulong)r * ldx + i];
 }
 
-// ---- dense projections of a chunk on DPAS --------------------------------------------------------------------------
-//
-// y[row][n] = bf16(x[row][k] . dequant(W)[n][k]) for the Q8 weights of q8.zig, any number of rows, FP32 sums. The weights are
-// the A operand (8 weight rows a tile, lane = k) and the rows of x the B operand (lane = row), so one fragment of codes feeds
-// every row tile of the sub-group. `tf_ink2_pf_perm` first reorders each 256-value plane of x so that a k16 step (block b,
-// parity p) is 16 contiguous values: step s = 2 b + p holds the block's values 2 l + p for l = 0 to 15, which are the values
-// lane l of the weights' plane holds (q8.zig). A block's 32 products go through DPAS into a fresh sum, which the block's fp16
-// scale then weighs into the running sum: acc += scale * (sum of 32 code * x). A row's result does not depend on the other
-// rows of the launch.
-
-#define PF_WA 2 // weight tiles of a sub-group (8 rows each)
-#define PF_TB 2 // row tiles of a sub-group (16 rows each)
-
 // Grid (k / 256, rows): xp[row][plane][s][l] = x[row][plane * 256 + (s / 2) * 32 + 2 l + (s & 1)].
 KERNEL(256) void tf_ink2_pf_perm(global const ushort *x, global ushort *xp, uint rows, uint k) {
   const uint plane = get_group_id(0), row = get_group_id(1), o = get_local_id(0);
   if (row >= rows) return;
   const uint s = o >> 4, l = o & 15u;
   xp[(ulong)row * k + plane * 256 + o] = x[(ulong)row * k + plane * 256 + (s >> 1) * 32 + 2 * l + (s & 1)];
-}
-
-static inline ushort pf_code_bf16(uint word, uint shift) {
-  const int c = (int)(word << (24 - shift)) >> 24; // the signed byte at `shift`
-  return (ushort)(as_uint((float)c) >> 16);        // an integer of 7 bits is exact in bf16
 }
 
 // Grid (ceil(n / (8 * PF_WA * 8)), ceil(rows / (16 * PF_TB))), work-group of 8 sub-groups. ldy: values between output rows.
@@ -247,13 +302,6 @@ KERNEL(128) void tf_ink2_pf_q8(global const ushort *xp, global const uchar *w, g
     }
   }
 }
-
-// ---- the message controllers of a chunk on DPAS --------------------------------------------------------------------
-//
-// The controller tuple of tf_inkling2_loop_zeta and _gates for every row at once. `zeta_norm` writes each row's h and m
-// normed to bf16 (h first, then m: 2 * 2304 values); `zeta` is the D projection, zeta[row][r] = bf16(normed . down[r]), on
-// DPAS (the rows of x the A operand); `gates` makes F and Gamma from zeta and the weights, also on DPAS, and ends in the
-// blend out = (1 - tanh F) h + tanh Gamma m with every step rounded in binary32, as the per-row kernel does.
 
 // Grid (rows): zn[row][0..2303] = bf16(h[row] * inverse rms of h[row]), zn[row][2304..4607] the same for m.
 KERNEL(256) void tf_ink2_pf_zeta_norm(global const float *h, global const float *m, global ushort *zn, uint rows) {
@@ -351,27 +399,6 @@ KERNEL(16) void tf_ink2_pf_gates(global const float *h, global const float *m, g
       out[at] = left + right;
     }
 }
-
-// ---- sliding-window prompt attention on DPAS -------------------------------------------------------------------------
-//
-// The kernel is prompt_attention.cl's, cut for a window: a sub-group owns 16 (row, query head) pairs of one K/V head and
-// walks the keys of its rows' windows in tiles of 16, S = Q.K and O = P.V on DPAS, every P rounded to bf16 against the
-// running maximum before it enters the denominator and the product. Keys come from a staging ring (position % ring) that
-// holds the window before the chunk and the chunk itself, so a chunk longer than the cache ring never overwrites a key a
-// row still needs. One partial (max, sum, P.V) a (row, head) is left for the merge of attention.cl, which is launched with a
-// key chunk too large to split a window.
-
-#define PF_D 128
-#define PF_GROUP 3
-#define PF_KEYS 16
-#define PF_PAIRS 16
-#define PF_WINDOW 1024
-#define PF_LOG2E 1.4426950408889634f
-
-typedef struct {
-  int row0, n, p0, pad;
-  long off;
-} PfSeg;
 
 // Copies `n` rows of every K/V head from position `from` of one ring to the same positions of another.
 KERNEL(16) void tf_ink2_pf_kv_copy(global const ushort *src, global ushort *dst, uint from, uint src_ring, uint dst_ring, uint n, uint kv_heads) {
@@ -521,11 +548,6 @@ KERNEL(128) void tf_ink2_pf_dense(global const ushort *x, global const ushort *w
   }
 }
 
-static inline float pf_sigmoid(float x) {
-  const float e = exp(-fabs(x));
-  return x < 0.0f ? e / (1.0f + e) : 1.0f / (1.0f + e);
-}
-
 // glue.cl's router for 4 rows a work-group: the same sums in the same order (so the scores, the picks and the weights are bit
 // for bit a one-row launch's), but each expert's weight row is read once for four independent chains. Grid (ceil(rows / 4)).
 // Work-item e < 128 sums expert e's products; sub-group r of the group then picks the top 8 of row r.
@@ -617,8 +639,6 @@ KERNEL(256) void tf_ink2_pf_router(global const ushort *x, global const ushort *
   }
 }
 
-#define PF_SQRT5 0x1.1e377ap+1f // binary32(sqrt(5))
-
 // glue.cl's static convolution, four channels a work-item: the same arithmetic a channel, so the result is bit for bit.
 // Grid (ceil(channels / 4 / 256), rows); channels a multiple of 4.
 KERNEL(256) void tf_ink2_pf_conv_static(global const ushort *history, global const ushort *current, global ushort *taps,
@@ -645,19 +665,20 @@ KERNEL(256) void tf_ink2_pf_conv_static(global const ushort *history, global con
   vstore4((ushort4)(f2bf(q.x), f2bf(q.y), f2bf(q.z), f2bf(q.w)), 0, out + (ulong)r * channels + c);
 }
 
-#define PF_REL 16
-#define PF_EXTENT 1024
-
-// attention.cl's relative-bias table, four distances a work-item (one work-group a (row, head)): each distance's 16 taps add in
-// the same order, so the table is bit for bit the same. Grid (rows * heads).
+// attention.cl's relative-bias table, four distances a work-item and PF_REL_BATCH (row, head) pairs a work-group (the 16 projection values of a distance load once for all of them): each distance's 16 taps add in
+// the same order, so the table is bit for bit the same. Grid (rows * heads / PF_REL_BATCH).
 KERNEL(256) void tf_ink2_pf_rel_table(global const ushort *rel, global const ushort *proj, global ushort *tab) {
-  const uint rh = get_group_id(0), d = get_local_id(0) * 4;
-  float r[PF_REL];
-  for (uint j = 0; j < PF_REL; ++j) r[j] = bf2f(rel[rh * PF_REL + j]);
-  float4 acc = (float4)(0.0f);
+  const uint d = get_local_id(0) * 4;
+  float4 pj[PF_REL];
   for (uint j = 0; j < PF_REL; ++j) {
     const ushort4 p = vload4(0, proj + j * PF_EXTENT + d);
-    acc += r[j] * (float4)(bf2f(p.x), bf2f(p.y), bf2f(p.z), bf2f(p.w));
+    pj[j] = (float4)(bf2f(p.x), bf2f(p.y), bf2f(p.z), bf2f(p.w));
   }
-  vstore4((ushort4)(f2bf(acc.x), f2bf(acc.y), f2bf(acc.z), f2bf(acc.w)), 0, tab + (ulong)rh * PF_EXTENT + d);
+  for (uint b = 0; b < PF_REL_BATCH; ++b) {
+    const ulong rh = (ulong)get_group_id(0) * PF_REL_BATCH + b;
+    const ushort16 rr = vload16(0, rel + rh * PF_REL);
+    float4 acc = (float4)(0.0f);
+    for (uint j = 0; j < PF_REL; ++j) acc += bf2f(rr[j]) * pj[j];
+    vstore4((ushort4)(f2bf(acc.x), f2bf(acc.y), f2bf(acc.z), f2bf(acc.w)), 0, tab + rh * PF_EXTENT + d);
+  }
 }
