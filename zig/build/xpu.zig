@@ -184,7 +184,8 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const nem = nemotronModules(b, target, optimize, ocloc, device, dpas, ze_mod, core, lanes);
     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
-    const engines = b.createModule(.{ .root_source_file = b.path("zig/src/native/xpu.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes }, .{ .name = "xpu", .module = nem.xpu }, .{ .name = "nemotron_xpu", .module = nem.nemotron }, .{ .name = "lfm3_xpu", .module = lfm3Module(b, target, optimize, nem.xpu) } } });
+    const ink_images = xpu_inkling2.productionModule(b, target, optimize, ocloc, device);
+    const engines = b.createModule(.{ .root_source_file = b.path("zig/src/native/xpu.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes }, .{ .name = "xpu", .module = nem.xpu }, .{ .name = "nemotron_xpu", .module = nem.nemotron }, .{ .name = "lfm3_xpu", .module = lfm3Module(b, target, optimize, nem.xpu) }, .{ .name = "inkling2_xpu", .module = xpu_inkling2.familyModule(b, target, optimize, nem.xpu, core, lanes, ink_images) } } });
     // the Qwen3.8-27B runner and Gemma 4 E4B (DPAS, nGEN) only with DPAS: a Gen12LP server serves Nemotron and LFM3
     const engine_options = b.addOptions();
     engine_options.addOption(bool, "qwen27", dpas);
@@ -226,7 +227,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         // Inkling 2 Mini on the device: the resident model, the whole forward and their device tests. The runtime is host-only
         // (the kernels are the family's own zebins, loaded by `inkling2_xpu`).
         const resident_xpu = runtime(b, target, optimize, &.{}, ze_mod, core, dpas);
-        const inkling2 = xpu_inkling2.familyModule(b, target, optimize, resident_xpu, core, xpu_inkling2.productionModule(b, target, optimize, ocloc, device));
+        const inkling2 = xpu_inkling2.familyModule(b, target, optimize, resident_xpu, core, lanes, ink_images);
         const resident = b.createModule(.{ .root_source_file = b.path("zig/tests/xpu/inkling2_resident.zig"), .target = target, .optimize = optimize, .link_libc = true });
         resident.addImport("xpu", resident_xpu);
         resident.addImport("inkling2_xpu", inkling2);
@@ -395,6 +396,7 @@ pub fn hostTests(b: *std.Build, step: *std.Build.Step) void {
     gemma_native.addImport("xpu_gemma4_kernels", empty);
     sources.addImport("gemma4_xpu", gemma_native);
     sources.addImport("lfm3_xpu", lfm3Module(b, b.graph.host, .debug, xpu));
+    sources.addImport("inkling2_xpu", xpu_inkling2.familyModule(b, host, .debug, xpu, core, lanes, xpu_inkling2.productionModule(b, host, .debug, null, "bmg")));
     // the host test checks every family's admission, so it builds with both DPAS engines
     const source_options = b.addOptions();
     source_options.addOption(bool, "qwen27", true);
@@ -432,7 +434,7 @@ pub fn hostTests(b: *std.Build, step: *std.Build.Step) void {
     b.step("test-rope-xpu-host", "The XPU 27B runner's RoPE tables on core's rope_freq, without devices or ocloc").dependOn(&rope_tests.step);
     step.dependOn(&rope_tests.step);
     // Inkling 2 Mini's XPU cache geometry, capacity math and snapshot sizes (host arithmetic only)
-    const inkling2_host = xpu_inkling2.familyModule(b, host, .debug, xpu, core, xpu_inkling2.productionModule(b, host, .debug, null, "bmg"));
+    const inkling2_host = xpu_inkling2.familyModule(b, host, .debug, xpu, core, lanes, xpu_inkling2.productionModule(b, host, .debug, null, "bmg"));
     const inkling2_tests = b.addRunArtifact(b.addTest(.{ .root_module = inkling2_host }));
     b.step("test-inkling2-xpu-host", "Inkling 2 Mini's XPU stream state and snapshot geometry without devices").dependOn(&inkling2_tests.step);
     step.dependOn(&inkling2_tests.step);
