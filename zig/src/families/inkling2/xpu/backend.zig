@@ -186,6 +186,8 @@ pub const Xpu = struct {
         const set = try self.sampler.select(cache.logits.ptr, @intCast(self.vocab()), &.{row});
         var buf: [sampler.top_max]lanes.gpu_rule.Cand = undefined;
         const top = set.list(0, row.n, &buf);
+        // top_k off: the kernel summed the normalizer, so the row comes back only when the draw reads past the candidates
+        if (row.norm) if (lanes.gpu_full.drawTopNorm(top, set.z[0], t, @intCast(position))) |token| return token;
         const whole: ?[]const f32 = if (lanes.gpu_full.needsRow(t)) try self.logits(cache) else null;
         return lanes.gpu_full.drawTop(whole, top, t, @intCast(position));
     }
@@ -382,11 +384,12 @@ pub const Xpu = struct {
                 device[at + k] = ok;
                 any = any or ok;
                 picks[at + k] = if (ok) sampler.Row.of(t.?) else .{ .inv_t = 1.0, .n = 1 };
-                if (!ok or lanes.gpu_full.needsRow(t.?)) whole = true;
+                if (!ok) whole = true;
             }
             at += w.rows();
         }
         const set = if (any) try self.sampler.select(self.scratch.logits_all.ptr, @intCast(v), picks[0..total]) else undefined;
+        var fetched = whole;
         if (whole) {
             try r.download(std.mem.sliceAsBytes(all), self.scratch.logits_all);
             try r.sync();
@@ -402,7 +405,18 @@ pub const Xpu = struct {
                     const t = sampled(w.stream.sampling).?;
                     var buf: [sampler.top_max]lanes.gpu_rule.Cand = undefined;
                     const top = set.list(base + k, picks[base + k].n, &buf);
-                    o.sampled[k] = lanes.gpu_full.drawTop(if (lanes.gpu_full.needsRow(t)) l else null, top, t, @intCast(w.positions[k]));
+                    // top_k off: the kernel summed the row's normalizer, so the window's rows are fetched only when a draw reads past the candidates
+                    const quick = if (picks[base + k].norm) lanes.gpu_full.drawTopNorm(top, set.z[base + k], t, @intCast(w.positions[k])) else null;
+                    if (quick) |token| {
+                        o.sampled[k] = token;
+                    } else {
+                        if (lanes.gpu_full.needsRow(t) and !fetched) {
+                            try r.download(std.mem.sliceAsBytes(all), self.scratch.logits_all);
+                            try r.sync();
+                            fetched = true;
+                        }
+                        o.sampled[k] = lanes.gpu_full.drawTop(if (lanes.gpu_full.needsRow(t)) l else null, top, t, @intCast(w.positions[k]));
+                    }
                 } else {
                     o.sampled[k] = try self.draw(l, w.stream.sampling, w.positions[k], mask);
                 }
