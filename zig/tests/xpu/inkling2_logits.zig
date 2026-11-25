@@ -876,13 +876,15 @@ fn verifyBits(gpa: std.mem.Allocator, io: std.Io, m: *const ink.model.Model, scr
     defer gpa.free(wk);
     const wv = try gpa.alloc(u8, kv_bytes);
     defer gpa.free(wv);
-    const att_row = state.hidden * 4;
+    const att_row = state.hidden * 2;
     const patt = try gpa.alloc(u8, n * att_row);
     defer gpa.free(patt);
     const watt = try gpa.alloc(u8, n * att_row);
     defer gpa.free(watt);
-    const vv = try gpa.alloc(u8, 1);
-    defer gpa.free(vv);
+    const pmlp = try gpa.alloc(u8, n * att_row);
+    defer gpa.free(pmlp);
+    const wmlp = try gpa.alloc(u8, n * att_row);
+    defer gpa.free(wmlp);
     var i: usize = 0;
     while (i < n) : (i += 1) {
         cache.len = from + i;
@@ -890,7 +892,8 @@ fn verifyBits(gpa: std.mem.Allocator, io: std.Io, m: *const ink.model.Model, scr
         try ink.forward.runShared(m, scratch, &.{.{ .cache = cache, .rows = 1 }}, ids[from + i ..][0..1], .{});
         try r.download(std.mem.sliceAsBytes(plain[i * vocab ..][0..vocab]), cache.logits);
         try r.sync();
-        try grab(r, cache, 0, 0, patt[i * att_row ..][0..att_row], vv[0..0]);
+        try grabBuf(r, scratch.att, patt[i * att_row ..][0..att_row]);
+        try grabBuf(r, scratch.mlp_normed, pmlp[i * att_row ..][0..att_row]);
         try cache.rollback();
     }
     try grab(r, cache, 0, from, pk, pv);
@@ -900,7 +903,8 @@ fn verifyBits(gpa: std.mem.Allocator, io: std.Io, m: *const ink.model.Model, scr
     try r.download(std.mem.sliceAsBytes(host[0 .. n * vocab]), scratch.logits_all);
     try r.sync();
     try grab(r, cache, 0, from, wk, wv);
-    try grabAtt(r, scratch, watt, n);
+    try grabBuf(r, scratch.att, watt);
+    try grabBuf(r, scratch.mlp_normed, wmlp);
     try cache.rollback();
     var diff: usize = 0;
     var worst: f64 = 0;
@@ -942,11 +946,19 @@ fn verifyBits(gpa: std.mem.Allocator, io: std.Io, m: *const ink.model.Model, scr
         }
     }
     std.debug.print("VERIFY ATT: {d} of {d} attention bytes differ (first row {d})\n", .{ ad, n * att_row, arow });
+    var md: usize = 0;
+    var mrow: usize = 0;
+    for (0..n * att_row) |b| {
+        if (pmlp[b] != wmlp[b]) {
+            if (md == 0) mrow = b / att_row;
+            md += 1;
+        }
+    }
+    std.debug.print("VERIFY MLP: {d} of {d} mlp_normed bytes differ (first row {d})\n", .{ md, n * att_row, mrow });
 }
 
-fn grabAtt(r: *xpu.rt.Runtime, scratch: *state.Scratch, out: []u8, n: usize) !void {
-    const row = state.hidden * 4;
-    const b = xpu.rt.Buffer{ .rt = r, .ptr = scratch.att.ptr, .len = n * row };
+fn grabBuf(r: *xpu.rt.Runtime, buf: xpu.rt.Buffer, out: []u8) !void {
+    const b = xpu.rt.Buffer{ .rt = r, .ptr = buf.ptr, .len = out.len };
     try r.download(out, b);
 }
 
