@@ -59,6 +59,9 @@ pub const Drafter = struct {
     kernels: k.Kernels,
     scratch: state.Scratch,
     scores: ?xpu.DeviceBuffer = null,
+    /// A split rank keeps only its vocabulary slice of the target's unembedding. The base head reads every row, so the
+    /// drafter holds the full matrix itself when the target's is a slice.
+    unembed: ?xpu.DeviceBuffer = null,
     capacity: usize = 1,
     contexts: std.AutoHashMapUnmanaged(*Stream, state.Lane) = .empty,
     /// The pending token's host copy, and one row of bf16 logits.
@@ -81,6 +84,8 @@ pub const Drafter = struct {
         const host = try gpa.alloc(u16, full);
         defer gpa.free(host);
         const unembed = target.weights.unembed;
+        var own_unembed: ?xpu.DeviceBuffer = null;
+        errdefer if (own_unembed) |b| b.free();
         if (unembed.bytes / 2 == full) {
             try target.r.download(std.mem.sliceAsBytes(host), unembed.buf);
             try target.r.sync();
@@ -89,6 +94,9 @@ pub const Drafter = struct {
             defer ldr.deinit();
             const inf = try ldr.info("model.llm.unembed.weight");
             try xpu.loader.readExact(inf.fd, std.mem.sliceAsBytes(host), inf.off);
+            own_unembed = try target.r.alloc(full * 2);
+            try target.r.upload(.{ .rt = target.r, .ptr = own_unembed.?.ptr, .len = full * 2 }, std.mem.sliceAsBytes(host));
+            try target.r.sync();
         }
         var config: weight_loader.Config = .{
             .layers = mtp.layers,
@@ -107,7 +115,7 @@ pub const Drafter = struct {
         for (0..@min(4, mtp.taps_n)) |i| config.taps[i] = mtp.taps[i];
         for (0..@min(3, mtp.layers)) |i| config.local[i] = mtp.local[i];
         const weights = try weight_loader.load(gpa, io, ctx, d.stream, config, drafter_dir, host);
-        d.* = .{ .gpa = gpa, .target = target, .ctx = ctx, .stream = d.stream, .weights = weights, .module = undefined, .kernels = undefined, .scratch = undefined, .host_logits = undefined };
+        d.* = .{ .gpa = gpa, .target = target, .ctx = ctx, .stream = d.stream, .weights = weights, .module = undefined, .kernels = undefined, .scratch = undefined, .host_logits = undefined, .unembed = own_unembed };
         errdefer d.weights.deinit();
         d.module = try xpu.Module.loadNative(ctx, &images.dspark);
         errdefer d.module.unload();
@@ -130,6 +138,7 @@ pub const Drafter = struct {
         while (it.next()) |lane| lane.deinit();
         d.contexts.deinit(d.gpa);
         if (d.scores) |*scores| scores.free();
+        if (d.unembed) |*b| b.free();
         d.gpa.free(d.host_logits);
         d.scratch.deinit();
         d.kernels.deinit();
@@ -333,7 +342,8 @@ pub const Drafter = struct {
                 d.traceDevice('N', &tag, at(sc.x, 0), 8 * state.hidden * 2);
             }
         }
-        try k.base(&d.kernels, s, target.weights.unembed.buf.ptr, at(sc.x, state.hidden * 2), at(sc.base, 0), @intCast(depth), state.vocabulary);
+        const unembed_ptr = if (d.unembed) |b| b.ptr else target.weights.unembed.buf.ptr;
+        try k.base(&d.kernels, s, unembed_ptr, at(sc.x, state.hidden * 2), at(sc.base, 0), @intCast(depth), state.vocabulary);
         try k.kappa(&d.kernels, s, at(sc.x, state.hidden * 2), at(lane.newest, 0), r(d.weights.weights.rnn), r(d.weights.weights.rnn_bias), at(sc.kappa, 0), @intCast(depth));
     }
 
