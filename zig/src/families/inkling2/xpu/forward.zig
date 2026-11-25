@@ -392,6 +392,14 @@ const Run = struct {
             try g.dense(w.attn.sink, at(s.q_norm, 0), at(s.sink, 0), rows);
         }
         xpu.profile.label = "";
+        if (dump_dir_len > 0) {
+            dumpRow(g.m, g.s, s.q_raw, state.query_width * 2, "qraw");
+            dumpRow(g.m, g.s, s.k_raw, state.kv_width * 2, "kraw");
+            dumpRow(g.m, g.s, s.v_raw, state.kv_width * 2, "vraw");
+            dumpRow(g.m, g.s, s.rel_raw, state.rel_width * 2, "relraw");
+            dumpRow(g.m, g.s, s.gate, state.query_width * 2, "gate");
+            dumpRow(g.m, g.s, s.sink, 24 * 2, "sink");
+        }
         try g.attendSegments(v, segments);
         xpu.profile.label = "wo";
         try g.dense(w.attn.wo, at(s.att, 0), at(s.attn_dense, 0), rows);
