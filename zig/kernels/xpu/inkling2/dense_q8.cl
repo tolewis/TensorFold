@@ -204,3 +204,51 @@ Q8_HEAD(4)
 Q8_HEAD(8)
 Q8_HEAD(16)
 Q8_HEAD(32)
+
+// Head only. One sub-group reads one 512-byte tile a block. A tile past the buffer is not read.
+__attribute__((reqd_work_group_size(128, 1, 1)))
+__kernel void Q8_NAME(q8_quant)(global const ushort *x, global char *qc, global float *qs, uint rows, uint k) {
+  const uint idx = get_global_id(0), nb = k / 32;
+  if (idx >= rows * nb) return;
+  const uint r = idx / nb, b = idx % nb;
+  global const ushort *src = x + ((ulong)r * k + b * 32);
+  float am = 0.0f;
+  for (uint e = 0; e < 32; ++e) am = fmax(am, fabs(q8_bf2f(src[e])));
+  const float ascl = am > 0.0f ? am * (1.0f / 127.0f) : 1.0f;
+  qs[idx] = ascl;
+  const float inv = 1.0f / ascl;
+  for (uint e = 0; e < 32; ++e) {
+    const int qv = clamp((int)rint(clamp(q8_bf2f(src[e]) * inv, -128.0f, 128.0f)), -127, 127);
+    qc[(ulong)r * k + b * 32 + e] = (char)qv;
+  }
+}
+
+__attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(16, 1, 1)))
+kernel void Q8_NAME(head_dpas)(global const char *qc, global const float *qs, global const uchar *w, global float *out,
+                                uint rows, uint vocab) {
+  const uint lane = get_sub_group_local_id();
+  const uint tile = get_group_id(0);
+  const uint j = tile * 16 + lane;
+  const uint nb = Q8_HIDDEN / 32, tiles = (vocab + 15) >> 4;
+  const int live = tile < tiles;
+  global const uchar *codes = w;
+  global const half *soa = (global const half *)(w + (ulong)tiles * nb * 512);
+  float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  for (uint b = 0; b < nb; ++b) {
+    int8 bv = (int8)(0);
+    float ws = 0.0f;
+    if (live) {
+      bv = vload8(0, (global const int *)(codes + ((ulong)tile * nb + b) * 512 + lane * 32));
+      ws = convert_float(soa[((ulong)tile * nb + b) * 16 + lane]);
+    }
+    short8 a = (short8)(0);
+    for (uint m = 0; m < rows && m < 8; ++m)
+      a[m] = as_short(intel_sub_group_block_read_us((global const ushort *)(qc + (ulong)m * Q8_HIDDEN + b * 32)));
+    const int8 dot = intel_sub_group_i8_i8_matrix_mad_k32(a, bv, (int8)(0));
+    for (uint m = 0; m < rows && m < 8; ++m)
+      acc[m] = Q8_ACC(acc[m], ws * qs[m * nb + b], (float)dot[m]);
+  }
+  if (j < vocab)
+    for (uint m = 0; m < rows && m < 8; ++m)
+      out[(ulong)m * vocab + j] = q8_cap(Q8_CAP_ROUND(acc[m]), 30.0f);
+}
