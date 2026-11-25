@@ -531,7 +531,7 @@ fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) 
                 try gp.allReduce(at(s.attn_dense, 0).?, @intCast(rows));
             }
         }
-        if (vdump and visit_i == 0) {
+        if (std.c.getenv("TF_TP_VDUMP") != null and visit_i == 0) {
             try dumpVisit(m.r, m.options.place.rank, vdump_cur, 90, at(s.q_norm, 0), rows);
             try dumpVisit(m.r, m.options.place.rank, vdump_cur, 91, at(s.attn_dense, 0), rows);
         }
