@@ -107,8 +107,19 @@ const Run = struct {
     fn dense(g: Run, weight: Tensor, input: Ptr, out: Ptr, rows: usize) !void {
         const k: u32 = @intCast(weight.shape[weight.rank - 1]);
         const n: u32 = @intCast(weight.shape[weight.rank - 2]);
+        if (weight.nvfp4) return g.denseNvfp4(weight, input, out, rows, n, k);
         if (weight.q8) return dense_q8_kernels.dense(&g.p.dense_q8, g.s, tensor(weight), input, out, @intCast(rows), n, k);
         try dense_kernels.dense(&g.p.dense, g.s, tensor(weight), input, out, @intCast(rows), n, k);
+    }
+
+    fn denseNvfp4(g: Run, weight: Tensor, input: Ptr, out: Ptr, rows: usize, n: u32, k: u32) !void {
+        const ids = g.m.dense_ids orelse return error.Inkling2NoKernels;
+        var i: usize = 0;
+        while (i < rows) : (i += 1) {
+            const in: Ptr = @ptrFromInt(@intFromPtr(input) + i * @as(usize, k) * 2);
+            const ou: Ptr = @ptrFromInt(@intFromPtr(out) + i * @as(usize, n) * 2);
+            try g.p.experts.denseRow(g.s, weight.buf.ptr, n, k, in, ou, ids.ptr);
+        }
     }
 
     /// One launch for every row: the AR of a row reads that row's blocks and partial and nothing of another row's, so batch
@@ -250,8 +261,28 @@ const Run = struct {
                 .segs = aref(s.segs, si * @sizeOf(ap.Seg)),
             };
             const kv = attention.Cache{ .k = sref(cache.keys(v.cache_slot)), .v = sref(cache.values(v.cache_slot)) };
-            try g.convInputForAttention(cache, v, base, rows, true);
-            try g.convInputForAttention(cache, v, base, rows, false);
+            const both_static = switch (w.attn.k_conv) {
+                .static => switch (w.attn.v_conv) {
+                    .static => true,
+                    .dynamic => false,
+                },
+                .dynamic => false,
+            };
+            if (fuse.kvConv() and both_static) {
+                const channels: u32 = state.kv_width;
+                const wk = switch (w.attn.k_conv) {
+                    .static => |weight| weight,
+                    .dynamic => unreachable,
+                };
+                const wv = switch (w.attn.v_conv) {
+                    .static => |weight| weight,
+                    .dynamic => unreachable,
+                };
+                try fuse.convKv(&g.p.fuse, g.s, cache.history(v.cache_slot, 0).ptr(), at(s.k_raw, base * channels * 2), cache.staged(v.cache_slot, 0, 0).ptr(), tensor(wk), at(s.k_conv, base * channels * 2), cache.history(v.cache_slot, 1).ptr(), at(s.v_raw, base * channels * 2), cache.staged(v.cache_slot, 1, 0).ptr(), tensor(wv), at(s.v_conv, base * channels * 2), @intCast(rows), channels);
+            } else {
+                try g.convInputForAttention(cache, v, base, rows, true);
+                try g.convInputForAttention(cache, v, base, rows, false);
+            }
             const k = &g.p.attention;
             const q_at = base * state.query_width * 2;
             const tab_at = base * 24 * ap.extent * 2;
@@ -301,7 +332,7 @@ const Run = struct {
                 .mxfp8 => try ex.mxfp8DownPrompt(g.s, act, tensor(w.down.weight), tensor(w.down.scale), items, count, members, down, down_call),
             }
         }
-        try ex.combine(g.s, down, ids, at(s.route_weights, 0), at(s.mlp_out, 0), down_call);
+        if (!(fuse.downEpi() and rows == 1)) try ex.combine(g.s, down, ids, at(s.route_weights, 0), at(s.mlp_out, 0), down_call);
     }
 
     fn visit(g: Run, v: *const layer_plan.Visit, segments: []const Segment, rows: usize, taps: ?Ptr) !void {
@@ -390,7 +421,11 @@ const Run = struct {
         if (route_trace) |tb| try g.s.copy(plus(tb.ptr, v.cache_slot * rows * 32), at(s.route_ids, 0), rows * 32);
         try g.routedExperts(v.layer, rows);
         base = 0;
-        if (fuse.convFold() and segments.len == 1) {
+        if (fuse.downEpi() and rows == 1 and segments.len == 1) {
+            const seg = segments[0];
+            const channels: u32 = @intCast(state.convWidth(3));
+            try fuse.downEpilogue(&g.p.fuse, g.s, at(s.down, 0), at(s.route_ids, 0), at(s.route_weights, 0), seg.cache.history(v.cache_slot, 3).ptr(), seg.cache.staged(v.cache_slot, 3, 0).ptr(), tensor(w.mlp_conv), at(s.mlp_conv, 0), at(s.partial, 0), at(s.p, 0), state.hidden, 8, channels);
+        } else if (fuse.convFold() and segments.len == 1) {
             const seg = segments[0];
             const channels: u32 = @intCast(state.convWidth(3));
             try fuse.convMlpPartial(&g.p.fuse, g.s, seg.cache.history(v.cache_slot, 3).ptr(), at(s.mlp_out, 0), seg.cache.staged(v.cache_slot, 3, 0).ptr(), tensor(w.mlp_conv), at(s.mlp_conv, 0), at(s.partial, 0), at(s.p, 0), @intCast(rows), channels);
