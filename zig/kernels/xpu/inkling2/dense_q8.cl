@@ -113,8 +113,11 @@ static inline float q8_cap(float x, float c) { return c * tanh(x / c); }
     (p) += (U);                                                                                                    \
   }
 
+// Eight live rows with nine planes in flight spills. Two planes at a time still reads each weight once.
+#define Q8_WIDE(ROWS) ((ROWS) >= 8 ? 2 : Q8_UNROLL)
+
 // The lane's sums for output column j over ROWS rows of x (`k` values a row, a multiple of 256), into acc[ROWS]: groups
-// of Q8_UNROLL planes, then of Q8_TAIL, then single planes.
+// of UNROLL planes, then of Q8_TAIL, then single planes.
 #define Q8_DOT(ROWS, x, codes, scales, j, n, k)                                                                    \
   {                                                                                                                \
     const uint planes = (k) / 256, lane = get_sub_group_local_id();                                                \
@@ -124,7 +127,7 @@ static inline float q8_cap(float x, float c) { return c * tanh(x / c); }
     const ulong xs = (k) / 2; /* a row of x in words */                                                            \
     _Pragma("unroll") for (uint r = 0; r < ROWS; ++r) acc[r] = 0.0f;                                               \
     uint p = 0;                                                                                                    \
-    for (; p + Q8_UNROLL <= planes;) Q8_GROUP(ROWS, Q8_UNROLL, p)                                                  \
+    for (; p + Q8_WIDE(ROWS) <= planes;) Q8_GROUP(ROWS, Q8_WIDE(ROWS), p)                                                  \
     for (; p + Q8_TAIL <= planes;) Q8_GROUP(ROWS, Q8_TAIL, p)                                                      \
     for (; p < planes;) Q8_GROUP(ROWS, 1, p)                                                                       \
   }

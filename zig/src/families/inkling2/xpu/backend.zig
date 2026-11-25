@@ -13,6 +13,12 @@ const sampler = @import("sampler.zig");
 const cfg = @import("../config.zig");
 const be = lanes.backend;
 
+fn verifyNow() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
 pub const Options = struct { capacity: usize, streams: u32 = 4, budget: u64 };
 const ring = 4096;
 /// The forward serves the K/V rows as bf16 (an int8 cache is refused there), so every cache is bf16.
@@ -367,7 +373,9 @@ pub const Xpu = struct {
             begun += 1;
         }
         const generation = if (self.prepared) self.nextTapGeneration() else 0;
+        const t_fwd = verifyNow();
         try fwd.runShared(self.model, &self.scratch, segments[0..windows.len], ids[0..total], .{ .all = true, .taps = self.tapPtr() });
+        const t_sel = verifyNow();
         const v = self.vocab();
         const all = self.window[0 .. total * v];
         // A sampled row without a mask or logprobs is selected on the device; the rest of the window is drawn from the host rows.
@@ -388,7 +396,22 @@ pub const Xpu = struct {
             }
             at += w.rows();
         }
-        const set = if (any) try self.sampler.select(self.scratch.logits_all.ptr, @intCast(v), picks[0..total]) else undefined;
+        var raced: ?[]const u32 = null;
+        if (any and !whole and total > 0) {
+            const t0 = sampled(windows[0].stream.sampling).?;
+            if (t0.top_k == 0 and t0.top_p >= 1.0 and t0.min_p == 0.0) {
+                var pos: [st.batch_rows]u32 = undefined;
+                var npos: usize = 0;
+                for (windows) |w| {
+                    for (w.positions) |p| {
+                        pos[npos] = @intCast(p);
+                        npos += 1;
+                    }
+                }
+                raced = try self.sampler.raceRows(self.scratch.logits_all.ptr, @intCast(v), pos[0..npos], t0.seed, @floatCast(1.0 / @max(t0.temperature, 1e-6)));
+            }
+        }
+        const set = if (raced == null and any) try self.sampler.select(self.scratch.logits_all.ptr, @intCast(v), picks[0..total]) else undefined;
         var fetched = whole;
         if (whole) {
             try r.download(std.mem.sliceAsBytes(all), self.scratch.logits_all);
@@ -401,7 +424,9 @@ pub const Xpu = struct {
             for (0..seg.rows) |k| {
                 const l = all[(base + k) * v ..][0..v];
                 const mask = if (w.masks.len >= (k + 1) * words) w.masks[k * words ..][0..words] else &.{};
-                if (device[base + k]) {
+                if (raced) |toks| {
+                    o.sampled[k] = toks[base + k];
+                } else if (device[base + k]) {
                     const t = sampled(w.stream.sampling).?;
                     var buf: [sampler.top_max]lanes.gpu_rule.Cand = undefined;
                     const top = set.list(base + k, picks[base + k].n, &buf);
@@ -425,7 +450,16 @@ pub const Xpu = struct {
             try r.copy(seg.cache.logits, st.view(self.scratch.logits_all, (base + seg.rows - 1) * v * 4, v * 4), v * 4);
             base += seg.rows;
         }
+        const t_draw = verifyNow();
         try r.sync();
+        if (std.c.getenv("TF_VERIFY_TIMES") != null and total >= 8) {
+            const ms = struct {
+                fn of(a: u64, b: u64) f64 {
+                    return @as(f64, @floatFromInt(b - a)) / 1e6;
+                }
+            }.of;
+            std.log.info("verify times: rows {d} forward {d:.2} ms, select+draw {d:.2} ms, fetched {}", .{ total, ms(t_fwd, t_sel), ms(t_sel, t_draw), fetched });
+        }
     }
 
     fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) !void {

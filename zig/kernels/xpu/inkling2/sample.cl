@@ -213,3 +213,56 @@ KERNEL(SMP_W) void tf_ink2_sample_top(global const float *logits, global const u
     out[((ulong)row * stride + j) * 2 + 1] = 0xFFFFFFFFu - (uint)w;
   }
 }
+
+// Full-row Gumbel race for top_k off and top_p 1: one token a row, no host scan of the vocabulary.
+static inline ulong race_mix(ulong x) {
+  x ^= x >> 30;
+  x *= 0xBF58476D1CE4E5B9UL;
+  x ^= x >> 27;
+  x *= 0x94D049BB133111EBUL;
+  return x ^ (x >> 31);
+}
+
+KERNEL(SMP_W) void tf_ink2_sample_race(global const float *logits, global const uint *pos, global uint *tok, uint vocab, uint seed_lo, uint seed_hi, float inv_t) {
+  local float best_s[SMP_W];
+  local uint best_k[SMP_W];
+  local uint best_i[SMP_W];
+  const uint t = get_local_id(0);
+  const uint row = get_group_id(0);
+  global const float *l = logits + (ulong)row * vocab;
+  float m = -INFINITY;
+  for (uint i = t; i < vocab; i += SMP_W) m = fmax(m, l[i] * inv_t);
+  best_s[t] = m;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (uint n = SMP_W >> 1; n > 0; n >>= 1) {
+    if (t < n) best_s[t] = fmax(best_s[t], best_s[t + n]);
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float lo = best_s[0] - 24.0f;
+  const ulong seed = ((ulong)seed_hi << 32) | seed_lo;
+  const ulong base = race_mix(race_mix(seed + 0x9E3779B97F4A7C15UL) ^ ((ulong)pos[row] * 0xD1B54A32D192ED03UL));
+  float bs = -INFINITY;
+  uint bk = 0, bi = 0xFFFFFFFFu;
+  for (uint i = t; i < vocab; i += SMP_W) {
+    const float v = l[i] * inv_t;
+    if (!(v >= lo)) continue;
+    const ulong x = race_mix(base ^ (ulong)i);
+    const float u = fmin(((float)(x >> 40) + 0.5f) * (1.0f / 16777216.0f), as_float(0x3F7FFFFFu));
+    const float score = v - log(-log(u));
+    const uint k = order_key(v);
+    const bool win = score > bs || (score == bs && (k > bk || (k == bk && i < bi)));
+    if (win) { bs = score; bk = k; bi = i; }
+  }
+  best_s[t] = bs; best_k[t] = bk; best_i[t] = bi;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (uint n = SMP_W >> 1; n > 0; n >>= 1) {
+    if (t < n) {
+      const float os = best_s[t + n];
+      const uint ok = best_k[t + n], oi = best_i[t + n];
+      const bool take = os > best_s[t] || (os == best_s[t] && (ok > best_k[t] || (ok == best_k[t] && oi < best_i[t])));
+      if (take) { best_s[t] = os; best_k[t] = ok; best_i[t] = oi; }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (t == 0) tok[row] = best_i[0];
+}
