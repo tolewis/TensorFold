@@ -81,6 +81,7 @@ const Run = struct {
     p: *const model_file.Pipelines,
     s: xpu.Stream,
     sc: *state.Scratch,
+    wrote: ?*[state.visit_slots]u8 = null,
 
     fn copyBf16(g: Run, from: Ptr, to: Ptr, count: usize) !void {
         try runtime.copyBf16(&g.p.runtime, g.s, from, to, 1, count);
@@ -267,7 +268,11 @@ const Run = struct {
                     .static => |weight| weight,
                     .dynamic => unreachable,
                 };
-                try fuse.convKv(&g.p.fuse, g.s, cache.history(v.cache_slot, 0).ptr(), at(s.k_raw, base * channels * 2), cache.staged(v.cache_slot, 0, 0).ptr(), tensor(wk), at(s.k_conv, base * channels * 2), cache.history(v.cache_slot, 1).ptr(), at(s.v_raw, base * channels * 2), cache.staged(v.cache_slot, 1, 0).ptr(), tensor(wv), at(s.v_conv, base * channels * 2), @intCast(rows), channels);
+                const commit1: u32 = if (fuse.roleConv() and rows == 1) 1 else 0;
+                if (commit1 == 1) if (g.wrote) |mask| {
+                    mask[v.cache_slot] = mask[v.cache_slot] | 0x3;
+                };
+                try fuse.convKv(&g.p.fuse, g.s, cache.history(v.cache_slot, 0).ptr(), at(s.k_raw, base * channels * 2), cache.staged(v.cache_slot, 0, 0).ptr(), tensor(wk), at(s.k_conv, base * channels * 2), cache.history(v.cache_slot, 1).ptr(), at(s.v_raw, base * channels * 2), cache.staged(v.cache_slot, 1, 0).ptr(), tensor(wv), at(s.v_conv, base * channels * 2), @intCast(rows), channels, commit1);
             } else {
                 try g.convInputForAttention(cache, v, base, rows, true);
                 try g.convInputForAttention(cache, v, base, rows, false);
@@ -382,7 +387,11 @@ const Run = struct {
         if (fuse.convFold() and segments.len == 1) {
             const seg = segments[0];
             const channels: u32 = @intCast(state.convWidth(2));
-            try fuse.convAttnPartial(&g.p.fuse, g.s, seg.cache.history(v.cache_slot, 2).ptr(), at(s.attn_dense, 0), seg.cache.staged(v.cache_slot, 2, 0).ptr(), tensor(w.attn_conv), at(s.attn_conv, 0), at(s.p, 0), at(s.blocks, 0), at(s.partial, 0), @intCast(rows), channels, if (lp.boundary) lp.blocks_in + 1 else 0);
+            const commit1: u32 = if (fuse.roleConv() and rows == 1) 1 else 0;
+            if (commit1 == 1) if (g.wrote) |mask| {
+                mask[v.cache_slot] = mask[v.cache_slot] | 0x4;
+            };
+            try fuse.convAttnPartial(&g.p.fuse, g.s, seg.cache.history(v.cache_slot, 2).ptr(), at(s.attn_dense, 0), seg.cache.staged(v.cache_slot, 2, 0).ptr(), tensor(w.attn_conv), at(s.attn_conv, 0), at(s.p, 0), at(s.blocks, 0), at(s.partial, 0), @intCast(rows), channels, if (lp.boundary) lp.blocks_in + 1 else 0, commit1);
         } else {
             for (segments) |seg| {
                 try g.staticPostConv(seg.cache, v.cache_slot, 2, s.attn_dense, w.attn_conv, s.attn_conv, base, seg.rows);
@@ -416,11 +425,19 @@ const Run = struct {
         if (fuse.downEpi() and segments.len == 1) {
             const seg = segments[0];
             const channels: u32 = @intCast(state.convWidth(3));
-            try fuse.downEpilogue(&g.p.fuse, g.s, at(s.down, 0), at(s.route_ids, 0), at(s.route_weights, 0), seg.cache.history(v.cache_slot, 3).ptr(), seg.cache.staged(v.cache_slot, 3, 0).ptr(), tensor(w.mlp_conv), at(s.mlp_out, 0), at(s.mlp_conv, 0), at(s.partial, 0), at(s.p, 0), state.hidden, 8, channels, @intCast(rows));
+            const commit1: u32 = if (fuse.roleConv() and rows == 1) 1 else 0;
+            if (commit1 == 1) if (g.wrote) |mask| {
+                mask[v.cache_slot] = mask[v.cache_slot] | 0x8;
+            };
+            try fuse.downEpilogue(&g.p.fuse, g.s, at(s.down, 0), at(s.route_ids, 0), at(s.route_weights, 0), seg.cache.history(v.cache_slot, 3).ptr(), seg.cache.staged(v.cache_slot, 3, 0).ptr(), tensor(w.mlp_conv), at(s.mlp_out, 0), at(s.mlp_conv, 0), at(s.partial, 0), at(s.p, 0), state.hidden, 8, channels, @intCast(rows), commit1);
         } else if (fuse.convFold() and segments.len == 1) {
             const seg = segments[0];
             const channels: u32 = @intCast(state.convWidth(3));
-            try fuse.convMlpPartial(&g.p.fuse, g.s, seg.cache.history(v.cache_slot, 3).ptr(), at(s.mlp_out, 0), seg.cache.staged(v.cache_slot, 3, 0).ptr(), tensor(w.mlp_conv), at(s.mlp_conv, 0), at(s.partial, 0), at(s.p, 0), @intCast(rows), channels);
+            const commit1: u32 = if (fuse.roleConv() and rows == 1) 1 else 0;
+            if (commit1 == 1) if (g.wrote) |mask| {
+                mask[v.cache_slot] = mask[v.cache_slot] | 0x8;
+            };
+            try fuse.convMlpPartial(&g.p.fuse, g.s, seg.cache.history(v.cache_slot, 3).ptr(), at(s.mlp_out, 0), seg.cache.staged(v.cache_slot, 3, 0).ptr(), tensor(w.mlp_conv), at(s.mlp_conv, 0), at(s.partial, 0), at(s.p, 0), @intCast(rows), channels, commit1);
         } else {
             for (segments) |seg| {
                 try g.staticPostConv(seg.cache, v.cache_slot, 3, s.mlp_out, w.mlp_conv, s.mlp_conv, base, seg.rows);
@@ -433,6 +450,9 @@ const Run = struct {
 
     fn commitFullHistories(g: Run, segments: []const Segment) !void {
         for (segments) |seg| for (0..state.visit_slots) |slot| for (0..state.conv_states) |cs| {
+            if (g.wrote) |mask| {
+                if ((mask[slot] & (@as(u8, 1) << @intCast(cs))) != 0) continue;
+            }
             try g.copyBf16(seg.cache.staged(slot, cs, seg.rows).ptr(), seg.cache.history(slot, cs).ptr(), 3 * state.convWidth(cs));
         };
     }
@@ -605,7 +625,8 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     try m.r.upload(s.pos, std.mem.sliceAsBytes(pos[0..rows]));
     try m.r.upload(s.seg_of, std.mem.sliceAsBytes(seg_of[0..rows]));
     try m.r.upload(s.segs, std.mem.sliceAsBytes(segs[0..segments.len]));
-    const g = Run{ .m = m, .p = p, .s = stream, .sc = s };
+    var wrote: [state.visit_slots]u8 = @splat(0);
+    const g = Run{ .m = m, .p = p, .s = stream, .sc = s, .wrote = if (fuse.roleConv() and rows == 1) &wrote else null };
     try glue.embedNorm(&p.glue, stream, at(s.ids, 0), tensor(m.weights.embed), tensor(m.weights.embed_norm), at(s.p, 0), @intCast(rows));
     for (m.weight_plan.visits[0..m.weight_plan.n_visits]) |*v| try g.visit(v, segments, rows, options.taps);
     try g.widen(at(s.p, 0), at(s.partial, 0), rows);

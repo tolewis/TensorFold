@@ -13,6 +13,15 @@ pub var zeta_wide: bool = false;
 pub var kv_conv: bool = false;
 pub var down_epi: bool = false;
 pub var norm_router: bool = false;
+pub var role_conv: bool = false;
+pub fn roleConv() bool {
+    if (role_conv) return true;
+    if (std.c.getenv("INK2_ROLE")) |p| {
+        const s = std.mem.span(p);
+        if (s.len > 0 and s[0] == '0') return false;
+    }
+    return true;
+}
 
 pub fn normRouter() bool {
     if (norm_router) return true;
@@ -163,24 +172,24 @@ pub const PhaseA = struct {
     norm_n: u32,
 };
 
-pub fn convAttnPartial(p: *const Pipelines, s: xpu.Stream, history: Ref, current: Ref, taps: Ref, weight: Ref, conv_out: Ref, prev: Ref, blocks: Ref, partial: Ref, rows: u32, channels: u32, boundary: u32) !void {
+pub fn convAttnPartial(p: *const Pipelines, s: xpu.Stream, history: Ref, current: Ref, taps: Ref, weight: Ref, conv_out: Ref, prev: Ref, blocks: Ref, partial: Ref, rows: u32, channels: u32, boundary: u32, commit1: u32) !void {
     const groups = (channels + 255) / 256;
-    try xpu.launch.dispatch(p.conv_attn, s, .{ groups, rows, 1 }, .{ history, current, taps, weight, conv_out, prev, blocks, partial, rows, channels, boundary });
+    try xpu.launch.dispatch(p.conv_attn, s, .{ groups, rows, 1 }, .{ history, current, taps, weight, conv_out, prev, blocks, partial, rows, channels, boundary, commit1 });
 }
 
-pub fn downEpilogue(p: *const Pipelines, s: xpu.Stream, down: Ref, ids: Ref, weights: Ref, history: Ref, taps: Ref, conv_w: Ref, current: Ref, conv_out: Ref, partial: Ref, pout: Ref, n: u32, topk: u32, channels: u32, rows: u32) !void {
+pub fn downEpilogue(p: *const Pipelines, s: xpu.Stream, down: Ref, ids: Ref, weights: Ref, history: Ref, taps: Ref, conv_w: Ref, current: Ref, conv_out: Ref, partial: Ref, pout: Ref, n: u32, topk: u32, channels: u32, rows: u32, commit1: u32) !void {
     const groups = (n + 255) / 256;
-    try xpu.launch.dispatch(p.down_epi, s, .{ groups, 1, 1 }, .{ down, ids, weights, history, taps, conv_w, current, conv_out, partial, pout, n, topk, channels, rows });
+    try xpu.launch.dispatch(p.down_epi, s, .{ groups, 1, 1 }, .{ down, ids, weights, history, taps, conv_w, current, conv_out, partial, pout, n, topk, channels, rows, commit1 });
 }
 
-pub fn convKv(p: *const Pipelines, s: xpu.Stream, hk: Ref, ck: Ref, tk: Ref, wk: Ref, ok: Ref, hv: Ref, cv: Ref, tv: Ref, wv: Ref, ov: Ref, rows: u32, channels: u32) !void {
+pub fn convKv(p: *const Pipelines, s: xpu.Stream, hk: Ref, ck: Ref, tk: Ref, wk: Ref, ok: Ref, hv: Ref, cv: Ref, tv: Ref, wv: Ref, ov: Ref, rows: u32, channels: u32, commit1: u32) !void {
     const groups = (channels + 255) / 256;
-    try xpu.launch.dispatch(p.conv_kv, s, .{ groups, rows, 1 }, .{ hk, ck, tk, wk, ok, hv, cv, tv, wv, ov, rows, channels });
+    try xpu.launch.dispatch(p.conv_kv, s, .{ groups, rows, 1 }, .{ hk, ck, tk, wk, ok, hv, cv, tv, wv, ov, rows, channels, commit1 });
 }
 
-pub fn convMlpPartial(p: *const Pipelines, s: xpu.Stream, history: Ref, current: Ref, taps: Ref, weight: Ref, conv_out: Ref, t: Ref, out: Ref, rows: u32, channels: u32) !void {
+pub fn convMlpPartial(p: *const Pipelines, s: xpu.Stream, history: Ref, current: Ref, taps: Ref, weight: Ref, conv_out: Ref, t: Ref, out: Ref, rows: u32, channels: u32, commit1: u32) !void {
     const groups = (channels + 255) / 256;
-    try xpu.launch.dispatch(p.conv_mlp, s, .{ groups, rows, 1 }, .{ history, current, taps, weight, conv_out, t, out, rows, channels });
+    try xpu.launch.dispatch(p.conv_mlp, s, .{ groups, rows, 1 }, .{ history, current, taps, weight, conv_out, t, out, rows, channels, commit1 });
 }
 
 pub fn routerNormLaunch(p: *const Pipelines, s: xpu.Stream, x: Ref, norm_w: Ref, weight: Ref, normed: Ref, bias: Ref, scores: Ref, ids: Ref, weights: Ref, rows: u32) !void {
