@@ -76,12 +76,20 @@ pub const Drafter = struct {
         const d = try gpa.create(Drafter);
         errdefer gpa.destroy(d);
         d.stream = target.r.stream(ctx);
-        // The fold reads the target's unembedding once, as host bf16.
-        const unembed = target.weights.unembed;
-        const host = try gpa.alloc(u16, unembed.bytes / 2);
+        // The fold reads the full unembedding. A split rank keeps only its vocab slice on the device, so the full rows come from the file.
+        const full: usize = weight_loader.vocabulary * weight_loader.hidden;
+        const host = try gpa.alloc(u16, full);
         defer gpa.free(host);
-        try target.r.download(std.mem.sliceAsBytes(host), unembed.buf);
-        try target.r.sync();
+        const unembed = target.weights.unembed;
+        if (unembed.bytes / 2 == full) {
+            try target.r.download(std.mem.sliceAsBytes(host), unembed.buf);
+            try target.r.sync();
+        } else {
+            var ldr = try xpu.loader.Loader.init(gpa, target.r, drafter_dir);
+            defer ldr.deinit();
+            const inf = try ldr.info("model.llm.unembed.weight");
+            try xpu.loader.readExact(inf.fd, std.mem.sliceAsBytes(host), inf.off);
+        }
         var config: weight_loader.Config = .{
             .layers = mtp.layers,
             .q_heads = mtp.q_heads,
