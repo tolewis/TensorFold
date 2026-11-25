@@ -439,17 +439,18 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
         if (rec.op == .close) return true;
         std.log.info("inkling2: follow base {d} n {d}", .{ rec.base, rec.n });
         cache.len = rec.base;
-        const profile_one = rec.n == 1 and std.c.getenv("TF_TP_PROFILE") != null and xpu.profile.active == null;
+        const profile_one = std.c.getenv("TF_TP_PROFILE") != null and xpu.profile.active == null;
         var prof: xpu.profile.Profile = undefined;
         if (profile_one) {
-            prof = xpu.profile.Profile.init(&ctx, 8192, true) catch |e| {
+            prof = xpu.profile.Profile.init(&ctx, 131072, true) catch |e| {
                 std.log.err("inkling2_loop: profile ({s})", .{@errorName(e)});
                 return false;
             };
             xpu.profile.active = &prof;
             xpu.rt.Runtime.resetSyncLog();
         }
-        if (rec.n > 1) {
+        // A prompt chunk is larger than a verify window. A window of 2 to 32 rows is a verify, not a prefill.
+        if (rec.n > st.batch_rows) {
             ink.prefill.run(model, &scratch, &cache, rec.ids[0..rec.n], .{ .defer_head = rec.flags & 2 != 0, .all = rec.flags & 1 != 0 }) catch |e| {
                 std.log.err("inkling2_loop: rank 1 prefill ({s})", .{@errorName(e)});
                 return false;
