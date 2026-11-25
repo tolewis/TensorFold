@@ -11,7 +11,7 @@ pub const Markers = struct { open: []const u8, close: []const u8, optional: bool
 /// The close token is `<|end_message|>` (server.zig); the answer starts after the whole sequence.
 pub const inkling_markers: Markers = .{
     .open = "<|message_model|><|content_thinking|>",
-    .close = "<|end_message|><|message_model|><|content_text|>",
+    .close = "<|end_message|>",
     .answer_open = "<|message_model|><|content_text|>",
     .answer_end = "<|end_message|>",
 };
@@ -131,16 +131,84 @@ pub fn splitThinkingTokens(a: Allocator, decode: anytype, ctx: anytype, full: []
 pub fn splitThinkingAt(a: Allocator, full: []const u8, finished: bool, m: Markers, close: Close) Allocator.Error!Split {
     if (m.answer_end.len == 0) return splitBlock(a, full, finished, m, close);
     // a reply of messages: an answer message with no thinking before it, else the thinking block and then the answer
-    if (std.mem.startsWith(u8, full, m.answer_open)) return .{ .reasoning = "", .answer = untilAnswerEnd(full[m.answer_open.len..], finished, m) };
+    if (std.mem.startsWith(u8, full, m.answer_open)) return .{ .reasoning = "", .answer = try inklingAnswer(a, full, finished) };
     if (!finished and std.mem.startsWith(u8, m.answer_open, full)) return .{ .reasoning = "", .answer = "" };
     const s = try splitBlock(a, full, finished, m, close);
-    return .{ .reasoning = s.reasoning, .answer = untilAnswerEnd(s.answer, finished, m) };
+    return .{ .reasoning = s.reasoning, .answer = try inklingAnswer(a, s.answer, finished) };
 }
 
-/// The answer message's text: it ends where the message does, and a partial end tag is held while the reply streams.
-fn untilAnswerEnd(answer: []const u8, finished: bool, m: Markers) []const u8 {
-    if (find(answer, m.answer_end)) |at| return answer[0..at];
-    return if (finished) answer else answer[0 .. answer.len - partialTag(answer, m.answer_end)];
+/// An Inkling 2 reply's answer: each `<|message_model|>` segment is a text message or a tool call. A text message
+/// keeps its bytes; a tool segment becomes a `<tool_call>` envelope, which the shared parser reads as a call.
+fn inklingAnswer(a: Allocator, tail: []const u8, finished: bool) Allocator.Error![]const u8 {
+    const model = "<|message_model|>";
+    const text_open = "<|content_text|>";
+    const call_open = "<|content_invoke_tool_json|>";
+    const end = "<|end_message|>";
+    const eos = "<|content_model_end_sampling|>";
+    var out: std.ArrayList(u8) = .empty;
+    var pos: usize = 0;
+    while (pos < tail.len) {
+        while (pos < tail.len and isSpaceByte(tail[pos])) pos += 1;
+        if (pos >= tail.len) break;
+        if (std.mem.startsWith(u8, tail[pos..], eos)) break;
+        if (!std.mem.startsWith(u8, tail[pos..], model)) {
+            if (!finished and std.mem.startsWith(u8, model, tail[pos..])) break;
+            // the prompt prefilled the answer message: its text ends where the message does
+            const rest = tail[pos..];
+            const cut = find(rest, end) orelse find(rest, eos);
+            if (cut) |n| {
+                try out.appendSlice(a, rest[0..n]);
+            } else {
+                const keep = if (finished) rest.len else rest.len - @max(partialTag(rest, end), partialTag(rest, eos));
+                try out.appendSlice(a, rest[0..keep]);
+            }
+            break;
+        }
+        pos += model.len;
+        const thinking_open = "<|content_thinking|>";
+        if (std.mem.startsWith(u8, tail[pos..], thinking_open)) {
+            pos += thinking_open.len;
+            if (find(tail[pos..], end)) |n| {
+                pos += n + end.len;
+                continue;
+            }
+            break; // a later thinking message is not the answer
+        }
+        if (std.mem.startsWith(u8, tail[pos..], text_open)) {
+            pos += text_open.len;
+            const at = find(tail[pos..], end);
+            if (at) |n| {
+                try out.appendSlice(a, tail[pos .. pos + n]);
+                pos += n + end.len;
+                continue;
+            }
+            const keep = if (finished) tail.len else tail.len - partialTag(tail[pos..], end);
+            try out.appendSlice(a, tail[pos..keep]);
+            break;
+        }
+        const open_at = find(tail[pos..], call_open);
+        if (open_at) |n| {
+            const payload = pos + n + call_open.len;
+            const at = find(tail[payload..], end);
+            if (at) |m2| {
+                try out.appendSlice(a, "<tool_call>");
+                try out.appendSlice(a, tail[payload .. payload + m2]);
+                try out.appendSlice(a, "</tool_call>");
+                pos = payload + m2 + end.len;
+                continue;
+            }
+            if (finished) {
+                try out.appendSlice(a, "<tool_call>");
+                try out.appendSlice(a, tail[payload..]);
+                try out.appendSlice(a, "</tool_call>");
+            }
+            break;
+        }
+        if (!finished) break; // a partial tool header is held
+        try out.appendSlice(a, tail[pos..]);
+        break;
+    }
+    return out.items;
 }
 
 /// Tokens of the reasoning, the close token included; none when a reply of messages opens with its answer.
@@ -656,4 +724,37 @@ test "reply text: Inkling 2's messages split into reasoning and answer, with the
     try std.testing.expectEqualStrings("Compute 17", cut.reasoning);
     try std.testing.expectEqual(@as(usize, 0), reasoningCountOpened(&.{ 5, 6, 7 }, 99, 7));
     try std.testing.expectEqual(@as(usize, 3), reasoningCountOpened(&.{ 1, 99, 7, 8 }, 99, 7));
+}
+
+test "reply text: Inkling 2's thinking ends at its own end tag, and a tool message becomes a call envelope" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const m = inkling_markers;
+    const call = "<|message_model|>bash<|content_invoke_tool_json|>{\"name\":\"bash\",\"args\":{\"command\":\"ls ~\"}}<|end_message|>";
+    const reply = "<|message_model|><|content_thinking|>List the home folder.<|end_message|>" ++ call ++ "<|content_model_end_sampling|>";
+    const s = try splitThinkingAt(a, reply, true, m, .spelled);
+    try std.testing.expectEqualStrings("List the home folder.", s.reasoning);
+    try std.testing.expectEqualStrings("<tool_call>{\"name\":\"bash\",\"args\":{\"command\":\"ls ~\"}}</tool_call>", s.answer);
+    // an answer message then two calls
+    const two = "<|message_model|><|content_thinking|>Look.<|end_message|><|message_model|><|content_text|>Two files.<|end_message|>" ++ call ++ call;
+    const t = try splitThinkingAt(a, two, true, m, .spelled);
+    try std.testing.expectEqualStrings("Look.", t.reasoning);
+    try std.testing.expectEqualStrings("Two files.<tool_call>{\"name\":\"bash\",\"args\":{\"command\":\"ls ~\"}}</tool_call><tool_call>{\"name\":\"bash\",\"args\":{\"command\":\"ls ~\"}}</tool_call>", t.answer);
+    // streaming: a partial end tag or call header is held, a whole call is out at once
+    const held = try splitThinkingAt(a, "<|message_model|><|content_thinking|>Look.<|end_message|><|message_model|><|content_text|>Two<|end_", false, m, .{ .token = 42 });
+    try std.testing.expectEqualStrings("Look.", held.reasoning);
+    try std.testing.expectEqualStrings("Two", held.answer);
+    const partial = try splitThinkingAt(a, "<|message_model|><|content_thinking|>Look.<|end_message|><|message_model|>bash<|content_invoke_tool_json|>{\"name\":\"bash\",\"args\":{\"command\":\"ls", false, m, .{ .token = 42 });
+    try std.testing.expectEqualStrings("Look.", partial.reasoning);
+    try std.testing.expectEqualStrings("", partial.answer);
+    const whole = try splitThinkingAt(a, "<|message_model|><|content_thinking|>Look.<|end_message|>" ++ call ++ "<|message_model|><|content", false, m, .{ .token = 42 });
+    try std.testing.expectEqualStrings("Look.", whole.reasoning);
+    try std.testing.expectEqualStrings("<tool_call>{\"name\":\"bash\",\"args\":{\"command\":\"ls ~\"}}</tool_call>", whole.answer);
+    // the prompt prefilled the answer message: the reply starts with its text and ends at its end tag
+    const prefilled = try splitThinkingAt(a, "A B70 is a GPU.<|end_message|><|content_model_end_sampling|>", true, m, .pending);
+    try std.testing.expectEqualStrings("", prefilled.reasoning);
+    try std.testing.expectEqualStrings("A B70 is a GPU.", prefilled.answer);
+    const prefilled_live = try splitThinkingAt(a, "A B70 is a GPU.<|end_", false, m, .pending);
+    try std.testing.expectEqualStrings("A B70 is a GPU.", prefilled_live.answer);
 }
