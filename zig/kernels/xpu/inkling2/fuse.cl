@@ -744,37 +744,40 @@ KERNEL(256) void tf_ink2_down_epilogue(
     global const ushort *down, global const int *ids, global const float *weights,
     global const ushort *history, global ushort *taps, global const ushort *conv_w, global ushort *current,
     global ushort *conv_out, global const float *partial, global ushort *p, uint n, uint topk, uint channels, uint rows, uint commit1) {
-  const uint c = get_group_id(0) * 256 + get_local_id(0);
-  if (c >= n || c >= channels) return;
+  const uint c = get_group_id(0) * 256 + get_local_id(0), t = get_local_id(0);
+  local uint order[8];
   for (uint r = 0; r < rows; ++r) {
-    float sum = 0.0f;
-    int last_id = INT_MIN;
-    int last_slot = -1;
     global const int *id_row = ids + (size_t)r * topk;
     global const float *w_row = weights + (size_t)r * topk;
-    for (uint t = 0; t < topk; ++t) {
-      int best_id = INT_MAX;
-      int best_slot = -1;
-      for (uint slot = 0; slot < topk; ++slot) {
-        const int id = id_row[slot];
-        const bool after = id > last_id || (id == last_id && (int)slot > last_slot);
-        if (after && (best_slot < 0 || id < best_id)) {
-          best_id = id;
-          best_slot = (int)slot;
-        }
+    // One thread a slot works out where its slot sits in the expert order the serial selection gives, so every
+    // channel reads the order from SLM instead of replaying the scan over global memory.
+    if (t < topk && t < 8) {
+      const int me = id_row[t];
+      uint rank = 0;
+      for (uint s = 0; s < 8; ++s) {
+        if (s >= topk) break;
+        const int id = id_row[s];
+        rank += (id < me || (id == me && s < t)) ? 1u : 0u;
       }
-      if (best_slot < 0) break;
-      sum += w_row[best_slot] * bf2f(down[((size_t)r * topk + (uint)best_slot) * n + c]);
-      last_id = best_id;
-      last_slot = best_slot;
+      order[rank] = t;
     }
-    const ushort y = f2bf(sum);
-    current[(size_t)r * channels + c] = y;
-    const ushort cy = conv_y(history, current, taps, conv_w, r, c, channels);
-    conv_out[(size_t)r * channels + c] = cy;
-    const uint at = r * channels + c;
-    p[at] = FUSE_EPI ? f2bf(partial[at] + bf2f(cy)) : (ushort)0;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (c < n && c < channels) {
+      float sum = 0.0f;
+      for (uint k = 0; k < 8; ++k) {
+        if (k >= topk) break;
+        const uint slot = order[k];
+        sum += w_row[slot] * bf2f(down[((size_t)r * topk + slot) * n + c]);
+      }
+      const ushort y = f2bf(sum);
+      current[(size_t)r * channels + c] = y;
+      const ushort cy = conv_y(history, current, taps, conv_w, r, c, channels);
+      conv_out[(size_t)r * channels + c] = cy;
+      const uint at = r * channels + c;
+      p[at] = FUSE_EPI ? f2bf(partial[at] + bf2f(cy)) : (ushort)0;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
   }
-  if (commit1 && rows == 1) commit3(history, current, c, channels);
+  if (commit1 && rows == 1 && c < n && c < channels) commit3(history, current, c, channels);
 }
 
