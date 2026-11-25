@@ -143,7 +143,7 @@ pub const Group = struct {
     /// `partial` holds `rows` x 2304 fp16. On return it holds the sum. Both ranks call this in the same order.
     /// The sequence is exPush then tp_add, as Group.allReduce does for TF_TP_DEVFLAG=3 at e5506ae.
     pub fn allReduce(g: *Group, partial: *anyopaque, rows: u32) !void {
-        if (rows == 0 or rows > rows_max) return error.Inkling2Tp;
+        if (rows == 0 or rows > 2048) return error.Inkling2Tp;
         if (g.qgroup == null) return error.Inkling2Tp;
         qg.dev.noteKernel(xpu.profile.last_kernel);
         if (std.c.getenv("TF_TP_LAUNCHLOG") != null) std.log.info("inkling2: reduce rank {d} rows {d} seq {d}", .{ g.rank, rows, g.qgroup.?.seq + 1 });
