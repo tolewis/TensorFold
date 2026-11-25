@@ -922,6 +922,23 @@ fn verifyBits(gpa: std.mem.Allocator, io: std.Io, m: *const ink.model.Model, scr
     };
     std.debug.print("\nVERIFY BITS: {d} of {d} logits differ from plain decode at the same position (first at {d}, worst {e:.6})\n", .{ diff, n * vocab, first_at, worst });
     std.debug.print("VERIFY BITS per row: {d} {d} {d} {d} {d} {d} {d} {d}\n", .{ per_row[0], per_row[1], per_row[2], per_row[3], per_row[4], per_row[5], per_row[6], per_row[7] });
+    var top_same: [8]bool = @splat(false);
+    var top_gap: [8]f64 = @splat(0);
+    for (0..n) |row| {
+        var pa: usize = 0;
+        var wa: usize = 0;
+        for (0..vocab) |j| {
+            if (plain[row * vocab + j] > plain[row * vocab + pa]) pa = j;
+            if (host[row * vocab + j] > host[row * vocab + wa]) wa = j;
+        }
+        top_same[row] = pa == wa;
+        top_gap[row] = @abs(@as(f64, plain[row * vocab + pa]) - @as(f64, host[row * vocab + wa]));
+    }
+    std.debug.print("VERIFY ARGMAX same: {s} {s} {s} {s} {s} {s} {s} {s}; gap {e:.3} {e:.3} {e:.3} {e:.3} {e:.3} {e:.3} {e:.3} {e:.3}\n", .{
+        if (top_same[0]) "y" else "n", if (top_same[1]) "y" else "n", if (top_same[2]) "y" else "n", if (top_same[3]) "y" else "n",
+        if (top_same[4]) "y" else "n", if (top_same[5]) "y" else "n", if (top_same[6]) "y" else "n", if (top_same[7]) "y" else "n",
+        top_gap[0], top_gap[1], top_gap[2], top_gap[3], top_gap[4], top_gap[5], top_gap[6], top_gap[7],
+    });
     var kd: usize = 0;
     var vd: usize = 0;
     var krow: usize = 0;
