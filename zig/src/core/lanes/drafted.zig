@@ -110,6 +110,7 @@ pub const Drafted = struct {
         m.drafts = @min(d.depth, if (target.exact_width > 1) target.exact_width - 1 else 0);
         m.mtp_step_ms = d.step_ms;
         m.fixed_draft_block = d.fixed_block;
+        m.force_depth = d.force_depth;
         m.draft_prior = d.prior;
         m.plain_guard = d.plain_guard;
         m.draft_streams = d.batched;
