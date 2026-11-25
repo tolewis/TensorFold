@@ -17,9 +17,9 @@ pub fn downEpi() bool {
     if (down_epi) return true;
     if (std.c.getenv("INK2_DOWN_EPI")) |p| {
         const s = std.mem.span(p);
-        return s.len > 0 and s[0] == '1';
+        if (s.len > 0 and s[0] == '0') return false;
     }
-    return false;
+    return true;
 }
 
 pub fn kvConv() bool {
@@ -101,8 +101,8 @@ pub const Pipelines = struct {
         errdefer zeta_wide_k.deinit();
         var conv_kv = try module.kernel("tf_ink2_conv_kv", .{ 256, 1, 1 });
         errdefer conv_kv.deinit();
-        const down_epi = try module.kernel("tf_ink2_down_epilogue", .{ 256, 1, 1 });
-        return .{ .pre = pre, .zeta = zeta, .gates = gates, .norms = norms, .router_gemv = router_gemv, .router_pick = router_pick, .conv_attn = conv_attn, .conv_mlp = conv_mlp, .zeta_wide = zeta_wide_k, .conv_kv = conv_kv, .down_epi = down_epi };
+        const down_epi_k = try module.kernel("tf_ink2_down_epilogue", .{ 256, 1, 1 });
+        return .{ .pre = pre, .zeta = zeta, .gates = gates, .norms = norms, .router_gemv = router_gemv, .router_pick = router_pick, .conv_attn = conv_attn, .conv_mlp = conv_mlp, .zeta_wide = zeta_wide_k, .conv_kv = conv_kv, .down_epi = down_epi_k };
     }
 
     pub fn deinit(p: *Pipelines) void {
