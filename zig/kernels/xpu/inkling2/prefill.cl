@@ -754,8 +754,8 @@ KERNEL(256) void tf_ink2_pf_conv_static(global const ushort *history, global con
 }
 
 // attention.cl's relative-bias table, four distances a work-item and PF_REL_BATCH (row, head) pairs a work-group (the 16 projection values of a distance load once for all of them): each distance's 16 taps add in
-// the same order, so the table is bit for bit the same. Grid (rows * heads / PF_REL_BATCH).
-KERNEL(256) void tf_ink2_pf_rel_table(global const ushort *rel, global const ushort *proj, global ushort *tab) {
+// the same order, so the table is bit for bit the same. Grid ((rows * heads + PF_REL_BATCH - 1) / PF_REL_BATCH). A split rank's head count need not divide by the batch, so pairs past `n` are skipped.
+KERNEL(256) void tf_ink2_pf_rel_table(global const ushort *rel, global const ushort *proj, global ushort *tab, uint n) {
   const uint d = get_local_id(0) * 4;
   float4 pj[PF_REL];
   for (uint j = 0; j < PF_REL; ++j) {
@@ -764,6 +764,7 @@ KERNEL(256) void tf_ink2_pf_rel_table(global const ushort *rel, global const ush
   }
   for (uint b = 0; b < PF_REL_BATCH; ++b) {
     const ulong rh = (ulong)get_group_id(0) * PF_REL_BATCH + b;
+    if (rh >= n) return;
     const ushort16 rr = vload16(0, rel + rh * PF_REL);
     float4 acc = (float4)(0.0f);
     for (uint j = 0; j < PF_REL; ++j) acc += bf2f(rr[j]) * pj[j];
