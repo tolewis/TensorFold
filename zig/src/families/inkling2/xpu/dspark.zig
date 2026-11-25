@@ -85,7 +85,7 @@ pub const Drafter = struct {
         defer gpa.free(host);
         const unembed = target.weights.unembed;
         var own_unembed: ?xpu.DeviceBuffer = null;
-        errdefer if (own_unembed) |b| b.free();
+        errdefer if (own_unembed) |*b| b.free();
         if (unembed.bytes / 2 == full) {
             try target.r.download(std.mem.sliceAsBytes(host), unembed.buf);
             try target.r.sync();
