@@ -112,20 +112,8 @@ pub const default_prefix = "tf_ink2_";
 /// A device address, as the launcher takes it.
 pub const Ptr = ?*anyopaque;
 
-pub var nv_flight: bool = false;
-
-pub fn nvFlight() bool {
-    if (nv_flight) return true;
-    if (std.c.getenv("INK2_NV_FLIGHT")) |p| {
-        const s = std.mem.span(p);
-        return s.len > 0 and s[0] == '1';
-    }
-    return false;
-}
-
 pub const Kernels = struct {
     k: [std.enums.values(Op).len]?xpu.Kernel = @splat(null),
-    gu_flight: ?xpu.Kernel = null,
     /// The kernels of `module` named `<prefix><op>`; `only` loads one (a control image holds one a prefix).
     pub fn load(module: *xpu.Module, prefix: []const u8, only: ?Op) !Kernels {
         var out: Kernels = .{};
@@ -136,16 +124,10 @@ pub const Kernels = struct {
             const sym = try std.fmt.bufPrintSentinel(&buf, "{s}{s}", .{ prefix, op.name() }, 0);
             out.k[@intFromEnum(op)] = try module.kernel(sym, op.threads());
         }
-        if (only == null) {
-            var fbuf: [96]u8 = undefined;
-            const fsym = try std.fmt.bufPrintSentinel(&fbuf, "{s}nvfp4_gu_flight", .{prefix}, 0);
-            out.gu_flight = module.kernel(fsym, .{ 16 * decode_subgroups.nvfp4_gu, 1, 1 }) catch null;
-        }
         return out;
     }
 
     pub fn deinit(self: *Kernels) void {
-        if (self.gu_flight) |*fk| fk.deinit();
         for (&self.k) |*slot| if (slot.*) |*k| {
             k.deinit();
             slot.* = null;
@@ -193,10 +175,6 @@ pub const Kernels = struct {
     pub fn nvfp4Gu(self: *const Kernels, s: xpu.Stream, x: Ptr, w: Ptr, scales: Ptr, amax: Ptr, den: Ptr, ids: Ptr, out: Ptr, c: Call) !void {
         if (c.format != .nvfp4) return error.WrongExpertFormat;
         try check(c);
-        if (nvFlight() and c.rows == 1) if (self.gu_flight) |k| {
-            try xpu.launch.dispatch(k, s, .{ tiles(c, true), routes(c), 1 }, .{ x, w, scales, amax, den, ids, out, c.k, c.n, c.topk, c.experts });
-            return;
-        };
         try xpu.launch.dispatch(try self.get(.nvfp4_gu), s, .{ tiles(c, true), routes(c), 1 }, .{ x, w, scales, amax, den, ids, out, c.k, c.n, c.topk, c.experts });
     }
 
