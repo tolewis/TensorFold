@@ -309,6 +309,10 @@ pub fn main(init: std.process.Init) !void {
             route_union = true;
         } else if (std.mem.eql(u8, a, "--fuse")) {
             ink.fuse.force = true;
+        } else if (std.mem.eql(u8, a, "--attn-splits")) {
+            i += 1;
+            ink.attention_plan.flash_splits = try std.fmt.parseInt(u32, argv[i], 10);
+            ink.attention_plan.flash_user_set = true;
         } else if (std.mem.eql(u8, a, "--fuse-check")) {
             fuse_check = true;
         } else if (std.mem.eql(u8, a, "--profile-all")) {

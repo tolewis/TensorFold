@@ -84,7 +84,8 @@ pub fn globalSlots(capacity: usize) usize {
 pub fn partialStride(capacity: usize) usize {
     const sliding = ap.slotsFor(ap.Layer.sliding(1024, max_rows), 1024 + max_rows);
     const global = ap.slotsFor(ap.Layer.global(@intCast(capacity)), capacity);
-    return @max(sliding, global);
+    // 128 leaves room for a 64-split decode of a 1,024 window (chunk 16 needs 65 slots) without growing a long context.
+    return @max(@max(sliding, global), 128);
 }
 
 /// Bytes of every visit's K and V (values and scales) for a global capacity of `capacity` positions.

@@ -7,6 +7,7 @@ const layer_plan = @import("../plan.zig");
 const st = @import("core").safetensors;
 const images = @import("inkling2_xpu_images");
 const attention = @import("attention.zig");
+const attention_plan = @import("attention_plan.zig");
 const glue = @import("glue.zig");
 const experts = @import("experts.zig");
 const loop = @import("loop.zig");
@@ -486,6 +487,7 @@ pub const Model = struct {
     /// Builds the production kernels on `ctx` (the context `r` runs on); the forward needs them.
     pub fn loadKernels(m: *Model, ctx: *const xpu.Context) !void {
         if (m.pipelines != null) return;
+        if (!attention_plan.flash_user_set) attention_plan.flash_splits = 64;
         m.pipelines = try Pipelines.load(ctx);
         m.ctx = ctx;
     }
