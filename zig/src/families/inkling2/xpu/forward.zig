@@ -418,6 +418,20 @@ const Run = struct {
             std.debug.print("GEOM v{d}: rows {d} last_pos {d} chunk {d} chunks {d} window {d} ring {d}\n", .{ dump_visit, seg0.rows, glp, lay.chunk, ap.chunks(glp, lay.chunk), lay.window, lay.ring });
         }
         try g.attendSegments(v, segments);
+        if (dump_dir_len > 0) {
+            dumpBufAt(g.m, g.s, s.rel_tab, 0, 24 * ap.extent * 2, "reltab0");
+            dumpBufAt(g.m, g.s, s.rel_tab, 24 * ap.extent * 2, 24 * ap.extent * 2, "reltab1");
+            const stride = s.stride;
+            const slot = 24 * stride;
+            dumpBufAt(g.m, g.s, s.part_o, 0, 8 * 128 * 4, "po0");
+            dumpBufAt(g.m, g.s, s.part_o, slot * 128 * 4, 8 * 128 * 4, "po1");
+            dumpBufAt(g.m, g.s, s.part_ml, 0, 8 * 8, "pm0");
+            dumpBufAt(g.m, g.s, s.part_ml, slot * 8, 8 * 8, "pm1");
+            std.debug.print("PART stride {d} slot {d}\n", .{ stride, slot });
+            dumpBufAt(g.m, g.s, s.pos, 0, 8 * 4, "pos");
+            dumpBufAt(g.m, g.s, s.seg_of, 0, 8 * 4, "segof");
+            dumpBufAt(g.m, g.s, s.segs, 0, @sizeOf(ap.Seg) * 2, "segs");
+        }
         xpu.profile.label = "wo";
         try g.dense(w.attn.wo, at(s.att, 0), at(s.attn_dense, 0), rows);
         xpu.profile.label = "";
@@ -489,11 +503,11 @@ const Run = struct {
         }
         if (v.cache_slot == 5) try g.copyBf16(at(s.p, 0), at(s.prelude, 0), rows * state.hidden);
         if (dump_dir_len > 0) {
-            dumpRow(g.m, g.s, s.p, state.hidden * 2, "p");
-            dumpRow(g.m, g.s, s.att, state.query_width * 2, "att");
-            dumpRow(g.m, g.s, s.attn_dense, state.hidden * 2, "pres");
-            dumpRow(g.m, g.s, s.mlp_normed, state.hidden * 2, "mlpnorm");
-            dumpRow(g.m, g.s, s.mlp_out, state.hidden * 2, "mlpout");
+            dump2(g.m, g.s, "p", s.p, state.hidden * 2, state.hidden * 2);
+            dump2(g.m, g.s, "att", s.att, state.query_width * 2, state.query_width * 2);
+            dump2(g.m, g.s, "pres", s.attn_dense, state.hidden * 2, state.hidden * 2);
+            dump2(g.m, g.s, "mlpnorm", s.mlp_normed, state.hidden * 2, state.hidden * 2);
+            dump2(g.m, g.s, "mlpout", s.mlp_out, state.hidden * 2, state.hidden * 2);
             dump_visit += 1;
         }
         // A window stages every layer's conv rows into one shared buffer, so committing once at the end would copy the last
@@ -529,6 +543,31 @@ pub fn dumpEnable(dir: []const u8, at_row: usize) void {
     @memcpy(dump_dir_buf[0..dump_dir_len], dir[0..dump_dir_len]);
     dump_row = at_row;
     dump_visit = 0;
+}
+
+fn dump2(m: *const Model, s: xpu.Stream, tag: []const u8, buf: rt.Buffer, stride: usize, len: usize) void {
+    var a: [64]u8 = undefined;
+    var b: [64]u8 = undefined;
+    const t0 = std.fmt.bufPrint(&a, "{s}0", .{tag}) catch return;
+    const t1 = std.fmt.bufPrint(&b, "{s}1", .{tag}) catch return;
+    dumpBufAt(m, s, buf, 0, len, t0);
+    dumpBufAt(m, s, buf, stride, len, t1);
+}
+
+fn dumpBufAt(m: *const Model, s: xpu.Stream, buf: rt.Buffer, off: usize, len: usize, tag: []const u8) void {
+    if (dump_dir_len == 0) return;
+    var stack: [65536]u8 = undefined;
+    const n = @min(len, stack.len);
+    const b = rt.Buffer{ .rt = m.r, .ptr = @ptrFromInt(@intFromPtr(buf.ptr.?) + off), .len = n };
+    s.synchronize() catch return;
+    m.r.download(stack[0..n], b) catch return;
+    var path_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/v{d}-{s}.bin", .{ dump_dir_buf[0..dump_dir_len], dump_visit, tag }) catch return;
+    path_buf[path.len] = 0;
+    const fd = std.c.open(path_buf[0..path.len :0], .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    if (fd < 0) return;
+    _ = std.c.write(fd, stack[0..n].ptr, n);
+    _ = std.c.close(fd);
 }
 
 fn dumpRowRef(m: *const Model, s: xpu.Stream, ref: state.Ref, off: usize, n: usize, tag: []const u8) void {
