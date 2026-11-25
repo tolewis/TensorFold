@@ -112,18 +112,6 @@ pub const default_prefix = "tf_ink2_";
 /// A device address, as the launcher takes it.
 pub const Ptr = ?*anyopaque;
 
-/// Pad one-row tiles so the group count fills whole 256-group waves. GRF 256, 4 hardware threads a group.
-pub var nv_waves: bool = false;
-
-pub fn nvWaves() bool {
-    if (nv_waves) return true;
-    if (std.c.getenv("INK2_NV_WAVES")) |p| {
-        const s = std.mem.span(p);
-        return s.len > 0 and s[0] == '1';
-    }
-    return false;
-}
-
 pub const Kernels = struct {
     k: [std.enums.values(Op).len]?xpu.Kernel = @splat(null),
     /// The kernels of `module` named `<prefix><op>`; `only` loads one (a control image holds one a prefix).
@@ -168,17 +156,6 @@ pub const Kernels = struct {
         x_full: bool,
     };
 
-    fn paddedTiles(c: Call, is_gu: bool) u32 {
-        const t = tiles(c, is_gu);
-        if (!nvWaves() or c.rows != 1) return t;
-        const r = routes(c);
-        const resident: u32 = 256;
-        const groups = t * r;
-        const rem = groups % resident;
-        if (rem == 0 or r == 0 or rem % r != 0) return t;
-        return t + (resident - rem) / r;
-    }
-
     pub fn gridFill(tile_count: u32, route_count: u32) GridFill {
         const groups = tile_count * route_count;
         const rem = groups % xe_cores;
@@ -198,7 +175,7 @@ pub const Kernels = struct {
     pub fn nvfp4Gu(self: *const Kernels, s: xpu.Stream, x: Ptr, w: Ptr, scales: Ptr, amax: Ptr, den: Ptr, ids: Ptr, out: Ptr, c: Call) !void {
         if (c.format != .nvfp4) return error.WrongExpertFormat;
         try check(c);
-        try xpu.launch.dispatch(try self.get(.nvfp4_gu), s, .{ paddedTiles(c, true), routes(c), 1 }, .{ x, w, scales, amax, den, ids, out, c.k, c.n, c.topk, c.experts });
+        try xpu.launch.dispatch(try self.get(.nvfp4_gu), s, .{ tiles(c, true), routes(c), 1 }, .{ x, w, scales, amax, den, ids, out, c.k, c.n, c.topk, c.experts });
     }
 
     /// Packed MXFP8 GU with UE8M0 scales per row and block of 32.

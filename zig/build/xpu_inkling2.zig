@@ -70,7 +70,7 @@ pub fn controlsTest(b: *std.Build) void {
 }
 
 /// One production image: the source, ocloc's options after the common ones, and the files the source includes.
-const Production = struct { name: []const u8, path: []const u8, extra: []const u8 = "", inputs: []const []const u8 = &.{} };
+const Production = struct { name: []const u8, path: []const u8, extra: []const u8 = "", inputs: []const []const u8 = &.{}, grf: []const u8 = "-cl-intel-256-GRF-per-thread" };
 
 /// The kernels the whole forward runs, built as the contract builds them (the same sources and options, no controls).
 const production_images = [_]Production{
@@ -102,7 +102,7 @@ pub fn productionModule(b: *std.Build, target: std.Build.ResolvedTarget, optimiz
         if (ocloc) |tool| {
             const run = b.addSystemCommand(&.{ tool, "compile", "-q", "-file" });
             run.addFileArg(b.path(img.path));
-            const opts = b.fmt("-cl-std=CL3.0 -cl-intel-256-GRF-per-thread -I zig/kernels/xpu/qwen27{s}", .{img.extra});
+            const opts = b.fmt("-cl-std=CL3.0 {s} -I zig/kernels/xpu/qwen27{s}", .{ img.grf, img.extra });
             run.addArgs(&.{ "-device", device, "-options", opts, "-output_no_suffix", "-output", img.name, "-out_dir" });
             run.setCwd(b.path("."));
             run.addFileInput(b.path("zig/kernels/xpu/qwen27/shape.h"));
