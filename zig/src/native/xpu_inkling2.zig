@@ -450,7 +450,7 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
             xpu.rt.Runtime.resetSyncLog();
         }
         if (rec.n > 1) {
-            ink.prefill.run(model, &scratch, &cache, rec.ids[0..rec.n], .{ .defer_head = true, .all = rec.flags != 0 }) catch |e| {
+            ink.prefill.run(model, &scratch, &cache, rec.ids[0..rec.n], .{ .defer_head = rec.flags & 2 != 0, .all = rec.flags & 1 != 0 }) catch |e| {
                 std.log.err("inkling2_loop: rank 1 prefill ({s})", .{@errorName(e)});
                 return false;
             };

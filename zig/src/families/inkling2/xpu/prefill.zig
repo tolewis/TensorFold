@@ -441,9 +441,11 @@ pub fn run(m: *const Model, s: *state.Scratch, cache: *state.Cache, ids: []const
     try m.r.upload(s.pos, std.mem.sliceAsBytes(pos_buf[0..rows]));
     try m.r.upload(s.seg_of, std.mem.sliceAsBytes(zero_buf[0..rows]));
     try m.r.upload(s.segs, std.mem.sliceAsBytes(segs[0..slices]));
-    if (m.options.place.rank == 0) if (group.live) |gp| {
-        const flags: u32 = (if (options.all) @as(u32, 1) else 0) | (if (options.defer_head) @as(u32, 2) else 0);
-        try gp.note(.forward, ids, flags, @intCast(cache.len));
+    if (m.options.place.rank == 0) {
+        if (group.live) |gp| {
+            const flags: u32 = (if (options.all) @as(u32, 1) else 0) | (if (options.defer_head) @as(u32, 2) else 0);
+            try gp.note(.forward, ids, flags, @intCast(cache.len));
+        }
     }
     const g = Run{ .m = m, .p = p, .s = stream, .sc = s, .rows = rows, .old_experts = options.old_experts, .old_dense = options.old_dense, .old_loop = options.old_loop, .old_sliding = options.old_sliding, .gl_slice = gl_slice, .sl_slice = sl_slice, .sl_seg0 = gl_n };
     try glue.embedNorm(&p.glue, stream, at(s.ids, 0), tensor(m.weights.embed), tensor(m.weights.embed_norm), at(s.p, 0), @intCast(rows));
