@@ -330,6 +330,8 @@ pub fn main(init: std.process.Init) !void {
             ink.fuse.zeta_wide = true;
         } else if (std.mem.eql(u8, a, "--kv-conv")) {
             ink.fuse.kv_conv = true;
+        } else if (std.mem.eql(u8, a, "--rad-gu")) {
+            ink.experts.rad_gu = true;
         } else if (std.mem.eql(u8, a, "--profile-all")) {
             // the first --ref prompt prefilled in --chunk row chunks (last row's logits only, as the server does), profiled per
             // chunk; then plain decode profiled greedy and sampled; then stop

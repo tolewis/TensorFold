@@ -10,6 +10,9 @@ pub const intermediate: u32 = 1152;
 pub const expert_count: u32 = 128;
 pub const top_k: u32 = 8;
 
+/// RAD-shaped gate/up. Off until it wins the A/B and the pooled KL16.
+pub var rad_gu: bool = false;
+
 /// The kernels' reduction split: one decode work-group holds this many sub-groups, each over a slice of k
 /// (INK2_KS_NV_GU, INK2_KS_NV_DOWN, INK2_KS_MX_GU and INK2_KS_MX_DOWN in the source).
 pub const decode_subgroups = struct {
@@ -114,6 +117,7 @@ pub const Ptr = ?*anyopaque;
 
 pub const Kernels = struct {
     k: [std.enums.values(Op).len]?xpu.Kernel = @splat(null),
+    rad_gu: ?xpu.Kernel = null,
 
     /// The kernels of `module` named `<prefix><op>`; `only` loads one (a control image holds one a prefix).
     pub fn load(module: *xpu.Module, prefix: []const u8, only: ?Op) !Kernels {
@@ -125,6 +129,11 @@ pub const Kernels = struct {
             const sym = try std.fmt.bufPrintSentinel(&buf, "{s}{s}", .{ prefix, op.name() }, 0);
             out.k[@intFromEnum(op)] = try module.kernel(sym, op.threads());
         }
+        if (only == null) {
+            var rbuf: [96]u8 = undefined;
+            const rsym = try std.fmt.bufPrintSentinel(&rbuf, "{s}nvfp4_gu_rad", .{prefix}, 0);
+            out.rad_gu = module.kernel(rsym, .{ 128, 1, 1 }) catch null;
+        }
         return out;
     }
 
@@ -133,6 +142,7 @@ pub const Kernels = struct {
             k.deinit();
             slot.* = null;
         };
+        if (self.rad_gu) |*rk| rk.deinit();
     }
 
     fn get(self: *const Kernels, op: Op) !xpu.Kernel {
@@ -148,6 +158,11 @@ pub const Kernels = struct {
     pub fn nvfp4Gu(self: *const Kernels, s: xpu.Stream, x: Ptr, w: Ptr, scales: Ptr, amax: Ptr, den: Ptr, ids: Ptr, out: Ptr, c: Call) !void {
         if (c.format != .nvfp4) return error.WrongExpertFormat;
         try check(c);
+        if (rad_gu) if (self.rad_gu) |k| {
+            const cols = (c.n + 7) / 8;
+            try xpu.launch.dispatch(k, s, .{ cols, routes(c), 1 }, .{ x, w, scales, amax, den, ids, out, c.k, c.n, c.topk });
+            return;
+        };
         try xpu.launch.dispatch(try self.get(.nvfp4_gu), s, .{ tiles(c, true), routes(c), 1 }, .{ x, w, scales, amax, den, ids, out, c.k, c.n, c.topk, c.experts });
     }
 

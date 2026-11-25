@@ -510,6 +510,50 @@ __kernel void P(nvfp4_quantize)(__global const uchar *W, __global const uchar *S
   const float k1 = P(e4m3)((uint)S[row * (k / 16u) + col / 16u]) * 0x1p100f;
   Y[at] = P(f_to_bf)(P(nv_value)(nibble, k1, phi26));
 }
+
+// RAD-shaped gate/up: 8 sub-groups of 16, one output column each, both dots share the activation.
+// Scales multiply in FP32. The sum order is not the DPAS order.
+static inline uint P(nib16)(uint2 v, uint c) {
+  const uint byte = c >> 1;
+  const uint word = byte >> 2;
+  const uint shift = ((byte & 3u) * 8u) + ((c & 1u) * 4u);
+  return (v[word] >> shift) & 15u;
+}
+
+__attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(128, 1, 1)))
+__kernel void P(nvfp4_gu_rad)(__global const ushort *X, __global const uchar *W, __global const uchar *S,
+                              __global const float *amax, __global const float *den, __global const int *ids,
+                              __global ushort *Y, uint k, uint n, uint topk) {
+  const uint sg = get_sub_group_id(), lane = get_sub_group_local_id();
+  const uint col = get_group_id(0) * 8u + sg;
+  const uint route = get_group_id(1);
+  if (col >= n) return;
+  const uint e = (uint)ids[route];
+  const float phi26 = P(phi)(amax, den, e) * 0x1p26f;
+  const uint nb = k >> 4;
+  const ulong grow = ((ulong)e * (2u * n) + 2u * col);
+  __global const uchar *wg = W + grow * (k >> 1);
+  __global const uchar *wu = W + (grow + 1u) * (k >> 1);
+  __global const uchar *sgate = S + grow * nb;
+  __global const uchar *sup = S + (grow + 1u) * nb;
+  __global const ushort *xr = X + (ulong)(route / topk) * k;
+  float gacc = 0.0f, uacc = 0.0f;
+  for (uint b = lane; b < nb; b += 16u) {
+    const uint2 vg = vload2(0, (__global const uint *)(wg + 8u * b));
+    const uint2 vu = vload2(0, (__global const uint *)(wu + 8u * b));
+    const float k1g = P(e4m3)(sgate[b]) * 0x1p100f;
+    const float k1u = P(e4m3)(sup[b]) * 0x1p100f;
+#pragma unroll
+    for (uint c = 0; c < 16u; ++c) {
+      const float xv = P(bf_to_f)(xr[16u * b + c]);
+      gacc = fma(P(nv_value)(P(nib16)(vg, c), k1g, phi26), xv, gacc);
+      uacc = fma(P(nv_value)(P(nib16)(vu, c), k1u, phi26), xv, uacc);
+    }
+  }
+  gacc = sub_group_reduce_add(gacc);
+  uacc = sub_group_reduce_add(uacc);
+  if (lane == 0) Y[(ulong)route * n + col] = P(act)(gacc, uacc);
+}
 #endif
 
 #if INK2_ONLY & INK2_MX_QUANT
