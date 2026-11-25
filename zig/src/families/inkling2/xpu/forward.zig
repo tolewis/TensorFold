@@ -800,11 +800,11 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     }
     if (vdump) {
         var meta_buf: [64]u8 = undefined;
-        const meta = std.fmt.bufPrint(&meta_buf, "c{d} rows {d} base {d}\n", .{ seq, rows, segments[0].cache.len }) catch "";
+        const meta = std.fmt.bufPrint(&meta_buf, "rows {d} base {d} rank {d}\n", .{ rows, segments[0].cache.len, m.options.place.rank }) catch "";
         if (meta.len > 0) {
             const dir_z = std.c.getenv("TF_TP_VDUMP").?;
             var path_buf: [512]u8 = undefined;
-            const path = std.fmt.bufPrint(&path_buf, "{s}/meta-r{d}.txt", .{ std.mem.span(dir_z), m.options.place.rank }) catch "";
+            const path = std.fmt.bufPrint(&path_buf, "{s}/c{d}.txt", .{ std.mem.span(dir_z), seq }) catch "";
             if (path.len > 0) {
                 path_buf[path.len] = 0;
                 const fd = open(path_buf[0..path.len :0], 1 | 64 | 1024, 0o644);
