@@ -147,6 +147,14 @@ pub const Group = struct {
         if (g.qgroup == null) return error.Inkling2Tp;
         qg.dev.noteKernel(xpu.profile.last_kernel);
         if (std.c.getenv("TF_TP_LAUNCHLOG") != null) std.log.info("inkling2: reduce rank {d} rows {d} seq {d}", .{ g.rank, rows, g.qgroup.?.seq + 1 });
+        // TF_TP_AR1: one row an exchange, the shape a plain decode takes. A test switch, not a speed path.
+        if (rows > 1 and std.c.getenv("TF_TP_AR1") != null) {
+            var r: u32 = 0;
+            while (r < rows) : (r += 1) {
+                try g.qgroup.?.allReduce(&g.qdev, @ptrFromInt(@intFromPtr(partial) + @as(usize, r) * D * 2), 1);
+            }
+            return;
+        }
         return g.qgroup.?.allReduce(&g.qdev, partial, rows);
     }
 

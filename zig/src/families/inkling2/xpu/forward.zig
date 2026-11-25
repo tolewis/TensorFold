@@ -800,7 +800,18 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
         defer tight.free();
         var peer = try m.r.alloc(tight_bytes);
         defer peer.free();
-        if (m.weights.unembed_q8) |head| {
+        // TF_TP_HEAD1: one row a launch, the head shape a plain decode takes. A test switch, not a speed path.
+        const head1 = std.c.getenv("TF_TP_HEAD1") != null and n_rows > 1;
+        if (head1) {
+            var r: u32 = 0;
+            while (r < n_rows) : (r += 1) {
+                const hrow = plus(head_input, @as(usize, r) * state.hidden * 2).?;
+                const orow = plus(tight.ptr, @as(usize, r) * @as(usize, vocab_n) * 4).?;
+                if (m.weights.unembed_q8) |head| {
+                    try dense_q8_kernels.head(&p.dense_q8, stream, tensor(head), hrow, orow, 1, vocab_n);
+                } else try glue.logits(&p.glue, stream, hrow, tensor(m.weights.unembed), orow, 1, vocab_n);
+            }
+        } else if (m.weights.unembed_q8) |head| {
             try dense_q8_kernels.head(&p.dense_q8, stream, tensor(head), head_input, tight.ptr, @intCast(n_rows), vocab_n);
         } else try glue.logits(&p.glue, stream, head_input, tensor(m.weights.unembed), tight.ptr, @intCast(n_rows), vocab_n);
         try stream.synchronize();
