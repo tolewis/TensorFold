@@ -359,11 +359,17 @@ const Run = struct {
         try g.dense(w.attn.wo, at(s.att, 0), at(s.attn_dense, 0), rows);
         xpu.profile.label = "";
         var base: usize = 0;
-        for (segments) |seg| {
-            try g.staticPostConv(seg.cache, v.cache_slot, 2, s.attn_dense, w.attn_conv, s.attn_conv, base, seg.rows);
-            base += seg.rows;
+        if (fuse.convFold() and segments.len == 1) {
+            const seg = segments[0];
+            const channels: u32 = @intCast(state.convWidth(2));
+            try fuse.convAttnPartial(&g.p.fuse, g.s, seg.cache.history(v.cache_slot, 2).ptr(), at(s.attn_dense, 0), seg.cache.staged(v.cache_slot, 2, 0).ptr(), tensor(w.attn_conv), at(s.attn_conv, 0), at(s.p, 0), at(s.blocks, 0), at(s.partial, 0), @intCast(rows), channels, if (lp.boundary) lp.blocks_in + 1 else 0);
+        } else {
+            for (segments) |seg| {
+                try g.staticPostConv(seg.cache, v.cache_slot, 2, s.attn_dense, w.attn_conv, s.attn_conv, base, seg.rows);
+                base += seg.rows;
+            }
+            try runtime.attentionPartial(&g.p.runtime, g.s, at(s.p, 0), at(s.attn_conv, 0), at(s.blocks, 0), at(s.partial, 0), rows, if (lp.boundary) lp.blocks_in + 1 else 0);
         }
-        try runtime.attentionPartial(&g.p.runtime, g.s, at(s.p, 0), at(s.attn_conv, 0), at(s.blocks, 0), at(s.partial, 0), rows, if (lp.boundary) lp.blocks_in + 1 else 0);
         try g.residual(m.weights.mlp_queries[v.layer], lp.mlp_sources, rows);
         if (gated) {
             const c = w.controllers.?[3];
@@ -377,11 +383,17 @@ const Run = struct {
         if (route_trace) |tb| try g.s.copy(plus(tb.ptr, v.cache_slot * rows * 32), at(s.route_ids, 0), rows * 32);
         try g.routedExperts(v.layer, rows);
         base = 0;
-        for (segments) |seg| {
-            try g.staticPostConv(seg.cache, v.cache_slot, 3, s.mlp_out, w.mlp_conv, s.mlp_conv, base, seg.rows);
-            base += seg.rows;
+        if (fuse.convFold() and segments.len == 1) {
+            const seg = segments[0];
+            const channels: u32 = @intCast(state.convWidth(3));
+            try fuse.convMlpPartial(&g.p.fuse, g.s, seg.cache.history(v.cache_slot, 3).ptr(), at(s.mlp_out, 0), seg.cache.staged(v.cache_slot, 3, 0).ptr(), tensor(w.mlp_conv), at(s.mlp_conv, 0), at(s.partial, 0), at(s.p, 0), @intCast(rows), channels);
+        } else {
+            for (segments) |seg| {
+                try g.staticPostConv(seg.cache, v.cache_slot, 3, s.mlp_out, w.mlp_conv, s.mlp_conv, base, seg.rows);
+                base += seg.rows;
+            }
+            try runtime.mlpPartial(&g.p.runtime, g.s, at(s.partial, 0), at(s.mlp_conv, 0), at(s.p, 0), rows);
         }
-        try runtime.mlpPartial(&g.p.runtime, g.s, at(s.partial, 0), at(s.mlp_conv, 0), at(s.p, 0), rows);
         if (v.cache_slot == 5) try g.copyBf16(at(s.p, 0), at(s.prelude, 0), rows * state.hidden);
     }
 

@@ -282,3 +282,46 @@ __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_si
     }
   }
 }
+
+#define SQRT5 0x1.1e377ap+1f
+
+static inline ushort conv_y(global const ushort *history, global const ushort *current, global ushort *taps,
+                            global const ushort *weight, uint r, uint c, uint channels) {
+  float window[4];
+  for (uint tap = 0; tap < 4; ++tap) {
+    const uint k = r + tap;
+    window[tap] = bf2f(k < 3 ? history[(size_t)k * channels + c] : current[(size_t)(k - 3) * channels + c]);
+  }
+  if (r == 0)
+    for (uint k = 0; k < 3; ++k) taps[(size_t)k * channels + c] = history[(size_t)k * channels + c];
+  taps[(size_t)(r + 3) * channels + c] = current[(size_t)r * channels + c];
+  float sum = bf2f(current[(size_t)r * channels + c]);
+  for (uint tap = 0; tap < 4; ++tap) sum += bf2f(weight[c * 4 + tap]) * window[tap];
+  return f2bf(sum / SQRT5);
+}
+
+// Grid (ceil(channels/256), rows). The attention convolution, then the partial, with the bf16 round between them.
+KERNEL(256) void tf_ink2_conv_attn_partial(
+    global const ushort *history, global const ushort *current, global ushort *taps, global const ushort *weight,
+    global ushort *conv_out, global const ushort *p, global ushort *blocks, global float *partial, uint rows, uint channels,
+    uint boundary) {
+  const uint c = get_group_id(0) * 256 + get_local_id(0), r = get_group_id(1);
+  if (c >= channels || r >= rows) return;
+  const ushort y = conv_y(history, current, taps, weight, r, c, channels);
+  conv_out[(size_t)r * channels + c] = y;
+  const uint at = r * channels + c;
+  partial[at] = boundary ? bf2f(y) : bf2f(p[at]) + bf2f(y);
+  if (boundary) blocks[(size_t)r * 4 * channels + (boundary - 1) * channels + c] = p[at];
+}
+
+// Grid (ceil(channels/256), rows). The MLP convolution, then the partial add into p.
+KERNEL(256) void tf_ink2_conv_mlp_partial(
+    global const ushort *history, global const ushort *current, global ushort *taps, global const ushort *weight,
+    global ushort *conv_out, global const float *t, global ushort *p, uint rows, uint channels) {
+  const uint c = get_group_id(0) * 256 + get_local_id(0), r = get_group_id(1);
+  if (c >= channels || r >= rows) return;
+  const ushort y = conv_y(history, current, taps, weight, r, c, channels);
+  conv_out[(size_t)r * channels + c] = y;
+  const uint at = r * channels + c;
+  p[at] = f2bf(t[at] + bf2f(y));
+}

@@ -8,6 +8,16 @@ pub const Ref = ?*anyopaque;
 pub var force: ?bool = null;
 pub var seg: bool = true;
 pub var router_wide: bool = false;
+pub var conv_fold: bool = false;
+
+pub fn convFold() bool {
+    if (conv_fold) return true;
+    if (std.c.getenv("INK2_CONV_FOLD")) |p| {
+        const s = std.mem.span(p);
+        return s.len > 0 and s[0] == '1';
+    }
+    return false;
+}
 
 pub fn routerWide() bool {
     if (router_wide) return true;
@@ -34,6 +44,8 @@ pub const Pipelines = struct {
     norms: xpu.Kernel,
     router_gemv: xpu.Kernel,
     router_pick: xpu.Kernel,
+    conv_attn: xpu.Kernel,
+    conv_mlp: xpu.Kernel,
 
     pub fn load(module: xpu.Module) !Pipelines {
         var pre = try module.kernel("tf_ink2_fuse_pre", .{ 256, 1, 1 });
@@ -46,11 +58,17 @@ pub const Pipelines = struct {
         errdefer norms.deinit();
         var router_gemv = try module.kernel("tf_ink2_router_gemv", .{ 256, 1, 1 });
         errdefer router_gemv.deinit();
-        const router_pick = try module.kernel("tf_ink2_router_pick", .{ 128, 1, 1 });
-        return .{ .pre = pre, .zeta = zeta, .gates = gates, .norms = norms, .router_gemv = router_gemv, .router_pick = router_pick };
+        var router_pick = try module.kernel("tf_ink2_router_pick", .{ 128, 1, 1 });
+        errdefer router_pick.deinit();
+        var conv_attn = try module.kernel("tf_ink2_conv_attn_partial", .{ 256, 1, 1 });
+        errdefer conv_attn.deinit();
+        const conv_mlp = try module.kernel("tf_ink2_conv_mlp_partial", .{ 256, 1, 1 });
+        return .{ .pre = pre, .zeta = zeta, .gates = gates, .norms = norms, .router_gemv = router_gemv, .router_pick = router_pick, .conv_attn = conv_attn, .conv_mlp = conv_mlp };
     }
 
     pub fn deinit(p: *Pipelines) void {
+        p.conv_mlp.deinit();
+        p.conv_attn.deinit();
         p.router_pick.deinit();
         p.router_gemv.deinit();
         p.norms.deinit();
@@ -88,6 +106,16 @@ pub const PhaseA = struct {
     msg_entries: u32,
     norm_n: u32,
 };
+
+pub fn convAttnPartial(p: *const Pipelines, s: xpu.Stream, history: Ref, current: Ref, taps: Ref, weight: Ref, conv_out: Ref, prev: Ref, blocks: Ref, partial: Ref, rows: u32, channels: u32, boundary: u32) !void {
+    const groups = (channels + 255) / 256;
+    try xpu.launch.dispatch(p.conv_attn, s, .{ groups, rows, 1 }, .{ history, current, taps, weight, conv_out, prev, blocks, partial, rows, channels, boundary });
+}
+
+pub fn convMlpPartial(p: *const Pipelines, s: xpu.Stream, history: Ref, current: Ref, taps: Ref, weight: Ref, conv_out: Ref, t: Ref, out: Ref, rows: u32, channels: u32) !void {
+    const groups = (channels + 255) / 256;
+    try xpu.launch.dispatch(p.conv_mlp, s, .{ groups, rows, 1 }, .{ history, current, taps, weight, conv_out, t, out, rows, channels });
+}
 
 pub fn routerWideLaunch(p: *const Pipelines, s: xpu.Stream, x: Ref, weight: Ref, bias: Ref, scores: Ref, ids: Ref, weights: Ref, rows: u32) !void {
     try xpu.launch.dispatch(p.router_gemv, s, .{ 8, rows, 1 }, .{ x, weight, scores, rows });
