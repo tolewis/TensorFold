@@ -262,7 +262,11 @@ KERNEL(128) void tf_ink2_merge_split(global const float *part_o, global const fl
     o = o * x + po[k][t] * y;
     mm = mn;
   }
+#if INK2_CTL == 7
+  const float sk = -INFINITY; // control: the sink dropped
+#else
   const float sk = bf2f(sink[rh]) * LOG2E;
+#endif
   const float mf = fmax(mm, sk), a0 = exp2(mm - mf);
   const float y = o * a0 / (ll * a0 + exp2(sk - mf));
   const float gv = bf2f(gate[(size_t)rh * D + t]);
