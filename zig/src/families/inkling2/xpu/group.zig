@@ -179,7 +179,7 @@ pub const Group = struct {
         if (g.qgroup == null) return error.Inkling2Tp;
         qg.dev.noteKernel(xpu.profile.last_kernel);
         const from = if (g.rank == 0) @as(usize, 0) else half;
-        const zeros = [_]u8{0} ** 8;
+        const zeros: [8]u8 = @splat(0);
         const off_bytes: usize = from * row_bytes;
         const fill_bytes: usize = half * row_bytes;
         const dst: *anyopaque = @ptrFromInt(@intFromPtr(partial) + off_bytes);
