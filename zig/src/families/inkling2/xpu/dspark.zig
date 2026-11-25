@@ -85,7 +85,7 @@ pub const Drafter = struct {
         const host = try gpa.alloc(u16, full);
         defer gpa.free(host);
         const unembed = target.weights.unembed;
-        var own_unembed: ?xpu.DeviceBuffer = null;
+        var own_unembed: ?rt.Buffer = null;
         errdefer if (own_unembed) |*b| b.free();
         if (unembed.bytes / 2 == full) {
             try target.r.download(std.mem.sliceAsBytes(host), unembed.buf);
