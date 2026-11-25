@@ -459,10 +459,19 @@ const Run = struct {
             try runtime.mlpPartial(&g.p.runtime, g.s, at(s.partial, 0), at(s.mlp_conv, 0), at(s.p, 0), rows);
         }
         if (v.cache_slot == 5) try g.copyBf16(at(s.p, 0), at(s.prelude, 0), rows * state.hidden);
+        // A window stages every layer's conv rows into one shared buffer, so committing once at the end would copy the last
+        // layer's rows into every slot's history. Each visit commits its own slot's last three rows instead.
+        if (rows > 1) {
+            for (segments) |seg| for (0..state.conv_states) |cs| {
+                try g.copyBf16(seg.cache.staged(v.cache_slot, cs, seg.rows).ptr(), seg.cache.history(v.cache_slot, cs).ptr(), 3 * state.convWidth(cs));
+            };
+        }
     }
 
     fn commitFullHistories(g: Run, segments: []const Segment) !void {
         for (segments) |seg| for (0..state.visit_slots) |slot| for (0..state.conv_states) |cs| {
+            // A window already committed each slot at its own visit.
+            if (seg.rows > 1) continue;
             if (g.wrote) |mask| {
                 if ((mask[slot] & (@as(u8, 1) << @intCast(cs))) != 0) continue;
             }
