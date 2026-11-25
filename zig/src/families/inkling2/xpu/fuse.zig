@@ -14,9 +14,9 @@ pub fn convFold() bool {
     if (conv_fold) return true;
     if (std.c.getenv("INK2_CONV_FOLD")) |p| {
         const s = std.mem.span(p);
-        return s.len > 0 and s[0] == '1';
+        if (s.len > 0 and s[0] == '0') return false;
     }
-    return false;
+    return true;
 }
 
 pub fn routerWide() bool {
