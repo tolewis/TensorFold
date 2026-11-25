@@ -412,6 +412,7 @@ const Run = struct {
             std.debug.print("ATT ARGS v{d}: rows {d} layer {d} extent {d}\n", .{ dump_visit, rows, v.layer, ap.extent });
         }
         if (dump_dir_len > 0) {
+            dump_layer = v.layer;
             const seg0 = segments[0];
             const lay = seg0.cache.attentionLayer(&g.m.weight_plan, v.cache_slot, seg0.rows);
             const glp = seg0.cache.len + seg0.rows - 1;
@@ -431,6 +432,34 @@ const Run = struct {
             dumpBufAt(g.m, g.s, s.pos, 0, 8 * 4, "pos");
             dumpBufAt(g.m, g.s, s.seg_of, 0, 8 * 4, "segof");
             dumpBufAt(g.m, g.s, s.segs, 0, @sizeOf(ap.Seg) * 2, "segs");
+            var pr: usize = 500;
+            while (pr <= 507) : (pr += 1) {
+                var tb: [16]u8 = undefined;
+                const tt = std.fmt.bufPrint(&tb, "pr{d}", .{pr}) catch "pr";
+                dumpRowRef(g.m, g.s, segments[0].cache.keys(v.cache_slot), (pr % state.sliding_ring) * ap.head_dim * 2, ap.head_dim * 2, tt);
+            }
+            var kr: usize = 0;
+            while (kr < 8) : (kr += 1) {
+                var tb2: [16]u8 = undefined;
+                const t2 = std.fmt.bufPrint(&tb2, "kc{d}", .{kr}) catch "kc";
+                dumpBufAt(g.m, g.s, s.k_conv, kr * state.kv_width * 2, state.kv_width * 2, t2);
+            }
+            dumpBufAt(g.m, g.s, s.k_conv, 0, state.kv_width * 2, "kc0");
+            dumpBufAt(g.m, g.s, s.k_conv, state.kv_width * 2, state.kv_width * 2, "kc1");
+            dumpRowRef(g.m, g.s, segments[0].cache.keys(v.cache_slot), (501 % state.sliding_ring) * ap.head_dim * 2, ap.head_dim * 2, "kp501");
+            const segk = segments[0];
+            const ring = state.sliding_ring;
+            const kref2 = segk.cache.keys(v.cache_slot);
+            const vref2 = segk.cache.values(v.cache_slot);
+            var pk: usize = 500;
+            while (pk <= 507) : (pk += 1) {
+                var kb: [16]u8 = undefined;
+                var vb: [16]u8 = undefined;
+                const kt = std.fmt.bufPrint(&kb, "k{d}", .{pk}) catch "k";
+                const vt = std.fmt.bufPrint(&vb, "v{d}", .{pk}) catch "v";
+                dumpRowRef(g.m, g.s, kref2, (pk % ring) * ap.head_dim * 2, ap.head_dim * 2, kt);
+                dumpRowRef(g.m, g.s, vref2, (pk % ring) * ap.head_dim * 2, ap.head_dim * 2, vt);
+            }
         }
         xpu.profile.label = "wo";
         try g.dense(w.attn.wo, at(s.att, 0), at(s.attn_dense, 0), rows);
@@ -537,6 +566,7 @@ var dump_dir_buf: [256]u8 = undefined;
 var dump_dir_len: usize = 0;
 var dump_row: usize = 1;
 var dump_visit: usize = 0;
+var dump_layer: u32 = 0;
 
 pub fn dumpEnable(dir: []const u8, at_row: usize) void {
     dump_dir_len = @min(dir.len, dump_dir_buf.len);
@@ -555,7 +585,7 @@ fn dump2(m: *const Model, s: xpu.Stream, tag: []const u8, buf: rt.Buffer, stride
 }
 
 fn dumpBufAt(m: *const Model, s: xpu.Stream, buf: rt.Buffer, off: usize, len: usize, tag: []const u8) void {
-    if (dump_dir_len == 0) return;
+    if (dump_dir_len == 0 or dump_visit != 0 or dump_layer != 0) return;
     var stack: [65536]u8 = undefined;
     const n = @min(len, stack.len);
     const b = rt.Buffer{ .rt = m.r, .ptr = @ptrFromInt(@intFromPtr(buf.ptr.?) + off), .len = n };
@@ -571,7 +601,7 @@ fn dumpBufAt(m: *const Model, s: xpu.Stream, buf: rt.Buffer, off: usize, len: us
 }
 
 fn dumpRowRef(m: *const Model, s: xpu.Stream, ref: state.Ref, off: usize, n: usize, tag: []const u8) void {
-    if (dump_dir_len == 0) return;
+    if (dump_dir_len == 0 or dump_visit != 0 or dump_layer != 0) return;
     var stack: [state.hidden * 2]u8 = undefined;
     const len = @min(n, stack.len);
     const b = rt.Buffer{ .rt = m.r, .ptr = @ptrFromInt(@intFromPtr(ref.buf.ptr.?) + ref.off + off), .len = len };

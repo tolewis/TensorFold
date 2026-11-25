@@ -120,6 +120,7 @@ KERNEL(16) void tf_ink2_attn_decode(global const ushort *q, global const ushort 
   const uint c = first + get_group_id(1);
   if (c > pos / chunk || (window && c < lo / chunk)) return;
   const uint from = max(lo, c * chunk), to = min(pos + 1, (c + 1) * chunk);
+  if (row == 1 && lane == 0 && c == pos / chunk) printf("DEC row 1 pos %u c %u from %u to %u live %u\n", pos, c, from, to, (uint)(0u));
   const InkSeg s = segs[rseg[row]];
   global const ushort *kh = kc + s.off + (size_t)kvh * ring * D;
   global const ushort *vh = vc + s.off + (size_t)kvh * ring * D;
@@ -226,6 +227,7 @@ KERNEL(128) void tf_ink2_merge(global const float *part_o, global const float2 *
     } else {
       const size_t at = (size_t)rh * chunks + c - (window ? lo / chunk : c0);
       const float2 ml = part_ml[at];
+      if ((rh == 24 || rh == 0) && d == 0 && (c == lo / chunk || c == pos / chunk)) printf("MERGE rh %u pos %u lo %u c %u chunk %u chunks %u at %u ml %.6g %.6g\n", rh, pos, lo, c, chunk, chunks, (uint)at, ml.x, ml.y);
       cm = ml.x; cl = ml.y; co = part_o[at * D + d];
     }
     const float mn = fmax(mm, cm), x = exp2(mm - mn), y = exp2(cm - mn);
