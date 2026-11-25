@@ -375,7 +375,8 @@ static inline void P(nv_decode_one)(const uint ks, __global const ushort *X, __g
   const uint e = (uint)ids[route];
   const uint rows_total = gu ? 2u * n : n;
   const uint raw = tile * INK2_SG + lane;
-  const uint row = raw < rows_total ? raw : 0u;
+  if (raw >= rows_total) return;
+  const uint row = raw;
   const uint nb = k / 16u;
   __global const uchar *wr = W + ((ulong)e * rows_total + row) * (k / 2u);
   __global const uchar *sr = S + ((ulong)e * rows_total + row) * nb;

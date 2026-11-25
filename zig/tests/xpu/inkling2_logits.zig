@@ -338,6 +338,8 @@ pub fn main(init: std.process.Init) !void {
             ink.fuse.role_conv = true;
         } else if (std.mem.eql(u8, a, "--sink-seg")) {
             ink.fuse.sink_seg = true;
+        } else if (std.mem.eql(u8, a, "--nv-waves")) {
+            ink.experts.nv_waves = true;
         } else if (std.mem.eql(u8, a, "--profile-all")) {
             // the first --ref prompt prefilled in --chunk row chunks (last row's logits only, as the server does), profiled per
             // chunk; then plain decode profiled greedy and sampled; then stop
