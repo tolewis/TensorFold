@@ -176,10 +176,10 @@ const Run = struct {
         return @intCast(weight.shape[weight.rank - 2]);
     }
 
-    fn dense(g: Run, weight: Tensor, input: Ptr, out: Ptr, rows: usize) !void {
+    fn dense(g: Run, weight: Tensor, input: Ptr, out: Ptr, wide: ?*anyopaque, rows: usize) !void {
         const k: u32 = @intCast(weight.shape[weight.rank - 1]);
         const n: u32 = @intCast(weight.shape[weight.rank - 2]);
-        if (weight.q8) return dense_q8_kernels.dense(&g.p.dense_q8, g.s, tensor(weight), input, out, @intCast(rows), n, k);
+        if (weight.q8) return dense_q8_kernels.dense(&g.p.dense_q8, g.s, tensor(weight), input, out, wide, @intCast(rows), n, k);
         try dense_kernels.dense(&g.p.dense, g.s, tensor(weight), input, out, @intCast(rows), n, k);
     }
 
@@ -350,44 +350,47 @@ const Run = struct {
         const down_call = experts.Call{ .rows = @intCast(rows), .k = state.intermediate, .n = state.hidden, .format = precision };
         const x = at(s.mlp_normed, 0);
         const ids = at(s.route_ids, 0);
+        try experts.armFault(g.m.r);
         const act = at(s.gu, 0);
         const down = at(s.down, 0);
         const pl = g.m.options.place;
         if (pl.split()) {
-            const local_ids = at(s.members, 0);
+            const counts = at(s.members, 0);
             if (group.live) |gp| {
-                try xpu.launch.dispatch(gp.zero, g.s, .{ @intCast((rows * 8 + 255) / 256), 1, 1 }, .{ ids, at(s.route_weights, 0), local_ids, @as(u32, @intCast(rows * 8)), pl.expertBase(), pl.expertCount() });
+                try xpu.launch.dispatch(gp.zero, g.s, .{ @intCast(rows), 1, 1 }, .{ ids, at(s.route_weights, 0), counts, @as(u32, @intCast(rows)), pl.expertBase(), pl.expertCount() });
             }
             if (rows <= decode_rows) {
                 const local = experts.Call{ .rows = @intCast(rows), .k = state.hidden, .n = state.intermediate, .format = precision, .experts = pl.expertCount() };
                 const down_local = experts.Call{ .rows = @intCast(rows), .k = state.intermediate, .n = state.hidden, .format = precision, .experts = pl.expertCount() };
                 switch (precision) {
-                    .nvfp4 => try ex.nvfp4Gu(g.s, x, tensor(w.gu.weight), tensor(w.gu.scale), tensor(w.gu.amax.?), tensor(w.gu.denominator.?), local_ids, act, local),
-                    .mxfp8 => try ex.mxfp8Gu(g.s, x, tensor(w.gu.weight), tensor(w.gu.scale), local_ids, act, local),
+                    .nvfp4 => try ex.nvfp4Gu(g.s, x, tensor(w.gu.weight), tensor(w.gu.scale), tensor(w.gu.amax.?), tensor(w.gu.denominator.?), ids, act, local),
+                    .mxfp8 => try ex.mxfp8Gu(g.s, x, tensor(w.gu.weight), tensor(w.gu.scale), ids, act, local),
                 }
                 switch (precision) {
-                    .nvfp4 => try ex.nvfp4Down(g.s, act, tensor(w.down.weight), tensor(w.down.scale), tensor(w.down.amax.?), tensor(w.down.denominator.?), local_ids, down, down_local),
-                    .mxfp8 => try ex.mxfp8Down(g.s, act, tensor(w.down.weight), tensor(w.down.scale), local_ids, down, down_local),
+                    .nvfp4 => try ex.nvfp4Down(g.s, act, tensor(w.down.weight), tensor(w.down.scale), tensor(w.down.amax.?), tensor(w.down.denominator.?), ids, down, down_local),
+                    .mxfp8 => try ex.mxfp8Down(g.s, act, tensor(w.down.weight), tensor(w.down.scale), ids, down, down_local),
                 }
             } else {
                 const items = at(s.items, 0);
                 const count = at(s.count, 0);
-                var call = gu_call;
-                call.experts = 128;
-                try ex.plan(g.s, ids, local_ids, items, count, call);
-                if (group.live) |gp| try xpu.launch.dispatch(gp.filter, g.s, .{ 1, 1, 1 }, .{ items, count, pl.expertBase(), pl.expertCount() });
                 const local = experts.Call{ .rows = @intCast(rows), .k = state.hidden, .n = state.intermediate, .format = precision, .experts = pl.expertCount() };
                 const down_local = experts.Call{ .rows = @intCast(rows), .k = state.intermediate, .n = state.hidden, .format = precision, .experts = pl.expertCount() };
+                try ex.plan(g.s, ids, counts, items, count, local);
                 switch (precision) {
-                    .nvfp4 => try ex.nvfp4GuPrompt(g.s, x, tensor(w.gu.weight), tensor(w.gu.scale), tensor(w.gu.amax.?), tensor(w.gu.denominator.?), items, count, local_ids, act, local),
-                    .mxfp8 => try ex.mxfp8GuPrompt(g.s, x, tensor(w.gu.weight), tensor(w.gu.scale), items, count, local_ids, act, local),
+                    .nvfp4 => try ex.nvfp4GuPrompt(g.s, x, tensor(w.gu.weight), tensor(w.gu.scale), tensor(w.gu.amax.?), tensor(w.gu.denominator.?), items, count, counts, act, local),
+                    .mxfp8 => try ex.mxfp8GuPrompt(g.s, x, tensor(w.gu.weight), tensor(w.gu.scale), items, count, counts, act, local),
                 }
                 switch (precision) {
-                    .nvfp4 => try ex.nvfp4DownPrompt(g.s, act, tensor(w.down.weight), tensor(w.down.scale), tensor(w.down.amax.?), tensor(w.down.denominator.?), items, count, local_ids, down, down_local),
-                    .mxfp8 => try ex.mxfp8DownPrompt(g.s, act, tensor(w.down.weight), tensor(w.down.scale), items, count, local_ids, down, down_local),
+                    .nvfp4 => try ex.nvfp4DownPrompt(g.s, act, tensor(w.down.weight), tensor(w.down.scale), tensor(w.down.amax.?), tensor(w.down.denominator.?), items, count, counts, down, down_local),
+                    .mxfp8 => try ex.mxfp8DownPrompt(g.s, act, tensor(w.down.weight), tensor(w.down.scale), items, count, counts, down, down_local),
                 }
             }
             try finishExperts(g, down, ids, at(s.route_weights, 0), down_call);
+            if (std.c.getenv("TF_TP_IDCHECK") != null) if (experts.faultHits()) |p| {
+                var word: i32 = 0;
+                try g.m.r.download(std.mem.asBytes(&word), .{ .rt = g.m.r, .ptr = p, .len = 4 });
+                if (word != 0) std.log.err("inkling2: expert id fault {d}", .{word});
+            };
             return;
         }
         if (rows <= decode_rows) {
@@ -417,7 +420,7 @@ const Run = struct {
     }
 
 fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) !void {
-    try experts.Kernels.combine(&g.p.experts, g.s, down, ids, weights, at(g.sc.mlp_out, 0), call);
+    try experts.Kernels.combine(&g.p.experts, g.s, down, ids, weights, at(g.sc.mlp_out, 0), null, call);
 }
 
     fn visit(g: Run, v: *const layer_plan.Visit, segments: []const Segment, rows: usize, taps: ?Ptr, visit_i: usize) !void {
@@ -457,24 +460,29 @@ fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) 
             }, k);
         } else {
             xpu.profile.label = "wq";
-            try g.dense(w.attn.wq, at(s.q_norm, 0), at(s.q_raw, 0), rows);
+            try g.dense(w.attn.wq, at(s.q_norm, 0), at(s.q_raw, 0), null, rows);
             xpu.profile.label = "wk";
-            try g.dense(w.attn.wk, knorm, at(s.k_raw, 0), rows);
+            try g.dense(w.attn.wk, knorm, at(s.k_raw, 0), null, rows);
             xpu.profile.label = "wv";
-            try g.dense(w.attn.wv, vnorm, at(s.v_raw, 0), rows);
+            try g.dense(w.attn.wv, vnorm, at(s.v_raw, 0), null, rows);
             xpu.profile.label = "wr";
-            try g.dense(w.attn.wr, at(s.q_norm, 0), at(s.rel_raw, 0), rows);
+            try g.dense(w.attn.wr, at(s.q_norm, 0), at(s.rel_raw, 0), null, rows);
             xpu.profile.label = "gate";
-            try g.dense(w.attn.gate, at(s.q_norm, 0), at(s.gate, 0), rows);
+            try g.dense(w.attn.gate, at(s.q_norm, 0), at(s.gate, 0), null, rows);
         }
         xpu.profile.label = "sink";
-        try g.dense(w.attn.sink, at(s.q_norm, 0), at(s.sink, 0), rows);
+        try g.dense(w.attn.sink, at(s.q_norm, 0), at(s.sink, 0), null, rows);
         xpu.profile.label = "";
         try g.attendSegments(v, segments);
         xpu.profile.label = "wo";
-        try g.dense(w.attn.wo, at(s.att, 0), at(s.attn_dense, 0), rows);
+        try g.dense(w.attn.wo, at(s.att, 0), at(s.attn_dense, 0), null, rows);
         xpu.profile.label = "";
-        if (g.m.options.place.split()) if (group.live) |gp| try gp.allReduce(at(s.attn_dense, 0).?, @intCast(rows));
+        if (g.m.options.place.split()) {
+            if (group.live) |gp| {
+                xpu.profile.last_kernel = "tf_ink2_dense_q8 wo";
+                try gp.allReduce(at(s.attn_dense, 0).?, @intCast(rows));
+            }
+        }
         var base: usize = 0;
         if (fuse.convFold() and segments.len == 1) {
             const seg = segments[0];
@@ -506,7 +514,16 @@ fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) 
         } else try glue.router(&g.p.glue, g.s, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.route_ids, 0), at(s.route_weights, 0), @intCast(rows));
         if (route_trace) |tb| try g.s.copy(plus(tb.ptr, v.cache_slot * rows * 32), at(s.route_ids, 0), rows * 32);
         try g.routedExperts(v.layer, rows);
-        if (g.m.options.place.split()) if (group.live) |gp| try gp.allReduce(at(s.mlp_out, 0).?, @intCast(rows));
+        if (g.m.options.place.split()) if (group.live) |gp| {
+            xpu.profile.last_kernel = "tf_ink2_combine";
+            const t0 = xpu.profile.nowNs();
+            try gp.allReduce(at(s.mlp_out, 0).?, @intCast(rows));
+            if (std.c.getenv("TF_TP_ROUTELOG") != null and rows == 1) {
+                try g.m.r.sync();
+                const us = (xpu.profile.nowNs() - t0) / 1000;
+                std.log.info("inkling2: route rank {d} layer {d} kept {d} reduce {d} us", .{ g.m.options.place.rank, v.layer, experts.last_kept, us });
+            }
+        };
         try dumpBytes(&g, visit_i, "exp-red", at(s.mlp_out, 0), 2 * state.hidden * 2);
         base = 0;
         if (fuse.convFold() and segments.len == 1) {

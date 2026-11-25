@@ -202,6 +202,13 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         gpa.destroy(h);
         return null;
     };
+    if (std.c.getenv("TF_TP_NOMODEL") != null and place.split()) {
+        _ = ink.group.Group.open(gpa, &h.rt, &h.ctx, place) catch |err| {
+            problem.* = try std.fmt.allocPrint(a, "inkling2_loop: the TP group did not open ({s})", .{@errorName(err)});
+            return null;
+        };
+        std.process.exit(0);
+    }
     h.model = Model.load(gpa, &h.rt, o.dir, .{ .embed_host = embed_host, .place = place }) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "the native Inkling 2 Mini engine cannot load this checkpoint ({s})", .{@errorName(err)});
         h.rt.deinit();
@@ -390,6 +397,14 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
         return false;
     };
     defer rt.deinit();
+    if (std.c.getenv("TF_TP_NOMODEL") != null) {
+        const gp = ink.group.Group.open(gpa, &rt, &ctx, place) catch |e| {
+            problem.* = try std.fmt.allocPrint(a, "inkling2_loop: the TP group did not open ({s})", .{@errorName(e)});
+            return false;
+        };
+        gpa.destroy(gp);
+        std.process.exit(0);
+    }
     var model = Model.load(gpa, &rt, o.dir, .{ .place = place }) catch |e| {
         problem.* = try std.fmt.allocPrint(a, "the native Inkling 2 Mini engine cannot load this checkpoint ({s})", .{@errorName(e)});
         return false;
@@ -434,7 +449,16 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
             xpu.profile.active = &prof;
             xpu.rt.Runtime.resetSyncLog();
         }
-        ink.forward.run(model, &scratch, &cache, rec.ids[0..rec.n], .{ .all = rec.flags != 0 }) catch |e| {
+        if (rec.n > 1) {
+            ink.prefill.run(model, &scratch, &cache, rec.ids[0..rec.n], .{ .defer_head = true, .all = rec.flags != 0 }) catch |e| {
+                std.log.err("inkling2_loop: rank 1 prefill ({s})", .{@errorName(e)});
+                return false;
+            };
+            ink.prefill.headRows(model, &scratch, 0, rec.n) catch |e| {
+                std.log.err("inkling2_loop: rank 1 head ({s})", .{@errorName(e)});
+                return false;
+            };
+        } else ink.forward.run(model, &scratch, &cache, rec.ids[0..rec.n], .{ .all = rec.flags != 0 }) catch |e| {
             std.log.err("inkling2_loop: rank 1 forward ({s})", .{@errorName(e)});
             return false;
         };

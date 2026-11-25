@@ -125,6 +125,7 @@ pub fn familyModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
     m.addImport("core", core);
     m.addImport("lanes", lanes);
     m.addImport("inkling2_xpu_images", images_module);
+    m.addImport("qwen_group", b.createModule(.{ .root_source_file = b.path("zig/src/xpu/qwen_group/root.zig"), .target = target, .optimize = optimize, .link_libc = true }));
     for ([_][2][]const u8{
         .{ "inkling2_glue_plan", "zig/src/families/inkling2/metal/glue_plan.zig" },
         .{ "inkling2_runtime_plan", "zig/src/families/inkling2/metal/runtime_plan.zig" },

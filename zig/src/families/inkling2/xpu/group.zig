@@ -7,6 +7,7 @@ const ze = xpu.ze;
 const images = @import("inkling2_xpu_images");
 const place = @import("place.zig");
 const rt = xpu.rt;
+const qg = @import("qwen_group");
 
 const D = place.hidden;
 const rows_max: u32 = 64;
@@ -44,6 +45,8 @@ fn watchPeer(pid: i32) void {
     }
 }
 
+const TsFn = *const fn (ze.H, *anyopaque, ze.H, u32, ?*ze.H) callconv(.c) u32;
+
 pub const Op = enum(u32) { forward = 1, close = 2 };
 pub const Rec = extern struct { seq: u64, op: Op, n: u32, flags: u32, base: u32, ids: [64]u32 };
 
@@ -57,10 +60,17 @@ pub const Group = struct {
     add_f32: xpu.Kernel = undefined,
     down: xpu.Kernel = undefined,
     f32row: ?*anyopaque = null,
+    stamp_fn: ?TsFn = null,
+    stamp_buf: ?*anyopaque = null,
+    stamp_on: bool = false,
     /// Counter events of this token. Qwen destroys them after the stream settles. A live set makes the next wait slower.
     evs: [256]ze.H = undefined,
     ev_n: u32 = 0,
     zero: xpu.Kernel = undefined,
+    zero_w: xpu.Kernel = undefined,
+    set_launch: xpu.Kernel = undefined,
+    /// Three u32s: the indirect group count for one row of experts.
+    gc: ?*anyopaque = null,
     filter: xpu.Kernel = undefined,
     mod: xpu.Module = undefined,
     blk: ?*anyopaque = null,
@@ -74,6 +84,8 @@ pub const Group = struct {
     conn: linux.fd_t = -1,
     ex: u8 = 0,
     rec_seq: u64 = 0,
+    qdev: qg.dev.Dev = undefined,
+    qgroup: ?qg.tp.Group = null,
 
     pub fn open(gpa: std.mem.Allocator, r: *rt.Runtime, ctx: *const xpu.Context, p: place.Place) !*Group {
         if (!p.split()) return error.Inkling2Tp;
@@ -85,18 +97,19 @@ pub const Group = struct {
         g.up = try g.mod.kernel("tp_up", .{ 256, 1, 1 });
         g.add_f32 = try g.mod.kernel("tp_add_f32", .{ 256, 1, 1 });
         g.down = try g.mod.kernel("tp_down", .{ 256, 1, 1 });
-        if (std.c.getenv("TF_TP_F32")) |v| {
-            if (v[0] != '0') {
-                const buf = try r.alloc(D * 4);
-                g.f32row = buf.ptr;
-            }
-        }
-        g.zero = try g.mod.kernel("tp_zero_unowned", .{ 256, 1, 1 });
+        g.zero = try g.mod.kernel("tp_keep_local", .{ 256, 1, 1 });
+        g.zero_w = try g.mod.kernel("tp_zero_foreign_weight", .{ 256, 1, 1 });
+        g.set_launch = try g.mod.kernel("tp_set_launch", .{ 1, 1, 1 });
+        g.gc = (try g.r.alloc(16)).ptr;
         g.filter = try g.mod.kernel("tp_filter_items", .{ 1, 1, 1 });
         const name = shmName();
         g.map = try mapShm(name, p.rank);
         try g.handshake(name);
-        std.log.info("inkling2: TP {d} rank {d}: all-reduce {s}", .{ g.tp, g.rank, if (g.ex == 3) "EX flag 3" else "host-staged" });
+        qg.q.setRank(p.rank);
+        _ = setenv("TF_TP_SHM", "/dev/shm/tf-tp-inkling2-qwen", 1);
+        g.qdev = try qg.dev.bind(@constCast(&r.drv.lib), ctx.gpu.driver, r.ctx, r.device, r.list, g.add.handle, ctx.gpu.props.timerResolution);
+        g.qgroup = try qg.tp.Group.open(&g.qdev);
+        std.log.info("inkling2: TP {d} rank {d}: Qwen Group exchange", .{ g.tp, g.rank });
         if (std.c.getenv("TF_TP_PEER_PID")) |z| {
             const pid = std.fmt.parseInt(i32, std.mem.span(z), 10) catch 0;
             if (pid > 0) {
@@ -114,30 +127,26 @@ pub const Group = struct {
         var buf = try g.r.alloc(D * 2);
         defer buf.free();
         try g.r.stream(g.ctx).fill8(buf.ptr, 0, D * 2);
+        g.stamp_on = std.c.getenv("TF_TP_DEVSTAMP") != null;
         try g.allReduce(buf.ptr.?, 1);
         try g.r.sync();
+        xpu.profile.reportAppend(g.rank);
         const t0 = now();
         for (0..128) |_| try g.allReduce(buf.ptr.?, 1);
         try g.r.sync();
         const ms = (now() - t0) * 1e3;
-        std.log.info("inkling2: exchange ms a round (128 exchanges) by rows: 1 {d:.2}", .{ms});
+        xpu.profile.reportAppend(g.rank);
+        std.log.info("inkling2: exchange ms a round (128 exchanges) by rows: 1 {d:.2}", .{ ms });
+        if (std.c.getenv("TF_TP_PING") != null) if (g.qgroup) |*qg_g| try qg_g.pingBench(&g.qdev);
     }
 
     /// `partial` holds `rows` x 2304 fp16. On return it holds the sum. Both ranks call this in the same order.
     /// The sequence is exPush then tp_add, as Group.allReduce does for TF_TP_DEVFLAG=3 at e5506ae.
     pub fn allReduce(g: *Group, partial: *anyopaque, rows: u32) !void {
         if (rows == 0 or rows > rows_max) return error.Inkling2Tp;
-        const n: usize = @as(usize, rows) * D;
-        if (g.ex == 3 and g.f32row != null) return g.allReduceF32(partial, rows);
-        g.seq += 1;
-        if (g.ex == 3) {
-            const peer = try g.exPush(partial, n * 2);
-            const a: ?*anyopaque = partial;
-            const b: ?*anyopaque = peer;
-            try xpu.launch.dispatch(g.add, g.r.stream(g.ctx), .{ @as(u32, @intCast((n + 255) / 256)), 1, 1 }, .{ a, a, b, @as(u32, @intCast(n)) });
-            return;
-        }
-        try g.hostAdd(partial, n);
+        if (g.qgroup == null) return error.Inkling2Tp;
+        qg.dev.noteKernel(xpu.profile.last_kernel);
+        return g.qgroup.?.allReduce(&g.qdev, partial, rows);
     }
 
     /// Rank 1 pushes its f32 logit slice. Rank 0 copies it to `dst` (the high half of its logit row).
@@ -189,51 +198,6 @@ pub const Group = struct {
     }
 
     /// Exchange f32 rows, add in f32, store bf16 once. One row fits the slot.
-    pub fn reduceF32(g: *Group, src_f32: *anyopaque, dst_bf16: *anyopaque, rows: u32) !void {
-        const s = g.r.stream(g.ctx);
-        for (0..rows) |r| {
-            g.seq += 1;
-            const src: ?*anyopaque = off(src_f32, r * D * 4);
-            const peer = try g.exPush(src.?, D * 4);
-            const got: ?*anyopaque = peer;
-            try xpu.launch.dispatch(g.add_f32, s, .{ (D + 255) / 256, 1, 1 }, .{ src, src, got, @as(u32, D) });
-            const dst: ?*anyopaque = off(dst_bf16, r * D * 2);
-            try xpu.launch.dispatch(g.down, s, .{ (D + 255) / 256, 1, 1 }, .{ dst, src, @as(u32, D) });
-        }
-    }
-
-    /// Promote each bf16 row, exchange the f32 values, add in f32, store bf16. One row fits the slot.
-    fn allReduceF32(g: *Group, partial: *anyopaque, rows: u32) !void {
-        const s = g.r.stream(g.ctx);
-        for (0..rows) |r| {
-            g.seq += 1;
-            const src: ?*anyopaque = off(partial, r * D * 2);
-            const wide: ?*anyopaque = g.f32row;
-            try xpu.launch.dispatch(g.up, s, .{ (D + 255) / 256, 1, 1 }, .{ wide, src, @as(u32, D) });
-            const peer = try g.exPush(g.f32row.?, D * 4);
-            const got: ?*anyopaque = peer;
-            try xpu.launch.dispatch(g.add_f32, s, .{ (D + 255) / 256, 1, 1 }, .{ wide, wide, got, @as(u32, D) });
-            try xpu.launch.dispatch(g.down, s, .{ (D + 255) / 256, 1, 1 }, .{ src, wide, @as(u32, D) });
-        }
-    }
-
-    /// Production exPush (e5506ae): copy into the peer slot, store the flag on the peer, wait for the peer's flag.
-    fn exPush(g: *Group, partial: *anyopaque, bytes: usize) !*anyopaque {
-        const par: usize = @intCast(g.seq % 2);
-        const pb = g.peer_blk.?;
-        const c0 = xpu.profile.nowNs();
-        try g.r.stream(g.ctx).copy(off(pb, par * slot_bytes), partial, bytes);
-        xpu.profile.noteAppend(0, xpu.profile.nowNs() - c0);
-        try g.writeFlag(off(pb, blk_flag + par * 8));
-        try g.waitFlag(off(g.blk.?, blk_flag + par * 8));
-        return off(g.blk.?, par * slot_bytes);
-    }
-
-    fn pushBytes(g: *Group, dst: *anyopaque, src: *anyopaque, bytes: usize) !void {
-        try g.r.stream(g.ctx).copy(dst, src, bytes);
-        try g.writeFlag(off(g.peer_blk.?, blk_flag));
-    }
-
     fn writeFlag(g: *Group, flag: *anyopaque) !void {
         if (g.ex != 3) return;
         const desc: ZexWriteDesc = .{ .writeScope = 4 };
@@ -244,6 +208,7 @@ pub const Group = struct {
 
     /// Qwen's check() after a settle: the waits have completed, so the counter events go back to the driver.
     pub fn releaseEvents(g: *Group) void {
+        if (g.qgroup != null) qg.dev.reportWaits(&g.qdev, g.rank) catch {};
         for (g.evs[0..g.ev_n]) |e| _ = g.r.drv.api.zeEventDestroy(e);
         g.ev_n = 0;
     }
@@ -268,35 +233,8 @@ pub const Group = struct {
         xpu.profile.noteAppend(3, xpu.profile.nowNs() - t1);
     }
 
-    fn hostAdd(g: *Group, partial: *anyopaque, n: usize) !void {
-        var mine = try g.r.allocHost(n * 2);
-        defer mine.free();
-        const host: [*]u8 = @ptrCast(mine.ptr);
-        try g.r.download(host[0 .. n * 2], .{ .rt = g.r, .ptr = partial, .len = n * 2 });
-        try g.r.sync();
-        const slot = g.hostSlot(g.rank, g.seq);
-        @memcpy(slot[0 .. n * 2], host[0 .. n * 2]);
-        g.counter().store(g.seq, .release);
-        const deadline = now() + 30.0;
-        while (g.peerCounter().load(.acquire) < g.seq) {
-            if (now() > deadline) return error.PeerLost;
-            std.atomic.spinLoopHint();
-        }
-        const peer = g.hostSlot(1 - g.rank, g.seq);
-        const sum = try gpaBytes(n);
-        defer std.heap.c_allocator.free(sum);
-        const a = std.mem.bytesAsSlice(u16, slot[0 .. n * 2]);
-        const b = std.mem.bytesAsSlice(u16, peer[0 .. n * 2]);
-        const o = std.mem.bytesAsSlice(u16, sum);
-        for (a, b, o) |x, y, *z| {
-            const s = @as(f32, @floatCast(@as(f16, @bitCast(x)))) + @as(f32, @floatCast(@as(f16, @bitCast(y))));
-            z.* = @bitCast(@as(f16, @floatCast(s)));
-        }
-        try g.r.upload(.{ .rt = g.r, .ptr = partial, .len = n * 2 }, sum);
-    }
-
     fn handshake(g: *Group, name: []const u8) !void {
-        const blk = try g.r.alloc(blk_bytes);
+        const blk = try g.r.allocAlign(blk_bytes, 4096);
         const head = try g.r.alloc(head_bytes);
         g.blk = blk.ptr;
         g.head = head.ptr;
@@ -420,6 +358,7 @@ fn gpaBytes(n: usize) ![]u8 {
 }
 
 extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 fn mapShm(name: [:0]const u8, rank: u32) ![]align(4096) u8 {
     const bytes = 256 + 4 * slot_bytes + 8 * @sizeOf(Rec) + 4096;

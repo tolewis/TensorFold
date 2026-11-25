@@ -488,15 +488,16 @@ pub fn main(init: std.process.Init) !void {
         var pos: usize = 0;
         while (pos < ref.rows) {
             const n = @min(chunk, ref.rows - pos);
-            if (old_forward) {
+            if (old_forward or n == 1) {
                 if (n > state.max_rows) return error.BadChunk;
                 try ink.forward.run(m, &scratch, &cache, ref.ids[pos..][0..n], .{ .all = true });
             } else try ink.prefill.run(m, &scratch, &cache, ref.ids[pos..][0..n], .{ .defer_head = true, .old_experts = old_experts, .old_dense = old_dense, .old_loop = old_loop, .old_global = old_global, .old_sliding = old_sliding });
             cache.len += n;
+            if (std.c.getenv("TF_TP_ONE_CHUNK") != null) break;
             var sub: usize = 0;
             while (sub < n) : (sub += state.max_rows) {
             const sn: usize = @min(state.max_rows, n - sub);
-            if (!old_forward) try ink.prefill.headRows(m, &scratch, sub, sn);
+            if (!old_forward and n != 1) try ink.prefill.headRows(m, &scratch, sub, sn);
             try r.download(std.mem.sliceAsBytes(host_logits[0 .. sn * vocab]), scratch.logits_all);
             try r.sync();
             if (digest) prefill_digest.update(std.mem.sliceAsBytes(host_logits[0 .. sn * vocab]));
