@@ -41,6 +41,7 @@ pub const Driver = struct {
     pub fn check(_: *const Driver, res: u32, what: []const u8) Error!void {
         if (res == 0) return;
         std.log.err("{s}: ze result 0x{x}", .{ what, res });
+        ze.noteLost(res, what); // a lost device ends the process (ze.on_lost) so the supervisor restarts it
         return if (res == out_of_device_memory) error.OutOfDeviceMemory else error.ZeFailed;
     }
 };

@@ -3,8 +3,11 @@ const std = @import("std");
 const core = @import("core");
 const rig_ = @import("contract_rig.zig");
 const dspark = @import("inkling2_dspark.zig");
+const dflash2 = @import("inkling2_dflash2.zig");
 const dense = @import("inkling2_dense.zig");
 const dense_q8 = @import("inkling2_dense_q8.zig");
+const pf_experts = @import("inkling2_prefill_experts.zig");
+const pf_glue = @import("inkling2_prefill.zig");
 
 const limits = core.xpu_limits;
 const records = core.xpu_records;
@@ -65,10 +68,10 @@ fn argsOf(planted: []const u8) u32 {
         .{ "tf_ctl_attn_drop_slice", 8 },
         .{ "tf_ctl_attn_merge_unguarded", 8 },
         .{ "tf_inkling2_loop_messages", 6 },
-        .{ "tf_inkling2_loop_zeta", 5 },
-        .{ "tf_inkling2_loop_gates", 7 },
+        .{ "tf_inkling2_loop_zeta", 6 },
+        .{ "tf_inkling2_loop_gates", 8 },
         .{ "tf_inkling2_embed_norm", 5 },
-        .{ "tf_inkling2_ar", 6 },
+        .{ "tf_inkling2_ar", 8 },
         .{ "tf_inkling2_conv_static", 7 },
         .{ "tf_inkling2_conv_dynamic", 9 },
         .{ "tf_inkling2_router", 6 },
@@ -90,8 +93,11 @@ fn argsOf(planted: []const u8) u32 {
     };
     for (table) |e| if (std.mem.eql(u8, e[0], symbol)) return e[1];
     if (dspark.argsOf(symbol)) |n| return n;
+    if (dflash2.argsOf(symbol)) |n| return n;
     if (dense.argsOf(symbol)) |n| return n;
     if (dense_q8.argsOf(symbol)) |n| return n;
+    if (pf_experts.argsOf(symbol)) |n| return n;
+    if (pf_glue.argsOf(symbol)) |n| return n;
     if (inkling2Args(symbol)) |n| return n;
     return 1; // gate 5's controls take one output pointer
 }

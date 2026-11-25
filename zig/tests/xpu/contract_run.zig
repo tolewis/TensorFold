@@ -17,10 +17,13 @@ const loop_k = @import("inkling2_loop.zig");
 const ink2_glue_k = @import("inkling2_glue.zig");
 const ink2_runtime_k = @import("inkling2_runtime.zig");
 const dspark_k = @import("inkling2_dspark.zig");
+const dflash2_k = @import("inkling2_dflash2.zig");
 const ink2_attn_k = @import("inkling2_attention.zig");
 const ink2_k = @import("inkling2_experts.zig");
 const dense_k = @import("inkling2_dense.zig");
 const dense_q8_k = @import("inkling2_dense_q8.zig");
+const pf_experts_k = @import("inkling2_prefill_experts.zig");
+const pf_glue_k = @import("inkling2_prefill.zig");
 
 const g = core.gates;
 
@@ -116,6 +119,9 @@ pub fn main(init: std.process.Init) !u8 {
     var dspark = try dspark_k.Suite.init(a, &dev);
     defer dspark.deinit();
     try dspark.collect(&kernels);
+    var dflash2 = try dflash2_k.Suite.init(a, &dev);
+    defer dflash2.deinit();
+    try dflash2.collect(&kernels);
     var ink2_attn: ink2_attn_k.Suite = .{ .a = a, .dev = &dev, .kernels = &kernels };
     defer ink2_attn.deinit();
     try ink2_attn.collect();
@@ -128,6 +134,12 @@ pub fn main(init: std.process.Init) !u8 {
     var dense_q8 = try dense_q8_k.Suite.init(a, &dev);
     defer dense_q8.deinit();
     try dense_q8.collect(&kernels);
+    var pf_experts = try pf_experts_k.Suite.init(a, &dev);
+    defer pf_experts.deinit();
+    try pf_experts.collect(&kernels);
+    var pf_glue = try pf_glue_k.Suite.init(a, &dev);
+    defer pf_glue.deinit();
+    try pf_glue.collect(&kernels);
     if (only) |text| {
         var keep: usize = 0;
         for (kernels.items) |k| {

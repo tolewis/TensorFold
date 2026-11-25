@@ -24,7 +24,10 @@ pub const Stream = struct {
 
     pub fn synchronize(self: Stream) Error!void {
         const d = self.ctx.d;
-        try d.check(d.api.zeCommandListHostSynchronize(self.list, @import("std").math.maxInt(u64)), "zeCommandListHostSynchronize");
+        const rc = d.api.zeCommandListHostSynchronize(self.list, @import("std").math.maxInt(u64));
+        // an unbounded wait that fails means the queue did not drain: its copies may still touch host memory, nothing on it is safe
+        if (rc != 0) ze.on_lost(rc, "zeCommandListHostSynchronize");
+        try d.check(rc, "zeCommandListHostSynchronize");
     }
 
     /// Queues a copy; host memory must stay valid until the next synchronize.

@@ -9,16 +9,20 @@ const rt = xpu.rt;
 const rule = lanes.gpu_rule;
 
 pub const top_max: u32 = lanes.gpu_full.top_max;
+/// Bit 31 of a row's n in the kernel's cfg: the normalizer is wanted.
+const want_z_bit: u32 = 0x8000_0000;
 
 /// One row's request: the sampling rule and how many candidates it needs.
 pub const Row = struct {
     inv_t: f32,
     n: u32,
+    /// Also return the row's normalizer (the draw with top_k off sums every token's exp).
+    norm: bool = false,
 
     /// The row of `s`: top_k candidates, or all 1,024 with top_k off.
     pub fn of(s: lanes.Sampling) Row {
         const r = rule.rule(s);
-        return .{ .inv_t = r.inv_t, .n = if (s.top_k == 0) top_max else s.top_k };
+        return .{ .inv_t = r.inv_t, .n = if (s.top_k == 0) top_max else s.top_k, .norm = s.top_k == 0 };
     }
 
     /// Whether the device can select this row's candidates: top_k beyond 1,024 needs a deeper sort than the kernel makes.
@@ -33,10 +37,13 @@ pub const Sampler = struct {
     ctx: *const xpu.Context,
     module: xpu.Module,
     kernel: xpu.Kernel,
+    race: xpu.Kernel,
     cfg: rt.Buffer,
     out: rt.Buffer,
+    zbuf: rt.Buffer,
     host_cfg: []u32,
     host_out: []u32,
+    host_z: []f32,
     rows_max: usize,
 
     pub fn init(gpa: std.mem.Allocator, r: *rt.Runtime, ctx: *const xpu.Context, rows_max: usize) !Sampler {
@@ -44,21 +51,30 @@ pub const Sampler = struct {
         errdefer module.unload();
         var kernel = try module.kernel("tf_ink2_sample_top", .{ 256, 1, 1 });
         errdefer kernel.deinit();
+        var race = try module.kernel("tf_ink2_sample_race", .{ 256, 1, 1 });
+        errdefer race.deinit();
         var cfg = try r.alloc(rows_max * 8);
         errdefer cfg.free();
         var out = try r.alloc(rows_max * top_max * 8);
         errdefer out.free();
+        var zbuf = try r.alloc(rows_max * 4);
+        errdefer zbuf.free();
         const host_cfg = try gpa.alloc(u32, rows_max * 2);
         errdefer gpa.free(host_cfg);
         const host_out = try gpa.alloc(u32, rows_max * top_max * 2);
-        return .{ .gpa = gpa, .r = r, .ctx = ctx, .module = module, .kernel = kernel, .cfg = cfg, .out = out, .host_cfg = host_cfg, .host_out = host_out, .rows_max = rows_max };
+        errdefer gpa.free(host_out);
+        const host_z = try gpa.alloc(f32, rows_max);
+        return .{ .gpa = gpa, .r = r, .ctx = ctx, .module = module, .kernel = kernel, .race = race, .cfg = cfg, .out = out, .zbuf = zbuf, .host_cfg = host_cfg, .host_out = host_out, .host_z = host_z, .rows_max = rows_max };
     }
 
     pub fn deinit(s: *Sampler) void {
+        s.gpa.free(s.host_z);
         s.gpa.free(s.host_out);
+        s.zbuf.free();
         s.gpa.free(s.host_cfg);
         s.out.free();
         s.cfg.free();
+        s.race.deinit();
         s.kernel.deinit();
         s.module.unload();
         s.* = undefined;
@@ -69,18 +85,31 @@ pub const Sampler = struct {
     pub fn select(s: *Sampler, logits: ?*anyopaque, vocab: u32, rows: []const Row) !Set {
         if (rows.len == 0 or rows.len > s.rows_max) return error.Inkling2SampleRows;
         var stride: u32 = 1;
+        var want_z = false;
         for (rows, 0..) |row, i| {
             if (row.n == 0 or row.n > top_max) return error.Inkling2SampleTop;
             s.host_cfg[2 * i] = @bitCast(row.inv_t);
-            s.host_cfg[2 * i + 1] = row.n;
+            s.host_cfg[2 * i + 1] = row.n | if (row.norm) want_z_bit else 0;
             stride = @max(stride, row.n);
+            want_z = want_z or row.norm;
         }
         try s.r.upload(s.cfg, std.mem.sliceAsBytes(s.host_cfg[0 .. rows.len * 2]));
-        try xpu.launch.dispatch(s.kernel, s.r.stream(s.ctx), .{ @intCast(rows.len), 1, 1 }, .{ logits, s.cfg.ptr, s.out.ptr, vocab, stride });
+        try xpu.launch.dispatch(s.kernel, s.r.stream(s.ctx), .{ @intCast(rows.len), 1, 1 }, .{ logits, s.cfg.ptr, s.out.ptr, s.zbuf.ptr, vocab, stride });
         const words = rows.len * stride * 2;
         try s.r.download(std.mem.sliceAsBytes(s.host_out[0..words]), s.out);
+        if (want_z) try s.r.download(std.mem.sliceAsBytes(s.host_z[0..rows.len]), s.zbuf);
         try s.r.sync();
-        return .{ .words = s.host_out[0..words], .stride = stride };
+        return .{ .words = s.host_out[0..words], .stride = stride, .z = s.host_z[0..rows.len] };
+    }
+
+    /// One token a row for top_k off and top_p 1. The host does not read the vocabulary.
+    pub fn raceRows(s: *Sampler, logits: ?*anyopaque, vocab: u32, positions: []const u32, seed: u64, inv_t: f32) ![]const u32 {
+        if (positions.len == 0 or positions.len > s.rows_max) return error.Inkling2SampleRows;
+        try s.r.upload(s.cfg, std.mem.sliceAsBytes(positions));
+        try xpu.launch.dispatch(s.race, s.r.stream(s.ctx), .{ @intCast(positions.len), 1, 1 }, .{ logits, s.cfg.ptr, s.out.ptr, vocab, @as(u32, @truncate(seed)), @as(u32, @truncate(seed >> 32)), inv_t });
+        try s.r.download(std.mem.sliceAsBytes(s.host_out[0..positions.len]), s.out);
+        try s.r.sync();
+        return s.host_out[0..positions.len];
     }
 };
 
@@ -88,6 +117,8 @@ pub const Sampler = struct {
 pub const Set = struct {
     words: []const u32,
     stride: u32,
+    /// Each row's normalizer, set for the rows asked with `norm`.
+    z: []const f32,
 
     /// Row `r`'s first `n` candidates into `into` (at least `n` long), in the host sampler's order.
     pub fn list(set: Set, r: usize, n: u32, into: []rule.Cand) []const rule.Cand {

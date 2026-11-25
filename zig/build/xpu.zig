@@ -234,6 +234,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         const logits = b.createModule(.{ .root_source_file = b.path("zig/tests/xpu/inkling2_logits.zig"), .target = target, .optimize = optimize, .link_libc = true });
         logits.addImport("xpu", resident_xpu);
         logits.addImport("inkling2_xpu", inkling2);
+        logits.addImport("lanes", lanes);
         const sample = b.createModule(.{ .root_source_file = b.path("zig/tests/xpu/inkling2_sample.zig"), .target = target, .optimize = optimize, .link_libc = true });
         sample.addImport("xpu", resident_xpu);
         sample.addImport("inkling2_xpu", inkling2);

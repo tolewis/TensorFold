@@ -9,6 +9,7 @@ const attention = @import("attention.zig");
 const glue = @import("glue.zig");
 const experts = @import("experts.zig");
 const loop = @import("loop.zig");
+const fuse = @import("fuse.zig");
 const runtime = @import("runtime.zig");
 const dense_kernels = @import("dense.zig");
 const dense_q8_kernels = @import("dense_q8.zig");
@@ -117,6 +118,10 @@ pub fn finalPlan(rows: usize, all: bool, taps: bool) FinalPlan {
 /// Rows the decode gather experts take in one call; more go through the grouped prompt kernels.
 pub const decode_rows = 16;
 
+/// Diagnostic, off by default: when set, every visit copies its routes (rows x 8 int32 expert ids) here, visit-major
+/// (`visit * rows * 8` ids), for the measurement of how many distinct experts a window reads.
+pub var route_trace: ?rt.Buffer = null;
+
 fn at(b: rt.Buffer, off: usize) Ptr {
     return @ptrFromInt(@intFromPtr(b.ptr.?) + off);
 }
@@ -166,6 +171,11 @@ const Run = struct {
 
     /// Every projection uses the shared matvec's FP32 reduction and one BF16 store: over BF16 weights, or over Q8_0 blocks
     /// (q8.zig) when the model loaded them re-encoded.
+    fn projN(g: Run, weight: Tensor) u32 {
+        _ = g;
+        return @intCast(weight.shape[weight.rank - 2]);
+    }
+
     fn dense(g: Run, weight: Tensor, input: Ptr, out: Ptr, rows: usize) !void {
         const k: u32 = @intCast(weight.shape[weight.rank - 1]);
         const n: u32 = @intCast(weight.shape[weight.rank - 2]);
@@ -173,10 +183,11 @@ const Run = struct {
         try dense_kernels.dense(&g.p.dense, g.s, tensor(weight), input, out, @intCast(rows), n, k);
     }
 
-    /// One row because M2's AR ABI is [sources,H] -> [queries,H]. Batch composition never mixes rows.
+    /// One launch for every row: the AR of a row reads that row's blocks and partial and nothing of another row's, so batch
+    /// composition never mixes rows (the arithmetic of a row is the single-row launch's, bit for bit).
     fn residual(g: Run, queries: Tensor, sources: usize, rows: usize) !void {
         const s = g.sc;
-        for (0..rows) |i| try glue.ar(&g.p.glue, g.s, at(s.blocks, i * state.block_slots * state.hidden * 2), row(s.partial, i, state.hidden * 4), tensor(queries), row(s.mlp_ar, i, state.hidden * 4), @intCast(sources), 1);
+        try glue.arRows(&g.p.glue, g.s, at(s.blocks, 0), at(s.partial, 0), tensor(queries), at(s.mlp_ar, 0), @intCast(sources), 1, @intCast(rows), state.block_slots * state.hidden);
     }
 
     fn bankAndReset(g: Run, rows: usize) !void {
@@ -191,6 +202,55 @@ const Run = struct {
         try g.copyBf16(at(s.prelude, 0), at(s.p, 0), rows * state.hidden);
     }
 
+    /// Widen, the attention residual, the three controller gates and the norms, in one launch.
+    fn phaseA(g: Run, v: *const layer_plan.Visit, rows: usize) !void {
+        const s = g.sc;
+        const m = g.m;
+        const lp = m.weight_plan.at(v.layer);
+        const w = &m.weights.layers[v.layer];
+        const gated = v.hasMessages();
+        const nq: u32 = if (v.layer == 0) 0 else lp.attn_queries;
+        var down: [3]fuse.Ref = .{ null, null, null };
+        var forget: [3]fuse.Ref = .{ null, null, null };
+        var gain: [3]fuse.Ref = .{ null, null, null };
+        if (gated) {
+            const controllers = w.controllers orelse return error.Inkling2NoKernels;
+            for (0..3) |role| {
+                down[role] = tensor(controllers[role].down);
+                forget[role] = tensor(controllers[role].forget);
+                gain[role] = tensor(controllers[role].gain);
+            }
+        }
+        try fuse.phaseA(&g.p.fuse, g.s, .{
+            .p = at(s.p, 0),
+            .partial = at(s.partial, 0),
+            .blocks = at(s.blocks, 0),
+            .queries = if (v.layer == 0) null else at(m.weights.attn_queries[v.layer - 1].buf, 0),
+            .ar = at(s.ar, 0),
+            .messages = if (gated) at(s.messages, 0) else null,
+            .down = down,
+            .forget = forget,
+            .gain = gain,
+            .zeta = at(s.zeta, 0),
+            .gated = at(s.gated, 0),
+            .wq = tensor(w.attn.q_norm),
+            .wk = tensor(w.attn.k_norm),
+            .wv = tensor(w.attn.v_norm),
+            .q_norm = at(s.q_norm, 0),
+            .k_norm = at(s.k_norm, 0),
+            .v_norm = at(s.v_norm, 0),
+            .rows = @intCast(rows),
+            .blocks_stride = state.block_slots * state.hidden,
+            .sources = lp.attn_sources,
+            .n_queries = nq,
+            .roles = if (gated) 3 else 0,
+            .local_src = if (lp.kind == .local) 1 else 0,
+            .core = if (gated) v.layer - 6 else 0,
+            .msg_entries = state.message_entries,
+            .norm_n = if (!gated and lp.kind == .local) 1 else 3,
+        });
+    }
+
     fn prepareAttentionInputs(g: Run, v: *const layer_plan.Visit, rows: usize) !void {
         const s = g.sc;
         const m = g.m;
@@ -200,22 +260,17 @@ const Run = struct {
             try g.widen(at(s.p, 0), at(s.ar, 0), rows);
         } else {
             const q = m.weights.attn_queries[v.layer - 1];
-            // One row: the queries and their results are contiguous, so one launch serves every role.
-            if (rows == 1) {
-                try glue.ar(&g.p.glue, g.s, at(s.blocks, 0), row(s.partial, 0, state.hidden * 4), at(q.buf, 0), arRow(s, 0, 1, 0, false), lp.attn_sources, @intCast(lp.attn_queries));
-            } else for (0..lp.attn_queries) |role| {
-                const query = at(q.buf, role * state.hidden * 4);
-                for (0..rows) |i| try glue.ar(&g.p.glue, g.s, at(s.blocks, i * state.block_slots * state.hidden * 2), row(s.partial, i, state.hidden * 4), query, arRow(s, role, rows, i, false), lp.attn_sources, 1);
-            }
+            // One launch serves every role and every row: result (role, row) is `arRow(role, rows, row)`.
+            try glue.arRows(&g.p.glue, g.s, at(s.blocks, 0), at(s.partial, 0), at(q.buf, 0), arRow(s, 0, rows, 0, false), lp.attn_sources, @intCast(lp.attn_queries), @intCast(rows), state.block_slots * state.hidden);
         }
         if (v.hasMessages()) {
             const controllers = w.controllers.?;
             const core = v.layer - 6;
-            for (0..3) |role| for (0..rows) |i| {
+            for (0..3) |role| {
                 const c = controllers[role];
                 const source_role = if (lp.kind == .local) 0 else role;
-                try loop.gates(&g.p.loop, g.s, arRow(s, source_role, rows, i, false), messageRow(s, core, role, i), tensor(c.down), tensor(c.forget), tensor(c.gain), row(s.zeta, i, 64 * 4), arRow(s, role, rows, i, true), 1);
-            };
+                try loop.gates(&g.p.loop, g.s, arRow(s, source_role, rows, 0, false), messageRow(s, core, role, 0), tensor(c.down), tensor(c.forget), tensor(c.gain), at(s.zeta, 0), arRow(s, role, rows, 0, true), @intCast(rows), state.message_entries * state.hidden);
+            }
         }
         const gated = v.hasMessages();
         // An ungated local visit has exactly one AR result and one norm result; Q/K/V alias.
@@ -382,56 +437,89 @@ fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) 
         if (v.pass > 1 and v.layer == 6) try g.bankAndReset(rows);
         const w = &m.weights.layers[v.layer];
         // The running BF16 p is the partial AR source before attention replaces it with t.
-        try g.widen(at(s.p, 0), at(s.partial, 0), rows);
-        try g.prepareAttentionInputs(v, rows);
+        if (fuse.enabled()) try g.phaseA(v, rows) else {
+            try g.widen(at(s.p, 0), at(s.partial, 0), rows);
+            try g.prepareAttentionInputs(v, rows);
+        }
         const knorm = if (gated or lp.kind == .global) at(s.k_norm, 0) else at(s.q_norm, 0);
         const vnorm = if (gated or lp.kind == .global) at(s.v_norm, 0) else at(s.q_norm, 0);
-        try g.dense(w.attn.wq, at(s.q_norm, 0), at(s.q_raw, 0), rows);
-        try g.dense(w.attn.wk, knorm, at(s.k_raw, 0), rows);
-        try g.dense(w.attn.wv, vnorm, at(s.v_raw, 0), rows);
-        try g.dense(w.attn.wr, at(s.q_norm, 0), at(s.rel_raw, 0), rows);
+        if (fuse.seg and rows == 1 and w.attn.wq.q8) {
+            xpu.profile.label = "wqkv";
+            const k: u32 = @intCast(w.attn.wq.shape[w.attn.wq.rank - 1]);
+            try dense_q8_kernels.seg1(&g.p.dense_q8, g.s, .{
+                at(s.q_norm, 0), knorm, vnorm, at(s.q_norm, 0), at(s.q_norm, 0),
+            }, .{
+                tensor(w.attn.wq), tensor(w.attn.wk), tensor(w.attn.wv), tensor(w.attn.wr), tensor(w.attn.gate),
+            }, .{
+                at(s.q_raw, 0), at(s.k_raw, 0), at(s.v_raw, 0), at(s.rel_raw, 0), at(s.gate, 0),
+            }, .{
+                g.projN(w.attn.wq), g.projN(w.attn.wk), g.projN(w.attn.wv), g.projN(w.attn.wr), g.projN(w.attn.gate),
+            }, k);
+        } else {
+            xpu.profile.label = "wq";
+            try g.dense(w.attn.wq, at(s.q_norm, 0), at(s.q_raw, 0), rows);
+            xpu.profile.label = "wk";
+            try g.dense(w.attn.wk, knorm, at(s.k_raw, 0), rows);
+            xpu.profile.label = "wv";
+            try g.dense(w.attn.wv, vnorm, at(s.v_raw, 0), rows);
+            xpu.profile.label = "wr";
+            try g.dense(w.attn.wr, at(s.q_norm, 0), at(s.rel_raw, 0), rows);
+            xpu.profile.label = "gate";
+            try g.dense(w.attn.gate, at(s.q_norm, 0), at(s.gate, 0), rows);
+        }
+        xpu.profile.label = "sink";
         try g.dense(w.attn.sink, at(s.q_norm, 0), at(s.sink, 0), rows);
-        try g.dense(w.attn.gate, at(s.q_norm, 0), at(s.gate, 0), rows);
+        xpu.profile.label = "";
         try g.attendSegments(v, segments);
-        if (visit_i == 0 and std.c.getenv("TF_TP_HEAD") != null and (dump_fwd == 0 or dump_fwd == 15)) {
-            const local: usize = if (dump_fwd == 0) 10 else 0;
-            const tag = if (dump_fwd == 0) "r10" else "r960";
-            const pl = g.m.options.place;
-            try dumpNamed(&g, tag, "att", plus(at(s.att, 0), local * pl.qWidth() * 2), pl.qWidth() * 2);
-            try dumpNamed(&g, tag, "q", plus(at(s.q_prep, 0), local * pl.qWidth() * 2), pl.qWidth() * 2);
-            try dumpNamed(&g, tag, "rel", plus(at(s.rel_tab, 0), local * pl.qHeads() * ap.extent * 2), pl.qHeads() * ap.extent * 2);
-            try dumpNamed(&g, tag, "sink", plus(at(s.sink, 0), local * pl.qHeads() * 2), pl.qHeads() * 2);
-            try dumpNamed(&g, tag, "k", plus(at(s.k_conv, 0), local * pl.kvWidth() * 2), pl.kvWidth() * 2);
-        }
+        xpu.profile.label = "wo";
         try g.dense(w.attn.wo, at(s.att, 0), at(s.attn_dense, 0), rows);
+        xpu.profile.label = "";
         if (g.m.options.place.split()) if (group.live) |gp| try gp.allReduce(at(s.attn_dense, 0).?, @intCast(rows));
-        try dumpBytes(&g, visit_i, "wo", at(s.attn_dense, 0), 2 * state.hidden * 2);
-        try dumpBytes(&g, visit_i, "attn-red", at(s.attn_dense, 0), 2 * state.hidden * 2);
         var base: usize = 0;
-        for (segments) |seg| {
-            try g.staticPostConv(seg.cache, v.cache_slot, 2, s.attn_dense, w.attn_conv, s.attn_conv, base, seg.rows);
-            base += seg.rows;
+        if (fuse.convFold() and segments.len == 1) {
+            const seg = segments[0];
+            const channels: u32 = @intCast(state.convWidth(2));
+            try fuse.convAttnPartial(&g.p.fuse, g.s, seg.cache.history(v.cache_slot, 2).ptr(), at(s.attn_dense, 0), seg.cache.staged(v.cache_slot, 2, 0).ptr(), tensor(w.attn_conv), at(s.attn_conv, 0), at(s.p, 0), at(s.blocks, 0), at(s.partial, 0), @intCast(rows), channels, if (lp.boundary) lp.blocks_in + 1 else 0);
+        } else {
+            for (segments) |seg| {
+                try g.staticPostConv(seg.cache, v.cache_slot, 2, s.attn_dense, w.attn_conv, s.attn_conv, base, seg.rows);
+                base += seg.rows;
+            }
+            try runtime.attentionPartial(&g.p.runtime, g.s, at(s.p, 0), at(s.attn_conv, 0), at(s.blocks, 0), at(s.partial, 0), rows, if (lp.boundary) lp.blocks_in + 1 else 0);
         }
-        try runtime.attentionPartial(&g.p.runtime, g.s, at(s.p, 0), at(s.attn_conv, 0), at(s.blocks, 0), at(s.partial, 0), rows, if (lp.boundary) lp.blocks_in + 1 else 0);
         try g.residual(m.weights.mlp_queries[v.layer], lp.mlp_sources, rows);
         if (gated) {
             const c = w.controllers.?[3];
             const core = v.layer - 6;
-            for (0..rows) |i| try loop.gates(&g.p.loop, g.s, row(s.mlp_ar, i, state.hidden * 4), messageRow(s, core, 3, i), tensor(c.down), tensor(c.forget), tensor(c.gain), row(s.zeta, i, 64 * 4), row(s.mlp_gated, i, state.hidden * 4), 1);
+            if (fuse.zetaWide()) {
+                const stride: u32 = state.message_entries * state.hidden;
+                try xpu.launch.dispatch(g.p.fuse.zeta_wide, g.s, .{ 4, 1, @as(u32, @intCast(rows)) }, .{
+                    at(s.mlp_ar, 0), messageRow(s, core, 3, 0), tensor(c.down), tensor(c.down), tensor(c.down), at(s.zeta, 0),
+                    @as(u32, @intCast(rows)), @as(u32, 1), @as(u32, 1), @as(u32, 0), stride / state.hidden, @as(u32, 0),
+                });
+                try loop.gatesOnly(&g.p.loop, g.s, at(s.mlp_ar, 0), messageRow(s, core, 3, 0), tensor(c.forget), tensor(c.gain), at(s.zeta, 0), at(s.mlp_gated, 0), @intCast(rows), stride);
+            } else try loop.gates(&g.p.loop, g.s, at(s.mlp_ar, 0), messageRow(s, core, 3, 0), tensor(c.down), tensor(c.forget), tensor(c.gain), at(s.zeta, 0), at(s.mlp_gated, 0), @intCast(rows), state.message_entries * state.hidden);
             try g.norm(at(s.mlp_gated, 0), w.mlp_norm, at(s.mlp_normed, 0), rows);
         } else try g.norm(at(s.mlp_ar, 0), w.mlp_norm, at(s.mlp_normed, 0), rows);
-        try glue.router(&g.p.glue, g.s, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.route_ids, 0), at(s.route_weights, 0), @intCast(rows));
-        try dumpBytes(&g, visit_i, "router", at(s.mlp_normed, 0), 2 * state.hidden * 2);
-        try dumpBytes(&g, visit_i, "route-ids", at(s.route_ids, 0), 2 * 8 * 4);
+        if (fuse.routerWide()) {
+            try fuse.routerWideLaunch(&g.p.fuse, g.s, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.logits_all, 0), at(s.route_ids, 0), at(s.route_weights, 0), @intCast(rows));
+        } else try glue.router(&g.p.glue, g.s, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.route_ids, 0), at(s.route_weights, 0), @intCast(rows));
+        if (route_trace) |tb| try g.s.copy(plus(tb.ptr, v.cache_slot * rows * 32), at(s.route_ids, 0), rows * 32);
         try g.routedExperts(v.layer, rows);
         if (g.m.options.place.split()) if (group.live) |gp| try gp.allReduce(at(s.mlp_out, 0).?, @intCast(rows));
         try dumpBytes(&g, visit_i, "exp-red", at(s.mlp_out, 0), 2 * state.hidden * 2);
         base = 0;
-        for (segments) |seg| {
-            try g.staticPostConv(seg.cache, v.cache_slot, 3, s.mlp_out, w.mlp_conv, s.mlp_conv, base, seg.rows);
-            base += seg.rows;
+        if (fuse.convFold() and segments.len == 1) {
+            const seg = segments[0];
+            const channels: u32 = @intCast(state.convWidth(3));
+            try fuse.convMlpPartial(&g.p.fuse, g.s, seg.cache.history(v.cache_slot, 3).ptr(), at(s.mlp_out, 0), seg.cache.staged(v.cache_slot, 3, 0).ptr(), tensor(w.mlp_conv), at(s.mlp_conv, 0), at(s.partial, 0), at(s.p, 0), @intCast(rows), channels);
+        } else {
+            for (segments) |seg| {
+                try g.staticPostConv(seg.cache, v.cache_slot, 3, s.mlp_out, w.mlp_conv, s.mlp_conv, base, seg.rows);
+                base += seg.rows;
+            }
+            try runtime.mlpPartial(&g.p.runtime, g.s, at(s.partial, 0), at(s.mlp_conv, 0), at(s.p, 0), rows);
         }
-        try runtime.mlpPartial(&g.p.runtime, g.s, at(s.partial, 0), at(s.mlp_conv, 0), at(s.p, 0), rows);
         if (v.cache_slot == 5) try g.copyBf16(at(s.p, 0), at(s.prelude, 0), rows * state.hidden);
     }
 
@@ -448,6 +536,133 @@ fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) 
     }
 };
 
+fn bf16bits(x: f32) u16 {
+    const bits: u32 = @bitCast(x);
+    return @truncate((bits +% 0x7fff +% ((bits >> 16) & 1)) >> 16);
+}
+
+/// One row, three visit kinds, fused phase A against the unfused launches. Prints the first mismatch. Returns the mismatch count.
+pub fn checkPhaseA(m: *const Model, s: *state.Scratch, r: *xpu.rt.Runtime) !usize {
+    if (m.pipelines == null or m.ctx == null) return error.Inkling2NoKernels;
+    const pipes = &m.pipelines.?;
+    const stream = m.r.stream(m.ctx.?);
+    const H = state.hidden;
+    var p_bits: [H]u16 = undefined;
+    var blk: [state.block_slots * H]u16 = undefined;
+    var msg: [state.message_entries * H]f32 = undefined;
+    for (0..H) |d| {
+        p_bits[d] = bf16bits(0.01 * @as(f32, @floatFromInt((d * 3) % 97)) - 0.2);
+        msg[d] = 0.02 * @as(f32, @floatFromInt((d * 5) % 53)) - 0.4;
+    }
+    for (0..blk.len) |d| blk[d] = bf16bits(0.005 * @as(f32, @floatFromInt(d % 113)) - 0.1);
+    for (H..msg.len) |d| msg[d] = msg[d % H] * 0.5;
+    try r.upload(s.p, std.mem.sliceAsBytes(&p_bits));
+    try r.upload(s.blocks, std.mem.sliceAsBytes(&blk));
+    try r.upload(s.messages, std.mem.sliceAsBytes(&msg));
+    const g = Run{ .m = m, .p = pipes, .s = stream, .sc = s };
+    var bad: usize = 0;
+    var part_a: [H]f32 = undefined;
+    var part_b: [H]f32 = undefined;
+    var ar_a: [3 * H]f32 = undefined;
+    var ar_b: [3 * H]f32 = undefined;
+    var gate_a: [3 * H]f32 = undefined;
+    var gate_b: [3 * H]f32 = undefined;
+    var nq_a: [H]u16 = undefined;
+    var nq_b: [H]u16 = undefined;
+    var nk_a: [H]u16 = undefined;
+    var nk_b: [H]u16 = undefined;
+    var nv_a: [H]u16 = undefined;
+    var nv_b: [H]u16 = undefined;
+    for (m.weight_plan.visits[0..m.weight_plan.n_visits]) |*v| {
+        const kind = m.weight_plan.at(v.layer).kind;
+        const want = (v.layer == 0) or (v.layer == 5 and !v.hasMessages()) or (v.hasMessages() and v.layer == 6);
+        if (!want) continue;
+        fuse.force = false;
+        try g.widen(at(s.p, 0), at(s.partial, 0), 1);
+        try g.prepareAttentionInputs(v, 1);
+        try stream.synchronize();
+        try r.download(std.mem.sliceAsBytes(&part_a), s.partial);
+        try r.download(std.mem.sliceAsBytes(&ar_a), s.ar);
+        try r.download(std.mem.sliceAsBytes(&gate_a), s.gated);
+        try r.download(std.mem.sliceAsBytes(&nq_a), s.q_norm);
+        try r.download(std.mem.sliceAsBytes(&nk_a), s.k_norm);
+        try r.download(std.mem.sliceAsBytes(&nv_a), s.v_norm);
+        try r.sync();
+        fuse.force = true;
+        try g.phaseA(v, 1);
+        try stream.synchronize();
+        try r.download(std.mem.sliceAsBytes(&part_b), s.partial);
+        try r.download(std.mem.sliceAsBytes(&ar_b), s.ar);
+        try r.download(std.mem.sliceAsBytes(&gate_b), s.gated);
+        try r.download(std.mem.sliceAsBytes(&nq_b), s.q_norm);
+        try r.download(std.mem.sliceAsBytes(&nk_b), s.k_norm);
+        try r.download(std.mem.sliceAsBytes(&nv_b), s.v_norm);
+        try r.sync();
+        var row_bad: usize = 0;
+        for (part_a, part_b) |x, y| if (x != y) {
+            row_bad += 1;
+        };
+        for (ar_a, ar_b) |x, y| if (x != y) {
+            row_bad += 1;
+        };
+        for (gate_a, gate_b) |x, y| if (x != y) {
+            row_bad += 1;
+        };
+        for (nq_a, nq_b) |x, y| if (x != y) {
+            row_bad += 1;
+        };
+        if (kind == .global or v.hasMessages()) {
+            for (nk_a, nk_b) |x, y| if (x != y) {
+                row_bad += 1;
+            };
+            for (nv_a, nv_b) |x, y| if (x != y) {
+                row_bad += 1;
+            };
+        }
+        std.debug.print("fuse-a layer {d} pass {d} gated {} mismatches {d}\n", .{ v.layer, v.pass, v.hasMessages(), row_bad });
+        bad += row_bad;
+    }
+    fuse.force = null;
+    return bad;
+}
+
+/// One row, layer 0 router weights. The wide path's picks against the old kernel.
+pub fn checkRouter(m: *const Model, s: *state.Scratch, r: *xpu.rt.Runtime) !usize {
+    if (m.pipelines == null or m.ctx == null) return error.Inkling2NoKernels;
+    const pipes = &m.pipelines.?;
+    const stream = m.r.stream(m.ctx.?);
+    const H = state.hidden;
+    var xbits: [H]u16 = undefined;
+    for (0..H) |d| xbits[d] = bf16bits(0.02 * @as(f32, @floatFromInt((d * 13) % 80)) - 0.4);
+    try r.upload(s.mlp_normed, std.mem.sliceAsBytes(&xbits));
+    const w = &m.weights.layers[0];
+    const g = Run{ .m = m, .p = pipes, .s = stream, .sc = s };
+    _ = g;
+    try glue.router(&pipes.glue, stream, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.route_ids, 0), at(s.route_weights, 0), 1);
+    try stream.synchronize();
+    var ids_a: [8]u32 = undefined;
+    var w_a: [8]f32 = undefined;
+    var ids_b: [8]u32 = undefined;
+    var w_b: [8]f32 = undefined;
+    try r.download(std.mem.sliceAsBytes(&ids_a), s.route_ids);
+    try r.download(std.mem.sliceAsBytes(&w_a), s.route_weights);
+    try r.sync();
+    try fuse.routerWideLaunch(&pipes.fuse, stream, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.logits_all, 0), at(s.route_ids, 0), at(s.route_weights, 0), 1);
+    try stream.synchronize();
+    try r.download(std.mem.sliceAsBytes(&ids_b), s.route_ids);
+    try r.download(std.mem.sliceAsBytes(&w_b), s.route_weights);
+    try r.sync();
+    var bad: usize = 0;
+    for (ids_a, ids_b) |a, b| if (a != b) {
+        bad += 1;
+    };
+    for (w_a, w_b) |a, b| if (a != b) {
+        bad += 1;
+    };
+    std.debug.print("router-check ids {any} vs {any} weight mismatches in the {d} bad slots\n", .{ ids_a, ids_b, bad });
+    return bad;
+}
+
 pub fn run(m: *const Model, s: *state.Scratch, cache: *state.Cache, ids: []const u32, options: Options) !void {
     return runShared(m, s, &.{.{ .cache = cache, .rows = ids.len }}, ids, options);
 }
@@ -459,7 +674,7 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     const p: *const model_file.Pipelines = if (m.pipelines) |*x| x else return error.Inkling2NoKernels;
     const ctx = m.ctx orelse return error.Inkling2NoKernels;
     const rows = ids.len;
-    if (rows == 0 or rows > s.rows or segments.len == 0 or segments.len > state.max_segments or (!options.all and segments.len != 1)) return error.Inkling2RowsExceeded;
+    if (rows == 0 or rows > s.rows or rows > state.max_rows or segments.len == 0 or segments.len > state.max_segments or (!options.all and segments.len != 1)) return error.Inkling2RowsExceeded;
     var pos: [state.max_rows]i32 = undefined;
     var seg_of: [state.max_rows]i32 = undefined;
     var segs: [state.max_segments]ap.Seg = undefined;
@@ -495,9 +710,11 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     if (std.c.getenv("TF_TP_DUMP") != null) dump_fwd += 1;
     try g.widen(at(s.p, 0), at(s.partial, 0), rows);
     const final = finalPlan(rows, options.all, options.taps != null);
-    for (0..final.work_rows) |j| {
-        const i = if (final.work_rows == rows) j else rows - 1;
-        try glue.ar(&p.glue, stream, at(s.blocks, i * state.block_slots * state.hidden * 2), row(s.partial, i, state.hidden * 4), tensor(m.weights.output_query), row(s.mlp_ar, j, state.hidden * 4), m.weight_plan.final_sources, 1);
+    if (final.work_rows == rows) {
+        try glue.arRows(&p.glue, stream, at(s.blocks, 0), at(s.partial, 0), tensor(m.weights.output_query), at(s.mlp_ar, 0), m.weight_plan.final_sources, 1, @intCast(rows), state.block_slots * state.hidden);
+    } else {
+        // the last row only
+        try glue.ar(&p.glue, stream, at(s.blocks, (rows - 1) * state.block_slots * state.hidden * 2), row(s.partial, rows - 1, state.hidden * 4), tensor(m.weights.output_query), at(s.mlp_ar, 0), m.weight_plan.final_sources, 1);
     }
     try g.norm(at(s.mlp_ar, 0), m.weights.norm, at(s.mlp_normed, 0), final.work_rows);
     if (options.taps) |to| try g.captureTap(at(s.mlp_normed, 0), to, final.capture_rows, 3);

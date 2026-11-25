@@ -1,0 +1,229 @@
+//! Inkling 2 Mini's prompt-chunk kernels on XPU: the row-batched glue of kernels/xpu/inkling2/prefill.cl and its launches.
+//! Buffers are Level Zero device addresses with offsets applied; every launch queues on the stream.
+const std = @import("std");
+const xpu = @import("xpu");
+
+pub const hidden: u32 = 2304;
+pub const message_entries: u32 = 48;
+/// A device address; offsets are already applied.
+pub const Ref = ?*anyopaque;
+
+pub const Kernels = struct {
+    ar: xpu.Kernel,
+    messages: xpu.Kernel,
+    copy_rows: xpu.Kernel,
+    perm: xpu.Kernel,
+    q8: xpu.Kernel,
+    zeta_norm: xpu.Kernel,
+    zeta: xpu.Kernel,
+    gates: xpu.Kernel,
+    kv_copy: xpu.Kernel,
+    attn_window: xpu.Kernel,
+    dense: xpu.Kernel,
+    router: xpu.Kernel,
+    router_xt: xpu.Kernel,
+    router16: xpu.Kernel,
+    messages_row: xpu.Kernel,
+    perm_c: xpu.Kernel,
+    merge4: xpu.Kernel,
+    norm8: xpu.Kernel,
+    conv_static: xpu.Kernel,
+    rel_table: xpu.Kernel,
+
+    pub fn load(module: xpu.Module) !Kernels {
+        var k_ar = try module.kernel("tf_ink2_pf_ar", .{ 256, 1, 1 });
+        errdefer k_ar.deinit();
+        var k_messages = try module.kernel("tf_ink2_pf_messages", .{ 256, 1, 1 });
+        errdefer k_messages.deinit();
+        var k_copy = try module.kernel("tf_ink2_pf_copy_rows", .{ 256, 1, 1 });
+        errdefer k_copy.deinit();
+        var k_perm = try module.kernel("tf_ink2_pf_perm", .{ 256, 1, 1 });
+        errdefer k_perm.deinit();
+        var k_q8 = try module.kernel("tf_ink2_pf_q8", .{ 128, 1, 1 });
+        errdefer k_q8.deinit();
+        var k_zn = try module.kernel("tf_ink2_pf_zeta_norm", .{ 256, 1, 1 });
+        errdefer k_zn.deinit();
+        var k_zeta = try module.kernel("tf_ink2_pf_zeta", .{ 64, 1, 1 });
+        errdefer k_zeta.deinit();
+        var k_gates = try module.kernel("tf_ink2_pf_gates", .{ 16, 1, 1 });
+        errdefer k_gates.deinit();
+        var k_kv = try module.kernel("tf_ink2_pf_kv_copy", .{ 16, 1, 1 });
+        errdefer k_kv.deinit();
+        var k_win = try module.kernel("tf_ink2_pf_attn_window", .{ 16, 1, 1 });
+        errdefer k_win.deinit();
+        var k_dense = try module.kernel("tf_ink2_pf_dense", .{ 128, 1, 1 });
+        errdefer k_dense.deinit();
+        var k_router = try module.kernel("tf_ink2_pf_router", .{ 256, 1, 1 });
+        errdefer k_router.deinit();
+        var k_router_xt = try module.kernel("tf_ink2_pf_router_xt", .{ 256, 1, 1 });
+        errdefer k_router_xt.deinit();
+        var k_router16 = try module.kernel("tf_ink2_pf_router16", .{ 128, 1, 1 });
+        errdefer k_router16.deinit();
+        var k_messages_row = try module.kernel("tf_ink2_pf_messages_row", .{ 256, 1, 1 });
+        errdefer k_messages_row.deinit();
+        var k_perm_c = try module.kernel("tf_ink2_pf_perm_c", .{ 256, 1, 1 });
+        errdefer k_perm_c.deinit();
+        var k_merge4 = try module.kernel("tf_ink2_pf_merge", .{ 256, 1, 1 });
+        errdefer k_merge4.deinit();
+        var k_norm8 = try module.kernel("tf_ink2_pf_norm", .{ 256, 1, 1 });
+        errdefer k_norm8.deinit();
+        var k_conv = try module.kernel("tf_ink2_pf_conv_static", .{ 256, 1, 1 });
+        errdefer k_conv.deinit();
+        const k_rel = try module.kernel("tf_ink2_pf_rel_table", .{ 256, 1, 1 });
+        return .{ .ar = k_ar, .messages = k_messages, .copy_rows = k_copy, .perm = k_perm, .q8 = k_q8, .zeta_norm = k_zn, .zeta = k_zeta, .gates = k_gates, .kv_copy = k_kv, .attn_window = k_win, .dense = k_dense, .router = k_router, .router_xt = k_router_xt, .router16 = k_router16, .messages_row = k_messages_row, .perm_c = k_perm_c, .merge4 = k_merge4, .norm8 = k_norm8, .conv_static = k_conv, .rel_table = k_rel };
+    }
+
+    /// The contract's planted twin: replaces the kernel `name` (one of this struct's fields) by its control, `tf_ctl_ink2_pf_<name>`.
+    pub fn swap(k: *Kernels, module: xpu.Module, name: []const u8) !void {
+        const table = [_]struct { []const u8, u32 }{
+            .{ "ar", 256 },       .{ "messages", 256 }, .{ "copy_rows", 256 }, .{ "perm", 256 },     .{ "q8", 128 },     .{ "zeta_norm", 256 }, .{ "zeta", 64 },
+            .{ "gates", 16 },     .{ "kv_copy", 16 },   .{ "attn_window", 16 }, .{ "dense", 128 },   .{ "router", 256 }, .{ "conv_static", 256 }, .{ "rel_table", 256 },
+        };
+        var buf: [64]u8 = undefined;
+        for (table) |e| {
+            if (!std.mem.eql(u8, e[0], name)) continue;
+            const text = try std.fmt.bufPrint(&buf, "tf_ctl_ink2_pf_{s}", .{name});
+            buf[text.len] = 0;
+            var made = try module.kernel(buf[0..text.len :0], .{ e[1], 1, 1 });
+            errdefer made.deinit();
+            const slot: *xpu.Kernel = if (std.mem.eql(u8, name, "ar")) &k.ar else if (std.mem.eql(u8, name, "messages")) &k.messages else if (std.mem.eql(u8, name, "copy_rows")) &k.copy_rows else if (std.mem.eql(u8, name, "perm")) &k.perm else if (std.mem.eql(u8, name, "q8")) &k.q8 else if (std.mem.eql(u8, name, "zeta_norm")) &k.zeta_norm else if (std.mem.eql(u8, name, "zeta")) &k.zeta else if (std.mem.eql(u8, name, "gates")) &k.gates else if (std.mem.eql(u8, name, "kv_copy")) &k.kv_copy else if (std.mem.eql(u8, name, "attn_window")) &k.attn_window else if (std.mem.eql(u8, name, "dense")) &k.dense else if (std.mem.eql(u8, name, "router")) &k.router else if (std.mem.eql(u8, name, "conv_static")) &k.conv_static else &k.rel_table;
+            slot.deinit();
+            slot.* = made;
+            return;
+        }
+        return error.UnknownKernel;
+    }
+
+    pub fn deinit(k: *Kernels) void {
+        k.rel_table.deinit();
+        k.conv_static.deinit();
+        k.router.deinit();
+        k.router16.deinit();
+        k.router_xt.deinit();
+        k.messages_row.deinit();
+        k.perm_c.deinit();
+        k.merge4.deinit();
+        k.norm8.deinit();
+        k.dense.deinit();
+        k.attn_window.deinit();
+        k.kv_copy.deinit();
+        k.gates.deinit();
+        k.zeta.deinit();
+        k.zeta_norm.deinit();
+        k.q8.deinit();
+        k.perm.deinit();
+        k.copy_rows.deinit();
+        k.messages.deinit();
+        k.ar.deinit();
+        k.* = undefined;
+    }
+};
+
+/// The attention residual of `rows` rows for `queries` query rows: row r takes its sources from `blocks` (4 block slots a
+/// row) and `partial` (the last source) and writes `out[query][row][H]` as FP32.
+pub fn ar(k: *const Kernels, s: xpu.Stream, blocks: Ref, partial: Ref, queries: Ref, out: Ref, sources: u32, count: u32, rows: u32) !void {
+    std.debug.assert(sources > 0 and sources <= 5 and count > 0 and count <= 3 and rows > 0);
+    try xpu.launch.dispatch(k.ar, s, .{ count, rows, 1 }, .{ blocks, partial, queries, out, sources, count, rows });
+}
+
+/// The cross-pass messages of `rows` rows, laid out [entry][row][H] FP32.
+pub fn messages(k: *const Kernels, s: xpu.Stream, bank0: Ref, bank1: Ref, q_mlp: Ref, kv: Ref, out: Ref, rows: u32) !void {
+    std.debug.assert(rows > 0);
+    try xpu.launch.dispatch(k.messages, s, .{ rows * message_entries, 1, 1 }, .{ bank0, bank1, q_mlp, kv, out, rows });
+}
+
+/// y[r][0..n] = x[r * ldx ..] for bf16 rows, `ldx` and `ldy` in elements.
+pub fn copyRows(k: *const Kernels, s: xpu.Stream, x: Ref, y: Ref, rows: u32, n: u32, ldx: u32, ldy: u32) !void {
+    std.debug.assert(rows > 0 and n > 0);
+    try xpu.launch.dispatch(k.copy_rows, s, .{ (n + 255) / 256, rows, 1 }, .{ x, y, rows, n, ldx, ldy });
+}
+
+/// xp[row][plane][s][l] = x[row][plane * 256 + (s / 2) * 32 + 2 l + (s & 1)] for `rows` rows of `k` bf16 values, `k` a multiple of 256.
+pub fn permute(k_: *const Kernels, s: xpu.Stream, x: Ref, xp: Ref, rows: u32, k: u32) !void {
+    std.debug.assert(rows > 0 and k % 256 == 0);
+    try xpu.launch.dispatch(k_.perm, s, .{ k / 256, rows, 1 }, .{ x, xp, rows, k });
+}
+
+/// Weight rows a work-group covers in `q8` (8 sub-groups of PF_WA weight tiles of 8 rows) and rows of x a group covers (PF_TB tiles of 16).
+const q8_cols: u32 = 128;
+const q8_rows: u32 = 32;
+
+/// out[r][0..n] = bf16(x[r][0..k] . dequant(weight)[n][k]) for the Q8 matrix `weight` (q8.zig's layout), `xp` a scratch of
+/// `rows * k` bf16 values for the reordered x. `n` a multiple of 8, `k` a multiple of 256.
+pub fn denseQ8(k_: *const Kernels, s: xpu.Stream, weight: Ref, x: Ref, xp: Ref, out: Ref, rows: u32, n: u32, k: u32) !void {
+    std.debug.assert(rows > 0 and n % 8 == 0 and k % 256 == 0);
+    try xpu.launch.dispatch(k_.perm, s, .{ k / 256, rows, 1 }, .{ x, xp, rows, k });
+    try xpu.launch.dispatch(k_.q8, s, .{ (n + q8_cols - 1) / q8_cols, (rows + q8_rows - 1) / q8_rows, 1 }, .{ xp, weight, out, rows, n, k, n });
+}
+
+/// out[r][0..n] = bf16(x[r][0..k] . weight[n][k]) for BF16 weights, bit for bit the rows of dense.zig's 32-row launches, all rows in one launch.
+pub fn denseBf16(k_: *const Kernels, s: xpu.Stream, weight: Ref, x: Ref, out: Ref, rows: u32, n: u32, k: u32) !void {
+    std.debug.assert(rows > 0 and n > 0 and k % 8 == 0);
+    try xpu.launch.dispatch(k_.dense, s, .{ (n + 7) / 8, (rows + 31) / 32, 1 }, .{ x, weight, out, rows, n, k, n });
+}
+
+/// The router of glue.cl for `rows` rows, 4 a work-group; ids and weights are the same bit for bit.
+pub fn router(k: *const Kernels, s: xpu.Stream, x: Ref, weight: Ref, bias: Ref, ids: Ref, weights: Ref, rows: u32) !void {
+    std.debug.assert(rows > 0);
+    try xpu.launch.dispatch(k.router, s, .{ (rows + 3) / 4, 1, 1 }, .{ x, weight, bias, ids, weights, rows });
+}
+
+/// The same router, 16 rows a work-group. `scratch` holds the transposed weight (128 * 2304 bf16) and is not read after the launch.
+pub fn router16(k: *const Kernels, s: xpu.Stream, x: Ref, weight: Ref, bias: Ref, ids: Ref, weights: Ref, rows: u32, scratch: Ref) !void {
+    std.debug.assert(rows > 0);
+    try xpu.launch.dispatch(k.router_xt, s, .{ 128, 1, 1 }, .{ weight, scratch });
+    try xpu.launch.dispatch(k.router16, s, .{ (rows + 15) / 16, 1, 1 }, .{ x, scratch, bias, ids, weights, rows });
+}
+
+/// Cross-pass messages, one work-group a row. The two norms are computed once.
+pub fn messagesRow(k: *const Kernels, s: xpu.Stream, bank0: Ref, bank1: Ref, q_mlp: Ref, kv: Ref, out: Ref, rows: u32) !void {
+    std.debug.assert(rows > 0);
+    try xpu.launch.dispatch(k.messages_row, s, .{ rows, 1, 1 }, .{ bank0, bank1, q_mlp, kv, out, rows });
+}
+
+/// glue.zig's static convolution (same arguments), four channels a work-item; `channels` a multiple of 4.
+pub fn convStatic(k: *const Kernels, s: xpu.Stream, history: Ref, current: Ref, taps: Ref, weight: Ref, out: Ref, rows: u32, channels: u32) !void {
+    std.debug.assert(rows > 0 and channels > 0 and channels % 4 == 0);
+    try xpu.launch.dispatch(k.conv_static, s, .{ (channels / 4 + 255) / 256, rows, 1 }, .{ history, current, taps, weight, out, rows, channels });
+}
+
+/// attention.zig's relative-bias table for `rows * heads` (row, head) pairs; bit for bit the same.
+pub fn relTable(k: *const Kernels, s: xpu.Stream, pairs: u32, rel: Ref, proj: Ref, tab: Ref) !void {
+    std.debug.assert(pairs % 8 == 0); // PF_REL_BATCH
+    try xpu.launch.dispatch(k.rel_table, s, .{ pairs / 8, 1, 1 }, .{ rel, proj, tab });
+}
+
+/// The controller tuple for every row: zn is a scratch of `rows * 2 * hidden` bf16 values, zeta one of `rows * 64`.
+/// out = (1 - tanh F) h + tanh Gamma m, h and m [row][hidden] binary32.
+pub fn controller(k: *const Kernels, s: xpu.Stream, h: Ref, m: Ref, down: Ref, forget: Ref, gain: Ref, zn: Ref, zeta: Ref, out: Ref, rows: u32) !void {
+    std.debug.assert(rows > 0);
+    try xpu.launch.dispatch(k.zeta_norm, s, .{ rows, 1, 1 }, .{ h, m, zn, rows });
+    try xpu.launch.dispatch(k.zeta, s, .{ (rows + 31) / 32, 1, 1 }, .{ zn, down, zeta, rows });
+    try xpu.launch.dispatch(k.gates, s, .{ hidden / 16, (rows + 15) / 16, 1 }, .{ h, m, zeta, forget, gain, out, rows });
+}
+
+/// Copies `n` positions from `from` of every K/V head of one ring to the same positions of another ring.
+pub fn kvCopy(k: *const Kernels, s: xpu.Stream, src: Ref, dst: Ref, from: u32, src_ring: u32, dst_ring: u32, n: u32, kv_heads: u32) !void {
+    if (n == 0) return;
+    try xpu.launch.dispatch(k.kv_copy, s, .{ n, kv_heads, 1 }, .{ src, dst, from, src_ring, dst_ring, n, kv_heads });
+}
+
+/// Sliding-window attention of one slice of `rows` rows (3 query heads a K/V head) over a staging ring of `ring` positions.
+/// `seg` holds the slice's `attention_plan.Seg` (row 0, `rows`, first position, offset 0). One partial a (row, head) goes to
+/// `part_o` and `part_ml`; `tab` is the slice's relative-bias table.
+pub fn attnWindow(k: *const Kernels, s: xpu.Stream, q: Ref, kc: Ref, vc: Ref, tab: Ref, seg: Ref, part_o: Ref, part_ml: Ref, rows: u32, heads: u32, kv_heads: u32, ring: u32, scale: f32) !void {
+    std.debug.assert(rows > 0 and heads == kv_heads * 3);
+    try xpu.launch.dispatch(k.attn_window, s, .{ (rows * 3 + 15) / 16, kv_heads, 1 }, .{ q, kc, vc, tab, seg, part_o, part_ml, heads, kv_heads, ring, scale });
+}
+
+/// The attention merge, four columns a work-item and eight (row, head) pairs a work-group. Same bf16 as tf_ink2_merge.
+pub fn merge4(k: *const Kernels, s: xpu.Stream, part_o: Ref, part_ml: Ref, sink: Ref, gate: Ref, pos: Ref, out: Ref, npairs: u32, heads: u32, window: u32, chunk: u32, c0: u32, chunks: u32, subs: u32) !void {
+    if (npairs == 0) return;
+    try xpu.launch.dispatch(k.merge4, s, .{ (npairs + 7) / 8, 1, 1 }, .{ part_o, part_ml, sink, gate, pos, out, npairs, heads, window, chunk, c0, chunks, subs });
+}
+
+/// RMS norm, eight rows a work-group. The sum order is not the 256-thread kernel's.
+pub fn norm8(k: *const Kernels, s: xpu.Stream, input: Ref, weight: Ref, out: Ref, rows: u32) !void {
+    std.debug.assert(rows > 0);
+    try xpu.launch.dispatch(k.norm8, s, .{ (rows + 7) / 8, 1, 1 }, .{ input, weight, out, rows });
+}

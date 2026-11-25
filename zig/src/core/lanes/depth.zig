@@ -16,6 +16,8 @@ pub const State = struct {
     probe: ?i64 = null, // a probe's depth for the next round (a lone window keeps it)
     plain: ?u64 = null,
     wait: ?u64 = null,
+    sched: i64 = 0, // the 1/2/3 depth the old rule would offer this round
+    fallback: bool = false, // last deep round did not beat that depth: the next round stays on it
     ms: ?Table = null, // plain_guard: the stream's own round times
     copy_ms: ?Table = null, // opt-in copy prices, independent of the head depth rule
     copy_plain: ?u64 = null,
@@ -111,6 +113,24 @@ pub const Rule = struct {
             const at: usize = @intCast(j);
             p[at] += r.k.depth_rate * (hit - p[at]);
         }
+        noteRun(who.state, proposed, accepted);
+    }
+
+    /// A deep offer that did not keep more drafts than the scheduler's depth falls back next round.
+    fn noteRun(slot: *?State, proposed: i64, accepted: i64) void {
+        _ = proposed;
+        var st = slot.* orelse return;
+        // A miss is the first draft failing. A short accept of a deep block still beat the scheduler depth.
+        if (accepted == 0) {
+            st.fallback = true;
+            slot.* = st;
+        }
+    }
+
+    /// The old empty-table rule: one draft below 0.8, two below 0.9, else three.
+    fn schedulerDepth(p: []const f64, most: i64) i64 {
+        const want: i64 = if (p.len == 0 or p[0] < 0.8) 1 else if (p[0] < 0.9) 2 else 3;
+        return @max(1, @min(most, want));
     }
 
     /// Round times by depth: the stream's own under `plain_guard`, else greedy rounds' for a greedy stream.
@@ -143,6 +163,10 @@ pub const Rule = struct {
 
     /// Measured round time when there is one, else the load-time forward cost plus head steps.
     pub fn roundCost(r: *Rule, drafts: i64, who: ?Who) !?f64 {
+        // A fixed block's round cost is the load-time table. One noisy round must not replace it and pin a shallow depth.
+        if (r.k.fixed_draft_block) {
+            if (r.family_costs.get(drafts + 1)) |forward| return forward;
+        }
         const table = try r.costs(who);
         if (table.get(drafts)) |v| return v;
         const forward = r.family_costs.get(drafts + 1) orelse return null;
@@ -166,6 +190,7 @@ pub const Rule = struct {
     pub fn depth(r: *Rule, who: Who) !i64 {
         const most = @min(@as(i64, r.most_drafts), @max(1, who.draft_room - 1));
         if (most <= 0) return 0;
+        if (r.k.force_depth) return most;
         if (r.confidence_floor != null and !who.sampled and !r.k.floor_rates) return most;
         const p = try r.rates(who);
         if (r.family_costs.empty()) {
@@ -173,6 +198,21 @@ pub const Rule = struct {
             return @max(1, @min(most, want));
         }
         const st = try r.state(who);
+        if (r.k.fixed_draft_block) {
+            const sched = schedulerDepth(p, most);
+            st.sched = sched;
+            st.rounds += 1;
+            if (st.fallback) {
+                st.fallback = false;
+                st.last = sched;
+                return sched;
+            }
+            // The full block, or the scheduler depth. Nothing between: a local optimum of 4 never reaches 7.
+            const upgrade = most > sched and marginPays(rateAt(r, who, p, most), rateAt(r, who, p, sched));
+            const chosen: i64 = if (upgrade) most else sched;
+            st.last = chosen;
+            return chosen;
+        }
         var best = (try r.bestRows(who, p, most, st.last)).rows;
         st.rounds += 1;
         if (best == 0) {
@@ -189,6 +229,31 @@ pub const Rule = struct {
             st.probe = best;
         }
         return best;
+    }
+
+    /// A deeper block must beat the scheduler depth by 10 percent in expected tokens a ms.
+    fn marginPays(deep: ?f64, sched: ?f64) bool {
+        const d = deep orelse return false;
+        const s = sched orelse return true;
+        if (!(s > 0)) return true;
+        return d >= s * 1.10;
+    }
+
+    /// Expected tokens a ms at `drafts`, from the stream's acceptance and the round-cost table.
+    fn rateAt(r: *Rule, who: Who, chances: []const f64, drafts: i64) ?f64 {
+        const cost = r.roundCost(drafts, who) catch return null;
+        const ms = cost orelse return null;
+        if (ms == 0) return null;
+        if (drafts <= 0) return 1.0 / ms;
+        var run: f64 = 1.0;
+        var expected: f64 = 1.0;
+        var d: i64 = 1;
+        while (d <= drafts) : (d += 1) {
+            const at: usize = @intCast(d - 1);
+            run *= if (at < chances.len) chances[at] else chances[chances.len - 1];
+            expected += run;
+        }
+        return expected / ms;
     }
 
     /// The stream's estimate state, allocated from its prior on first use.

@@ -113,8 +113,11 @@ static inline float q8_cap(float x, float c) { return c * tanh(x / c); }
     (p) += (U);                                                                                                    \
   }
 
+// Eight live rows with nine planes in flight spills. Two planes at a time still reads each weight once.
+#define Q8_WIDE(ROWS) ((ROWS) >= 8 ? 2 : Q8_UNROLL)
+
 // The lane's sums for output column j over ROWS rows of x (`k` values a row, a multiple of 256), into acc[ROWS]: groups
-// of Q8_UNROLL planes, then of Q8_TAIL, then single planes.
+// of UNROLL planes, then of Q8_TAIL, then single planes.
 #define Q8_DOT(ROWS, x, codes, scales, j, n, k)                                                                    \
   {                                                                                                                \
     const uint planes = (k) / 256, lane = get_sub_group_local_id();                                                \
@@ -124,7 +127,7 @@ static inline float q8_cap(float x, float c) { return c * tanh(x / c); }
     const ulong xs = (k) / 2; /* a row of x in words */                                                            \
     _Pragma("unroll") for (uint r = 0; r < ROWS; ++r) acc[r] = 0.0f;                                               \
     uint p = 0;                                                                                                    \
-    for (; p + Q8_UNROLL <= planes;) Q8_GROUP(ROWS, Q8_UNROLL, p)                                                  \
+    for (; p + Q8_WIDE(ROWS) <= planes;) Q8_GROUP(ROWS, Q8_WIDE(ROWS), p)                                                  \
     for (; p + Q8_TAIL <= planes;) Q8_GROUP(ROWS, Q8_TAIL, p)                                                      \
     for (; p < planes;) Q8_GROUP(ROWS, 1, p)                                                                       \
   }
@@ -162,6 +165,33 @@ static inline float q8_cap(float x, float c) { return c * tanh(x / c); }
   }
 
 Q8_MATVEC(1)
+
+// One launch, five projections, one row of x each. Grid (ceil(max_n / (Q8_WG/16)), 5). A group whose column is past its n returns.
+// The dot is Q8_DOT, the same lane order as dense_q8_1.
+Q8_KERNEL(Q8_WG) void Q8_NAME(dense_q8_seg1)(
+    global const ushort *x0, global const ushort *x1, global const ushort *x2, global const ushort *x3, global const ushort *x4,
+    global const uchar *w0, global const uchar *w1, global const uchar *w2, global const uchar *w3, global const uchar *w4,
+    global ushort *y0, global ushort *y1, global ushort *y2, global ushort *y3, global ushort *y4,
+    uint n0, uint n1, uint n2, uint n3, uint n4, uint k) {
+  const uint seg = get_group_id(1);
+  const uint j = get_group_id(0) * (Q8_WG / 16) + get_sub_group_id();
+  uint n = n0;
+  global const ushort *x = x0;
+  global const uchar *w = w0;
+  global ushort *y = y0;
+  if (seg == 1) { n = n1; x = x1; w = w1; y = y1; }
+  else if (seg == 2) { n = n2; x = x2; w = w2; y = y2; }
+  else if (seg == 3) { n = n3; x = x3; w = w3; y = y3; }
+  else if (seg == 4) { n = n4; x = x4; w = w4; y = y4; }
+  if (seg > 4 || j >= n) return;
+  global const uchar *codes = w;
+  global const half *scales = (global const half *)(w + (ulong)n * k);
+  float acc[1];
+  Q8_DOT(1, x, codes, scales, j, n, k)
+  const float s = sub_group_reduce_add(acc[0]);
+  if (get_sub_group_local_id() == 0) y[j] = Q8_STORE(s);
+}
+
 Q8_MATVEC(2)
 Q8_MATVEC(4)
 Q8_MATVEC(8)

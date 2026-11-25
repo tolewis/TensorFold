@@ -9,6 +9,7 @@ const Model = ink.model.Model;
 const st = ink.state;
 const backend = ink.backend;
 const dspark = ink.dspark;
+const dflash2 = ink.dflash2;
 
 const Allocator = std.mem.Allocator;
 
@@ -28,6 +29,7 @@ const Host = struct {
     model: *Model,
     lane: *backend.Xpu,
     drafter: ?*dspark.Drafter = null,
+    flash: ?*dflash2.Drafter = null,
     drafted: ?lanes.drafted.Drafted = null,
     clock: lanes.backend.WallClock,
     config: lanes.Config = undefined,
@@ -44,6 +46,7 @@ const Host = struct {
         h.config.deinit(h.gpa);
         if (h.drafted) |*d| d.deinit();
         if (h.drafter) |d| d.deinit();
+        if (h.flash) |d| d.deinit();
         h.lane.deinit();
         h.model.deinit();
         h.rt.deinit();
@@ -86,14 +89,47 @@ fn readMemory(_: ?*anyopaque, reset_peak: bool) ?api.Memory {
     return m;
 }
 
+/// Which drafter `--drafter` names: Mini's DSpark head, or the DFlash 2 model (its config names the architecture).
+const Draft = enum {
+    none,
+    dspark,
+    dflash2,
+
+    fn kind(gpa: Allocator, io: std.Io, dir: ?[]const u8) Draft {
+        const d = dir orelse return .none;
+        return if (dflash2.loader.isDraft(gpa, io, d)) .dflash2 else .dspark;
+    }
+    fn streamBytes(k: Draft, positions: usize) u64 {
+        return switch (k) {
+            .none => 0,
+            .dspark => dspark.Drafter.streamBytes(positions),
+            .dflash2 => dflash2.Drafter.streamBytes(positions),
+        };
+    }
+    fn scoreBytes(k: Draft, positions: usize) u64 {
+        return switch (k) {
+            .none => 0,
+            .dspark => dspark.Drafter.scoreBytes(positions),
+            .dflash2 => dflash2.Drafter.scoreBytes(positions),
+        };
+    }
+    fn label(k: Draft) []const u8 {
+        return switch (k) {
+            .none => "",
+            .dspark => "DSpark",
+            .dflash2 => "DFlash2",
+        };
+    }
+};
+
 /// What `positions` of context cost beside the weights: the scratch, `streams` states and, with a drafter, its rings and scores.
-fn contextBytes(positions: usize, streams: u64, drafter: bool) u64 {
-    const lane: u64 = if (drafter) streams * dspark.Drafter.streamBytes(positions) + dspark.Drafter.scoreBytes(positions) else 0;
+fn contextBytes(positions: usize, streams: u64, drafter: Draft) u64 {
+    const lane: u64 = if (drafter != .none) streams * drafter.streamBytes(positions) + drafter.scoreBytes(positions) else 0;
     return backend.scratchBytes(positions) + backend.streamBytes(positions) + lane;
 }
 
 /// The longest context (at most `most`) a budget of `bytes` holds with one stream; zero when none does.
-fn longest(bytes: u64, most: usize, streams: u64, drafter: bool) usize {
+fn longest(bytes: u64, most: usize, streams: u64, drafter: Draft) usize {
     if (contextBytes(1, streams, drafter) > bytes) return 0;
     var lo: usize = 1;
     var hi: usize = most;
@@ -200,9 +236,18 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     }
     const drafter_dir = drafterDirectory(o);
     h.drafter = null;
+    h.flash = null;
+    const draft_kind = Draft.kind(gpa, io, drafter_dir);
     if (drafter_dir) |dir| {
-        h.drafter = dspark.Drafter.init(gpa, io, h.model, dir) catch |err| {
-            problem.* = try std.fmt.allocPrint(a, "--drafter: Inkling 2 Mini DSpark cannot load {s} ({s})", .{ dir, @errorName(err) });
+        const loaded = if (draft_kind == .dflash2) blk: {
+            h.flash = dflash2.Drafter.init(gpa, io, h.model, dir) catch |err| break :blk err;
+            break :blk {};
+        } else blk: {
+            h.drafter = dspark.Drafter.init(gpa, io, h.model, dir) catch |err| break :blk err;
+            break :blk {};
+        };
+        loaded catch |err| {
+            problem.* = try std.fmt.allocPrint(a, "--drafter: Inkling 2 Mini {s} cannot load {s} ({s})", .{ draft_kind.label(), dir, @errorName(err) });
             h.model.deinit();
             h.rt.deinit();
             h.stream.deinit();
@@ -213,15 +258,16 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         };
     }
     errdefer if (h.drafter) |d| d.deinit();
-    const drafter = h.drafter;
+    errdefer if (h.flash) |d| d.deinit();
     const free = freeMemory(&h.ctx);
     const streams: u64 = @max(o.lanes, 1);
     const room: u64 = if (free > margin) free - margin else 0;
-    const fits = longest(room, h.model.config.text.max_context, streams, drafter != null);
+    const fits = longest(room, h.model.config.text.max_context, streams, draft_kind);
     const window: i64 = o.context orelse @intCast(@min(fits, default_context));
     if (contextProblem(window, fits)) |why| {
         problem.* = why;
-        if (drafter) |d| d.deinit();
+        if (h.drafter) |d| d.deinit();
+        if (h.flash) |d| d.deinit();
         h.model.deinit();
         h.rt.deinit();
         h.stream.deinit();
@@ -232,14 +278,18 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     }
     const context: usize = @intCast(window);
     // what the streams and the prompt cache share: the room, less the scratch and the drafter's rings
-    const fixed: u64 = backend.scratchBytes(context) + if (drafter != null) streams * dspark.Drafter.streamBytes(context) + dspark.Drafter.scoreBytes(context) else 0;
+    const fixed: u64 = backend.scratchBytes(context) + if (draft_kind != .none) streams * draft_kind.streamBytes(context) + draft_kind.scoreBytes(context) else 0;
     const budget: u64 = room - @min(room, fixed);
     std.log.info("inkling2_loop: {d:.1} GiB free for stream and prompt state, context up to {d} tokens, {d} streams", .{ @as(f64, @floatFromInt(budget)) / (1 << 30), window, streams });
     h.lane = try backend.Xpu.init(gpa, h.model, .{ .capacity = context, .streams = @intCast(streams), .budget = budget });
     errdefer h.lane.deinit();
     try h.lane.warm();
     h.drafted = null;
-    if (drafter) |d| {
+    if (h.drafter) |d| {
+        try d.setContext(@intCast(window));
+        h.drafted = try lanes.drafted.Drafted.init(gpa, h.lane.backend(), d.drafter());
+        h.drafted.?.first_rows = true;
+    } else if (h.flash) |d| {
         try d.setContext(@intCast(window));
         h.drafted = try lanes.drafted.Drafted.init(gpa, h.lane.backend(), d.drafter());
         h.drafted.?.first_rows = true;
@@ -251,7 +301,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     h.clock = .{ .io = io };
     h.core = lanes.Engine.init(gpa, &h.config, if (h.drafted) |*d| d.backend() else h.lane.backend(), h.clock.clock());
     errdefer h.core.deinit();
-    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "inkling2-xpu", .lanes = o.lanes, .context_window = @intCast(window), .prefill_step = st.prompt_rows, .decode_share = o.decode_share, .structures = true, .logprobs = true, .draft_sources = .{ .drafter = if (drafter_dir) |dir| .{ .kind = "DSpark", .name = o.drafter_name orelse dir } else null } });
+    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "inkling2-xpu", .lanes = o.lanes, .context_window = @intCast(window), .prefill_step = st.prompt_rows, .decode_share = o.decode_share, .structures = true, .logprobs = true, .draft_sources = .{ .drafter = if (drafter_dir) |dir| .{ .kind = if (draft_kind == .dflash2) "DFlash2" else "DSpark", .name = o.drafter_name orelse dir } else null } });
     h.cache = null;
     const want: u64 = std.math.lossyCast(u64, (o.prompt_cache_gib orelse default_cache_gib) * (1 << 30));
     h.cache_cap = @min(want, budget);
@@ -266,7 +316,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     errdefer if (h.cache) |*store| store.deinit();
     h.host.memory = .{ .read = readMemory };
     try h.host.start();
-    std.log.info("inkling2-xpu: {s}, {d:.2} GB on the device, {d} streams of {d} tokens{s}", .{ h.ctx.name(), @as(f64, @floatFromInt(xpu.rt.alloc_now)) / 1e9, streams, window, if (drafter != null) ", DSpark" else "" });
+    std.log.info("inkling2-xpu: {s}, {d:.2} GB on the device, {d} streams of {d} tokens{s}", .{ h.ctx.name(), @as(f64, @floatFromInt(xpu.rt.alloc_now)) / 1e9, streams, window, if (draft_kind == .none) "" else if (draft_kind == .dflash2) ", DFlash2" else ", DSpark" });
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
 }
 
@@ -294,12 +344,12 @@ test "Inkling XPU admission keeps DSpark opt-in and refuses learned modes" {
 
 test "Inkling XPU longest context accounts the scratch, the streams and the drafter's rings" {
     const gib: u64 = 1 << 30;
-    const fits = longest(8 * gib, 1048576, 4, true);
+    const fits = longest(8 * gib, 1048576, 4, .dspark);
     try std.testing.expect(fits > 1024);
-    try std.testing.expect(contextBytes(fits, 4, true) <= 8 * gib);
-    try std.testing.expect(contextBytes(fits + 1, 4, true) > 8 * gib or fits == 1048576);
-    try std.testing.expect(longest(8 * gib, 1048576, 4, false) > fits);
-    try std.testing.expectEqual(@as(usize, 0), longest(1 << 20, 1048576, 1, false));
+    try std.testing.expect(contextBytes(fits, 4, .dspark) <= 8 * gib);
+    try std.testing.expect(contextBytes(fits + 1, 4, .dspark) > 8 * gib or fits == 1048576);
+    try std.testing.expect(longest(8 * gib, 1048576, 4, .none) > fits);
+    try std.testing.expectEqual(@as(usize, 0), longest(1 << 20, 1048576, 1, .none));
 }
 
 /// Rank 1 loads its half and replays rank 0's forwards. It serves no HTTP.

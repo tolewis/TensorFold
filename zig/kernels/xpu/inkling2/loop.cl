@@ -93,21 +93,22 @@ KERNEL(256) void tf_inkling2_loop_messages(global const ushort *bank0, global co
   }
 }
 
-// One controller tuple of a token: h and m are [row][H] binary32, down [64][2H], forget and gain [H][64] bf16.
+// One controller tuple of a token: h is [row][H] binary32, m is a row of H binary32 values every m_stride values (H for
+// [row][H]; a message tensor's row stride otherwise), down [64][2H], forget and gain [H][64] bf16.
 // Two launches, so that more than one work-group streams the weights (about 1.2 MB a tuple).
 //
 // First, zeta (the D projection, rounded to bf16): work-group (part, row) norms the row's h and m, as every work-group
 // of the row does in the same order, then sub-group s of it owns rank LOOP_RANKS_A_GROUP * part + s. A lane adds its 8-wide chunks in
 // order, four chunks' loads in flight at a time, then the 16 lanes reduce.
 KERNEL(256) void tf_inkling2_loop_zeta(global const float *h, global const float *m, global const ushort *down,
-                                       global float *zeta, uint rows) {
+                                       global float *zeta, uint rows, uint m_stride) {
   local float red[LOOP_SGS];
   local ushort normalized[2 * LOOP_H];
   const uint t = get_local_id(0), part = get_group_id(0), row = get_group_id(1);
   if (row >= rows) return;
   const uint lane = get_sub_group_local_id(), sg = get_sub_group_id();
   global const float *hr = h + (size_t)row * LOOP_H;
-  global const float *mr = m + (size_t)row * LOOP_H;
+  global const float *mr = m + (size_t)row * m_stride;
   float hv[LOOP_H / 256], mv[LOOP_H / 256];
   float ss0 = 0.0f, ss1 = 0.0f;
 #pragma unroll
@@ -154,7 +155,7 @@ KERNEL(256) void tf_inkling2_loop_zeta(global const float *h, global const float
 // all sixteen weight loads issued first.
 KERNEL(64) void tf_inkling2_loop_gates(global const float *h, global const float *m, global const ushort *forget,
                                        global const ushort *gain, global const float *zeta, global float *out,
-                                       uint rows) {
+                                       uint rows, uint m_stride) {
   local float z[LOOP_RANK];
   const uint t = get_local_id(0), row = get_group_id(1);
   const uint d = get_group_id(0) * 64 + t;
@@ -181,6 +182,6 @@ KERNEL(64) void tf_inkling2_loop_gates(global const float *h, global const float
   // Four separately rounded binary32 steps; do not fold these into one expression.
   const float keep = 1.0f - f;
   const float left = keep * h[(size_t)row * LOOP_H + d];
-  const float right = g * m[(size_t)row * LOOP_H + d];
+  const float right = g * m[(size_t)row * m_stride + d];
   out[(size_t)row * LOOP_H + d] = left + right;
 }

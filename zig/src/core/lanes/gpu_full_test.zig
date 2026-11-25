@@ -200,7 +200,30 @@ test "drawTop from the best candidates draws what draw draws from the whole row"
                 const pos: u32 = @intCast(k * 5);
                 const want = try full.draw(a, row, s, pos, null);
                 try expectEqual(want, full.drawTop(if (full.needsRow(s)) row else null, top, s, pos));
+                if (s.top_k == 0) {
+                    // the device's normalizer: the host's own sum here, so a draw that needs no row equals the draw from the row
+                    if (full.drawTopNorm(top, hostNorm(row, top[0].v, @floatCast(1.0 / s.temperature)), s, pos)) |got| {
+                        try expectEqual(want, got);
+                        answered += 1;
+                    } else asked += 1;
+                }
             }
         }
     }
+    // a nucleus inside the candidates answers; a flat row's wide nucleus, or no top_p (every token within the near window of the
+    // top can be kept, so the race reads the row), asks for the row
+    try std.testing.expect(answered > 0 and asked > 0);
+}
+
+var answered: usize = 0;
+var asked: usize = 0;
+
+/// The normalizer the kernel sums: exp(v - m) over every token, in 1,024 strided lanes.
+fn hostNorm(row: []const f32, m: f32, inv_t: f32) f32 {
+    var lanes: [1024]f32 = @splat(0.0);
+    for (row, 0..) |l, i| {
+        const v = l * inv_t;
+        if (v >= -std.math.inf(f32)) lanes[i % 1024] += @exp(v - m);
+    }
+    return rule.lanesSum(&lanes);
 }

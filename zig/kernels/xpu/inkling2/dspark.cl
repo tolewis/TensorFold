@@ -65,6 +65,9 @@ static inline float rbf(float f) { return bf2f(f2bf(f)); }
 #ifndef DSP_BIAS
 #define DSP_BIAS(beta, dot) rbf((beta) + (dot))
 #endif
+#ifndef DSP_DRAW_SCORE
+#define DSP_DRAW_SCORE(v, u) ((v) - log(-log(u)))
+#endif
 
 // sum += a[d] * b[d] in order, for d in [0, n), n a multiple of 8; both BF16.
 static inline float dot8(float sum, global const ushort *a, global const ushort *b, uint n) {
@@ -355,9 +358,10 @@ KERNEL(256) void DSP_NAME(kappa)(global const ushort *y, global const ushort *f,
 // One Markov recurrent step: z (3 x 256, rounded), the next state and lambda, all BF16.
 KERNEL(256) void DSP_NAME(recurrent)(global const ushort *state, global const float *kappa, global const ushort *rnn_weight,
                                      global const ushort *markov, global ushort *z, global ushort *next_state,
-                                     global ushort *lambda, uint token) {
+                                     global ushort *lambda, global const uint *token_in) {
   const uint i = get_global_id(0);
   if (i >= DSP_RANK) return;
+  const uint token = token_in[0];
   float values[3];
   for (uint part = 0; part < 3; ++part) {
     const uint channel = part * DSP_RANK + i;
@@ -378,36 +382,33 @@ KERNEL(256) void DSP_NAME(recurrent)(global const ushort *state, global const fl
   lambda[i] = f2bf(tanh(values[2]));
 }
 
-// out [row][vocab] = BF16(U[id] . y[row]), serial over the 2304 inputs. A work-item owns one vocabulary id and walks
-// its unembedding row once for every row of y (up to eight), so each U row is read from memory once.
+// out [row][vocab] = BF16(U[id] . y[row]) over the 2304 inputs, for up to eight rows of y. A sub-group takes 16 vocabulary
+// ids as the columns of a DPAS (bf16 products, FP32 sums: lane n holds id n's 16 weights of a k step as its B operand)
+// with the rows of y as its eight A rows, so each U row is read from memory once for all rows at the memory's pace. A
+// row's sum is the DPAS's: 16 products added in a fixed order a step, the steps added in order (not the serial chain
+// of the Metal kernel; the result is within an FP32 rounding of it, so BF16 can differ by a unit in the last place).
 KERNEL(256) void DSP_NAME(base)(global const ushort *unembed, global const ushort *y, global ushort *out, uint rows, uint vocab) {
-  const uint id = get_global_id(0);
-  if (id >= vocab) return;
-  float acc[DSP_ROWS_MAX];
-  for (uint r = 0; r < DSP_ROWS_MAX; ++r) acc[r] = 0.0f;
-  global const ushort *u = unembed + (ulong)id * DSP_H;
-  for (uint d = 0; d < DSP_H; d += 8) {
-    const ushort8 uv = vload8(0, u + d);
-    const float w[8] = {bf2f(uv.s0), bf2f(uv.s1), bf2f(uv.s2), bf2f(uv.s3), bf2f(uv.s4), bf2f(uv.s5), bf2f(uv.s6), bf2f(uv.s7)};
+  const uint lane = get_sub_group_local_id();
+  const uint raw = get_group_id(0) * 256 + get_sub_group_id() * 16 + lane;
+  const uint id = raw < vocab ? raw : vocab - 1; // a lane past the last id reads the last row and writes nothing
+  global const uint *u = (global const uint *)(unembed + (ulong)id * DSP_H);
+  float8 acc = 0.0f;
+  for (uint d = 0; d < DSP_H; d += 32) {
+    const uint16 w = vload16(0, u + d / 2); // 32 weights: two k steps of 16
 #pragma unroll
-    for (uint r = 0; r < DSP_ROWS_MAX; ++r) {
-      if (r < rows) {
-        const ushort8 yv = vload8(0, y + (ulong)r * DSP_H + d);
-        float a = acc[r];
-        a += w[0] * bf2f(yv.s0);
-        a += w[1] * bf2f(yv.s1);
-        a += w[2] * bf2f(yv.s2);
-        a += w[3] * bf2f(yv.s3);
-        a += w[4] * bf2f(yv.s4);
-        a += w[5] * bf2f(yv.s5);
-        a += w[6] * bf2f(yv.s6);
-        a += w[7] * bf2f(yv.s7);
-        acc[r] = a;
-      }
+    for (uint half_step = 0; half_step < 2; ++half_step) {
+      short8 a = (short8)(0);
+#pragma unroll
+      for (uint r = 0; r < DSP_ROWS_MAX; ++r)
+        if (r < rows) a[r] = (short)intel_sub_group_block_read_us(y + (ulong)r * DSP_H + d + 16 * half_step);
+      const int8 b = half_step == 0 ? as_int8(w.s01234567) : as_int8(w.s89abcdef);
+      acc = intel_sub_group_bf16_bf16_matrix_mad_k16(a, b, acc);
     }
   }
-  for (uint r = 0; r < DSP_ROWS_MAX; ++r) {
-    if (r < rows) out[(ulong)r * vocab + id] = f2bf(DSP_BASE_OUT(acc[r]));
+  if (raw < vocab) {
+#pragma unroll
+    for (uint r = 0; r < DSP_ROWS_MAX; ++r)
+      if (r < rows) out[(ulong)r * vocab + raw] = f2bf(DSP_BASE_OUT(acc[r]));
   }
 }
 
@@ -420,4 +421,223 @@ KERNEL(256) void DSP_NAME(logits)(global const ushort *base, global const ushort
   const float bias = DSP_BIAS(bf2f(beta[i]), dot);
   const float logit = rbf(bf2f(base[i]) + bias);
   out[i] = f2bf(30.0f * tanh(logit / 30.0f));
+}
+
+// ---- the draft draw, on the device ---------------------------------------------------------------------------------
+// One work-group takes the row of BF16 logits a draft step made and writes the token the host sampler (gpu_rule.sample)
+// would draw: the best n candidates by a radix select over the order key of logit * (1 / T), a bitonic sort of them,
+// then the nucleus, min_p and the keyed Gumbel race of gpu_rule.pick. The selection is integer comparison, so the
+// candidate list is the host sort's; the exp and log are the device's, so a draw can differ from the host's where two
+// scores tie within a few ulps. A draft only has to be a good guess: the target's own draw decides every token.
+// cfg: 0 1/T bits, 1 top_p bits, 2 ln(min_p) bits, 3 top_k (0: off), 4 seed low, 5 seed high, 6 unused, 7 greedy (1) or not.
+// `position` is the draw's position in the keyed race. token_out[0] is written; the next recurrent step reads it there.
+#define DSP_TOP 1024
+
+static inline uint dsp_key(float v) {
+  const uint b = as_uint(v);
+  return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+static inline ulong dsp_mix(ulong x) {
+  x ^= x >> 30;
+  x *= 0xBF58476D1CE4E5B9UL;
+  x ^= x >> 27;
+  x *= 0x94D049BB133111EBUL;
+  return x ^ (x >> 31);
+}
+
+KERNEL(256) void DSP_NAME(draw)(global const ushort *logits, global const uint *cfg, global uint *token_out, uint vocab, uint position32) {
+  local uint hist[256];
+  local ulong order[DSP_TOP];
+  local float cv[DSP_TOP];
+  local uint cid[DSP_TOP];
+  local float partial[256];
+  local uint partial_at[256];
+  local uint cut_s, need_s, base_g, base_e, tot_g, tot_e, keep_s;
+  local float norm_s;
+  const uint t = get_local_id(0);
+  const float inv_t = as_float(cfg[0]);
+  const float top_p = as_float(cfg[1]);
+  const float min_log = as_float(cfg[2]);
+  const uint top_k = cfg[3];
+  const bool greedy = cfg[7] != 0;
+  const uint n = greedy ? 1u : (top_k == 0 || top_k > DSP_TOP ? (uint)DSP_TOP : top_k);
+  uint np2 = 2;
+  while (np2 < n) np2 <<= 1;
+
+  // radix select: the n-th largest key
+  uint cut = 0;
+  uint need = n;
+  for (int p = 0; p < 4; p++) {
+    const int shift = 24 - 8 * p;
+    hist[t] = 0;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint i = t; i < vocab; i += 256) {
+      const uint k = dsp_key(bf2f(logits[i]) * inv_t);
+      if (p == 0 || (k >> (shift + 8)) == (cut >> (shift + 8))) atomic_inc(&hist[(k >> shift) & 0xFFu]);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (t == 0) {
+      uint s = 0;
+      uint d = 255;
+      while (d > 0 && s + hist[d] < need) {
+        s += hist[d];
+        d--;
+      }
+      cut_s = cut | (d << shift);
+      need_s = need - s;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    cut = cut_s;
+    need = need_s;
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+
+  // the entries above the cut, and the first `need` equal to it in id order
+  const uint above = n - need;
+  for (uint j = t; j < np2; j += 256) order[j] = 0;
+  if (t == 0) {
+    base_g = 0;
+    base_e = 0;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (uint c = 0; c < vocab; c += 256 * 4) {
+    uint keys[4];
+    uint tg = 0;
+    uint te = 0;
+    for (uint j = 0; j < 4; j++) {
+      const uint i = c + t * 4 + j;
+      keys[j] = i < vocab ? dsp_key(bf2f(logits[i]) * inv_t) : 0u;
+      tg += (i < vocab && keys[j] > cut) ? 1u : 0u;
+      te += (i < vocab && keys[j] == cut) ? 1u : 0u;
+    }
+    const uint sg = work_group_scan_exclusive_add(tg);
+    const uint se = work_group_scan_exclusive_add(te);
+    if (t == 255) {
+      tot_g = sg + tg;
+      tot_e = se + te;
+    }
+    uint pg = base_g + sg;
+    uint pe = base_e + se;
+    for (uint j = 0; j < 4; j++) {
+      const uint i = c + t * 4 + j;
+      if (i >= vocab) break;
+      const ulong w = ((ulong)keys[j] << 32) | (ulong)(0xFFFFFFFFu - i);
+      if (keys[j] > cut) {
+        order[pg++] = w;
+      } else if (keys[j] == cut) {
+        if (pe < need) order[above + pe] = w;
+        pe++;
+      }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (t == 0) {
+      base_g += tot_g;
+      base_e += tot_e;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  for (uint size = 2; size <= np2; size <<= 1) {
+    for (uint gap = size >> 1; gap > 0; gap >>= 1) {
+      barrier(CLK_LOCAL_MEM_FENCE);
+      for (uint q = t; q < np2 / 2; q += 256) {
+        const uint a = 2 * q - (q & (gap - 1));
+        const uint b = a + gap;
+        const bool descending = (q & (size >> 1)) == 0;
+        const ulong x = order[a];
+        const ulong y = order[b];
+        if (descending ? (x < y) : (x > y)) {
+          order[a] = y;
+          order[b] = x;
+        }
+      }
+    }
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (uint j = t; j < n; j += 256) {
+    const ulong w = order[j];
+    const uint k = (uint)(w >> 32);
+    cv[j] = as_float((k & 0x80000000u) ? (k & 0x7FFFFFFFu) : ~k);
+    cid[j] = 0xFFFFFFFFu - (uint)w;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (greedy) {
+    if (t == 0) token_out[0] = cid[0];
+    return;
+  }
+
+  // normalizer: the candidates' sum with top_k on, the whole row's with it off
+  const float m = cv[0];
+  float mine = 0.0f;
+  if (top_k == 0 || top_k > DSP_TOP) {
+    for (uint i = t; i < vocab; i += 256) mine += exp(bf2f(logits[i]) * inv_t - m);
+    partial[t] = mine;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint hv = 128; hv > 0; hv >>= 1) {
+      if (t < hv) partial[t] += partial[t + hv];
+      barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (t == 0) norm_s = partial[0];
+  } else {
+    if (t == 0) {
+      float sum = 0.0f;
+      for (uint j = 0; j < n; j++) sum += exp(cv[j] - m);
+      norm_s = sum;
+    }
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (t == 0) {
+    const float norm = norm_s;
+    uint keep = n;
+    if (top_p > 0.0f && top_p < 1.0f) {
+      float cum = 0.0f;
+      for (uint j = 0; j < n; j++) {
+        cum += exp(cv[j] - m) / norm;
+        if (cum >= top_p) {
+          keep = j + 1;
+          break;
+        }
+      }
+    }
+    if (min_log > -INFINITY) {
+      const float floor_v = m + min_log;
+      uint j = 0;
+      while (j < keep && cv[j] >= floor_v) j++;
+      keep = j;
+    }
+    keep_s = keep;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const uint keep = keep_s;
+  const ulong seed = (ulong)cfg[4] | ((ulong)cfg[5] << 32);
+  const ulong position = (ulong)position32;
+  const ulong base = dsp_mix(dsp_mix(seed + 0x9E3779B97F4A7C15UL) ^ (position * 0xD1B54A32D192ED03UL));
+  float best = -INFINITY;
+  uint best_j = 0xFFFFFFFFu;
+  for (uint j = t; j < keep; j += 256) {
+    const ulong x = dsp_mix(base ^ (ulong)cid[j]);
+    const float u = ((float)(uint)(x >> 40) + 0.5f) * (1.0f / 16777216.0f);
+    const float score = DSP_DRAW_SCORE(cv[j], u);
+    if (best_j == 0xFFFFFFFFu || score > best) {
+      best = score;
+      best_j = j;
+    }
+  }
+  partial[t] = best;
+  partial_at[t] = best_j;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (t == 0) {
+    float top = -INFINITY;
+    uint at = 0;
+    bool any = false;
+    for (uint q = 0; q < 256; q++) {
+      const uint j = partial_at[q];
+      if (j == 0xFFFFFFFFu) continue;
+      if (!any || partial[q] > top || (partial[q] == top && j < at)) {
+        top = partial[q];
+        at = j;
+        any = true;
+      }
+    }
+    token_out[0] = cid[at];
+  }
 }

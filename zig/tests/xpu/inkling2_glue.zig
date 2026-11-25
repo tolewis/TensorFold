@@ -253,7 +253,7 @@ pub const Probe = struct {
         const n: u32 = @intCast(self.shape.n);
         switch (self.kind) {
             .embed_norm => try host.embedNorm(pl, s, R[0], R[1], R[2], y, r),
-            .ar => try host.ar(pl, s, R[0], R[1], R[2], y, r, 2),
+            .ar => try host.arRows(pl, s, R[0], R[1], R[2], y, r, 2, 1, 0),
             .conv_static => try host.convStatic(pl, s, R[0], R[1], R[2], R[3], y, r, n),
             .conv_dynamic => try host.convDynamic(pl, s, R[0], R[1], R[2], R[3], R[4], R[5], y, r, n),
             .router => try host.router(pl, s, R[0], R[1], R[2], self.route_ids, y, r),

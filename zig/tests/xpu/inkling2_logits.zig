@@ -24,6 +24,7 @@
 const std = @import("std");
 const xpu = @import("xpu");
 const ink = @import("inkling2_xpu");
+const lanes = @import("lanes");
 
 pub const panic = std.debug.FullPanic(xpu.rt.panicDrain);
 
@@ -234,7 +235,13 @@ pub fn main(init: std.process.Init) !void {
     var embed_host = false;
     var digest = false;
     var profile_steps: usize = 0;
+    var profile_all = false;
+    var fuse_check = false;
+    var router_check = false;
+    var verify_bench = false;
+    var route_union = false;
     var bench_context: ?usize = null;
+    var bench_prefill: usize = 0;
     var options: ink.model.Options = .{ .embed_host = false };
     var tp: u32 = 1;
     var rank: u32 = 0;
@@ -278,10 +285,64 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--compare-logits")) {
             i += 1;
             compare_prefix = argv[i];
+        } else if (std.mem.eql(u8, a, "--old-forward")) {
+            // the forward of 64-row chunks, every launch a row at a time (the control of an A/B)
+            old_forward = true;
+        } else if (std.mem.eql(u8, a, "--old-experts")) {
+            // the prompt chunk with the decode path's expert kernels (the control of an A/B)
+            old_experts = true;
+        } else if (std.mem.eql(u8, a, "--old-global")) {
+            old_global = true;
+        } else if (std.mem.eql(u8, a, "--old-sliding")) {
+            old_sliding = true;
+        } else if (std.mem.eql(u8, a, "--old-loop")) {
+            old_loop = true;
+        } else if (std.mem.eql(u8, a, "--old-dense")) {
+            // the prompt chunk with the decode path's dense projections (the control of an A/B)
+            old_dense = true;
         } else if (std.mem.eql(u8, a, "--digest")) {
             digest = true;
         } else if (std.mem.eql(u8, a, "--profile")) {
-            profile_steps = 8;
+            if (profile_steps == 0) profile_steps = 8;
+        } else if (std.mem.eql(u8, a, "--profile-steps")) {
+            i += 1;
+            profile_steps = try std.fmt.parseInt(usize, argv[i], 10);
+        } else if (std.mem.eql(u8, a, "--verify-bench")) {
+            // the first --ref prompt prefilled, then windows of 1, 2, 3, 4, 6, 8, 12 and 16 real rows run as the server's verify
+            // does (every row's logits, the DSpark taps, the cache transaction), timed; then stop
+            verify_bench = true;
+        } else if (std.mem.eql(u8, a, "--route-union")) {
+            // with --verify-bench: also count the distinct experts a window of real rows reads in each visit
+            route_union = true;
+        } else if (std.mem.eql(u8, a, "--fuse")) {
+            ink.fuse.force = true;
+        } else if (std.mem.eql(u8, a, "--seg")) {
+            ink.fuse.seg = true;
+        } else if (std.mem.eql(u8, a, "--no-seg")) {
+            ink.fuse.seg = false;
+        } else if (std.mem.eql(u8, a, "--attn-splits")) {
+            i += 1;
+            ink.attention_plan.flash_splits = try std.fmt.parseInt(u32, argv[i], 10);
+            ink.attention_plan.flash_user_set = true;
+        } else if (std.mem.eql(u8, a, "--fuse-check")) {
+            fuse_check = true;
+        } else if (std.mem.eql(u8, a, "--router-check")) {
+            router_check = true;
+        } else if (std.mem.eql(u8, a, "--router-wide")) {
+            ink.fuse.router_wide = true;
+        } else if (std.mem.eql(u8, a, "--conv-fold")) {
+            ink.fuse.conv_fold = true;
+        } else if (std.mem.eql(u8, a, "--zeta-wide")) {
+            ink.fuse.zeta_wide = true;
+        } else if (std.mem.eql(u8, a, "--profile-all")) {
+            // the first --ref prompt prefilled in --chunk row chunks (last row's logits only, as the server does), profiled per
+            // chunk; then plain decode profiled greedy and sampled; then stop
+            profile_all = true;
+            if (profile_steps == 0) profile_steps = 8;
+        } else if (std.mem.eql(u8, a, "--bench-prefill")) {
+            // the first --ref prompt, repeated to N rows, prefilled in --chunk row chunks with the last row's logits only; cold first token
+            i += 1;
+            bench_prefill = try std.fmt.parseInt(usize, argv[i], 10);
         } else if (std.mem.eql(u8, a, "--bench-context")) {
             i += 1;
             bench_context = try std.fmt.parseInt(usize, argv[i], 10);
@@ -300,7 +361,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("skipped: no model directory (argument or TF_XPU_INKLING2)\n", .{});
         return;
     };
-    if (chunk == 0 or chunk > state.max_rows) return error.BadChunk;
+    if (chunk == 0 or chunk > state.max_prefill_rows) return error.BadChunk;
     if (refs.items.len == 0 and ids_path == null and bench_context == null) return error.NothingToDo;
 
     // inputs first, so a bad file fails before the model loads
@@ -316,7 +377,16 @@ pub fn main(init: std.process.Init) !void {
         prompt = try loadIds(gpa, p);
         longest = @max(longest, prompt.len + generate);
     }
-    if (bench_context) |c| longest = @max(longest, c + decode_steps + profile_steps + 2);
+    if (bench_context) |c| longest = @max(longest, c + decode_steps + 4 * profile_steps + 8);
+    if (bench_prefill > 0) {
+        if (loaded_refs.items.len == 0) return error.NothingToDo;
+        const src = loaded_refs.items[0].ids;
+        const cycled = try gpa.alloc(u32, bench_prefill);
+        for (cycled, 0..) |*x, k| x.* = src[k % src.len];
+        loaded_refs.items[0].ids = cycled;
+        loaded_refs.items[0].rows = bench_prefill;
+        longest = @max(longest, bench_prefill + decode_steps + 4 * profile_steps + 8);
+    }
     const capacity = std.mem.alignForward(usize, longest, 64);
 
     xpu.stop.install();
@@ -342,7 +412,23 @@ pub fn main(init: std.process.Init) !void {
     try m.loadKernels(&ctx);
     if (m.options.place.split()) _ = try ink.group.Group.open(gpa, &r, &ctx, m.options.place);
     std.debug.print("loaded {d:.2} GiB and built the kernels in {d:.1} s\n", .{ @as(f64, @floatFromInt(m.device_bytes)) / (1 << 30), secs(nowNs(init.io) - t_load) });
-    var scratch = try state.Scratch.init(&r, state.max_rows, capacity);
+    if (fuse_check) {
+        var scratch = try state.Scratch.init(&r, state.max_rows, 64);
+        defer scratch.deinit();
+        const bad = try ink.forward.checkPhaseA(m, &scratch, &r);
+        std.debug.print("FUSE-A-CHECK mismatches {d}\n", .{bad});
+        if (bad != 0) return error.FuseMismatch;
+        if (!router_check) return;
+    }
+    if (router_check) {
+        var scratch_r = try state.Scratch.init(&r, state.max_rows, 64);
+        defer scratch_r.deinit();
+        const bad_r = try ink.forward.checkRouter(m, &scratch_r, &r);
+        std.debug.print("ROUTER-CHECK mismatches {d}\n", .{bad_r});
+        if (bad_r != 0) return error.FuseMismatch;
+        return;
+    }
+    var scratch = try state.Scratch.init(&r, @max(chunk, state.max_rows), capacity);
     defer scratch.deinit();
     var prec = ink.model.precisions();
     const schedule = try ink.plan.build(&m.config.text, &prec);
@@ -350,6 +436,31 @@ pub fn main(init: std.process.Init) !void {
     const host_logits = try gpa.alloc(f32, state.max_rows * vocab);
     defer gpa.free(host_logits);
 
+    if (verify_bench) {
+        try verifyBench(gpa, init.io, &ctx, m, &scratch, &r, &schedule, capacity, loaded_refs.items[0].ids, host_logits, profile_steps > 0, route_union);
+        return;
+    }
+    if (bench_prefill > 0 and !profile_all) {
+        var cache = try state.Cache.init(&r, capacity, &schedule, .bf16);
+        defer cache.deinit();
+        const ids = loaded_refs.items[0].ids;
+        var pos: usize = 0;
+        const t0 = nowNs(init.io);
+        while (pos < ids.len) {
+            const n = @min(chunk, ids.len - pos);
+            try promptRun(m, &scratch, &cache, ids[pos..][0..n], .{});
+            cache.len += n;
+            pos += n;
+        }
+        _ = try lastLogits(&r, &cache, host_logits[0..vocab]);
+        const dt = secs(nowNs(init.io) - t0);
+        std.debug.print("\nBENCH prefill {d} rows in chunks of {d}: {d:.3} s, {d:.1} tok/s (cold first token)\n", .{ ids.len, chunk, dt, @as(f64, @floatFromInt(ids.len)) / dt });
+        return;
+    }
+    if (profile_all) {
+        try profileAll(gpa, init.io, &ctx, m, &scratch, &r, &schedule, capacity, loaded_refs.items[0].ids, chunk, host_logits[0..vocab], profile_steps);
+        return;
+    }
     var overall_diffs: usize = 0;
     var prefill_digest = std.crypto.hash.sha2.Sha256.init(.{});
     var decode_digest = std.crypto.hash.sha2.Sha256.init(.{});
@@ -375,17 +486,22 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(other);
         const t0 = nowNs(init.io);
         var pos: usize = 0;
-        var chunk_agree: usize = 0;
-        var chunk_rows: usize = 0;
         while (pos < ref.rows) {
             const n = @min(chunk, ref.rows - pos);
-            try ink.forward.run(m, &scratch, &cache, ref.ids[pos..][0..n], .{ .all = true });
+            if (old_forward) {
+                if (n > state.max_rows) return error.BadChunk;
+                try ink.forward.run(m, &scratch, &cache, ref.ids[pos..][0..n], .{ .all = true });
+            } else try ink.prefill.run(m, &scratch, &cache, ref.ids[pos..][0..n], .{ .defer_head = true, .old_experts = old_experts, .old_dense = old_dense, .old_loop = old_loop, .old_global = old_global, .old_sliding = old_sliding });
             cache.len += n;
-            try r.download(std.mem.sliceAsBytes(host_logits[0 .. n * vocab]), scratch.logits_all);
+            var sub: usize = 0;
+            while (sub < n) : (sub += state.max_rows) {
+            const sn: usize = @min(state.max_rows, n - sub);
+            if (!old_forward) try ink.prefill.headRows(m, &scratch, sub, sn);
+            try r.download(std.mem.sliceAsBytes(host_logits[0 .. sn * vocab]), scratch.logits_all);
             try r.sync();
-            if (digest) prefill_digest.update(std.mem.sliceAsBytes(host_logits[0 .. n * vocab]));
-            for (0..n) |j| {
-                const p = pos + j;
+            if (digest) prefill_digest.update(std.mem.sliceAsBytes(host_logits[0 .. sn * vocab]));
+            for (0..sn) |j| {
+                const p = pos + sub + j;
                 const row = host_logits[j * vocab ..][0..vocab];
                 const t = top2(row);
                 st.rows += 1;
@@ -399,7 +515,6 @@ pub fn main(init: std.process.Init) !void {
                 if (!std.math.isFinite(t.first)) st.nan += 1;
                 if (t.id == @as(u32, @intCast(ref_top[0]))) {
                     st.agree += 1;
-                    chunk_agree += 1;
                 } else {
                     const gap = row[@intCast(ref_top[0])] - t.first;
                     st.max_diff_margin = @max(st.max_diff_margin, ref.margin[p]);
@@ -443,10 +558,7 @@ pub fn main(init: std.process.Init) !void {
                     st.count_abs += 1;
                 }
             }
-            chunk_rows += n;
-            std.debug.print("ref chunk {d}-{d} agree {d}/{d}\n", .{ pos, pos + n - 1, chunk_agree, chunk_rows });
-            chunk_agree = 0;
-            chunk_rows = 0;
+            }
             pos += n;
         }
         const prefill_s = secs(nowNs(init.io) - t0);
@@ -477,7 +589,7 @@ pub fn main(init: std.process.Init) !void {
             }
             const total = secs(nowNs(init.io) - t1);
             std.debug.print("  decode: {d} steps at context {d}: {d:.2} tok/s ({d:.2} ms a token, {d:.2} ms of it the forward)\n", .{ decode_steps, ref.rows, @as(f64, @floatFromInt(decode_steps)) / total, 1000 * total / @as(f64, @floatFromInt(decode_steps)), 1000 * secs(fwd_ns) / @as(f64, @floatFromInt(decode_steps)) });
-            if (profile_steps > 0 and ref_path.ptr == refs.items[0].ptr) try profileDecode(&ctx, init.io, m, &scratch, &cache, &r, host_logits[0..vocab], token, profile_steps);
+            if (profile_steps > 0 and ref_path.ptr == refs.items[0].ptr) try profileDecode(&ctx, init.io, m, &scratch, &cache, &r, host_logits[0..vocab], token, profile_steps, null);
         }
     }
 
@@ -492,7 +604,7 @@ pub fn main(init: std.process.Init) !void {
         while (pos < prompt.len) {
             var n = @min(chunk, prompt.len - pos);
             if (pos < resume_at) n = @min(n, resume_at - pos);
-            try ink.forward.run(m, &scratch, &fresh, prompt[pos..][0..n], .{});
+            try promptRun(m, &scratch, &fresh, prompt[pos..][0..n], .{});
             fresh.len += n;
             pos += n;
             if (pos == resume_at) snap = try ink.snapshot.save(&r, &fresh);
@@ -506,7 +618,7 @@ pub fn main(init: std.process.Init) !void {
         pos = resume_at;
         while (pos < prompt.len) {
             const n = @min(chunk, prompt.len - pos);
-            try ink.forward.run(m, &scratch, &resumed, prompt[pos..][0..n], .{});
+            try promptRun(m, &scratch, &resumed, prompt[pos..][0..n], .{});
             resumed.len += n;
             pos += n;
         }
@@ -530,7 +642,7 @@ pub fn main(init: std.process.Init) !void {
         const t0 = nowNs(init.io);
         while (pos < prompt.len) {
             const n = @min(chunk, prompt.len - pos);
-            try ink.forward.run(m, &scratch, &cache, prompt[pos..][0..n], .{});
+            try promptRun(m, &scratch, &cache, prompt[pos..][0..n], .{});
             cache.len += n;
             pos += n;
         }
@@ -572,7 +684,12 @@ pub fn main(init: std.process.Init) !void {
         }
         const total = secs(nowNs(init.io) - t1);
         std.debug.print("\nbench: {d} decode steps at context {d} (no prompt): {d:.2} tok/s, {d:.2} ms a token\n", .{ decode_steps, context, @as(f64, @floatFromInt(decode_steps)) / total, 1000 * total / @as(f64, @floatFromInt(decode_steps)) });
-        if (profile_steps > 0) try profileDecode(&ctx, init.io, m, &scratch, &cache, &r, host_logits[0..vocab], token, profile_steps);
+        if (profile_steps > 0) try profileDecode(&ctx, init.io, m, &scratch, &cache, &r, host_logits[0..vocab], token, profile_steps, null);
+        if (profile_steps > 0) {
+            var smp = try ink.sampler.Sampler.init(gpa, &r, &ctx, 1);
+            defer smp.deinit();
+            try profileDecode(&ctx, init.io, m, &scratch, &cache, &r, host_logits[0..vocab], token, profile_steps, &smp);
+        }
     }
     if (digest) {
         var a: [32]u8 = undefined;
@@ -585,8 +702,11 @@ pub fn main(init: std.process.Init) !void {
 }
 
 /// Plain decode steps again, once with launch counts and host times only and once with a device timestamp on every kernel.
-fn profileDecode(ctx: *xpu.Context, io: std.Io, m: *const ink.model.Model, scratch: *state.Scratch, cache: *state.Cache, r: *xpu.rt.Runtime, logits: []f32, first: u32, steps: usize) !void {
+/// `smp` null: the token is the host argmax of the downloaded row (the check tool's loop). Else the server's sampled path: the
+/// device selects the candidates of the last row (tf_ink2_sample_top) and the host draws (T 0.8, top_k 20, top_p 0.95).
+fn profileDecode(ctx: *xpu.Context, io: std.Io, m: *const ink.model.Model, scratch: *state.Scratch, cache: *state.Cache, r: *xpu.rt.Runtime, logits: []f32, first: u32, steps: usize, smp: ?*ink.sampler.Sampler) !void {
     var token = first;
+    const rule: lanes.Sampling = .{ .seed = 7, .temperature = 0.8, .top_k = 20, .top_p = 0.95 };
     for ([_]bool{ false, true }) |device| {
         var prof = try xpu.profile.Profile.init(ctx, 8192, device);
         defer prof.deinit();
@@ -594,21 +714,197 @@ fn profileDecode(ctx: *xpu.Context, io: std.Io, m: *const ink.model.Model, scrat
         defer xpu.profile.active = null;
         var wall: i96 = 0;
         var enqueue: i96 = 0;
+        var draw: i96 = 0;
         for (0..steps) |_| {
             const f0 = nowNs(io);
             const e0 = xpu.profile.nowNs();
             try ink.forward.run(m, scratch, cache, &.{token}, .{});
             wall += nowNs(io) - f0;
             enqueue += @as(i96, prof.enqueued_at) - e0;
-            try prof.collect();
-            xpu.rt.Runtime.logSync("rank 0");
-            xpu.rt.Runtime.resetSyncLog();
             cache.len += 1;
-            token = argmax(try lastLogits(r, cache, logits));
+            if (smp == null) {
+                try prof.collect();
+                const d0 = nowNs(io);
+                token = argmax(try lastLogits(r, cache, logits));
+                draw += nowNs(io) - d0;
+            } else {
+                const d0 = nowNs(io);
+                const row = ink.sampler.Row.of(rule);
+                const set = try smp.?.select(cache.logits.ptr, @intCast(vocab), &.{row});
+                var buf: [ink.sampler.top_max]lanes.gpu_rule.Cand = undefined;
+                const top = set.list(0, row.n, &buf);
+                const whole: ?[]const f32 = if (lanes.gpu_full.needsRow(rule)) try lastLogits(r, cache, logits) else null;
+                token = lanes.gpu_full.drawTop(whole, top, rule, @intCast(cache.len));
+                draw += nowNs(io) - d0;
+                try prof.collect();
+            }
         }
         const n: f64 = @floatFromInt(steps);
-        std.debug.print("\nprofile, {s}: {d} decode steps, {d:.0} launches a token, forward {d:.2} ms a token, of it queueing on the host {d:.2} ms, waiting {d:.2} ms\n", .{ if (device) "with a timestamp event on every launch" else "host timing only", steps, @as(f64, @floatFromInt(prof.launches)) / n, 1000 * secs(wall) / n, 1000 * secs(enqueue) / n, 1000 * secs(wall - enqueue) / n });
+        std.debug.print("\nprofile ({s}), {s}: {d} decode steps, {d:.0} launches a token, forward {d:.3} ms a token, of it queueing on the host {d:.3} ms, waiting {d:.3} ms; draw {d:.3} ms a token (needsRow {})\n", .{ if (smp == null) "greedy, host argmax" else "sampled T 0.8 top_k 20 top_p 0.95, device candidates", if (device) "with a timestamp event on every launch" else "host timing only", steps, @as(f64, @floatFromInt(prof.launches)) / n, 1000 * secs(wall) / n, 1000 * secs(enqueue) / n, 1000 * secs(wall - enqueue) / n, 1000 * secs(draw) / n, lanes.gpu_full.needsRow(rule) });
         prof.print();
+    }
+}
+
+/// The old forward (64-row chunks, a launch a row) with `--old-forward`, else the prompt-chunk forward.
+var old_forward = false;
+var old_experts = false;
+var old_dense = false;
+var old_loop = false;
+var old_global = false;
+var old_sliding = false;
+fn promptRun(m: *const ink.model.Model, scratch: *state.Scratch, cache: *state.Cache, ids: []const u32, _: anytype) !void {
+    if (old_forward) {
+        if (ids.len > state.max_rows) return error.BadChunk;
+        return ink.forward.run(m, scratch, cache, ids, .{});
+    }
+    return ink.prefill.run(m, scratch, cache, ids, .{ .old_experts = old_experts, .old_dense = old_dense, .old_loop = old_loop, .old_global = old_global, .old_sliding = old_sliding });
+}
+
+/// The first reference prompt in chunks of `chunk` rows with the last row's logits only (the server's prompt path), a
+/// profile of every chunk (the table after the first 512 rows, then after the whole prompt), then decode at that context.
+fn profileAll(gpa: std.mem.Allocator, io: std.Io, ctx: *xpu.Context, m: *const ink.model.Model, scratch: *state.Scratch, r: *xpu.rt.Runtime, schedule: anytype, capacity: usize, ids: []const u32, chunk: usize, logits: []f32, steps: usize) !void {
+    var cache = try state.Cache.init(r, capacity, schedule, .bf16);
+    defer cache.deinit();
+    var prof = try xpu.profile.Profile.init(ctx, 131072, true);
+    defer prof.deinit();
+    xpu.profile.active = &prof;
+    var pos: usize = 0;
+    var chunks: usize = 0;
+    var wall: i96 = 0;
+    const first_rows: usize = 512;
+    var first_done = false;
+    while (pos < ids.len) {
+        const n = @min(chunk, ids.len - pos);
+        const f0 = nowNs(io);
+        try promptRun(m, scratch, &cache, ids[pos..][0..n], .{});
+        const dt = nowNs(io) - f0;
+        wall += dt;
+        try prof.collect();
+        cache.len += n;
+        pos += n;
+        chunks += 1;
+        if (pos <= first_rows) {
+        }
+        if (!first_done and pos >= first_rows) {
+            first_done = true;
+            std.debug.print("\nPREFILL first {d} rows (context 0 to {d}), {d} chunks of {d}: forward wall {d:.2} ms, {d:.1} tok/s; the table is per chunk (a pass)\n", .{ pos, pos, chunks, chunk, 1000 * secs(wall), @as(f64, @floatFromInt(pos)) / secs(wall) });
+            prof.print();
+            prof.reset();
+        }
+    }
+    std.debug.print("\nPREFILL rows {d} to {d} ({d} chunks of {d}, wall of the whole prompt {d:.2} s = {d:.1} tok/s): table per chunk (a pass) over the chunks after the first 512 rows\n", .{ first_rows, pos, chunks, chunk, secs(wall), @as(f64, @floatFromInt(pos)) / secs(wall) });
+    prof.print();
+    xpu.profile.active = null;
+    var token = argmax(try lastLogits(r, &cache, logits));
+    std.debug.print("\nDECODE at context {d}\n", .{cache.len});
+    try profileDecode(ctx, io, m, scratch, &cache, r, logits, token, steps, null);
+    var smp = try ink.sampler.Sampler.init(gpa, r, ctx, 1);
+    defer smp.deinit();
+    token = argmax(try lastLogits(r, &cache, logits));
+    try profileDecode(ctx, io, m, scratch, &cache, r, logits, token, steps, &smp);
+}
+
+/// Windows of n real rows (the prompt's own next tokens, so the routing is real) through `runShared` the way the backend's
+/// verify runs them: all rows' logits, the taps, begin and rollback around each. Median of the reps, in ms: the forward,
+/// then the forward and the host argmax of every row's downloaded logits (the greedy verify today).
+fn verifyBench(gpa: std.mem.Allocator, io: std.Io, ctx: *xpu.Context, m: *const ink.model.Model, scratch: *state.Scratch, r: *xpu.rt.Runtime, schedule: anytype, capacity: usize, ids: []const u32, host: []f32, profile: bool, route_union: bool) !void {
+    var cache = try state.Cache.init(r, capacity, schedule, .bf16);
+    defer cache.deinit();
+    scratch.taps = try r.alloc(state.captureBytes(state.max_rows));
+    const prefix: usize = @min(ids.len / 2, 512);
+    var pos: usize = 0;
+    while (pos < prefix) {
+        const n = @min(state.max_rows, prefix - pos);
+        try ink.forward.run(m, scratch, &cache, ids[pos..][0..n], .{});
+        cache.len += n;
+        pos += n;
+    }
+    const sizes = [_]usize{ 1, 2, 3, 4, 6, 8, 12, 16 };
+    const reps = 15;
+    var base_ms: f64 = 0;
+    std.debug.print("\nVERIFY BENCH at context {d}: windows of real rows, all rows' logits and taps; median of {d}\n", .{ cache.len, reps });
+    std.debug.print("rows   forward ms   x one row   forward+host argmax ms   x one row\n", .{});
+    for (sizes) |n| {
+        var fw: [reps]f64 = undefined;
+        var tot: [reps]f64 = undefined;
+        for (0..reps) |rep| {
+            const from = prefix + (rep * 7) % 64;
+            try cache.begin(n);
+            const t0 = nowNs(io);
+            try ink.forward.runShared(m, scratch, &.{.{ .cache = &cache, .rows = n }}, ids[from..][0..n], .{ .all = true, .taps = scratch.taps.?.ptr });
+            const t1 = nowNs(io);
+            try r.download(std.mem.sliceAsBytes(host[0 .. n * vocab]), scratch.logits_all);
+            try r.sync();
+            var sink: u32 = 0;
+            for (0..n) |j| sink +%= argmax(host[j * vocab ..][0..vocab]);
+            std.mem.doNotOptimizeAway(sink);
+            const t2 = nowNs(io);
+            fw[rep] = 1000 * secs(t1 - t0);
+            tot[rep] = 1000 * secs(t2 - t0);
+            try cache.rollback();
+        }
+        std.mem.sort(f64, &fw, {}, std.sort.asc(f64));
+        std.mem.sort(f64, &tot, {}, std.sort.asc(f64));
+        if (n == 1) base_ms = fw[reps / 2];
+        std.debug.print("{d:4}   {d:10.2}   {d:9.2}   {d:22.2}   {d:9.2}\n", .{ n, fw[reps / 2], fw[reps / 2] / base_ms, tot[reps / 2], tot[reps / 2] / base_ms });
+    }
+    if (route_union) try routeUnion(gpa, m, scratch, r, &cache, ids, prefix);
+    if (profile) {
+        var prof = try xpu.profile.Profile.init(ctx, 8192, true);
+        defer prof.deinit();
+        for ([_]usize{ 2, 8 }) |n| {
+            xpu.profile.active = &prof;
+            prof.reset();
+            for (0..4) |rep| {
+                try cache.begin(n);
+                try ink.forward.runShared(m, scratch, &.{.{ .cache = &cache, .rows = n }}, ids[prefix + rep * 5 ..][0..n], .{ .all = true, .taps = scratch.taps.?.ptr });
+                try prof.collect();
+                try cache.rollback();
+            }
+            xpu.profile.active = null;
+            std.debug.print("\nPROFILE of a verify window of {d} rows (mean of 4 windows, per window)\n", .{n});
+            prof.print();
+        }
+    }
+}
+
+/// The distinct experts a window of n real rows reads in a visit, averaged over the visits of the same precision and over
+/// windows that slide through the prompt, against the random-routing model 128 (1 - (120/128)^n) of PLAN section 3.
+fn routeUnion(gpa: std.mem.Allocator, m: *const ink.model.Model, scratch: *state.Scratch, r: *xpu.rt.Runtime, cache: *state.Cache, ids: []const u32, prefix: usize) !void {
+    const visits = 48;
+    var trace = try r.alloc(visits * 16 * 32);
+    defer trace.free();
+    ink.forward.route_trace = trace;
+    defer ink.forward.route_trace = null;
+    const host = try gpa.alloc(i32, visits * 16 * 8);
+    defer gpa.free(host);
+    std.debug.print("\nROUTE UNION: distinct experts of a window of n real rows, mean over visits and windows (NVFP4 visits 0 to 43, MXFP8 visits 44 to 47)\n", .{});
+    std.debug.print("rows   nvfp4 measured   random model   ratio   mxfp8 measured   random model\n", .{});
+    const windows = 40;
+    for ([_]usize{ 1, 2, 3, 4, 6, 8, 12, 16 }) |n| {
+        var sum_nv: f64 = 0;
+        var sum_mx: f64 = 0;
+        for (0..windows) |w| {
+            const from = prefix + (w * 13) % 400;
+            try cache.begin(n);
+            try ink.forward.runShared(m, scratch, &.{.{ .cache = cache, .rows = n }}, ids[from..][0..n], .{ .all = true });
+            try r.download(std.mem.sliceAsBytes(host[0 .. visits * n * 8]), trace);
+            try r.sync();
+            try cache.rollback();
+            for (0..visits) |v| {
+                var seen: [128]bool = @splat(false);
+                var count: f64 = 0;
+                for (host[v * n * 8 ..][0 .. n * 8]) |e| {
+                    const ei: usize = @intCast(e);
+                    if (!seen[ei]) count += 1;
+                    seen[ei] = true;
+                }
+                if (v < 44) sum_nv += count else sum_mx += count;
+            }
+        }
+        const w: f64 = @floatFromInt(windows);
+        const model_u = 128.0 * (1.0 - std.math.pow(f64, 120.0 / 128.0, @floatFromInt(n)));
+        std.debug.print("{d:4}   {d:14.2}   {d:12.2}   {d:5.2}   {d:14.2}   {d:12.2}\n", .{ n, sum_nv / (44 * w), model_u, sum_nv / (44 * w) / model_u, sum_mx / (4 * w), model_u });
     }
 }
 

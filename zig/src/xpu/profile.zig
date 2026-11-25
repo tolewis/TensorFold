@@ -11,6 +11,10 @@ const Error = @import("context.zig").Error;
 /// The profile launches report to, or none.
 pub var active: ?*Profile = null;
 
+/// A name the caller sets before launches that share one kernel (the dense projections); the profile keeps a row for each
+/// (kernel, label). Static strings only.
+pub var label: []const u8 = "";
+
 /// Host time of the exchange appends, when TF_TP_APPEND=1. Sites: copy, flag write, event create, event wait, kernel launch.
 pub var host_append_ns: [5]u64 = @splat(0);
 pub var append_n: [5]u64 = @splat(0);
@@ -72,10 +76,11 @@ pub fn nowNs() u64 {
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
-const Rec = struct { handle: ze.H, set_ns: u32, append_ns: u32, args: u16 };
+const Rec = struct { handle: ze.H, set_ns: u32, append_ns: u32, args: u16, label: []const u8 };
 
 pub const Row = struct {
     name: [64]u8 = @splat(0),
+    label: []const u8 = "",
     calls: u64 = 0,
     device_ns: u64 = 0,
     set_ns: u64 = 0,
@@ -93,7 +98,7 @@ pub const Profile = struct {
     dropped: usize = 0,
     device_time: bool,
     rows: std.ArrayList(Row) = .empty,
-    names: std.ArrayList(struct { handle: ze.H, row: usize }) = .empty,
+    names: std.ArrayList(struct { handle: ze.H, label: []const u8, row: usize }) = .empty,
     /// Totals over every `collect`.
     launches: u64 = 0,
     device_busy_ns: u64 = 0,
@@ -136,7 +141,7 @@ pub const Profile = struct {
             p.dropped += 1;
             return;
         }
-        p.recs[p.used] = .{ .handle = handle, .set_ns = @intCast(@min(set_ns, std.math.maxInt(u32))), .append_ns = @intCast(@min(append_ns, std.math.maxInt(u32))), .args = @intCast(args) };
+        p.recs[p.used] = .{ .label = label, .handle = handle, .set_ns = @intCast(@min(set_ns, std.math.maxInt(u32))), .append_ns = @intCast(@min(append_ns, std.math.maxInt(u32))), .args = @intCast(args) };
         p.used += 1;
     }
 
@@ -145,8 +150,8 @@ pub const Profile = struct {
         p.enqueued_at = nowNs();
     }
 
-    fn row(p: *Profile, handle: ze.H) !*Row {
-        for (p.names.items) |n| if (n.handle == handle) return &p.rows.items[n.row];
+    fn row(p: *Profile, handle: ze.H, lab: []const u8) !*Row {
+        for (p.names.items) |n| if (n.handle == handle and n.label.ptr == lab.ptr and n.label.len == lab.len) return &p.rows.items[n.row];
         var buf: [64]u8 = @splat(0);
         var size: usize = 0;
         const d = p.ctx.d;
@@ -155,13 +160,13 @@ pub const Profile = struct {
         if (size > full.len) return error.Invalid;
         try d.check(d.x.zeKernelGetName(handle, &size, &full), "zeKernelGetName");
         const name = std.mem.sliceTo(full[0..size], 0);
-        for (p.rows.items, 0..) |*r, i| if (std.mem.eql(u8, std.mem.sliceTo(&r.name, 0), name)) {
-            try p.names.append(gpa, .{ .handle = handle, .row = i });
+        for (p.rows.items, 0..) |*r, i| if (std.mem.eql(u8, std.mem.sliceTo(&r.name, 0), name) and std.mem.eql(u8, r.label, lab)) {
+            try p.names.append(gpa, .{ .handle = handle, .label = lab, .row = i });
             return r;
         };
         @memcpy(buf[0..@min(name.len, 63)], name[0..@min(name.len, 63)]);
-        try p.rows.append(gpa, .{ .name = buf });
-        try p.names.append(gpa, .{ .handle = handle, .row = p.rows.items.len - 1 });
+        try p.rows.append(gpa, .{ .name = buf, .label = lab });
+        try p.names.append(gpa, .{ .handle = handle, .label = lab, .row = p.rows.items.len - 1 });
         return &p.rows.items[p.rows.items.len - 1];
     }
 
@@ -186,7 +191,7 @@ pub const Profile = struct {
         var reduce_gaps: u64 = 0;
         var big: [8]struct { ns: u64, name: [24]u8 } = @splat(.{ .ns = 0, .name = @splat(0) });
         for (p.recs[0..p.used], 0..) |rec, i| {
-            const r = p.row(rec.handle) catch return error.Invalid;
+            const r = p.row(rec.handle, rec.label) catch return error.Invalid;
             r.calls += 1;
             r.set_ns += rec.set_ns;
             r.append_ns += rec.append_ns;
@@ -243,6 +248,17 @@ pub const Profile = struct {
         if (overlap_fd >= 0) _ = std.c.close(overlap_fd);
     }
 
+    /// Forgets every total (the capacity stays).
+    pub fn reset(p: *Profile) void {
+        p.rows.clearRetainingCapacity();
+        p.names.clearRetainingCapacity();
+        p.launches = 0;
+        p.device_busy_ns = 0;
+        p.device_span_ns = 0;
+        p.tokens = 0;
+        p.used = 0;
+    }
+
     fn lessDevice(_: void, a: Row, b: Row) bool {
         return if (a.device_ns != b.device_ns) a.device_ns > b.device_ns else a.set_ns + a.append_ns > b.set_ns + b.append_ns;
     }
@@ -251,7 +267,7 @@ pub const Profile = struct {
     pub fn print(p: *Profile) void {
         const n: f64 = @floatFromInt(@max(p.tokens, 1));
         std.mem.sort(Row, p.rows.items, {}, lessDevice);
-        std.debug.print("{s:<34} {s:>7} {s:>10} {s:>9} {s:>10} {s:>10} {s:>6}\n", .{ "kernel", "calls", "dev ms", "dev us/c", "set ms", "append ms", "args" });
+        std.debug.print("{s:<40} {s:>7} {s:>10} {s:>9} {s:>10} {s:>10} {s:>6}\n", .{ "kernel", "calls", "dev ms", "dev us/c", "set ms", "append ms", "args" });
         var calls: u64 = 0;
         var dev: u64 = 0;
         var set: u64 = 0;
@@ -259,14 +275,16 @@ pub const Profile = struct {
         var args: u64 = 0;
         for (p.rows.items) |r| {
             const c: f64 = @floatFromInt(@max(r.calls, 1));
-            std.debug.print("{s:<34} {d:>7.1} {d:>10.3} {d:>9.1} {d:>10.3} {d:>10.3} {d:>6.1}\n", .{ std.mem.sliceTo(&r.name, 0), @as(f64, @floatFromInt(r.calls)) / n, @as(f64, @floatFromInt(r.device_ns)) / 1e6 / n, @as(f64, @floatFromInt(r.device_ns)) / 1e3 / c, @as(f64, @floatFromInt(r.set_ns)) / 1e6 / n, @as(f64, @floatFromInt(r.append_ns)) / 1e6 / n, @as(f64, @floatFromInt(r.args)) / n });
+            var full_name: [96]u8 = undefined;
+            const shown = if (r.label.len > 0) (std.fmt.bufPrint(&full_name, "{s}:{s}", .{ r.label, std.mem.sliceTo(&r.name, 0) }) catch "?") else std.mem.sliceTo(&r.name, 0);
+            std.debug.print("{s:<40} {d:>7.1} {d:>10.3} {d:>9.1} {d:>10.3} {d:>10.3} {d:>6.1}\n", .{ shown, @as(f64, @floatFromInt(r.calls)) / n, @as(f64, @floatFromInt(r.device_ns)) / 1e6 / n, @as(f64, @floatFromInt(r.device_ns)) / 1e3 / c, @as(f64, @floatFromInt(r.set_ns)) / 1e6 / n, @as(f64, @floatFromInt(r.append_ns)) / 1e6 / n, @as(f64, @floatFromInt(r.args)) / n });
             calls += r.calls;
             dev += r.device_ns;
             set += r.set_ns;
             app += r.append_ns;
             args += r.args;
         }
-        std.debug.print("{s:<34} {d:>7.1} {d:>10.3} {s:>9} {d:>10.3} {d:>10.3} {d:>6.1}\n", .{ "all (a pass)", @as(f64, @floatFromInt(calls)) / n, @as(f64, @floatFromInt(dev)) / 1e6 / n, "", @as(f64, @floatFromInt(set)) / 1e6 / n, @as(f64, @floatFromInt(app)) / 1e6 / n, @as(f64, @floatFromInt(args)) / n });
+        std.debug.print("{s:<40} {d:>7.1} {d:>10.3} {s:>9} {d:>10.3} {d:>10.3} {d:>6.1}\n", .{ "all (a pass)", @as(f64, @floatFromInt(calls)) / n, @as(f64, @floatFromInt(dev)) / 1e6 / n, "", @as(f64, @floatFromInt(set)) / 1e6 / n, @as(f64, @floatFromInt(app)) / 1e6 / n, @as(f64, @floatFromInt(args)) / n });
         if (p.device_time) std.debug.print("device busy {d:.3} ms, first start to last end {d:.3} ms, idle between kernels {d:.3} ms (a pass); {d} launches not timed\n", .{ @as(f64, @floatFromInt(p.device_busy_ns)) / 1e6 / n, @as(f64, @floatFromInt(p.device_span_ns)) / 1e6 / n, @as(f64, @floatFromInt(p.device_span_ns -| p.device_busy_ns)) / 1e6 / n, p.dropped });
     }
 };

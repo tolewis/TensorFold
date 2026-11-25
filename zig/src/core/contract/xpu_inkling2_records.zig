@@ -23,8 +23,8 @@ pub const records = [_]R.Record{
         .usage = .{.{ .threads = .{ 256, 1, 1 }, .slm = 9344, .sub_group = 16, .grf = 256, .spill = 0, .private = 0 }},
     },
     .{
-        .launch = .{ .name = "inkling2 glue router", .symbol = "tf_inkling2_router", .image = "inkling2_glue", .format = native, .threads = .{ 256, 1, 1 }, .slm = 10304, .sub_group = 16, .grf = 256 },
-        .usage = .{.{ .threads = .{ 256, 1, 1 }, .slm = 10304, .sub_group = 16, .grf = 256, .spill = 0, .private = 0 }},
+        .launch = .{ .name = "inkling2 glue router", .symbol = "tf_inkling2_router", .image = "inkling2_glue", .format = native, .threads = .{ 256, 1, 1 }, .slm = 10848, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 256, 1, 1 }, .slm = 10848, .sub_group = 16, .grf = 256, .spill = 0, .private = 0 }},
     },
     .{
         .launch = .{ .name = "inkling2 glue swiglu", .symbol = "tf_inkling2_swiglu", .image = "inkling2_glue", .format = native, .threads = .{ 256, 1, 1 }, .slm = 0, .sub_group = 16, .grf = 256 },
@@ -83,8 +83,8 @@ pub const records = [_]R.Record{
         .usage = .{.{ .threads = .{ 256, 1, 1 }, .slm = 9344, .sub_group = 16, .grf = 256, .spill = 0, .private = 0 }},
     },
     .{
-        .launch = .{ .name = "planted inkling2 glue router (one edit)", .symbol = "tf_ctl_inkling2_router", .image = "inkling2_glue_ctl", .format = native, .threads = .{ 256, 1, 1 }, .slm = 10304, .sub_group = 16, .grf = 256 },
-        .usage = .{.{ .threads = .{ 256, 1, 1 }, .slm = 10304, .sub_group = 16, .grf = 256, .spill = 0, .private = 0 }},
+        .launch = .{ .name = "planted inkling2 glue router (one edit)", .symbol = "tf_ctl_inkling2_router", .image = "inkling2_glue_ctl", .format = native, .threads = .{ 256, 1, 1 }, .slm = 10848, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 256, 1, 1 }, .slm = 10848, .sub_group = 16, .grf = 256, .spill = 0, .private = 0 }},
     },
     .{
         .launch = .{ .name = "planted inkling2 glue swiglu (one edit)", .symbol = "tf_ctl_inkling2_swiglu", .image = "inkling2_glue_ctl", .format = native, .threads = .{ 256, 1, 1 }, .slm = 0, .sub_group = 16, .grf = 256 },

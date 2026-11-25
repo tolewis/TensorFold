@@ -62,7 +62,7 @@ pub const Drafter = struct {
     capacity: usize = 1,
     contexts: std.AutoHashMapUnmanaged(*Stream, state.Lane) = .empty,
     /// The pending token's host copy, and one row of bf16 logits.
-    host_id: [1]u32 = .{0},
+    host_id: [16]u32 = @splat(0),
     host_logits: []u16,
     /// Diagnostic trace (`TF_DSPARK_TRACE=file`): every absorb and the first blocks' intermediates, for replay against a reference.
     trace: ?*std.c.FILE = null,
@@ -293,7 +293,7 @@ pub const Drafter = struct {
         const target = d.target;
         const p = if (target.pipelines) |*x| x else return error.Inkling2NoKernels;
         d.host_id[0] = pending;
-        try sc.ids.upload(s, 0, std.mem.sliceAsBytes(&d.host_id));
+        try sc.ids.upload(s, 0, std.mem.sliceAsBytes(&d.host_id)); // tokens [0..8): the pending token, then the drafts; cfg [8..16)
         try glue.embedNorm(&p.glue, s, at(sc.ids, 0), target.weights.embed.buf.ptr, target.weights.embed_norm.buf.ptr, at(sc.x, 0), 1);
         try k.initializeRows(&d.kernels, s, at(sc.x, 0), r(d.weights.weights.mask), at(sc.x, 0));
         try k.residualNorm(&d.kernels, s, at(sc.x, 0), at(sc.resid, 0), r(d.weights.weights.layers[0].input_norm), at(sc.resid, 0), at(sc.x, 0), 8, true);
@@ -329,12 +329,24 @@ pub const Drafter = struct {
         try k.kappa(&d.kernels, s, at(sc.x, state.hidden * 2), at(lane.newest, 0), r(d.weights.weights.rnn), r(d.weights.weights.rnn_bias), at(sc.kappa, 0), @intCast(depth));
     }
 
-    fn recurrent(d: *Drafter, step: usize, previous: u32, second_bank: bool) !void {
+    fn recurrent(d: *Drafter, step: usize, second_bank: bool) !void {
         const sc = &d.scratch;
         const current = if (second_bank) sc.next_state else sc.state;
         const next = if (second_bank) sc.state else sc.next_state;
-        try k.recurrentStep(&d.kernels, d.stream, at(current, 0), at(sc.kappa, step * 3 * state.rank * 4), r(d.weights.weights.rnn), r(d.weights.weights.markov_w1), at(sc.z, 0), at(next, 0), at(sc.lambda, 0), previous);
+        try k.recurrentStep(&d.kernels, d.stream, at(current, 0), at(sc.kappa, step * 3 * state.rank * 4), r(d.weights.weights.rnn), r(d.weights.weights.markov_w1), at(sc.z, 0), at(next, 0), at(sc.lambda, 0), at(sc.ids, step * 4));
         try k.finalLogits(&d.kernels, d.stream, at(sc.base, step * state.vocabulary * 2), at(d.weights.phi, 0), at(d.weights.beta, 0), at(sc.lambda, 0), at(sc.logits, 0));
+    }
+
+    /// Every 50 holds under TF_DSPARK_TIMES: the mean time of a hold (block, and on the device path every draft too).
+    fn report(d: *Drafter) void {
+        const t = d.times;
+        if (t.holds % 50 != 0) return;
+        const ms = struct {
+            fn of(ns: u64, n: u64) f64 {
+                return @as(f64, @floatFromInt(ns)) / 1e6 / @as(f64, @floatFromInt(@max(n, 1)));
+            }
+        }.of;
+        std.log.info("dspark times: holds {d} drafts/hold {d:.2} | per hold: block {d:.2} ms; per draft: step {d:.2} download {d:.2} sample {d:.2} ms | absorb {d:.2} ms each ({d})", .{ t.holds, @as(f64, @floatFromInt(t.drafts)) / @as(f64, @floatFromInt(t.holds)), ms(t.block, t.holds), ms(t.step, t.drafts), ms(t.download, t.drafts), ms(t.sample, t.drafts), ms(t.absorb, t.absorbs), t.absorbs });
     }
 
     fn holdFn(ptr: *anyopaque, items: []const dr.Hold) anyerror!void {
@@ -360,8 +372,46 @@ pub const Drafter = struct {
                 d.traceDevice('f', &.{0}, at(lane.newest, 0), state.hidden * 2);
             }
             const t0 = nowNs();
+            // Sampled drafts draw on the device (the host sort of a 200058-wide row took 9 to 11 ms a draft). A greedy draft is a download and an argmax on the host, about 0.2 ms, and the single-group device draw costs more than that.
+            const on_device = d.trace == null and item.sampling != null and item.sampling.?.top_k <= 1024;
+            if (on_device) {
+                // Every draft is drawn on the device and the next recurrent step reads it there: one sync a block.
+                const rule: gpu_rule.Rule = if (item.sampling) |sm| gpu_rule.rule(sm) else .{ .seed = 0, .inv_t = 1.0, .top_p = 1.0, .min_log = -std.math.inf(f32), .top_k = 0 };
+                const base_position = std.math.cast(u32, item.position) orelse return error.DraftDepth;
+                const halves = rule.seedHalves();
+                d.host_id[8] = @bitCast(rule.inv_t);
+                d.host_id[9] = @bitCast(rule.top_p);
+                d.host_id[10] = @bitCast(rule.min_log);
+                d.host_id[11] = rule.top_k;
+                d.host_id[12] = halves[0];
+                d.host_id[13] = halves[1];
+                d.host_id[14] = 0;
+                d.host_id[15] = @intFromBool(item.sampling == null);
+                try d.encodeBlock(lane, item.pending, anchor, depth, debug);
+                var second_bank = false;
+                for (0..depth) |step| {
+                    if (step != 0) second_bank = !second_bank;
+                    try d.recurrent(step, second_bank);
+                    try k.draw(&d.kernels, d.stream, at(d.scratch.logits, 0), at(d.scratch.ids, 32), at(d.scratch.ids, 4 * (step + 1)), state.vocabulary, base_position +% @as(u32, @intCast(step)));
+                }
+                var tokens: [8]u32 = undefined;
+                try d.scratch.ids.download(d.stream, 0, std.mem.sliceAsBytes(&tokens));
+                try d.stream.synchronize();
+                for (0..depth) |step| {
+                    if (tokens[step + 1] >= state.vocabulary) return error.DraftNonfinite;
+                    lane.held[step] = tokens[step + 1];
+                }
+                lane.held_len = @intCast(offered);
+                if (d.times.on) {
+                    d.times.block += nowNs() - t0;
+                    d.times.drafts += depth;
+                    d.times.holds += 1;
+                    d.report();
+                }
+                continue;
+            }
             try d.encodeBlock(lane, item.pending, anchor, depth, debug);
-            try d.recurrent(0, item.pending, false);
+            try d.recurrent(0, false);
             try d.stream.synchronize();
             if (d.times.on) d.times.block += nowNs() - t0;
             if (debug) d.traceDevice('a', &.{0}, at(d.scratch.kappa, 0), depth * 3 * state.rank * 4);
@@ -373,7 +423,8 @@ pub const Drafter = struct {
                 var t1 = nowNs();
                 if (step != 0) {
                     second_bank = !second_bank;
-                    try d.recurrent(step, previous, second_bank);
+                    try d.scratch.ids.upload(d.stream, step * 4, std.mem.asBytes(&previous));
+                    try d.recurrent(step, second_bank);
                     try d.stream.synchronize();
                 }
                 if (d.times.on) {
@@ -418,15 +469,7 @@ pub const Drafter = struct {
             lane.held_len = @intCast(offered);
             if (d.times.on) {
                 d.times.holds += 1;
-                if (d.times.holds % 50 == 0) {
-                    const t = d.times;
-                    const ms = struct {
-                        fn of(ns: u64, n: u64) f64 {
-                            return @as(f64, @floatFromInt(ns)) / 1e6 / @as(f64, @floatFromInt(@max(n, 1)));
-                        }
-                    }.of;
-                    std.log.info("dspark times: holds {d} drafts/hold {d:.2} | per hold: block {d:.2} ms; per draft: step {d:.2} download {d:.2} sample {d:.2} ms | absorb {d:.2} ms each ({d})", .{ t.holds, @as(f64, @floatFromInt(t.drafts)) / @as(f64, @floatFromInt(t.holds)), ms(t.block, t.holds), ms(t.step, t.drafts), ms(t.download, t.drafts), ms(t.sample, t.drafts), ms(t.absorb, t.absorbs), t.absorbs });
-                }
+                d.report();
             }
             if (d.trace != null) {
                 const head = [_]u64{ item.position, item.pending, depth, lane.end, lane.from, offered };

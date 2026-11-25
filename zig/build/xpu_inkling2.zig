@@ -6,7 +6,7 @@ const std = @import("std");
 const options = "-cl-std=CL3.0 -cl-intel-256-GRF-per-thread -cl-fp32-correctly-rounded-divide-sqrt";
 
 /// The image names the records and the runner use.
-pub const names = [_][]const u8{ "inkling2_glue", "inkling2_runtime", "inkling2_glue_ctl", "inkling2_runtime_ctl" };
+pub const names = [_][]const u8{ "inkling2_glue", "inkling2_runtime", "inkling2_glue_ctl", "inkling2_runtime_ctl", "inkling2_prefill", "inkling2_prefill_ctl" };
 
 fn compile(b: *std.Build, ocloc: []const u8, device: []const u8, name: []const u8, source: std.Build.LazyPath) std.Build.LazyPath {
     const run = b.addSystemCommand(&.{ ocloc, "compile", "-q", "-file" });
@@ -25,7 +25,7 @@ fn control(b: *std.Build, gen: *std.Build.Step.Compile, part: []const u8, produc
 }
 
 /// The four zebins for `device`, in `names` order.
-pub fn images(b: *std.Build, ocloc: []const u8, device: []const u8) [4]std.Build.LazyPath {
+pub fn images(b: *std.Build, ocloc: []const u8, device: []const u8) [6]std.Build.LazyPath {
     const gen = b.addExecutable(.{ .name = "inkling2-control-gen", .root_module = b.createModule(.{
         .root_source_file = b.path("zig/tests/xpu/inkling2_control_gen.zig"),
         .target = b.graph.host,
@@ -33,11 +33,14 @@ pub fn images(b: *std.Build, ocloc: []const u8, device: []const u8) [4]std.Build
     }) });
     const glue = "zig/kernels/xpu/inkling2/glue.cl";
     const runtime = "zig/kernels/xpu/inkling2/runtime.cl";
+    const prefill = "zig/kernels/xpu/inkling2/prefill.cl";
     return .{
         compile(b, ocloc, device, names[0], b.path(glue)),
         compile(b, ocloc, device, names[1], b.path(runtime)),
         compile(b, ocloc, device, names[2], control(b, gen, "glue", glue, "glue_ctl.cl")),
         compile(b, ocloc, device, names[3], control(b, gen, "runtime", runtime, "runtime_ctl.cl")),
+        compile(b, ocloc, device, names[4], b.path(prefill)),
+        compile(b, ocloc, device, names[5], control(b, gen, "prefill", prefill, "prefill_ctl.cl")),
     };
 }
 
@@ -62,6 +65,7 @@ pub fn controlsTest(b: *std.Build) void {
     const m = b.createModule(.{ .root_source_file = b.path("zig/tests/xpu/inkling2_controls.zig"), .target = b.graph.host, .optimize = .Debug });
     m.addAnonymousImport("inkling2_glue_cl", .{ .root_source_file = b.path("zig/kernels/xpu/inkling2/glue.cl") });
     m.addAnonymousImport("inkling2_runtime_cl", .{ .root_source_file = b.path("zig/kernels/xpu/inkling2/runtime.cl") });
+    m.addAnonymousImport("inkling2_prefill_cl", .{ .root_source_file = b.path("zig/kernels/xpu/inkling2/prefill.cl") });
     b.step("test-inkling2-xpu-controls", "Inkling 2 Mini's XPU source controls plant one fault each (no device, no ocloc)").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
 }
 
@@ -75,14 +79,19 @@ const production_images = [_]Production{
     .{ .name = "glue", .path = "zig/kernels/xpu/inkling2/glue.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt" },
     .{ .name = "experts", .path = "zig/kernels/xpu/inkling2/experts.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2" },
     .{ .name = "loop", .path = "zig/kernels/xpu/inkling2/loop.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt" },
+    .{ .name = "fuse", .path = "zig/kernels/xpu/inkling2/fuse.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt" },
     .{ .name = "runtime", .path = "zig/kernels/xpu/inkling2/runtime.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt" },
     .{ .name = "dense", .path = "zig/kernels/xpu/inkling2/dense.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2" },
     // the sampler's candidate selection
     .{ .name = "sample", .path = "zig/kernels/xpu/inkling2/sample.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt" },
     // the drafter's kernels: the engine loads this one only with a drafter
     .{ .name = "dspark", .path = "zig/kernels/xpu/inkling2/dspark.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2" },
+    .{ .name = "dflash2", .path = "zig/kernels/xpu/inkling2/dflash2.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2" },
     .{ .name = "dense_q8", .path = "zig/kernels/xpu/inkling2/dense_q8.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2" },
     .{ .name = "tp", .path = "zig/kernels/xpu/inkling2/tp.cl" },
+    // the prompt chunk's row-batched glue, grouped expert GEMMs, DPAS projections and attention
+    .{ .name = "prefill", .path = "zig/kernels/xpu/inkling2/prefill.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2" },
+    .{ .name = "prefill_experts", .path = "zig/kernels/xpu/inkling2/prefill_experts.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2" },
 };
 
 /// The module `inkling2_xpu_images`: every production kernel as a native zebin for `device`, one `align(8)` array each,

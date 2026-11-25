@@ -202,7 +202,7 @@ pub const Probe = struct {
         const s = self.rig.dev.s;
         switch (self.kind) {
             .messages => try host.crossPassMessageAttention(&self.pipes, s, self.refs[0], self.refs[1], self.refs[2], self.refs[3], self.out, rows),
-            .gates => try host.gates(&self.pipes, s, self.refs[0], self.refs[1], self.refs[2], self.refs[3], self.refs[4], self.refs[5], self.out, rows),
+            .gates => try host.gates(&self.pipes, s, self.refs[0], self.refs[1], self.refs[2], self.refs[3], self.refs[4], self.refs[5], self.out, rows, p.hidden),
         }
         try s.synchronize();
     }
