@@ -150,6 +150,38 @@ const qwen27_records = [_]Record{
         .usage = .{.{ .threads = .{ 256, 1, 1 }, .slm = 640, .sub_group = 16, .grf = 256 }},
     },
     .{
+        .launch = .{ .name = "inkling2 fuse zeta", .symbol = "tf_ink2_zeta_wide", .image = "contract_inkling2_fuse", .format = glue, .threads = .{ 256, 1, 1 }, .slm = 9280, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 256, 1, 1 }, .slm = 9280, .sub_group = 16, .grf = 256 }},
+    },
+    .{
+        .launch = .{ .name = "planted inkling2 fuse zeta stores zero", .symbol = "tf_ink2_zeta_wide", .image = "contract_inkling2_fuse_controls", .format = glue, .threads = .{ 256, 1, 1 }, .slm = 9280, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 256, 1, 1 }, .slm = 9280, .sub_group = 16, .grf = 256 }},
+    },
+    .{
+        .launch = .{ .name = "inkling2 fuse gates", .symbol = "tf_ink2_fuse_gates", .image = "contract_inkling2_fuse", .format = glue, .threads = .{ 64, 1, 1 }, .slm = 256, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 64, 1, 1 }, .slm = 256, .sub_group = 16, .grf = 256 }},
+    },
+    .{
+        .launch = .{ .name = "planted inkling2 fuse gates drops the message term", .symbol = "tf_ink2_fuse_gates", .image = "contract_inkling2_fuse_controls", .format = glue, .threads = .{ 64, 1, 1 }, .slm = 256, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 64, 1, 1 }, .slm = 256, .sub_group = 16, .grf = 256 }},
+    },
+    .{
+        .launch = .{ .name = "inkling2 fuse epilogue", .symbol = "tf_ink2_down_epilogue", .image = "contract_inkling2_fuse", .format = glue, .threads = .{ 256, 1, 1 }, .slm = 0, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 256, 1, 1 }, .sub_group = 16, .grf = 256 }},
+    },
+    .{
+        .launch = .{ .name = "planted inkling2 fuse epilogue drops the residual add", .symbol = "tf_ink2_down_epilogue", .image = "contract_inkling2_fuse_controls", .format = glue, .threads = .{ 256, 1, 1 }, .slm = 0, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 256, 1, 1 }, .sub_group = 16, .grf = 256 }},
+    },
+    .{
+        .launch = .{ .name = "inkling2 fuse norm-router", .symbol = "tf_ink2_router_norm_gemv", .image = "contract_inkling2_fuse", .format = glue, .threads = .{ 256, 1, 1 }, .slm = 4672, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 256, 1, 1 }, .slm = 4672, .sub_group = 16, .grf = 256 }},
+    },
+    .{
+        .launch = .{ .name = "planted inkling2 fuse norm-router drops the norm", .symbol = "tf_ink2_router_norm_gemv", .image = "contract_inkling2_fuse_controls", .format = glue, .threads = .{ 256, 1, 1 }, .slm = 4672, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 256, 1, 1 }, .slm = 4672, .sub_group = 16, .grf = 256 }},
+    },
+    .{
         .launch = .{ .name = "inkling2 attention prep", .symbol = "tf_ink2_prep", .image = "inkling2_attention", .format = glue, .threads = .{ 16, 1, 1 }, .sub_group = 16, .grf = 256 },
         .usage = .{.{ .threads = .{ 16, 1, 1 }, .sub_group = 16, .grf = 256 }},
     },

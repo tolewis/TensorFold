@@ -111,10 +111,14 @@ pub fn main(init: std.process.Init) !u8 {
         made += 1;
     };
     for (loops[0..made]) |*x| try kernels.append(a, x.kernel());
-    var fuses: [2]fuse_k.Probe = undefined;
-    for (&fuses, [_]bool{ false, true }) |*x, control| x.* = try fuse_k.Probe.init(a, &dev, .pre, control);
-    defer for (&fuses) |*x| x.deinit();
-    for (&fuses) |*x| try kernels.append(a, x.kernel());
+    var fuses: [2 * std.enums.values(fuse_k.Kind).len]fuse_k.Probe = undefined;
+    var fuse_n: usize = 0;
+    defer for (fuses[0..fuse_n]) |*x| x.deinit();
+    for (std.enums.values(fuse_k.Kind)) |kind| for ([_]bool{ false, true }) |control| {
+        fuses[fuse_n] = try fuse_k.Probe.init(a, &dev, kind, control);
+        fuse_n += 1;
+    };
+    for (fuses[0..fuse_n]) |*x| try kernels.append(a, x.kernel());
     var ink2_glue = ink2_glue_k.Suite{ .a = a, .dev = &dev, .kernels = &kernels };
     defer ink2_glue.deinit();
     try ink2_glue.collect(null);

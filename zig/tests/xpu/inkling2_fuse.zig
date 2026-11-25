@@ -43,6 +43,11 @@ pub const Probe = struct {
     p0: ?*anyopaque = null,
     p1: ?*anyopaque = null,
     p2: ?*anyopaque = null,
+    p3: ?*anyopaque = null,
+    p4: ?*anyopaque = null,
+    p5: ?*anyopaque = null,
+    p6: ?*anyopaque = null,
+    p7: ?*anyopaque = null,
 
     pub fn init(a: std.mem.Allocator, dev: *rig_.Dev, kind: Kind, control: bool) !Probe {
         const image: rig_.Image = if (control) .inkling2_fuse_controls else .inkling2_fuse;
@@ -109,20 +114,69 @@ pub const Probe = struct {
         self.args_ready = true;
         return true;
     }
-    fn upload(self: *Probe, seed: u64) !void {
-        var rng = std.Random.DefaultPrng.init(seed);
-        const rnd = rng.random();
-        const rows = self.shape.rows;
-        const x = try self.a.alloc(f32, rows * H);
+    fn ones(self: *Probe, n: usize, nan0: bool) !?*anyopaque {
+        const x = try self.a.alloc(f32, n);
         defer self.a.free(x);
-        for (x) |*v| v.* = rnd.float(f32) * 0.2 - 0.1;
-        if (self.fill == .nonfinite) x[0] = std.math.nan(f32);
-        self.p0 = try self.rig.input(std.mem.sliceAsBytes(x));
-        self.p1 = try self.rig.scratch(rows * H * 4);
-        self.p2 = try self.rig.scratch(8 * 4);
+        @memset(x, 1);
+        if (nan0) x[0] = std.math.nan(f32);
+        return try self.rig.input(std.mem.sliceAsBytes(x));
+    }
+    fn bfOnes(self: *Probe, n: usize) !?*anyopaque {
+        const x = try self.a.alloc(u16, n);
+        defer self.a.free(x);
+        @memset(x, 0x3f80);
+        return try self.rig.input(std.mem.sliceAsBytes(x));
+    }
+    fn upload(self: *Probe, seed: u64) !void {
+        _ = seed;
+        const rows = self.shape.rows;
+        const nan0 = self.fill == .nonfinite;
         switch (self.kind) {
-            .pre => self.expectPre(x),
-            .zeta, .gates, .epi, .norm => @memset(self.host, 0),
+            .pre => {
+                self.p0 = try self.ones(rows * H, nan0);
+                self.p1 = try self.rig.scratch(rows * H * 4);
+                var x = try self.a.alloc(f32, rows * H);
+                defer self.a.free(x);
+                @memset(x, 1);
+                if (nan0) x[0] = std.math.nan(f32);
+                self.expectPre(x);
+            },
+            .zeta => {
+                self.p0 = try self.ones(rows * H, nan0);
+                self.p1 = try self.ones(rows * 4 * H, nan0);
+                self.p2 = try self.bfOnes(64 * 2 * H);
+                self.expectZeta();
+            },
+            .gates => {
+                self.p0 = try self.ones(rows * H, nan0);
+                self.p1 = try self.ones(rows * 4 * H, false);
+                self.p2 = try self.bfOnes(H * 64);
+                self.p3 = try self.ones(rows * 256, false);
+                self.p4 = try self.rig.scratch(H * 64 * 2);
+                @memset(self.host, 1);
+            },
+            .epi => {
+                self.p0 = try self.rig.scratch(8 * rows * H * 2);
+                self.p1 = try self.rig.scratch(rows * 8 * 4);
+                self.p2 = try self.rig.scratch(rows * 8 * 4);
+                self.p3 = try self.rig.scratch(3 * H * 2);
+                self.p4 = try self.rig.scratch(H * 4 * 2);
+                self.p6 = try self.rig.scratch((rows + 3) * H * 2);
+                self.p7 = try self.rig.scratch(rows * H * 2);
+                const part = try self.a.alloc(f32, rows * H);
+                defer self.a.free(part);
+                @memset(part, 1);
+                if (nan0) part[0] = std.math.nan(f32);
+                self.p5 = try self.rig.input(std.mem.sliceAsBytes(part));
+                @memset(self.host, 1);
+            },
+            .norm => {
+                self.p0 = try self.ones(rows * H, nan0);
+                self.p1 = try self.bfOnes(H);
+                self.p2 = try self.bfOnes(128 * H);
+                self.p3 = try self.rig.scratch(rows * H * 2);
+                @memset(self.host, 1);
+            },
         }
     }
     fn expectPre(self: *Probe, x: []const f32) void {
@@ -143,7 +197,20 @@ pub const Probe = struct {
                 self.p1, self.p0, self.p1, self.p0, self.outp, self.p1, self.p1, self.p1, self.p1, self.p1, self.p1,
                 rows, @as(u32, H), @as(u32, 1), @as(u32, 1), @as(u32, 0),
             }),
-            .zeta, .gates, .epi, .norm => {},
+            .zeta => try xpu.launch.dispatch(self.kern, s, .{ 4, 1, rows }, .{
+                self.p0, self.p1, self.p2, self.p2, self.p2, self.outp, rows, @as(u32, 1), @as(u32, 1), @as(u32, 0), @as(u32, 4), @as(u32, 0),
+            }),
+            .gates => try xpu.launch.dispatch(self.kern, s, .{ 36, 1, rows }, .{
+                self.p0, self.p1, self.p4, self.p4, self.p4, self.p2, self.p2, self.p2, self.p3, self.outp,
+                rows, @as(u32, 1), @as(u32, 1), @as(u32, 0), @as(u32, 4),
+            }),
+            .epi => try xpu.launch.dispatch(self.kern, s, .{ 9, 1, 1 }, .{
+                self.p0, self.p1, self.p2, self.p3, self.p6, self.p4, self.p7, self.p7, self.p5, self.outp,
+                @as(u32, H), @as(u32, 8), @as(u32, H), rows,
+            }),
+            .norm => try xpu.launch.dispatch(self.kern, s, .{ 8, rows, 1 }, .{
+                self.p0, self.p1, self.p2, self.p3, self.outp, rows,
+            }),
         }
         try s.synchronize();
     }
@@ -158,14 +225,31 @@ pub const Probe = struct {
     pub fn check(self: *Probe, at: g.Gate) !?[]const u8 {
         const out = try self.rig.outputBytes();
         if (at == .nonfinite) {
-            if (self.kind != .pre) return null;
+            if (self.kind == .epi) {
+                const bits: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, out));
+                for (bits) |b| if (b & 0x7f80 == 0x7f80) return null;
+                return "no NaN in the bf16 output";
+            }
             const f: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, out));
             for (f) |v| if (!std.math.isFinite(v)) return null;
             return "no non-finite output";
         }
-        if (at != .shapes or self.kind != .pre or self.fill == .nonfinite) return null;
+        if (at != .shapes or self.fill == .nonfinite) return null;
+        if (self.kind == .epi) {
+            const got: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, out));
+            for (got) |bits| if (bits != 0x3f80) return "epilogue left bf16(1)";
+            return null;
+        }
         const got: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, out));
-        for (got, self.host) |gv, w| if (!std.math.isFinite(gv) or @abs(gv - w) > 1e-3) return "prologue left the host residual";
+        const tol: f32 = if (self.kind == .zeta) 64 else 1e-3;
+        for (got, self.host) |gv, w| if (!std.math.isFinite(gv) or @abs(gv - w) > tol) return "fused output left the host value";
         return null;
+    }
+    fn expectZeta(self: *Probe) void {
+        const inv = 1.0 / @sqrt(1.0 + 1e-6);
+        const unit = c.fromBf16(c.toBf16(@as(f32, @floatCast(inv))));
+        const dot = unit * 4608;
+        const stored = c.fromBf16(c.toBf16(@as(f32, @floatCast(dot))));
+        @memset(self.host, stored);
     }
 };
