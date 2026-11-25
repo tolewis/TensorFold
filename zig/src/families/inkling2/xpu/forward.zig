@@ -30,6 +30,26 @@ fn dumpWanted() bool {
 var slice_own_dumped = false;
 var slice_pulled_dumped = false;
 
+var vdump_seq: u32 = 0;
+
+/// TF_TP_VDUMP: the hidden state after each visit of a short call (a verify window or a decode row), for the bisect.
+fn dumpVisit(r: *xpu.rt.Runtime, rank: u32, seq: u32, visit: usize, src: ?*anyopaque, rows: usize) !void {
+    const dir_z = std.c.getenv("TF_TP_VDUMP") orelse return;
+    const ptr = src orelse return;
+    const bytes: usize = rows * 2304 * 2;
+    const host = try std.heap.page_allocator.alloc(u8, bytes);
+    defer std.heap.page_allocator.free(host);
+    try r.download(host, .{ .rt = r, .ptr = ptr, .len = bytes });
+    try r.sync();
+    var path_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/c{d}-v{d}-r{d}.bin", .{ std.mem.span(dir_z), seq, visit, rank }) catch return;
+    path_buf[path.len] = 0;
+    const fd = open(path_buf[0..path.len :0], 1 | 64 | 512, 0o644);
+    if (fd < 0) return;
+    _ = std.c.write(fd, host.ptr, bytes);
+    _ = std.c.close(fd);
+}
+
 fn dumpF32(r: *xpu.rt.Runtime, rank: u32, name: []const u8, src: ?*anyopaque, n: u32) !void {
     const dir_z = std.c.getenv("TF_TP_DUMP") orelse return;
     const ptr = src orelse return;
@@ -771,7 +791,30 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     const g = Run{ .m = m, .p = p, .s = stream, .sc = s, .wrote = if (fuse.roleConv() and rows == 1) &wrote else null };
     if (m.options.place.rank == 0) if (group.live) |gp| try gp.note(.forward, ids, if (options.all) 1 else 0, @intCast(segments[0].cache.len));
     try glue.embedNorm(&p.glue, stream, at(s.ids, 0), tensor(m.weights.embed), tensor(m.weights.embed_norm), at(s.p, 0), @intCast(rows));
-    for (m.weight_plan.visits[0..m.weight_plan.n_visits], 0..) |*v, vi| try g.visit(v, segments, rows, options.taps, vi);
+    const vdump = std.c.getenv("TF_TP_VDUMP") != null and rows <= state.batch_rows;
+    const seq = vdump_seq;
+    if (vdump) vdump_seq += 1;
+    for (m.weight_plan.visits[0..m.weight_plan.n_visits], 0..) |*v, vi| {
+        try g.visit(v, segments, rows, options.taps, vi);
+        if (vdump) try dumpVisit(m.r, m.options.place.rank, seq, vi, at(s.p, 0), rows);
+    }
+    if (vdump) {
+        var meta_buf: [64]u8 = undefined;
+        const meta = std.fmt.bufPrint(&meta_buf, "c{d} rows {d} base {d}\n", .{ seq, rows, segments[0].cache.len }) catch "";
+        if (meta.len > 0) {
+            const dir_z = std.c.getenv("TF_TP_VDUMP").?;
+            var path_buf: [512]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "{s}/meta-r{d}.txt", .{ std.mem.span(dir_z), m.options.place.rank }) catch "";
+            if (path.len > 0) {
+                path_buf[path.len] = 0;
+                const fd = open(path_buf[0..path.len :0], 1 | 64 | 1024, 0o644);
+                if (fd >= 0) {
+                    _ = std.c.write(fd, meta.ptr, meta.len);
+                    _ = std.c.close(fd);
+                }
+            }
+        }
+    }
     if (std.c.getenv("TF_TP_DUMP") != null) dump_fwd += 1;
     try g.widen(at(s.p, 0), at(s.partial, 0), rows);
     const final = finalPlan(rows, options.all, options.taps != null);
