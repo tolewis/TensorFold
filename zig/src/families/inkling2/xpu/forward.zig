@@ -563,6 +563,8 @@ fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) 
             try dumpVisit(m.r, m.options.place.rank, vdump_cur, 95, at(s.rel_tab, 0), rows, m.options.place.qHeads() * ap.extent);
             try dumpVisit(m.r, m.options.place.rank, vdump_cur, 96, at(s.k_raw, 0), rows, m.options.place.kvWidth());
             try dumpVisit(m.r, m.options.place.rank, vdump_cur, 97, at(s.k_conv, 0), rows, m.options.place.kvWidth());
+            try dumpVisit(m.r, m.options.place.rank, vdump_cur, 98, at(s.v_conv, 0), rows, m.options.place.kvWidth());
+            try dumpVisit(m.r, m.options.place.rank, vdump_cur, 99, at(s.v_raw, 0), rows, m.options.place.kvWidth());
         }
         var base: usize = 0;
         if (fuse.convFold() and segments.len == 1) {
