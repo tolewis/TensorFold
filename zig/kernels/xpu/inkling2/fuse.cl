@@ -632,56 +632,6 @@ KERNEL(256) void tf_ink2_router_norm_gemv(
 }
 
 // Grid (rows). Same tie rule as tf_inkling2_router: a larger key wins, an equal key keeps the lower index.
-// The same pick, without the 128 by 128 rank scan: eight rounds of the largest key, lowest slot on a tie, which is the
-// same order the rank scan gives. The picked slots are then written in ascending slot order, as tf_ink2_router_pick does.
-__attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(128, 1, 1))) kernel void tf_ink2_router_pick_fast(
-    global const float *scores_in, global const float *bias, global uint *ids, global float *weights, uint rows) {
-  const uint row = get_group_id(0), t = get_local_id(0), lane = get_sub_group_local_id(), sg = get_sub_group_id();
-  if (row >= rows) return;
-  local float keys[128], scores[128], chosen[8];
-  local uint flag[128], picked[8], taken[128], lowred[16];
-  local float red[16];
-  const float sc = scores_in[(size_t)row * 128 + t];
-  scores[t] = sc;
-  keys[t] = sc + bias[t];
-  taken[t] = 0;
-  barrier(CLK_LOCAL_MEM_FENCE);
-  for (uint round = 0; round < 8; ++round) {
-    const float cand = taken[t] ? -INFINITY : keys[t];
-    const float part = sub_group_reduce_max(cand);
-    if (lane == 0) red[sg] = part;
-    barrier(CLK_LOCAL_MEM_FENCE);
-    float mx = red[0];
-    for (uint j = 1; j < 8; ++j) mx = fmax(mx, red[j]);
-    const uint mine = (!taken[t] && keys[t] == mx) ? t : 0xffffu;
-    const uint low = sub_group_reduce_min(mine);
-    if (lane == 0) lowred[sg] = low;
-    barrier(CLK_LOCAL_MEM_FENCE);
-    uint win = lowred[0];
-    for (uint j = 1; j < 8; ++j) win = win < lowred[j] ? win : lowred[j];
-    barrier(CLK_LOCAL_MEM_FENCE);
-    if (t == 0 && win < 128u) taken[win] = 1;
-    barrier(CLK_LOCAL_MEM_FENCE);
-  }
-  flag[t] = taken[t];
-  barrier(CLK_LOCAL_MEM_FENCE);
-  if (flag[t]) {
-    uint at = 0;
-    for (uint j = 0; j < t; ++j) at += flag[j];
-    picked[at] = t;
-    chosen[at] = scores[t];
-  }
-  barrier(CLK_LOCAL_MEM_FENCE);
-  if (t == 0) {
-    float den = 1e-20f;
-    for (uint j = 0; j < 8; ++j) den += chosen[j];
-    for (uint j = 0; j < 8; ++j) {
-      ids[(size_t)row * 8 + j] = picked[j];
-      weights[(size_t)row * 8 + j] = chosen[j] / den * 8.0f;
-    }
-  }
-}
-
 __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(128, 1, 1))) kernel void tf_ink2_router_pick(
     global const float *scores_in, global const float *bias, global uint *ids, global float *weights, uint rows) {
   const uint row = get_group_id(0), t = get_local_id(0);

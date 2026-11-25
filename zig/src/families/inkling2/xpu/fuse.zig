@@ -84,18 +84,6 @@ pub fn preZeta() bool {
     return true;
 }
 
-/// The pick without the rank scan, off until it wins.
-pub var pick_fast: bool = false;
-
-pub fn pickFast() bool {
-    if (pick_fast) return true;
-    if (std.c.getenv("INK2_PICK_FAST")) |p| {
-        const s = std.mem.span(p);
-        return s.len > 0 and s[0] == '1';
-    }
-    return false;
-}
-
 /// The gates and the norms of the gated rows in one group a row, off until it wins.
 pub var gates_norms: bool = false;
 
@@ -163,7 +151,6 @@ pub const Pipelines = struct {
     norms: xpu.Kernel,
     router_gemv: xpu.Kernel,
     router_pick: xpu.Kernel,
-    router_pick_fast: xpu.Kernel,
     conv_attn: xpu.Kernel,
     conv_mlp: xpu.Kernel,
     zeta_wide: xpu.Kernel,
@@ -188,7 +175,6 @@ pub const Pipelines = struct {
         errdefer router_gemv.deinit();
         var router_pick = try module.kernel("tf_ink2_router_pick", .{ 128, 1, 1 });
         errdefer router_pick.deinit();
-        const router_pick_fast = try module.kernel("tf_ink2_router_pick_fast", .{ 128, 1, 1 });
         var conv_attn = try module.kernel("tf_ink2_conv_attn_partial", .{ 256, 1, 1 });
         errdefer conv_attn.deinit();
         var conv_mlp = try module.kernel("tf_ink2_conv_mlp_partial", .{ 256, 1, 1 });
@@ -204,7 +190,7 @@ pub const Pipelines = struct {
         var down_epi_k = try module.kernel("tf_ink2_down_epilogue", .{ 256, 1, 1 });
         errdefer down_epi_k.deinit();
         const router_norm = try module.kernel("tf_ink2_router_norm_gemv", .{ 256, 1, 1 });
-        return .{ .pre = pre, .zeta = zeta, .gates = gates, .norms = norms, .router_gemv = router_gemv, .router_pick = router_pick, .router_pick_fast = router_pick_fast, .conv_attn = conv_attn, .conv_mlp = conv_mlp, .zeta_wide = zeta_wide_k, .zeta_split_k = zeta_split_k, .gates_norms_k = gates_norms_k, .pre_q_k = pre_q_k, .pre_zeta_k = pre_zeta_k, .conv_kv = conv_kv, .down_epi = down_epi_k, .router_norm = router_norm };
+        return .{ .pre = pre, .zeta = zeta, .gates = gates, .norms = norms, .router_gemv = router_gemv, .router_pick = router_pick, .conv_attn = conv_attn, .conv_mlp = conv_mlp, .zeta_wide = zeta_wide_k, .zeta_split_k = zeta_split_k, .gates_norms_k = gates_norms_k, .pre_q_k = pre_q_k, .pre_zeta_k = pre_zeta_k, .conv_kv = conv_kv, .down_epi = down_epi_k, .router_norm = router_norm };
     }
 
     pub fn deinit(p: *Pipelines) void {
@@ -219,7 +205,6 @@ pub const Pipelines = struct {
         p.conv_mlp.deinit();
         p.conv_attn.deinit();
         p.router_pick.deinit();
-        p.router_pick_fast.deinit();
         p.router_gemv.deinit();
         p.norms.deinit();
         p.gates.deinit();
@@ -279,14 +264,12 @@ pub fn convMlpPartial(p: *const Pipelines, s: xpu.Stream, history: Ref, current:
 
 pub fn routerNormLaunch(p: *const Pipelines, s: xpu.Stream, x: Ref, norm_w: Ref, weight: Ref, normed: Ref, bias: Ref, scores: Ref, ids: Ref, weights: Ref, rows: u32) !void {
     try xpu.launch.dispatch(p.router_norm, s, .{ 8, rows, 1 }, .{ x, norm_w, weight, normed, scores, rows });
-    const pk = if (pickFast()) p.router_pick_fast else p.router_pick;
-    try xpu.launch.dispatch(pk, s, .{ rows, 1, 1 }, .{ scores, bias, ids, weights, rows });
+    try xpu.launch.dispatch(p.router_pick, s, .{ rows, 1, 1 }, .{ scores, bias, ids, weights, rows });
 }
 
 pub fn routerWideLaunch(p: *const Pipelines, s: xpu.Stream, x: Ref, weight: Ref, bias: Ref, scores: Ref, ids: Ref, weights: Ref, rows: u32) !void {
     try xpu.launch.dispatch(p.router_gemv, s, .{ 8, rows, 1 }, .{ x, weight, scores, rows });
-    const pk = if (pickFast()) p.router_pick_fast else p.router_pick;
-    try xpu.launch.dispatch(pk, s, .{ rows, 1, 1 }, .{ scores, bias, ids, weights, rows });
+    try xpu.launch.dispatch(p.router_pick, s, .{ rows, 1, 1 }, .{ scores, bias, ids, weights, rows });
 }
 
 pub fn phaseA(p: *const Pipelines, s: xpu.Stream, a: PhaseA) !void {
