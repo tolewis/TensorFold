@@ -751,4 +751,10 @@ test "reply text: Inkling 2's thinking ends at its own end tag, and a tool messa
     const whole = try splitThinkingAt(a, "<|message_model|><|content_thinking|>Look.<|end_message|>" ++ call ++ "<|message_model|><|content", false, m, .{ .token = 42 });
     try std.testing.expectEqualStrings("Look.", whole.reasoning);
     try std.testing.expectEqualStrings("<tool_call>{\"name\":\"bash\",\"args\":{\"command\":\"ls ~\"}}</tool_call>", whole.answer);
+    // the prompt prefilled the answer message: the reply starts with its text and ends at its end tag
+    const prefilled = try splitThinkingAt(a, "A B70 is a GPU.<|end_message|><|content_model_end_sampling|>", true, m, .pending);
+    try std.testing.expectEqualStrings("", prefilled.reasoning);
+    try std.testing.expectEqualStrings("A B70 is a GPU.", prefilled.answer);
+    const prefilled_live = try splitThinkingAt(a, "A B70 is a GPU.<|end_", false, m, .pending);
+    try std.testing.expectEqualStrings("A B70 is a GPU.", prefilled_live.answer);
 }
