@@ -16,9 +16,9 @@ pub fn kvConv() bool {
     if (kv_conv) return true;
     if (std.c.getenv("INK2_KV_CONV")) |p| {
         const s = std.mem.span(p);
-        return s.len > 0 and s[0] == '1';
+        if (s.len > 0 and s[0] == '0') return false;
     }
-    return false;
+    return true;
 }
 
 pub fn zetaWide() bool {
