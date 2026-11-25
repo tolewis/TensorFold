@@ -247,7 +247,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     const draft_kind = Draft.kind(gpa, io, drafter_dir);
     if (drafter_dir) |dir| {
         const loaded = if (draft_kind == .dflash2) blk: {
-            h.flash = dflash2.Drafter.init(gpa, io, h.model, dir) catch |err| break :blk err;
+            h.flash = dflash2.Drafter.init(gpa, io, h.model, dir, o.dir) catch |err| break :blk err;
             break :blk {};
         } else blk: {
             h.drafter = dspark.Drafter.init(gpa, io, h.model, dir) catch |err| break :blk err;

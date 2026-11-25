@@ -5,6 +5,7 @@
 //! meet on the same noise. Every step queues on the target's stream, which the drafter waits for before it reads.
 const std = @import("std");
 const xpu = @import("xpu");
+const rt = xpu.rt;
 const lanes = @import("lanes");
 const images = @import("inkling2_xpu_images");
 const gpu_rule = lanes.gpu_rule;
@@ -70,6 +71,10 @@ pub const Drafter = struct {
     spark_module: xpu.Module,
     spark: ds.Kernels,
     scratch: state.Scratch,
+    /// A split rank keeps only its vocabulary slice of the target's unembedding. The block's base head reads every row,
+    /// so the drafter holds the full matrix itself when the target's is a slice. The DFlash 2 file has no unembedding;
+    /// the rows come from the target checkpoint.
+    unembed: ?rt.Buffer = null,
     capacity: usize = 1,
     contexts: std.AutoHashMapUnmanaged(*Stream, state.Lane) = .empty,
     host_ids: [2]u32 = .{ 0, mask_token },
@@ -91,13 +96,29 @@ pub const Drafter = struct {
     trace_blocks: u32 = 0,
     trace_absorbs: u32 = 0,
 
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, target: *const Model, drafter_dir: []const u8) !*Drafter {
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, target: *const Model, drafter_dir: []const u8, target_dir: []const u8) !*Drafter {
         const ctx = target.ctx orelse return error.Inkling2NoKernels;
         const d = try gpa.create(Drafter);
         errdefer gpa.destroy(d);
         const stream = target.r.stream(ctx);
         var weights = try weight_loader.load(gpa, io, ctx, stream, drafter_dir);
         errdefer weights.deinit();
+        // The fold reads the full unembedding. A split rank keeps only its vocab slice on the device, so the full rows
+        // come from the target checkpoint file (the DFlash 2 drafter file does not hold the unembedding).
+        const full: usize = weight_loader.vocabulary * weight_loader.hidden;
+        var own_unembed: ?rt.Buffer = null;
+        errdefer if (own_unembed) |*b| b.free();
+        if (target.weights.unembed.bytes / 2 != full) {
+            const host = try gpa.alloc(u16, full);
+            defer gpa.free(host);
+            var ldr = try xpu.loader.Loader.init(gpa, target.r, target_dir);
+            defer ldr.deinit();
+            const inf = try ldr.info("model.llm.unembed.weight");
+            try xpu.loader.readExact(inf.fd, std.mem.sliceAsBytes(host), inf.off);
+            own_unembed = try target.r.alloc(full * 2);
+            try target.r.upload(.{ .rt = target.r, .ptr = own_unembed.?.ptr, .len = full * 2 }, std.mem.sliceAsBytes(host));
+            try target.r.sync();
+        }
         var module = try xpu.Module.loadNative(ctx, &images.dflash2);
         errdefer module.unload();
         var kernels = try k.Kernels.load(module, false);
@@ -114,7 +135,7 @@ pub const Drafter = struct {
         errdefer gpa.free(top_i);
         const sel = try gpa.alloc(u16, 7 * state.rank);
         errdefer gpa.free(sel);
-        d.* = .{ .gpa = gpa, .target = target, .ctx = ctx, .stream = stream, .weights = weights, .module = module, .kernels = kernels, .spark_module = spark_module, .spark = spark, .scratch = scratch, .top_v = top_v, .top_i = top_i, .sel = sel };
+        d.* = .{ .gpa = gpa, .target = target, .ctx = ctx, .stream = stream, .weights = weights, .module = module, .kernels = kernels, .spark_module = spark_module, .spark = spark, .scratch = scratch, .top_v = top_v, .top_i = top_i, .sel = sel, .unembed = own_unembed };
         d.times = .{ .on = std.c.getenv("TF_DFLASH2_TIMES") != null };
         d.full = std.c.getenv("TF_DFLASH2_FULL") != null;
         if (std.c.getenv("TF_DFLASH2_TRACE")) |path| d.trace = std.c.fopen(path, "wb");
@@ -140,6 +161,7 @@ pub const Drafter = struct {
         d.gpa.free(d.sel);
         d.gpa.free(d.top_i);
         d.gpa.free(d.top_v);
+        if (d.unembed) |*b| b.free();
         d.scratch.deinit();
         d.spark.deinit();
         d.spark_module.unload();
@@ -388,7 +410,8 @@ pub const Drafter = struct {
         }
         // rows 1 .. rows of the final norm: the unembedding once for all of them, the 16 best of each, the selector rows
         const draft_rows = at(sc.final, row_bytes);
-        try ds.base(&d.spark, s, target.weights.unembed.buf.ptr, draft_rows, at(sc.base, 0), rows, state.vocabulary);
+        const unembed_ptr = if (d.unembed) |b| b.ptr else target.weights.unembed.buf.ptr;
+        try ds.base(&d.spark, s, unembed_ptr, draft_rows, at(sc.base, 0), rows, state.vocabulary);
         try k.topKeep(&d.kernels, s, at(sc.base, 0), state.vocabulary, state.vocabulary, rows, at(sc.top_v, 0), at(sc.top_i, 0));
         try d.project(w.selector, draft_rows, at(sc.sel, 0), rows, state.rank, hidden);
         try sc.top_v.downloadAsync(s, 0, std.mem.sliceAsBytes(d.top_v[0 .. rows * state.lists]));
