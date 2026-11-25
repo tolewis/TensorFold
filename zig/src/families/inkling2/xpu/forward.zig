@@ -107,19 +107,8 @@ const Run = struct {
     fn dense(g: Run, weight: Tensor, input: Ptr, out: Ptr, rows: usize) !void {
         const k: u32 = @intCast(weight.shape[weight.rank - 1]);
         const n: u32 = @intCast(weight.shape[weight.rank - 2]);
-        if (weight.nvfp4) return g.denseNvfp4(weight, input, out, rows, n, k);
         if (weight.q8) return dense_q8_kernels.dense(&g.p.dense_q8, g.s, tensor(weight), input, out, @intCast(rows), n, k);
         try dense_kernels.dense(&g.p.dense, g.s, tensor(weight), input, out, @intCast(rows), n, k);
-    }
-
-    fn denseNvfp4(g: Run, weight: Tensor, input: Ptr, out: Ptr, rows: usize, n: u32, k: u32) !void {
-        const ids = g.m.dense_ids orelse return error.Inkling2NoKernels;
-        var i: usize = 0;
-        while (i < rows) : (i += 1) {
-            const in: Ptr = @ptrFromInt(@intFromPtr(input) + i * @as(usize, k) * 2);
-            const ou: Ptr = @ptrFromInt(@intFromPtr(out) + i * @as(usize, n) * 2);
-            try g.p.experts.denseRow(g.s, weight.buf.ptr, n, k, in, ou, ids.ptr);
-        }
     }
 
     /// One launch for every row: the AR of a row reads that row's blocks and partial and nothing of another row's, so batch

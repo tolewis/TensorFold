@@ -18,7 +18,6 @@ const dense_q8 = @import("dense_q8.zig");
 const prefill_kernels = @import("prefill_kernels.zig");
 const prefill_experts = @import("prefill_experts.zig");
 const q8 = @import("q8.zig");
-const nvfp4_dense = @import("nvfp4_dense.zig");
 
 const rt = xpu.rt;
 const loader = xpu.loader;
@@ -35,8 +34,6 @@ pub const Tensor = struct {
     host: bool = false,
     /// A dense matrix re-encoded at load to q8.zig's blocks (`dtype` is u8, `shape` the matrix's [n][k]); `bytes` is the codes then the scales.
     q8: bool = false,
-    /// Re-encoded at load to NVFP4 (codes, E4M3 scales, one amax, denominator 2688). The head stays Q8.
-    nvfp4: bool = false,
 
     pub fn count(self: Tensor) usize {
         return self.bytes / self.dtype.size();
@@ -177,12 +174,6 @@ pub const DenseFormat = enum {
     q8,
     /// As stored: bf16.
     bf16,
-    /// wq, wk, wv, wr, gate, and wo as NVFP4. The head stays Q8.
-    nvfp4,
-    /// Same, but wo stays Q8.
-    nvfp4_wo,
-    /// Same, but layers 0 and 23 stay Q8.
-    nvfp4_ends,
 };
 
 pub const Options = struct {
@@ -201,7 +192,7 @@ fn withEnvironment(options: Options) Options {
     var out = options;
     if (std.c.getenv("XPU_DENSE")) |v| {
         const text = std.mem.span(v);
-        if (std.mem.eql(u8, text, "bf16")) out.dense = .bf16 else if (std.mem.eql(u8, text, "q8")) out.dense = .q8 else if (std.mem.eql(u8, text, "nvfp4")) out.dense = .nvfp4 else if (std.mem.eql(u8, text, "nvfp4-wo")) out.dense = .nvfp4_wo else if (std.mem.eql(u8, text, "nvfp4-ends")) out.dense = .nvfp4_ends;
+        if (std.mem.eql(u8, text, "bf16")) out.dense = .bf16 else if (std.mem.eql(u8, text, "q8")) out.dense = .q8;
     }
     return out;
 }
@@ -317,66 +308,6 @@ const Source = struct {
         }
     }
 
-    fn usesNvfp4(s: *Source, layer: u32, wo: bool) bool {
-        return switch (s.options.dense) {
-            .nvfp4 => true,
-            .nvfp4_wo => !wo,
-            .nvfp4_ends => layer != 0 and layer != 23,
-            else => false,
-        };
-    }
-
-    fn getProj(s: *Source, comptime fmt: []const u8, args: anytype, dims: []const usize, layer: u32, wo: bool) !Tensor {
-        if (s.usesNvfp4(layer, wo)) return s.getNvfp4(fmt, args, dims);
-        return s.getDense(fmt, args, dims, null);
-    }
-
-    fn getNvfp4(s: *Source, comptime fmt: []const u8, args: anytype, dims: []const usize) !Tensor {
-        var buf: [256]u8 = undefined;
-        const name = try std.fmt.bufPrint(&buf, fmt, args);
-        const inf = try s.require(name, .bf16, dims);
-        if (dims.len != 2 or !nvfp4_dense.admits(dims[1])) return error.UnexpectedInkling2Tensor;
-        const n = dims[0];
-        const k = dims[1];
-        var t: Tensor = .{ .buf = .{ .rt = s.l.r, .ptr = null, .len = 0 }, .bytes = nvfp4_dense.bytes(n, k), .dtype = .u8, .shape = inf.shape, .rank = inf.rank, .nvfp4 = true };
-        if (s.dry) return t;
-        try s.owned.ensureUnusedCapacity(s.gpa, 1);
-        t.buf = try s.l.empty(t.bytes);
-        errdefer t.buf.free();
-        try s.encodeNvfp4(t.buf, inf, n, k);
-        s.owned.appendAssumeCapacity(t.buf);
-        return t;
-    }
-
-    fn encodeNvfp4(s: *Source, dst: rt.Buffer, inf: loader.Info, n: usize, k: usize) !void {
-        const nb = k / nvfp4_dense.group;
-        const row_bytes = k * 2;
-        var amax: f32 = 0;
-        const raw = try s.gpa.alloc(u16, k);
-        defer s.gpa.free(raw);
-        var codes = try s.gpa.alloc(u8, k / 2);
-        defer s.gpa.free(codes);
-        const scales = try s.gpa.alloc(u8, nb);
-        defer s.gpa.free(scales);
-        var row: usize = 0;
-        while (row < n) : (row += 1) {
-            try loader.readExact(inf.fd, std.mem.sliceAsBytes(raw), inf.off + @as(u64, row) * row_bytes);
-            for (raw) |h| amax = @max(amax, @abs(@as(f32, @bitCast(@as(u32, h) << 16))));
-        }
-        const codes_len = n * (k / 2);
-        const base: [*]u8 = @ptrCast(dst.ptr.?);
-        row = 0;
-        while (row < n) : (row += 1) {
-            try loader.readExact(inf.fd, std.mem.sliceAsBytes(raw), inf.off + @as(u64, row) * row_bytes);
-            nvfp4_dense.encodeRows(raw, 1, k, amax, codes, scales);
-            try s.l.r.upload(.{ .rt = dst.rt, .ptr = base + row * (k / 2), .len = k / 2 }, codes);
-            try s.l.r.upload(.{ .rt = dst.rt, .ptr = base + codes_len + row * nb, .len = nb }, scales);
-        }
-        var tail = [_]f32{ amax, nvfp4_dense.denominator };
-        try s.l.r.upload(.{ .rt = dst.rt, .ptr = base + codes_len + n * nb, .len = 8 }, std.mem.sliceAsBytes(&tail));
-        try s.l.r.sync();
-    }
-
     fn freeScratch(s: *Source) void {
         if (s.scratch) |sc| {
             s.gpa.free(sc.raw);
@@ -459,12 +390,12 @@ fn loadWeights(s: *Source, config: *const cfg.Config, wp: *const layer_plan.Plan
         // a sliding layer's three input norms are one stored tensor: uploaded once, shared by q, k and v
         const local_norm = if (!global) try s.get("model.llm.layers.{d}.attn_norm.weight", .{layer}, .bf16, &.{2304}) else undefined;
         l.attn = .{
-            .wq = try s.getProj("model.llm.layers.{d}.attn.wq_du.weight", .{layer}, &.{ q_width, 2304 }, layer, false),
-            .wk = try s.getProj("model.llm.layers.{d}.attn.wk_dv.weight", .{layer}, &.{ 1024, 2304 }, layer, false),
-            .wv = try s.getProj("model.llm.layers.{d}.attn.wv_dv.weight", .{layer}, &.{ 1024, 2304 }, layer, false),
-            .wr = try s.getProj("model.llm.layers.{d}.attn.wr_du.weight", .{layer}, &.{ 384, 2304 }, layer, false),
-            .wo = try s.getProj("model.llm.layers.{d}.attn.wo_ud.weight", .{layer}, &.{ 2304, q_width }, layer, true),
-            .gate = try s.getProj("model.llm.layers.{d}.attn.gate_attn.weight", .{layer}, &.{ q_width, 2304 }, layer, false),
+            .wq = try s.getDense("model.llm.layers.{d}.attn.wq_du.weight", .{layer}, &.{ q_width, 2304 }, null),
+            .wk = try s.getDense("model.llm.layers.{d}.attn.wk_dv.weight", .{layer}, &.{ 1024, 2304 }, null),
+            .wv = try s.getDense("model.llm.layers.{d}.attn.wv_dv.weight", .{layer}, &.{ 1024, 2304 }, null),
+            .wr = try s.getDense("model.llm.layers.{d}.attn.wr_du.weight", .{layer}, &.{ 384, 2304 }, null),
+            .wo = try s.getDense("model.llm.layers.{d}.attn.wo_ud.weight", .{layer}, &.{ 2304, q_width }, null),
+            .gate = try s.getDense("model.llm.layers.{d}.attn.gate_attn.weight", .{layer}, &.{ q_width, 2304 }, null),
             .sink = try s.get("model.llm.layers.{d}.attn.attn_sink_proj.weight", .{layer}, .bf16, &.{ 24, 2304 }),
             .q_scale = try s.get("model.llm.layers.{d}.attn.q_l2_clip.scale", .{layer}, .bf16, &.{ 24, 128 }),
             .rel_scale = try s.get("model.llm.layers.{d}.attn.rel_l2_clip.scale", .{layer}, .bf16, &.{ 24, 16 }),
@@ -513,8 +444,6 @@ pub const Model = struct {
     ctx: ?*const xpu.Context = null,
     pipelines: ?Pipelines = null,
     options: Options,
-    /// A single zero expert id for the NVFP4 dense GEMV. Null unless a dense matrix was re-encoded.
-    dense_ids: ?rt.Buffer = null,
     /// Every device or pinned host buffer the weights own, each once (shared tensors appear once).
     owned: std.ArrayList(rt.Buffer),
     /// Bytes of device memory the weights hold, and bytes of pinned host memory (the embedding with `embed_host`).
@@ -547,13 +476,6 @@ pub const Model = struct {
         src.dry = false;
         m.weights = try loadWeights(&src, &m.config, &m.weight_plan);
         try r.sync();
-        if (options.dense == .nvfp4 or options.dense == .nvfp4_wo or options.dense == .nvfp4_ends) {
-            var z: i32 = 0;
-            const ids = try r.alloc(4);
-            try r.upload(ids, std.mem.asBytes(&z));
-            try m.owned.append(gpa, ids);
-            m.dense_ids = ids;
-        }
         for (m.owned.items) |b| if (b.host) {
             m.host_bytes += b.len;
         } else {
