@@ -160,27 +160,28 @@ pub const Group = struct {
 
     /// TF_TP_SEQPAR: rank r keeps rows [r*half, (r+1)*half) summed and leaves the other half summed as well, which the
     /// gather overwrites. Each rank pushes the half the other rank owns, so the bytes are half an all-reduce's.
-    pub fn reduceScatterRows(g: *Group, partial: *anyopaque, rows: u32) !void {
+    pub fn reduceScatterRows(g: *Group, partial: *anyopaque, rows: u32, row_bytes: usize) !void {
         const half = rows / 2;
-        if (rows < 4 or rows % 2 != 0) return error.Inkling2Tp;
+        if (rows < 4 or rows % 2 != 0 or row_bytes * rows > rows_max * D * 2) return error.Inkling2Tp;
         if (g.qgroup == null) return error.Inkling2Tp;
         qg.dev.noteKernel(xpu.profile.last_kernel);
         if (g.rank == 0) {
-            return g.qgroup.?.allReduce(&g.qdev, @ptrFromInt(@intFromPtr(partial) + @as(usize, half) * D * 2), rows - half);
+            return g.qgroup.?.allReduceBytes(&g.qdev, @ptrFromInt(@intFromPtr(partial) + half * row_bytes), rows - half, row_bytes);
         }
-        return g.qgroup.?.allReduce(&g.qdev, partial, half);
+        return g.qgroup.?.allReduceBytes(&g.qdev, partial, half, row_bytes);
     }
 
     /// TF_TP_SEQPAR: each rank processed its own half. Zero the other half, then sum, so each rank ends with both halves
     /// processed. A copy exchange would save the zero fill's bytes; this keeps one exchange shape.
-    pub fn allGatherRows(g: *Group, partial: *anyopaque, rows: u32) !void {
+    pub fn allGatherRows(g: *Group, partial: *anyopaque, rows: u32, row_bytes: usize) !void {
         const half = rows / 2;
-        if (rows < 4 or rows % 2 != 0) return error.Inkling2Tp;
+        if (rows < 4 or rows % 2 != 0 or row_bytes * rows > rows_max * D * 2) return error.Inkling2Tp;
         if (g.qgroup == null) return error.Inkling2Tp;
         qg.dev.noteKernel(xpu.profile.last_kernel);
         const from = if (g.rank == 0) @as(usize, 0) else half;
-        try g.r.drv.check(g.r.drv.x.zeCommandListAppendMemoryFill(g.r.list, @ptrFromInt(@intFromPtr(partial) + from * D * 2), &[_]u8{0} ** 2, 2, half * D * 2, null, 0, null), "inkling2 gather zero");
-        return g.qgroup.?.allReduce(&g.qdev, partial, rows);
+        const zeros = [_]u8{0} ** 8;
+        try g.r.drv.check(g.r.drv.x.zeCommandListAppendMemoryFill(g.r.list, @ptrFromInt(@intFromPtr(partial) + from * row_bytes), &zeros, 8, half * row_bytes, null, 0, null), "inkling2 gather zero");
+        return g.qgroup.?.allReduceBytes(&g.qdev, partial, rows, row_bytes);
     }
 
     /// Rank 1 pushes its f32 logit slice. Rank 0 copies it to `dst` (the high half of its logit row).

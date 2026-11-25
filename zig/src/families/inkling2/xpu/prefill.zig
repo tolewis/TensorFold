@@ -176,9 +176,25 @@ const Run = struct {
     }
 
     fn staticPostConv(g: Run, cache: *state.Cache, slot: usize, conv_state: usize, raw: rt.Buffer, weight: Tensor, out: rt.Buffer) !void {
+        return staticPostConvAt(g, cache, slot, conv_state, raw, weight, out, 0, g.rows);
+    }
+
+    /// `base` and `rows` select the window this launch convolves. A sequence-parallel half that starts past row 0 takes
+    /// the three rows before the half as its window, so the convolution sees the same taps the full run would.
+    fn staticPostConvAt(g: Run, cache: *state.Cache, slot: usize, conv_state: usize, raw: rt.Buffer, weight: Tensor, out: rt.Buffer, base: usize, rows: usize) !void {
         const channels = g.convChannels(conv_state);
-        try pk.convStatic(&g.p.prefill, g.s, cache.history(slot, conv_state).ptr(), at(raw, 0), at(g.sc.staging, 0), tensor(weight), at(out, 0), @intCast(g.rows), @intCast(channels));
-        try g.commitHistory(cache, slot, conv_state);
+        const history = if (base == 0) cache.history(slot, conv_state).ptr() else at(raw, (base - 3) * channels * 2);
+        try pk.convStatic(&g.p.prefill, g.s, history, at(raw, base * channels * 2), at(g.sc.staging, 0), tensor(weight), at(out, base * channels * 2), @intCast(rows), @intCast(channels));
+        try g.copyBf16(at(g.sc.staging, rows * channels * 2), cache.history(slot, conv_state).ptr(), 3 * channels);
+    }
+
+    /// TF_TP_SEQPAR: rank r runs the full-width steps on rows [r*half, (r+1)*half) and leaves both halves processed.
+    const Seqpar = struct { seq: bool, base: usize, rows: usize };
+
+    fn seqpar(g: Run, rows: usize) Seqpar {
+        if (std.c.getenv("TF_TP_SEQPAR") == null or !g.m.options.place.split() or rows < 4 or rows % 2 != 0) return .{ .seq = false, .base = 0, .rows = rows };
+        const half = rows / 2;
+        return .{ .seq = true, .base = if (g.m.options.place.rank == 0) 0 else half, .rows = half };
     }
 
     fn convInputForAttention(g: Run, cache: *state.Cache, v: *const layer_plan.Visit, key: bool) !void {
@@ -387,19 +403,35 @@ const Run = struct {
         xpu.profile.label = "wo";
         try g.dense(w.attn.wo, at(s.att, 0), at(s.attn_dense, 0), rows);
         xpu.profile.label = "";
-        if (g.m.options.place.split()) if (group.live) |gp| try gp.allReduce(at(s.attn_dense, 0).?, @intCast(rows));
-        try g.staticPostConv(cache, v.cache_slot, 2, s.attn_dense, w.attn_conv, s.attn_conv);
-        try pointwise(&g.p.runtime, g.s, .attention_partial, rows, if (lp.boundary) @intCast(lp.blocks_in + 1) else 0, .{ at(s.p, 0), at(s.attn_conv, 0), at(s.blocks, 0), at(s.partial, 0) });
-        try pk.ar(&g.p.prefill, g.s, at(s.blocks, 0), at(s.partial, 0), tensor(m.weights.mlp_queries[v.layer]), at(s.mlp_ar, 0), @intCast(lp.mlp_sources), 1, @intCast(rows));
+        const sp = seqpar(g, rows);
+        const hb = sp.base * state.hidden * 2;
+        const bb = sp.base * state.block_slots * state.hidden * 2;
+        const pb = sp.base * state.partialStride(g.m.options.place.capacity()) * 2;
+        const rb = sp.base * 8;
+        if (g.m.options.place.split()) if (group.live) |gp| {
+            if (sp.seq) try gp.reduceScatterRows(at(s.attn_dense, 0).?, @intCast(rows), state.hidden * 2) else try gp.allReduce(at(s.attn_dense, 0).?, @intCast(rows));
+        };
+        try staticPostConvAt(g, cache, v.cache_slot, 2, s.attn_dense, w.attn_conv, s.attn_conv, sp.base, sp.rows);
+        try pointwise(&g.p.runtime, g.s, .attention_partial, sp.rows, if (lp.boundary) @intCast(lp.blocks_in + 1) else 0, .{ at(s.p, hb), at(s.attn_conv, hb), at(s.blocks, bb), at(s.partial, pb) });
+        try pk.ar(&g.p.prefill, g.s, at(s.blocks, bb), at(s.partial, pb), tensor(m.weights.mlp_queries[v.layer]), at(s.mlp_ar, hb), @intCast(lp.mlp_sources), 1, @intCast(sp.rows));
         if (gated) {
-            try g.gates(at(s.mlp_ar, 0), g.messageBlock(v.layer - 6, 3), w.controllers.?[3], at(s.mlp_gated, 0));
-            try g.norm(at(s.mlp_gated, 0), w.mlp_norm, at(s.mlp_normed, 0), rows);
-        } else try g.norm(at(s.mlp_ar, 0), w.mlp_norm, at(s.mlp_normed, 0), rows);
-        if (g.old_experts) try glue.router(&g.p.glue, g.s, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.route_ids, 0), at(s.route_weights, 0), @intCast(rows)) else try pk.router16(&g.p.prefill, g.s, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.route_ids, 0), at(s.route_weights, 0), @intCast(rows), at(s.logits_all, 0));
+            try g.gates(at(s.mlp_ar, hb), g.messageBlock(v.layer - 6, 3), w.controllers.?[3], at(s.mlp_gated, hb));
+            try g.norm(at(s.mlp_gated, hb), w.mlp_norm, at(s.mlp_normed, hb), sp.rows);
+        } else try g.norm(at(s.mlp_ar, hb), w.mlp_norm, at(s.mlp_normed, hb), sp.rows);
+        if (g.old_experts) try glue.router(&g.p.glue, g.s, at(s.mlp_normed, hb), tensor(w.router_weight), tensor(w.router_bias), at(s.route_ids, rb), at(s.route_weights, rb), @intCast(sp.rows)) else try pk.router16(&g.p.prefill, g.s, at(s.mlp_normed, hb), tensor(w.router_weight), tensor(w.router_bias), at(s.route_ids, rb), at(s.route_weights, rb), @intCast(sp.rows), at(s.logits_all, rb));
+        if (g.m.options.place.split()) if (group.live) |gp| {
+            if (sp.seq) try gp.allGatherRows(at(s.mlp_normed, 0).?, @intCast(rows), state.hidden * 2);
+            if (sp.seq) {
+                try gp.allGatherRows(at(s.route_ids, 0).?, @intCast(rows), 8 * 4);
+                try gp.allGatherRows(at(s.route_weights, 0).?, @intCast(rows), 8 * 2);
+            }
+        };
         try g.routedExperts(v.layer);
-        if (g.m.options.place.split()) if (group.live) |gp| try gp.allReduce(at(s.mlp_out, 0).?, @intCast(rows));
-        try g.staticPostConv(cache, v.cache_slot, 3, s.mlp_out, w.mlp_conv, s.mlp_conv);
-        try pointwise(&g.p.runtime, g.s, .mlp_partial, rows, 0, .{ at(s.partial, 0), at(s.mlp_conv, 0), at(s.p, 0) });
+        if (g.m.options.place.split()) if (group.live) |gp| {
+            if (sp.seq) try gp.reduceScatterRows(at(s.mlp_out, 0).?, @intCast(rows), state.hidden * 2) else try gp.allReduce(at(s.mlp_out, 0).?, @intCast(rows));
+        };
+        try staticPostConvAt(g, cache, v.cache_slot, 3, s.mlp_out, w.mlp_conv, s.mlp_conv, sp.base, sp.rows);
+        try pointwise(&g.p.runtime, g.s, .mlp_partial, sp.rows, 0, .{ at(s.partial, pb), at(s.mlp_conv, hb), at(s.p, hb) });
         if (v.cache_slot == 5) try g.copyBf16(at(s.p, 0), at(s.prelude, 0), rows * state.hidden);
     }
 };
