@@ -17,16 +17,17 @@ pub const RowMeta = struct { pos: Ref, seg_of: Ref, segs: Ref };
 
 pub const Error = planning.Error || xpu.Error || error{OutOfMemory};
 
-/// The merge over eight sub-groups of chunk ranges, off until the contract covers it and the gate agrees on the bits.
+/// The merge over eight sub-groups of chunk ranges. It regroups the fold, so it is bit-identical only where the row
+/// count is one; every other row count keeps the serial fold. Default; `INK2_MERGE_SPLIT=0` selects the serial fold.
 pub var merge_split: bool = false;
 
 pub fn mergeSplit() bool {
     if (merge_split) return true;
     if (std.c.getenv("INK2_MERGE_SPLIT")) |p| {
         const s = std.mem.span(p);
-        return s.len > 0 and s[0] == '1';
+        if (s.len > 0 and s[0] == '0') return false;
     }
-    return false;
+    return true;
 }
 
 /// Kernel names, with the work-group size each is made at.
@@ -113,7 +114,7 @@ pub fn attendAs(k: *const Kernels, s: xpu.Stream, path: planning.Path, r: planni
             launch.chunk, @as(u32, 0), launch.partials_rh, scale,
         });
     }
-    const m = if (mergeSplit()) k.merge_split else k.merge;
+    const m = if (mergeSplit() and r.rows == 1) k.merge_split else k.merge;
     try xpu.launch.dispatch(m, s, launch.merge_grid, .{
         part_o.at(), part_ml.at(), sink.at(), gate.at(), meta.pos.at(), out.at(),
         r.heads,     l.window,     launch.chunk, @as(u32, 0), launch.partials_rh, launch.subs,

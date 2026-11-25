@@ -242,7 +242,9 @@ KERNEL(128) void tf_ink2_merge_split(global const float *part_o, global const fl
       for (uint i = 0; i < 8; ++i) co8[i] = part_o[at * D + lane * 8 + i];
     }
     for (uint i = 0; i < 8; ++i) {
-      const float mn = fmax(m8[i], cm), x = exp2(m8[i] - mn), y = exp2(cm - mn);
+      const float mn = fmax(m8[i], cm);
+      const float x = m8[i] == -INFINITY ? 0.0f : exp2(m8[i] - mn);
+      const float y = cm == -INFINITY ? 0.0f : exp2(cm - mn);
       l8[i] = l8[i] * x + cl * y;
       o8[i] = o8[i] * x + co8[i] * y;
       m8[i] = mn;
@@ -257,7 +259,9 @@ KERNEL(128) void tf_ink2_merge_split(global const float *part_o, global const fl
   // every thread owns one channel and reads the eight partials of that channel
   float mm = pmax[0][t], ll = psum[0][t], o = po[0][t];
   for (uint k = 1; k < 8; ++k) {
-    const float mn = fmax(mm, pmax[k][t]), x = exp2(mm - mn), y = exp2(pmax[k][t] - mn);
+    const float mn = fmax(mm, pmax[k][t]);
+    const float x = mm == -INFINITY ? 0.0f : exp2(mm - mn);
+    const float y = pmax[k][t] == -INFINITY ? 0.0f : exp2(pmax[k][t] - mn);
     ll = ll * x + psum[k][t] * y;
     o = o * x + po[k][t] * y;
     mm = mn;
