@@ -601,6 +601,8 @@ fn profileDecode(ctx: *xpu.Context, io: std.Io, m: *const ink.model.Model, scrat
             wall += nowNs(io) - f0;
             enqueue += @as(i96, prof.enqueued_at) - e0;
             try prof.collect();
+            xpu.rt.Runtime.logSync("rank 0");
+            xpu.rt.Runtime.resetSyncLog();
             cache.len += 1;
             token = argmax(try lastLogits(r, cache, logits));
         }

@@ -118,7 +118,12 @@ pub const Profile = struct {
         const mask: u64 = if (bits >= 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(bits)) - 1;
         var first: u64 = 0;
         var last_end: u64 = 0;
+        var prev_end: u64 = 0;
         var busy: f64 = 0;
+        var gap_ns: u64 = 0;
+        var reduce_gap_ns: u64 = 0;
+        var reduce_gaps: u64 = 0;
+        var big: [8]struct { ns: u64, name: [24]u8 } = @splat(.{ .ns = 0, .name = @splat(0) });
         for (p.recs[0..p.used], 0..) |rec, i| {
             const r = p.row(rec.handle) catch return error.Invalid;
             r.calls += 1;
@@ -132,10 +137,34 @@ pub const Profile = struct {
                 const ns: u64 = @intFromFloat(@as(f64, @floatFromInt(dur)) * res);
                 r.device_ns += ns;
                 busy += @floatFromInt(ns);
-                if (i == 0) first = ts.global_start;
+                if (i == 0) first = ts.global_start else {
+                    const gap: u64 = @intFromFloat(@as(f64, @floatFromInt((ts.global_start -% prev_end) & mask)) * res);
+                    gap_ns += gap;
+                    const name = std.mem.sliceTo(&r.name, 0);
+                    if (std.mem.startsWith(u8, name, "tp_")) {
+                        reduce_gap_ns += gap;
+                        reduce_gaps += 1;
+                    }
+                    var slot: usize = 8;
+                    for (big, 0..) |b, k| if (gap > b.ns) {
+                        slot = k;
+                        break;
+                    };
+                    if (slot < 8) {
+                        var j: usize = 7;
+                        while (j > slot) : (j -= 1) big[j] = big[j - 1];
+                        big[slot] = .{ .ns = gap, .name = @splat(0) };
+                        @memcpy(big[slot].name[0..@min(name.len, 23)], name[0..@min(name.len, 23)]);
+                    }
+                }
+                prev_end = ts.global_end;
                 last_end = ts.global_end;
                 try d.check(d.api.zeEventHostReset(p.events[i]), "zeEventHostReset");
             }
+        }
+        if (p.device_time and std.c.getenv("TF_TP_GAPS") != null) {
+            std.log.info("inkling2: idle between kernels {d:.2} ms; before tp_* {d} gaps {d:.2} ms", .{ @as(f64, @floatFromInt(gap_ns)) / 1e6, reduce_gaps, @as(f64, @floatFromInt(reduce_gap_ns)) / 1e6 });
+            for (big) |b| if (b.ns > 0) std.log.info("inkling2: gap {d:.1} us before {s}", .{ @as(f64, @floatFromInt(b.ns)) / 1e3, std.mem.sliceTo(&b.name, 0) });
         }
         if (p.device_time and p.used > 0) {
             p.device_busy_ns += @intFromFloat(busy);

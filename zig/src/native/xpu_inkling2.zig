@@ -367,9 +367,27 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
         if (rec.op == .close) return true;
         std.log.info("inkling2: follow base {d} n {d}", .{ rec.base, rec.n });
         cache.len = rec.base;
+        const profile_one = rec.n == 1 and std.c.getenv("TF_TP_PROFILE") != null and xpu.profile.active == null;
+        var prof: xpu.profile.Profile = undefined;
+        if (profile_one) {
+            prof = xpu.profile.Profile.init(&ctx, 8192, true) catch |e| {
+                std.log.err("inkling2_loop: profile ({s})", .{@errorName(e)});
+                return false;
+            };
+            xpu.profile.active = &prof;
+            xpu.rt.Runtime.resetSyncLog();
+        }
         ink.forward.run(model, &scratch, &cache, rec.ids[0..rec.n], .{ .all = rec.flags != 0 }) catch |e| {
             std.log.err("inkling2_loop: rank 1 forward ({s})", .{@errorName(e)});
             return false;
         };
+        if (profile_one) {
+            prof.collect() catch {};
+            std.log.info("inkling2: rank 1 one token, {d} launches", .{prof.launches});
+            prof.print();
+            xpu.rt.Runtime.logSync("rank 1");
+            xpu.profile.active = null;
+            prof.deinit();
+        }
     }
 }

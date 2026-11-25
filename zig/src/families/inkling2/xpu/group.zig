@@ -27,6 +27,23 @@ const CbCreate = *const fn (ze.H, ze.H, *const CbEventDesc, *ze.H) callconv(.c) 
 const GetIpc = *const fn (ze.H, *const anyopaque, *IpcHandle) callconv(.c) u32;
 const OpenIpc = *const fn (ze.H, ze.H, IpcHandle, u32, *?*anyopaque) callconv(.c) u32;
 
+fn watchPeer(pid: i32) void {
+    var gone: u8 = 0;
+    while (true) {
+        var ts: linux.timespec = .{ .sec = 1, .nsec = 0 };
+        _ = linux.nanosleep(&ts, null);
+        if (linux.kill(pid, @enumFromInt(0)) == 0) {
+            gone = 0;
+            continue;
+        }
+        gone += 1;
+        if (gone >= 2) {
+            std.log.err("inkling2: peer {d} is gone; exit", .{pid});
+            std.c._exit(1);
+        }
+    }
+}
+
 pub const Op = enum(u32) { forward = 1, close = 2 };
 pub const Rec = extern struct { seq: u64, op: Op, n: u32, flags: u32, base: u32, ids: [64]u32 };
 
@@ -77,6 +94,13 @@ pub const Group = struct {
         g.map = try mapShm(name, p.rank);
         try g.handshake(name);
         std.log.info("inkling2: TP {d} rank {d}: all-reduce {s}", .{ g.tp, g.rank, if (g.ex == 3) "EX flag 3" else "host-staged" });
+        if (std.c.getenv("TF_TP_PEER_PID")) |z| {
+            const pid = std.fmt.parseInt(i32, std.mem.span(z), 10) catch 0;
+            if (pid > 0) {
+                const watch = std.Thread.spawn(.{}, watchPeer, .{pid}) catch null;
+                if (watch) |t| t.detach();
+            }
+        }
         live = g;
         if (std.c.getenv("TF_TP_EXBENCH")) |v| if (v[0] != '0') try g.exchangeBench();
         return g;
@@ -159,6 +183,20 @@ pub const Group = struct {
         var rec: Rec = undefined;
         @memcpy(std.mem.asBytes(&rec), g.recSlot(want)[0..@sizeOf(Rec)]);
         return rec;
+    }
+
+    /// Exchange f32 rows, add in f32, store bf16 once. One row fits the slot.
+    pub fn reduceF32(g: *Group, src_f32: *anyopaque, dst_bf16: *anyopaque, rows: u32) !void {
+        const s = g.r.stream(g.ctx);
+        for (0..rows) |r| {
+            g.seq += 1;
+            const src: ?*anyopaque = off(src_f32, r * D * 4);
+            const peer = try g.exPush(src.?, D * 4);
+            const got: ?*anyopaque = peer;
+            try xpu.launch.dispatch(g.add_f32, s, .{ (D + 255) / 256, 1, 1 }, .{ src, src, got, @as(u32, D) });
+            const dst: ?*anyopaque = off(dst_bf16, r * D * 2);
+            try xpu.launch.dispatch(g.down, s, .{ (D + 255) / 256, 1, 1 }, .{ dst, src, @as(u32, D) });
+        }
     }
 
     /// Promote each bf16 row, exchange the f32 values, add in f32, store bf16. One row fits the slot.

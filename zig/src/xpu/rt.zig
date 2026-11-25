@@ -214,8 +214,33 @@ pub const Runtime = struct {
         try self.drv.check(self.drv.api.zeCommandListAppendMemoryCopy(self.list, dst.ptr, src.ptr, bytes, null, 0, null), "copy");
     }
 
+    pub var sync_calls: u64 = 0;
+    pub var sync_ns: u64 = 0;
+    pub var sync_max_ns: u64 = 0;
+
+    fn noteSync(dt: u64) void {
+        sync_calls += 1;
+        sync_ns += dt;
+        if (dt > sync_max_ns) sync_max_ns = dt;
+    }
+
+    pub fn resetSyncLog() void {
+        sync_calls = 0;
+        sync_ns = 0;
+        sync_max_ns = 0;
+    }
+
+    pub fn logSync(prefix: []const u8) void {
+        if (std.c.getenv("TF_TP_SYNCLOG") == null) return;
+        const n: f64 = @floatFromInt(@max(sync_calls, 1));
+        std.log.info("inkling2: {s} syncs {d} total {d:.2} ms mean {d:.1} us max {d:.1} us", .{ prefix, sync_calls, @as(f64, @floatFromInt(sync_ns)) / 1e6, @as(f64, @floatFromInt(sync_ns)) / 1e3 / n, @as(f64, @floatFromInt(sync_max_ns)) / 1e3 });
+    }
+
     pub fn sync(self: *Runtime) Error!void {
+        const log = std.c.getenv("TF_TP_SYNCLOG") != null;
+        const t0: u64 = if (log) profNow() else 0;
         try self.drv.check(self.drv.api.zeCommandListHostSynchronize(self.list, std.math.maxInt(u64)), "sync");
+        if (log) noteSync(profNow() - t0);
     }
 
     /// Builds a SPIR-V module; a refused build logs the driver text.
