@@ -158,6 +158,14 @@ const qwen27_records = [_]Record{
         .usage = .{.{ .threads = .{ 256, 1, 1 }, .slm = 9280, .sub_group = 16, .grf = 256 }},
     },
     .{
+        .launch = .{ .name = "inkling2 fuse zeta split", .symbol = "tf_ink2_zeta_split", .image = "contract_inkling2_fuse", .format = glue, .threads = .{ 256, 1, 1 }, .slm = 9344, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 256, 1, 1 }, .slm = 9344, .sub_group = 16, .grf = 256 }},
+    },
+    .{
+        .launch = .{ .name = "planted inkling2 fuse zeta split stores zero", .symbol = "tf_ink2_zeta_split", .image = "contract_inkling2_fuse_controls", .format = glue, .threads = .{ 256, 1, 1 }, .slm = 9280, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 256, 1, 1 }, .slm = 9280, .sub_group = 16, .grf = 256 }},
+    },
+    .{
         .launch = .{ .name = "inkling2 fuse gates", .symbol = "tf_ink2_fuse_gates", .image = "contract_inkling2_fuse", .format = glue, .threads = .{ 64, 1, 1 }, .slm = 256, .sub_group = 16, .grf = 256 },
         .usage = .{.{ .threads = .{ 64, 1, 1 }, .slm = 256, .sub_group = 16, .grf = 256 }},
     },

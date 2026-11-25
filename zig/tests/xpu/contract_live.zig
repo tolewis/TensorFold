@@ -74,6 +74,7 @@ fn argsOf(planted: []const u8) u32 {
         .{ "tf_inkling2_loop_gates", 8 },
         .{ "tf_ink2_fuse_pre", 16 },
         .{ "tf_ink2_zeta_wide", 12 },
+        .{ "tf_ink2_zeta_split", 12 },
         .{ "tf_ink2_fuse_gates", 15 },
         .{ "tf_ink2_down_epilogue", 15 },
         .{ "tf_ink2_router_norm_gemv", 6 },

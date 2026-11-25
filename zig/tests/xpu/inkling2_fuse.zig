@@ -8,12 +8,13 @@ const c = core.spec;
 const g = core.gates;
 const H: usize = 2304;
 
-pub const Kind = enum { pre, zeta, gates, epi, norm };
+pub const Kind = enum { pre, zeta, zeta_split, gates, epi, norm };
 
 fn nameOf(k: Kind, control: bool) []const u8 {
     const real = switch (k) {
         .pre => "xpu inkling2 fuse prologue tf_ink2_fuse_pre",
         .zeta => "xpu inkling2 fuse zeta tf_ink2_zeta_wide",
+        .zeta_split => "xpu inkling2 fuse zeta split tf_ink2_zeta_split",
         .gates => "xpu inkling2 fuse gates tf_ink2_fuse_gates",
         .epi => "xpu inkling2 fuse epilogue tf_ink2_down_epilogue",
         .norm => "xpu inkling2 fuse norm-router tf_ink2_router_norm_gemv",
@@ -22,6 +23,7 @@ fn nameOf(k: Kind, control: bool) []const u8 {
     return switch (k) {
         .pre => "control: xpu inkling2 fuse prologue tf_ink2_fuse_pre stores zero",
         .zeta => "control: xpu inkling2 fuse zeta tf_ink2_zeta_wide stores zero",
+        .zeta_split => "control: xpu inkling2 fuse zeta split tf_ink2_zeta_split stores zero",
         .gates => "control: xpu inkling2 fuse gates tf_ink2_fuse_gates drops the message term",
         .epi => "control: xpu inkling2 fuse epilogue tf_ink2_down_epilogue drops the residual add",
         .norm => "control: xpu inkling2 fuse norm-router tf_ink2_router_norm_gemv drops the norm",
@@ -55,6 +57,7 @@ pub const Probe = struct {
         const symbol = switch (kind) {
             .pre => "tf_ink2_fuse_pre",
             .zeta => "tf_ink2_zeta_wide",
+            .zeta_split => "tf_ink2_zeta_split",
             .gates => "tf_ink2_fuse_gates",
             .epi => "tf_ink2_down_epilogue",
             .norm => "tf_ink2_router_norm_gemv",
@@ -98,7 +101,7 @@ pub const Probe = struct {
     pub fn count(self: *Probe) usize {
         return switch (self.kind) {
             .pre, .gates, .epi => self.shape.rows * H,
-            .zeta => self.shape.rows * 64,
+            .zeta, .zeta_split => self.shape.rows * 64,
             .norm => self.shape.rows * 128,
         };
     }
@@ -147,7 +150,7 @@ pub const Probe = struct {
                 if (nan0) x[0] = std.math.nan(f32);
                 self.expectPre(x);
             },
-            .zeta => {
+            .zeta, .zeta_split => {
                 self.p0 = try self.ones(rows * H, nan0);
                 self.p1 = try self.ones(rows * 4 * H, nan0);
                 self.p2 = try self.bfOnes(64 * 2 * H);
@@ -206,6 +209,9 @@ pub const Probe = struct {
             .zeta => try xpu.launch.dispatch(self.kern, s, .{ 4, 1, rows }, .{
                 self.p0, self.p1, self.p2, self.p2, self.p2, self.outp, rows, @as(u32, 1), @as(u32, 1), @as(u32, 0), @as(u32, 4), @as(u32, 0),
             }),
+            .zeta_split => try xpu.launch.dispatch(self.kern, s, .{ 16, 1, rows }, .{
+                self.p0, self.p1, self.p2, self.p2, self.p2, self.outp, rows, @as(u32, 1), @as(u32, 1), @as(u32, 0), @as(u32, 4), @as(u32, 0),
+            }),
             .gates => try xpu.launch.dispatch(self.kern, s, .{ 36, 1, rows }, .{
                 self.p0, self.p1, self.p4, self.p4, self.p4, self.p2, self.p2, self.p2, self.p3, self.outp,
                 rows, @as(u32, 1), @as(u32, 1), @as(u32, 0), @as(u32, 4),
@@ -247,7 +253,7 @@ pub const Probe = struct {
             return null;
         }
         const got: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, out));
-        const tol: f32 = if (self.kind == .zeta) 64 else 1e-3;
+        const tol: f32 = if (self.kind == .zeta or self.kind == .zeta_split) 64 else 1e-3;
         for (got, self.host) |gv, w| if (!std.math.isFinite(gv) or @abs(gv - w) > tol) return "fused output left the host value";
         return null;
     }
