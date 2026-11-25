@@ -394,12 +394,12 @@ const Run = struct {
                     };
                     const q1 = at_row * pl.qWidth() * 2;
                     const tab1 = at_row * pl.qHeads() * ap.extent * 2;
-                    try attention.prep(k, g.s, rr1, layer, prep, meta1, .{ aref(s.q_raw, q1), aref(s.k_conv, at_row * state.kv_width * 2), aref(s.v_conv, at_row * state.kv_width * 2), aref(s.rel_raw, at_row * pl.relWidth() * 2) }, .{ aref(w.attn.q_scale.buf, 0), aref(w.attn.rel_scale.buf, 0) }, aref(s.q_prep, q1), aref(s.rel_prep, tab1), kv);
+                    try attention.prep(k, g.s, rr1, layer, prep, meta1, .{ aref(s.q_raw, q1), aref(s.k_conv, at_row * pl.kvWidth() * 2), aref(s.v_conv, at_row * pl.kvWidth() * 2), aref(s.rel_raw, at_row * pl.relWidth() * 2) }, .{ aref(w.attn.q_scale.buf, 0), aref(w.attn.rel_scale.buf, 0) }, aref(s.q_prep, q1), aref(s.rel_prep, tab1), kv);
                     try attention.relTable(k, g.s, rr1, aref(s.rel_prep, tab1), aref(w.attn.rel_projection.buf, 0), aref(s.rel_tab, tab1));
                     try attention.attend(k, g.s, rr1, layer, s.stride, meta1, aref(s.q_prep, q1), kv, aref(s.rel_tab, tab1), aref(s.part_o, at_row * pl.qHeads() * s.stride * ap.head_dim * 4), aref(s.part_ml, at_row * pl.qHeads() * s.stride * 8), aref(s.sink, at_row * pl.qHeads() * 2), aref(s.gate, q1), aref(s.att, q1));
                 }
             } else {
-                try attention.prep(k, g.s, rr, layer, prep, meta, .{ aref(s.q_raw, q_at), aref(s.k_conv, base * state.kv_width * 2), aref(s.v_conv, base * state.kv_width * 2), aref(s.rel_raw, base * pl.relWidth() * 2) }, .{ aref(w.attn.q_scale.buf, 0), aref(w.attn.rel_scale.buf, 0) }, aref(s.q_prep, q_at), aref(s.rel_prep, tab_at), kv);
+                try attention.prep(k, g.s, rr, layer, prep, meta, .{ aref(s.q_raw, q_at), aref(s.k_conv, base * pl.kvWidth() * 2), aref(s.v_conv, base * pl.kvWidth() * 2), aref(s.rel_raw, base * pl.relWidth() * 2) }, .{ aref(w.attn.q_scale.buf, 0), aref(w.attn.rel_scale.buf, 0) }, aref(s.q_prep, q_at), aref(s.rel_prep, tab_at), kv);
                 try attention.relTable(k, g.s, rr, aref(s.rel_prep, tab_at), aref(w.attn.rel_projection.buf, 0), aref(s.rel_tab, tab_at));
                 const part = base * pl.qHeads() * s.stride * ap.head_dim * 4;
                 const part_ml = base * pl.qHeads() * s.stride * 8;
@@ -559,7 +559,7 @@ fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) 
             try dumpVisit(m.r, m.options.place.rank, vdump_cur, 91, at(s.attn_dense, 0), rows, state.hidden);
             try dumpVisit(m.r, m.options.place.rank, vdump_cur, 92, at(s.att, 0), rows, m.options.place.qWidth());
             try dumpVisit(m.r, m.options.place.rank, vdump_cur, 93, at(s.q_raw, 0), rows, m.options.place.qWidth());
-            try dumpVisit(m.r, m.options.place.rank, vdump_cur, 94, at(s.k_conv, 0), rows, state.kv_width);
+            try dumpVisit(m.r, m.options.place.rank, vdump_cur, 94, at(s.k_conv, 0), rows, m.options.place.kvWidth());
             try dumpVisit(m.r, m.options.place.rank, vdump_cur, 95, at(s.rel_tab, 0), rows, m.options.place.qHeads() * ap.extent);
             try dumpVisit(m.r, m.options.place.rank, vdump_cur, 96, at(s.k_raw, 0), rows, m.options.place.kvWidth());
             try dumpVisit(m.r, m.options.place.rank, vdump_cur, 97, at(s.k_conv, 0), rows, m.options.place.kvWidth());
