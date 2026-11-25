@@ -84,8 +84,6 @@ pub const Op = enum {
     combine,
     plan,
     nvfp4_gu_prompt,
-    nvfp4_gu_split,
-    nvfp4_gu_join,
     nvfp4_down_prompt,
     mxfp8_gu_prompt,
     mxfp8_down_prompt,
@@ -105,25 +103,11 @@ pub const Op = enum {
             .nvfp4_quantize, .mxfp8_quantize, .plan => .{ 256, 1, 1 },
             .combine => .{ 64, 1, 1 },
             .nvfp4_gu_prompt, .nvfp4_down_prompt, .mxfp8_gu_prompt, .mxfp8_down_prompt => .{ 16, 1, 1 },
-            .nvfp4_gu_split => .{ 16 * decode_subgroups.nvfp4_gu, 1, 1 },
-            .nvfp4_gu_join => .{ 64, 1, 1 },
         };
     }
 };
 
 pub const default_prefix = "tf_ink2_";
-
-/// The one-row gate/up split over two work-groups a tile and joined by a second launch, off until it wins.
-pub var nv_split: bool = false;
-
-pub fn nvSplit() bool {
-    if (nv_split) return true;
-    if (std.c.getenv("INK2_NV_SPLIT")) |p| {
-        const s = std.mem.span(p);
-        return s.len > 0 and s[0] == '1';
-    }
-    return false;
-}
 
 /// A device address, as the launcher takes it.
 pub const Ptr = ?*anyopaque;
@@ -192,15 +176,6 @@ pub const Kernels = struct {
         if (c.format != .nvfp4) return error.WrongExpertFormat;
         try check(c);
         try xpu.launch.dispatch(try self.get(.nvfp4_gu), s, .{ tiles(c, true), routes(c), 1 }, .{ x, w, scales, amax, den, ids, out, c.k, c.n, c.topk, c.experts });
-    }
-
-    /// Packed NVFP4 GU over two launches: the halves of k into `part` f32 [routes][2n][2], then the join.
-    pub fn nvfp4GuSplit(self: *const Kernels, s: xpu.Stream, x: Ptr, w: Ptr, scales: Ptr, amax: Ptr, den: Ptr, ids: Ptr, part: Ptr, out: Ptr, c: Call) !void {
-        if (c.format != .nvfp4) return error.WrongExpertFormat;
-        try check(c);
-        if (c.rows != 1) return error.BadExpertShape;
-        try xpu.launch.dispatch(try self.get(.nvfp4_gu_split), s, .{ 2 * tiles(c, true), routes(c), 1 }, .{ x, w, scales, amax, den, ids, part, c.k, c.n, c.topk, c.experts });
-        try xpu.launch.dispatch(try self.get(.nvfp4_gu_join), s, .{ (2 * c.n + 63) / 64, routes(c), 1 }, .{ part, out, c.n, c.topk, c.experts });
     }
 
     /// Packed MXFP8 GU with UE8M0 scales per row and block of 32.

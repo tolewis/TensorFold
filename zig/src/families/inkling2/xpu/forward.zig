@@ -305,10 +305,7 @@ const Run = struct {
         const down = at(s.down, 0);
         if (rows <= decode_rows) {
             switch (precision) {
-                .nvfp4 => if (experts.nvSplit() and rows == 1)
-                    try ex.nvfp4GuSplit(g.s, x, tensor(w.gu.weight), tensor(w.gu.scale), tensor(w.gu.amax.?), tensor(w.gu.denominator.?), ids, at(s.gu_part, 0), act, gu_call)
-                else
-                    try ex.nvfp4Gu(g.s, x, tensor(w.gu.weight), tensor(w.gu.scale), tensor(w.gu.amax.?), tensor(w.gu.denominator.?), ids, act, gu_call),
+                .nvfp4 => try ex.nvfp4Gu(g.s, x, tensor(w.gu.weight), tensor(w.gu.scale), tensor(w.gu.amax.?), tensor(w.gu.denominator.?), ids, act, gu_call),
                 .mxfp8 => try ex.mxfp8Gu(g.s, x, tensor(w.gu.weight), tensor(w.gu.scale), ids, act, gu_call),
             }
             switch (precision) {

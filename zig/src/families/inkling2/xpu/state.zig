@@ -316,8 +316,6 @@ pub const fields = [_][]const u8{
     "part_ml",  "att",        "attn_dense", "attn_conv", "mlp_normed", "route_ids", "route_weights", "gu",       "down",    "mlp_out",
     "mlp_conv", "logits_all", "members",    "items",     "count",     "zeta",          "staging",
     "inv",      "xs",        "xp",        "kstage",    "vstage",
-    // the one-row gate/up K-split's f32 partials [route][row][half]
-    "gu_part",
 };
 
 fn sizes(rows: usize, capacity: usize) [fields.len]usize {
@@ -341,7 +339,6 @@ fn sizes(rows: usize, capacity: usize) [fields.len]usize {
         r * experts_per_token * 4, items * 3 * 4,                      4,                                         r * 4 * 64 * fp,                (3 + r) * hidden * bf,
         r * experts_per_token * 4, r * experts_per_token * h * bf, r * 2 * h * bf,
         8 * stageRows(r) * ap.head_dim * bf, 8 * stageRows(r) * ap.head_dim * bf,
-        r * experts_per_token * 2 * intermediate * 2 * fp,
     };
 }
 
@@ -410,8 +407,6 @@ pub const Scratch = struct {
     /// The sliding layers' K and V of the window before a chunk and of the chunk, in a ring of `stageRows(rows)` positions.
     kstage: rt.Buffer,
     vstage: rt.Buffer,
-    /// The one-row gate/up K-split's f32 partials [route][row][half], written by one launch and read by the next.
-    gu_part: rt.Buffer,
     /// Opt-in DSpark features [row][tap][H], allocated by prepare_features.
     taps: ?rt.Buffer = null,
     rows: usize,
