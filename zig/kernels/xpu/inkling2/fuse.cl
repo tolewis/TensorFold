@@ -294,6 +294,57 @@ KERNEL(256) void tf_ink2_router_gemv(global const ushort *x, global const ushort
   if (lane == 0) scores[(size_t)row * 128 + expert] = rsig(dot);
 }
 
+static inline float4 rx4l(local const uint2 *xg, uint i) {
+  const uint2 v = xg[i];
+  return (float4)(as_float(v.x << 16), as_float(v.x & 0xffff0000u), as_float(v.y << 16), as_float(v.y & 0xffff0000u));
+}
+
+// The dense norm, then the wide router GEMV. Group 0 stores the bf16 row. The GEMV reads that row from local.
+KERNEL(256) void tf_ink2_router_norm_gemv(
+    global const float *x, global const ushort *nw, global const ushort *weight, global ushort *normed_out,
+    global float *scores, uint rows) {
+  const uint row = get_group_id(1), lane = get_sub_group_local_id(), sg = get_sub_group_id(), t = get_local_id(0);
+  if (row >= rows) return;
+  local float red[16];
+  local ushort normed[H];
+  global const float *xr = x + (size_t)row * H;
+  float sum = 0.0f;
+  for (uint d = t; d < H; d += 256) sum = fma(xr[d], xr[d], sum);
+  const float s = sub_group_reduce_add(sum);
+  if (lane == 0) red[sg] = s;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float total = 0.0f;
+  for (uint i = 0; i < 16; ++i) total += red[i];
+  const float inverse = 1.0f / sqrt(total / (float)H + EPS);
+  for (uint d = t; d < H; d += 256) normed[d] = f2bf(bf2f(nw[d]) * (xr[d] * inverse));
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (get_group_id(0) == 0) {
+    for (uint d = t; d < H; d += 256) normed_out[(size_t)row * H + d] = normed[d];
+  }
+  const uint expert = get_group_id(0) * 16 + sg;
+  if (expert >= 128) return;
+  local const uint2 *xg = (local const uint2 *)normed;
+  global const uint4 *w = (global const uint4 *)(weight + (size_t)expert * H);
+  float dot = 0.0f;
+  for (uint part = 0; part < 2; ++part) {
+    for (uint u = 0; u < 9; ++u) {
+      const uint at = (part * 9 + u) * 16 + lane;
+      const uint4 a = w[(part * 9 + u) * 16 + lane];
+      const float4 b0 = rx4l(xg, 2 * at), b1 = rx4l(xg, 2 * at + 1);
+      dot += as_float(a.x << 16) * b0.x;
+      dot += as_float(a.x & 0xffff0000u) * b0.y;
+      dot += as_float(a.y << 16) * b0.z;
+      dot += as_float(a.y & 0xffff0000u) * b0.w;
+      dot += as_float(a.z << 16) * b1.x;
+      dot += as_float(a.z & 0xffff0000u) * b1.y;
+      dot += as_float(a.w << 16) * b1.z;
+      dot += as_float(a.w & 0xffff0000u) * b1.w;
+    }
+  }
+  dot = sub_group_reduce_add(dot);
+  if (lane == 0) scores[(size_t)row * 128 + expert] = rsig(dot);
+}
+
 // Grid (rows). Same tie rule as tf_inkling2_router: a larger key wins, an equal key keeps the lower index.
 __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(128, 1, 1))) kernel void tf_ink2_router_pick(
     global const float *scores_in, global const float *bias, global uint *ids, global float *weights, uint rows) {

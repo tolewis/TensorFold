@@ -332,6 +332,8 @@ pub fn main(init: std.process.Init) !void {
             ink.fuse.kv_conv = true;
         } else if (std.mem.eql(u8, a, "--down-epi")) {
             ink.fuse.down_epi = true;
+        } else if (std.mem.eql(u8, a, "--norm-router")) {
+            ink.fuse.norm_router = true;
         } else if (std.mem.eql(u8, a, "--rad-gu")) {
             ink.experts.rad_gu = true;
         } else if (std.mem.eql(u8, a, "--profile-all")) {
