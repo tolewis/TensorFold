@@ -18,6 +18,9 @@ pub const Kernels = struct {
     dense: [variants.len]xpu.Kernel,
     head: [variants.len]xpu.Kernel,
     seg1: xpu.Kernel,
+    /// The head tile kernel. One sub-group, 16 columns. Dense stays on `head`.
+    head_dpas: xpu.Kernel,
+    quant: xpu.Kernel,
     /// Output columns a work-group covers.
     columns: u32 = group_threads / 16,
 
@@ -37,18 +40,24 @@ pub const Kernels = struct {
             made[n] = try module.kernel(symbol("head", rows, control), .{ threads, 1, 1 });
             n += 1;
         }
-        var out: Kernels = .{ .dense = undefined, .head = undefined, .seg1 = undefined, .columns = threads / 16 };
+        var out: Kernels = .{ .dense = undefined, .head = undefined, .seg1 = undefined, .head_dpas = undefined, .quant = undefined, .columns = threads / 16 };
         for (0..variants.len) |i| {
             out.dense[i] = made[2 * i];
             out.head[i] = made[2 * i + 1];
         }
         const seg_name = if (control) "tf_ctl_ink2_dense_q8_seg1" else "tf_ink2_dense_q8_seg1";
         out.seg1 = try module.kernel(seg_name, .{ threads, 1, 1 });
+        const dpas_name = if (control) "tf_ctl_ink2_head_dpas" else "tf_ink2_head_dpas";
+        const qname = if (control) "tf_ctl_ink2_q8_quant" else "tf_ink2_q8_quant";
+        out.head_dpas = try module.kernel(dpas_name, .{ 16, 1, 1 });
+        out.quant = try module.kernel(qname, .{ 128, 1, 1 });
         return out;
     }
 
     pub fn deinit(p: *Kernels) void {
         p.seg1.deinit();
+        p.head_dpas.deinit();
+        p.quant.deinit();
         for (&p.dense) |*k| k.deinit();
         for (&p.head) |*k| k.deinit();
     }
