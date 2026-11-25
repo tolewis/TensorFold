@@ -454,7 +454,7 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
                 std.log.err("inkling2_loop: rank 1 prefill ({s})", .{@errorName(e)});
                 return false;
             };
-            ink.prefill.headRows(model, &scratch, 0, rec.n) catch |e| {
+            if (rec.flags & 2 != 0) ink.prefill.headRows(model, &scratch, 0, rec.n) catch |e| {
                 std.log.err("inkling2_loop: rank 1 head ({s})", .{@errorName(e)});
                 return false;
             };

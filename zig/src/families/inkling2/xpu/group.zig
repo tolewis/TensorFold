@@ -146,6 +146,7 @@ pub const Group = struct {
         if (rows == 0 or rows > rows_max) return error.Inkling2Tp;
         if (g.qgroup == null) return error.Inkling2Tp;
         qg.dev.noteKernel(xpu.profile.last_kernel);
+        if (std.c.getenv("TF_TP_LAUNCHLOG") != null) std.log.info("inkling2: reduce rank {d} rows {d} seq {d}", .{ g.rank, rows, g.qgroup.?.seq + 1 });
         return g.qgroup.?.allReduce(&g.qdev, partial, rows);
     }
 

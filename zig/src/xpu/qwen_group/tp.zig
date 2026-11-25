@@ -41,7 +41,7 @@ const off = dev.off;
 const D = q.D;
 
 const line = 64;
-const rows_max = 1024 + 128 + 16; // the widest forward (q.maxRows at XPU_CHUNK 1024) and a decode window
+const rows_max = 2048; // the Inkling prompt chunk, not Qwen's 1168
 const slot_bytes = rows_max * D * 2;
 const ring_len = 64;
 /// The segment header: the generation (0), the magic (8), then the rank lines. A segment is only taken by a follower
