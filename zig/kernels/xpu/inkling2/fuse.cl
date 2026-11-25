@@ -477,7 +477,9 @@ KERNEL(256) void tf_ink2_fuse_norms(
 // group. The source means are recomputed by each group, the same code and the same order, so the bits do not move.
 KERNEL(256) void tf_ink2_fuse_pre_q(
     global const ushort *p, global float *partial, global const ushort *blocks, global const float *queries, global float *ar,
-    uint rows, uint blocks_stride, uint sources, uint n_queries) {
+    global const ushort *wq, global const ushort *wk, global const ushort *wv,
+    global ushort *q_norm, global ushort *k_norm, global ushort *v_norm,
+    uint rows, uint blocks_stride, uint sources, uint n_queries, uint norm_n) {
   const uint q = get_group_id(0), row = get_group_id(1), t = get_local_id(0), lane = get_sub_group_local_id(), sg = get_sub_group_id();
   if (row >= rows || q >= n_queries || sources == 0 || sources > 5) return;
   local float red[160];
@@ -535,6 +537,11 @@ KERNEL(256) void tf_ink2_fuse_pre_q(
       if (s < sources) acc += weights[s] * (v[s][i] * means[s]);
     dst[t + 256 * i] = FUSE_PRE(acc);
   }
+  if (norm_n == 0) return;
+  barrier(CLK_GLOBAL_MEM_FENCE);
+  global const ushort *w = q == 0 ? wq : q == 1 ? wk : wv;
+  global ushort *out = (q == 0 ? q_norm : q == 1 ? k_norm : v_norm) + (size_t)row * H;
+  do_norm(dst, w, out, t, red);
 }
 
 static inline float4 rx4(global const uint2 *xg, uint i) {

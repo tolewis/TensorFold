@@ -292,10 +292,12 @@ pub fn phaseA(p: *const Pipelines, s: xpu.Stream, a: PhaseA) !void {
         });
         return;
     }
-    if (preQ() and norm_here == 0 and a.n_queries > 0 and a.queries != null) {
+    if (preQ() and a.n_queries > 0 and a.queries != null and (norm_here == 0 or norm_here == a.n_queries)) {
         try xpu.launch.dispatch(p.pre_q_k, s, .{ a.n_queries, a.rows, 1 }, .{
             a.p, a.partial, a.blocks, a.queries orelse dummy, a.ar,
-            a.rows, a.blocks_stride, a.sources, a.n_queries,
+            a.wq, a.wk orelse a.wq, a.wv orelse a.wq,
+            a.q_norm, a.k_norm orelse a.q_norm, a.v_norm orelse a.q_norm,
+            a.rows, a.blocks_stride, a.sources, a.n_queries, norm_here,
         });
     } else try xpu.launch.dispatch(p.pre, s, .{ a.rows, 1, 1 }, .{
         a.p, a.partial, a.blocks, a.queries orelse dummy, a.ar,
