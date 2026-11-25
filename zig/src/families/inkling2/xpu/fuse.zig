@@ -9,6 +9,16 @@ pub var force: ?bool = null;
 pub var seg: bool = true;
 pub var router_wide: bool = false;
 pub var conv_fold: bool = false;
+pub var zeta_wide: bool = false;
+
+pub fn zetaWide() bool {
+    if (zeta_wide) return true;
+    if (std.c.getenv("INK2_ZETA_WIDE")) |p| {
+        const s = std.mem.span(p);
+        return s.len > 0 and s[0] == '1';
+    }
+    return false;
+}
 
 pub fn convFold() bool {
     if (conv_fold) return true;
@@ -46,6 +56,7 @@ pub const Pipelines = struct {
     router_pick: xpu.Kernel,
     conv_attn: xpu.Kernel,
     conv_mlp: xpu.Kernel,
+    zeta_wide: xpu.Kernel,
 
     pub fn load(module: xpu.Module) !Pipelines {
         var pre = try module.kernel("tf_ink2_fuse_pre", .{ 256, 1, 1 });
@@ -62,11 +73,14 @@ pub const Pipelines = struct {
         errdefer router_pick.deinit();
         var conv_attn = try module.kernel("tf_ink2_conv_attn_partial", .{ 256, 1, 1 });
         errdefer conv_attn.deinit();
-        const conv_mlp = try module.kernel("tf_ink2_conv_mlp_partial", .{ 256, 1, 1 });
-        return .{ .pre = pre, .zeta = zeta, .gates = gates, .norms = norms, .router_gemv = router_gemv, .router_pick = router_pick, .conv_attn = conv_attn, .conv_mlp = conv_mlp };
+        var conv_mlp = try module.kernel("tf_ink2_conv_mlp_partial", .{ 256, 1, 1 });
+        errdefer conv_mlp.deinit();
+        const zeta_wide_k = try module.kernel("tf_ink2_zeta_wide", .{ 256, 1, 1 });
+        return .{ .pre = pre, .zeta = zeta, .gates = gates, .norms = norms, .router_gemv = router_gemv, .router_pick = router_pick, .conv_attn = conv_attn, .conv_mlp = conv_mlp, .zeta_wide = zeta_wide_k };
     }
 
     pub fn deinit(p: *Pipelines) void {
+        p.zeta_wide.deinit();
         p.conv_mlp.deinit();
         p.conv_attn.deinit();
         p.router_pick.deinit();
@@ -131,7 +145,12 @@ pub fn phaseA(p: *const Pipelines, s: xpu.Stream, a: PhaseA) !void {
         a.rows, a.blocks_stride, a.sources, a.n_queries, norm_here,
     });
     if (a.roles == 0) return;
-    try xpu.launch.dispatch(p.zeta, s, .{ 32, a.roles, a.rows }, .{
+    if (zetaWide()) {
+        try xpu.launch.dispatch(p.zeta_wide, s, .{ 4, a.roles, a.rows }, .{
+            a.ar, a.messages orelse dummy, a.down[0], a.down[1], a.down[2], a.zeta,
+            a.rows, a.roles, a.local_src, a.core, a.msg_entries, @as(u32, 1),
+        });
+    } else try xpu.launch.dispatch(p.zeta, s, .{ 32, a.roles, a.rows }, .{
         a.ar, a.messages orelse dummy, a.down[0], a.down[1], a.down[2], a.zeta,
         a.rows, a.roles, a.local_src, a.core, a.msg_entries,
     });

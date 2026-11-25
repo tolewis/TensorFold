@@ -162,6 +162,53 @@ KERNEL(256) void tf_ink2_fuse_zeta(
   }
 }
 
+// Grid (4, roles, rows). Every sub-group owns one rank. The norm and the lane dot match tf_ink2_fuse_zeta.
+// pack4 stores (row * 4 + role); otherwise row * 64, for the MLP controller.
+KERNEL(256) void tf_ink2_zeta_wide(
+    global const float *ar, global const float *messages, global const ushort *down0, global const ushort *down1,
+    global const ushort *down2, global float *zeta, uint rows, uint roles, uint local_src, uint core, uint msg_entries,
+    uint pack4) {
+  const uint part = get_group_id(0), role = get_group_id(1), row = get_group_id(2);
+  if (row >= rows || role >= roles || part >= 4) return;
+  const uint t = get_local_id(0), lane = get_sub_group_local_id(), sg = get_sub_group_id();
+  const uint r = part * 16 + sg;
+  local float red[16];
+  local ushort normalized[2 * H];
+  const uint src = local_src ? 0 : role;
+  global const float *h = ar + ((size_t)src * rows + row) * H;
+  global const float *m = messages + ((size_t)row * msg_entries + core * 4 + role) * H;
+  global const ushort *down = role == 0 ? down0 : role == 1 ? down1 : down2;
+  float hv[H / 256], mv[H / 256];
+  float ss0 = 0.0f, ss1 = 0.0f;
+  for (uint i = 0; i < H / 256; ++i) {
+    hv[i] = h[t + 256 * i];
+    mv[i] = m[t + 256 * i];
+    ss0 += hv[i] * hv[i];
+    ss1 += mv[i] * mv[i];
+  }
+  const float inv0 = 1.0f / sqrt(wg_sum(ss0, red) / 2304.0f + EPS);
+  const float inv1 = 1.0f / sqrt(wg_sum(ss1, red) / 2304.0f + EPS);
+  for (uint i = 0; i < H / 256; ++i) {
+    normalized[t + 256 * i] = f2bf(hv[i] * inv0);
+    normalized[H + t + 256 * i] = f2bf(mv[i] * inv1);
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  global const ushort *dr = down + (size_t)r * (2 * H);
+  float dot = 0.0f;
+  for (uint d = 8 * lane; d < 2 * H; d += 512) {
+    const ushort8 w0 = vload8(0, dr + d), w1 = vload8(0, dr + d + 128);
+    const ushort8 w2 = vload8(0, dr + d + 256), w3 = vload8(0, dr + d + 384);
+    const ushort8 x0 = vload8(0, normalized + d), x1 = vload8(0, normalized + d + 128);
+    const ushort8 x2 = vload8(0, normalized + d + 256), x3 = vload8(0, normalized + d + 384);
+    for (int j = 0; j < 8; ++j) dot += bf2f(w0[j]) * bf2f(x0[j]);
+    for (int j = 0; j < 8; ++j) dot += bf2f(w1[j]) * bf2f(x1[j]);
+    for (int j = 0; j < 8; ++j) dot += bf2f(w2[j]) * bf2f(x2[j]);
+    for (int j = 0; j < 8; ++j) dot += bf2f(w3[j]) * bf2f(x3[j]);
+  }
+  dot = sub_group_reduce_add(dot);
+  if (lane == 0) zeta[pack4 ? ((size_t)row * 4 + role) * RANK + r : (size_t)row * RANK + r] = rbf(dot);
+}
+
 // Grid (36, roles, rows). One work-item one channel, the same 64-term order as tf_inkling2_loop_gates.
 KERNEL(64) void tf_ink2_fuse_gates(
     global const float *ar, global const float *messages, global const ushort *forget0, global const ushort *forget1,
