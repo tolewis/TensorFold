@@ -32,6 +32,7 @@ var slice_pulled_dumped = false;
 
 pub var vdump_seq: u32 = 0;
 pub var vdump_visit: usize = 0;
+pub var vdump_cur: u32 = 0;
 pub var vdump_active: bool = false;
 
 /// TF_TP_VDUMP: the hidden state after each visit of a short call (a verify window or a decode row), for the bisect.
@@ -530,6 +531,10 @@ fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) 
                 try gp.allReduce(at(s.attn_dense, 0).?, @intCast(rows));
             }
         }
+        if (vdump and visit_i == 0) {
+            try dumpVisit(m.r, m.options.place.rank, vdump_cur, 90, at(s.q_norm, 0), rows);
+            try dumpVisit(m.r, m.options.place.rank, vdump_cur, 91, at(s.attn_dense, 0), rows);
+        }
         var base: usize = 0;
         if (fuse.convFold() and segments.len == 1) {
             const seg = segments[0];
@@ -798,6 +803,7 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     if (vdump) vdump_seq += 1;
     for (m.weight_plan.visits[0..m.weight_plan.n_visits], 0..) |*v, vi| {
         vdump_visit = vi;
+        vdump_cur = seq;
         vdump_active = vdump;
         try g.visit(v, segments, rows, options.taps, vi);
         if (vdump) try dumpVisit(m.r, m.options.place.rank, seq, vi, at(s.p, 0), rows);
