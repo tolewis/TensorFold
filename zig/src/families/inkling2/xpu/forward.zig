@@ -371,7 +371,9 @@ const Run = struct {
             try loop.gates(&g.p.loop, g.s, at(s.mlp_ar, 0), messageRow(s, core, 3, 0), tensor(c.down), tensor(c.forget), tensor(c.gain), at(s.zeta, 0), at(s.mlp_gated, 0), @intCast(rows), state.message_entries * state.hidden);
             try g.norm(at(s.mlp_gated, 0), w.mlp_norm, at(s.mlp_normed, 0), rows);
         } else try g.norm(at(s.mlp_ar, 0), w.mlp_norm, at(s.mlp_normed, 0), rows);
-        try glue.router(&g.p.glue, g.s, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.route_ids, 0), at(s.route_weights, 0), @intCast(rows));
+        if (fuse.routerWide()) {
+            try fuse.routerWideLaunch(&g.p.fuse, g.s, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.logits_all, 0), at(s.route_ids, 0), at(s.route_weights, 0), @intCast(rows));
+        } else try glue.router(&g.p.glue, g.s, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.route_ids, 0), at(s.route_weights, 0), @intCast(rows));
         if (route_trace) |tb| try g.s.copy(plus(tb.ptr, v.cache_slot * rows * 32), at(s.route_ids, 0), rows * 32);
         try g.routedExperts(v.layer, rows);
         base = 0;
@@ -477,6 +479,43 @@ pub fn checkPhaseA(m: *const Model, s: *state.Scratch, r: *xpu.rt.Runtime) !usiz
         bad += row_bad;
     }
     fuse.force = null;
+    return bad;
+}
+
+/// One row, layer 0 router weights. The wide path's picks against the old kernel.
+pub fn checkRouter(m: *const Model, s: *state.Scratch, r: *xpu.rt.Runtime) !usize {
+    if (m.pipelines == null or m.ctx == null) return error.Inkling2NoKernels;
+    const pipes = &m.pipelines.?;
+    const stream = m.r.stream(m.ctx.?);
+    const H = state.hidden;
+    var xbits: [H]u16 = undefined;
+    for (0..H) |d| xbits[d] = bf16bits(0.02 * @as(f32, @floatFromInt((d * 13) % 80)) - 0.4);
+    try r.upload(s.mlp_normed, std.mem.sliceAsBytes(&xbits));
+    const w = &m.weights.layers[0];
+    const g = Run{ .m = m, .p = pipes, .s = stream, .sc = s };
+    _ = g;
+    try glue.router(&pipes.glue, stream, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.route_ids, 0), at(s.route_weights, 0), 1);
+    try stream.synchronize();
+    var ids_a: [8]u32 = undefined;
+    var w_a: [8]f32 = undefined;
+    var ids_b: [8]u32 = undefined;
+    var w_b: [8]f32 = undefined;
+    try r.download(std.mem.sliceAsBytes(&ids_a), s.route_ids);
+    try r.download(std.mem.sliceAsBytes(&w_a), s.route_weights);
+    try r.sync();
+    try fuse.routerWideLaunch(&pipes.fuse, stream, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.logits_all, 0), at(s.route_ids, 0), at(s.route_weights, 0), 1);
+    try stream.synchronize();
+    try r.download(std.mem.sliceAsBytes(&ids_b), s.route_ids);
+    try r.download(std.mem.sliceAsBytes(&w_b), s.route_weights);
+    try r.sync();
+    var bad: usize = 0;
+    for (ids_a, ids_b) |a, b| if (a != b) {
+        bad += 1;
+    };
+    for (w_a, w_b) |a, b| if (a != b) {
+        bad += 1;
+    };
+    std.debug.print("router-check ids {any} vs {any} weight mismatches in the {d} bad slots\n", .{ ids_a, ids_b, bad });
     return bad;
 }
 

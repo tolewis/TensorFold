@@ -7,6 +7,16 @@ pub const Ref = ?*anyopaque;
 
 pub var force: ?bool = null;
 pub var seg: bool = true;
+pub var router_wide: bool = false;
+
+pub fn routerWide() bool {
+    if (router_wide) return true;
+    if (std.c.getenv("INK2_ROUTER_WIDE")) |p| {
+        const s = std.mem.span(p);
+        return s.len > 0 and s[0] == '1';
+    }
+    return false;
+}
 
 pub fn enabled() bool {
     if (force) |v| return v;
@@ -22,6 +32,8 @@ pub const Pipelines = struct {
     zeta: xpu.Kernel,
     gates: xpu.Kernel,
     norms: xpu.Kernel,
+    router_gemv: xpu.Kernel,
+    router_pick: xpu.Kernel,
 
     pub fn load(module: xpu.Module) !Pipelines {
         var pre = try module.kernel("tf_ink2_fuse_pre", .{ 256, 1, 1 });
@@ -30,11 +42,17 @@ pub const Pipelines = struct {
         errdefer zeta.deinit();
         var gates = try module.kernel("tf_ink2_fuse_gates", .{ 64, 1, 1 });
         errdefer gates.deinit();
-        const norms = try module.kernel("tf_ink2_fuse_norms", .{ 256, 1, 1 });
-        return .{ .pre = pre, .zeta = zeta, .gates = gates, .norms = norms };
+        var norms = try module.kernel("tf_ink2_fuse_norms", .{ 256, 1, 1 });
+        errdefer norms.deinit();
+        var router_gemv = try module.kernel("tf_ink2_router_gemv", .{ 256, 1, 1 });
+        errdefer router_gemv.deinit();
+        const router_pick = try module.kernel("tf_ink2_router_pick", .{ 128, 1, 1 });
+        return .{ .pre = pre, .zeta = zeta, .gates = gates, .norms = norms, .router_gemv = router_gemv, .router_pick = router_pick };
     }
 
     pub fn deinit(p: *Pipelines) void {
+        p.router_pick.deinit();
+        p.router_gemv.deinit();
         p.norms.deinit();
         p.gates.deinit();
         p.zeta.deinit();
@@ -70,6 +88,11 @@ pub const PhaseA = struct {
     msg_entries: u32,
     norm_n: u32,
 };
+
+pub fn routerWideLaunch(p: *const Pipelines, s: xpu.Stream, x: Ref, weight: Ref, bias: Ref, scores: Ref, ids: Ref, weights: Ref, rows: u32) !void {
+    try xpu.launch.dispatch(p.router_gemv, s, .{ 8, rows, 1 }, .{ x, weight, scores, rows });
+    try xpu.launch.dispatch(p.router_pick, s, .{ rows, 1, 1 }, .{ scores, bias, ids, weights, rows });
+}
 
 pub fn phaseA(p: *const Pipelines, s: xpu.Stream, a: PhaseA) !void {
     const dummy = a.zeta;
