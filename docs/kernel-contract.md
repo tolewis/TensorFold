@@ -145,6 +145,8 @@ source built with `TF_CTL_LOOP_NO_SCALE` and `TF_CTL_LOOP_NO_ZETA_ROUND`: the me
 gates without the bf16 rounding of zeta), red at `shapes`. The run also compares the device with the host float model
 of `zig/src/families/inkling2/loop_model.zig`. `tf-xpu-contract-run --only TEXT` runs the kernels whose name holds TEXT.
 
+Inkling 2 Mini's fused visit kernels (`zig/kernels/xpu/inkling2/fuse.cl`) are a contract image, `contract_inkling2_fuse`, so a change rebuilds it. The control image is the same source with `-DFUSE_CTL`. The prologue probe is wired: the control stores zero and gate 3 must go red. Zeta, gates, the down epilogue and the norm-router use the same flags; their probes are next.
+
 On any host, with no device, `zig build cpu-contract` runs the CPU kernels (Qwen3.5-2B's affine projection and RMS
 norm on the host's cores) through gates 1 to 4 and their eight controls; a CPU kernel has no launch, so gate 5 has
 nothing to check. `zig build test-kernel-contract`, CI's no-device step, runs the same gates as a test, and `zig build

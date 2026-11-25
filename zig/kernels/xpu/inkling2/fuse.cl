@@ -7,6 +7,21 @@
 #define H 2304
 #define EPS 1e-6f
 #define AR_SCALE 0x1.555556p-6f
+#ifdef FUSE_CTL
+#define FUSE_AR_SCALE 0.0f
+#define FUSE_PRE(acc) (0.0f)
+#define FUSE_ZETA(dot) (0.0f)
+#define FUSE_GATE 0.0f
+#define FUSE_EPI 0
+#define FUSE_NORM 0.0f
+#else
+#define FUSE_AR_SCALE AR_SCALE
+#define FUSE_PRE(acc) (acc)
+#define FUSE_ZETA(dot) rbf(dot)
+#define FUSE_GATE 1.0f
+#define FUSE_EPI 1
+#define FUSE_NORM 1.0f
+#endif
 #define RANK 64
 
 static inline float bf2f(ushort h) { return as_float((uint)h << 16); }
@@ -87,7 +102,7 @@ KERNEL(256) void tf_ink2_fuse_pre(
       for (uint s = 0; s < 5; ++s) {
         float dot = 0.0f;
         for (uint j = 0; j < 16; ++j) dot += dots[s * 16 + j];
-        weights[s] = dot * AR_SCALE;
+        weights[s] = dot * FUSE_AR_SCALE;
         if (s < sources) peak = peak < weights[s] ? weights[s] : peak;
       }
       float den = 0.0f;
@@ -101,7 +116,7 @@ KERNEL(256) void tf_ink2_fuse_pre(
         float acc = 0.0f;
         for (uint s = 0; s < 5; ++s)
           if (s < sources) acc += weights[s] * (v[s][i] * means[s]);
-        dst[t + 256 * i] = acc;
+        dst[t + 256 * i] = FUSE_PRE(acc);
       }
       barrier(CLK_LOCAL_MEM_FENCE);
     }
@@ -158,7 +173,7 @@ KERNEL(256) void tf_ink2_fuse_zeta(
       for (int j = 0; j < 8; ++j) dot += bf2f(w3[j]) * bf2f(x3[j]);
     }
     dot = sub_group_reduce_add(dot);
-    if (lane == 0) zeta[((size_t)row * 4 + role) * RANK + r] = rbf(dot);
+    if (lane == 0) zeta[((size_t)row * 4 + role) * RANK + r] = FUSE_ZETA(dot);
   }
 }
 
@@ -206,7 +221,7 @@ KERNEL(256) void tf_ink2_zeta_wide(
     for (int j = 0; j < 8; ++j) dot += bf2f(w3[j]) * bf2f(x3[j]);
   }
   dot = sub_group_reduce_add(dot);
-  if (lane == 0) zeta[pack4 ? ((size_t)row * 4 + role) * RANK + r : (size_t)row * RANK + r] = rbf(dot);
+  if (lane == 0) zeta[pack4 ? ((size_t)row * 4 + role) * RANK + r : (size_t)row * RANK + r] = FUSE_ZETA(dot);
 }
 
 // Grid (36, roles, rows). One work-item one channel, the same 64-term order as tf_inkling2_loop_gates.
@@ -240,7 +255,7 @@ KERNEL(64) void tf_ink2_fuse_gates(
   const float g = tanh(gdot);
   const float keep = 1.0f - f;
   const float left = keep * h[d];
-  const float right = g * m[d];
+  const float right = FUSE_GATE * g * m[d];
   gated[((size_t)role * rows + row) * H + d] = left + right;
 }
 
@@ -315,7 +330,7 @@ KERNEL(256) void tf_ink2_router_norm_gemv(
   barrier(CLK_LOCAL_MEM_FENCE);
   float total = 0.0f;
   for (uint i = 0; i < 16; ++i) total += red[i];
-  const float inverse = 1.0f / sqrt(total / (float)H + EPS);
+  const float inverse = FUSE_NORM / sqrt(total / (float)H + EPS);
   for (uint d = t; d < H; d += 256) normed[d] = f2bf(bf2f(nw[d]) * (xr[d] * inverse));
   barrier(CLK_LOCAL_MEM_FENCE);
   if (get_group_id(0) == 0) {
@@ -470,6 +485,6 @@ KERNEL(256) void tf_ink2_down_epilogue(
     const ushort cy = conv_y(history, current, taps, conv_w, r, c, channels);
     conv_out[(size_t)r * channels + c] = cy;
     const uint at = r * channels + c;
-    p[at] = f2bf(partial[at] + bf2f(cy));
+    p[at] = FUSE_EPI ? f2bf(partial[at] + bf2f(cy)) : (ushort)0;
   }
 }

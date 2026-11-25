@@ -142,6 +142,14 @@ const qwen27_records = [_]Record{
         .usage = .{.{ .threads = .{ 64, 1, 1 }, .slm = 256, .sub_group = 16, .grf = 256 }},
     },
     .{
+        .launch = .{ .name = "inkling2 fuse prologue", .symbol = "tf_ink2_fuse_pre", .image = "contract_inkling2_fuse", .format = glue, .threads = .{ 256, 1, 1 }, .slm = 640, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 256, 1, 1 }, .slm = 640, .sub_group = 16, .grf = 256 }},
+    },
+    .{
+        .launch = .{ .name = "planted inkling2 fuse prologue stores zero", .symbol = "tf_ink2_fuse_pre", .image = "contract_inkling2_fuse_controls", .format = glue, .threads = .{ 256, 1, 1 }, .slm = 640, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 256, 1, 1 }, .slm = 640, .sub_group = 16, .grf = 256 }},
+    },
+    .{
         .launch = .{ .name = "inkling2 attention prep", .symbol = "tf_ink2_prep", .image = "inkling2_attention", .format = glue, .threads = .{ 16, 1, 1 }, .sub_group = 16, .grf = 256 },
         .usage = .{.{ .threads = .{ 16, 1, 1 }, .sub_group = 16, .grf = 256 }},
     },
