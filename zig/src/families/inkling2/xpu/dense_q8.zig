@@ -88,12 +88,16 @@ fn at(r: Ref, bytes: usize) Ref {
 /// layout (k a multiple of 256).
 /// One launch of five one-row matvecs. Each segment has its own x, weight and n. k is shared. The dot matches `matvec` of one row.
 pub fn seg1(p: *const Kernels, s: xpu.Stream, x: [5]Ref, w: [5]Ref, y: [5]Ref, n: [5]u32, k: u32) !void {
+    try seg1Sink(p, s, x, w, y, n, k, w[0], y[0], 0, 0);
+}
+
+pub fn seg1Sink(p: *const Kernels, s: xpu.Stream, x: [5]Ref, w: [5]Ref, y: [5]Ref, n: [5]u32, k: u32, sink_w: Ref, sink_y: Ref, sink_n: u32, sink_on: u32) !void {
     var max_n: u32 = 0;
     for (n) |ni| max_n = @max(max_n, ni);
     const cols = (max_n + p.columns - 1) / p.columns;
     try xpu.launch.dispatch(p.seg1, s, .{ cols, 5, 1 }, .{
         x[0], x[1], x[2], x[3], x[4], w[0], w[1], w[2], w[3], w[4], y[0], y[1], y[2], y[3], y[4],
-        n[0], n[1], n[2], n[3], n[4], k,
+        n[0], n[1], n[2], n[3], n[4], k, sink_w, sink_y, sink_n, sink_on,
     });
 }
 

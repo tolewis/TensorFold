@@ -355,7 +355,17 @@ const Run = struct {
         if (fuse.seg and rows == 1 and w.attn.wq.q8) {
             xpu.profile.label = "wqkv";
             const k: u32 = @intCast(w.attn.wq.shape[w.attn.wq.rank - 1]);
-            try dense_q8_kernels.seg1(&g.p.dense_q8, g.s, .{
+            if (fuse.sinkSeg()) {
+                try dense_q8_kernels.seg1Sink(&g.p.dense_q8, g.s, .{
+                    at(s.q_norm, 0), knorm, vnorm, at(s.q_norm, 0), at(s.q_norm, 0),
+                }, .{
+                    tensor(w.attn.wq), tensor(w.attn.wk), tensor(w.attn.wv), tensor(w.attn.wr), tensor(w.attn.gate),
+                }, .{
+                    at(s.q_raw, 0), at(s.k_raw, 0), at(s.v_raw, 0), at(s.rel_raw, 0), at(s.gate, 0),
+                }, .{
+                    g.projN(w.attn.wq), g.projN(w.attn.wk), g.projN(w.attn.wv), g.projN(w.attn.wr), g.projN(w.attn.gate),
+                }, k, tensor(w.attn.sink), at(s.sink, 0), 24, 1);
+            } else try dense_q8_kernels.seg1(&g.p.dense_q8, g.s, .{
                 at(s.q_norm, 0), knorm, vnorm, at(s.q_norm, 0), at(s.q_norm, 0),
             }, .{
                 tensor(w.attn.wq), tensor(w.attn.wk), tensor(w.attn.wv), tensor(w.attn.wr), tensor(w.attn.gate),
@@ -376,8 +386,10 @@ const Run = struct {
             xpu.profile.label = "gate";
             try g.dense(w.attn.gate, at(s.q_norm, 0), at(s.gate, 0), rows);
         }
-        xpu.profile.label = "sink";
-        try g.dense(w.attn.sink, at(s.q_norm, 0), at(s.sink, 0), rows);
+        if (!fuse.sinkSeg()) {
+            xpu.profile.label = "sink";
+            try g.dense(w.attn.sink, at(s.q_norm, 0), at(s.sink, 0), rows);
+        }
         xpu.profile.label = "";
         try g.attendSegments(v, segments);
         xpu.profile.label = "wo";
