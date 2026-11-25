@@ -180,7 +180,10 @@ pub const Group = struct {
         qg.dev.noteKernel(xpu.profile.last_kernel);
         const from = if (g.rank == 0) @as(usize, 0) else half;
         const zeros = [_]u8{0} ** 8;
-        try g.r.drv.check(g.r.drv.x.zeCommandListAppendMemoryFill(g.r.list, @ptrFromInt(@intFromPtr(partial) + from * row_bytes), &zeros, 8, half * row_bytes, null, 0, null), "inkling2 gather zero");
+        const off_bytes: usize = from * row_bytes;
+        const fill_bytes: usize = half * row_bytes;
+        const dst: *anyopaque = @ptrFromInt(@intFromPtr(partial) + off_bytes);
+        try g.r.drv.check(g.r.drv.x.zeCommandListAppendMemoryFill(g.r.list, dst, &zeros, 8, fill_bytes, null, 0, null), "inkling2 gather zero");
         return g.qgroup.?.allReduceBytes(&g.qdev, partial, rows, row_bytes);
     }
 
