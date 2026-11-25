@@ -565,8 +565,13 @@ fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) 
             try dumpVisit(m.r, m.options.place.rank, vdump_cur, 97, at(s.k_conv, 0), rows, m.options.place.kvWidth());
             try dumpVisit(m.r, m.options.place.rank, vdump_cur, 98, at(s.v_conv, 0), rows, m.options.place.kvWidth());
             try dumpVisit(m.r, m.options.place.rank, vdump_cur, 99, at(s.v_raw, 0), rows, m.options.place.kvWidth());
-            try dumpVisit(m.r, m.options.place.rank, vdump_cur, 100, at(segments[0].cache.keys(v.cache_slot).buf, segments[0].cache.keys(v.cache_slot).off), 1, 24 * m.options.place.kvWidth());
-            try dumpVisit(m.r, m.options.place.rank, vdump_cur, 101, at(segments[0].cache.values(v.cache_slot).buf, segments[0].cache.values(v.cache_slot).off), 1, 24 * m.options.place.kvWidth());
+            const ring_k = segments[0].cache.keys(v.cache_slot);
+            const ring_v = segments[0].cache.values(v.cache_slot);
+            const ring_n = segments[0].cache.ring(v.cache_slot);
+            for (0..4) |h| {
+                try dumpVisit(m.r, m.options.place.rank, vdump_cur, 110 + h, at(ring_k.buf, ring_k.off + h * ring_n * ap.head_dim * 2), 1, 24 * ap.head_dim);
+                try dumpVisit(m.r, m.options.place.rank, vdump_cur, 120 + h, at(ring_v.buf, ring_v.off + h * ring_n * ap.head_dim * 2), 1, 24 * ap.head_dim);
+            }
         }
         var base: usize = 0;
         if (fuse.convFold() and segments.len == 1) {
