@@ -434,42 +434,42 @@ KERNEL(256) void tf_ink2_conv_kv(
   ov[(size_t)r * channels + c] = conv_y(hv, cv, tv, wv, r, c, channels);
 }
 
-// One row. Combine in expert order, round to bf16, then the MLP convolution and the residual add into p.
+// Every row of the chunk. One thread owns a column and walks rows in order, so the convolution window
+// sees this column's earlier combine results. The combine order matches the expert kernel. Row 0 matches the
+// old one-row formula because conv_y at row 0 is that formula.
 KERNEL(256) void tf_ink2_down_epilogue(
     global const ushort *down, global const int *ids, global const float *weights,
-    global const ushort *history, global ushort *taps, global const ushort *conv_w, global ushort *conv_out,
-    global const float *partial, global ushort *p, uint n, uint topk, uint channels) {
+    global const ushort *history, global ushort *taps, global const ushort *conv_w, global ushort *current,
+    global ushort *conv_out, global const float *partial, global ushort *p, uint n, uint topk, uint channels, uint rows) {
   const uint c = get_group_id(0) * 256 + get_local_id(0);
   if (c >= n || c >= channels) return;
-  float sum = 0.0f;
-  int last_id = INT_MIN;
-  int last_slot = -1;
-  for (uint t = 0; t < topk; ++t) {
-    int best_id = INT_MAX;
-    int best_slot = -1;
-    for (uint slot = 0; slot < topk; ++slot) {
-      const int id = ids[slot];
-      const bool after = id > last_id || (id == last_id && (int)slot > last_slot);
-      if (after && (best_slot < 0 || id < best_id)) {
-        best_id = id;
-        best_slot = (int)slot;
+  for (uint r = 0; r < rows; ++r) {
+    float sum = 0.0f;
+    int last_id = INT_MIN;
+    int last_slot = -1;
+    global const int *id_row = ids + (size_t)r * topk;
+    global const float *w_row = weights + (size_t)r * topk;
+    for (uint t = 0; t < topk; ++t) {
+      int best_id = INT_MAX;
+      int best_slot = -1;
+      for (uint slot = 0; slot < topk; ++slot) {
+        const int id = id_row[slot];
+        const bool after = id > last_id || (id == last_id && (int)slot > last_slot);
+        if (after && (best_slot < 0 || id < best_id)) {
+          best_id = id;
+          best_slot = (int)slot;
+        }
       }
+      if (best_slot < 0) break;
+      sum += w_row[best_slot] * bf2f(down[((size_t)r * topk + (uint)best_slot) * n + c]);
+      last_id = best_id;
+      last_slot = best_slot;
     }
-    if (best_slot < 0) break;
-    sum += weights[best_slot] * bf2f(down[(size_t)best_slot * n + c]);
-    last_id = best_id;
-    last_slot = best_slot;
+    const ushort y = f2bf(sum);
+    current[(size_t)r * channels + c] = y;
+    const ushort cy = conv_y(history, current, taps, conv_w, r, c, channels);
+    conv_out[(size_t)r * channels + c] = cy;
+    const uint at = r * channels + c;
+    p[at] = f2bf(partial[at] + bf2f(cy));
   }
-  const ushort y = f2bf(sum);
-  conv_out[c] = y;
-  float window[4];
-  for (uint tap = 0; tap < 4; ++tap) {
-    window[tap] = bf2f(tap < 3 ? history[(size_t)tap * channels + c] : y);
-  }
-  for (uint k = 0; k < 3; ++k) taps[(size_t)k * channels + c] = history[(size_t)k * channels + c];
-  taps[3 * channels + c] = y;
-  float acc = bf2f(y);
-  for (uint tap = 0; tap < 4; ++tap) acc += bf2f(conv_w[c * 4 + tap]) * window[tap];
-  const ushort cy = f2bf(acc / SQRT5);
-  p[c] = f2bf(partial[c] + bf2f(cy));
 }

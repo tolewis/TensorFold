@@ -168,9 +168,9 @@ pub fn convAttnPartial(p: *const Pipelines, s: xpu.Stream, history: Ref, current
     try xpu.launch.dispatch(p.conv_attn, s, .{ groups, rows, 1 }, .{ history, current, taps, weight, conv_out, prev, blocks, partial, rows, channels, boundary });
 }
 
-pub fn downEpilogue(p: *const Pipelines, s: xpu.Stream, down: Ref, ids: Ref, weights: Ref, history: Ref, taps: Ref, conv_w: Ref, conv_out: Ref, partial: Ref, pout: Ref, n: u32, topk: u32, channels: u32) !void {
+pub fn downEpilogue(p: *const Pipelines, s: xpu.Stream, down: Ref, ids: Ref, weights: Ref, history: Ref, taps: Ref, conv_w: Ref, current: Ref, conv_out: Ref, partial: Ref, pout: Ref, n: u32, topk: u32, channels: u32, rows: u32) !void {
     const groups = (n + 255) / 256;
-    try xpu.launch.dispatch(p.down_epi, s, .{ groups, 1, 1 }, .{ down, ids, weights, history, taps, conv_w, conv_out, partial, pout, n, topk, channels });
+    try xpu.launch.dispatch(p.down_epi, s, .{ groups, 1, 1 }, .{ down, ids, weights, history, taps, conv_w, current, conv_out, partial, pout, n, topk, channels, rows });
 }
 
 pub fn convKv(p: *const Pipelines, s: xpu.Stream, hk: Ref, ck: Ref, tk: Ref, wk: Ref, ok: Ref, hv: Ref, cv: Ref, tv: Ref, wv: Ref, ov: Ref, rows: u32, channels: u32) !void {
