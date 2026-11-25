@@ -328,6 +328,10 @@ pub fn main(init: std.process.Init) !void {
             ink.fuse.conv_fold = true;
         } else if (std.mem.eql(u8, a, "--zeta-wide")) {
             ink.fuse.zeta_wide = true;
+        } else if (std.mem.eql(u8, a, "--pre-q")) {
+            ink.fuse.pre_q = true;
+        } else if (std.mem.eql(u8, a, "--gates-norms")) {
+            ink.fuse.gates_norms = true;
         } else if (std.mem.eql(u8, a, "--zeta-split")) {
             ink.fuse.zeta_split = true;
         } else if (std.mem.eql(u8, a, "--kv-conv")) {

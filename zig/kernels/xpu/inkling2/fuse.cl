@@ -310,6 +310,51 @@ KERNEL(64) void tf_ink2_fuse_gates(
   gated[((size_t)role * rows + row) * H + d] = left + right;
 }
 
+// Grid (roles, rows). One group a gated row: every channel of the row in the group, so the norm of the row follows in
+// the same group. The per-channel mix is the gates kernel's, and do_norm keeps its 256-thread order, so the bits do not move.
+KERNEL(256) void tf_ink2_gates_norms(
+    global const float *ar, global const float *messages, global const ushort *forget0, global const ushort *forget1,
+    global const ushort *forget2, global const ushort *gain0, global const ushort *gain1, global const ushort *gain2,
+    global const float *zeta, global float *gated, global const ushort *wq, global const ushort *wk, global const ushort *wv,
+    global ushort *q_norm, global ushort *k_norm, global ushort *v_norm,
+    uint rows, uint roles, uint local_src, uint core, uint msg_entries, uint norm_n) {
+  const uint role = get_group_id(0), row = get_group_id(1), t = get_local_id(0);
+  if (row >= rows || role >= roles) return;
+  local float z[RANK];
+  local float red[16];
+  if (t < RANK) z[t] = zeta[((size_t)row * 4 + role) * RANK + t];
+  const uint src = local_src ? 0 : role;
+  global const float *h = ar + ((size_t)src * rows + row) * H;
+  global const float *m = messages + ((size_t)row * msg_entries + core * 4 + role) * H;
+  global const ushort *forget = role == 0 ? forget0 : role == 1 ? forget1 : forget2;
+  global const ushort *gain = role == 0 ? gain0 : role == 1 ? gain1 : gain2;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (uint d = t; d < H; d += 256) {
+    ushort8 fw[RANK / 8], gw[RANK / 8];
+    for (uint r = 0; r < RANK / 8; ++r) {
+      fw[r] = vload8(0, forget + (size_t)d * RANK + 8 * r);
+      gw[r] = vload8(0, gain + (size_t)d * RANK + 8 * r);
+    }
+    float fdot = 0.0f, gdot = 0.0f;
+    for (uint r = 0; r < RANK / 8; ++r)
+      for (int j = 0; j < 8; ++j) {
+        fdot += bf2f(fw[r][j]) * z[8 * r + j];
+        gdot += bf2f(gw[r][j]) * z[8 * r + j];
+      }
+    const float f = tanh(fdot);
+    const float g = tanh(gdot);
+    const float keep = 1.0f - f;
+    const float left = keep * h[d];
+    const float right = FUSE_GATE * g * m[d];
+    gated[((size_t)role * rows + row) * H + d] = left + right;
+  }
+  barrier(CLK_GLOBAL_MEM_FENCE);
+  if (role >= norm_n) return;
+  global const ushort *w = role == 0 ? wq : role == 1 ? wk : wv;
+  global ushort *out = (role == 0 ? q_norm : role == 1 ? k_norm : v_norm) + (size_t)row * H;
+  do_norm(gated + ((size_t)role * rows + row) * H, w, out, t, red);
+}
+
 // Grid (norm_n, rows). The three gated rows, one group each.
 KERNEL(256) void tf_ink2_fuse_norms(
     global const float *gated, global const ushort *wq, global const ushort *wk, global const ushort *wv,
@@ -321,6 +366,70 @@ KERNEL(256) void tf_ink2_fuse_norms(
   global const ushort *w = which == 0 ? wq : which == 1 ? wk : wv;
   global ushort *out = (which == 0 ? q_norm : which == 1 ? k_norm : v_norm) + (size_t)row * H;
   do_norm(x, w, out, t, red);
+}
+
+// Grid (n_queries, rows). One group a query row: the same AR as tf_ink2_fuse_pre, whose query rows ran in a loop in one
+// group. The source means are recomputed by each group, the same code and the same order, so the bits do not move.
+KERNEL(256) void tf_ink2_fuse_pre_q(
+    global const ushort *p, global float *partial, global const ushort *blocks, global const float *queries, global float *ar,
+    uint rows, uint blocks_stride, uint sources, uint n_queries) {
+  const uint q = get_group_id(0), row = get_group_id(1), t = get_local_id(0), lane = get_sub_group_local_id(), sg = get_sub_group_id();
+  if (row >= rows || q >= n_queries || sources == 0 || sources > 5) return;
+  local float red[160];
+  global const ushort *pb = p + (size_t)row * H;
+  global float *part = partial + (size_t)row * H;
+  for (uint d = t; d < H; d += 256) part[d] = bf2f(pb[d]);
+  for (uint i = t; i < 160; i += 256) red[i] = 0.0f;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  global const ushort *blk = blocks + (size_t)row * blocks_stride;
+  float v[5][H / 256];
+  for (uint s = 0; s < 5; ++s)
+    for (uint i = 0; i < H / 256; ++i)
+      v[s][i] = s < sources ? (s + 1 == sources ? part[t + 256 * i] : bf2f(blk[(size_t)s * H + t + 256 * i])) : 0.0f;
+  float means[5];
+  for (uint s = 0; s < 5; ++s) {
+    float ss = 0.0f;
+    for (uint i = 0; i < H / 256; ++i) ss += v[s][i] * v[s][i];
+    const float reduced = sub_group_reduce_add(ss);
+    if (s < sources && lane == 0) red[s * 16 + sg] = reduced;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (uint s = 0; s < 5; ++s) {
+    float ss = 0.0f;
+    for (uint j = 0; j < 16; ++j) ss += red[s * 16 + j];
+    means[s] = rsqrt(ss / 2304.0f + EPS);
+  }
+  float query[H / 256];
+  for (uint i = 0; i < H / 256; ++i) query[i] = queries[(size_t)q * H + t + 256 * i];
+  local float *dots = red + 80;
+  for (uint s = 0; s < 5; ++s) {
+    float dot = 0.0f;
+    for (uint i = 0; i < H / 256; ++i) dot += query[i] * (v[s][i] * means[s]);
+    const float reduced = sub_group_reduce_add(dot);
+    if (s < sources && lane == 0) dots[s * 16 + sg] = reduced;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float weights[5];
+  float peak = -INFINITY;
+  for (uint s = 0; s < 5; ++s) {
+    float dot = 0.0f;
+    for (uint j = 0; j < 16; ++j) dot += dots[s * 16 + j];
+    weights[s] = dot * FUSE_AR_SCALE;
+    if (s < sources) peak = peak < weights[s] ? weights[s] : peak;
+  }
+  float den = 0.0f;
+  for (uint s = 0; s < 5; ++s) {
+    weights[s] = exp(weights[s] - peak);
+    if (s < sources) den += weights[s];
+  }
+  for (uint s = 0; s < 5; ++s) weights[s] = weights[s] / den;
+  global float *dst = ar + ((size_t)q * rows + row) * H;
+  for (uint i = 0; i < H / 256; ++i) {
+    float acc = 0.0f;
+    for (uint s = 0; s < 5; ++s)
+      if (s < sources) acc += weights[s] * (v[s][i] * means[s]);
+    dst[t + 256 * i] = FUSE_PRE(acc);
+  }
 }
 
 static inline float4 rx4(global const uint2 *xg, uint i) {
