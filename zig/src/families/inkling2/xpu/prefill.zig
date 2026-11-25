@@ -192,9 +192,29 @@ const Run = struct {
     const Seqpar = struct { seq: bool, base: usize, rows: usize };
 
     fn seqpar(g: Run, rows: usize) Seqpar {
-        if (std.c.getenv("TF_TP_SEQPAR") == null or !g.m.options.place.split() or rows < 4 or rows % 2 != 0) return .{ .seq = false, .base = 0, .rows = rows };
+        return seqparFor(rows, g.m.options.place.split(), g.m.options.place.rank, std.c.getenv("TF_TP_SEQPAR") != null);
+    }
+
+    /// The plan without a device: rank 0 takes the lower half of the rows and rank 1 the upper half, and a row count that
+    /// does not split in two keeps the plain path.
+    pub fn seqparFor(rows: usize, split: bool, rank: u32, on: bool) Seqpar {
+        if (!on or !split or rows < 4 or rows % 2 != 0) return .{ .seq = false, .base = 0, .rows = rows };
         const half = rows / 2;
-        return .{ .seq = true, .base = if (g.m.options.place.rank == 0) 0 else half, .rows = half };
+        return .{ .seq = true, .base = if (rank == 0) 0 else half, .rows = half };
+    }
+
+    test "sequence-parallel plan halves the rows and gives each rank its own half" {
+        const off = seqparFor(2048, true, 0, false);
+        try std.testing.expect(!off.seq and off.base == 0 and off.rows == 2048);
+        const plain = seqparFor(2048, false, 1, true);
+        try std.testing.expect(!plain.seq and plain.base == 0 and plain.rows == 2048);
+        const odd = seqparFor(2047, true, 0, true);
+        try std.testing.expect(!odd.seq and odd.rows == 2047);
+        const r0 = seqparFor(2048, true, 0, true);
+        try std.testing.expect(r0.seq and r0.base == 0 and r0.rows == 1024);
+        const r1 = seqparFor(2048, true, 1, true);
+        try std.testing.expect(r1.seq and r1.base == 1024 and r1.rows == 1024);
+        try std.testing.expect(r0.base + r0.rows == r1.base);
     }
 
     fn convInputForAttention(g: Run, cache: *state.Cache, v: *const layer_plan.Visit, key: bool) !void {
