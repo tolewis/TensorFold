@@ -13,7 +13,7 @@ pub const top_k: u32 = 8;
 /// The kernels' reduction split: one decode work-group holds this many sub-groups, each over a slice of k
 /// (INK2_KS_NV_GU, INK2_KS_NV_DOWN, INK2_KS_MX_GU and INK2_KS_MX_DOWN in the source).
 pub const decode_subgroups = struct {
-    pub const nvfp4_gu: u32 = 4;
+    pub const nvfp4_gu: u32 = 3;
     pub const nvfp4_down: u32 = 3;
     pub const mxfp8_gu: u32 = 4;
     pub const mxfp8_down: u32 = 4;
