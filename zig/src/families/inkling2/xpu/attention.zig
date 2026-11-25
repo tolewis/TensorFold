@@ -17,16 +17,16 @@ pub const RowMeta = struct { pos: Ref, seg_of: Ref, segs: Ref };
 
 pub const Error = planning.Error || xpu.Error || error{OutOfMemory};
 
-/// The merge over eight sub-groups of chunk ranges. Default; `INK2_MERGE_SPLIT=0` selects the serial fold.
+/// The merge over eight sub-groups of chunk ranges, off until the contract covers it and the gate agrees on the bits.
 pub var merge_split: bool = false;
 
 pub fn mergeSplit() bool {
     if (merge_split) return true;
     if (std.c.getenv("INK2_MERGE_SPLIT")) |p| {
         const s = std.mem.span(p);
-        if (s.len > 0 and s[0] == '0') return false;
+        return s.len > 0 and s[0] == '1';
     }
-    return true;
+    return false;
 }
 
 /// Kernel names, with the work-group size each is made at.
