@@ -431,14 +431,40 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
     };
     defer cache.deinit();
     std.log.info("inkling2_loop: TP rank 1 following", .{});
+    // The leader commits an accepted prefix of a verify window. This rank replays the window, whose forward advances
+    // the convolution history to the window's last row. Without the leader's commit the rejected rows stay in this
+    // rank's history, so its partial differs and the reduce drifts (2026-11-26: a drafted round diverged from plain).
+    var pending_rows: usize = 0;
+    var pending_base: usize = 0;
     while (true) {
         const rec = gp.wait() catch |e| {
             std.log.err("inkling2_loop: rank 1 stopped ({s})", .{@errorName(e)});
             return false;
         };
         if (rec.op == .close) return true;
+        if (pending_rows != 0) {
+            const end = pending_base + pending_rows;
+            if (rec.base >= pending_base and rec.base <= end) {
+                cache.commit(rec.base - pending_base) catch |e| {
+                    std.log.err("inkling2_loop: rank 1 commit ({s})", .{@errorName(e)});
+                    return false;
+                };
+            } else cache.rollback() catch |e| {
+                std.log.err("inkling2_loop: rank 1 rollback ({s})", .{@errorName(e)});
+                return false;
+            };
+            pending_rows = 0;
+        }
         std.log.info("inkling2: follow base {d} n {d}", .{ rec.base, rec.n });
         cache.len = rec.base;
+        // A request at position 0 must not read the previous request's convolution history (as `feed` clears it).
+        if (rec.base == 0 and rec.flags & 4 != 0) {
+            st.zero(&rt, cache.conv, st.conv_bytes) catch |e| {
+                std.log.err("inkling2_loop: rank 1 conv zero ({s})", .{@errorName(e)});
+                return false;
+            };
+            rt.sync() catch {};
+        }
         const profile_one = std.c.getenv("TF_TP_PROFILE") != null and xpu.profile.active == null;
         var prof: xpu.profile.Profile = undefined;
         if (profile_one) {
@@ -459,10 +485,18 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
                 std.log.err("inkling2_loop: rank 1 head ({s})", .{@errorName(e)});
                 return false;
             };
-        } else ink.forward.run(model, &scratch, &cache, rec.ids[0..rec.n], .{ .all = rec.flags != 0 }) catch |e| {
-            std.log.err("inkling2_loop: rank 1 forward ({s})", .{@errorName(e)});
-            return false;
-        };
+        } else {
+            cache.begin(rec.n) catch |e| {
+                std.log.err("inkling2_loop: rank 1 begin ({s})", .{@errorName(e)});
+                return false;
+            };
+            pending_rows = rec.n;
+            pending_base = rec.base;
+            ink.forward.run(model, &scratch, &cache, rec.ids[0..rec.n], .{ .all = rec.flags != 0 }) catch |e| {
+                std.log.err("inkling2_loop: rank 1 forward ({s})", .{@errorName(e)});
+                return false;
+            };
+        }
         if (profile_one) {
             prof.collect() catch {};
             std.log.info("inkling2: rank 1 one token, {d} launches", .{prof.launches});
