@@ -131,7 +131,7 @@ pub fn splitThinkingTokens(a: Allocator, decode: anytype, ctx: anytype, full: []
 pub fn splitThinkingAt(a: Allocator, full: []const u8, finished: bool, m: Markers, close: Close) Allocator.Error!Split {
     if (m.answer_end.len == 0) return splitBlock(a, full, finished, m, close);
     // a reply of messages: an answer message with no thinking before it, else the thinking block and then the answer
-    if (std.mem.startsWith(u8, full, m.answer_open)) return .{ .reasoning = "", .answer = untilAnswerEnd(full[m.answer_open.len..], finished, m) };
+    if (std.mem.startsWith(u8, full, m.answer_open)) return .{ .reasoning = "", .answer = try inklingAnswer(a, full, finished) };
     if (!finished and std.mem.startsWith(u8, m.answer_open, full)) return .{ .reasoning = "", .answer = "" };
     const s = try splitBlock(a, full, finished, m, close);
     return .{ .reasoning = s.reasoning, .answer = try inklingAnswer(a, s.answer, finished) };
