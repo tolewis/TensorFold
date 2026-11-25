@@ -312,6 +312,8 @@ pub fn main(init: std.process.Init) !void {
             ink.fuse.force = true;
         } else if (std.mem.eql(u8, a, "--seg")) {
             ink.fuse.seg = true;
+        } else if (std.mem.eql(u8, a, "--nv-split")) {
+            ink.experts.nv_split = true;
         } else if (std.mem.eql(u8, a, "--no-seg")) {
             ink.fuse.seg = false;
         } else if (std.mem.eql(u8, a, "--attn-splits")) {

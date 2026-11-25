@@ -18,7 +18,7 @@
 #define INK2_PREFIX tf_ink2_
 #endif
 #ifndef INK2_ONLY
-#define INK2_ONLY 0xfff
+#define INK2_ONLY 0xffff
 #endif
 #ifndef INK2_KS
 #define INK2_KS 4 // sub-groups of a decode work-group, each over a slice of k
@@ -48,6 +48,8 @@
 #define INK2_MX_QUANT 32
 #define INK2_COMBINE 64
 #define INK2_PLAN 128
+#define INK2_NV_GU_SPLIT 4096
+#define INK2_NV_GU_JOIN 8192
 #define INK2_NV_GU_PROMPT 256
 #define INK2_NV_DOWN_PROMPT 512
 #define INK2_MX_GU_PROMPT 1024
@@ -458,6 +460,84 @@ __kernel void P(nvfp4_gu)(__global const ushort *X, __global const uchar *W, __g
   local float part[INK2_RB * INK2_KS_NV_GU * INK2_SG];
   local uint mem[INK2_MAX_MEMBERS + 1];
   P(nv_decode)(INK2_KS_NV_GU, X, W, S, amax, den, ids, Y, k, n, topk, true, part, mem);
+}
+#endif
+
+// K-split one-row gate/up: two work-groups a tile, each over half of k, into f32 partials [route][row][half]. The join
+// work-group sums the halves and applies the activation, so the two launches fill nine waves of 256 groups.
+static inline void P(nv_split)(const uint ks, __global const ushort *X, __global const uchar *W, __global const uchar *S,
+                               __global const float *amax, __global const float *den, __global const int *ids,
+                               __global float *Part, uint k, uint n, uint topk, local float *part) {
+  const uint lane = get_sub_group_local_id();
+  const uint sg = get_sub_group_id();
+  const uint tile = get_group_id(0) >> 1, kh = get_group_id(0) & 1u, route = get_group_id(1);
+  const uint e = (uint)ids[route];
+  const uint rows_total = 2u * n;
+  const uint raw = tile * INK2_SG + lane;
+  const uint row = raw < rows_total ? raw : 0u;
+  const uint nb = k / 16u;
+  __global const uchar *wr = W + ((ulong)e * rows_total + row) * (k / 2u);
+  __global const uchar *sr = S + ((ulong)e * rows_total + row) * nb;
+  const __global ushort *xr = X + (ulong)(route / topk) * k;
+  const float phi26 = P(phi)(amax, den, e) * 0x1p26f;
+  float acc = 0.0f;
+  if ((nb & 7u) == 0) { // whole 64-byte lines a row: eight blocks, one line a lane
+    const uint chunks = nb / 8u;
+    const uint first = kh * ((chunks + 1u) / 2u), last = kh ? chunks : (chunks + 1u) / 2u;
+    for (uint c = first + sg; c < last; c += ks) {
+      const uint16 v = vload16(0, (__global const uint *)(wr + 64u * c));
+      const uint2 s2 = vload2(0, (__global const uint *)(sr + 8u * c));
+#pragma unroll
+      for (int u = 0; u < 8; u++) {
+        const uint sc = (s2[u >> 2] >> (8 * (u & 3))) & 255u;
+        const int8 b = P(nv_frag)(v[2 * u], v[2 * u + 1], sc, phi26);
+        acc = INK2_DOT((short)intel_sub_group_block_read_us(xr + 128u * c + 16u * u), b, acc);
+      }
+    }
+  } else {
+    const uint first = kh * ((nb + 1u) / 2u), last = kh ? nb : (nb + 1u) / 2u;
+    for (uint blk = first + sg; blk < last; blk += ks) {
+      const uint2 v = vload2(0, (__global const uint *)(wr + 8u * blk));
+      const int8 b = P(nv_frag)(v.x, v.y, (uint)sr[blk], phi26);
+      acc = INK2_DOT((short)intel_sub_group_block_read_us(xr + 16u * blk), b, acc);
+    }
+  }
+  part[sg * INK2_SG + lane] = acc;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (sg != 0) return;
+  float sum = part[lane];
+#pragma unroll
+  for (uint s = 1; s < ks; s++) sum += part[s * INK2_SG + lane];
+  Part[((ulong)route * rows_total + row) * 2u + kh] = sum;
+}
+
+// Sums the halves of each row and writes the activation of 64 rows of one route.
+static inline void P(nv_join)(__global const float *Part, __global ushort *Y, uint n, uint topk) {
+  const uint lane = get_sub_group_local_id();
+  const uint sg = get_sub_group_id();
+  const uint tile = get_group_id(0), route = get_group_id(1);
+  const uint rows_total = 2u * n;
+  const uint row = tile * 64u + sg * INK2_SG + lane;
+  if (row >= rows_total) return;
+  const float sum = Part[((ulong)route * rows_total + row) * 2u] + Part[((ulong)route * rows_total + row) * 2u + 1u];
+  const float other = sub_group_shuffle_xor(sum, 1);
+  if ((lane & 1u) == 0) Y[(ulong)route * n + (row >> 1)] = P(act)(sum, other);
+}
+
+#if INK2_ONLY & INK2_NV_GU_SPLIT
+__attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(16 * INK2_KS_NV_GU, 1, 1)))
+__kernel void P(nvfp4_gu_split)(__global const ushort *X, __global const uchar *W, __global const uchar *S,
+                                __global const float *amax, __global const float *den, __global const int *ids,
+                                __global float *Part, uint k, uint n, uint topk, uint experts) {
+  local float part[INK2_KS_NV_GU * INK2_SG];
+  P(nv_split)(INK2_KS_NV_GU, X, W, S, amax, den, ids, Part, k, n, topk, part);
+}
+#endif
+
+#if INK2_ONLY & INK2_NV_GU_JOIN
+__attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(64, 1, 1)))
+__kernel void P(nvfp4_gu_join)(__global const float *Part, __global ushort *Y, uint n, uint topk, uint experts) {
+  P(nv_join)(Part, Y, n, topk);
 }
 #endif
 
