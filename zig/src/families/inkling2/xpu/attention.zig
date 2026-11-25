@@ -115,7 +115,8 @@ pub fn attendAs(k: *const Kernels, s: xpu.Stream, path: planning.Path, r: planni
             launch.chunk, @as(u32, 0), launch.partials_rh, scale,
         });
     }
-    const m = if (mergeSplit() and r.rows == 1) k.merge_split else k.merge;
+    // Every row count takes the same fold: the split regroups it, so plain and verify must not mix the two.
+    const m = if (mergeSplit()) k.merge_split else k.merge;
     try xpu.launch.dispatch(m, s, launch.merge_grid, .{
         part_o.at(), part_ml.at(), sink.at(), gate.at(), meta.pos.at(), out.at(),
         r.heads,     l.window,     launch.chunk, @as(u32, 0), launch.partials_rh, launch.subs,
