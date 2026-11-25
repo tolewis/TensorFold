@@ -420,7 +420,7 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
     };
     defer gpa.destroy(gp);
     const cap: usize = @intCast(o.context orelse 8192);
-    var scratch = st.Scratch.init(&rt, st.max_rows, cap) catch |e| {
+    var scratch = st.Scratch.init(&rt, st.prompt_rows, cap) catch |e| {
         problem.* = try std.fmt.allocPrint(a, "inkling2_loop: scratch ({s})", .{@errorName(e)});
         return false;
     };
