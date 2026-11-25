@@ -65,6 +65,15 @@ pub fn renderStarts(srv: *Server, cx: *Cx, messages: Value, tools: []const Value
     if (!thinking and generation and std.mem.eql(u8, srv.markers.close, @import("reply_text.zig").mm_markers.close)) {
         if (srv.text.tokenId(srv.markers.close)) |close| return try std.mem.concat(cx.a, u32, &.{ ids, &.{close} });
     }
+    // Inkling 2's template ends with the effort message and leaves the reply to open its own thinking message.
+    // With thinking off and no tools, prefill the answer message so the reply starts with its text.
+    if (!thinking and generation and tools.len == 0 and srv.markers.answer_end.len > 0) {
+        const answer = srv.text.encode(cx.a, srv.markers.answer_open, false) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Template => &[_]u32{},
+        };
+        if (answer.len > 0) ids = try std.mem.concat(cx.a, u32, &.{ ids, answer });
+    }
     if (!thinking and generation and ids.len > 0) {
         const last = try srv.text.decode(cx.a, ids[ids.len - 1 ..]);
         if (std.mem.eql(u8, @import("reply_text.zig").pyStrip(last), "<think>")) {
