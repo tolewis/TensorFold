@@ -449,8 +449,8 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
             xpu.profile.active = &prof;
             xpu.rt.Runtime.resetSyncLog();
         }
-        // A prompt chunk is larger than a verify window. A window of 2 to 32 rows is a verify, not a prefill.
-        if (rec.n > st.batch_rows) {
+        // Bit 2 marks a prompt chunk. A verify window is a forward, even when it has more than one row.
+        if (rec.flags & 4 != 0) {
             ink.prefill.run(model, &scratch, &cache, rec.ids[0..rec.n], .{ .defer_head = rec.flags & 2 != 0, .all = rec.flags & 1 != 0 }) catch |e| {
                 std.log.err("inkling2_loop: rank 1 prefill ({s})", .{@errorName(e)});
                 return false;
