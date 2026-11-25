@@ -658,6 +658,17 @@ pub const Group = struct {
 
     /// `partial` on the device holds `rows` x D fp16: on return it holds the ranks' sum. Every rank calls this the
     /// same number of times in the same order.
+    /// The same push and wait as allReduceBytes, then a copy of the peer's partial into `dst` instead of an add. For a
+    /// sequence-parallel gather the two halves do not overlap, so a copy is the whole exchange.
+    pub fn allReduceCopy(g: *Group, d: *Dev, src: *anyopaque, dst: *anyopaque, rows: u32, row_bytes: usize) !void {
+        const n: usize = @as(usize, rows) * (row_bytes / 2);
+        if (n == 0 or n > @as(usize, rows_max) * D) return error.TooManyRows;
+        if (!g.devflag or g.ex == 0) return error.NotDirect;
+        g.seq += 1;
+        const peer = try g.exPush(d, src, n);
+        try dev.copy(d, dst, peer, n * 2);
+    }
+
     /// The DEVFLAG=3 exchange over a buffer whose row is `row_bytes` wide, for sequence-parallel prefill. Other modes fall
     /// back to allReduce, which needs a row of D bf16 values.
     pub fn allReduceBytes(g: *Group, d: *Dev, partial: *anyopaque, rows: u32, row_bytes: usize) !void {

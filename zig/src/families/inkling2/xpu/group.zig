@@ -178,13 +178,11 @@ pub const Group = struct {
         if (rows < 4 or rows % 2 != 0 or row_bytes * rows > rows_max * D * 2) return error.Inkling2Tp;
         if (g.qgroup == null) return error.Inkling2Tp;
         qg.dev.noteKernel(xpu.profile.last_kernel);
-        const from = if (g.rank == 0) @as(usize, 0) else half;
-        const zeros: [8]u8 = @splat(0);
-        const off_bytes: usize = from * row_bytes;
-        const fill_bytes: usize = half * row_bytes;
-        const dst: *anyopaque = @ptrFromInt(@intFromPtr(partial) + off_bytes);
-        try g.r.drv.check(g.r.drv.x.zeCommandListAppendMemoryFill(g.r.list, dst, &zeros, 8, fill_bytes, null, 0, null), "inkling2 gather zero");
-        return g.qgroup.?.allReduceBytes(&g.qdev, partial, rows, row_bytes);
+        const own: usize = if (g.rank == 0) 0 else half * row_bytes;
+        const other: usize = if (g.rank == 0) half * row_bytes else 0;
+        const src: *anyopaque = @ptrFromInt(@intFromPtr(partial) + own);
+        const dst: *anyopaque = @ptrFromInt(@intFromPtr(partial) + other);
+        return g.qgroup.?.allReduceCopy(&g.qdev, src, dst, half, row_bytes);
     }
 
     /// Rank 1 pushes its f32 logit slice. Rank 0 copies it to `dst` (the high half of its logit row).
