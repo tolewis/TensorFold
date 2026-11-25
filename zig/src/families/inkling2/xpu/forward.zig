@@ -403,10 +403,7 @@ const Run = struct {
         if (gated) {
             const c = w.controllers.?[3];
             const core = v.layer - 6;
-            if (fuse.ctlOne() and fuse.zetaWide()) {
-                const stride: u32 = state.message_entries * state.hidden;
-                try fuse.mlpOne(&g.p.fuse, g.s, at(s.mlp_ar, 0), messageRow(s, core, 3, 0), tensor(c.down), tensor(c.forget), tensor(c.gain), at(s.mlp_gated, 0), @intCast(rows), stride);
-            } else if (fuse.zetaWide()) {
+            if (fuse.zetaWide()) {
                 const stride: u32 = state.message_entries * state.hidden;
                 try xpu.launch.dispatch(g.p.fuse.zeta_wide, g.s, .{ 4, 1, @as(u32, @intCast(rows)) }, .{
                     at(s.mlp_ar, 0), messageRow(s, core, 3, 0), tensor(c.down), tensor(c.down), tensor(c.down), at(s.zeta, 0),

@@ -14,24 +14,13 @@ pub var kv_conv: bool = false;
 pub var down_epi: bool = false;
 pub var norm_router: bool = false;
 pub var role_conv: bool = false;
-pub var ctl_one: bool = false;
-
 pub fn roleConv() bool {
     if (role_conv) return true;
     if (std.c.getenv("INK2_ROLE")) |p| {
         const s = std.mem.span(p);
-        return s.len > 0 and s[0] == '1';
+        if (s.len > 0 and s[0] == '0') return false;
     }
-    return false;
-}
-
-pub fn ctlOne() bool {
-    if (ctl_one) return true;
-    if (std.c.getenv("INK2_CTL_ONE")) |p| {
-        const s = std.mem.span(p);
-        return s.len > 0 and s[0] == '1';
-    }
-    return false;
+    return true;
 }
 
 pub fn normRouter() bool {
@@ -110,7 +99,6 @@ pub const Pipelines = struct {
     conv_kv: xpu.Kernel,
     down_epi: xpu.Kernel,
     router_norm: xpu.Kernel,
-    mlp_one: xpu.Kernel,
 
     pub fn load(module: xpu.Module) !Pipelines {
         var pre = try module.kernel("tf_ink2_fuse_pre", .{ 256, 1, 1 });
@@ -135,14 +123,11 @@ pub const Pipelines = struct {
         errdefer conv_kv.deinit();
         var down_epi_k = try module.kernel("tf_ink2_down_epilogue", .{ 256, 1, 1 });
         errdefer down_epi_k.deinit();
-        var router_norm = try module.kernel("tf_ink2_router_norm_gemv", .{ 256, 1, 1 });
-        errdefer router_norm.deinit();
-        const mlp_one = try module.kernel("tf_ink2_mlp_one", .{ 64, 1, 1 });
-        return .{ .pre = pre, .zeta = zeta, .gates = gates, .norms = norms, .router_gemv = router_gemv, .router_pick = router_pick, .conv_attn = conv_attn, .conv_mlp = conv_mlp, .zeta_wide = zeta_wide_k, .conv_kv = conv_kv, .down_epi = down_epi_k, .router_norm = router_norm, .mlp_one = mlp_one };
+        const router_norm = try module.kernel("tf_ink2_router_norm_gemv", .{ 256, 1, 1 });
+        return .{ .pre = pre, .zeta = zeta, .gates = gates, .norms = norms, .router_gemv = router_gemv, .router_pick = router_pick, .conv_attn = conv_attn, .conv_mlp = conv_mlp, .zeta_wide = zeta_wide_k, .conv_kv = conv_kv, .down_epi = down_epi_k, .router_norm = router_norm };
     }
 
     pub fn deinit(p: *Pipelines) void {
-        p.mlp_one.deinit();
         p.router_norm.deinit();
         p.down_epi.deinit();
         p.conv_kv.deinit();
@@ -205,10 +190,6 @@ pub fn convKv(p: *const Pipelines, s: xpu.Stream, hk: Ref, ck: Ref, tk: Ref, wk:
 pub fn convMlpPartial(p: *const Pipelines, s: xpu.Stream, history: Ref, current: Ref, taps: Ref, weight: Ref, conv_out: Ref, t: Ref, out: Ref, rows: u32, channels: u32, commit1: u32) !void {
     const groups = (channels + 255) / 256;
     try xpu.launch.dispatch(p.conv_mlp, s, .{ groups, rows, 1 }, .{ history, current, taps, weight, conv_out, t, out, rows, channels, commit1 });
-}
-
-pub fn mlpOne(p: *const Pipelines, s: xpu.Stream, h: Ref, m: Ref, down: Ref, forget: Ref, gain: Ref, out: Ref, rows: u32, m_stride: u32) !void {
-    try xpu.launch.dispatch(p.mlp_one, s, .{ 36, rows, 1 }, .{ h, m, down, forget, gain, out, rows, m_stride });
 }
 
 pub fn routerNormLaunch(p: *const Pipelines, s: xpu.Stream, x: Ref, norm_w: Ref, weight: Ref, normed: Ref, bias: Ref, scores: Ref, ids: Ref, weights: Ref, rows: u32) !void {
