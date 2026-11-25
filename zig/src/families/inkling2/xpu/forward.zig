@@ -299,25 +299,38 @@ const Run = struct {
         const down = at(s.down, 0);
         const pl = g.m.options.place;
         if (pl.split()) {
+            const local_ids = at(s.members, 0);
             if (group.live) |gp| {
-                try xpu.launch.dispatch(gp.zero, g.s, .{ @intCast((rows * 8 + 255) / 256), 1, 1 }, .{ ids, at(s.route_weights, 0), @as(u32, @intCast(rows * 8)), pl.expertBase(), pl.expertCount() });
+                try xpu.launch.dispatch(gp.zero, g.s, .{ @intCast((rows * 8 + 255) / 256), 1, 1 }, .{ ids, at(s.route_weights, 0), local_ids, @as(u32, @intCast(rows * 8)), pl.expertBase(), pl.expertCount() });
             }
-            const members = at(s.members, 0);
-            const items = at(s.items, 0);
-            const count = at(s.count, 0);
-            var call = gu_call;
-            call.experts = 128;
-            try ex.plan(g.s, ids, members, items, count, call);
-            if (group.live) |gp| try xpu.launch.dispatch(gp.filter, g.s, .{ 1, 1, 1 }, .{ items, count, pl.expertBase(), pl.expertCount() });
-            const local = experts.Call{ .rows = @intCast(rows), .k = state.hidden, .n = state.intermediate, .format = precision, .experts = pl.expertCount() };
-            const down_local = experts.Call{ .rows = @intCast(rows), .k = state.intermediate, .n = state.hidden, .format = precision, .experts = pl.expertCount() };
-            switch (precision) {
-                .nvfp4 => try ex.nvfp4GuPrompt(g.s, x, tensor(w.gu.weight), tensor(w.gu.scale), tensor(w.gu.amax.?), tensor(w.gu.denominator.?), items, count, members, act, local),
-                .mxfp8 => try ex.mxfp8GuPrompt(g.s, x, tensor(w.gu.weight), tensor(w.gu.scale), items, count, members, act, local),
-            }
-            switch (precision) {
-                .nvfp4 => try ex.nvfp4DownPrompt(g.s, act, tensor(w.down.weight), tensor(w.down.scale), tensor(w.down.amax.?), tensor(w.down.denominator.?), items, count, members, down, down_local),
-                .mxfp8 => try ex.mxfp8DownPrompt(g.s, act, tensor(w.down.weight), tensor(w.down.scale), items, count, members, down, down_local),
+            if (rows <= decode_rows) {
+                const local = experts.Call{ .rows = @intCast(rows), .k = state.hidden, .n = state.intermediate, .format = precision, .experts = pl.expertCount() };
+                const down_local = experts.Call{ .rows = @intCast(rows), .k = state.intermediate, .n = state.hidden, .format = precision, .experts = pl.expertCount() };
+                switch (precision) {
+                    .nvfp4 => try ex.nvfp4Gu(g.s, x, tensor(w.gu.weight), tensor(w.gu.scale), tensor(w.gu.amax.?), tensor(w.gu.denominator.?), local_ids, act, local),
+                    .mxfp8 => try ex.mxfp8Gu(g.s, x, tensor(w.gu.weight), tensor(w.gu.scale), local_ids, act, local),
+                }
+                switch (precision) {
+                    .nvfp4 => try ex.nvfp4Down(g.s, act, tensor(w.down.weight), tensor(w.down.scale), tensor(w.down.amax.?), tensor(w.down.denominator.?), local_ids, down, down_local),
+                    .mxfp8 => try ex.mxfp8Down(g.s, act, tensor(w.down.weight), tensor(w.down.scale), local_ids, down, down_local),
+                }
+            } else {
+                const items = at(s.items, 0);
+                const count = at(s.count, 0);
+                var call = gu_call;
+                call.experts = 128;
+                try ex.plan(g.s, ids, local_ids, items, count, call);
+                if (group.live) |gp| try xpu.launch.dispatch(gp.filter, g.s, .{ 1, 1, 1 }, .{ items, count, pl.expertBase(), pl.expertCount() });
+                const local = experts.Call{ .rows = @intCast(rows), .k = state.hidden, .n = state.intermediate, .format = precision, .experts = pl.expertCount() };
+                const down_local = experts.Call{ .rows = @intCast(rows), .k = state.intermediate, .n = state.hidden, .format = precision, .experts = pl.expertCount() };
+                switch (precision) {
+                    .nvfp4 => try ex.nvfp4GuPrompt(g.s, x, tensor(w.gu.weight), tensor(w.gu.scale), tensor(w.gu.amax.?), tensor(w.gu.denominator.?), items, count, local_ids, act, local),
+                    .mxfp8 => try ex.mxfp8GuPrompt(g.s, x, tensor(w.gu.weight), tensor(w.gu.scale), items, count, local_ids, act, local),
+                }
+                switch (precision) {
+                    .nvfp4 => try ex.nvfp4DownPrompt(g.s, act, tensor(w.down.weight), tensor(w.down.scale), tensor(w.down.amax.?), tensor(w.down.denominator.?), items, count, local_ids, down, down_local),
+                    .mxfp8 => try ex.mxfp8DownPrompt(g.s, act, tensor(w.down.weight), tensor(w.down.scale), items, count, local_ids, down, down_local),
+                }
             }
             try finishExperts(g, down, ids, at(s.route_weights, 0), down_call);
             return;

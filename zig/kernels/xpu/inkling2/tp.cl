@@ -27,12 +27,18 @@ __kernel void tp_down(__global ushort *out, __global const float *a, int n) {
   out[i] = f_to_bf(a[i]);
 }
 
-// Zero the route weight when the expert is not in this rank's half. The expert kernels are not changed.
-__kernel void tp_zero_unowned(__global int *ids, __global float *weights, int routes, int base, int count) {
+// Zero the route weight when the expert is not in this rank's half, and write a packed id for the decode gather.
+// An unowned route gets `count`, which the gather treats as out of range and does not read.
+__kernel void tp_zero_unowned(__global int *ids, __global float *weights, __global int *local_ids, int routes, int base, int count) {
   const int i = get_global_id(0);
   if (i >= routes) return;
   const int id = ids[i];
-  if (id < base || id >= base + count) weights[i] = 0.0f;
+  if (id < base || id >= base + count) {
+    weights[i] = 0.0f;
+    local_ids[i] = count;
+  } else {
+    local_ids[i] = id - base;
+  }
 }
 
 // Keep plan items this rank holds and rewrite the expert id to the packed table. Items past the new count are unused.

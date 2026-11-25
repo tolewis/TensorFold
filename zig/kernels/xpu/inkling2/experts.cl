@@ -177,13 +177,20 @@ static inline void P(finish)(const uint ks, float acc, local float *part, __glob
 
 static inline void P(nv_decode)(const uint ks, __global const ushort *X, __global const uchar *W, __global const uchar *S,
                                 __global const float *amax, __global const float *den, __global const int *ids,
-                                __global ushort *Y, uint k, uint n, uint topk, bool gu, local float *part) {
+                                __global ushort *Y, uint k, uint n, uint topk, uint experts, bool gu, local float *part) {
   const uint lane = get_sub_group_local_id();
   const uint sg = get_sub_group_id();
   const uint tile = get_group_id(0), route = get_group_id(1);
   const uint e = (uint)ids[route];
   const uint rows_total = gu ? 2u * n : n;
   const uint raw = tile * INK2_SG + lane;
+  // A split rank passes a packed table. An id past that table is not this rank's expert: write zero and do not read.
+  if (e >= experts) {
+    if (gu) {
+      if ((lane & 1u) == 0 && raw < rows_total) Y[(ulong)route * n + (raw >> 1)] = 0;
+    } else if (raw < rows_total) Y[(ulong)route * n + raw] = 0;
+    return;
+  }
   const uint row = raw < rows_total ? raw : 0u;
   const uint nb = k / 16u;
   __global const uchar *wr = W + ((ulong)e * rows_total + row) * (k / 2u);
@@ -216,7 +223,7 @@ static inline void P(nv_decode)(const uint ks, __global const ushort *X, __globa
 }
 
 static inline void P(mx_decode)(const uint ks, __global const ushort *X, __global const uchar *W, __global const uchar *S,
-                                __global const int *ids, __global ushort *Y, uint k, uint n, uint topk, bool gu,
+                                __global const int *ids, __global ushort *Y, uint k, uint n, uint topk, uint experts, bool gu,
                                 local float *part) {
   const uint lane = get_sub_group_local_id();
   const uint sg = get_sub_group_id();
@@ -224,6 +231,12 @@ static inline void P(mx_decode)(const uint ks, __global const ushort *X, __globa
   const uint e = (uint)ids[route];
   const uint rows_total = gu ? 2u * n : n;
   const uint raw = tile * INK2_SG + lane;
+  if (e >= experts) {
+    if (gu) {
+      if ((lane & 1u) == 0 && raw < rows_total) Y[(ulong)route * n + (raw >> 1)] = 0;
+    } else if (raw < rows_total) Y[(ulong)route * n + raw] = 0;
+    return;
+  }
   const uint row = raw < rows_total ? raw : 0u;
   const uint nb = k / 32u;
   __global const uchar *wr = W + ((ulong)e * rows_total + row) * k;
@@ -250,7 +263,7 @@ __kernel void P(nvfp4_gu)(__global const ushort *X, __global const uchar *W, __g
                           __global const float *amax, __global const float *den, __global const int *ids,
                           __global ushort *Y, uint k, uint n, uint topk, uint experts) {
   local float part[INK2_KS_NV_GU * INK2_SG];
-  P(nv_decode)(INK2_KS_NV_GU, X, W, S, amax, den, ids, Y, k, n, topk, true, part);
+  P(nv_decode)(INK2_KS_NV_GU, X, W, S, amax, den, ids, Y, k, n, topk, experts, true, part);
 }
 #endif
 
@@ -260,7 +273,7 @@ __kernel void P(nvfp4_down)(__global const ushort *X, __global const uchar *W, _
                             __global const float *amax, __global const float *den, __global const int *ids,
                             __global ushort *Y, uint k, uint n, uint topk, uint experts) {
   local float part[INK2_KS_NV_DOWN * INK2_SG];
-  P(nv_decode)(INK2_KS_NV_DOWN, X, W, S, amax, den, ids, Y, k, n, topk, false, part);
+  P(nv_decode)(INK2_KS_NV_DOWN, X, W, S, amax, den, ids, Y, k, n, topk, experts, false, part);
 }
 #endif
 
@@ -269,7 +282,7 @@ __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_si
 __kernel void P(mxfp8_gu)(__global const ushort *X, __global const uchar *W, __global const uchar *S,
                           __global const int *ids, __global ushort *Y, uint k, uint n, uint topk, uint experts) {
   local float part[INK2_KS_MX_GU * INK2_SG];
-  P(mx_decode)(INK2_KS_MX_GU, X, W, S, ids, Y, k, n, topk, true, part);
+  P(mx_decode)(INK2_KS_MX_GU, X, W, S, ids, Y, k, n, topk, experts, true, part);
 }
 #endif
 
@@ -278,7 +291,7 @@ __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_si
 __kernel void P(mxfp8_down)(__global const ushort *X, __global const uchar *W, __global const uchar *S,
                             __global const int *ids, __global ushort *Y, uint k, uint n, uint topk, uint experts) {
   local float part[INK2_KS_MX_DOWN * INK2_SG];
-  P(mx_decode)(INK2_KS_MX_DOWN, X, W, S, ids, Y, k, n, topk, false, part);
+  P(mx_decode)(INK2_KS_MX_DOWN, X, W, S, ids, Y, k, n, topk, experts, false, part);
 }
 #endif
 
@@ -357,6 +370,33 @@ __kernel void P(combine)(__global const ushort *down, __global const int *ids, _
   }
 #endif
   Y[(ulong)token * n + col] = P(f_to_bf)(sum);
+}
+
+__attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(64, 1, 1)))
+__kernel void P(combine_f32)(__global const ushort *down, __global const int *ids, __global const float *weights,
+                             __global float *Y, uint n, uint topk, uint experts) {
+  const uint col = get_global_id(0), token = get_group_id(1);
+  if (col >= n) return;
+  float sum = 0.0f;
+  int last_id = INT_MIN;
+  int last_slot = -1;
+  for (uint t = 0; t < topk; t++) {
+    int best_id = INT_MAX;
+    int best_slot = -1;
+    for (uint slot = 0; slot < topk; slot++) {
+      const int id = ids[token * topk + slot];
+      const bool after = id > last_id || (id == last_id && (int)slot > last_slot);
+      if (after && (best_slot < 0 || id < best_id)) {
+        best_id = id;
+        best_slot = (int)slot;
+      }
+    }
+    if (best_slot < 0) break;
+    sum += weights[token * topk + best_slot] * P(bf_to_f)(down[(ulong)(token * topk + best_slot) * n + col]);
+    last_id = best_id;
+    last_slot = best_slot;
+  }
+  Y[(ulong)token * n + col] = sum;
 }
 #endif
 
