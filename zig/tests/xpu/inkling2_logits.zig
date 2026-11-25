@@ -839,6 +839,7 @@ fn verifyBench(gpa: std.mem.Allocator, io: std.Io, ctx: *xpu.Context, m: *const 
         std.debug.print("{d:4}   {d:10.2}   {d:9.2}   {d:22.2}   {d:9.2}\n", .{ n, fw[reps / 2], fw[reps / 2] / base_ms, tot[reps / 2], tot[reps / 2] / base_ms });
     }
     if (route_union) try routeUnion(gpa, m, scratch, r, &cache, ids, prefix);
+    try verifyBits(gpa, io, m, scratch, r, &cache, ids, host, prefix);
     if (profile) {
         var prof = try xpu.profile.Profile.init(ctx, 8192, true);
         defer prof.deinit();
@@ -856,6 +857,43 @@ fn verifyBench(gpa: std.mem.Allocator, io: std.Io, ctx: *xpu.Context, m: *const 
             prof.print();
         }
     }
+}
+
+/// Every verify row's logits against plain decode of that row at that position, bit for bit.
+fn verifyBits(gpa: std.mem.Allocator, io: std.Io, m: *const ink.model.Model, scratch: *state.Scratch, r: *xpu.rt.Runtime, cache: *state.Cache, ids: []const u32, host: []f32, prefix: usize) !void {
+    _ = io;
+    const n = 8;
+    const from = prefix;
+    const plain = try gpa.alloc(f32, n * vocab);
+    defer gpa.free(plain);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        cache.len = from + i;
+        try cache.begin(1);
+        try ink.forward.runShared(m, scratch, &.{.{ .cache = cache, .rows = 1 }}, ids[from + i ..][0..1], .{});
+        try r.download(std.mem.sliceAsBytes(plain[i * vocab ..][0..vocab]), cache.logits);
+        try r.sync();
+        try cache.rollback();
+    }
+    cache.len = from;
+    try cache.begin(n);
+    try ink.forward.runShared(m, scratch, &.{.{ .cache = cache, .rows = n }}, ids[from..][0..n], .{ .all = true, .taps = scratch.taps.?.ptr });
+    try r.download(std.mem.sliceAsBytes(host[0 .. n * vocab]), scratch.logits_all);
+    try r.sync();
+    try cache.rollback();
+    var diff: usize = 0;
+    var worst: f64 = 0;
+    var first_at: usize = 0;
+    for (0..n) |row| for (0..vocab) |j| {
+        const a = plain[row * vocab + j];
+        const b = host[row * vocab + j];
+        if (@as(u32, @bitCast(a)) != @as(u32, @bitCast(b))) {
+            if (diff == 0) first_at = row * vocab + j;
+            diff += 1;
+            worst = @max(worst, @abs(@as(f64, a) - @as(f64, b)));
+        }
+    };
+    std.debug.print("\nVERIFY BITS: {d} of {d} logits differ from plain decode at the same position (first at {d}, worst {e:.6})\n", .{ diff, n * vocab, first_at, worst });
 }
 
 /// The distinct experts a window of n real rows reads in a visit, averaged over the visits of the same precision and over
