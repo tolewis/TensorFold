@@ -138,7 +138,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         return null;
     };
     errdefer h.driver.close();
-    h.ctx = xpu.Context.init(&h.driver, o.device) catch |e| {
+    h.ctx = xpu.Context.init(&h.driver, deviceOrdinal(o.device)) catch |e| {
         problem.* = try std.fmt.allocPrint(a, "no Intel GPU device ({s})", .{@errorName(e)});
         h.driver.close();
         gpa.destroy(h);
@@ -303,6 +303,13 @@ test "Inkling XPU longest context accounts the scratch, the streams and the draf
 }
 
 /// Rank 1 loads its half and replays rank 0's forwards. It serves no HTTP.
+/// `--device` wins. The serve path otherwise ignored XPU_DEVICE, so rank 1 opened the same card as rank 0.
+fn deviceOrdinal(named: ?u32) ?u32 {
+    if (named) |n| return n;
+    const z = std.c.getenv("XPU_DEVICE") orelse return null;
+    return std.fmt.parseInt(u32, std.mem.span(z), 10) catch null;
+}
+
 pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !bool {
     _ = io;
     const place = ink.place.Place.parse(o.tp, o.rank) catch {
@@ -318,7 +325,7 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
         return false;
     };
     defer driver.close();
-    var ctx = xpu.Context.init(&driver, o.device) catch |e| {
+    var ctx = xpu.Context.init(&driver, deviceOrdinal(o.device)) catch |e| {
         problem.* = try std.fmt.allocPrint(a, "no Intel GPU device ({s})", .{@errorName(e)});
         return false;
     };

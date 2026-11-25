@@ -87,6 +87,34 @@ pub fn select(names: []const []const u8, ordinal: ?u32) Error!usize {
     return 0;
 }
 
+const PciGet = *const fn (ze.H, *PciProps) callconv(.c) u32;
+const PciAddr = extern struct { domain: u32 = 0, bus: u32 = 0, device: u32 = 0, function: u32 = 0 };
+const PciSpeed = extern struct { gen: i32 = -1, width: i32 = -1, bandwidth: i64 = -1 };
+const PciProps = extern struct {
+    stype: u32 = 0x10008,
+    pNext: ?*anyopaque = null,
+    address: PciAddr = .{},
+    speed: PciSpeed = .{},
+};
+
+fn logCard(d: *Driver, device: ze.H, props: *const ze.DeviceProperties, ordinal: u32) void {
+    var bdf_buf: [32]u8 = undefined;
+    var bdf: []const u8 = "unknown";
+    if (d.lib.lookup(PciGet, "zeDevicePciGetPropertiesExt")) |get| {
+        var pci: PciProps = .{};
+        if (get(device, &pci) == 0) {
+            bdf = std.fmt.bufPrint(&bdf_buf, "{x:0>4}:{x:0>2}:{x:0>2}.{x}", .{ pci.address.domain, pci.address.bus, pci.address.device, pci.address.function }) catch "unknown";
+        }
+    }
+    var uuid: [32]u8 = undefined;
+    const hex = "0123456789abcdef";
+    for (props.uuid, 0..) |b, i| {
+        uuid[2 * i] = hex[b >> 4];
+        uuid[2 * i + 1] = hex[b & 0xf];
+    }
+    std.log.info("inkling2: opened ordinal {d} bdf {s} uuid {s} name {s}", .{ ordinal, bdf, uuid, std.mem.sliceTo(&props.name, 0) });
+}
+
 pub const Context = struct {
     d: *const Driver,
     /// The device and context as the XPU backend's ze.Gpu, so its helpers serve this device too.
@@ -97,9 +125,11 @@ pub const Context = struct {
         const list = try enumerate(d, &all);
         var names: [max_devices][]const u8 = undefined;
         for (list, 0..) |*e, i| names[i] = entryName(e);
-        const e = list[try select(names[0..list.len], ordinal)];
+        const picked = try select(names[0..list.len], ordinal);
+        const e = list[picked];
         var ctx: ze.H = null;
         try d.check(d.api.zeContextCreate(e.driver, &.{}, &ctx), "zeContextCreate");
+        logCard(@constCast(d), e.device, &e.props, @intCast(picked));
         return .{ .d = d, .gpu = .{ .lib = d.lib, .api = d.api, .driver = e.driver, .device = e.device, .context = ctx, .props = e.props } };
     }
 

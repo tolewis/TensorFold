@@ -39,6 +39,33 @@ pub fn reportAppend(rank: u32) void {
     append_slow = @splat(0);
 }
 
+const Stamp = *const fn (ze.H, *u64, *u64) callconv(.c) u32;
+
+const HostClock = struct {
+    host: u64,
+    device: u64,
+    res: f64,
+    mask: u64,
+
+    fn hostNs(c: HostClock, tick: u64) i64 {
+        const delta = @as(i64, @intCast((tick -% c.device) & c.mask));
+        const wrapped = if (delta > @as(i64, @intCast(c.mask / 2))) delta - @as(i64, @intCast(c.mask)) - 1 else delta;
+        const ns: i64 = @intFromFloat(@as(f64, @floatFromInt(wrapped)) * 1e9 / c.res);
+        return @as(i64, @intCast(c.host)) + ns;
+    }
+};
+
+fn hostClock(ctx: *const Context) ?HostClock {
+    const get = @constCast(ctx.d).lib.lookup(Stamp, "zeDeviceGetGlobalTimestamps") orelse return null;
+    var host: u64 = 0;
+    var device: u64 = 0;
+    if (get(ctx.gpu.device, &host, &device) != 0) return null;
+    const bits = ctx.gpu.props.timestampValidBits;
+    const mask: u64 = if (bits >= 64 or bits == 0) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(bits)) - 1;
+    const res: f64 = @floatFromInt(@max(ctx.gpu.props.timerResolution, 1));
+    return .{ .host = host, .device = device, .res = res, .mask = mask };
+}
+
 pub fn nowNs() u64 {
     var ts: platform.c.timespec = undefined;
     _ = platform.c.clock_gettime(platform.c.CLOCK.MONOTONIC, &ts);
@@ -144,6 +171,12 @@ pub const Profile = struct {
         const res: f64 = 1e9 / @as(f64, @floatFromInt(p.ctx.gpu.props.timerResolution));
         const bits = p.ctx.gpu.props.kernelTimestampValidBits;
         const mask: u64 = if (bits >= 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(bits)) - 1;
+        const overlap = std.c.getenv("TF_TP_OVERLAP");
+        const clock = if (overlap != null and p.device_time) hostClock(p.ctx) else null;
+        var overlap_fd: i32 = -1;
+        if (overlap) |path| {
+            if (clock != null) overlap_fd = std.c.open(path, @bitCast(@as(u32, 1 | 64 | 1024)), @as(c_uint, 0o644));
+        }
         var first: u64 = 0;
         var last_end: u64 = 0;
         var prev_end: u64 = 0;
@@ -165,6 +198,12 @@ pub const Profile = struct {
                 const ns: u64 = @intFromFloat(@as(f64, @floatFromInt(dur)) * res);
                 r.device_ns += ns;
                 busy += @floatFromInt(ns);
+                if (overlap_fd >= 0) if (clock) |c| {
+                    var line: [80]u8 = undefined;
+                    if (std.fmt.bufPrint(&line, "{d} {d}\n", .{ c.hostNs(ts.global_start), c.hostNs(ts.global_end) })) |s| {
+                        _ = std.c.write(overlap_fd, s.ptr, s.len);
+                    } else |_| {}
+                };
                 if (i == 0) first = ts.global_start else {
                     const gap: u64 = @intFromFloat(@as(f64, @floatFromInt((ts.global_start -% prev_end) & mask)) * res);
                     gap_ns += gap;
@@ -201,6 +240,7 @@ pub const Profile = struct {
         p.launches += p.used;
         p.tokens += 1;
         p.used = 0;
+        if (overlap_fd >= 0) _ = std.c.close(overlap_fd);
     }
 
     fn lessDevice(_: void, a: Row, b: Row) bool {
