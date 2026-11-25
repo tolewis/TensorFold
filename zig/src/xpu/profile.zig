@@ -28,6 +28,8 @@ pub const Row = struct {
     label: []const u8 = "",
     calls: u64 = 0,
     device_ns: u64 = 0,
+    /// The device time between this launch's end and the next launch's start, in the same pass.
+    gap_ns: u64 = 0,
     set_ns: u64 = 0,
     append_ns: u64 = 0,
     args: u64 = 0,
@@ -124,6 +126,8 @@ pub const Profile = struct {
         var first: u64 = 0;
         var last_end: u64 = 0;
         var busy: f64 = 0;
+        var prev_end: u64 = 0;
+        var prev_row: ?*Row = null;
         for (p.recs[0..p.used], 0..) |rec, i| {
             const r = p.row(rec.handle, rec.label) catch return error.Invalid;
             r.calls += 1;
@@ -139,6 +143,10 @@ pub const Profile = struct {
                 busy += @floatFromInt(ns);
                 if (i == 0) first = ts.global_start;
                 last_end = ts.global_end;
+                // the idle time before this launch belongs to the launch before it, in this pass
+                if (prev_row) |pr| pr.gap_ns += @intFromFloat(@as(f64, @floatFromInt((ts.global_start -% prev_end) & mask)) * res);
+                prev_row = r;
+                prev_end = ts.global_end;
                 try d.check(d.api.zeEventHostReset(p.events[i]), "zeEventHostReset");
             }
         }
@@ -170,7 +178,7 @@ pub const Profile = struct {
     pub fn print(p: *Profile) void {
         const n: f64 = @floatFromInt(@max(p.tokens, 1));
         std.mem.sort(Row, p.rows.items, {}, lessDevice);
-        std.debug.print("{s:<40} {s:>7} {s:>10} {s:>9} {s:>10} {s:>10} {s:>6}\n", .{ "kernel", "calls", "dev ms", "dev us/c", "set ms", "append ms", "args" });
+        std.debug.print("{s:<40} {s:>7} {s:>10} {s:>9} {s:>9} {s:>10} {s:>10} {s:>6}\n", .{ "kernel", "calls", "dev ms", "dev us/c", "gap us/c", "set ms", "append ms", "args" });
         var calls: u64 = 0;
         var dev: u64 = 0;
         var set: u64 = 0;
@@ -180,7 +188,7 @@ pub const Profile = struct {
             const c: f64 = @floatFromInt(@max(r.calls, 1));
             var full_name: [96]u8 = undefined;
             const shown = if (r.label.len > 0) (std.fmt.bufPrint(&full_name, "{s}:{s}", .{ r.label, std.mem.sliceTo(&r.name, 0) }) catch "?") else std.mem.sliceTo(&r.name, 0);
-            std.debug.print("{s:<40} {d:>7.1} {d:>10.3} {d:>9.1} {d:>10.3} {d:>10.3} {d:>6.1}\n", .{ shown, @as(f64, @floatFromInt(r.calls)) / n, @as(f64, @floatFromInt(r.device_ns)) / 1e6 / n, @as(f64, @floatFromInt(r.device_ns)) / 1e3 / c, @as(f64, @floatFromInt(r.set_ns)) / 1e6 / n, @as(f64, @floatFromInt(r.append_ns)) / 1e6 / n, @as(f64, @floatFromInt(r.args)) / n });
+            std.debug.print("{s:<40} {d:>7.1} {d:>10.3} {d:>9.1} {d:>9.1} {d:>10.3} {d:>10.3} {d:>6.1}\n", .{ shown, @as(f64, @floatFromInt(r.calls)) / n, @as(f64, @floatFromInt(r.device_ns)) / 1e6 / n, @as(f64, @floatFromInt(r.device_ns)) / 1e3 / c, @as(f64, @floatFromInt(r.gap_ns)) / 1e3 / c, @as(f64, @floatFromInt(r.set_ns)) / 1e6 / n, @as(f64, @floatFromInt(r.append_ns)) / 1e6 / n, @as(f64, @floatFromInt(r.args)) / n });
             calls += r.calls;
             dev += r.device_ns;
             set += r.set_ns;

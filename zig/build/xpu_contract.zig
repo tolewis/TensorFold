@@ -148,6 +148,7 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         \\pub const ink2_attention_ctl3 align(8) = @embedFile("inkling2_attention_ctl3.bin").*;
         \\pub const ink2_attention_ctl4 align(8) = @embedFile("inkling2_attention_ctl4.bin").*;
         \\pub const ink2_attention_ctl5 align(8) = @embedFile("inkling2_attention_ctl5.bin").*;
+        \\pub const ink2_attention_ctl7 align(8) = @embedFile("inkling2_attention_ctl7.bin").*;
         \\pub const ink2_prompt_ctl6 align(8) = @embedFile("inkling2_prompt_ctl6.bin").*;
         \\pub const inkling2_experts align(8) = @embedFile("contract_inkling2_experts.bin").*;
         \\pub const inkling2_controls align(8) = @embedFile("contract_inkling2_controls.bin").*;
@@ -373,6 +374,7 @@ const ink2_attn_controls = [_]Source{
     .{ .name = "inkling2_attention_ctl3", .path = "zig/kernels/xpu/inkling2/attention.cl", .extra = " -DINK2_CTL=3" },
     .{ .name = "inkling2_attention_ctl4", .path = "zig/kernels/xpu/inkling2/attention.cl", .extra = " -DINK2_CTL=4" },
     .{ .name = "inkling2_attention_ctl5", .path = "zig/kernels/xpu/inkling2/attention.cl", .extra = " -DINK2_CTL=5" },
+    .{ .name = "inkling2_attention_ctl7", .path = "zig/kernels/xpu/inkling2/attention.cl", .extra = " -DINK2_CTL=7" },
     .{ .name = "inkling2_prompt_ctl6", .path = "zig/kernels/xpu/inkling2/prompt_attention.cl", .extra = " -DINK2_CTL=6" },
 };
 
