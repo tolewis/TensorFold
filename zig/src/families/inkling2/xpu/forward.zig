@@ -411,6 +411,12 @@ const Run = struct {
             dumpRow(g.m, g.s, s.rel_tab, state.query_width * 2, "reltab");
             std.debug.print("ATT ARGS v{d}: rows {d} layer {d} extent {d}\n", .{ dump_visit, rows, v.layer, ap.extent });
         }
+        if (dump_dir_len > 0) {
+            const seg0 = segments[0];
+            const lay = seg0.cache.attentionLayer(&g.m.weight_plan, v.cache_slot, seg0.rows);
+            const glp = seg0.cache.len + seg0.rows - 1;
+            std.debug.print("GEOM v{d}: rows {d} last_pos {d} chunk {d} chunks {d} window {d} ring {d}\n", .{ dump_visit, seg0.rows, glp, lay.chunk, ap.chunks(glp, lay.chunk), lay.window, lay.ring });
+        }
         try g.attendSegments(v, segments);
         xpu.profile.label = "wo";
         try g.dense(w.attn.wo, at(s.att, 0), at(s.attn_dense, 0), rows);
