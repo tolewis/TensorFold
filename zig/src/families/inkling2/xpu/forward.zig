@@ -636,7 +636,10 @@ fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) 
         };
         try dumpBytes(&g, visit_i, "exp-red", at(s.mlp_out, 0), 2 * state.hidden * 2);
         base = 0;
-        if (fuse.downEpi() and segments.len == 1) {
+        // The down epilogue re-does the expert combine from s.down, which on a split rank holds only that rank's
+        // experts. It would overwrite the reduced mlp_out with a rank-local half sum, so a split rank keeps the plain
+        // branch, which reads the reduced mlp_out.
+        if (fuse.downEpi() and segments.len == 1 and !g.m.options.place.split()) {
             const seg = segments[0];
             const channels: u32 = @intCast(state.convWidth(3));
             const commit1: u32 = if (fuse.roleConv() and rows == 1) 1 else 0;
