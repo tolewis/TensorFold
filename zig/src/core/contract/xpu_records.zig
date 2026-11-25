@@ -202,6 +202,10 @@ const qwen27_records = [_]Record{
         .usage = .{.{ .threads = .{ 16, 1, 1 }, .slm = 1536, .sub_group = 16, .grf = 256 }},
     },
     .{
+        .launch = .{ .name = "inkling2 attention decode rows", .symbol = "tf_ink2_attn_decode_rows", .image = "inkling2_attention", .format = glue, .threads = .{ 16, 1, 1 }, .slm = 12288, .sub_group = 16, .grf = 256 },
+        .usage = .{.{ .threads = .{ 16, 1, 1 }, .slm = 12288, .sub_group = 16, .grf = 256 }},
+    },
+    .{
         .launch = .{ .name = "inkling2 attention merge", .symbol = "tf_ink2_merge", .image = "inkling2_attention", .format = glue, .threads = .{ 128, 1, 1 }, .sub_group = 16, .grf = 256 },
         .usage = .{.{ .threads = .{ 128, 1, 1 }, .sub_group = 16, .grf = 256 }},
     },
