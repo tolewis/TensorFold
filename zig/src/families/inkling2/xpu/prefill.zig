@@ -388,6 +388,10 @@ const Run = struct {
         try g.dense(w.attn.wo, at(s.att, 0), at(s.attn_dense, 0), rows);
         xpu.profile.label = "";
         if (g.m.options.place.split()) if (group.live) |gp| try gp.allReduce(at(s.attn_dense, 0).?, @intCast(rows));
+        if (forward.vdump_active and forward.vdump_visit == 0) {
+            try forward.dumpVisit(g.m.r, g.m.options.place.rank, forward.vdump_seq, 90, at(s.q_norm, 0), rows);
+            try forward.dumpVisit(g.m.r, g.m.options.place.rank, forward.vdump_seq, 91, at(s.attn_dense, 0), rows);
+        }
         try g.staticPostConv(cache, v.cache_slot, 2, s.attn_dense, w.attn_conv, s.attn_conv);
         try pointwise(&g.p.runtime, g.s, .attention_partial, rows, if (lp.boundary) @intCast(lp.blocks_in + 1) else 0, .{ at(s.p, 0), at(s.attn_conv, 0), at(s.blocks, 0), at(s.partial, 0) });
         try pk.ar(&g.p.prefill, g.s, at(s.blocks, 0), at(s.partial, 0), tensor(m.weights.mlp_queries[v.layer]), at(s.mlp_ar, 0), @intCast(lp.mlp_sources), 1, @intCast(rows));

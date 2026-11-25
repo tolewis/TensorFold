@@ -30,10 +30,12 @@ fn dumpWanted() bool {
 var slice_own_dumped = false;
 var slice_pulled_dumped = false;
 
-var vdump_seq: u32 = 0;
+pub var vdump_seq: u32 = 0;
+pub var vdump_visit: usize = 0;
+pub var vdump_active: bool = false;
 
 /// TF_TP_VDUMP: the hidden state after each visit of a short call (a verify window or a decode row), for the bisect.
-fn dumpVisit(r: *xpu.rt.Runtime, rank: u32, seq: u32, visit: usize, src: ?*anyopaque, rows: usize) !void {
+pub fn dumpVisit(r: *xpu.rt.Runtime, rank: u32, seq: u32, visit: usize, src: ?*anyopaque, rows: usize) !void {
     const dir_z = std.c.getenv("TF_TP_VDUMP") orelse return;
     const ptr = src orelse return;
     const bytes: usize = rows * 2304 * 2;
@@ -795,9 +797,12 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     const seq = vdump_seq;
     if (vdump) vdump_seq += 1;
     for (m.weight_plan.visits[0..m.weight_plan.n_visits], 0..) |*v, vi| {
+        vdump_visit = vi;
+        vdump_active = vdump;
         try g.visit(v, segments, rows, options.taps, vi);
         if (vdump) try dumpVisit(m.r, m.options.place.rank, seq, vi, at(s.p, 0), rows);
     }
+    vdump_active = false;
     if (vdump) {
         var meta_buf: [64]u8 = undefined;
         const meta = std.fmt.bufPrint(&meta_buf, "rows {d} base {d} rank {d}\n", .{ rows, segments[0].cache.len, m.options.place.rank }) catch "";
