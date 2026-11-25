@@ -183,12 +183,16 @@ pub const Runtime = struct {
         return .{ .ctx = c, .list = self.list };
     }
 
-    pub fn alloc(self: *Runtime, bytes: usize) Error!Buffer {
+    pub fn allocAlign(self: *Runtime, bytes: usize, alignment: usize) Error!Buffer {
         var p: ?*anyopaque = null;
-        try self.drv.check(self.drv.api.zeMemAllocDevice(self.ctx, &.{}, bytes, 64, self.device, &p), "zeMemAllocDevice");
+        try self.drv.check(self.drv.api.zeMemAllocDevice(self.ctx, &.{}, bytes, alignment, self.device, &p), "zeMemAllocDevice");
         alloc_now += bytes;
         alloc_peak = @max(alloc_peak, alloc_now);
         return .{ .rt = self, .ptr = p, .len = bytes };
+    }
+
+    pub fn alloc(self: *Runtime, bytes: usize) Error!Buffer {
+        return self.allocAlign(bytes, 64);
     }
 
     /// Pinned host memory the kernels read directly over PCIe; for large tables read a few rows at a time.

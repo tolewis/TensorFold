@@ -15,14 +15,28 @@ pub var active: ?*Profile = null;
 /// (kernel, label). Static strings only.
 pub var label: []const u8 = "";
 
+/// The kernel queued most recently. The exchange wait log names this as the work before the wait.
+pub var last_kernel: []const u8 = "";
+
 /// Host time of the exchange appends, when TF_TP_APPEND=1. Sites: copy, flag write, event create, event wait, kernel launch.
 pub var host_append_ns: [5]u64 = @splat(0);
 pub var append_n: [5]u64 = @splat(0);
 pub var append_max: [5]u64 = @splat(0);
 pub var append_slow: [5]u64 = @splat(0);
 
+var append_checked: bool = false;
+var append_on: bool = false;
+
+fn appendEnabled() bool {
+    if (!append_checked) {
+        append_on = std.c.getenv("TF_TP_APPEND") != null;
+        append_checked = true;
+    }
+    return append_on;
+}
+
 pub fn noteAppend(site: u8, dt: u64) void {
-    if (std.c.getenv("TF_TP_APPEND") == null) return;
+    if (!appendEnabled()) return;
     const i: usize = site;
     append_n[i] += 1;
     host_append_ns[i] += dt;
@@ -31,7 +45,7 @@ pub fn noteAppend(site: u8, dt: u64) void {
 }
 
 pub fn reportAppend(rank: u32) void {
-    if (std.c.getenv("TF_TP_APPEND") == null) return;
+    if (!appendEnabled()) return;
     const name = [_][]const u8{ "copy", "write", "create", "wait", "launch" };
     for (name, 0..) |s, i| {
         const n: f64 = @floatFromInt(@max(append_n[i], 1));

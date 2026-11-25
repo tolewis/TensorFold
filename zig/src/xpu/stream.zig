@@ -11,7 +11,8 @@ pub const Stream = struct {
     pub fn init(ctx: *const Context) Error!Stream {
         const d = ctx.d;
         var list: ze.H = null;
-        try d.check(d.api.zeCommandListCreateImmediate(ctx.gpu.context, ctx.gpu.device, &.{ .flags = ze.queue_in_order, .mode = 2 }, &list), "zeCommandListCreateImmediate");
+        const desc: ze.QueueDesc = .{ .ordinal = 0, .flags = ze.queue_in_order, .mode = 2, .priority = 0 };
+        try d.check(d.api.zeCommandListCreateImmediate(ctx.gpu.context, ctx.gpu.device, &desc, &list), "zeCommandListCreateImmediate");
         return .{ .ctx = ctx, .list = list };
     }
 

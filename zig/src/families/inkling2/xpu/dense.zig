@@ -17,6 +17,7 @@ pub const variants = [_]u32{ 1, 2, 4, 8, 16, 32 };
 
 pub const Kernels = struct {
     dense: [variants.len]xpu.Kernel,
+    dense_f32: [variants.len]?xpu.Kernel = @splat(null),
     norm: xpu.Kernel,
     /// Output columns a matvec work-group covers.
     columns: u32 = matvec_columns,
@@ -35,8 +36,14 @@ pub const Kernels = struct {
             made[i] = try module.kernel(symbol(rows, control), .{ threads, 1, 1 });
             n += 1;
         }
+        var f32s: [variants.len]?xpu.Kernel = @splat(null);
+        if (!control) {
+            inline for (variants, 0..) |rows, i| {
+                f32s[i] = try module.kernel(std.fmt.comptimePrint("tf_ink2_dense_f32_{d}", .{rows}), .{ threads, 1, 1 });
+            }
+        }
         const norm_kernel = try module.kernel(if (control) "tf_ctl_ink2_norm" else "tf_ink2_norm", .{ norm_threads, 1, 1 });
-        return .{ .dense = made, .norm = norm_kernel, .columns = threads / 16 };
+        return .{ .dense = made, .dense_f32 = f32s, .norm = norm_kernel, .columns = threads / 16 };
     }
 
     pub fn deinit(p: *Kernels) void {
@@ -83,6 +90,17 @@ pub fn matvec(p: *const Kernels, s: xpu.Stream, lead: u32, weight: Ref, input: R
 
 /// out[rows][n] = bf16(input[rows][k] . weight[n][k]) with FP32 sums, for bf16 input and weight (n rows of k), k a
 /// multiple of 8. Rows go 32, 16, 8, 4, 2, 1 at a time; each launch's input and output start at its first row.
+/// Same matvec, stored as f32. Used so a split rank can round once after the cross-rank add.
+pub fn denseF32(p: *const Kernels, s: xpu.Stream, weight: Ref, input: Ref, out: Ref, rows: u32, n: u32, k: u32) !void {
+    std.debug.assert(rows > 0);
+    var base: u32 = 0;
+    const kern = p.dense_f32[variantOf(1)] orelse return error.KernelNotLoaded;
+    while (base < rows) {
+        try xpu.launch.dispatch(kern, s, .{ (n + p.columns - 1) / p.columns, 1, 1 }, .{ at(input, @as(usize, base) * k * 2), weight, at(out, @as(usize, base) * n * 4), @as(u32, 1), n, k, n });
+        base += 1;
+    }
+}
+
 pub fn dense(p: *const Kernels, s: xpu.Stream, weight: Ref, input: Ref, out: Ref, rows: u32, n: u32, k: u32) !void {
     std.debug.assert(rows > 0);
     var base: u32 = 0;

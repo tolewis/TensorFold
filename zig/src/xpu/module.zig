@@ -63,13 +63,14 @@ pub const Module = struct {
             std.log.err("kernel not in module: {s}", .{name});
             return e;
         };
-        return .{ .ctx = self.ctx, .handle = k };
+        return .{ .ctx = self.ctx, .handle = k, .name = name };
     }
 };
 
 pub const Kernel = struct {
     ctx: *const Context,
     handle: ze.H,
+    name: [:0]const u8 = "",
 
     pub fn deinit(self: *Kernel) void {
         _ = self.ctx.d.x.zeKernelDestroy(self.handle);

@@ -97,19 +97,19 @@ pub fn seg1(p: *const Kernels, s: xpu.Stream, x: [5]Ref, w: [5]Ref, y: [5]Ref, n
     });
 }
 
-pub fn matvec(p: *const Kernels, s: xpu.Stream, lead: u32, weight: Ref, input: Ref, out: Ref, rows: u32, n: u32, k: u32, ldy: u32) !void {
+pub fn matvec(p: *const Kernels, s: xpu.Stream, lead: u32, weight: Ref, input: Ref, out: Ref, wide: ?*anyopaque, rows: u32, n: u32, k: u32, ldy: u32) !void {
     std.debug.assert(rows > 0 and rows <= lead and n > 0 and k > 0 and k % 256 == 0 and ldy >= n);
-    try xpu.launch.dispatch(p.dense[variantOf(lead)], s, .{ (n + p.columns - 1) / p.columns, 1, 1 }, .{ input, weight, out, rows, n, k, ldy });
+    try xpu.launch.dispatch(p.dense[variantOf(lead)], s, .{ (n + p.columns - 1) / p.columns, 1, 1 }, .{ input, weight, out, wide, rows, n, k, ldy });
 }
 
 /// out[rows][n] = bf16(input[rows][k] . dequant(weight)[n][k]) with FP32 sums. Rows go 32, 16, 8, 4, 2, 1 at a time; each
 /// launch's input and output start at its first row.
-pub fn dense(p: *const Kernels, s: xpu.Stream, weight: Ref, input: Ref, out: Ref, rows: u32, n: u32, k: u32) !void {
+pub fn dense(p: *const Kernels, s: xpu.Stream, weight: Ref, input: Ref, out: Ref, wide: ?*anyopaque, rows: u32, n: u32, k: u32) !void {
     std.debug.assert(rows > 0);
     var base: u32 = 0;
     while (base < rows) {
         const t = take(rows - base);
-        try matvec(p, s, t, weight, at(input, @as(usize, base) * k * 2), at(out, @as(usize, base) * n * 2), t, n, k, n);
+        try matvec(p, s, t, weight, at(input, @as(usize, base) * k * 2), at(out, @as(usize, base) * n * 2), if (base == 0) wide else null, t, n, k, n);
         base += t;
     }
 }

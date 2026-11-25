@@ -135,7 +135,7 @@ static inline float q8_cap(float x, float c) { return c * tanh(x / c); }
 // y[r][j] for r < rows, rows <= ROWS; x holds ROWS rows of k values (k a multiple of 256); w is the codes then the scales.
 #define Q8_MATVEC(ROWS)                                                                                            \
   Q8_KERNEL(Q8_WG) void Q8_NAME(dense_q8_##ROWS)(global const ushort *x, global const uchar *w, global ushort *y,   \
-                                                  uint rows, uint n, uint k, uint ldy) {                           \
+                                                  global float *wide, uint rows, uint n, uint k, uint ldy) {       \
     const uint j = get_group_id(0) * (Q8_WG / 16) + get_sub_group_id();                                            \
     if (j >= n) return;                                                                                            \
     global const uchar *codes = w;                                                                                 \
@@ -144,7 +144,10 @@ static inline float q8_cap(float x, float c) { return c * tanh(x / c); }
     Q8_DOT(ROWS, x, codes, scales, j, n, k)                                                                        \
     _Pragma("unroll") for (uint r = 0; r < ROWS; ++r) {                                                            \
       const float s = sub_group_reduce_add(acc[r]);                                                                \
-      if (get_sub_group_local_id() == 0 && r < rows) y[(ulong)r * ldy + j] = Q8_STORE(s);                          \
+      if (get_sub_group_local_id() == 0 && r < rows) {                                                             \
+        y[(ulong)r * ldy + j] = Q8_STORE(s);                                                                       \
+        if (wide) wide[(ulong)r * n + j] = s;                                                                      \
+      }                                                                                                            \
     }                                                                                                              \
   }
 

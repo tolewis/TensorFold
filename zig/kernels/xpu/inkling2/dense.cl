@@ -103,6 +103,40 @@ DENSE_MATVEC(8)
 DENSE_MATVEC(16)
 DENSE_MATVEC(32)
 
+// f32 store of the same matvec, so a split rank can round once after the cross-rank add.
+#define DENSE_MATVEC_F32(ROWS)                                                                                     \
+  DENSE_KERNEL(DENSE_WG, DENSE_SG) void DENSE_NAME(dense_f32_##ROWS)(global const ushort *x, global const ushort *w, \
+                                                                      global float *y, uint rows, uint n, uint k,  \
+                                                                      uint ldy) {                                  \
+    const uint j = get_group_id(0) * (DENSE_WG / DENSE_SG) + get_sub_group_id();                                   \
+    if (j >= n) return;                                                                                            \
+    const uint lane = get_sub_group_local_id(), chunks = k / 8;                                                    \
+    global const uint4 *wr = (global const uint4 *)(w + (ulong)j * k);                                             \
+    float acc[ROWS];                                                                                               \
+    _Pragma("unroll") for (uint r = 0; r < ROWS; ++r) acc[r] = 0.0f;                                             \
+    uint c = lane;                                                                                                 \
+    for (; c + (DENSE_UNROLL - 1) * DENSE_SG < chunks; c += DENSE_UNROLL * DENSE_SG) {                             \
+      uint4 wv[DENSE_UNROLL];                                                                                      \
+      _Pragma("unroll") for (uint u = 0; u < DENSE_UNROLL; ++u) wv[u] = wr[c + u * DENSE_SG];                    \
+      _Pragma("unroll") for (uint u = 0; u < DENSE_UNROLL; ++u) DENSE_STEP(ROWS, wv[u], x, c + u * DENSE_SG)     \
+    }                                                                                                              \
+    for (; c < chunks; c += DENSE_SG) {                                                                            \
+      const uint4 wv = wr[c];                                                                                      \
+      DENSE_STEP(ROWS, wv, x, c)                                                                                   \
+    }                                                                                                              \
+    _Pragma("unroll") for (uint r = 0; r < ROWS; ++r) {                                                          \
+      const float s = sub_group_reduce_add(acc[r]);                                                                \
+      if (lane == 0 && r < rows) y[(ulong)r * ldy + j] = s;                                                        \
+    }                                                                                                              \
+  }
+
+DENSE_MATVEC_F32(1)
+DENSE_MATVEC_F32(2)
+DENSE_MATVEC_F32(4)
+DENSE_MATVEC_F32(8)
+DENSE_MATVEC_F32(16)
+DENSE_MATVEC_F32(32)
+
 // Grid (rows), 256 work-items a row. A work-item sums x[t], x[t + 256], ... as fused multiply-adds, in order; the
 // sub-groups' sums are then added in order, so every work-item holds the same total.
 __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(256, 1, 1))) kernel void
