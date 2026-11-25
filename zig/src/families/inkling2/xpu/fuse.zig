@@ -11,6 +11,16 @@ pub var router_wide: bool = false;
 pub var conv_fold: bool = false;
 pub var zeta_wide: bool = false;
 pub var kv_conv: bool = false;
+pub var down_epi: bool = false;
+
+pub fn downEpi() bool {
+    if (down_epi) return true;
+    if (std.c.getenv("INK2_DOWN_EPI")) |p| {
+        const s = std.mem.span(p);
+        return s.len > 0 and s[0] == '1';
+    }
+    return false;
+}
 
 pub fn kvConv() bool {
     if (kv_conv) return true;
@@ -68,6 +78,7 @@ pub const Pipelines = struct {
     conv_mlp: xpu.Kernel,
     zeta_wide: xpu.Kernel,
     conv_kv: xpu.Kernel,
+    down_epi: xpu.Kernel,
 
     pub fn load(module: xpu.Module) !Pipelines {
         var pre = try module.kernel("tf_ink2_fuse_pre", .{ 256, 1, 1 });
@@ -88,11 +99,14 @@ pub const Pipelines = struct {
         errdefer conv_mlp.deinit();
         var zeta_wide_k = try module.kernel("tf_ink2_zeta_wide", .{ 256, 1, 1 });
         errdefer zeta_wide_k.deinit();
-        const conv_kv = try module.kernel("tf_ink2_conv_kv", .{ 256, 1, 1 });
-        return .{ .pre = pre, .zeta = zeta, .gates = gates, .norms = norms, .router_gemv = router_gemv, .router_pick = router_pick, .conv_attn = conv_attn, .conv_mlp = conv_mlp, .zeta_wide = zeta_wide_k, .conv_kv = conv_kv };
+        var conv_kv = try module.kernel("tf_ink2_conv_kv", .{ 256, 1, 1 });
+        errdefer conv_kv.deinit();
+        const down_epi = try module.kernel("tf_ink2_down_epilogue", .{ 256, 1, 1 });
+        return .{ .pre = pre, .zeta = zeta, .gates = gates, .norms = norms, .router_gemv = router_gemv, .router_pick = router_pick, .conv_attn = conv_attn, .conv_mlp = conv_mlp, .zeta_wide = zeta_wide_k, .conv_kv = conv_kv, .down_epi = down_epi };
     }
 
     pub fn deinit(p: *Pipelines) void {
+        p.down_epi.deinit();
         p.conv_kv.deinit();
         p.zeta_wide.deinit();
         p.conv_mlp.deinit();
@@ -138,6 +152,11 @@ pub const PhaseA = struct {
 pub fn convAttnPartial(p: *const Pipelines, s: xpu.Stream, history: Ref, current: Ref, taps: Ref, weight: Ref, conv_out: Ref, prev: Ref, blocks: Ref, partial: Ref, rows: u32, channels: u32, boundary: u32) !void {
     const groups = (channels + 255) / 256;
     try xpu.launch.dispatch(p.conv_attn, s, .{ groups, rows, 1 }, .{ history, current, taps, weight, conv_out, prev, blocks, partial, rows, channels, boundary });
+}
+
+pub fn downEpilogue(p: *const Pipelines, s: xpu.Stream, down: Ref, ids: Ref, weights: Ref, history: Ref, taps: Ref, conv_w: Ref, conv_out: Ref, partial: Ref, pout: Ref, n: u32, topk: u32, channels: u32) !void {
+    const groups = (n + 255) / 256;
+    try xpu.launch.dispatch(p.down_epi, s, .{ groups, 1, 1 }, .{ down, ids, weights, history, taps, conv_w, conv_out, partial, pout, n, topk, channels });
 }
 
 pub fn convKv(p: *const Pipelines, s: xpu.Stream, hk: Ref, ck: Ref, tk: Ref, wk: Ref, ok: Ref, hv: Ref, cv: Ref, tv: Ref, wv: Ref, ov: Ref, rows: u32, channels: u32) !void {
