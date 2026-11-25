@@ -50,8 +50,8 @@ const Bench = struct {
         return try d.at(0);
     }
     /// A weight copy of `n` rows of `k` values: random codes and scales in a plausible range.
-    fn weight(b: *Bench, n: usize, k: usize, codes: []const u8, scales: []const u16) !host.Ref {
-        var d = try b.alloc(q8.bytes(n, k));
+    fn weight(b: *Bench, n: usize, k: usize, codes: []const u8, scales: []const u16, dpas: bool) !host.Ref {
+        var d = try b.alloc(if (dpas) q8.dpasBytes(n, k) else q8.bytes(n, k));
         var at: usize = 0;
         const plane = n * k;
         while (at < plane) {
@@ -104,16 +104,32 @@ fn deviceTime(b: *Bench, head: bool, ws: []const host.Ref, x: host.Ref, y: host.
     var gpu = &b.dev.ctx.gpu;
     const events = try gpu.events(count);
     const d = b.dev.ctx.d;
-    const kern = if (head) b.k.head[host.variantOf(rows)] else b.k.dense[host.variantOf(rows)];
-    const groups: ze.GroupCount = .{ .x = (n + b.k.columns - 1) / b.k.columns, .y = 1, .z = 1 };
+    const kern = if (head) b.k.head_dpas else b.k.dense[host.variantOf(rows)];
+    const groups: ze.GroupCount = if (head) .{ .x = (n + 15) / 16, .y = 1, .z = 1 } else .{ .x = (n + b.k.columns - 1) / b.k.columns, .y = 1, .z = 1 };
+    var qc: host.Ref = null;
+    var qs: host.Ref = null;
+    if (head) {
+        const sc = try host.actScratch(b.dev.s);
+        qc = sc.qc;
+        qs = sc.qs;
+        const nblk = rows * (host.hidden / 32);
+        try xpu.launch.dispatch(b.k.quant, b.dev.s, .{ (nblk + 127) / 128, 1, 1 }, .{ x, qc, qs, rows, host.hidden });
+    }
     for (0..count + ws.len) |i| {
         const timed = i >= ws.len;
-        try kern.setPtr(0, x);
-        try kern.setPtr(1, ws[i % ws.len]);
-        try kern.setPtr(2, y);
-        try kern.setU32(3, rows);
-        try kern.setU32(4, n);
-        if (!head) {
+        if (head) {
+            try kern.setPtr(0, qc);
+            try kern.setPtr(1, qs);
+            try kern.setPtr(2, ws[i % ws.len]);
+            try kern.setPtr(3, y);
+            try kern.setU32(4, rows);
+            try kern.setU32(5, n);
+        } else {
+            try kern.setPtr(0, x);
+            try kern.setPtr(1, ws[i % ws.len]);
+            try kern.setPtr(2, y);
+            try kern.setU32(3, rows);
+            try kern.setU32(4, n);
             try kern.setU32(5, k);
             try kern.setU32(6, n);
         }
@@ -152,9 +168,17 @@ fn check(b: *Bench, head: bool, rows: u32, n: u32, k: u32) !f64 {
     const xs = try a.alloc(u16, @as(usize, rows) * k);
     defer a.free(xs);
     for (xs) |*v| v.* = bf((rng.float(f32) - 0.5) * 4);
-    var wd = try b.alloc(q8.bytes(n, k));
-    try wd.upload(b.dev.s, 0, codes);
-    try wd.upload(b.dev.s, @as(usize, n) * k, std.mem.sliceAsBytes(scales));
+    const nbytes = if (head) q8.dpasBytes(n, k) else q8.bytes(n, k);
+    var wd = try b.alloc(nbytes);
+    if (head) {
+        const tile = try a.alloc(u8, nbytes);
+        defer a.free(tile);
+        q8.repackDpas(codes, scales, n, k, tile);
+        try wd.upload(b.dev.s, 0, tile);
+    } else {
+        try wd.upload(b.dev.s, 0, codes);
+        try wd.upload(b.dev.s, @as(usize, n) * k, std.mem.sliceAsBytes(scales));
+    }
     var xd = try b.alloc(xs.len * 2);
     try xd.upload(b.dev.s, 0, std.mem.sliceAsBytes(xs));
     const osize: usize = if (head) 4 else 2;
@@ -241,14 +265,14 @@ pub fn main(init: std.process.Init) !u8 {
     };
     for (shapes) |sh| {
         if (quick and sh.n == 384) continue;
-        const bytes = q8.bytes(sh.n, sh.k);
+        const bytes = if (sh.head) q8.dpasBytes(sh.n, sh.k) else q8.bytes(sh.n, sh.k);
         const copies = @max(2, (pool_bytes + bytes - 1) / bytes);
         const keep = b.bufs.items.len;
         const x = try b.noisyBf16(32 * @as(usize, sh.k) * 2, noise);
         const y = try b.buf(32 * @as(usize, sh.n) * 4, 0);
         var ws = try b.a.alloc(host.Ref, copies);
         defer b.a.free(ws);
-        for (ws) |*w| w.* = try b.weight(sh.n, sh.k, codes, scales);
+        for (ws) |*w| w.* = try b.weight(sh.n, sh.k, codes, scales, sh.head);
         try dev.s.synchronize();
         for ([_]u32{ 1, 2, 4, 8, 16, 32 }) |rows| {
             if (quick and rows != 1 and rows != 8) continue;
