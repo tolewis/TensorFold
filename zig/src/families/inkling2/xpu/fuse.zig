@@ -60,6 +60,42 @@ pub fn kvConv() bool {
     return true;
 }
 
+/// The AR of the prologue over one group a query row. Default; `INK2_PRE_Q=0` selects the looped prologue.
+pub var pre_q: bool = false;
+
+pub fn preQ() bool {
+    if (pre_q) return true;
+    if (std.c.getenv("INK2_PRE_Q")) |p| {
+        const s = std.mem.span(p);
+        if (s.len > 0 and s[0] == '0') return false;
+    }
+    return true;
+}
+
+/// The prologue's AR and the message gate projection in one launch. Default; `INK2_PRE_ZETA=0` selects the two launches.
+pub var pre_zeta: bool = false;
+
+pub fn preZeta() bool {
+    if (pre_zeta) return true;
+    if (std.c.getenv("INK2_PRE_ZETA")) |p| {
+        const s = std.mem.span(p);
+        if (s.len > 0 and s[0] == '0') return false;
+    }
+    return true;
+}
+
+/// The gates and the norms of the gated rows in one group a row, off until it wins.
+pub var gates_norms: bool = false;
+
+pub fn gatesNorms() bool {
+    if (gates_norms) return true;
+    if (std.c.getenv("INK2_GATES_NORMS")) |p| {
+        const s = std.mem.span(p);
+        return s.len > 0 and s[0] == '1';
+    }
+    return false;
+}
+
 /// The zeta over 16 groups of four sub-groups a rank. Default; `INK2_ZETA_SPLIT=0` selects the wide kernel.
 pub var zeta_split: bool = false;
 
@@ -119,6 +155,9 @@ pub const Pipelines = struct {
     conv_mlp: xpu.Kernel,
     zeta_wide: xpu.Kernel,
     zeta_split_k: xpu.Kernel,
+    gates_norms_k: xpu.Kernel,
+    pre_q_k: xpu.Kernel,
+    pre_zeta_k: xpu.Kernel,
     conv_kv: xpu.Kernel,
     down_epi: xpu.Kernel,
     router_norm: xpu.Kernel,
@@ -143,12 +182,15 @@ pub const Pipelines = struct {
         var zeta_wide_k = try module.kernel("tf_ink2_zeta_wide", .{ 256, 1, 1 });
         errdefer zeta_wide_k.deinit();
         const zeta_split_k = try module.kernel("tf_ink2_zeta_split", .{ 256, 1, 1 });
+        const gates_norms_k = try module.kernel("tf_ink2_gates_norms", .{ 256, 1, 1 });
+        const pre_q_k = try module.kernel("tf_ink2_fuse_pre_q", .{ 256, 1, 1 });
+        const pre_zeta_k = try module.kernel("tf_ink2_pre_zeta", .{ 256, 1, 1 });
         var conv_kv = try module.kernel("tf_ink2_conv_kv", .{ 256, 1, 1 });
         errdefer conv_kv.deinit();
         var down_epi_k = try module.kernel("tf_ink2_down_epilogue", .{ 256, 1, 1 });
         errdefer down_epi_k.deinit();
         const router_norm = try module.kernel("tf_ink2_router_norm_gemv", .{ 256, 1, 1 });
-        return .{ .pre = pre, .zeta = zeta, .gates = gates, .norms = norms, .router_gemv = router_gemv, .router_pick = router_pick, .conv_attn = conv_attn, .conv_mlp = conv_mlp, .zeta_wide = zeta_wide_k, .zeta_split_k = zeta_split_k, .conv_kv = conv_kv, .down_epi = down_epi_k, .router_norm = router_norm };
+        return .{ .pre = pre, .zeta = zeta, .gates = gates, .norms = norms, .router_gemv = router_gemv, .router_pick = router_pick, .conv_attn = conv_attn, .conv_mlp = conv_mlp, .zeta_wide = zeta_wide_k, .zeta_split_k = zeta_split_k, .gates_norms_k = gates_norms_k, .pre_q_k = pre_q_k, .pre_zeta_k = pre_zeta_k, .conv_kv = conv_kv, .down_epi = down_epi_k, .router_norm = router_norm };
     }
 
     pub fn deinit(p: *Pipelines) void {
@@ -157,6 +199,9 @@ pub const Pipelines = struct {
         p.conv_kv.deinit();
         p.zeta_wide.deinit();
         p.zeta_split_k.deinit();
+        p.gates_norms_k.deinit();
+        p.pre_q_k.deinit();
+        p.pre_zeta_k.deinit();
         p.conv_mlp.deinit();
         p.conv_attn.deinit();
         p.router_pick.deinit();
@@ -230,7 +275,31 @@ pub fn routerWideLaunch(p: *const Pipelines, s: xpu.Stream, x: Ref, weight: Ref,
 pub fn phaseA(p: *const Pipelines, s: xpu.Stream, a: PhaseA) !void {
     const dummy = a.zeta;
     const norm_here: u32 = if (a.roles == 0) a.norm_n else 0;
-    try xpu.launch.dispatch(p.pre, s, .{ a.rows, 1, 1 }, .{
+    if (preZeta() and norm_here == 0 and a.n_queries > 0 and a.queries != null and a.messages != null) {
+        try xpu.launch.dispatch(p.pre_zeta_k, s, .{ 16, a.roles, a.rows }, .{
+            a.p, a.partial, a.blocks, a.queries orelse dummy, a.ar,
+            a.messages orelse dummy, a.down[0], a.down[1], a.down[2], a.zeta,
+            a.rows, a.blocks_stride, a.sources, a.roles, a.local_src, a.core, a.msg_entries,
+        });
+        try xpu.launch.dispatch(p.gates, s, .{ 36, a.roles, a.rows }, .{
+            a.ar, a.messages orelse dummy,
+            a.forget[0], a.forget[1], a.forget[2], a.gain[0], a.gain[1], a.gain[2],
+            a.zeta, a.gated, a.rows, a.roles, a.local_src, a.core, a.msg_entries,
+        });
+        try xpu.launch.dispatch(p.norms, s, .{ a.norm_n, a.rows, 1 }, .{
+            a.gated, a.wq, a.wk orelse a.wq, a.wv orelse a.wq, a.q_norm, a.k_norm orelse a.q_norm, a.v_norm orelse a.q_norm,
+            a.rows, a.norm_n,
+        });
+        return;
+    }
+    if (preQ() and a.n_queries > 0 and a.queries != null and (norm_here == 0 or norm_here == a.n_queries)) {
+        try xpu.launch.dispatch(p.pre_q_k, s, .{ a.n_queries, a.rows, 1 }, .{
+            a.p, a.partial, a.blocks, a.queries orelse dummy, a.ar,
+            a.wq, a.wk orelse a.wq, a.wv orelse a.wq,
+            a.q_norm, a.k_norm orelse a.q_norm, a.v_norm orelse a.q_norm,
+            a.rows, a.blocks_stride, a.sources, a.n_queries, norm_here,
+        });
+    } else try xpu.launch.dispatch(p.pre, s, .{ a.rows, 1, 1 }, .{
         a.p, a.partial, a.blocks, a.queries orelse dummy, a.ar,
         a.wq, a.wk orelse a.wq, a.wv orelse a.wq, a.q_norm, a.k_norm orelse a.q_norm, a.v_norm orelse a.q_norm,
         a.rows, a.blocks_stride, a.sources, a.n_queries, norm_here,
@@ -250,13 +319,23 @@ pub fn phaseA(p: *const Pipelines, s: xpu.Stream, a: PhaseA) !void {
         a.ar, a.messages orelse dummy, a.down[0], a.down[1], a.down[2], a.zeta,
         a.rows, a.roles, a.local_src, a.core, a.msg_entries,
     });
-    try xpu.launch.dispatch(p.gates, s, .{ 36, a.roles, a.rows }, .{
-        a.ar, a.messages orelse dummy,
-        a.forget[0], a.forget[1], a.forget[2], a.gain[0], a.gain[1], a.gain[2],
-        a.zeta, a.gated, a.rows, a.roles, a.local_src, a.core, a.msg_entries,
-    });
-    try xpu.launch.dispatch(p.norms, s, .{ a.norm_n, a.rows, 1 }, .{
-        a.gated, a.wq, a.wk orelse a.wq, a.wv orelse a.wq, a.q_norm, a.k_norm orelse a.q_norm, a.v_norm orelse a.q_norm,
-        a.rows, a.norm_n,
-    });
+    if (gatesNorms()) {
+        try xpu.launch.dispatch(p.gates_norms_k, s, .{ a.roles, a.rows, 1 }, .{
+            a.ar, a.messages orelse dummy,
+            a.forget[0], a.forget[1], a.forget[2], a.gain[0], a.gain[1], a.gain[2],
+            a.zeta, a.gated, a.wq, a.wk orelse a.wq, a.wv orelse a.wq,
+            a.q_norm, a.k_norm orelse a.q_norm, a.v_norm orelse a.q_norm,
+            a.rows, a.roles, a.local_src, a.core, a.msg_entries, a.norm_n,
+        });
+    } else {
+        try xpu.launch.dispatch(p.gates, s, .{ 36, a.roles, a.rows }, .{
+            a.ar, a.messages orelse dummy,
+            a.forget[0], a.forget[1], a.forget[2], a.gain[0], a.gain[1], a.gain[2],
+            a.zeta, a.gated, a.rows, a.roles, a.local_src, a.core, a.msg_entries,
+        });
+        try xpu.launch.dispatch(p.norms, s, .{ a.norm_n, a.rows, 1 }, .{
+            a.gated, a.wq, a.wk orelse a.wq, a.wv orelse a.wq, a.q_norm, a.k_norm orelse a.q_norm, a.v_norm orelse a.q_norm,
+            a.rows, a.norm_n,
+        });
+    }
 }
