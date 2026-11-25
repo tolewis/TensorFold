@@ -12,7 +12,19 @@ pub const Ref = struct {
         return if (r.ptr) |p| @ptrFromInt(@intFromPtr(p) + r.off) else null;
     }
 };
-pub const Cache = struct { k: Ref, v: Ref };
+pub const Cache = struct { k: Ref, v: Ref, ks: Ref, vs: Ref };
+
+/// The K/V cache in int8 with one fp32 scale a head a position, off until it passes the gate.
+pub var kv8_on: bool = false;
+
+pub fn kv8() bool {
+    if (kv8_on) return true;
+    if (std.c.getenv("INK2_KV8")) |p| {
+        const s = std.mem.span(p);
+        return s.len > 0 and s[0] == '1';
+    }
+    return false;
+}
 pub const RowMeta = struct { pos: Ref, seg_of: Ref, segs: Ref };
 
 pub const Error = planning.Error || xpu.Error || error{OutOfMemory};
@@ -83,7 +95,8 @@ pub fn prep(k: *const Kernels, s: xpu.Stream, r: planning.Rows, l: planning.Laye
         raw[0].at(),     raw[1].at(),  raw[2].at(), raw[3].at(),
         scales[0].at(),  scales[1].at(), meta.pos.at(), meta.seg_of.at(),
         meta.segs.at(),  q.at(),       rel.at(),    kv.k.at(),
-        kv.v.at(),       r.heads,      r.kv_heads,  l.ring,
+        kv.v.at(),       kv.k.at(),    kv.v.at(),   kv.ks.at(),   kv.vs.at(),   @intFromBool(kv8()),
+        r.heads,         r.kv_heads,   l.ring,
         @intFromBool(l.tau), c.qk_clip, c.rel_clip, c.floor,
         c.alpha,         c.eps,
     });

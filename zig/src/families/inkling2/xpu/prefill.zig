@@ -202,7 +202,7 @@ const Run = struct {
         const w = &m.weights.layers[v.layer];
         try g.convInputForAttention(cache, v, true);
         try g.convInputForAttention(cache, v, false);
-        const kv = attention.Cache{ .k = sref(cache.keys(v.cache_slot)), .v = sref(cache.values(v.cache_slot)) };
+        const kv = attention.Cache{ .k = sref(cache.keys(v.cache_slot)), .v = sref(cache.values(v.cache_slot)), .ks = sref(cache.keyScales(v.cache_slot)), .vs = sref(cache.valueScales(v.cache_slot)) };
         const k = &g.p.attention;
         const prep = ap.Prep{ .qk_clip = m.config.text.qk_clip, .rel_clip = m.config.text.rel_clip, .floor = @floatFromInt(m.config.text.log_floor), .alpha = m.config.text.log_alpha, .eps = m.config.text.eps };
         const layer = cache.attentionLayer(&m.weight_plan, v.cache_slot, state.max_rows);
@@ -216,7 +216,7 @@ const Run = struct {
         var into = kv;
         var prep_layer = layer;
         if (sliding) {
-            into = .{ .k = aref(s.kstage, 0), .v = aref(s.vstage, 0) };
+            into = .{ .k = aref(s.kstage, 0), .v = aref(s.vstage, 0), .ks = kv.ks, .vs = kv.vs };
             prep_layer.ring = stage;
             const history = @min(start, layer.window - 1);
             try pk.kvCopy(&g.p.prefill, g.s, kv.k.at(), into.k.at(), start - history, layer.ring, stage, history, 8);
@@ -259,7 +259,7 @@ const Run = struct {
         const s = g.sc;
         const m = g.m;
         const w = &m.weights.layers[v.layer];
-        const kv = attention.Cache{ .k = sref(cache.keys(v.cache_slot)), .v = sref(cache.values(v.cache_slot)) };
+        const kv = attention.Cache{ .k = sref(cache.keys(v.cache_slot)), .v = sref(cache.values(v.cache_slot)), .ks = sref(cache.keyScales(v.cache_slot)), .vs = sref(cache.valueScales(v.cache_slot)) };
         const k = &g.p.attention;
         const prep = ap.Prep{ .qk_clip = m.config.text.qk_clip, .rel_clip = m.config.text.rel_clip, .floor = @floatFromInt(m.config.text.log_floor), .alpha = m.config.text.log_alpha, .eps = m.config.text.eps };
         var base: usize = 0;

@@ -399,9 +399,9 @@ pub const Probe = struct {
             try p.rig.put(p.out[2], zeros);
             try p.rig.put(p.out[3], zeros);
             const raw = [4]attn.Ref{ ref(p.refs[0]), ref(p.refs[1]), ref(p.refs[2]), ref(p.refs[3]) };
-            try attn.prep(&p.k, s, r, p.layer, .{}, meta, raw, .{ ref(p.refs[4]), ref(p.refs[5]) }, ref(p.out[0]), ref(p.out[1]), .{ .k = ref(p.out[2]), .v = ref(p.out[3]) });
+            try attn.prep(&p.k, s, r, p.layer, .{}, meta, raw, .{ ref(p.refs[4]), ref(p.refs[5]) }, ref(p.out[0]), ref(p.out[1]), .{ .k = ref(p.out[2]), .v = ref(p.out[3]), .ks = ref(p.out[2]), .vs = ref(p.out[3]) });
         } else {
-            const kv: attn.Cache = .{ .k = ref(p.refs[1]), .v = ref(p.refs[2]) };
+            const kv: attn.Cache = .{ .k = ref(p.refs[1]), .v = ref(p.refs[2]), .ks = ref(p.refs[1]), .vs = ref(p.refs[2]) };
             if (p.which == .prompt and rows <= plan.split_rows) {
                 // the plan sends few rows to the decode kernel; the contract runs the prompt kernel at them too
                 try attn.attendAs(&p.k, s, .prompt, r, p.layer, p.stride, meta, ref(p.refs[0]), kv, ref(p.refs[3]), ref(p.po), ref(p.pml), ref(p.refs[4]), ref(p.refs[5]), ref(p.out[0]));

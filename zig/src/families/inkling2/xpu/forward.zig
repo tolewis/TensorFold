@@ -250,7 +250,7 @@ const Run = struct {
                 .seg_of = aref(s.seg_of, base * 4),
                 .segs = aref(s.segs, si * @sizeOf(ap.Seg)),
             };
-            const kv = attention.Cache{ .k = sref(cache.keys(v.cache_slot)), .v = sref(cache.values(v.cache_slot)) };
+            const kv = attention.Cache{ .k = sref(cache.keys(v.cache_slot)), .v = sref(cache.values(v.cache_slot)), .ks = sref(cache.keyScales(v.cache_slot)), .vs = sref(cache.valueScales(v.cache_slot)) };
             const both_static = switch (w.attn.k_conv) {
                 .static => switch (w.attn.v_conv) {
                     .static => true,

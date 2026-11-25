@@ -93,7 +93,7 @@ fn argsOf(planted: []const u8) u32 {
         .{ "tf_ink2_attention_partial", 6 },
         .{ "tf_ink2_mlp_partial", 5 },
         .{ "tf_ink2_capture_tap", 4 },
-        .{ "tf_ink2_prep", 22 },
+        .{ "tf_ink2_prep", 27 },
         .{ "tf_ink2_rel_table", 3 },
         .{ "tf_ink2_attn_decode", 17 },
         .{ "tf_ink2_merge", 12 },

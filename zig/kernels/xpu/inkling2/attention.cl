@@ -36,12 +36,19 @@ static inline float sum8(float8 x) {
 }
 
 static inline float8 bf2f8(ushort8 h) { return as_float8(convert_uint8(h) << 16); }
+static inline float8 abs8(float8 v) {
+  return (float8)(fabs(v.s0), fabs(v.s1), fabs(v.s2), fabs(v.s3), fabs(v.s4), fabs(v.s5), fabs(v.s6), fabs(v.s7));
+}
+static inline float max8(float8 v) {
+  return fmax(fmax(fmax(v.s0, v.s1), fmax(v.s2, v.s3)), fmax(fmax(v.s4, v.s5), fmax(v.s6, v.s7)));
+}
 
 // One sub-group a (row, projection unit). Units 0 .. heads - 1 are query heads (q and the relative taps), then the K
 // heads, then the V heads. Independent q, k, v and relative rows keep their first bf16 rounding.
 KERNEL(16) void tf_ink2_prep(global const ushort *q_raw, global const ushort *k_raw, global const ushort *v_raw, global const ushort *rel_raw,
                              global const ushort *q_scale, global const ushort *rel_scale, global const int *rpos, global const int *rseg,
                              global const InkSeg *segs, global ushort *q_out, global ushort *rel_out, global ushort *kc, global ushort *vc,
+                             global uchar *kc8, global uchar *vc8, global float *ks8, global float *vs8, uint kv8,
                              uint heads, uint kv_heads, uint ring, uint is_global, float qk_clip, float rel_clip, float floor_pos,
                              float alpha, float eps) {
   const uint row = get_group_id(0), unit = get_group_id(1), lane = get_sub_group_local_id(), pos = (uint)rpos[row];
@@ -80,8 +87,27 @@ KERNEL(16) void tf_ink2_prep(global const ushort *q_raw, global const ushort *k_
   const float ss = sub_group_reduce_add(sum8(x));
   const float scale = key ? clip_factor(ss, qk_clip) : rsqrt(ss / (float)D + eps);
   const InkSeg s = segs[rseg[row]];
-  global ushort *dst = (key ? kc : vc) + s.off + ((size_t)h * ring + pos % ring) * D;
   const float8 y = x * scale;
+  const size_t at = (size_t)s.off + ((size_t)h * ring + pos % ring) * D;
+  if (kv8) {
+    // Symmetric int8: one fp32 scale a head a position, the amax over the head's 128 dims.
+    const float amax = sub_group_reduce_max(max8(abs8(y)));
+    const float qs = amax > 0.0f ? amax / 127.0f : 1.0f;
+    const float8 q = y * (1.0f / qs);
+    uchar8 c;
+    c.s0 = (uchar)(char)clamp(round(q.s0), -127.0f, 127.0f);
+    c.s1 = (uchar)(char)clamp(round(q.s1), -127.0f, 127.0f);
+    c.s2 = (uchar)(char)clamp(round(q.s2), -127.0f, 127.0f);
+    c.s3 = (uchar)(char)clamp(round(q.s3), -127.0f, 127.0f);
+    c.s4 = (uchar)(char)clamp(round(q.s4), -127.0f, 127.0f);
+    c.s5 = (uchar)(char)clamp(round(q.s5), -127.0f, 127.0f);
+    c.s6 = (uchar)(char)clamp(round(q.s6), -127.0f, 127.0f);
+    c.s7 = (uchar)(char)clamp(round(q.s7), -127.0f, 127.0f);
+    vstore8(c, 0, (key ? kc8 : vc8) + at + lane * 8);
+    if (lane == 0) (key ? ks8 : vs8)[(size_t)s.off / D + (size_t)h * ring + pos % ring] = qs;
+    return;
+  }
+  global ushort *dst = (key ? kc : vc) + at;
   ushort8 o;
   o.s0 = f2bf(y.s0); o.s1 = f2bf(y.s1); o.s2 = f2bf(y.s2); o.s3 = f2bf(y.s3);
   o.s4 = f2bf(y.s4); o.s5 = f2bf(y.s5); o.s6 = f2bf(y.s6); o.s7 = f2bf(y.s7);
