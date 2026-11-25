@@ -51,13 +51,13 @@ pub const runtime = [_]Entry{
 /// prefill.cl's row-batched kernels. The edits break only the kernel they sit in.
 pub const prefill = [_]Entry{
     .{ .symbol = "tf_ink2_pf_copy_rows", .from = "y[(ulong)r * ldy + i] = x[(ulong)r * ldx + i];", .to = "y[(ulong)r * ldy + i] = x[(ulong)r * ldx + (i ^ 1u)];" },
-    .{ .symbol = "tf_ink2_pf_perm", .from = "+ 2 * l + (s & 1)];", .to = "+ 2 * l + (1u - (s & 1))];" },
+    .{ .symbol = "tf_ink2_pf_perm", .from = "x[(ulong)row * k + plane * 256 + (s >> 1) * 32 + 2 * l + (s & 1)];", .to = "x[(ulong)row * k + plane * 256 + (s >> 1) * 32 + 2 * l + (1u - (s & 1))];" },
     .{ .symbol = "tf_ink2_pf_kv_copy", .from = "vstore8(v, 0, dst + ((ulong)h * dst_ring + p % dst_ring) * PF_D + lane * 8);", .to = "vstore8(v, 0, dst + ((ulong)h * dst_ring + p % src_ring) * PF_D + lane * 8);" },
     .{ .symbol = "tf_ink2_pf_conv_static", .from = "const float4 q = sum / PF_SQRT5;", .to = "const float4 q = sum;" },
     .{ .symbol = "tf_ink2_pf_router", .from = "keys[r][t] = scores[r][t] + bias[t];", .to = "keys[r][t] = scores[r][t];" },
     .{ .symbol = "tf_ink2_pf_ar", .from = "weights[s] = dot * PF_AR_SCALE;", .to = "weights[s] = dot;" },
     .{ .symbol = "tf_ink2_pf_dense", .from = "float part = as_float(wv.x << 16) * as_float(xv.x << 16);", .to = "float part = as_float(wv.x << 16) * as_float(xv.x & 0xffff0000u);" },
-    .{ .symbol = "tf_ink2_pf_messages", .from = "const float l0 = pf_group_sum(dot0, red) * PF_AR_SCALE;", .to = "const float l0 = pf_group_sum(dot0, red);" },
+    .{ .symbol = "tf_ink2_pf_messages", .from = "\n  const float l0 = pf_group_sum(dot0, red) * PF_AR_SCALE;", .to = "\n  const float l0 = pf_group_sum(dot0, red);" },
     .{ .symbol = "tf_ink2_pf_rel_table", .from = "acc += bf2f(rr[j]) * pj[j];", .to = "acc += bf2f(rr[15 - j]) * pj[j];" },
 };
 
