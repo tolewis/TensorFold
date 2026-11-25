@@ -153,7 +153,15 @@ fn inklingAnswer(a: Allocator, tail: []const u8, finished: bool) Allocator.Error
         if (std.mem.startsWith(u8, tail[pos..], eos)) break;
         if (!std.mem.startsWith(u8, tail[pos..], model)) {
             if (!finished and std.mem.startsWith(u8, model, tail[pos..])) break;
-            try out.appendSlice(a, tail[pos..]); // prose outside a message is kept
+            // the prompt prefilled the answer message: its text ends where the message does
+            const rest = tail[pos..];
+            const cut = find(rest, end) orelse find(rest, eos);
+            if (cut) |n| {
+                try out.appendSlice(a, rest[0..n]);
+            } else {
+                const keep = if (finished) rest.len else rest.len - @max(partialTag(rest, end), partialTag(rest, eos));
+                try out.appendSlice(a, rest[0..keep]);
+            }
             break;
         }
         pos += model.len;
