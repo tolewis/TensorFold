@@ -21,8 +21,15 @@ fn verifyNow() u64 {
 
 pub const Options = struct { capacity: usize, streams: u32 = 4, budget: u64 };
 const ring = 4096;
-/// The forward serves the K/V rows as bf16 (an int8 cache is refused there), so every cache is bf16.
-const kv: st.KvDtype = .bf16;
+/// The forward serves the K/V rows as bf16 (an int8 cache is refused there by name), so every cache is bf16 unless
+/// INK2_KV8 asks for int8, in which case the guards refuse it until the readers and writers are all wired.
+fn kvDtype() st.KvDtype {
+    if (std.c.getenv("INK2_KV8")) |p| {
+        const s = std.mem.span(p);
+        if (s.len > 0 and s[0] == '1') return .int8;
+    }
+    return .bf16;
+}
 
 /// The prompt cache gets the bytes left by live streams and never evicts the state being restored.
 pub const Room = struct { ctx: *anyopaque, fit: *const fn (ctx: *anyopaque, bytes: u64, restoring: ?*anyopaque, prompt: []const u32) void };
@@ -37,7 +44,7 @@ pub fn validateTaps(c: *const cfg.Config, taps: []const u32) !void {
 
 /// Device bytes of one stream's state for `positions` tokens (prompt plus reply).
 pub fn streamBytes(positions: usize) u64 {
-    return st.cacheBytes(positions, kv);
+    return st.cacheBytes(positions, kvDtype());
 }
 
 /// Device bytes the backend's scratch holds for good, for a context of `capacity` positions.
@@ -105,7 +112,7 @@ pub const Xpu = struct {
     pub fn createCache(self: *Xpu, capacity: usize) !*st.Cache {
         const cache = try self.gpa.create(st.Cache);
         errdefer self.gpa.destroy(cache);
-        cache.* = try st.Cache.init(self.model.r, capacity, &self.model.weight_plan, kv);
+        cache.* = try st.Cache.init(self.model.r, capacity, &self.model.weight_plan, kvDtype());
         return cache;
     }
 
@@ -292,7 +299,7 @@ pub const Xpu = struct {
 
     /// One prompt chunk and one window through every kernel, so the first request pays for neither.
     pub fn warm(self: *Xpu) !void {
-        var cache = try st.Cache.init(self.model.r, st.prompt_rows + st.window_rows, &self.model.weight_plan, kv);
+        var cache = try st.Cache.init(self.model.r, st.prompt_rows + st.window_rows, &self.model.weight_plan, kvDtype());
         defer cache.deinit();
         var ids: [st.prompt_rows]u32 = undefined;
         for (&ids, 0..) |*t, i| t.* = @intCast(1000 + i * 37 % 20000);
@@ -496,7 +503,7 @@ pub const Xpu = struct {
 
     pub fn snapBytes(ptr: *anyopaque, at: u32) u64 {
         _ = ptr;
-        return snapshot.bytes(at, kv);
+        return snapshot.bytes(at, kvDtype());
     }
 
     pub fn snapSave(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
