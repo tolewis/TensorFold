@@ -866,6 +866,23 @@ fn verifyBits(gpa: std.mem.Allocator, io: std.Io, m: *const ink.model.Model, scr
     const from = prefix;
     const plain = try gpa.alloc(f32, n * vocab);
     defer gpa.free(plain);
+    const row_bytes = state.kv_width * 2;
+    const kv_bytes = n * row_bytes;
+    const pk = try gpa.alloc(u8, kv_bytes);
+    defer gpa.free(pk);
+    const pv = try gpa.alloc(u8, kv_bytes);
+    defer gpa.free(pv);
+    const wk = try gpa.alloc(u8, kv_bytes);
+    defer gpa.free(wk);
+    const wv = try gpa.alloc(u8, kv_bytes);
+    defer gpa.free(wv);
+    const att_row = state.hidden * 4;
+    const patt = try gpa.alloc(u8, n * att_row);
+    defer gpa.free(patt);
+    const watt = try gpa.alloc(u8, n * att_row);
+    defer gpa.free(watt);
+    const vv = try gpa.alloc(u8, 1);
+    defer gpa.free(vv);
     var i: usize = 0;
     while (i < n) : (i += 1) {
         cache.len = from + i;
@@ -873,27 +890,73 @@ fn verifyBits(gpa: std.mem.Allocator, io: std.Io, m: *const ink.model.Model, scr
         try ink.forward.runShared(m, scratch, &.{.{ .cache = cache, .rows = 1 }}, ids[from + i ..][0..1], .{});
         try r.download(std.mem.sliceAsBytes(plain[i * vocab ..][0..vocab]), cache.logits);
         try r.sync();
+        try grab(r, cache, 0, 0, patt[i * att_row ..][0..att_row], vv[0..0]);
         try cache.rollback();
     }
+    try grab(r, cache, 0, from, pk, pv);
     cache.len = from;
     try cache.begin(n);
     try ink.forward.runShared(m, scratch, &.{.{ .cache = cache, .rows = n }}, ids[from..][0..n], .{ .all = true, .taps = scratch.taps.?.ptr });
     try r.download(std.mem.sliceAsBytes(host[0 .. n * vocab]), scratch.logits_all);
     try r.sync();
+    try grab(r, cache, 0, from, wk, wv);
+    try grabAtt(r, scratch, watt, n);
     try cache.rollback();
     var diff: usize = 0;
     var worst: f64 = 0;
     var first_at: usize = 0;
+    var per_row: [8]usize = @splat(0);
     for (0..n) |row| for (0..vocab) |j| {
         const a = plain[row * vocab + j];
         const b = host[row * vocab + j];
         if (@as(u32, @bitCast(a)) != @as(u32, @bitCast(b))) {
             if (diff == 0) first_at = row * vocab + j;
             diff += 1;
+            per_row[row] += 1;
             worst = @max(worst, @abs(@as(f64, a) - @as(f64, b)));
         }
     };
     std.debug.print("\nVERIFY BITS: {d} of {d} logits differ from plain decode at the same position (first at {d}, worst {e:.6})\n", .{ diff, n * vocab, first_at, worst });
+    std.debug.print("VERIFY BITS per row: {d} {d} {d} {d} {d} {d} {d} {d}\n", .{ per_row[0], per_row[1], per_row[2], per_row[3], per_row[4], per_row[5], per_row[6], per_row[7] });
+    var kd: usize = 0;
+    var vd: usize = 0;
+    var krow: usize = 0;
+    var vrow: usize = 0;
+    for (0..kv_bytes) |b| {
+        if (pk[b] != wk[b]) {
+            if (kd == 0) krow = b / row_bytes;
+            kd += 1;
+        }
+        if (pv[b] != wv[b]) {
+            if (vd == 0) vrow = b / row_bytes;
+            vd += 1;
+        }
+    }
+    std.debug.print("VERIFY KV: {d} of {d} K bytes and {d} of {d} V bytes differ (first K row {d}, first V row {d})\n", .{ kd, kv_bytes, vd, kv_bytes, krow, vrow });
+    var ad: usize = 0;
+    var arow: usize = 0;
+    for (0..n * att_row) |b| {
+        if (patt[b] != watt[b]) {
+            if (ad == 0) arow = b / att_row;
+            ad += 1;
+        }
+    }
+    std.debug.print("VERIFY ATT: {d} of {d} attention bytes differ (first row {d})\n", .{ ad, n * att_row, arow });
+}
+
+fn grabAtt(r: *xpu.rt.Runtime, scratch: *state.Scratch, out: []u8, n: usize) !void {
+    const row = state.hidden * 4;
+    const b = xpu.rt.Buffer{ .rt = r, .ptr = scratch.att.ptr, .len = n * row };
+    try r.download(out, b);
+}
+
+fn grab(r: *xpu.rt.Runtime, cache: *state.Cache, slot: usize, from: usize, k: []u8, v: []u8) !void {
+    const kref = cache.keys(slot);
+    const vref = cache.values(slot);
+    const kb = xpu.rt.Buffer{ .rt = r, .ptr = @ptrFromInt(@intFromPtr(kref.buf.ptr.?) + kref.off + from * state.kv_width * 2), .len = k.len };
+    const vb = xpu.rt.Buffer{ .rt = r, .ptr = @ptrFromInt(@intFromPtr(vref.buf.ptr.?) + vref.off + from * state.kv_width * 2), .len = v.len };
+    try r.download(k, kb);
+    try r.download(v, vb);
 }
 
 /// The distinct experts a window of n real rows reads in a visit, averaged over the visits of the same precision and over
