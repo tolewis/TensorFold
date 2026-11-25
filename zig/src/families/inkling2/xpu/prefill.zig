@@ -406,7 +406,7 @@ const Run = struct {
         const sp = seqpar(g, rows);
         const hb = sp.base * state.hidden * 2;
         const bb = sp.base * state.block_slots * state.hidden * 2;
-        const pb = sp.base * @as(usize, g.s.stride) * 2;
+        const pb = sp.base * @as(usize, g.sc.stride) * 2;
         const rb = sp.base * 8;
         if (g.m.options.place.split()) if (group.live) |gp| {
             if (sp.seq) try gp.reduceScatterRows(at(s.attn_dense, 0).?, @intCast(rows), state.hidden * 2) else try gp.allReduce(at(s.attn_dense, 0).?, @intCast(rows));
