@@ -223,6 +223,12 @@ pub const Xpu = struct {
     fn feed(self: *Xpu, cache: *st.Cache, ids: []const u32, stream: ?*lanes.Stream) !void {
         const r = self.model.r;
         const base = cache.len;
+        // A request that starts at position 0 must not read the previous request's convolution history. The cache is
+        // zeroed once at creation, so clear the history here.
+        if (base == 0) {
+            try st.zero(r, cache.conv, st.conv_bytes);
+            try r.sync();
+        }
         var at: usize = 0;
         while (at < ids.len) {
             var end = @min(ids.len, at + st.prompt_rows);
