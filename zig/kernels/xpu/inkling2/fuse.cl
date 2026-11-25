@@ -224,6 +224,162 @@ KERNEL(256) void tf_ink2_zeta_wide(
   if (lane == 0) zeta[pack4 ? ((size_t)row * 4 + role) * RANK + r : (size_t)row * RANK + r] = FUSE_ZETA(dot);
 }
 
+// Grid (16, roles, rows). The prologue's AR for the group's source row, then the message gate projection over four
+// sub-groups a rank. The AR is the code of tf_ink2_fuse_pre_q, run by every group, so the bits do not move.
+KERNEL(256) void tf_ink2_pre_zeta(
+    global const ushort *p, global float *partial, global const ushort *blocks, global const float *queries, global float *ar,
+    global const float *messages, global const ushort *down0, global const ushort *down1, global const ushort *down2,
+    global float *zeta, uint rows, uint blocks_stride, uint sources, uint roles, uint local_src, uint core, uint msg_entries) {
+  const uint g = get_group_id(0), role = get_group_id(1), row = get_group_id(2);
+  const uint t = get_local_id(0), lane = get_sub_group_local_id(), sg = get_sub_group_id();
+  if (row >= rows || role >= roles || g >= 16 || sources == 0 || sources > 5) return;
+  const uint src = local_src ? 0 : role;
+  const uint r = g * 4 + (sg >> 2), part = sg & 3u;
+  local float red[160];
+  local float parts[16];
+  local ushort normalized[2 * H];
+  global const ushort *pb = p + (size_t)row * H;
+  global float *part_row = partial + (size_t)row * H;
+  for (uint d = t; d < H; d += 256) part_row[d] = bf2f(pb[d]);
+  for (uint i = t; i < 160; i += 256) red[i] = 0.0f;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  global const ushort *blk = blocks + (size_t)row * blocks_stride;
+  float v[5][H / 256];
+  for (uint s = 0; s < 5; ++s)
+    for (uint i = 0; i < H / 256; ++i)
+      v[s][i] = s < sources ? (s + 1 == sources ? part_row[t + 256 * i] : bf2f(blk[(size_t)s * H + t + 256 * i])) : 0.0f;
+  float means[5];
+  for (uint s = 0; s < 5; ++s) {
+    float ss = 0.0f;
+    for (uint i = 0; i < H / 256; ++i) ss += v[s][i] * v[s][i];
+    const float reduced = sub_group_reduce_add(ss);
+    if (s < sources && lane == 0) red[s * 16 + sg] = reduced;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (uint s = 0; s < 5; ++s) {
+    float ss = 0.0f;
+    for (uint j = 0; j < 16; ++j) ss += red[s * 16 + j];
+    means[s] = rsqrt(ss / 2304.0f + EPS);
+  }
+  float query[H / 256];
+  for (uint i = 0; i < H / 256; ++i) query[i] = queries[(size_t)src * H + t + 256 * i];
+  local float *dots = red + 80;
+  for (uint s = 0; s < 5; ++s) {
+    float dot = 0.0f;
+    for (uint i = 0; i < H / 256; ++i) dot += query[i] * (v[s][i] * means[s]);
+    const float reduced = sub_group_reduce_add(dot);
+    if (s < sources && lane == 0) dots[s * 16 + sg] = reduced;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float weights[5];
+  float peak = -INFINITY;
+  for (uint s = 0; s < 5; ++s) {
+    float dot = 0.0f;
+    for (uint j = 0; j < 16; ++j) dot += dots[s * 16 + j];
+    weights[s] = dot * FUSE_AR_SCALE;
+    if (s < sources) peak = peak < weights[s] ? weights[s] : peak;
+  }
+  float den = 0.0f;
+  for (uint s = 0; s < 5; ++s) {
+    weights[s] = exp(weights[s] - peak);
+    if (s < sources) den += weights[s];
+  }
+  for (uint s = 0; s < 5; ++s) weights[s] = weights[s] / den;
+  float hv[H / 256];
+  for (uint i = 0; i < H / 256; ++i) {
+    float acc = 0.0f;
+    for (uint s = 0; s < 5; ++s)
+      if (s < sources) acc += weights[s] * (v[s][i] * means[s]);
+    hv[i] = FUSE_PRE(acc);
+    ar[((size_t)src * rows + row) * H + t + 256 * i] = hv[i];
+  }
+  barrier(CLK_GLOBAL_MEM_FENCE);
+  global const float *m = messages + ((size_t)row * msg_entries + core * 4 + role) * H;
+  float mv[H / 256];
+  float ss1 = 0.0f, ss0 = 0.0f;
+  for (uint i = 0; i < H / 256; ++i) {
+    mv[i] = m[t + 256 * i];
+    ss1 += mv[i] * mv[i];
+    ss0 += hv[i] * hv[i];
+  }
+  const float inv0 = 1.0f / sqrt(wg_sum(ss0, red) / 2304.0f + EPS);
+  const float inv1 = 1.0f / sqrt(wg_sum(ss1, red) / 2304.0f + EPS);
+  for (uint i = 0; i < H / 256; ++i) {
+    normalized[t + 256 * i] = f2bf(hv[i] * inv0);
+    normalized[H + t + 256 * i] = f2bf(mv[i] * inv1);
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  global const ushort *down = role == 0 ? down0 : role == 1 ? down1 : down2;
+  global const ushort *dr = down + (size_t)r * (2 * H);
+  float dot = 0.0f;
+  for (uint d = 8 * lane + 128 * part; d < 2 * H; d += 512) {
+    const ushort8 w0 = vload8(0, dr + d);
+    const ushort8 x0 = vload8(0, normalized + d);
+    for (int j = 0; j < 8; ++j) dot += bf2f(w0[j]) * bf2f(x0[j]);
+  }
+  dot = sub_group_reduce_add(dot);
+  if (lane == 0) parts[sg] = dot;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (sg == (sg & ~3u) && lane == 0) {
+    float total = parts[sg];
+    total += parts[sg + 1];
+    total += parts[sg + 2];
+    total += parts[sg + 3];
+    zeta[((size_t)row * 4 + role) * RANK + r] = FUSE_ZETA(total);
+  }
+}
+
+// Grid (16, roles, rows). Four sub-groups a rank, each over one of the four 128-term blocks of a step, so 256 sub-groups
+// a call instead of 64. The four partial dots are summed in SLM, in sub-group order, and stored once.
+KERNEL(256) void tf_ink2_zeta_split(
+    global const float *ar, global const float *messages, global const ushort *down0, global const ushort *down1,
+    global const ushort *down2, global float *zeta, uint rows, uint roles, uint local_src, uint core, uint msg_entries,
+    uint pack4) {
+  const uint g = get_group_id(0), role = get_group_id(1), row = get_group_id(2);
+  if (row >= rows || role >= roles || g >= 16) return;
+  const uint t = get_local_id(0), lane = get_sub_group_local_id(), sg = get_sub_group_id();
+  const uint r = g * 4 + (sg >> 2), part = sg & 3u;
+  local float red[16];
+  local float parts[16];
+  local ushort normalized[2 * H];
+  const uint src = local_src ? 0 : role;
+  global const float *h = ar + ((size_t)src * rows + row) * H;
+  global const float *m = messages + ((size_t)row * msg_entries + core * 4 + role) * H;
+  global const ushort *down = role == 0 ? down0 : role == 1 ? down1 : down2;
+  float hv[H / 256], mv[H / 256];
+  float ss0 = 0.0f, ss1 = 0.0f;
+  for (uint i = 0; i < H / 256; ++i) {
+    hv[i] = h[t + 256 * i];
+    mv[i] = m[t + 256 * i];
+    ss0 += hv[i] * hv[i];
+    ss1 += mv[i] * mv[i];
+  }
+  const float inv0 = 1.0f / sqrt(wg_sum(ss0, red) / 2304.0f + EPS);
+  const float inv1 = 1.0f / sqrt(wg_sum(ss1, red) / 2304.0f + EPS);
+  for (uint i = 0; i < H / 256; ++i) {
+    normalized[t + 256 * i] = f2bf(hv[i] * inv0);
+    normalized[H + t + 256 * i] = f2bf(mv[i] * inv1);
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  global const ushort *dr = down + (size_t)r * (2 * H);
+  float dot = 0.0f;
+  for (uint d = 8 * lane + 128 * part; d < 2 * H; d += 512) {
+    const ushort8 w0 = vload8(0, dr + d);
+    const ushort8 x0 = vload8(0, normalized + d);
+    for (int j = 0; j < 8; ++j) dot += bf2f(w0[j]) * bf2f(x0[j]);
+  }
+  dot = sub_group_reduce_add(dot);
+  if (lane == 0) parts[sg] = dot;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (sg == (sg & ~3u) && lane == 0) {
+    float total = parts[sg];
+    total += parts[sg + 1];
+    total += parts[sg + 2];
+    total += parts[sg + 3];
+    zeta[pack4 ? ((size_t)row * 4 + role) * RANK + r : (size_t)row * RANK + r] = FUSE_ZETA(total);
+  }
+}
+
 // Grid (36, roles, rows). One work-item one channel, the same 64-term order as tf_inkling2_loop_gates.
 KERNEL(64) void tf_ink2_fuse_gates(
     global const float *ar, global const float *messages, global const ushort *forget0, global const ushort *forget1,
@@ -259,6 +415,51 @@ KERNEL(64) void tf_ink2_fuse_gates(
   gated[((size_t)role * rows + row) * H + d] = left + right;
 }
 
+// Grid (roles, rows). One group a gated row: every channel of the row in the group, so the norm of the row follows in
+// the same group. The per-channel mix is the gates kernel's, and do_norm keeps its 256-thread order, so the bits do not move.
+KERNEL(256) void tf_ink2_gates_norms(
+    global const float *ar, global const float *messages, global const ushort *forget0, global const ushort *forget1,
+    global const ushort *forget2, global const ushort *gain0, global const ushort *gain1, global const ushort *gain2,
+    global const float *zeta, global float *gated, global const ushort *wq, global const ushort *wk, global const ushort *wv,
+    global ushort *q_norm, global ushort *k_norm, global ushort *v_norm,
+    uint rows, uint roles, uint local_src, uint core, uint msg_entries, uint norm_n) {
+  const uint role = get_group_id(0), row = get_group_id(1), t = get_local_id(0);
+  if (row >= rows || role >= roles) return;
+  local float z[RANK];
+  local float red[16];
+  if (t < RANK) z[t] = zeta[((size_t)row * 4 + role) * RANK + t];
+  const uint src = local_src ? 0 : role;
+  global const float *h = ar + ((size_t)src * rows + row) * H;
+  global const float *m = messages + ((size_t)row * msg_entries + core * 4 + role) * H;
+  global const ushort *forget = role == 0 ? forget0 : role == 1 ? forget1 : forget2;
+  global const ushort *gain = role == 0 ? gain0 : role == 1 ? gain1 : gain2;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (uint d = t; d < H; d += 256) {
+    ushort8 fw[RANK / 8], gw[RANK / 8];
+    for (uint r = 0; r < RANK / 8; ++r) {
+      fw[r] = vload8(0, forget + (size_t)d * RANK + 8 * r);
+      gw[r] = vload8(0, gain + (size_t)d * RANK + 8 * r);
+    }
+    float fdot = 0.0f, gdot = 0.0f;
+    for (uint r = 0; r < RANK / 8; ++r)
+      for (int j = 0; j < 8; ++j) {
+        fdot += bf2f(fw[r][j]) * z[8 * r + j];
+        gdot += bf2f(gw[r][j]) * z[8 * r + j];
+      }
+    const float f = tanh(fdot);
+    const float g = tanh(gdot);
+    const float keep = 1.0f - f;
+    const float left = keep * h[d];
+    const float right = FUSE_GATE * g * m[d];
+    gated[((size_t)role * rows + row) * H + d] = left + right;
+  }
+  barrier(CLK_GLOBAL_MEM_FENCE);
+  if (role >= norm_n) return;
+  global const ushort *w = role == 0 ? wq : role == 1 ? wk : wv;
+  global ushort *out = (role == 0 ? q_norm : role == 1 ? k_norm : v_norm) + (size_t)row * H;
+  do_norm(gated + ((size_t)role * rows + row) * H, w, out, t, red);
+}
+
 // Grid (norm_n, rows). The three gated rows, one group each.
 KERNEL(256) void tf_ink2_fuse_norms(
     global const float *gated, global const ushort *wq, global const ushort *wk, global const ushort *wv,
@@ -270,6 +471,77 @@ KERNEL(256) void tf_ink2_fuse_norms(
   global const ushort *w = which == 0 ? wq : which == 1 ? wk : wv;
   global ushort *out = (which == 0 ? q_norm : which == 1 ? k_norm : v_norm) + (size_t)row * H;
   do_norm(x, w, out, t, red);
+}
+
+// Grid (n_queries, rows). One group a query row: the same AR as tf_ink2_fuse_pre, whose query rows ran in a loop in one
+// group. The source means are recomputed by each group, the same code and the same order, so the bits do not move.
+KERNEL(256) void tf_ink2_fuse_pre_q(
+    global const ushort *p, global float *partial, global const ushort *blocks, global const float *queries, global float *ar,
+    global const ushort *wq, global const ushort *wk, global const ushort *wv,
+    global ushort *q_norm, global ushort *k_norm, global ushort *v_norm,
+    uint rows, uint blocks_stride, uint sources, uint n_queries, uint norm_n) {
+  const uint q = get_group_id(0), row = get_group_id(1), t = get_local_id(0), lane = get_sub_group_local_id(), sg = get_sub_group_id();
+  if (row >= rows || q >= n_queries || sources == 0 || sources > 5) return;
+  local float red[160];
+  global const ushort *pb = p + (size_t)row * H;
+  global float *part = partial + (size_t)row * H;
+  for (uint d = t; d < H; d += 256) part[d] = bf2f(pb[d]);
+  for (uint i = t; i < 160; i += 256) red[i] = 0.0f;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  global const ushort *blk = blocks + (size_t)row * blocks_stride;
+  float v[5][H / 256];
+  for (uint s = 0; s < 5; ++s)
+    for (uint i = 0; i < H / 256; ++i)
+      v[s][i] = s < sources ? (s + 1 == sources ? part[t + 256 * i] : bf2f(blk[(size_t)s * H + t + 256 * i])) : 0.0f;
+  float means[5];
+  for (uint s = 0; s < 5; ++s) {
+    float ss = 0.0f;
+    for (uint i = 0; i < H / 256; ++i) ss += v[s][i] * v[s][i];
+    const float reduced = sub_group_reduce_add(ss);
+    if (s < sources && lane == 0) red[s * 16 + sg] = reduced;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (uint s = 0; s < 5; ++s) {
+    float ss = 0.0f;
+    for (uint j = 0; j < 16; ++j) ss += red[s * 16 + j];
+    means[s] = rsqrt(ss / 2304.0f + EPS);
+  }
+  float query[H / 256];
+  for (uint i = 0; i < H / 256; ++i) query[i] = queries[(size_t)q * H + t + 256 * i];
+  local float *dots = red + 80;
+  for (uint s = 0; s < 5; ++s) {
+    float dot = 0.0f;
+    for (uint i = 0; i < H / 256; ++i) dot += query[i] * (v[s][i] * means[s]);
+    const float reduced = sub_group_reduce_add(dot);
+    if (s < sources && lane == 0) dots[s * 16 + sg] = reduced;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float weights[5];
+  float peak = -INFINITY;
+  for (uint s = 0; s < 5; ++s) {
+    float dot = 0.0f;
+    for (uint j = 0; j < 16; ++j) dot += dots[s * 16 + j];
+    weights[s] = dot * FUSE_AR_SCALE;
+    if (s < sources) peak = peak < weights[s] ? weights[s] : peak;
+  }
+  float den = 0.0f;
+  for (uint s = 0; s < 5; ++s) {
+    weights[s] = exp(weights[s] - peak);
+    if (s < sources) den += weights[s];
+  }
+  for (uint s = 0; s < 5; ++s) weights[s] = weights[s] / den;
+  global float *dst = ar + ((size_t)q * rows + row) * H;
+  for (uint i = 0; i < H / 256; ++i) {
+    float acc = 0.0f;
+    for (uint s = 0; s < 5; ++s)
+      if (s < sources) acc += weights[s] * (v[s][i] * means[s]);
+    dst[t + 256 * i] = FUSE_PRE(acc);
+  }
+  if (norm_n == 0) return;
+  barrier(CLK_GLOBAL_MEM_FENCE);
+  global const ushort *w = q == 0 ? wq : q == 1 ? wk : wv;
+  global ushort *out = (q == 0 ? q_norm : q == 1 ? k_norm : v_norm) + (size_t)row * H;
+  do_norm(dst, w, out, t, red);
 }
 
 static inline float4 rx4(global const uint2 *xg, uint i) {
@@ -472,37 +744,40 @@ KERNEL(256) void tf_ink2_down_epilogue(
     global const ushort *down, global const int *ids, global const float *weights,
     global const ushort *history, global ushort *taps, global const ushort *conv_w, global ushort *current,
     global ushort *conv_out, global const float *partial, global ushort *p, uint n, uint topk, uint channels, uint rows, uint commit1) {
-  const uint c = get_group_id(0) * 256 + get_local_id(0);
-  if (c >= n || c >= channels) return;
+  const uint c = get_group_id(0) * 256 + get_local_id(0), t = get_local_id(0);
+  local uint order[8];
   for (uint r = 0; r < rows; ++r) {
-    float sum = 0.0f;
-    int last_id = INT_MIN;
-    int last_slot = -1;
     global const int *id_row = ids + (size_t)r * topk;
     global const float *w_row = weights + (size_t)r * topk;
-    for (uint t = 0; t < topk; ++t) {
-      int best_id = INT_MAX;
-      int best_slot = -1;
-      for (uint slot = 0; slot < topk; ++slot) {
-        const int id = id_row[slot];
-        const bool after = id > last_id || (id == last_id && (int)slot > last_slot);
-        if (after && (best_slot < 0 || id < best_id)) {
-          best_id = id;
-          best_slot = (int)slot;
-        }
+    // One thread a slot works out where its slot sits in the expert order the serial selection gives, so every
+    // channel reads the order from SLM instead of replaying the scan over global memory.
+    if (t < topk && t < 8) {
+      const int me = id_row[t];
+      uint rank = 0;
+      for (uint s = 0; s < 8; ++s) {
+        if (s >= topk) break;
+        const int id = id_row[s];
+        rank += (id < me || (id == me && s < t)) ? 1u : 0u;
       }
-      if (best_slot < 0) break;
-      sum += w_row[best_slot] * bf2f(down[((size_t)r * topk + (uint)best_slot) * n + c]);
-      last_id = best_id;
-      last_slot = best_slot;
+      order[rank] = t;
     }
-    const ushort y = f2bf(sum);
-    current[(size_t)r * channels + c] = y;
-    const ushort cy = conv_y(history, current, taps, conv_w, r, c, channels);
-    conv_out[(size_t)r * channels + c] = cy;
-    const uint at = r * channels + c;
-    p[at] = FUSE_EPI ? f2bf(partial[at] + bf2f(cy)) : (ushort)0;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (c < n && c < channels) {
+      float sum = 0.0f;
+      for (uint k = 0; k < 8; ++k) {
+        if (k >= topk) break;
+        const uint slot = order[k];
+        sum += w_row[slot] * bf2f(down[((size_t)r * topk + slot) * n + c]);
+      }
+      const ushort y = f2bf(sum);
+      current[(size_t)r * channels + c] = y;
+      const ushort cy = conv_y(history, current, taps, conv_w, r, c, channels);
+      conv_out[(size_t)r * channels + c] = cy;
+      const uint at = r * channels + c;
+      p[at] = FUSE_EPI ? f2bf(partial[at] + bf2f(cy)) : (ushort)0;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
   }
-  if (commit1 && rows == 1) commit3(history, current, c, channels);
+  if (commit1 && rows == 1 && c < n && c < channels) commit3(history, current, c, channels);
 }
 

@@ -16,7 +16,7 @@ const R = 16;
 const EXTENT = 1024;
 const scale = 0.08838834764831845;
 
-pub const Which = enum { prep_sliding, prep_global, rel_table, decode_sliding, decode_global, prompt };
+pub const Which = enum { prep_sliding, prep_global, rel_table, decode_sliding, decode_global, decode_global_split, prompt };
 pub const Mutation = enum {
     none,
     prep_swap_kv,
@@ -24,6 +24,7 @@ pub const Mutation = enum {
     rel_late,
     decode_late_bias,
     merge_no_sink,
+    merge_split_no_sink,
     prompt_late_bias,
 
     fn name(m: Mutation) []const u8 {
@@ -34,6 +35,7 @@ pub const Mutation = enum {
             .rel_late => "control: xpu inkling2 attention relative projection one column late tf_ink2_rel_table",
             .decode_late_bias => "control: xpu inkling2 attention sliding first key score boosted tf_ink2_attn_decode",
             .merge_no_sink => "control: xpu inkling2 attention global merge without sink tf_ink2_merge",
+            .merge_split_no_sink => "control: xpu inkling2 attention global merge split without sink tf_ink2_merge_split",
             .prompt_late_bias => "control: xpu inkling2 prompt first key bias boosted tf_ink2_attn_prompt",
         };
     }
@@ -45,6 +47,7 @@ pub const Mutation = enum {
             .rel_late => .rel_table,
             .decode_late_bias => .decode_sliding,
             .merge_no_sink => .decode_global,
+            .merge_split_no_sink => .decode_global_split,
             .prompt_late_bias => .prompt,
         };
     }
@@ -56,13 +59,14 @@ pub const Mutation = enum {
             .rel_late => &images.ink2_attention_ctl3,
             .decode_late_bias => &images.ink2_attention_ctl4,
             .merge_no_sink => &images.ink2_attention_ctl5,
+            .merge_split_no_sink => &images.ink2_attention_ctl7,
             else => &images.ink2_attention,
         }, if (m == .prompt_late_bias) &images.ink2_prompt_ctl6 else &images.ink2_prompt };
     }
 };
 
 fn isAttention(w: Which) bool {
-    return w == .decode_sliding or w == .decode_global or w == .prompt;
+    return w == .decode_sliding or w == .decode_global or w == .decode_global_split or w == .prompt;
 }
 
 const prep_shapes = [_]c.Shape{ .{ .rows = 7, .n = H * D, .k = 1030 }, .{ .rows = 3, .n = H * D, .k = 9000 } };
@@ -100,6 +104,10 @@ fn spec(w: Which) c.Spec {
         },
         .decode_global => {
             s.name = "xpu inkling2 attention decode global tf_ink2_attn_decode + tf_ink2_merge";
+            s.served = &global_shapes;
+        },
+        .decode_global_split => {
+            s.name = "xpu inkling2 attention decode global split tf_ink2_attn_decode + tf_ink2_merge_split";
             s.served = &global_shapes;
         },
         .prompt => {
@@ -398,6 +406,8 @@ pub const Probe = struct {
                 // the plan sends few rows to the decode kernel; the contract runs the prompt kernel at them too
                 try attn.attendAs(&p.k, s, .prompt, r, p.layer, p.stride, meta, ref(p.refs[0]), kv, ref(p.refs[3]), ref(p.po), ref(p.pml), ref(p.refs[4]), ref(p.refs[5]), ref(p.out[0]));
             } else {
+                attn.merge_split = p.which == .decode_global_split;
+                defer attn.merge_split = false;
                 try attn.attend(&p.k, s, r, p.layer, p.stride, meta, ref(p.refs[0]), kv, ref(p.refs[3]), ref(p.po), ref(p.pml), ref(p.refs[4]), ref(p.refs[5]), ref(p.out[0]));
             }
         }

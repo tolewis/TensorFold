@@ -25,7 +25,7 @@
 #endif
 // Each decode kernel may take its own split: a slice of k should hold the same number of 64-byte lines in every sub-group.
 #ifndef INK2_KS_NV_GU
-#define INK2_KS_NV_GU 4
+#define INK2_KS_NV_GU 3
 #endif
 #ifndef INK2_KS_NV_DOWN
 #define INK2_KS_NV_DOWN 3

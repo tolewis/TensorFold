@@ -18,7 +18,7 @@ fn rec(comptime R: type, comptime name: []const u8, comptime symbol: []const u8,
 /// The launches as the caller's `Record` type holds them.
 pub fn list(comptime R: type) [24]R {
     return .{
-    rec(R, "xpu inkling2 experts tf_ink2_nvfp4_gu", "tf_ink2_nvfp4_gu", "contract_inkling2_experts", 64, .{ .threads = .{ 64, 1, 1 }, .slm = 2080, .sub_group = 16, .grf = 256 }),
+    rec(R, "xpu inkling2 experts tf_ink2_nvfp4_gu", "tf_ink2_nvfp4_gu", "contract_inkling2_experts", 48, .{ .threads = .{ 48, 1, 1 }, .slm = 2080, .sub_group = 16, .grf = 256 }),
     rec(R, "xpu inkling2 experts tf_ink2_nvfp4_down", "tf_ink2_nvfp4_down", "contract_inkling2_experts", 48, .{ .threads = .{ 48, 1, 1 }, .slm = 1824, .sub_group = 16, .grf = 256 }),
     rec(R, "xpu inkling2 experts tf_ink2_mxfp8_gu", "tf_ink2_mxfp8_gu", "contract_inkling2_experts", 64, .{ .threads = .{ 64, 1, 1 }, .slm = 2080, .sub_group = 16, .grf = 256 }),
     rec(R, "xpu inkling2 experts tf_ink2_mxfp8_down", "tf_ink2_mxfp8_down", "contract_inkling2_experts", 64, .{ .threads = .{ 64, 1, 1 }, .slm = 2080, .sub_group = 16, .grf = 256 }),

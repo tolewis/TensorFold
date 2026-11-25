@@ -606,7 +606,14 @@ fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) 
         if (gated) {
             const c = w.controllers.?[3];
             const core = v.layer - 6;
-            if (fuse.zetaWide()) {
+            if (fuse.zetaSplit()) {
+                const stride: u32 = state.message_entries * state.hidden;
+                try xpu.launch.dispatch(g.p.fuse.zeta_split_k, g.s, .{ 16, 1, @as(u32, @intCast(rows)) }, .{
+                    at(s.mlp_ar, 0), messageRow(s, core, 3, 0), tensor(c.down), tensor(c.down), tensor(c.down), at(s.zeta, 0),
+                    @as(u32, @intCast(rows)), @as(u32, 1), @as(u32, 1), @as(u32, 0), stride / state.hidden, @as(u32, 0),
+                });
+                try loop.gatesOnly(&g.p.loop, g.s, at(s.mlp_ar, 0), messageRow(s, core, 3, 0), tensor(c.forget), tensor(c.gain), at(s.zeta, 0), at(s.mlp_gated, 0), @intCast(rows), stride);
+            } else if (fuse.zetaWide()) {
                 const stride: u32 = state.message_entries * state.hidden;
                 try xpu.launch.dispatch(g.p.fuse.zeta_wide, g.s, .{ 4, 1, @as(u32, @intCast(rows)) }, .{
                     at(s.mlp_ar, 0), messageRow(s, core, 3, 0), tensor(c.down), tensor(c.down), tensor(c.down), at(s.zeta, 0),
