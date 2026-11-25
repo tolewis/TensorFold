@@ -15,9 +15,9 @@ pub fn zetaWide() bool {
     if (zeta_wide) return true;
     if (std.c.getenv("INK2_ZETA_WIDE")) |p| {
         const s = std.mem.span(p);
-        return s.len > 0 and s[0] == '1';
+        if (s.len > 0 and s[0] == '0') return false;
     }
-    return false;
+    return true;
 }
 
 pub fn convFold() bool {
