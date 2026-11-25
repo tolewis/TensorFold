@@ -156,7 +156,7 @@ pub fn main(init: std.process.Init) !u8 {
     const lim = try gate5.table(a) + try live5.live(a, &dev);
     const model_problems = try loop_k.modelCheck(a, &dev);
     const dense_problems = if (only == null or std.mem.indexOf(u8, only.?, "dense") != null or std.mem.indexOf(u8, only.?, "q8") != null)
-        try dense_k.report(a, &dev, &dense) + try dense_k.ldyCheck(a, &dev, &dense) + try dense_q8_k.report(a, &dev, &dense_q8) + try dense_q8_k.ldyCheck(a, &dev, &dense_q8)
+        try dense_k.report(a, &dev, &dense) + try dense_k.ldyCheck(a, &dev, &dense) + try dense_q8_k.report(a, &dev, &dense_q8) + try dense_q8_k.ldyCheck(a, &dev, &dense_q8) + try dense_q8_k.quantCheck(a, &dev, &dense_q8)
     else
         0;
     const t2 = ms(init.io);

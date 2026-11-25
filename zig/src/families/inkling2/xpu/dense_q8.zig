@@ -123,14 +123,25 @@ pub fn dense(p: *const Kernels, s: xpu.Stream, weight: Ref, input: Ref, out: Ref
     }
 }
 
+/// The head dot only. `qc` and `qs` are already quantized. `qs` holds the row flags after the scales.
+pub fn headDpas(p: *const Kernels, s: xpu.Stream, weight: Ref, qc: Ref, qs: Ref, x: Ref, out: Ref, rows: u32, vocab: u32) !void {
+    try xpu.launch.dispatch(p.head_dpas, s, .{ (vocab + 15) / 16, 1, 1 }, .{ qc, qs, weight, out, x, rows, vocab });
+}
+
 /// One launch of the head kernel that takes `lead` rows of h.
 pub fn headLaunch(p: *const Kernels, s: xpu.Stream, lead: u32, weight: Ref, h: Ref, out: Ref, rows: u32, vocab: u32) !void {
     _ = lead;
-    std.debug.assert(rows > 0 and rows <= 8 and vocab > 0);
-    const sc = try actScratch(s);
-    const nblk = rows * (hidden / 32);
-    try xpu.launch.dispatch(p.quant, s, .{ (nblk + 127) / 128, 1, 1 }, .{ h, sc.qc, sc.qs, rows, hidden });
-    try xpu.launch.dispatch(p.head_dpas, s, .{ (vocab + 15) / 16, 1, 1 }, .{ sc.qc, sc.qs, weight, out, rows, vocab });
+    std.debug.assert(rows > 0 and vocab > 0);
+    var base: u32 = 0;
+    while (base < rows) {
+        const t = @min(8, rows - base);
+        const sc = try actScratch(s);
+        const hrow = at(h, @as(usize, base) * hidden * 2);
+        const yrow = at(out, @as(usize, base) * vocab * 4);
+        try xpu.launch.dispatch(p.quant, s, .{ t, 1, 1 }, .{ hrow, sc.qc, sc.qs, t, hidden });
+        try xpu.launch.dispatch(p.head_dpas, s, .{ (vocab + 15) / 16, 1, 1 }, .{ sc.qc, sc.qs, weight, yrow, hrow, t, vocab });
+        base += t;
+    }
 }
 
 var act_slot: ?xpu.DeviceBuffer = null;

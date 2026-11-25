@@ -112,8 +112,7 @@ fn deviceTime(b: *Bench, head: bool, ws: []const host.Ref, x: host.Ref, y: host.
         const sc = try host.actScratch(b.dev.s);
         qc = sc.qc;
         qs = sc.qs;
-        const nblk = rows * (host.hidden / 32);
-        try xpu.launch.dispatch(b.k.quant, b.dev.s, .{ (nblk + 127) / 128, 1, 1 }, .{ x, qc, qs, rows, host.hidden });
+        try xpu.launch.dispatch(b.k.quant, b.dev.s, .{ rows, 1, 1 }, .{ x, qc, qs, rows, host.hidden });
     }
     for (0..count + ws.len) |i| {
         const timed = i >= ws.len;
@@ -122,8 +121,9 @@ fn deviceTime(b: *Bench, head: bool, ws: []const host.Ref, x: host.Ref, y: host.
             try kern.setPtr(1, qs);
             try kern.setPtr(2, ws[i % ws.len]);
             try kern.setPtr(3, y);
-            try kern.setU32(4, rows);
-            try kern.setU32(5, n);
+            try kern.setPtr(4, x);
+            try kern.setU32(5, rows);
+            try kern.setU32(6, n);
         } else {
             try kern.setPtr(0, x);
             try kern.setPtr(1, ws[i % ws.len]);

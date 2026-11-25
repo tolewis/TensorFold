@@ -832,7 +832,7 @@ fn verifyBench(gpa: std.mem.Allocator, io: std.Io, ctx: *xpu.Context, m: *const 
     if (profile) {
         var prof = try xpu.profile.Profile.init(ctx, 8192, true);
         defer prof.deinit();
-        for ([_]usize{ 2, 8 }) |n| {
+        for ([_]usize{ 1, 8 }) |n| {
             xpu.profile.active = &prof;
             prof.reset();
             for (0..4) |rep| {

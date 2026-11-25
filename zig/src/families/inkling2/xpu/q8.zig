@@ -128,6 +128,28 @@ test "layout: a lane's bytes in a plane are its two values of each of eight bloc
     };
 }
 
+test "dpas tile: lane bytes match the plane element, and a short last tile is zero" {
+    var codes: [1000 * 256]u8 = undefined;
+    var scales: [1000 * 8]u16 = undefined;
+    for (0..1000) |col| {
+        for (0..256) |e| codes[col * 256 + e] = @truncate(col * 3 + e);
+    }
+    for (0..1000 * 8) |i| scales[i] = @truncate(i + 1);
+    const dst = try std.testing.allocator.alloc(u8, dpasBytes(1000, 256));
+    defer std.testing.allocator.free(dst);
+    repackDpas(&codes, &scales, 1000, 256, dst);
+    const nb = 8;
+    const tiles = dpasTiles(1000);
+    for (0..tiles) |ti| for (0..nb) |b| for (0..16) |lane| {
+        const col = ti * 16 + lane;
+        for (0..32) |e| {
+            const got = dst[(ti * nb + b) * 512 + lane * 32 + e];
+            const want: u8 = if (col < 1000) codes[col * 256 + codeOffset(b, e)] else 0;
+            try std.testing.expectEqual(want, got);
+        }
+    };
+}
+
 test "encode: values come back within half a step, zeros stay zero, the largest is 127" {
     var src: [256]u16 = undefined;
     var prng = std.Random.DefaultPrng.init(7);
