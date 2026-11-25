@@ -5,6 +5,7 @@ pub const state = @import("xpu/state.zig");
 pub const snapshot = @import("xpu/snapshot.zig");
 pub const forward = @import("xpu/forward.zig");
 pub const fuse = @import("xpu/fuse.zig");
+pub const attention = @import("xpu/attention.zig");
 pub const attention_plan = @import("xpu/attention_plan.zig");
 pub const prefill = @import("xpu/prefill.zig");
 pub const experts = @import("xpu/experts.zig");
