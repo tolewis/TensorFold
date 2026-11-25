@@ -112,8 +112,20 @@ pub const default_prefix = "tf_ink2_";
 /// A device address, as the launcher takes it.
 pub const Ptr = ?*anyopaque;
 
+pub var nv_flight: bool = false;
+
+pub fn nvFlight() bool {
+    if (nv_flight) return true;
+    if (std.c.getenv("INK2_NV_FLIGHT")) |p| {
+        const s = std.mem.span(p);
+        return s.len > 0 and s[0] == '1';
+    }
+    return false;
+}
+
 pub const Kernels = struct {
     k: [std.enums.values(Op).len]?xpu.Kernel = @splat(null),
+    gu_flight: ?xpu.Kernel = null,
     /// The kernels of `module` named `<prefix><op>`; `only` loads one (a control image holds one a prefix).
     pub fn load(module: *xpu.Module, prefix: []const u8, only: ?Op) !Kernels {
         var out: Kernels = .{};
@@ -124,10 +136,16 @@ pub const Kernels = struct {
             const sym = try std.fmt.bufPrintSentinel(&buf, "{s}{s}", .{ prefix, op.name() }, 0);
             out.k[@intFromEnum(op)] = try module.kernel(sym, op.threads());
         }
+        if (only == null) {
+            var fbuf: [96]u8 = undefined;
+            const fsym = try std.fmt.bufPrintSentinel(&fbuf, "{s}nvfp4_gu_flight", .{prefix}, 0);
+            out.gu_flight = module.kernel(fsym, .{ 16 * decode_subgroups.nvfp4_gu, 1, 1 }) catch null;
+        }
         return out;
     }
 
     pub fn deinit(self: *Kernels) void {
+        if (self.gu_flight) |*fk| fk.deinit();
         for (&self.k) |*slot| if (slot.*) |*k| {
             k.deinit();
             slot.* = null;
@@ -143,10 +161,42 @@ pub const Kernels = struct {
         return (total + 15) / 16;
     }
 
+    pub const xe_cores: u32 = 32;
+
+    /// One-row decode grid. `full` is the flattened group count. `x_full` is one route's tile count.
+    pub const GridFill = struct {
+        tiles: u32,
+        routes: u32,
+        groups: u32,
+        tail: u32,
+        full: bool,
+        x_tail: u32,
+        x_full: bool,
+    };
+
+    pub fn gridFill(tile_count: u32, route_count: u32) GridFill {
+        const groups = tile_count * route_count;
+        const rem = groups % xe_cores;
+        const xrem = tile_count % xe_cores;
+        return .{
+            .tiles = tile_count,
+            .routes = route_count,
+            .groups = groups,
+            .tail = if (rem == 0) xe_cores else rem,
+            .full = rem == 0,
+            .x_tail = if (xrem == 0) xe_cores else xrem,
+            .x_full = xrem == 0,
+        };
+    }
+
     /// Packed NVFP4 GU: X [rows,k] BF16, ids [rows,topk] i32, Y [rows*topk,n] BF16 (the activation).
     pub fn nvfp4Gu(self: *const Kernels, s: xpu.Stream, x: Ptr, w: Ptr, scales: Ptr, amax: Ptr, den: Ptr, ids: Ptr, out: Ptr, c: Call) !void {
         if (c.format != .nvfp4) return error.WrongExpertFormat;
         try check(c);
+        if (nvFlight() and c.rows == 1) if (self.gu_flight) |k| {
+            try xpu.launch.dispatch(k, s, .{ tiles(c, true), routes(c), 1 }, .{ x, w, scales, amax, den, ids, out, c.k, c.n, c.topk, c.experts });
+            return;
+        };
         try xpu.launch.dispatch(try self.get(.nvfp4_gu), s, .{ tiles(c, true), routes(c), 1 }, .{ x, w, scales, amax, den, ids, out, c.k, c.n, c.topk, c.experts });
     }
 
@@ -269,6 +319,20 @@ test "the host plan groups routes by expert in route order" {
     try std.testing.expectEqual(@as(u32, 3), n);
     try std.testing.expectEqualSlices(i32, &.{ 1, 4, 0, 2, 5, 3 }, &members);
     try std.testing.expectEqualSlices(i32, &.{ 2, 0, 2, 5, 2, 3, 7, 5, 1 }, items[0..9]);
+}
+
+test "one-row NVFP4 grids fill 32 cores, but a route's tile tail does not" {
+    const gu = Kernels.gridFill(Kernels.tiles(.{ .rows = 1, .k = hidden, .n = intermediate, .format = .nvfp4 }, true), top_k);
+    try std.testing.expectEqual(@as(u32, 144), gu.tiles);
+    try std.testing.expectEqual(@as(u32, 1152), gu.groups);
+    try std.testing.expect(gu.full);
+    try std.testing.expectEqual(@as(u32, 16), gu.x_tail);
+    try std.testing.expect(!gu.x_full);
+    const down = Kernels.gridFill(Kernels.tiles(.{ .rows = 1, .k = intermediate, .n = hidden, .format = .nvfp4 }, false), top_k);
+    try std.testing.expectEqual(@as(u32, 144), down.tiles);
+    try std.testing.expectEqual(@as(u32, 1152), down.groups);
+    try std.testing.expect(down.full);
+    try std.testing.expectEqual(@as(u32, 16), down.x_tail);
 }
 
 test "calls are checked" {

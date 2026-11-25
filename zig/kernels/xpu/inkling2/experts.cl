@@ -458,6 +458,60 @@ __kernel void P(nvfp4_gu)(__global const ushort *X, __global const uchar *W, __g
   local uint mem[INK2_MAX_MEMBERS + 1];
   P(nv_decode)(INK2_KS_NV_GU, X, W, S, amax, den, ids, Y, k, n, topk, true, part, mem);
 }
+
+// The next 64-byte weight line is loaded before the current line is consumed. One row only.
+static inline void P(nv_decode_one_flight)(const uint ks, __global const ushort *X, __global const uchar *W, __global const uchar *S,
+                                __global const float *amax, __global const float *den, __global const int *ids,
+                                __global ushort *Y, uint k, uint n, uint topk, local float *part) {
+  const uint sg = get_sub_group_id();
+  const uint tile = get_group_id(0), route = get_group_id(1);
+  const uint e = (uint)ids[route];
+  const uint rows_total = 2u * n;
+  const uint raw = tile * INK2_SG + get_sub_group_local_id();
+  const uint row = raw < rows_total ? raw : 0u;
+  const uint nb = k / 16u;
+  __global const uchar *wr = W + ((ulong)e * rows_total + row) * (k / 2u);
+  __global const uchar *sr = S + ((ulong)e * rows_total + row) * nb;
+  __global const ushort *xr = X + (ulong)(route / topk) * k;
+  const float phi26 = P(phi)(amax, den, e) * 0x1p26f;
+  float acc = 0.0f;
+  const uint chunks = nb / 8u;
+  uint c = sg;
+  uint16 v = 0;
+  uint2 s2 = 0;
+  if (c < chunks) {
+    v = vload16(0, (__global const uint *)(wr + 64u * c));
+    s2 = vload2(0, (__global const uint *)(sr + 8u * c));
+  }
+  for (; c < chunks; c += ks) {
+    const uint c_next = c + ks;
+    uint16 v_next = 0;
+    uint2 s_next = 0;
+    if (c_next < chunks) {
+      v_next = vload16(0, (__global const uint *)(wr + 64u * c_next));
+      s_next = vload2(0, (__global const uint *)(sr + 8u * c_next));
+    }
+#pragma unroll
+    for (int u = 0; u < 8; u++) {
+      const uint sc = (s2[u >> 2] >> (8 * (u & 3))) & 255u;
+      const int8 b = P(nv_frag)(v[2 * u], v[2 * u + 1], sc, phi26);
+      const short a = (short)intel_sub_group_block_read_us(xr + 128u * c + 16u * u);
+      acc = INK2_DOT(a, b, acc);
+    }
+    v = v_next;
+    s2 = s_next;
+  }
+  P(finish_one)(ks, acc, part, Y, route, n, tile, rows_total, true);
+}
+
+__attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(16 * INK2_KS_NV_GU, 1, 1)))
+__kernel void P(nvfp4_gu_flight)(__global const ushort *X, __global const uchar *W, __global const uchar *S,
+                          __global const float *amax, __global const float *den, __global const int *ids,
+                          __global ushort *Y, uint k, uint n, uint topk, uint experts) {
+  local float part[INK2_RB * INK2_KS_NV_GU * INK2_SG];
+  (void)experts;
+  P(nv_decode_one_flight)(INK2_KS_NV_GU, X, W, S, amax, den, ids, Y, k, n, topk, part);
+}
 #endif
 
 #if INK2_ONLY & INK2_NV_DOWN
