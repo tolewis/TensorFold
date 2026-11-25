@@ -14,6 +14,16 @@ pub var kv_conv: bool = false;
 pub var down_epi: bool = false;
 pub var norm_router: bool = false;
 pub var role_conv: bool = false;
+pub var sink_seg: bool = false;
+
+pub fn sinkSeg() bool {
+    if (sink_seg) return true;
+    if (std.c.getenv("INK2_SINK_SEG")) |p| {
+        const s = std.mem.span(p);
+        if (s.len > 0 and s[0] == '0') return false;
+    }
+    return true;
+}
 pub fn roleConv() bool {
     if (role_conv) return true;
     if (std.c.getenv("INK2_ROLE")) |p| {

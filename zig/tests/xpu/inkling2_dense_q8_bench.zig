@@ -104,16 +104,32 @@ fn deviceTime(b: *Bench, head: bool, ws: []const host.Ref, x: host.Ref, y: host.
     var gpu = &b.dev.ctx.gpu;
     const events = try gpu.events(count);
     const d = b.dev.ctx.d;
-    const kern = if (head) b.k.head[host.variantOf(rows)] else b.k.dense[host.variantOf(rows)];
-    const groups: ze.GroupCount = .{ .x = (n + b.k.columns - 1) / b.k.columns, .y = 1, .z = 1 };
+    const kern = if (head) b.k.head_dpas else b.k.dense[host.variantOf(rows)];
+    const groups: ze.GroupCount = if (head) .{ .x = (n + 15) / 16, .y = 1, .z = 1 } else .{ .x = (n + b.k.columns - 1) / b.k.columns, .y = 1, .z = 1 };
+    var qc: host.Ref = null;
+    var qs: host.Ref = null;
+    if (head) {
+        const sc = try host.actScratch(b.dev.s);
+        qc = sc.qc;
+        qs = sc.qs;
+        try xpu.launch.dispatch(b.k.quant, b.dev.s, .{ rows, 1, 1 }, .{ x, qc, qs, rows, host.hidden });
+    }
     for (0..count + ws.len) |i| {
         const timed = i >= ws.len;
-        try kern.setPtr(0, x);
-        try kern.setPtr(1, ws[i % ws.len]);
-        try kern.setPtr(2, y);
-        try kern.setU32(3, rows);
-        try kern.setU32(4, n);
-        if (!head) {
+        if (head) {
+            try kern.setPtr(0, qc);
+            try kern.setPtr(1, qs);
+            try kern.setPtr(2, ws[i % ws.len]);
+            try kern.setPtr(3, y);
+            try kern.setPtr(4, x);
+            try kern.setU32(5, rows);
+            try kern.setU32(6, n);
+        } else {
+            try kern.setPtr(0, x);
+            try kern.setPtr(1, ws[i % ws.len]);
+            try kern.setPtr(2, y);
+            try kern.setU32(3, rows);
+            try kern.setU32(4, n);
             try kern.setU32(5, k);
             try kern.setU32(6, n);
         }

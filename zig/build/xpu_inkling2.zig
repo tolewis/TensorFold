@@ -70,7 +70,7 @@ pub fn controlsTest(b: *std.Build) void {
 }
 
 /// One production image: the source, ocloc's options after the common ones, and the files the source includes.
-const Production = struct { name: []const u8, path: []const u8, extra: []const u8 = "", inputs: []const []const u8 = &.{} };
+const Production = struct { name: []const u8, path: []const u8, extra: []const u8 = "", inputs: []const []const u8 = &.{}, grf: []const u8 = "-cl-intel-256-GRF-per-thread" };
 
 /// The kernels the whole forward runs, built as the contract builds them (the same sources and options, no controls).
 const production_images = [_]Production{
@@ -78,6 +78,8 @@ const production_images = [_]Production{
     .{ .name = "prompt", .path = "zig/kernels/xpu/inkling2/prompt_attention.cl" },
     .{ .name = "glue", .path = "zig/kernels/xpu/inkling2/glue.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt" },
     .{ .name = "experts", .path = "zig/kernels/xpu/inkling2/experts.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2" },
+    // Multi-row verify only. Same source, GRF 128. The one-row launch keeps `experts`.
+    .{ .name = "experts_mrow", .path = "zig/kernels/xpu/inkling2/experts.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2", .grf = "-cl-intel-128-GRF-per-thread" },
     .{ .name = "loop", .path = "zig/kernels/xpu/inkling2/loop.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt" },
     .{ .name = "fuse", .path = "zig/kernels/xpu/inkling2/fuse.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt" },
     .{ .name = "runtime", .path = "zig/kernels/xpu/inkling2/runtime.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt" },
@@ -103,7 +105,7 @@ pub fn productionModule(b: *std.Build, target: std.Build.ResolvedTarget, optimiz
         if (ocloc) |tool| {
             const run = b.addSystemCommand(&.{ tool, "compile", "-q", "-file" });
             run.addFileArg(b.path(img.path));
-            const opts = b.fmt("-cl-std=CL3.0 -cl-intel-256-GRF-per-thread -I zig/kernels/xpu/qwen27{s}", .{img.extra});
+            const opts = b.fmt("-cl-std=CL3.0 {s} -I zig/kernels/xpu/qwen27{s}", .{ img.grf, img.extra });
             run.addArgs(&.{ "-device", device, "-options", opts, "-output_no_suffix", "-output", img.name, "-out_dir" });
             run.setCwd(b.path("."));
             run.addFileInput(b.path("zig/kernels/xpu/qwen27/shape.h"));

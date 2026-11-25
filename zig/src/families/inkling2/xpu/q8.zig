@@ -26,6 +26,34 @@ pub fn bytes(n: usize, k: usize) usize {
 pub fn scaleOffset(n: usize, k: usize) usize {
     return n * k;
 }
+
+/// DPAS head tiles: 16 columns, 512 code bytes a block, then fp16 scales in that order. Pads `n` to a whole tile.
+pub fn dpasTiles(n: usize) usize {
+    return (n + 15) / 16;
+}
+
+pub fn dpasBytes(n: usize, k: usize) usize {
+    const t = dpasTiles(n);
+    const nb = k / block;
+    return t * nb * 512 + t * nb * 16 * 2;
+}
+
+/// Plane-layout codes into the DPAS tile buffer. Columns past `n` stay zero.
+pub fn repackDpas(codes: []const u8, scales: []const u16, n: usize, k: usize, dst: []u8) void {
+    const tcount = dpasTiles(n);
+    const nb = k / block;
+    const sc = tcount * nb * 512;
+    @memset(dst, 0);
+    for (0..tcount) |ti| for (0..nb) |b| for (0..16) |lane| {
+        const col = ti * 16 + lane;
+        if (col >= n) continue;
+        for (0..block) |e| dst[(ti * nb + b) * 512 + lane * 32 + e] = codes[col * k + codeOffset(b, e)];
+        const bits = scales[col * nb + b];
+        const so = sc + ((ti * nb + b) * 16 + lane) * 2;
+        dst[so] = @truncate(bits);
+        dst[so + 1] = @truncate(bits >> 8);
+    };
+}
 pub fn admits(k: usize) bool {
     return k != 0 and k % (plane_blocks * block) == 0;
 }
@@ -97,6 +125,28 @@ test "layout: a lane's bytes in a plane are its two values of each of eight bloc
         const o = codeOffset(b, e);
         try std.testing.expect(!seen[o]);
         seen[o] = true;
+    };
+}
+
+test "dpas tile: lane bytes match the plane element, and a short last tile is zero" {
+    var codes: [1000 * 256]u8 = undefined;
+    var scales: [1000 * 8]u16 = undefined;
+    for (0..1000) |col| {
+        for (0..256) |e| codes[col * 256 + e] = @truncate(col * 3 + e);
+    }
+    for (0..1000 * 8) |i| scales[i] = @truncate(i + 1);
+    const dst = try std.testing.allocator.alloc(u8, dpasBytes(1000, 256));
+    defer std.testing.allocator.free(dst);
+    repackDpas(&codes, &scales, 1000, 256, dst);
+    const nb = 8;
+    const tiles = dpasTiles(1000);
+    for (0..tiles) |ti| for (0..nb) |b| for (0..16) |lane| {
+        const col = ti * 16 + lane;
+        for (0..32) |e| {
+            const got = dst[(ti * nb + b) * 512 + lane * 32 + e];
+            const want: u8 = if (col < 1000) codes[col * 256 + codeOffset(b, e)] else 0;
+            try std.testing.expectEqual(want, got);
+        }
     };
 }
 

@@ -18,6 +18,9 @@ pub const Kernels = struct {
     dense: [variants.len]xpu.Kernel,
     head: [variants.len]xpu.Kernel,
     seg1: xpu.Kernel,
+    /// The head tile kernel. One sub-group, 16 columns. Dense stays on `head`.
+    head_dpas: xpu.Kernel,
+    quant: xpu.Kernel,
     /// Output columns a work-group covers.
     columns: u32 = group_threads / 16,
 
@@ -37,18 +40,24 @@ pub const Kernels = struct {
             made[n] = try module.kernel(symbol("head", rows, control), .{ threads, 1, 1 });
             n += 1;
         }
-        var out: Kernels = .{ .dense = undefined, .head = undefined, .seg1 = undefined, .columns = threads / 16 };
+        var out: Kernels = .{ .dense = undefined, .head = undefined, .seg1 = undefined, .head_dpas = undefined, .quant = undefined, .columns = threads / 16 };
         for (0..variants.len) |i| {
             out.dense[i] = made[2 * i];
             out.head[i] = made[2 * i + 1];
         }
         const seg_name = if (control) "tf_ctl_ink2_dense_q8_seg1" else "tf_ink2_dense_q8_seg1";
         out.seg1 = try module.kernel(seg_name, .{ threads, 1, 1 });
+        const dpas_name = if (control) "tf_ctl_ink2_head_dpas" else "tf_ink2_head_dpas";
+        const qname = if (control) "tf_ctl_ink2_q8_quant" else "tf_ink2_q8_quant";
+        out.head_dpas = try module.kernel(dpas_name, .{ 16, 1, 1 });
+        out.quant = try module.kernel(qname, .{ 128, 1, 1 });
         return out;
     }
 
     pub fn deinit(p: *Kernels) void {
         p.seg1.deinit();
+        p.head_dpas.deinit();
+        p.quant.deinit();
         for (&p.dense) |*k| k.deinit();
         for (&p.head) |*k| k.deinit();
     }
@@ -88,12 +97,16 @@ fn at(r: Ref, bytes: usize) Ref {
 /// layout (k a multiple of 256).
 /// One launch of five one-row matvecs. Each segment has its own x, weight and n. k is shared. The dot matches `matvec` of one row.
 pub fn seg1(p: *const Kernels, s: xpu.Stream, x: [5]Ref, w: [5]Ref, y: [5]Ref, n: [5]u32, k: u32) !void {
+    try seg1Sink(p, s, x, w, y, n, k, w[0], y[0], 0, 0);
+}
+
+pub fn seg1Sink(p: *const Kernels, s: xpu.Stream, x: [5]Ref, w: [5]Ref, y: [5]Ref, n: [5]u32, k: u32, sink_w: Ref, sink_y: Ref, sink_n: u32, sink_on: u32) !void {
     var max_n: u32 = 0;
     for (n) |ni| max_n = @max(max_n, ni);
     const cols = (max_n + p.columns - 1) / p.columns;
     try xpu.launch.dispatch(p.seg1, s, .{ cols, 5, 1 }, .{
         x[0], x[1], x[2], x[3], x[4], w[0], w[1], w[2], w[3], w[4], y[0], y[1], y[2], y[3], y[4],
-        n[0], n[1], n[2], n[3], n[4], k,
+        n[0], n[1], n[2], n[3], n[4], k, sink_w, sink_y, sink_n, sink_on,
     });
 }
 
@@ -114,10 +127,48 @@ pub fn dense(p: *const Kernels, s: xpu.Stream, weight: Ref, input: Ref, out: Ref
     }
 }
 
+/// The head dot only. `qc` and `qs` are already quantized. `qs` holds the row flags after the scales.
+pub fn headDpas(p: *const Kernels, s: xpu.Stream, weight: Ref, qc: Ref, qs: Ref, x: Ref, out: Ref, rows: u32, vocab: u32) !void {
+    try xpu.launch.dispatch(p.head_dpas, s, .{ (vocab + 15) / 16, 1, 1 }, .{ qc, qs, weight, out, x, rows, vocab });
+}
+
+/// The head the engine uses. The float head is the default for every row count, because the drafter's verify logits come
+/// from its own bf16 base kernel; the int8 tile head differs from those bits, so plain and verify would sample differently
+/// (`INK2_HEAD_DPAS=1` turns it on; drafted == plain then fails at N 512).
+pub fn tileHead() bool {
+    if (std.c.getenv("INK2_HEAD_DPAS")) |p| {
+        const s = std.mem.span(p);
+        if (s.len > 0 and s[0] == '1') return true;
+    }
+    return false;
+}
+
 /// One launch of the head kernel that takes `lead` rows of h.
 pub fn headLaunch(p: *const Kernels, s: xpu.Stream, lead: u32, weight: Ref, h: Ref, out: Ref, rows: u32, vocab: u32) !void {
-    std.debug.assert(rows > 0 and rows <= lead and vocab > 0);
-    try xpu.launch.dispatch(p.head[variantOf(lead)], s, .{ (vocab + p.columns - 1) / p.columns, 1, 1 }, .{ h, weight, out, rows, vocab });
+    std.debug.assert(rows > 0 and vocab > 0);
+    if (!tileHead()) {
+        std.debug.assert(rows <= lead);
+        try xpu.launch.dispatch(p.head[variantOf(lead)], s, .{ (vocab + p.columns - 1) / p.columns, 1, 1 }, .{ h, weight, out, rows, vocab });
+        return;
+    }
+    var base: u32 = 0;
+    while (base < rows) {
+        const t = @min(8, rows - base);
+        const sc = try actScratch(s);
+        const hrow = at(h, @as(usize, base) * hidden * 2);
+        const yrow = at(out, @as(usize, base) * vocab * 4);
+        try xpu.launch.dispatch(p.quant, s, .{ t, 1, 1 }, .{ hrow, sc.qc, sc.qs, t, hidden });
+        try xpu.launch.dispatch(p.head_dpas, s, .{ (vocab + 15) / 16, 1, 1 }, .{ sc.qc, sc.qs, weight, yrow, hrow, t, vocab });
+        base += t;
+    }
+}
+
+var act_slot: ?xpu.DeviceBuffer = null;
+
+pub fn actScratch(s: xpu.Stream) !struct { qc: Ref, qs: Ref } {
+    if (act_slot == null) act_slot = try xpu.DeviceBuffer.alloc(s.ctx, 64 << 10);
+    const b = act_slot.?;
+    return .{ .qc = try b.at(0), .qs = try b.at(48 << 10) };
 }
 
 /// out[rows][vocab] = softcap30(bf16(h[rows][2304] . dequant(unembed)[vocab][2304])) in FP32, the logits of the first
