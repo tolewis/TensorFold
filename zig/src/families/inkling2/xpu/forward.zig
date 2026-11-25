@@ -569,8 +569,8 @@ fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) 
             const ring_v = segments[0].cache.values(v.cache_slot);
             const ring_n = segments[0].cache.ring(v.cache_slot);
             for (0..4) |h| {
-                try dumpVisit(m.r, m.options.place.rank, vdump_cur, 110 + h, at(ring_k.buf, ring_k.off + h * ring_n * ap.head_dim * 2), 1, 24 * ap.head_dim);
-                try dumpVisit(m.r, m.options.place.rank, vdump_cur, 120 + h, at(ring_v.buf, ring_v.off + h * ring_n * ap.head_dim * 2), 1, 24 * ap.head_dim);
+                try dumpVisit(m.r, m.options.place.rank, vdump_cur, 110 + h, at(ring_k.buf, ring_k.off + h * ring_n * ap.head_dim * 2), 1, 48 * ap.head_dim);
+                try dumpVisit(m.r, m.options.place.rank, vdump_cur, 120 + h, at(ring_v.buf, ring_v.off + h * ring_n * ap.head_dim * 2), 1, 48 * ap.head_dim);
             }
         }
         var base: usize = 0;
