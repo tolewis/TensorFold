@@ -162,6 +162,53 @@ KERNEL(256) void tf_ink2_fuse_zeta(
   }
 }
 
+// Grid (4, roles, rows). Every sub-group owns one rank. The norm and the lane dot match tf_ink2_fuse_zeta.
+// pack4 stores (row * 4 + role); otherwise row * 64, for the MLP controller.
+KERNEL(256) void tf_ink2_zeta_wide(
+    global const float *ar, global const float *messages, global const ushort *down0, global const ushort *down1,
+    global const ushort *down2, global float *zeta, uint rows, uint roles, uint local_src, uint core, uint msg_entries,
+    uint pack4) {
+  const uint part = get_group_id(0), role = get_group_id(1), row = get_group_id(2);
+  if (row >= rows || role >= roles || part >= 4) return;
+  const uint t = get_local_id(0), lane = get_sub_group_local_id(), sg = get_sub_group_id();
+  const uint r = part * 16 + sg;
+  local float red[16];
+  local ushort normalized[2 * H];
+  const uint src = local_src ? 0 : role;
+  global const float *h = ar + ((size_t)src * rows + row) * H;
+  global const float *m = messages + ((size_t)row * msg_entries + core * 4 + role) * H;
+  global const ushort *down = role == 0 ? down0 : role == 1 ? down1 : down2;
+  float hv[H / 256], mv[H / 256];
+  float ss0 = 0.0f, ss1 = 0.0f;
+  for (uint i = 0; i < H / 256; ++i) {
+    hv[i] = h[t + 256 * i];
+    mv[i] = m[t + 256 * i];
+    ss0 += hv[i] * hv[i];
+    ss1 += mv[i] * mv[i];
+  }
+  const float inv0 = 1.0f / sqrt(wg_sum(ss0, red) / 2304.0f + EPS);
+  const float inv1 = 1.0f / sqrt(wg_sum(ss1, red) / 2304.0f + EPS);
+  for (uint i = 0; i < H / 256; ++i) {
+    normalized[t + 256 * i] = f2bf(hv[i] * inv0);
+    normalized[H + t + 256 * i] = f2bf(mv[i] * inv1);
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  global const ushort *dr = down + (size_t)r * (2 * H);
+  float dot = 0.0f;
+  for (uint d = 8 * lane; d < 2 * H; d += 512) {
+    const ushort8 w0 = vload8(0, dr + d), w1 = vload8(0, dr + d + 128);
+    const ushort8 w2 = vload8(0, dr + d + 256), w3 = vload8(0, dr + d + 384);
+    const ushort8 x0 = vload8(0, normalized + d), x1 = vload8(0, normalized + d + 128);
+    const ushort8 x2 = vload8(0, normalized + d + 256), x3 = vload8(0, normalized + d + 384);
+    for (int j = 0; j < 8; ++j) dot += bf2f(w0[j]) * bf2f(x0[j]);
+    for (int j = 0; j < 8; ++j) dot += bf2f(w1[j]) * bf2f(x1[j]);
+    for (int j = 0; j < 8; ++j) dot += bf2f(w2[j]) * bf2f(x2[j]);
+    for (int j = 0; j < 8; ++j) dot += bf2f(w3[j]) * bf2f(x3[j]);
+  }
+  dot = sub_group_reduce_add(dot);
+  if (lane == 0) zeta[pack4 ? ((size_t)row * 4 + role) * RANK + r : (size_t)row * RANK + r] = rbf(dot);
+}
+
 // Grid (36, roles, rows). One work-item one channel, the same 64-term order as tf_inkling2_loop_gates.
 KERNEL(64) void tf_ink2_fuse_gates(
     global const float *ar, global const float *messages, global const ushort *forget0, global const ushort *forget1,
@@ -208,4 +255,120 @@ KERNEL(256) void tf_ink2_fuse_norms(
   global const ushort *w = which == 0 ? wq : which == 1 ? wk : wv;
   global ushort *out = (which == 0 ? q_norm : which == 1 ? k_norm : v_norm) + (size_t)row * H;
   do_norm(x, w, out, t, red);
+}
+
+static inline float4 rx4(global const uint2 *xg, uint i) {
+  const uint2 v = xg[i];
+  return (float4)(as_float(v.x << 16), as_float(v.x & 0xffff0000u), as_float(v.y << 16), as_float(v.y & 0xffff0000u));
+}
+
+static inline float rsig(float x) {
+  const float e = exp(-fabs(x));
+  return x < 0.0f ? e / (1.0f + e) : 1.0f / (1.0f + e);
+}
+
+// Grid (8, rows). Sixteen sub-groups, one expert each. The lane map matches tf_inkling2_router.
+KERNEL(256) void tf_ink2_router_gemv(global const ushort *x, global const ushort *weight, global float *scores, uint rows) {
+  const uint row = get_group_id(1), lane = get_sub_group_local_id(), sg = get_sub_group_id();
+  const uint expert = get_group_id(0) * 16 + sg;
+  if (row >= rows || expert >= 128) return;
+  global const uint2 *xg = (global const uint2 *)(x + (size_t)row * H);
+  global const uint4 *w = (global const uint4 *)(weight + (size_t)expert * H);
+  float dot = 0.0f;
+  for (uint part = 0; part < 2; ++part) {
+    for (uint u = 0; u < 9; ++u) {
+      const uint at = (part * 9 + u) * 16 + lane;
+      const uint4 a = w[(part * 9 + u) * 16 + lane];
+      const float4 b0 = rx4(xg, 2 * at), b1 = rx4(xg, 2 * at + 1);
+      dot += as_float(a.x << 16) * b0.x;
+      dot += as_float(a.x & 0xffff0000u) * b0.y;
+      dot += as_float(a.y << 16) * b0.z;
+      dot += as_float(a.y & 0xffff0000u) * b0.w;
+      dot += as_float(a.z << 16) * b1.x;
+      dot += as_float(a.z & 0xffff0000u) * b1.y;
+      dot += as_float(a.w << 16) * b1.z;
+      dot += as_float(a.w & 0xffff0000u) * b1.w;
+    }
+  }
+  dot = sub_group_reduce_add(dot);
+  if (lane == 0) scores[(size_t)row * 128 + expert] = rsig(dot);
+}
+
+// Grid (rows). Same tie rule as tf_inkling2_router: a larger key wins, an equal key keeps the lower index.
+__attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(128, 1, 1))) kernel void tf_ink2_router_pick(
+    global const float *scores_in, global const float *bias, global uint *ids, global float *weights, uint rows) {
+  const uint row = get_group_id(0), t = get_local_id(0);
+  if (row >= rows) return;
+  local float keys[128], scores[128], chosen[8];
+  local uint flag[128], picked[8];
+  const float sc = scores_in[(size_t)row * 128 + t];
+  scores[t] = sc;
+  keys[t] = sc + bias[t];
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const float ke = keys[t];
+  uint rank = 0;
+  for (uint j = 0; j < 128; ++j) {
+    const float kj = keys[j];
+    rank += (kj > ke || (kj == ke && j < t)) ? 1u : 0u;
+  }
+  flag[t] = rank < 8 ? 1u : 0u;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (flag[t]) {
+    uint at = 0;
+    for (uint j = 0; j < t; ++j) at += flag[j];
+    picked[at] = t;
+    chosen[at] = scores[t];
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (t == 0) {
+    float den = 1e-20f;
+    for (uint j = 0; j < 8; ++j) den += chosen[j];
+    for (uint j = 0; j < 8; ++j) {
+      ids[(size_t)row * 8 + j] = picked[j];
+      weights[(size_t)row * 8 + j] = chosen[j] / den * 8.0f;
+    }
+  }
+}
+
+#define SQRT5 0x1.1e377ap+1f
+
+static inline ushort conv_y(global const ushort *history, global const ushort *current, global ushort *taps,
+                            global const ushort *weight, uint r, uint c, uint channels) {
+  float window[4];
+  for (uint tap = 0; tap < 4; ++tap) {
+    const uint k = r + tap;
+    window[tap] = bf2f(k < 3 ? history[(size_t)k * channels + c] : current[(size_t)(k - 3) * channels + c]);
+  }
+  if (r == 0)
+    for (uint k = 0; k < 3; ++k) taps[(size_t)k * channels + c] = history[(size_t)k * channels + c];
+  taps[(size_t)(r + 3) * channels + c] = current[(size_t)r * channels + c];
+  float sum = bf2f(current[(size_t)r * channels + c]);
+  for (uint tap = 0; tap < 4; ++tap) sum += bf2f(weight[c * 4 + tap]) * window[tap];
+  return f2bf(sum / SQRT5);
+}
+
+// Grid (ceil(channels/256), rows). The attention convolution, then the partial, with the bf16 round between them.
+KERNEL(256) void tf_ink2_conv_attn_partial(
+    global const ushort *history, global const ushort *current, global ushort *taps, global const ushort *weight,
+    global ushort *conv_out, global const ushort *p, global ushort *blocks, global float *partial, uint rows, uint channels,
+    uint boundary) {
+  const uint c = get_group_id(0) * 256 + get_local_id(0), r = get_group_id(1);
+  if (c >= channels || r >= rows) return;
+  const ushort y = conv_y(history, current, taps, weight, r, c, channels);
+  conv_out[(size_t)r * channels + c] = y;
+  const uint at = r * channels + c;
+  partial[at] = boundary ? bf2f(y) : bf2f(p[at]) + bf2f(y);
+  if (boundary) blocks[(size_t)r * 4 * channels + (boundary - 1) * channels + c] = p[at];
+}
+
+// Grid (ceil(channels/256), rows). The MLP convolution, then the partial add into p.
+KERNEL(256) void tf_ink2_conv_mlp_partial(
+    global const ushort *history, global const ushort *current, global ushort *taps, global const ushort *weight,
+    global ushort *conv_out, global const float *t, global ushort *p, uint rows, uint channels) {
+  const uint c = get_group_id(0) * 256 + get_local_id(0), r = get_group_id(1);
+  if (c >= channels || r >= rows) return;
+  const ushort y = conv_y(history, current, taps, weight, r, c, channels);
+  conv_out[(size_t)r * channels + c] = y;
+  const uint at = r * channels + c;
+  p[at] = f2bf(t[at] + bf2f(y));
 }

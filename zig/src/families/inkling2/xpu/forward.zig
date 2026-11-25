@@ -359,27 +359,48 @@ const Run = struct {
         try g.dense(w.attn.wo, at(s.att, 0), at(s.attn_dense, 0), rows);
         xpu.profile.label = "";
         var base: usize = 0;
-        for (segments) |seg| {
-            try g.staticPostConv(seg.cache, v.cache_slot, 2, s.attn_dense, w.attn_conv, s.attn_conv, base, seg.rows);
-            base += seg.rows;
+        if (fuse.convFold() and segments.len == 1) {
+            const seg = segments[0];
+            const channels: u32 = @intCast(state.convWidth(2));
+            try fuse.convAttnPartial(&g.p.fuse, g.s, seg.cache.history(v.cache_slot, 2).ptr(), at(s.attn_dense, 0), seg.cache.staged(v.cache_slot, 2, 0).ptr(), tensor(w.attn_conv), at(s.attn_conv, 0), at(s.p, 0), at(s.blocks, 0), at(s.partial, 0), @intCast(rows), channels, if (lp.boundary) lp.blocks_in + 1 else 0);
+        } else {
+            for (segments) |seg| {
+                try g.staticPostConv(seg.cache, v.cache_slot, 2, s.attn_dense, w.attn_conv, s.attn_conv, base, seg.rows);
+                base += seg.rows;
+            }
+            try runtime.attentionPartial(&g.p.runtime, g.s, at(s.p, 0), at(s.attn_conv, 0), at(s.blocks, 0), at(s.partial, 0), rows, if (lp.boundary) lp.blocks_in + 1 else 0);
         }
-        try runtime.attentionPartial(&g.p.runtime, g.s, at(s.p, 0), at(s.attn_conv, 0), at(s.blocks, 0), at(s.partial, 0), rows, if (lp.boundary) lp.blocks_in + 1 else 0);
         try g.residual(m.weights.mlp_queries[v.layer], lp.mlp_sources, rows);
         if (gated) {
             const c = w.controllers.?[3];
             const core = v.layer - 6;
-            try loop.gates(&g.p.loop, g.s, at(s.mlp_ar, 0), messageRow(s, core, 3, 0), tensor(c.down), tensor(c.forget), tensor(c.gain), at(s.zeta, 0), at(s.mlp_gated, 0), @intCast(rows), state.message_entries * state.hidden);
+            if (fuse.zetaWide()) {
+                const stride: u32 = state.message_entries * state.hidden;
+                try xpu.launch.dispatch(g.p.fuse.zeta_wide, g.s, .{ 4, 1, @as(u32, @intCast(rows)) }, .{
+                    at(s.mlp_ar, 0), messageRow(s, core, 3, 0), tensor(c.down), tensor(c.down), tensor(c.down), at(s.zeta, 0),
+                    @as(u32, @intCast(rows)), @as(u32, 1), @as(u32, 1), @as(u32, 0), stride / state.hidden, @as(u32, 0),
+                });
+                try loop.gatesOnly(&g.p.loop, g.s, at(s.mlp_ar, 0), messageRow(s, core, 3, 0), tensor(c.forget), tensor(c.gain), at(s.zeta, 0), at(s.mlp_gated, 0), @intCast(rows), stride);
+            } else try loop.gates(&g.p.loop, g.s, at(s.mlp_ar, 0), messageRow(s, core, 3, 0), tensor(c.down), tensor(c.forget), tensor(c.gain), at(s.zeta, 0), at(s.mlp_gated, 0), @intCast(rows), state.message_entries * state.hidden);
             try g.norm(at(s.mlp_gated, 0), w.mlp_norm, at(s.mlp_normed, 0), rows);
         } else try g.norm(at(s.mlp_ar, 0), w.mlp_norm, at(s.mlp_normed, 0), rows);
-        try glue.router(&g.p.glue, g.s, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.route_ids, 0), at(s.route_weights, 0), @intCast(rows));
+        if (fuse.routerWide()) {
+            try fuse.routerWideLaunch(&g.p.fuse, g.s, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.logits_all, 0), at(s.route_ids, 0), at(s.route_weights, 0), @intCast(rows));
+        } else try glue.router(&g.p.glue, g.s, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.route_ids, 0), at(s.route_weights, 0), @intCast(rows));
         if (route_trace) |tb| try g.s.copy(plus(tb.ptr, v.cache_slot * rows * 32), at(s.route_ids, 0), rows * 32);
         try g.routedExperts(v.layer, rows);
         base = 0;
-        for (segments) |seg| {
-            try g.staticPostConv(seg.cache, v.cache_slot, 3, s.mlp_out, w.mlp_conv, s.mlp_conv, base, seg.rows);
-            base += seg.rows;
+        if (fuse.convFold() and segments.len == 1) {
+            const seg = segments[0];
+            const channels: u32 = @intCast(state.convWidth(3));
+            try fuse.convMlpPartial(&g.p.fuse, g.s, seg.cache.history(v.cache_slot, 3).ptr(), at(s.mlp_out, 0), seg.cache.staged(v.cache_slot, 3, 0).ptr(), tensor(w.mlp_conv), at(s.mlp_conv, 0), at(s.partial, 0), at(s.p, 0), @intCast(rows), channels);
+        } else {
+            for (segments) |seg| {
+                try g.staticPostConv(seg.cache, v.cache_slot, 3, s.mlp_out, w.mlp_conv, s.mlp_conv, base, seg.rows);
+                base += seg.rows;
+            }
+            try runtime.mlpPartial(&g.p.runtime, g.s, at(s.partial, 0), at(s.mlp_conv, 0), at(s.p, 0), rows);
         }
-        try runtime.mlpPartial(&g.p.runtime, g.s, at(s.partial, 0), at(s.mlp_conv, 0), at(s.p, 0), rows);
         if (v.cache_slot == 5) try g.copyBf16(at(s.p, 0), at(s.prelude, 0), rows * state.hidden);
     }
 
@@ -477,6 +498,43 @@ pub fn checkPhaseA(m: *const Model, s: *state.Scratch, r: *xpu.rt.Runtime) !usiz
         bad += row_bad;
     }
     fuse.force = null;
+    return bad;
+}
+
+/// One row, layer 0 router weights. The wide path's picks against the old kernel.
+pub fn checkRouter(m: *const Model, s: *state.Scratch, r: *xpu.rt.Runtime) !usize {
+    if (m.pipelines == null or m.ctx == null) return error.Inkling2NoKernels;
+    const pipes = &m.pipelines.?;
+    const stream = m.r.stream(m.ctx.?);
+    const H = state.hidden;
+    var xbits: [H]u16 = undefined;
+    for (0..H) |d| xbits[d] = bf16bits(0.02 * @as(f32, @floatFromInt((d * 13) % 80)) - 0.4);
+    try r.upload(s.mlp_normed, std.mem.sliceAsBytes(&xbits));
+    const w = &m.weights.layers[0];
+    const g = Run{ .m = m, .p = pipes, .s = stream, .sc = s };
+    _ = g;
+    try glue.router(&pipes.glue, stream, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.route_ids, 0), at(s.route_weights, 0), 1);
+    try stream.synchronize();
+    var ids_a: [8]u32 = undefined;
+    var w_a: [8]f32 = undefined;
+    var ids_b: [8]u32 = undefined;
+    var w_b: [8]f32 = undefined;
+    try r.download(std.mem.sliceAsBytes(&ids_a), s.route_ids);
+    try r.download(std.mem.sliceAsBytes(&w_a), s.route_weights);
+    try r.sync();
+    try fuse.routerWideLaunch(&pipes.fuse, stream, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.logits_all, 0), at(s.route_ids, 0), at(s.route_weights, 0), 1);
+    try stream.synchronize();
+    try r.download(std.mem.sliceAsBytes(&ids_b), s.route_ids);
+    try r.download(std.mem.sliceAsBytes(&w_b), s.route_weights);
+    try r.sync();
+    var bad: usize = 0;
+    for (ids_a, ids_b) |a, b| if (a != b) {
+        bad += 1;
+    };
+    for (w_a, w_b) |a, b| if (a != b) {
+        bad += 1;
+    };
+    std.debug.print("router-check ids {any} vs {any} weight mismatches in the {d} bad slots\n", .{ ids_a, ids_b, bad });
     return bad;
 }
 

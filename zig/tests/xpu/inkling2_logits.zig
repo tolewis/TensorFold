@@ -234,6 +234,7 @@ pub fn main(init: std.process.Init) !void {
     var profile_steps: usize = 0;
     var profile_all = false;
     var fuse_check = false;
+    var router_check = false;
     var verify_bench = false;
     var route_union = false;
     var bench_context: ?usize = null;
@@ -319,6 +320,14 @@ pub fn main(init: std.process.Init) !void {
             ink.attention_plan.flash_user_set = true;
         } else if (std.mem.eql(u8, a, "--fuse-check")) {
             fuse_check = true;
+        } else if (std.mem.eql(u8, a, "--router-check")) {
+            router_check = true;
+        } else if (std.mem.eql(u8, a, "--router-wide")) {
+            ink.fuse.router_wide = true;
+        } else if (std.mem.eql(u8, a, "--conv-fold")) {
+            ink.fuse.conv_fold = true;
+        } else if (std.mem.eql(u8, a, "--zeta-wide")) {
+            ink.fuse.zeta_wide = true;
         } else if (std.mem.eql(u8, a, "--profile-all")) {
             // the first --ref prompt prefilled in --chunk row chunks (last row's logits only, as the server does), profiled per
             // chunk; then plain decode profiled greedy and sampled; then stop
@@ -389,6 +398,14 @@ pub fn main(init: std.process.Init) !void {
         const bad = try ink.forward.checkPhaseA(m, &scratch, &r);
         std.debug.print("FUSE-A-CHECK mismatches {d}\n", .{bad});
         if (bad != 0) return error.FuseMismatch;
+        if (!router_check) return;
+    }
+    if (router_check) {
+        var scratch_r = try state.Scratch.init(&r, state.max_rows, 64);
+        defer scratch_r.deinit();
+        const bad_r = try ink.forward.checkRouter(m, &scratch_r, &r);
+        std.debug.print("ROUTER-CHECK mismatches {d}\n", .{bad_r});
+        if (bad_r != 0) return error.FuseMismatch;
         return;
     }
     var scratch = try state.Scratch.init(&r, @max(chunk, state.max_rows), capacity);
