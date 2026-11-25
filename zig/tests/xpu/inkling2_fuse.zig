@@ -34,6 +34,7 @@ pub const Probe = struct {
     kind: Kind,
     control: bool,
     kern: xpu.Kernel,
+    vt: g.VTable = undefined,
     shape: c.Shape = .{ .rows = 1, .n = H, .k = 1 },
     served: [2]c.Shape = undefined,
     fill: g.Fill = .random,
@@ -74,10 +75,10 @@ pub const Probe = struct {
         self.rig.deinit();
     }
     pub fn kernel(self: *Probe) g.Kernel {
-        const vt = g.hooks(Probe);
+        self.vt = g.hooks(Probe);
         return .{
             .ctx = self,
-            .vt = &vt,
+            .vt = &self.vt,
             .spec = .{
                 .name = nameOf(self.kind, self.control),
                 .accum = .bf16,
@@ -133,8 +134,13 @@ pub const Probe = struct {
         const nan0 = self.fill == .nonfinite;
         switch (self.kind) {
             .pre => {
-                self.p0 = try self.ones(rows * H, nan0);
+                const bits = try self.a.alloc(u16, rows * H);
+                defer self.a.free(bits);
+                @memset(bits, 0x3f80);
+                if (nan0) bits[0] = 0x7fc0;
+                self.p0 = try self.rig.input(std.mem.sliceAsBytes(bits));
                 self.p1 = try self.rig.scratch(rows * H * 4);
+                self.p2 = try self.ones(H, false);
                 var x = try self.a.alloc(f32, rows * H);
                 defer self.a.free(x);
                 @memset(x, 1);
@@ -153,7 +159,7 @@ pub const Probe = struct {
                 self.p2 = try self.bfOnes(H * 64);
                 self.p3 = try self.ones(rows * 256, false);
                 self.p4 = try self.rig.scratch(H * 64 * 2);
-                @memset(self.host, 1);
+                @memset(self.host, 2);
             },
             .epi => {
                 self.p0 = try self.rig.scratch(8 * rows * H * 2);
@@ -194,7 +200,7 @@ pub const Probe = struct {
         const s = self.rig.dev.s;
         switch (self.kind) {
             .pre => try xpu.launch.dispatch(self.kern, s, .{ rows, 1, 1 }, .{
-                self.p1, self.p0, self.p1, self.p0, self.outp, self.p1, self.p1, self.p1, self.p1, self.p1, self.p1,
+                self.p0, self.p1, self.p1, self.p2, self.outp, self.p1, self.p1, self.p1, self.p1, self.p1, self.p1,
                 rows, @as(u32, H), @as(u32, 1), @as(u32, 1), @as(u32, 0),
             }),
             .zeta => try xpu.launch.dispatch(self.kern, s, .{ 4, 1, rows }, .{
