@@ -321,7 +321,7 @@ const Run = struct {
                 .mxfp8 => try ex.mxfp8DownPrompt(g.s, act, tensor(w.down.weight), tensor(w.down.scale), items, count, members, down, down_call),
             }
         }
-        if (!(fuse.downEpi() and rows == 1)) try ex.combine(g.s, down, ids, at(s.route_weights, 0), at(s.mlp_out, 0), down_call);
+        if (!fuse.downEpi()) try ex.combine(g.s, down, ids, at(s.route_weights, 0), at(s.mlp_out, 0), down_call);
     }
 
     fn visit(g: Run, v: *const layer_plan.Visit, segments: []const Segment, rows: usize, taps: ?Ptr) !void {
@@ -402,18 +402,21 @@ const Run = struct {
                 });
                 try loop.gatesOnly(&g.p.loop, g.s, at(s.mlp_ar, 0), messageRow(s, core, 3, 0), tensor(c.forget), tensor(c.gain), at(s.zeta, 0), at(s.mlp_gated, 0), @intCast(rows), stride);
             } else try loop.gates(&g.p.loop, g.s, at(s.mlp_ar, 0), messageRow(s, core, 3, 0), tensor(c.down), tensor(c.forget), tensor(c.gain), at(s.zeta, 0), at(s.mlp_gated, 0), @intCast(rows), state.message_entries * state.hidden);
-            try g.norm(at(s.mlp_gated, 0), w.mlp_norm, at(s.mlp_normed, 0), rows);
-        } else try g.norm(at(s.mlp_ar, 0), w.mlp_norm, at(s.mlp_normed, 0), rows);
-        if (fuse.routerWide()) {
+            if (!fuse.normRouter()) try g.norm(at(s.mlp_gated, 0), w.mlp_norm, at(s.mlp_normed, 0), rows);
+        } else if (!fuse.normRouter()) try g.norm(at(s.mlp_ar, 0), w.mlp_norm, at(s.mlp_normed, 0), rows);
+        if (fuse.normRouter() and fuse.routerWide()) {
+            const src = if (gated) at(s.mlp_gated, 0) else at(s.mlp_ar, 0);
+            try fuse.routerNormLaunch(&g.p.fuse, g.s, src, tensor(w.mlp_norm), tensor(w.router_weight), at(s.mlp_normed, 0), tensor(w.router_bias), at(s.logits_all, 0), at(s.route_ids, 0), at(s.route_weights, 0), @intCast(rows));
+        } else if (fuse.routerWide()) {
             try fuse.routerWideLaunch(&g.p.fuse, g.s, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.logits_all, 0), at(s.route_ids, 0), at(s.route_weights, 0), @intCast(rows));
         } else try glue.router(&g.p.glue, g.s, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.route_ids, 0), at(s.route_weights, 0), @intCast(rows));
         if (route_trace) |tb| try g.s.copy(plus(tb.ptr, v.cache_slot * rows * 32), at(s.route_ids, 0), rows * 32);
         try g.routedExperts(v.layer, rows);
         base = 0;
-        if (fuse.downEpi() and rows == 1 and segments.len == 1) {
+        if (fuse.downEpi() and segments.len == 1) {
             const seg = segments[0];
             const channels: u32 = @intCast(state.convWidth(3));
-            try fuse.downEpilogue(&g.p.fuse, g.s, at(s.down, 0), at(s.route_ids, 0), at(s.route_weights, 0), seg.cache.history(v.cache_slot, 3).ptr(), seg.cache.staged(v.cache_slot, 3, 0).ptr(), tensor(w.mlp_conv), at(s.mlp_conv, 0), at(s.partial, 0), at(s.p, 0), state.hidden, 8, channels);
+            try fuse.downEpilogue(&g.p.fuse, g.s, at(s.down, 0), at(s.route_ids, 0), at(s.route_weights, 0), seg.cache.history(v.cache_slot, 3).ptr(), seg.cache.staged(v.cache_slot, 3, 0).ptr(), tensor(w.mlp_conv), at(s.mlp_out, 0), at(s.mlp_conv, 0), at(s.partial, 0), at(s.p, 0), state.hidden, 8, channels, @intCast(rows));
         } else if (fuse.convFold() and segments.len == 1) {
             const seg = segments[0];
             const channels: u32 = @intCast(state.convWidth(3));

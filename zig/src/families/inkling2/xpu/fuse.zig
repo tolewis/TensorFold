@@ -12,6 +12,16 @@ pub var conv_fold: bool = false;
 pub var zeta_wide: bool = false;
 pub var kv_conv: bool = false;
 pub var down_epi: bool = false;
+pub var norm_router: bool = false;
+
+pub fn normRouter() bool {
+    if (norm_router) return true;
+    if (std.c.getenv("INK2_NORM_ROUTER")) |p| {
+        const s = std.mem.span(p);
+        return s.len > 0 and s[0] == '1';
+    }
+    return false;
+}
 
 pub fn downEpi() bool {
     if (down_epi) return true;
@@ -79,6 +89,7 @@ pub const Pipelines = struct {
     zeta_wide: xpu.Kernel,
     conv_kv: xpu.Kernel,
     down_epi: xpu.Kernel,
+    router_norm: xpu.Kernel,
 
     pub fn load(module: xpu.Module) !Pipelines {
         var pre = try module.kernel("tf_ink2_fuse_pre", .{ 256, 1, 1 });
@@ -101,11 +112,14 @@ pub const Pipelines = struct {
         errdefer zeta_wide_k.deinit();
         var conv_kv = try module.kernel("tf_ink2_conv_kv", .{ 256, 1, 1 });
         errdefer conv_kv.deinit();
-        const down_epi_k = try module.kernel("tf_ink2_down_epilogue", .{ 256, 1, 1 });
-        return .{ .pre = pre, .zeta = zeta, .gates = gates, .norms = norms, .router_gemv = router_gemv, .router_pick = router_pick, .conv_attn = conv_attn, .conv_mlp = conv_mlp, .zeta_wide = zeta_wide_k, .conv_kv = conv_kv, .down_epi = down_epi_k };
+        var down_epi_k = try module.kernel("tf_ink2_down_epilogue", .{ 256, 1, 1 });
+        errdefer down_epi_k.deinit();
+        const router_norm = try module.kernel("tf_ink2_router_norm_gemv", .{ 256, 1, 1 });
+        return .{ .pre = pre, .zeta = zeta, .gates = gates, .norms = norms, .router_gemv = router_gemv, .router_pick = router_pick, .conv_attn = conv_attn, .conv_mlp = conv_mlp, .zeta_wide = zeta_wide_k, .conv_kv = conv_kv, .down_epi = down_epi_k, .router_norm = router_norm };
     }
 
     pub fn deinit(p: *Pipelines) void {
+        p.router_norm.deinit();
         p.down_epi.deinit();
         p.conv_kv.deinit();
         p.zeta_wide.deinit();
@@ -154,9 +168,9 @@ pub fn convAttnPartial(p: *const Pipelines, s: xpu.Stream, history: Ref, current
     try xpu.launch.dispatch(p.conv_attn, s, .{ groups, rows, 1 }, .{ history, current, taps, weight, conv_out, prev, blocks, partial, rows, channels, boundary });
 }
 
-pub fn downEpilogue(p: *const Pipelines, s: xpu.Stream, down: Ref, ids: Ref, weights: Ref, history: Ref, taps: Ref, conv_w: Ref, conv_out: Ref, partial: Ref, pout: Ref, n: u32, topk: u32, channels: u32) !void {
+pub fn downEpilogue(p: *const Pipelines, s: xpu.Stream, down: Ref, ids: Ref, weights: Ref, history: Ref, taps: Ref, conv_w: Ref, current: Ref, conv_out: Ref, partial: Ref, pout: Ref, n: u32, topk: u32, channels: u32, rows: u32) !void {
     const groups = (n + 255) / 256;
-    try xpu.launch.dispatch(p.down_epi, s, .{ groups, 1, 1 }, .{ down, ids, weights, history, taps, conv_w, conv_out, partial, pout, n, topk, channels });
+    try xpu.launch.dispatch(p.down_epi, s, .{ groups, 1, 1 }, .{ down, ids, weights, history, taps, conv_w, current, conv_out, partial, pout, n, topk, channels, rows });
 }
 
 pub fn convKv(p: *const Pipelines, s: xpu.Stream, hk: Ref, ck: Ref, tk: Ref, wk: Ref, ok: Ref, hv: Ref, cv: Ref, tv: Ref, wv: Ref, ov: Ref, rows: u32, channels: u32) !void {
@@ -167,6 +181,11 @@ pub fn convKv(p: *const Pipelines, s: xpu.Stream, hk: Ref, ck: Ref, tk: Ref, wk:
 pub fn convMlpPartial(p: *const Pipelines, s: xpu.Stream, history: Ref, current: Ref, taps: Ref, weight: Ref, conv_out: Ref, t: Ref, out: Ref, rows: u32, channels: u32) !void {
     const groups = (channels + 255) / 256;
     try xpu.launch.dispatch(p.conv_mlp, s, .{ groups, rows, 1 }, .{ history, current, taps, weight, conv_out, t, out, rows, channels });
+}
+
+pub fn routerNormLaunch(p: *const Pipelines, s: xpu.Stream, x: Ref, norm_w: Ref, weight: Ref, normed: Ref, bias: Ref, scores: Ref, ids: Ref, weights: Ref, rows: u32) !void {
+    try xpu.launch.dispatch(p.router_norm, s, .{ 8, rows, 1 }, .{ x, norm_w, weight, normed, scores, rows });
+    try xpu.launch.dispatch(p.router_pick, s, .{ rows, 1, 1 }, .{ scores, bias, ids, weights, rows });
 }
 
 pub fn routerWideLaunch(p: *const Pipelines, s: xpu.Stream, x: Ref, weight: Ref, bias: Ref, scores: Ref, ids: Ref, weights: Ref, rows: u32) !void {
