@@ -798,6 +798,7 @@ fn profileAll(gpa: std.mem.Allocator, io: std.Io, ctx: *xpu.Context, m: *const i
             first_done = true;
             std.debug.print("\nPREFILL first {d} rows (context 0 to {d}), {d} chunks of {d}: forward wall {d:.2} ms, {d:.1} tok/s; the table is per chunk (a pass)\n", .{ pos, pos, chunks, chunk, 1000 * secs(wall), @as(f64, @floatFromInt(pos)) / secs(wall) });
             prof.print();
+            if (std.c.getenv("TF_TP_ONE_CHUNK") != null) return;
             prof.reset();
         }
     }
