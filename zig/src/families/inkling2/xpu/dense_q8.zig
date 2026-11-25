@@ -132,10 +132,25 @@ pub fn headDpas(p: *const Kernels, s: xpu.Stream, weight: Ref, qc: Ref, qs: Ref,
     try xpu.launch.dispatch(p.head_dpas, s, .{ (vocab + 15) / 16, 1, 1 }, .{ qc, qs, weight, out, x, rows, vocab });
 }
 
+/// The head the engine uses. The float head is the default for every row count, because the drafter's verify logits come
+/// from its own bf16 base kernel; the int8 tile head differs from those bits, so plain and verify would sample differently
+/// (`INK2_HEAD_DPAS=1` turns it on; drafted == plain then fails at N 512).
+pub fn tileHead() bool {
+    if (std.c.getenv("INK2_HEAD_DPAS")) |p| {
+        const s = std.mem.span(p);
+        if (s.len > 0 and s[0] == '1') return true;
+    }
+    return false;
+}
+
 /// One launch of the head kernel that takes `lead` rows of h.
 pub fn headLaunch(p: *const Kernels, s: xpu.Stream, lead: u32, weight: Ref, h: Ref, out: Ref, rows: u32, vocab: u32) !void {
-    _ = lead;
     std.debug.assert(rows > 0 and vocab > 0);
+    if (!tileHead()) {
+        std.debug.assert(rows <= lead);
+        try xpu.launch.dispatch(p.head[variantOf(lead)], s, .{ (vocab + p.columns - 1) / p.columns, 1, 1 }, .{ h, weight, out, rows, vocab });
+        return;
+    }
     var base: u32 = 0;
     while (base < rows) {
         const t = @min(8, rows - base);
