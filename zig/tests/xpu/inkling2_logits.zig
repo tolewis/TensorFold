@@ -334,6 +334,10 @@ pub fn main(init: std.process.Init) !void {
             ink.fuse.down_epi = true;
         } else if (std.mem.eql(u8, a, "--norm-router")) {
             ink.fuse.norm_router = true;
+        } else if (std.mem.eql(u8, a, "--role-conv")) {
+            ink.fuse.role_conv = true;
+        } else if (std.mem.eql(u8, a, "--ctl-one")) {
+            ink.fuse.ctl_one = true;
         } else if (std.mem.eql(u8, a, "--profile-all")) {
             // the first --ref prompt prefilled in --chunk row chunks (last row's logits only, as the server does), profiled per
             // chunk; then plain decode profiled greedy and sampled; then stop

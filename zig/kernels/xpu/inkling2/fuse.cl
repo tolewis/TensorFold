@@ -412,11 +412,21 @@ static inline ushort conv_y(global const ushort *history, global const ushort *c
   return f2bf(sum / SQRT5);
 }
 
+// The host commit for one row: the next history is history[1], history[2], current[0]. Read all three first.
+static void commit3(global ushort *history, global const ushort *current, uint c, uint channels) {
+  const ushort h1 = history[channels + c];
+  const ushort h2 = history[2 * channels + c];
+  const ushort cur = current[c];
+  history[c] = h1;
+  history[channels + c] = h2;
+  history[2 * channels + c] = cur;
+}
+
 // Grid (ceil(channels/256), rows). The attention convolution, then the partial, with the bf16 round between them.
 KERNEL(256) void tf_ink2_conv_attn_partial(
     global const ushort *history, global const ushort *current, global ushort *taps, global const ushort *weight,
     global ushort *conv_out, global const ushort *p, global ushort *blocks, global float *partial, uint rows, uint channels,
-    uint boundary) {
+    uint boundary, uint commit1) {
   const uint c = get_group_id(0) * 256 + get_local_id(0), r = get_group_id(1);
   if (c >= channels || r >= rows) return;
   const ushort y = conv_y(history, current, taps, weight, r, c, channels);
@@ -424,29 +434,35 @@ KERNEL(256) void tf_ink2_conv_attn_partial(
   const uint at = r * channels + c;
   partial[at] = boundary ? bf2f(y) : bf2f(p[at]) + bf2f(y);
   if (boundary) blocks[(size_t)r * 4 * channels + (boundary - 1) * channels + c] = p[at];
+  if (commit1 && rows == 1 && r == 0) commit3(history, current, c, channels);
 }
 
 // Grid (ceil(channels/256), rows). The MLP convolution, then the partial add into p.
 KERNEL(256) void tf_ink2_conv_mlp_partial(
     global const ushort *history, global const ushort *current, global ushort *taps, global const ushort *weight,
-    global ushort *conv_out, global const float *t, global ushort *p, uint rows, uint channels) {
+    global ushort *conv_out, global const float *t, global ushort *p, uint rows, uint channels, uint commit1) {
   const uint c = get_group_id(0) * 256 + get_local_id(0), r = get_group_id(1);
   if (c >= channels || r >= rows) return;
   const ushort y = conv_y(history, current, taps, weight, r, c, channels);
   conv_out[(size_t)r * channels + c] = y;
   const uint at = r * channels + c;
   p[at] = f2bf(t[at] + bf2f(y));
+  if (commit1 && rows == 1 && r == 0) commit3(history, current, c, channels);
 }
 
 // Grid (ceil(channels/256), rows). K folded into the V convolution. Each channel of each is the static formula.
 KERNEL(256) void tf_ink2_conv_kv(
     global const ushort *hk, global const ushort *ck, global ushort *tk, global const ushort *wk, global ushort *ok,
     global const ushort *hv, global const ushort *cv, global ushort *tv, global const ushort *wv, global ushort *ov,
-    uint rows, uint channels) {
+    uint rows, uint channels, uint commit1) {
   const uint c = get_group_id(0) * 256 + get_local_id(0), r = get_group_id(1);
   if (c >= channels || r >= rows) return;
   ok[(size_t)r * channels + c] = conv_y(hk, ck, tk, wk, r, c, channels);
   ov[(size_t)r * channels + c] = conv_y(hv, cv, tv, wv, r, c, channels);
+  if (commit1 && rows == 1 && r == 0) {
+    commit3(hk, ck, c, channels);
+    commit3(hv, cv, c, channels);
+  }
 }
 
 // Every row of the chunk. One thread owns a column and walks rows in order, so the convolution window
@@ -455,7 +471,7 @@ KERNEL(256) void tf_ink2_conv_kv(
 KERNEL(256) void tf_ink2_down_epilogue(
     global const ushort *down, global const int *ids, global const float *weights,
     global const ushort *history, global ushort *taps, global const ushort *conv_w, global ushort *current,
-    global ushort *conv_out, global const float *partial, global ushort *p, uint n, uint topk, uint channels, uint rows) {
+    global ushort *conv_out, global const float *partial, global ushort *p, uint n, uint topk, uint channels, uint rows, uint commit1) {
   const uint c = get_group_id(0) * 256 + get_local_id(0);
   if (c >= n || c >= channels) return;
   for (uint r = 0; r < rows; ++r) {
@@ -487,4 +503,61 @@ KERNEL(256) void tf_ink2_down_epilogue(
     const uint at = r * channels + c;
     p[at] = FUSE_EPI ? f2bf(partial[at] + bf2f(cy)) : (ushort)0;
   }
+  if (commit1 && rows == 1) commit3(history, current, c, channels);
+}
+
+// One launch for the MLP controller. Each group recomputes zeta, then one channel of the gates.
+// Off unless the host asks for it. The zeta reduction is not the wide kernel's, so the digest may move.
+KERNEL(64) void tf_ink2_mlp_one(
+    global const float *h, global const float *m, global const ushort *down,
+    global const ushort *forget, global const ushort *gain, global float *out,
+    uint rows, uint m_stride) {
+  const uint t = get_local_id(0), row = get_group_id(1);
+  const uint d = get_group_id(0) * 64 + t;
+  if (row >= rows || d >= H) return;
+  local float z[64];
+  local float red[8];
+  float ss0 = 0.0f, ss1 = 0.0f;
+  global const float *hr = h + (size_t)row * H;
+  global const float *mr = m + (size_t)row * m_stride;
+  for (uint i = 0; i < 36; ++i) {
+    const float hv = hr[t + 64 * i];
+    const float mv = mr[t + 64 * i];
+    ss0 += hv * hv;
+    ss1 += mv * mv;
+  }
+  ss0 = sub_group_reduce_add(ss0);
+  ss1 = sub_group_reduce_add(ss1);
+  if (get_sub_group_local_id() == 0) {
+    red[get_sub_group_id()] = ss0;
+    red[4 + get_sub_group_id()] = ss1;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float tot0 = 0.0f, tot1 = 0.0f;
+  for (int i = 0; i < 4; ++i) {
+    tot0 += red[i];
+    tot1 += red[4 + i];
+  }
+  const float inv0 = 1.0f / sqrt(tot0 / 2304.0f + EPS);
+  const float inv1 = 1.0f / sqrt(tot1 / 2304.0f + EPS);
+  global const ushort *dr = down + (size_t)t * (2 * H);
+  float dot = 0.0f;
+  for (uint i = 0; i < H; ++i) {
+    dot += bf2f(dr[i]) * (hr[i] * inv0);
+    dot += bf2f(dr[H + i]) * (mr[i] * inv1);
+  }
+  z[t] = rbf(dot);
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float fdot = 0.0f, gdot = 0.0f;
+  for (uint r = 0; r < 8; ++r) {
+    const ushort8 fw = vload8(0, forget + (size_t)d * 64 + 8 * r);
+    const ushort8 gw = vload8(0, gain + (size_t)d * 64 + 8 * r);
+    for (int j = 0; j < 8; ++j) {
+      fdot += bf2f(fw[j]) * z[8 * r + j];
+      gdot += bf2f(gw[j]) * z[8 * r + j];
+    }
+  }
+  const float f = tanh(fdot);
+  const float g = tanh(gdot);
+  out[(size_t)row * H + d] = (1.0f - f) * hr[d] + g * mr[d];
 }
