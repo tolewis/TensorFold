@@ -3,6 +3,7 @@
 //! drafter waits for before it reads a result.
 const std = @import("std");
 const xpu = @import("xpu");
+const rt = xpu.rt;
 const lanes = @import("lanes");
 const images = @import("inkling2_xpu_images");
 const gpu_rule = lanes.gpu_rule;
@@ -61,7 +62,7 @@ pub const Drafter = struct {
     scores: ?xpu.DeviceBuffer = null,
     /// A split rank keeps only its vocabulary slice of the target's unembedding. The base head reads every row, so the
     /// drafter holds the full matrix itself when the target's is a slice.
-    unembed: ?xpu.DeviceBuffer = null,
+    unembed: ?rt.Buffer = null,
     capacity: usize = 1,
     contexts: std.AutoHashMapUnmanaged(*Stream, state.Lane) = .empty,
     /// The pending token's host copy, and one row of bf16 logits.
