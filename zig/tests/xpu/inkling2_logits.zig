@@ -328,6 +328,8 @@ pub fn main(init: std.process.Init) !void {
             ink.fuse.conv_fold = true;
         } else if (std.mem.eql(u8, a, "--zeta-wide")) {
             ink.fuse.zeta_wide = true;
+        } else if (std.mem.eql(u8, a, "--zeta-split")) {
+            ink.fuse.zeta_split = true;
         } else if (std.mem.eql(u8, a, "--kv-conv")) {
             ink.fuse.kv_conv = true;
         } else if (std.mem.eql(u8, a, "--down-epi")) {

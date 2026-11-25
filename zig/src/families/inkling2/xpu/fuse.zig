@@ -60,6 +60,18 @@ pub fn kvConv() bool {
     return true;
 }
 
+/// The zeta over 16 groups of four sub-groups a rank. Default; `INK2_ZETA_SPLIT=0` selects the wide kernel.
+pub var zeta_split: bool = false;
+
+pub fn zetaSplit() bool {
+    if (zeta_split) return true;
+    if (std.c.getenv("INK2_ZETA_SPLIT")) |p| {
+        const s = std.mem.span(p);
+        if (s.len > 0 and s[0] == '0') return false;
+    }
+    return true;
+}
+
 pub fn zetaWide() bool {
     if (zeta_wide) return true;
     if (std.c.getenv("INK2_ZETA_WIDE")) |p| {
@@ -106,6 +118,7 @@ pub const Pipelines = struct {
     conv_attn: xpu.Kernel,
     conv_mlp: xpu.Kernel,
     zeta_wide: xpu.Kernel,
+    zeta_split_k: xpu.Kernel,
     conv_kv: xpu.Kernel,
     down_epi: xpu.Kernel,
     router_norm: xpu.Kernel,
@@ -129,12 +142,13 @@ pub const Pipelines = struct {
         errdefer conv_mlp.deinit();
         var zeta_wide_k = try module.kernel("tf_ink2_zeta_wide", .{ 256, 1, 1 });
         errdefer zeta_wide_k.deinit();
+        const zeta_split_k = try module.kernel("tf_ink2_zeta_split", .{ 256, 1, 1 });
         var conv_kv = try module.kernel("tf_ink2_conv_kv", .{ 256, 1, 1 });
         errdefer conv_kv.deinit();
         var down_epi_k = try module.kernel("tf_ink2_down_epilogue", .{ 256, 1, 1 });
         errdefer down_epi_k.deinit();
         const router_norm = try module.kernel("tf_ink2_router_norm_gemv", .{ 256, 1, 1 });
-        return .{ .pre = pre, .zeta = zeta, .gates = gates, .norms = norms, .router_gemv = router_gemv, .router_pick = router_pick, .conv_attn = conv_attn, .conv_mlp = conv_mlp, .zeta_wide = zeta_wide_k, .conv_kv = conv_kv, .down_epi = down_epi_k, .router_norm = router_norm };
+        return .{ .pre = pre, .zeta = zeta, .gates = gates, .norms = norms, .router_gemv = router_gemv, .router_pick = router_pick, .conv_attn = conv_attn, .conv_mlp = conv_mlp, .zeta_wide = zeta_wide_k, .zeta_split_k = zeta_split_k, .conv_kv = conv_kv, .down_epi = down_epi_k, .router_norm = router_norm };
     }
 
     pub fn deinit(p: *Pipelines) void {
@@ -142,6 +156,7 @@ pub const Pipelines = struct {
         p.down_epi.deinit();
         p.conv_kv.deinit();
         p.zeta_wide.deinit();
+        p.zeta_split_k.deinit();
         p.conv_mlp.deinit();
         p.conv_attn.deinit();
         p.router_pick.deinit();
@@ -221,7 +236,12 @@ pub fn phaseA(p: *const Pipelines, s: xpu.Stream, a: PhaseA) !void {
         a.rows, a.blocks_stride, a.sources, a.n_queries, norm_here,
     });
     if (a.roles == 0) return;
-    if (zetaWide()) {
+    if (zetaSplit()) {
+        try xpu.launch.dispatch(p.zeta_split_k, s, .{ 16, a.roles, a.rows }, .{
+            a.ar, a.messages orelse dummy, a.down[0], a.down[1], a.down[2], a.zeta,
+            a.rows, a.roles, a.local_src, a.core, a.msg_entries, @as(u32, 1),
+        });
+    } else if (zetaWide()) {
         try xpu.launch.dispatch(p.zeta_wide, s, .{ 4, a.roles, a.rows }, .{
             a.ar, a.messages orelse dummy, a.down[0], a.down[1], a.down[2], a.zeta,
             a.rows, a.roles, a.local_src, a.core, a.msg_entries, @as(u32, 1),
