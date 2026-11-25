@@ -12,6 +12,7 @@ pub const top_k: u32 = 8;
 
 /// RAD-shaped gate/up. Off until it wins the A/B and the pooled KL16.
 pub var rad_gu: bool = false;
+pub var rad_down: bool = false;
 
 /// The kernels' reduction split: one decode work-group holds this many sub-groups, each over a slice of k
 /// (INK2_KS_NV_GU, INK2_KS_NV_DOWN, INK2_KS_MX_GU and INK2_KS_MX_DOWN in the source).
@@ -118,6 +119,7 @@ pub const Ptr = ?*anyopaque;
 pub const Kernels = struct {
     k: [std.enums.values(Op).len]?xpu.Kernel = @splat(null),
     rad_gu: ?xpu.Kernel = null,
+    rad_down: ?xpu.Kernel = null,
 
     /// The kernels of `module` named `<prefix><op>`; `only` loads one (a control image holds one a prefix).
     pub fn load(module: *xpu.Module, prefix: []const u8, only: ?Op) !Kernels {
@@ -133,6 +135,9 @@ pub const Kernels = struct {
             var rbuf: [96]u8 = undefined;
             const rsym = try std.fmt.bufPrintSentinel(&rbuf, "{s}nvfp4_gu_rad", .{prefix}, 0);
             out.rad_gu = module.kernel(rsym, .{ 128, 1, 1 }) catch null;
+            var dbuf: [96]u8 = undefined;
+            const dsym = try std.fmt.bufPrintSentinel(&dbuf, "{s}nvfp4_down_rad", .{prefix}, 0);
+            out.rad_down = module.kernel(dsym, .{ 128, 1, 1 }) catch null;
         }
         return out;
     }
@@ -142,6 +147,7 @@ pub const Kernels = struct {
             k.deinit();
             slot.* = null;
         };
+        if (self.rad_down) |*dk| dk.deinit();
         if (self.rad_gu) |*rk| rk.deinit();
     }
 
@@ -174,9 +180,24 @@ pub const Kernels = struct {
     }
 
     /// NVFP4 down: act [rows*topk,k] BF16, Y [rows*topk,n] BF16.
+    /// One dense matrix stored as expert 0. `ids` is a zero. One row a call; the caller loops rows.
+    pub fn denseRow(self: *const Kernels, s: xpu.Stream, buf: Ptr, n: u32, k: u32, input: Ptr, out: Ptr, ids: Ptr) !void {
+        const base: [*]u8 = @ptrCast(buf.?);
+        const codes: Ptr = base;
+        const scales: Ptr = base + @as(usize, n) * k / 2;
+        const amax: Ptr = @ptrCast(base + @as(usize, n) * k / 2 + @as(usize, n) * k / 16);
+        const den: Ptr = @ptrCast(@as([*]u8, @ptrCast(amax)) + 4);
+        try self.nvfp4Down(s, input, codes, scales, amax, den, ids, out, .{ .rows = 1, .k = k, .n = n, .experts = 1, .topk = 1, .format = .nvfp4 });
+    }
+
     pub fn nvfp4Down(self: *const Kernels, s: xpu.Stream, act: Ptr, w: Ptr, scales: Ptr, amax: Ptr, den: Ptr, ids: Ptr, out: Ptr, c: Call) !void {
         if (c.format != .nvfp4) return error.WrongExpertFormat;
         try check(c);
+        if (rad_down) if (self.rad_down) |k| {
+            const cols = (c.n + 7) / 8;
+            try xpu.launch.dispatch(k, s, .{ cols, routes(c), 1 }, .{ act, w, scales, amax, den, ids, out, c.k, c.n, c.topk });
+            return;
+        };
         try xpu.launch.dispatch(try self.get(.nvfp4_down), s, .{ tiles(c, false), routes(c), 1 }, .{ act, w, scales, amax, den, ids, out, c.k, c.n, c.topk, c.experts });
     }
 

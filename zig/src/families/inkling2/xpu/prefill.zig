@@ -97,6 +97,16 @@ const Run = struct {
     fn dense(g: Run, weight: Tensor, input: Ptr, out: Ptr, rows: usize) !void {
         const k: u32 = @intCast(weight.shape[weight.rank - 1]);
         const n: u32 = @intCast(weight.shape[weight.rank - 2]);
+        if (weight.nvfp4) {
+            const ids = g.m.dense_ids orelse return error.Inkling2NoKernels;
+            var i: usize = 0;
+            while (i < rows) : (i += 1) {
+                const in: experts.Ptr = @ptrFromInt(@intFromPtr(input) + i * @as(usize, k) * 2);
+                const ou: experts.Ptr = @ptrFromInt(@intFromPtr(out) + i * @as(usize, n) * 2);
+                try g.p.experts.denseRow(g.s, weight.buf.ptr, n, k, in, ou, ids.ptr);
+            }
+            return;
+        }
         if (weight.q8 and !g.old_dense and n % 8 == 0 and k % 256 == 0) return pk.denseQ8(&g.p.prefill, g.s, tensor(weight), input, at(g.sc.xp, 0), out, @intCast(rows), n, k);
         if (weight.q8) return dense_q8_kernels.dense(&g.p.dense_q8, g.s, tensor(weight), input, out, @intCast(rows), n, k);
         if (!g.old_dense and k % 8 == 0) return pk.denseBf16(&g.p.prefill, g.s, tensor(weight), input, out, @intCast(rows), n, k);
