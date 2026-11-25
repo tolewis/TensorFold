@@ -16,6 +16,7 @@ const dense_kernels = @import("dense.zig");
 const dense_q8_kernels = @import("dense_q8.zig");
 const pk = @import("prefill_kernels.zig");
 const pe = @import("prefill_experts.zig");
+const group = @import("group.zig");
 const state = @import("state.zig");
 const model_file = @import("model.zig");
 const forward = @import("forward.zig");
@@ -98,7 +99,7 @@ const Run = struct {
         const k: u32 = @intCast(weight.shape[weight.rank - 1]);
         const n: u32 = @intCast(weight.shape[weight.rank - 2]);
         if (weight.q8 and !g.old_dense and n % 8 == 0 and k % 256 == 0) return pk.denseQ8(&g.p.prefill, g.s, tensor(weight), input, at(g.sc.xp, 0), out, @intCast(rows), n, k);
-        if (weight.q8) return dense_q8_kernels.dense(&g.p.dense_q8, g.s, tensor(weight), input, out, @intCast(rows), n, k);
+        if (weight.q8) return dense_q8_kernels.dense(&g.p.dense_q8, g.s, tensor(weight), input, out, null, @intCast(rows), n, k);
         if (!g.old_dense and k % 8 == 0) return pk.denseBf16(&g.p.prefill, g.s, tensor(weight), input, out, @intCast(rows), n, k);
         try dense_kernels.dense(&g.p.dense, g.s, tensor(weight), input, out, @intCast(rows), n, k);
     }
@@ -164,13 +165,18 @@ const Run = struct {
     }
 
     /// Runs one of the visit's four convolutions over the whole chunk and commits its three-row history.
+    fn convChannels(g: Run, conv_state: usize) usize {
+        if (conv_state < 2) return g.m.options.place.kvWidth();
+        return state.convWidth(conv_state);
+    }
+
     fn commitHistory(g: Run, cache: *state.Cache, slot: usize, conv_state: usize) !void {
-        const channels = state.convWidth(conv_state);
+        const channels = g.convChannels(conv_state);
         try g.copyBf16(at(g.sc.staging, g.rows * channels * 2), cache.history(slot, conv_state).ptr(), 3 * channels);
     }
 
     fn staticPostConv(g: Run, cache: *state.Cache, slot: usize, conv_state: usize, raw: rt.Buffer, weight: Tensor, out: rt.Buffer) !void {
-        const channels = state.convWidth(conv_state);
+        const channels = g.convChannels(conv_state);
         try pk.convStatic(&g.p.prefill, g.s, cache.history(slot, conv_state).ptr(), at(raw, 0), at(g.sc.staging, 0), tensor(weight), at(out, 0), @intCast(g.rows), @intCast(channels));
         try g.commitHistory(cache, slot, conv_state);
     }
@@ -187,8 +193,8 @@ const Run = struct {
         const taps = at(s.staging, 0);
         const rows: u32 = @intCast(g.rows);
         switch (if (key) w.attn.k_conv else w.attn.v_conv) {
-            .static => |weight| try pk.convStatic(&g.p.prefill, g.s, history, projected, taps, tensor(weight), raw, rows, state.kv_width),
-            .dynamic => |d| try glue.convDynamic(&g.p.glue, g.s, history, projected, taps, at(normalized, 0), tensor(d.static_w), tensor(d.projection), raw, rows, state.kv_width),
+            .static => |weight| try pk.convStatic(&g.p.prefill, g.s, history, projected, taps, tensor(weight), raw, rows, g.m.options.place.kvWidth()),
+            .dynamic => |d| try glue.convDynamic(&g.p.glue, g.s, history, projected, taps, at(normalized, 0), tensor(d.static_w), tensor(d.projection), raw, rows, g.m.options.place.kvWidth()),
         }
         try g.commitHistory(cache, v.cache_slot, conv_state);
     }
@@ -211,7 +217,9 @@ const Run = struct {
         const start: u32 = @intCast(cache.len);
         const rows: u32 = @intCast(g.rows);
         const stage: u32 = @intCast(state.stageRows(g.rows));
-        const all = ap.Rows{ .rows = rows, .heads = 24, .kv_heads = 8, .last_pos = start + rows - 1, .streams = 1 };
+        const qh = m.options.place.qHeads();
+        const kh = m.options.place.kvHeads();
+        const all = ap.Rows{ .rows = rows, .heads = qh, .kv_heads = kh, .last_pos = start + rows - 1, .streams = 1 };
         const meta_all = attention.RowMeta{ .pos = aref(s.pos, 0), .seg_of = aref(s.seg_of, 0), .segs = aref(s.segs, 0) };
         var into = kv;
         var prep_layer = layer;
@@ -219,8 +227,8 @@ const Run = struct {
             into = .{ .k = aref(s.kstage, 0), .v = aref(s.vstage, 0) };
             prep_layer.ring = stage;
             const history = @min(start, layer.window - 1);
-            try pk.kvCopy(&g.p.prefill, g.s, kv.k.at(), into.k.at(), start - history, layer.ring, stage, history, 8);
-            try pk.kvCopy(&g.p.prefill, g.s, kv.v.at(), into.v.at(), start - history, layer.ring, stage, history, 8);
+            try pk.kvCopy(&g.p.prefill, g.s, kv.k.at(), into.k.at(), start - history, layer.ring, stage, history, kh);
+            try pk.kvCopy(&g.p.prefill, g.s, kv.v.at(), into.v.at(), start - history, layer.ring, stage, history, kh);
         }
         try attention.prep(k, g.s, all, prep_layer, prep, meta_all, .{ aref(s.q_raw, 0), aref(s.k_conv, 0), aref(s.v_conv, 0), aref(s.rel_raw, 0) }, .{ aref(w.attn.q_scale.buf, 0), aref(w.attn.rel_scale.buf, 0) }, aref(s.q_prep, 0), aref(s.rel_prep, 0), into);
         try pk.relTable(&g.p.prefill, g.s, all.rows * all.heads, aref(s.rel_prep, 0).at(), aref(w.attn.rel_projection.buf, 0).at(), aref(s.rel_tab, 0).at());
@@ -229,16 +237,16 @@ const Run = struct {
         var si: usize = if (sliding) g.sl_seg0 else 0;
         while (base < g.rows) : (si += 1) {
             const n = @min(step, g.rows - base);
-            const rr = ap.Rows{ .rows = @intCast(n), .heads = 24, .kv_heads = 8, .last_pos = @intCast(start + base + n - 1), .streams = 1 };
+            const rr = ap.Rows{ .rows = @intCast(n), .heads = qh, .kv_heads = kh, .last_pos = @intCast(start + base + n - 1), .streams = 1 };
             const meta = attention.RowMeta{ .pos = aref(s.pos, base * 4), .seg_of = aref(s.seg_of, base * 4), .segs = aref(s.segs, si * @sizeOf(ap.Seg)) };
-            const q_at = base * state.query_width * 2;
-            const tab_at = base * 24 * ap.extent * 2;
-            const sink = aref(s.sink, base * 24 * 2);
+            const q_at = base * m.options.place.qWidth() * 2;
+            const tab_at = base * @as(usize, qh) * ap.extent * 2;
+            const sink = aref(s.sink, base * @as(usize, qh) * 2);
             if (sliding) {
                 const scale: f32 = 1.0 / @sqrt(@as(f32, ap.head_dim));
-                try pk.attnWindow(&g.p.prefill, g.s, at(s.q_prep, q_at), into.k.at(), into.v.at(), at(s.rel_tab, tab_at), meta.segs.at(), at(s.part_o, 0), at(s.part_ml, 0), @intCast(n), 24, 8, stage, scale);
+                try pk.attnWindow(&g.p.prefill, g.s, at(s.q_prep, q_at), into.k.at(), into.v.at(), at(s.rel_tab, tab_at), meta.segs.at(), at(s.part_o, 0), at(s.part_ml, 0), @intCast(n), qh, kh, stage, scale);
                 // one partial a (row, head) and a key chunk no window spans: the merge folds it and adds the sink and gate
-                try xpu.launch.dispatch(k.merge, g.s, .{ @as(u32, @intCast(n)) * 24, 1, 1 }, .{ aref(s.part_o, 0).at(), aref(s.part_ml, 0).at(), sink.at(), aref(s.gate, q_at).at(), meta.pos.at(), aref(s.att, q_at).at(), @as(u32, 24), layer.window, @as(u32, 1 << 30), @as(u32, 0), @as(u32, 1), @as(u32, 1) });
+                try xpu.launch.dispatch(k.merge, g.s, .{ @as(u32, @intCast(n)) * qh, 1, 1 }, .{ aref(s.part_o, 0).at(), aref(s.part_ml, 0).at(), sink.at(), aref(s.gate, q_at).at(), meta.pos.at(), aref(s.att, q_at).at(), qh, layer.window, @as(u32, 1 << 30), @as(u32, 0), @as(u32, 1), @as(u32, 1) });
             } else if (g.gl_slice > state.max_rows) {
                 var lg = layer;
                 lg.chunk = ap.prompt_chunk;
@@ -250,8 +258,8 @@ const Run = struct {
         }
         if (sliding) {
             const n: u32 = @min(rows, layer.ring);
-            try pk.kvCopy(&g.p.prefill, g.s, into.k.at(), kv.k.at(), start + rows - n, stage, layer.ring, n, 8);
-            try pk.kvCopy(&g.p.prefill, g.s, into.v.at(), kv.v.at(), start + rows - n, stage, layer.ring, n, 8);
+            try pk.kvCopy(&g.p.prefill, g.s, into.k.at(), kv.k.at(), start + rows - n, stage, layer.ring, n, kh);
+            try pk.kvCopy(&g.p.prefill, g.s, into.v.at(), kv.v.at(), start + rows - n, stage, layer.ring, n, kh);
         }
     }
 
@@ -268,13 +276,15 @@ const Run = struct {
             const rows = @min(state.max_rows, g.rows - base);
             const layer = cache.attentionLayer(&m.weight_plan, v.cache_slot, state.max_rows);
             const start = cache.len + base;
-            const rr = ap.Rows{ .rows = @intCast(rows), .heads = 24, .kv_heads = 8, .last_pos = @intCast(start + rows - 1), .streams = 1 };
+            const qh = m.options.place.qHeads();
+            const kh = m.options.place.kvHeads();
+            const rr = ap.Rows{ .rows = @intCast(rows), .heads = qh, .kv_heads = kh, .last_pos = @intCast(start + rows - 1), .streams = 1 };
             const meta = attention.RowMeta{ .pos = aref(s.pos, base * 4), .seg_of = aref(s.seg_of, base * 4), .segs = aref(s.segs, si * @sizeOf(ap.Seg)) };
-            const q_at = base * state.query_width * 2;
-            const tab_at = base * 24 * ap.extent * 2;
-            try attention.prep(k, g.s, rr, layer, prep, meta, .{ aref(s.q_raw, q_at), aref(s.k_conv, base * state.kv_width * 2), aref(s.v_conv, base * state.kv_width * 2), aref(s.rel_raw, base * state.rel_width * 2) }, .{ aref(w.attn.q_scale.buf, 0), aref(w.attn.rel_scale.buf, 0) }, aref(s.q_prep, q_at), aref(s.rel_prep, base * state.rel_width * 2), kv);
-            try attention.relTable(k, g.s, rr, aref(s.rel_prep, base * state.rel_width * 2), aref(w.attn.rel_projection.buf, 0), aref(s.rel_tab, tab_at));
-            try attention.attend(k, g.s, rr, layer, s.stride, meta, aref(s.q_prep, q_at), kv, aref(s.rel_tab, tab_at), aref(s.part_o, 0), aref(s.part_ml, 0), aref(s.sink, base * 24 * 2), aref(s.gate, q_at), aref(s.att, q_at));
+            const q_at = base * m.options.place.qWidth() * 2;
+            const tab_at = base * @as(usize, qh) * ap.extent * 2;
+            try attention.prep(k, g.s, rr, layer, prep, meta, .{ aref(s.q_raw, q_at), aref(s.k_conv, base * m.options.place.kvWidth() * 2), aref(s.v_conv, base * m.options.place.kvWidth() * 2), aref(s.rel_raw, base * m.options.place.relWidth() * 2) }, .{ aref(w.attn.q_scale.buf, 0), aref(w.attn.rel_scale.buf, 0) }, aref(s.q_prep, q_at), aref(s.rel_prep, base * m.options.place.relWidth() * 2), kv);
+            try attention.relTable(k, g.s, rr, aref(s.rel_prep, base * m.options.place.relWidth() * 2), aref(w.attn.rel_projection.buf, 0), aref(s.rel_tab, tab_at));
+            try attention.attend(k, g.s, rr, layer, s.stride, meta, aref(s.q_prep, q_at), kv, aref(s.rel_tab, tab_at), aref(s.part_o, 0), aref(s.part_ml, 0), aref(s.sink, base * @as(usize, qh) * 2), aref(s.gate, q_at), aref(s.att, q_at));
             base += rows;
         }
     }
@@ -296,10 +306,15 @@ const Run = struct {
         const xs = at(s.xs, 0);
         const gu_w: pe.Weights = .{ .w = tensor(w.gu.weight), .scales = tensor(w.gu.scale), .amax = if (w.gu.amax) |a| tensor(a) else null, .den = if (w.gu.denominator) |d| tensor(d) else null };
         const down_w: pe.Weights = .{ .w = tensor(w.down.weight), .scales = tensor(w.down.scale), .amax = if (w.down.amax) |a| tensor(a) else null, .den = if (w.down.denominator) |d| tensor(d) else null };
+        if (g.m.options.place.split()) if (group.live) |gp| {
+            try xpu.launch.dispatch(gp.zero_w, g.s, .{ @intCast((rows * 8 + 255) / 256), 1, 1 }, .{ at(s.route_ids, 0), at(s.route_weights, 0), @as(u32, @intCast(rows * 8)), g.m.options.place.expertBase(), g.m.options.place.expertCount() });
+        };
         try pe.plan(k, g.s, at(s.route_ids, 0), order, inv, items, count, rows);
         try pe.gather(k, g.s, at(s.mlp_normed, 0), order, xs, rows, state.hidden);
-        try pe.gu(k, g.s, format, xs, gu_w, items, count, at(s.gu, 0), rows, state.hidden, state.intermediate);
-        try pe.down(k, g.s, format, at(s.gu, 0), down_w, items, count, at(s.down, 0), rows, state.intermediate, state.hidden);
+        const base = g.m.options.place.expertBase();
+        const nlocal = g.m.options.place.expertCount();
+        try pe.gu(k, g.s, format, xs, gu_w, items, count, at(s.gu, 0), rows, state.hidden, state.intermediate, base, nlocal);
+        try pe.down(k, g.s, format, at(s.gu, 0), down_w, items, count, at(s.down, 0), rows, state.intermediate, state.hidden, base, nlocal);
         try pe.combine(k, g.s, at(s.down, 0), inv, at(s.route_ids, 0), at(s.route_weights, 0), at(s.mlp_out, 0), rows, state.hidden);
     }
 
@@ -330,7 +345,7 @@ const Run = struct {
             .nvfp4 => try ex.nvfp4DownPrompt(g.s, act, tensor(w.down.weight), tensor(w.down.scale), tensor(w.down.amax.?), tensor(w.down.denominator.?), items, count, members, down, down_call),
             .mxfp8 => try ex.mxfp8DownPrompt(g.s, act, tensor(w.down.weight), tensor(w.down.scale), items, count, members, down, down_call),
         }
-        try ex.combine(g.s, down, ids, at(s.route_weights, 0), at(s.mlp_out, 0), down_call);
+        try ex.combine(g.s, down, ids, at(s.route_weights, 0), at(s.mlp_out, 0), null, down_call);
     }
 
     fn visit(g: Run, cache: *state.Cache, v: *const layer_plan.Visit, taps: ?Ptr) !void {
@@ -372,6 +387,7 @@ const Run = struct {
         xpu.profile.label = "wo";
         try g.dense(w.attn.wo, at(s.att, 0), at(s.attn_dense, 0), rows);
         xpu.profile.label = "";
+        if (g.m.options.place.split()) if (group.live) |gp| try gp.allReduce(at(s.attn_dense, 0).?, @intCast(rows));
         try g.staticPostConv(cache, v.cache_slot, 2, s.attn_dense, w.attn_conv, s.attn_conv);
         try pointwise(&g.p.runtime, g.s, .attention_partial, rows, if (lp.boundary) @intCast(lp.blocks_in + 1) else 0, .{ at(s.p, 0), at(s.attn_conv, 0), at(s.blocks, 0), at(s.partial, 0) });
         try pk.ar(&g.p.prefill, g.s, at(s.blocks, 0), at(s.partial, 0), tensor(m.weights.mlp_queries[v.layer]), at(s.mlp_ar, 0), @intCast(lp.mlp_sources), 1, @intCast(rows));
@@ -381,6 +397,7 @@ const Run = struct {
         } else try g.norm(at(s.mlp_ar, 0), w.mlp_norm, at(s.mlp_normed, 0), rows);
         if (g.old_experts) try glue.router(&g.p.glue, g.s, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.route_ids, 0), at(s.route_weights, 0), @intCast(rows)) else try pk.router16(&g.p.prefill, g.s, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.route_ids, 0), at(s.route_weights, 0), @intCast(rows), at(s.logits_all, 0));
         try g.routedExperts(v.layer);
+        if (g.m.options.place.split()) if (group.live) |gp| try gp.allReduce(at(s.mlp_out, 0).?, @intCast(rows));
         try g.staticPostConv(cache, v.cache_slot, 3, s.mlp_out, w.mlp_conv, s.mlp_conv);
         try pointwise(&g.p.runtime, g.s, .mlp_partial, rows, 0, .{ at(s.partial, 0), at(s.mlp_conv, 0), at(s.p, 0) });
         if (v.cache_slot == 5) try g.copyBf16(at(s.p, 0), at(s.prelude, 0), rows * state.hidden);
@@ -424,6 +441,7 @@ pub fn run(m: *const Model, s: *state.Scratch, cache: *state.Cache, ids: []const
     try m.r.upload(s.pos, std.mem.sliceAsBytes(pos_buf[0..rows]));
     try m.r.upload(s.seg_of, std.mem.sliceAsBytes(zero_buf[0..rows]));
     try m.r.upload(s.segs, std.mem.sliceAsBytes(segs[0..slices]));
+    if (m.options.place.rank == 0) if (group.live) |gp| try gp.note(.forward, ids, if (options.all) 1 else 0, @intCast(cache.len));
     const g = Run{ .m = m, .p = p, .s = stream, .sc = s, .rows = rows, .old_experts = options.old_experts, .old_dense = options.old_dense, .old_loop = options.old_loop, .old_sliding = options.old_sliding, .gl_slice = gl_slice, .sl_slice = sl_slice, .sl_seg0 = gl_n };
     try glue.embedNorm(&p.glue, stream, at(s.ids, 0), tensor(m.weights.embed), tensor(m.weights.embed_norm), at(s.p, 0), @intCast(rows));
     for (m.weight_plan.visits[0..m.weight_plan.n_visits]) |*v| try g.visit(cache, v, options.taps);
@@ -448,6 +466,32 @@ pub fn run(m: *const Model, s: *state.Scratch, cache: *state.Cache, ids: []const
 }
 
 fn head(m: *const Model, p: *const model_file.Pipelines, stream: xpu.Stream, input: Ptr, logits: Ptr, rows: usize) !void {
+    if (m.options.place.split()) {
+        if (group.live) |gp| {
+            const vocab_n = m.options.place.vocabCount();
+            const tight_bytes = rows * @as(usize, vocab_n) * 4;
+            var tight = try m.r.alloc(tight_bytes);
+            defer tight.free();
+            var peer = try m.r.alloc(tight_bytes);
+            defer peer.free();
+            if (m.weights.unembed_q8) |h| {
+                try dense_q8_kernels.head(&p.dense_q8, stream, tensor(h), input, tight.ptr, @intCast(rows), vocab_n);
+            } else try glue.logits(&p.glue, stream, input, tensor(m.weights.unembed), tight.ptr, @intCast(rows), vocab_n);
+            try stream.synchronize();
+            const full: usize = m.config.text.unpadded_vocab;
+            const own: usize = m.options.place.vocabBase();
+            const other: usize = (full + 1) / 2;
+            for (0..rows) |r| {
+                const off = r * @as(usize, vocab_n) * 4;
+                try gp.headPull(plus(tight.ptr, off).?, plus(peer.ptr, off).?, vocab_n);
+                if (m.options.place.rank == 0) {
+                    try m.r.copy(.{ .rt = m.r, .ptr = plus(logits, (r * full + own) * 4), .len = vocab_n * 4 }, .{ .rt = m.r, .ptr = plus(tight.ptr, off), .len = vocab_n * 4 }, vocab_n * 4);
+                    try m.r.copy(.{ .rt = m.r, .ptr = plus(logits, (r * full + other) * 4), .len = vocab_n * 4 }, .{ .rt = m.r, .ptr = plus(peer.ptr, off), .len = vocab_n * 4 }, vocab_n * 4);
+                }
+            }
+            return;
+        }
+    }
     if (m.weights.unembed_q8) |h| {
         try dense_q8_kernels.head(&p.dense_q8, stream, tensor(h), input, logits, @intCast(rows), m.config.text.unpadded_vocab);
     } else try glue.logits(&p.glue, stream, input, tensor(m.weights.unembed), logits, @intCast(rows), m.config.text.unpadded_vocab);

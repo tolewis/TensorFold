@@ -80,9 +80,15 @@ pub fn attend(k: *const Kernels, s: xpu.Stream, r: planning.Rows, l: planning.La
     return attendAs(k, s, if (planning.usePrompt(r, l)) .prompt else .decode, r, l, stride, meta, q, kv, tab, part_o, part_ml, sink, gate, out);
 }
 
+var attn_logged = false;
+
 /// `attend` on a path the caller names (the contract runs the prompt kernel at a few rows too).
 pub fn attendAs(k: *const Kernels, s: xpu.Stream, path: planning.Path, r: planning.Rows, l: planning.Layer, stride: u32, meta: RowMeta, q: Ref, kv: Cache, tab: Ref, part_o: Ref, part_ml: Ref, sink: Ref, gate: Ref, out: Ref) Error!void {
     const launch = try planning.attendAs(r, l, stride, path);
+    if (!attn_logged) {
+        attn_logged = true;
+        std.log.info("inkling2: attn {s} heads {d} kv {d} splits {d} grid {d},{d}", .{ @tagName(launch.path), r.heads, r.kv_heads, planning.flash_splits, launch.grid[0], launch.grid[1] });
+    }
     const scale: f32 = 1.0 / @sqrt(@as(f32, planning.head_dim));
     if (launch.path == .decode) {
         try xpu.launch.dispatch(k.decode, s, launch.grid, .{

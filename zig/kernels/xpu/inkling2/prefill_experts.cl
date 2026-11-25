@@ -201,6 +201,7 @@ __kernel void P(gather)(__global const ushort *x, __global const int *order, __g
   const uint item = get_group_id(1);                                                                               \
   if (item >= (uint)item_count[0]) return;                                                                         \
   const uint e = (uint)items[3 * item], first = (uint)items[3 * item + 1], cnt = (uint)items[3 * item + 2];       \
+  const uint le = e - base;                                                                                            \
   const uint sg = get_sub_group_id(), lane = get_sub_group_local_id();                                             \
   const uint col0 = (get_group_id(0) * PF_NSG + sg) * 32u;                                                         \
   const uint tiles = (cnt + 7u) / 8u;                                                                              \
@@ -265,16 +266,17 @@ __kernel void P(gather)(__global const ushort *x, __global const int *order, __g
 // bytes (eight blocks) at a time.
 static inline void P(nv_gemm)(__global const ushort *xs, __global const uchar *w, __global const uchar *s, __global const float *amax,
                               __global const float *den, __global const int *items, __global const int *item_count, __global ushort *out,
-                              uint k, uint n, bool gu) {
+                              uint k, uint n, uint base, uint nlocal, bool gu) {
   PF_ITEM_SETUP
   const uint rows_total = gu ? 2u * n : n;
   if (col0 >= rows_total) return;
+  if (e < base || le >= nlocal) return;
   const uint nb = k / 16u;
-  global const uchar *wr0 = w + ((ulong)e * rows_total + col0 + lane) * (k / 2u);
+  global const uchar *wr0 = w + ((ulong)le * rows_total + col0 + lane) * (k / 2u);
   global const uchar *wr1 = wr0 + 16ul * (k / 2u);
-  global const uchar *sr0 = s + ((ulong)e * rows_total + col0 + lane) * nb;
+  global const uchar *sr0 = s + ((ulong)le * rows_total + col0 + lane) * nb;
   global const uchar *sr1 = sr0 + 16ul * nb;
-  const float phi26 = P(phi)(amax, den, e) * 0x1p26f;
+  const float phi26 = P(phi)(amax, den, le) * 0x1p26f;
   PF_ZERO_ACC
   for (uint c = 0; c < nb / 8u; c++) {
     const uint16 v0 = vload16(0, (__global const uint *)(wr0 + 64u * c));
@@ -298,14 +300,15 @@ static inline void P(nv_gemm)(__global const ushort *xs, __global const uchar *w
 
 // MXFP8. W: k e4m3 bytes a row, S: k / 32 UE8M0 bytes a row; 64 bytes (two blocks) at a time.
 static inline void P(mx_gemm)(__global const ushort *xs, __global const uchar *w, __global const uchar *s, __global const int *items,
-                              __global const int *item_count, __global ushort *out, uint k, uint n, bool gu) {
+                              __global const int *item_count, __global ushort *out, uint k, uint n, uint base, uint nlocal, bool gu) {
   PF_ITEM_SETUP
   const uint rows_total = gu ? 2u * n : n;
   if (col0 >= rows_total) return;
+  if (e < base || le >= nlocal) return;
   const uint nb = k / 32u;
-  global const uchar *wr0 = w + ((ulong)e * rows_total + col0 + lane) * k;
+  global const uchar *wr0 = w + ((ulong)le * rows_total + col0 + lane) * k;
   global const uchar *wr1 = wr0 + 16ul * k;
-  global const uchar *sr0 = s + ((ulong)e * rows_total + col0 + lane) * nb;
+  global const uchar *sr0 = s + ((ulong)le * rows_total + col0 + lane) * nb;
   global const uchar *sr1 = sr0 + 16ul * nb;
   PF_ZERO_ACC
   for (uint c = 0; c < nb / 2u; c++) {
@@ -344,27 +347,27 @@ static inline void P(mx_gemm)(__global const ushort *xs, __global const uchar *w
 #if PF_ONLY & PF_K_NV_GU
 PF_GEMM_ATTR __kernel void P(nvfp4_gu)(__global const ushort *xs, __global const uchar *w, __global const uchar *s, __global const float *amax,
                                        __global const float *den, __global const int *items, __global const int *item_count,
-                                       __global ushort *ys, uint k, uint n) {
-  P(nv_gemm)(xs, w, s, amax, den, items, item_count, ys, k, n, true);
+                                       __global ushort *ys, uint k, uint n, uint base, uint nlocal) {
+  P(nv_gemm)(xs, w, s, amax, den, items, item_count, ys, k, n, base, nlocal, true);
 }
 #endif
 #if PF_ONLY & PF_K_NV_DOWN
 PF_GEMM_ATTR __kernel void P(nvfp4_down)(__global const ushort *xs, __global const uchar *w, __global const uchar *s, __global const float *amax,
                                          __global const float *den, __global const int *items, __global const int *item_count,
-                                         __global ushort *ds, uint k, uint n) {
-  P(nv_gemm)(xs, w, s, amax, den, items, item_count, ds, k, n, false);
+                                         __global ushort *ds, uint k, uint n, uint base, uint nlocal) {
+  P(nv_gemm)(xs, w, s, amax, den, items, item_count, ds, k, n, base, nlocal, false);
 }
 #endif
 #if PF_ONLY & PF_K_MX_GU
 PF_GEMM_ATTR __kernel void P(mxfp8_gu)(__global const ushort *xs, __global const uchar *w, __global const uchar *s, __global const int *items,
-                                       __global const int *item_count, __global ushort *ys, uint k, uint n) {
-  P(mx_gemm)(xs, w, s, items, item_count, ys, k, n, true);
+                                       __global const int *item_count, __global ushort *ys, uint k, uint n, uint base, uint nlocal) {
+  P(mx_gemm)(xs, w, s, items, item_count, ys, k, n, base, nlocal, true);
 }
 #endif
 #if PF_ONLY & PF_K_MX_DOWN
 PF_GEMM_ATTR __kernel void P(mxfp8_down)(__global const ushort *xs, __global const uchar *w, __global const uchar *s, __global const int *items,
-                                         __global const int *item_count, __global ushort *ds, uint k, uint n) {
-  P(mx_gemm)(xs, w, s, items, item_count, ds, k, n, false);
+                                         __global const int *item_count, __global ushort *ds, uint k, uint n, uint base, uint nlocal) {
+  P(mx_gemm)(xs, w, s, items, item_count, ds, k, n, base, nlocal, false);
 }
 #endif
 
@@ -398,8 +401,9 @@ __kernel void P(combine)(__global const ushort *ds, __global const int *inv, __g
   if (col >= n) return;
   float4 sum = (float4)(0.0f);
   for (uint t = 0; t < 8; t++) {
-    const ushort4 v = vload4(0, ds + (ulong)rows[t] * n + col);
     const float w = wts[t];
+    if (w == 0.0f) continue;
+    const ushort4 v = vload4(0, ds + (ulong)rows[t] * n + col);
     sum.x += w * P(bf_to_f)(v.x);
     sum.y += w * P(bf_to_f)(v.y);
     sum.z += w * P(bf_to_f)(v.z);

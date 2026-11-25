@@ -112,20 +112,20 @@ pub const Weights = struct {
 };
 
 /// The GU GEMM over sorted rows: out[sorted][n] = the activation of (gate, up) = xs[sorted] . W[expert] (rows 2c, 2c + 1).
-pub fn gu(k: *const Kernels, s: xpu.Stream, format: Format, xs: Ref, w: Weights, items: Ref, count: Ref, out: Ref, rows: u32, kdim: u32, n: u32) !void {
+pub fn gu(k: *const Kernels, s: xpu.Stream, format: Format, xs: Ref, w: Weights, items: Ref, count: Ref, out: Ref, rows: u32, kdim: u32, n: u32, base: u32, nlocal: u32) !void {
     const groups: [3]u32 = .{ (2 * n + group_cols - 1) / group_cols, maxItems(rows), 1 };
     switch (format) {
-        .nvfp4 => try xpu.launch.dispatch(k.nvfp4_gu, s, groups, .{ xs, w.w, w.scales, w.amax, w.den, items, count, out, kdim, n }),
-        .mxfp8 => try xpu.launch.dispatch(k.mxfp8_gu, s, groups, .{ xs, w.w, w.scales, items, count, out, kdim, n }),
+        .nvfp4 => try xpu.launch.dispatch(k.nvfp4_gu, s, groups, .{ xs, w.w, w.scales, w.amax, w.den, items, count, out, kdim, n, base, nlocal }),
+        .mxfp8 => try xpu.launch.dispatch(k.mxfp8_gu, s, groups, .{ xs, w.w, w.scales, items, count, out, kdim, n, base, nlocal }),
     }
 }
 
 /// The down GEMM over sorted rows: out[sorted][n] = act[sorted] . W[expert].
-pub fn down(k: *const Kernels, s: xpu.Stream, format: Format, act: Ref, w: Weights, items: Ref, count: Ref, out: Ref, rows: u32, kdim: u32, n: u32) !void {
+pub fn down(k: *const Kernels, s: xpu.Stream, format: Format, act: Ref, w: Weights, items: Ref, count: Ref, out: Ref, rows: u32, kdim: u32, n: u32, base: u32, nlocal: u32) !void {
     const groups: [3]u32 = .{ (n + group_cols - 1) / group_cols, maxItems(rows), 1 };
     switch (format) {
-        .nvfp4 => try xpu.launch.dispatch(k.nvfp4_down, s, groups, .{ act, w.w, w.scales, w.amax, w.den, items, count, out, kdim, n }),
-        .mxfp8 => try xpu.launch.dispatch(k.mxfp8_down, s, groups, .{ act, w.w, w.scales, items, count, out, kdim, n }),
+        .nvfp4 => try xpu.launch.dispatch(k.nvfp4_down, s, groups, .{ act, w.w, w.scales, w.amax, w.den, items, count, out, kdim, n, base, nlocal }),
+        .mxfp8 => try xpu.launch.dispatch(k.mxfp8_down, s, groups, .{ act, w.w, w.scales, items, count, out, kdim, n, base, nlocal }),
     }
 }
 
