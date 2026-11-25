@@ -29,7 +29,9 @@ pub fn launch(k: Kernel, s: Stream, groups: [3]u32) Error!void {
 fn launchSignal(k: Kernel, s: Stream, groups: [3]u32, signal: ze.H) Error!void {
     const g: ze.GroupCount = .{ .x = groups[0], .y = groups[1], .z = groups[2] };
     if (g.x == 0 or g.y == 0 or g.z == 0) return error.Invalid;
+    const t0 = profile.nowNs();
     try k.ctx.d.check(k.ctx.d.api.zeCommandListAppendLaunchKernel(s.list, k.handle, &g, signal, 0, null), "zeCommandListAppendLaunchKernel");
+    profile.noteAppend(4, profile.nowNs() - t0);
 }
 
 /// Sets every argument of the tuple in order (buffer, device pointer, f32 or u32) and queues the kernel.

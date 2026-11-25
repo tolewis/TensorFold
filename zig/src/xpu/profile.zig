@@ -11,6 +11,34 @@ const Error = @import("context.zig").Error;
 /// The profile launches report to, or none.
 pub var active: ?*Profile = null;
 
+/// Host time of the exchange appends, when TF_TP_APPEND=1. Sites: copy, flag write, event create, event wait, kernel launch.
+pub var host_append_ns: [5]u64 = @splat(0);
+pub var append_n: [5]u64 = @splat(0);
+pub var append_max: [5]u64 = @splat(0);
+pub var append_slow: [5]u64 = @splat(0);
+
+pub fn noteAppend(site: u8, dt: u64) void {
+    if (std.c.getenv("TF_TP_APPEND") == null) return;
+    const i: usize = site;
+    append_n[i] += 1;
+    host_append_ns[i] += dt;
+    if (dt > append_max[i]) append_max[i] = dt;
+    if (dt > 50_000) append_slow[i] += 1;
+}
+
+pub fn reportAppend(rank: u32) void {
+    if (std.c.getenv("TF_TP_APPEND") == null) return;
+    const name = [_][]const u8{ "copy", "write", "create", "wait", "launch" };
+    for (name, 0..) |s, i| {
+        const n: f64 = @floatFromInt(@max(append_n[i], 1));
+        std.log.info("inkling2: append {s} rank {d} n {d} total {d:.1} us mean {d:.1} us max {d:.1} us over50us {d}", .{ s, rank, append_n[i], @as(f64, @floatFromInt(host_append_ns[i])) / 1e3, @as(f64, @floatFromInt(host_append_ns[i])) / 1e3 / n, @as(f64, @floatFromInt(append_max[i])) / 1e3, append_slow[i] });
+    }
+    host_append_ns = @splat(0);
+    append_n = @splat(0);
+    append_max = @splat(0);
+    append_slow = @splat(0);
+}
+
 pub fn nowNs() u64 {
     var ts: platform.c.timespec = undefined;
     _ = platform.c.clock_gettime(platform.c.CLOCK.MONOTONIC, &ts);

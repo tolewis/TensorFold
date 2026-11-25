@@ -57,6 +57,9 @@ pub const Group = struct {
     add_f32: xpu.Kernel = undefined,
     down: xpu.Kernel = undefined,
     f32row: ?*anyopaque = null,
+    /// Counter events of this token. Qwen destroys them after the stream settles. A live set makes the next wait slower.
+    evs: [256]ze.H = undefined,
+    ev_n: u32 = 0,
     zero: xpu.Kernel = undefined,
     filter: xpu.Kernel = undefined,
     mod: xpu.Module = undefined,
@@ -218,7 +221,9 @@ pub const Group = struct {
     fn exPush(g: *Group, partial: *anyopaque, bytes: usize) !*anyopaque {
         const par: usize = @intCast(g.seq % 2);
         const pb = g.peer_blk.?;
+        const c0 = xpu.profile.nowNs();
         try g.r.stream(g.ctx).copy(off(pb, par * slot_bytes), partial, bytes);
+        xpu.profile.noteAppend(0, xpu.profile.nowNs() - c0);
         try g.writeFlag(off(pb, blk_flag + par * 8));
         try g.waitFlag(off(g.blk.?, blk_flag + par * 8));
         return off(g.blk.?, par * slot_bytes);
@@ -232,7 +237,15 @@ pub const Group = struct {
     fn writeFlag(g: *Group, flag: *anyopaque) !void {
         if (g.ex != 3) return;
         const desc: ZexWriteDesc = .{ .writeScope = 4 };
+        const t0 = xpu.profile.nowNs();
         try g.r.drv.check(g.zex.?(g.r.list, &desc, flag, g.seq), "zexWrite");
+        xpu.profile.noteAppend(1, xpu.profile.nowNs() - t0);
+    }
+
+    /// Qwen's check() after a settle: the waits have completed, so the counter events go back to the driver.
+    pub fn releaseEvents(g: *Group) void {
+        for (g.evs[0..g.ev_n]) |e| _ = g.r.drv.api.zeEventDestroy(e);
+        g.ev_n = 0;
     }
 
     fn waitFlag(g: *Group, word: *anyopaque) !void {
@@ -242,9 +255,17 @@ pub const Group = struct {
         var desc: CbEventDesc = .{ .flags = 1, .signal = 2, .wait = 2 };
         desc.pNext = &sync;
         var ev: ze.H = null;
+        const t0 = xpu.profile.nowNs();
         try g.r.drv.check(cb(g.r.ctx, g.r.device, &desc, &ev), "zeEventCounterBasedCreate");
+        if (g.ev_n < g.evs.len) {
+            g.evs[g.ev_n] = ev;
+            g.ev_n += 1;
+        }
+        xpu.profile.noteAppend(2, xpu.profile.nowNs() - t0);
         var wa = [1]ze.H{ev};
+        const t1 = xpu.profile.nowNs();
         try g.r.drv.check(g.r.drv.api.zeCommandListAppendWaitOnEvents(g.r.list, 1, &wa), "wait");
+        xpu.profile.noteAppend(3, xpu.profile.nowNs() - t1);
     }
 
     fn hostAdd(g: *Group, partial: *anyopaque, n: usize) !void {

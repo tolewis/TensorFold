@@ -545,7 +545,9 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     }
     try g.commitFullHistories(segments);
     if (xpu.profile.active) |prof| prof.enqueued();
+    xpu.profile.reportAppend(m.options.place.rank);
     try stream.synchronize();
+    if (group.live) |gp| gp.releaseEvents();
 }
 
 test "the final plan unembeds one row unless all rows or taps are asked" {
