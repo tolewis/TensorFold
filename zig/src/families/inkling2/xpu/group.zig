@@ -103,8 +103,17 @@ pub const Group = struct {
         g.gc = (try g.r.alloc(16)).ptr;
         g.filter = try g.mod.kernel("tp_filter_items", .{ 1, 1, 1 });
         const name = shmName();
-        g.map = try mapShm(name, p.rank);
-        try g.handshake(name);
+        // A stale shm file left by an earlier run is the same path. Rank 0 unlinks it and creates a fresh one before it
+        // binds the socket. Rank 1 therefore maps only after the socket handshake connects it to the live rank 0, so it
+        // opens the fresh inode. Mapping first let rank 1 keep the stale file and read an old record word (2026-11-26:
+        // "wait saw seq 2, wanted 3", a drafted run started after production left /dev/shm/tf-tp-inkling2-prod).
+        if (p.rank == 0) {
+            g.map = try mapShm(name, p.rank);
+            try g.handshake(name);
+        } else {
+            try g.handshake(name);
+            g.map = try mapShm(name, p.rank);
+        }
         qg.q.setRank(p.rank);
         _ = setenv("TF_TP_SHM", "/dev/shm/tf-tp-inkling2-qwen", 1);
         g.qdev = try qg.dev.bind(@constCast(&r.drv.lib), ctx.gpu.driver, r.ctx, r.device, r.list, g.add.handle, ctx.gpu.props.timerResolution);
