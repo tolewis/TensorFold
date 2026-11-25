@@ -18,9 +18,9 @@ pub fn normRouter() bool {
     if (norm_router) return true;
     if (std.c.getenv("INK2_NORM_ROUTER")) |p| {
         const s = std.mem.span(p);
-        return s.len > 0 and s[0] == '1';
+        if (s.len > 0 and s[0] == '0') return false;
     }
-    return false;
+    return true;
 }
 
 pub fn downEpi() bool {
