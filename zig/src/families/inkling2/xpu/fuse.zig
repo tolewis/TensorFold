@@ -6,6 +6,7 @@ const xpu = @import("xpu");
 pub const Ref = ?*anyopaque;
 
 pub var force: ?bool = null;
+pub var seg: bool = true;
 
 pub fn enabled() bool {
     if (force) |v| return v;

@@ -99,6 +99,11 @@ const Run = struct {
 
     /// Every projection uses the shared matvec's FP32 reduction and one BF16 store: over BF16 weights, or over Q8_0 blocks
     /// (q8.zig) when the model loaded them re-encoded.
+    fn projN(g: Run, weight: Tensor) u32 {
+        _ = g;
+        return @intCast(weight.shape[weight.rank - 2]);
+    }
+
     fn dense(g: Run, weight: Tensor, input: Ptr, out: Ptr, rows: usize) !void {
         const k: u32 = @intCast(weight.shape[weight.rank - 1]);
         const n: u32 = @intCast(weight.shape[weight.rank - 2]);
@@ -322,18 +327,32 @@ const Run = struct {
         }
         const knorm = if (gated or lp.kind == .global) at(s.k_norm, 0) else at(s.q_norm, 0);
         const vnorm = if (gated or lp.kind == .global) at(s.v_norm, 0) else at(s.q_norm, 0);
-        xpu.profile.label = "wq";
-        try g.dense(w.attn.wq, at(s.q_norm, 0), at(s.q_raw, 0), rows);
-        xpu.profile.label = "wk";
-        try g.dense(w.attn.wk, knorm, at(s.k_raw, 0), rows);
-        xpu.profile.label = "wv";
-        try g.dense(w.attn.wv, vnorm, at(s.v_raw, 0), rows);
-        xpu.profile.label = "wr";
-        try g.dense(w.attn.wr, at(s.q_norm, 0), at(s.rel_raw, 0), rows);
+        if (fuse.seg and rows == 1 and w.attn.wq.q8) {
+            xpu.profile.label = "wqkv";
+            const k: u32 = @intCast(w.attn.wq.shape[w.attn.wq.rank - 1]);
+            try dense_q8_kernels.seg1(&g.p.dense_q8, g.s, .{
+                at(s.q_norm, 0), knorm, vnorm, at(s.q_norm, 0), at(s.q_norm, 0),
+            }, .{
+                tensor(w.attn.wq), tensor(w.attn.wk), tensor(w.attn.wv), tensor(w.attn.wr), tensor(w.attn.gate),
+            }, .{
+                at(s.q_raw, 0), at(s.k_raw, 0), at(s.v_raw, 0), at(s.rel_raw, 0), at(s.gate, 0),
+            }, .{
+                g.projN(w.attn.wq), g.projN(w.attn.wk), g.projN(w.attn.wv), g.projN(w.attn.wr), g.projN(w.attn.gate),
+            }, k);
+        } else {
+            xpu.profile.label = "wq";
+            try g.dense(w.attn.wq, at(s.q_norm, 0), at(s.q_raw, 0), rows);
+            xpu.profile.label = "wk";
+            try g.dense(w.attn.wk, knorm, at(s.k_raw, 0), rows);
+            xpu.profile.label = "wv";
+            try g.dense(w.attn.wv, vnorm, at(s.v_raw, 0), rows);
+            xpu.profile.label = "wr";
+            try g.dense(w.attn.wr, at(s.q_norm, 0), at(s.rel_raw, 0), rows);
+            xpu.profile.label = "gate";
+            try g.dense(w.attn.gate, at(s.q_norm, 0), at(s.gate, 0), rows);
+        }
         xpu.profile.label = "sink";
         try g.dense(w.attn.sink, at(s.q_norm, 0), at(s.sink, 0), rows);
-        xpu.profile.label = "gate";
-        try g.dense(w.attn.gate, at(s.q_norm, 0), at(s.gate, 0), rows);
         xpu.profile.label = "";
         try g.attendSegments(v, segments);
         xpu.profile.label = "wo";
