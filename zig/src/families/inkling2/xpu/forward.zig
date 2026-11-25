@@ -459,6 +459,13 @@ const Run = struct {
             try runtime.mlpPartial(&g.p.runtime, g.s, at(s.partial, 0), at(s.mlp_conv, 0), at(s.p, 0), rows);
         }
         if (v.cache_slot == 5) try g.copyBf16(at(s.p, 0), at(s.prelude, 0), rows * state.hidden);
+        if (dump_dir_len > 0) {
+            dumpRow(g.m, g.s, s.p, state.hidden * 2, "p");
+            dumpRow(g.m, g.s, s.att, state.hidden * 2, "att");
+            dumpRow(g.m, g.s, s.mlp_normed, state.hidden * 2, "mlpnorm");
+            dumpRow(g.m, g.s, s.mlp_out, state.hidden * 2, "mlpout");
+            dump_visit += 1;
+        }
         // A window stages every layer's conv rows into one shared buffer, so committing once at the end would copy the last
         // layer's rows into every slot's history. Each visit commits its own slot's last three rows instead.
         if (rows > 1) {
@@ -479,6 +486,36 @@ const Run = struct {
         };
     }
 };
+
+
+// Per-visit row dumps for the bit check (TF_STAGE_DUMP=dir). One file a visit and tensor, row `TF_STAGE_ROW`.
+var dump_dir_buf: [256]u8 = undefined;
+var dump_dir_len: usize = 0;
+var dump_row: usize = 1;
+var dump_visit: usize = 0;
+
+pub fn dumpEnable(dir: []const u8, at_row: usize) void {
+    dump_dir_len = @min(dir.len, dump_dir_buf.len);
+    @memcpy(dump_dir_buf[0..dump_dir_len], dir[0..dump_dir_len]);
+    dump_row = at_row;
+    dump_visit = 0;
+}
+
+fn dumpRow(m: *const Model, s: xpu.Stream, buf: rt.Buffer, row_bytes: usize, tag: []const u8) void {
+    if (dump_dir_len == 0) return;
+    var stack: [state.hidden * 2]u8 = undefined;
+    const n = @min(row_bytes, stack.len);
+    const b = rt.Buffer{ .rt = m.r, .ptr = @ptrFromInt(@intFromPtr(buf.ptr.?) + dump_row * row_bytes), .len = n };
+    s.synchronize() catch return;
+    m.r.download(stack[0..n], b) catch return;
+    var path_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/v{d}-{s}.bin", .{ dump_dir_buf[0..dump_dir_len], dump_visit, tag }) catch return;
+    path_buf[path.len] = 0;
+    const fd = std.c.open(path_buf[0..path.len :0], .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    if (fd < 0) return;
+    _ = std.c.write(fd, stack[0..n].ptr, n);
+    _ = std.c.close(fd);
+}
 
 fn bf16bits(x: f32) u16 {
     const bits: u32 = @bitCast(x);
@@ -650,6 +687,7 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     var wrote: [state.visit_slots]u8 = @splat(0);
     const g = Run{ .m = m, .p = p, .s = stream, .sc = s, .wrote = if (fuse.roleConv() and rows == 1) &wrote else null };
     try glue.embedNorm(&p.glue, stream, at(s.ids, 0), tensor(m.weights.embed), tensor(m.weights.embed_norm), at(s.p, 0), @intCast(rows));
+    dumpRow(m, stream, s.p, state.hidden * 2, "p0");
     for (m.weight_plan.visits[0..m.weight_plan.n_visits]) |*v| try g.visit(v, segments, rows, options.taps);
     try g.widen(at(s.p, 0), at(s.partial, 0), rows);
     const final = finalPlan(rows, options.all, options.taps != null);

@@ -898,6 +898,7 @@ fn verifyBits(gpa: std.mem.Allocator, io: std.Io, m: *const ink.model.Model, scr
     while (i < n) : (i += 1) {
         cache.len = from + i;
         try cache.begin(1);
+        ink.forward.dumpEnable(if (i == 1) (if (std.c.getenv("TF_DUMP_PLAIN")) |e| std.mem.span(e) else "") else "", 0);
         try ink.forward.runShared(m, scratch, &.{.{ .cache = cache, .rows = 1 }}, ids[from + i ..][0..1], .{});
         try r.download(std.mem.sliceAsBytes(plain[i * vocab ..][0..vocab]), cache.logits);
         try r.sync();
@@ -911,6 +912,7 @@ fn verifyBits(gpa: std.mem.Allocator, io: std.Io, m: *const ink.model.Model, scr
     try grabRef(r, cache.history(0, 3), pvconv);
     cache.len = from;
     try cache.begin(n);
+    ink.forward.dumpEnable(if (std.c.getenv("TF_DUMP_WIN")) |e| std.mem.span(e) else "", 1);
     try ink.forward.runShared(m, scratch, &.{.{ .cache = cache, .rows = n }}, ids[from..][0..n], .{ .all = true, .taps = scratch.taps.?.ptr });
     try r.download(std.mem.sliceAsBytes(host[0 .. n * vocab]), scratch.logits_all);
     try r.sync();
