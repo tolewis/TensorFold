@@ -554,7 +554,7 @@ fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) 
         // the sink is inside the segmented launch only for one row; every other row count needs the standalone launch
         if (!(fuse.sinkSeg() and rows == 1 and w.attn.wq.q8)) {
             xpu.profile.label = "sink";
-            try g.dense(w.attn.sink, at(s.q_norm, 0), at(s.sink, 0), rows);
+            try g.dense(w.attn.sink, at(s.q_norm, 0), at(s.sink, 0), null, rows);
         }
         xpu.profile.label = "";
         try g.attendSegments(v, segments);
