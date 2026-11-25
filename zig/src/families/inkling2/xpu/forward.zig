@@ -379,9 +379,28 @@ const Run = struct {
             const tab_at = base * pl.qHeads() * ap.extent * 2;
             try attention.prep(k, g.s, rr, layer, prep, meta, .{ aref(s.q_raw, q_at), aref(s.k_conv, base * state.kv_width * 2), aref(s.v_conv, base * state.kv_width * 2), aref(s.rel_raw, base * pl.relWidth() * 2) }, .{ aref(w.attn.q_scale.buf, 0), aref(w.attn.rel_scale.buf, 0) }, aref(s.q_prep, q_at), aref(s.rel_prep, tab_at), kv);
             try attention.relTable(k, g.s, rr, aref(s.rel_prep, tab_at), aref(w.attn.rel_projection.buf, 0), aref(s.rel_tab, tab_at));
-            const part = base * pl.qHeads() * s.stride * ap.head_dim * 4;
-            const part_ml = base * pl.qHeads() * s.stride * 8;
-            try attention.attend(k, g.s, rr, layer, s.stride, meta, aref(s.q_prep, q_at), kv, aref(s.rel_tab, tab_at), aref(s.part_o, part), aref(s.part_ml, part_ml), aref(s.sink, base * pl.qHeads() * 2), aref(s.gate, q_at), aref(s.att, q_at));
+            // A window of up to decode_rows rows attends one row a launch, each with its own last position. The plan splits
+            // the key range by last_pos, so a batched window would give an earlier row a longer range and other sums than
+            // plain decode gives that row. Same kernel, same plan, same bits.
+            if (rows <= decode_rows) {
+                var r: usize = 0;
+                while (r < rows) : (r += 1) {
+                    const at_row = base + r;
+                    const rr1 = ap.Rows{ .rows = 1, .heads = pl.qHeads(), .kv_heads = pl.kvHeads(), .last_pos = @intCast(start + r), .streams = 1 };
+                    const meta1 = attention.RowMeta{
+                        .pos = aref(s.pos, at_row * 4),
+                        .seg_of = aref(s.seg_of, at_row * 4),
+                        .segs = aref(s.segs, si * @sizeOf(ap.Seg)),
+                    };
+                    const q1 = at_row * pl.qWidth() * 2;
+                    const tab1 = at_row * pl.qHeads() * ap.extent * 2;
+                    try attention.attend(k, g.s, rr1, layer, s.stride, meta1, aref(s.q_prep, q1), kv, aref(s.rel_tab, tab1), aref(s.part_o, at_row * pl.qHeads() * s.stride * ap.head_dim * 4), aref(s.part_ml, at_row * pl.qHeads() * s.stride * 8), aref(s.sink, at_row * pl.qHeads() * 2), aref(s.gate, q1), aref(s.att, q1));
+                }
+            } else {
+                const part = base * pl.qHeads() * s.stride * ap.head_dim * 4;
+                const part_ml = base * pl.qHeads() * s.stride * 8;
+                try attention.attend(k, g.s, rr, layer, s.stride, meta, aref(s.q_prep, q_at), kv, aref(s.rel_tab, tab_at), aref(s.part_o, part), aref(s.part_ml, part_ml), aref(s.sink, base * pl.qHeads() * 2), aref(s.gate, q_at), aref(s.att, q_at));
+            }
             base += rows;
         }
     }
