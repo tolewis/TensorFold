@@ -224,6 +224,111 @@ KERNEL(256) void tf_ink2_zeta_wide(
   if (lane == 0) zeta[pack4 ? ((size_t)row * 4 + role) * RANK + r : (size_t)row * RANK + r] = FUSE_ZETA(dot);
 }
 
+// Grid (16, roles, rows). The prologue's AR for the group's source row, then the message gate projection over four
+// sub-groups a rank. The AR is the code of tf_ink2_fuse_pre_q, run by every group, so the bits do not move.
+KERNEL(256) void tf_ink2_pre_zeta(
+    global const ushort *p, global float *partial, global const ushort *blocks, global const float *queries, global float *ar,
+    global const float *messages, global const ushort *down0, global const ushort *down1, global const ushort *down2,
+    global float *zeta, uint rows, uint blocks_stride, uint sources, uint roles, uint local_src, uint core, uint msg_entries) {
+  const uint g = get_group_id(0), role = get_group_id(1), row = get_group_id(2);
+  const uint t = get_local_id(0), lane = get_sub_group_local_id(), sg = get_sub_group_id();
+  if (row >= rows || role >= roles || g >= 16 || sources == 0 || sources > 5) return;
+  const uint src = local_src ? 0 : role;
+  const uint r = g * 4 + (sg >> 2), part = sg & 3u;
+  local float red[160];
+  local float parts[16];
+  local ushort normalized[2 * H];
+  global const ushort *pb = p + (size_t)row * H;
+  global float *part_row = partial + (size_t)row * H;
+  for (uint d = t; d < H; d += 256) part_row[d] = bf2f(pb[d]);
+  for (uint i = t; i < 160; i += 256) red[i] = 0.0f;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  global const ushort *blk = blocks + (size_t)row * blocks_stride;
+  float v[5][H / 256];
+  for (uint s = 0; s < 5; ++s)
+    for (uint i = 0; i < H / 256; ++i)
+      v[s][i] = s < sources ? (s + 1 == sources ? part_row[t + 256 * i] : bf2f(blk[(size_t)s * H + t + 256 * i])) : 0.0f;
+  float means[5];
+  for (uint s = 0; s < 5; ++s) {
+    float ss = 0.0f;
+    for (uint i = 0; i < H / 256; ++i) ss += v[s][i] * v[s][i];
+    const float reduced = sub_group_reduce_add(ss);
+    if (s < sources && lane == 0) red[s * 16 + sg] = reduced;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (uint s = 0; s < 5; ++s) {
+    float ss = 0.0f;
+    for (uint j = 0; j < 16; ++j) ss += red[s * 16 + j];
+    means[s] = rsqrt(ss / 2304.0f + EPS);
+  }
+  float query[H / 256];
+  for (uint i = 0; i < H / 256; ++i) query[i] = queries[(size_t)src * H + t + 256 * i];
+  local float *dots = red + 80;
+  for (uint s = 0; s < 5; ++s) {
+    float dot = 0.0f;
+    for (uint i = 0; i < H / 256; ++i) dot += query[i] * (v[s][i] * means[s]);
+    const float reduced = sub_group_reduce_add(dot);
+    if (s < sources && lane == 0) dots[s * 16 + sg] = reduced;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float weights[5];
+  float peak = -INFINITY;
+  for (uint s = 0; s < 5; ++s) {
+    float dot = 0.0f;
+    for (uint j = 0; j < 16; ++j) dot += dots[s * 16 + j];
+    weights[s] = dot * FUSE_AR_SCALE;
+    if (s < sources) peak = peak < weights[s] ? weights[s] : peak;
+  }
+  float den = 0.0f;
+  for (uint s = 0; s < 5; ++s) {
+    weights[s] = exp(weights[s] - peak);
+    if (s < sources) den += weights[s];
+  }
+  for (uint s = 0; s < 5; ++s) weights[s] = weights[s] / den;
+  float hv[H / 256];
+  for (uint i = 0; i < H / 256; ++i) {
+    float acc = 0.0f;
+    for (uint s = 0; s < 5; ++s)
+      if (s < sources) acc += weights[s] * (v[s][i] * means[s]);
+    hv[i] = FUSE_PRE(acc);
+    ar[((size_t)src * rows + row) * H + t + 256 * i] = hv[i];
+  }
+  barrier(CLK_GLOBAL_MEM_FENCE);
+  global const float *m = messages + ((size_t)row * msg_entries + core * 4 + role) * H;
+  float mv[H / 256];
+  float ss1 = 0.0f, ss0 = 0.0f;
+  for (uint i = 0; i < H / 256; ++i) {
+    mv[i] = m[t + 256 * i];
+    ss1 += mv[i] * mv[i];
+    ss0 += hv[i] * hv[i];
+  }
+  const float inv0 = 1.0f / sqrt(wg_sum(ss0, red) / 2304.0f + EPS);
+  const float inv1 = 1.0f / sqrt(wg_sum(ss1, red) / 2304.0f + EPS);
+  for (uint i = 0; i < H / 256; ++i) {
+    normalized[t + 256 * i] = f2bf(hv[i] * inv0);
+    normalized[H + t + 256 * i] = f2bf(mv[i] * inv1);
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  global const ushort *down = role == 0 ? down0 : role == 1 ? down1 : down2;
+  global const ushort *dr = down + (size_t)r * (2 * H);
+  float dot = 0.0f;
+  for (uint d = 8 * lane + 128 * part; d < 2 * H; d += 512) {
+    const ushort8 w0 = vload8(0, dr + d);
+    const ushort8 x0 = vload8(0, normalized + d);
+    for (int j = 0; j < 8; ++j) dot += bf2f(w0[j]) * bf2f(x0[j]);
+  }
+  dot = sub_group_reduce_add(dot);
+  if (lane == 0) parts[sg] = dot;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (sg == (sg & ~3u) && lane == 0) {
+    float total = parts[sg];
+    total += parts[sg + 1];
+    total += parts[sg + 2];
+    total += parts[sg + 3];
+    zeta[((size_t)row * 4 + role) * RANK + r] = FUSE_ZETA(total);
+  }
+}
+
 // Grid (16, roles, rows). Four sub-groups a rank, each over one of the four 128-term blocks of a step, so 256 sub-groups
 // a call instead of 64. The four partial dots are summed in SLM, in sub-group order, and stored once.
 KERNEL(256) void tf_ink2_zeta_split(
