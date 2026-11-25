@@ -486,12 +486,16 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
                 return false;
             };
         } else {
-            cache.begin(rec.n) catch |e| {
-                std.log.err("inkling2_loop: rank 1 begin ({s})", .{@errorName(e)});
-                return false;
-            };
-            pending_rows = rec.n;
-            pending_base = rec.base;
+            // A window of more than one row is a drafted verify window: the leader opened a cache transaction, so this
+            // rank must too. A plain decode row writes its history itself, and the leader opened none.
+            if (rec.n > 1) {
+                cache.begin(rec.n) catch |e| {
+                    std.log.err("inkling2_loop: rank 1 begin ({s})", .{@errorName(e)});
+                    return false;
+                };
+                pending_rows = rec.n;
+                pending_base = rec.base;
+            }
             ink.forward.run(model, &scratch, &cache, rec.ids[0..rec.n], .{ .all = rec.flags != 0 }) catch |e| {
                 std.log.err("inkling2_loop: rank 1 forward ({s})", .{@errorName(e)});
                 return false;
