@@ -79,6 +79,7 @@ const production_images = [_]Production{
     .{ .name = "glue", .path = "zig/kernels/xpu/inkling2/glue.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt" },
     .{ .name = "experts", .path = "zig/kernels/xpu/inkling2/experts.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2" },
     // Multi-row verify only. Same source, GRF 128. The one-row launch keeps `experts`.
+    .{ .name = "experts_ks3", .path = "zig/kernels/xpu/inkling2/experts.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -DINK2_KS_NV_GU=3 -I zig/kernels/xpu/inkling2" },
     .{ .name = "experts_mrow", .path = "zig/kernels/xpu/inkling2/experts.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2", .grf = "-cl-intel-128-GRF-per-thread" },
     .{ .name = "loop", .path = "zig/kernels/xpu/inkling2/loop.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt" },
     .{ .name = "fuse", .path = "zig/kernels/xpu/inkling2/fuse.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt" },

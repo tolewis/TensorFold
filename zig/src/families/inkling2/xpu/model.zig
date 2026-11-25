@@ -118,7 +118,7 @@ pub const Pipelines = struct {
     prefill: prefill_kernels.Kernels,
     prefill_experts: prefill_experts.Kernels,
 
-    const image_count = 12;
+    const image_count = 13;
 
     fn native(ctx: *const xpu.Context, comptime name: []const u8) !xpu.Module {
         return xpu.Module.loadNative(ctx, &@field(images, name));
@@ -128,7 +128,7 @@ pub const Pipelines = struct {
         var p: Pipelines = undefined;
         var loaded: usize = 0;
         errdefer for (p.modules[0..loaded]) |*mod| mod.unload();
-        inline for (.{ "attention", "prompt", "glue", "experts", "loop", "fuse", "runtime", "dense", "dense_q8", "prefill", "prefill_experts", "experts_mrow" }, 0..) |name, i| {
+        inline for (.{ "attention", "prompt", "glue", "experts", "loop", "fuse", "runtime", "dense", "dense_q8", "prefill", "prefill_experts", "experts_mrow", "experts_ks3" }, 0..) |name, i| {
             p.modules[i] = try native(ctx, name);
             loaded += 1;
         }
@@ -139,6 +139,7 @@ pub const Pipelines = struct {
         p.experts = try experts.Kernels.load(&p.modules[3], experts.default_prefix, null);
         errdefer p.experts.deinit();
         p.experts_mrow = try experts.Kernels.load(&p.modules[11], experts.default_prefix, null);
+        try experts.loadGuKs3(&p.modules[12]);
         errdefer p.experts_mrow.deinit();
         p.loop = try loop.Pipelines.load(p.modules[4]);
         errdefer p.loop.deinit();
@@ -165,6 +166,7 @@ pub const Pipelines = struct {
         p.loop.deinit();
         p.fuse.deinit();
         p.experts_mrow.deinit();
+        experts.deinitGuKs3();
         p.experts.deinit();
         p.glue.deinit();
         p.attention.deinit();

@@ -109,6 +109,29 @@ pub const Op = enum {
 
 pub const default_prefix = "tf_ink2_";
 
+/// The one-row gate/up kernel from the three sub-group image, so a sub-group's slice of k holds six whole
+/// 64-byte lines. Default; `INK2_GU_KS3=0` selects the four sub-group kernel.
+pub var gu_ks3: ?xpu.Kernel = null;
+
+pub fn guKs3() bool {
+    if (std.c.getenv("INK2_GU_KS3")) |p| {
+        const s = std.mem.span(p);
+        if (s.len > 0 and s[0] == '0') return false;
+    }
+    return true;
+}
+
+pub fn loadGuKs3(module: *xpu.Module) !void {
+    gu_ks3 = try module.kernel("tf_ink2_nvfp4_gu", .{ 48, 1, 1 });
+}
+
+pub fn deinitGuKs3() void {
+    if (gu_ks3) |*k| {
+        k.deinit();
+        gu_ks3 = null;
+    }
+}
+
 /// A device address, as the launcher takes it.
 pub const Ptr = ?*anyopaque;
 
@@ -175,7 +198,11 @@ pub const Kernels = struct {
     pub fn nvfp4Gu(self: *const Kernels, s: xpu.Stream, x: Ptr, w: Ptr, scales: Ptr, amax: Ptr, den: Ptr, ids: Ptr, out: Ptr, c: Call) !void {
         if (c.format != .nvfp4) return error.WrongExpertFormat;
         try check(c);
-        try xpu.launch.dispatch(try self.get(.nvfp4_gu), s, .{ tiles(c, true), routes(c), 1 }, .{ x, w, scales, amax, den, ids, out, c.k, c.n, c.topk, c.experts });
+        var pick = try self.get(.nvfp4_gu);
+        if (c.rows == 1 and guKs3()) {
+            if (gu_ks3) |k| pick = k;
+        }
+        try xpu.launch.dispatch(pick, s, .{ tiles(c, true), routes(c), 1 }, .{ x, w, scales, amax, den, ids, out, c.k, c.n, c.topk, c.experts });
     }
 
     /// Packed MXFP8 GU with UE8M0 scales per row and block of 32.
