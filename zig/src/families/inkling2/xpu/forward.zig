@@ -440,6 +440,10 @@ const Run = struct {
         } else if (fuse.routerWide()) {
             try fuse.routerWideLaunch(&g.p.fuse, g.s, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.logits_all, 0), at(s.route_ids, 0), at(s.route_weights, 0), @intCast(rows));
         } else try glue.router(&g.p.glue, g.s, at(s.mlp_normed, 0), tensor(w.router_weight), tensor(w.router_bias), at(s.route_ids, 0), at(s.route_weights, 0), @intCast(rows));
+        if (dump_dir_len > 0) {
+            dumpRow(g.m, g.s, s.route_ids, state.experts_per_token * 4, "rids");
+            dumpRow(g.m, g.s, s.route_weights, state.experts_per_token * 4, "rw");
+        }
         if (route_trace) |tb| try g.s.copy(plus(tb.ptr, v.cache_slot * rows * 32), at(s.route_ids, 0), rows * 32);
         try g.routedExperts(v.layer, rows);
         base = 0;
@@ -469,7 +473,8 @@ const Run = struct {
         if (v.cache_slot == 5) try g.copyBf16(at(s.p, 0), at(s.prelude, 0), rows * state.hidden);
         if (dump_dir_len > 0) {
             dumpRow(g.m, g.s, s.p, state.hidden * 2, "p");
-            dumpRow(g.m, g.s, s.att, state.hidden * 2, "att");
+            dumpRow(g.m, g.s, s.att, state.query_width * 2, "att");
+            dumpRow(g.m, g.s, s.attn_dense, state.hidden * 2, "pres");
             dumpRow(g.m, g.s, s.mlp_normed, state.hidden * 2, "mlpnorm");
             dumpRow(g.m, g.s, s.mlp_out, state.hidden * 2, "mlpout");
             dump_visit += 1;
