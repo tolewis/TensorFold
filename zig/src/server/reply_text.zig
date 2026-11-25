@@ -157,6 +157,15 @@ fn inklingAnswer(a: Allocator, tail: []const u8, finished: bool) Allocator.Error
             break;
         }
         pos += model.len;
+        const thinking_open = "<|content_thinking|>";
+        if (std.mem.startsWith(u8, tail[pos..], thinking_open)) {
+            pos += thinking_open.len;
+            if (find(tail[pos..], end)) |n| {
+                pos += n + end.len;
+                continue;
+            }
+            break; // a later thinking message is not the answer
+        }
         if (std.mem.startsWith(u8, tail[pos..], text_open)) {
             pos += text_open.len;
             const at = find(tail[pos..], end);
@@ -725,13 +734,13 @@ test "reply text: Inkling 2's thinking ends at its own end tag, and a tool messa
     try std.testing.expectEqualStrings("Look.", t.reasoning);
     try std.testing.expectEqualStrings("Two files.<tool_call>{\"name\":\"bash\",\"args\":{\"command\":\"ls ~\"}}</tool_call><tool_call>{\"name\":\"bash\",\"args\":{\"command\":\"ls ~\"}}</tool_call>", t.answer);
     // streaming: a partial end tag or call header is held, a whole call is out at once
-    const held = try splitThinkingAt(a, "<|message_model|><|content_thinking|>Look.<|end_message|><|message_model|><|content_text|>Two<|end_", false, m, .{ .token = 45 });
+    const held = try splitThinkingAt(a, "<|message_model|><|content_thinking|>Look.<|end_message|><|message_model|><|content_text|>Two<|end_", false, m, .{ .token = 42 });
     try std.testing.expectEqualStrings("Look.", held.reasoning);
     try std.testing.expectEqualStrings("Two", held.answer);
-    const partial = try splitThinkingAt(a, "<|message_model|><|content_thinking|>Look.<|end_message|><|message_model|>bash<|content_invoke_tool_json|>{\"name\":\"bash\",\"args\":{\"command\":\"ls", false, m, .{ .token = 45 });
+    const partial = try splitThinkingAt(a, "<|message_model|><|content_thinking|>Look.<|end_message|><|message_model|>bash<|content_invoke_tool_json|>{\"name\":\"bash\",\"args\":{\"command\":\"ls", false, m, .{ .token = 42 });
     try std.testing.expectEqualStrings("Look.", partial.reasoning);
     try std.testing.expectEqualStrings("", partial.answer);
-    const whole = try splitThinkingAt(a, "<|message_model|><|content_thinking|>Look.<|end_message|>" ++ call ++ "<|message_model|><|content", false, m, .{ .token = 45 });
+    const whole = try splitThinkingAt(a, "<|message_model|><|content_thinking|>Look.<|end_message|>" ++ call ++ "<|message_model|><|content", false, m, .{ .token = 42 });
     try std.testing.expectEqualStrings("Look.", whole.reasoning);
     try std.testing.expectEqualStrings("<tool_call>{\"name\":\"bash\",\"args\":{\"command\":\"ls ~\"}}</tool_call>", whole.answer);
 }
