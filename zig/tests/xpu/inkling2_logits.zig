@@ -900,9 +900,6 @@ fn verifyBits(gpa: std.mem.Allocator, io: std.Io, m: *const ink.model.Model, scr
         try cache.begin(1);
         ink.forward.dumpEnable(if (i == 0) (if (std.c.getenv("TF_DUMP_PLAIN0")) |e| std.mem.span(e) else "") else if (i == 1) (if (std.c.getenv("TF_DUMP_PLAIN")) |e| std.mem.span(e) else "") else "", 0);
         try ink.forward.runShared(m, scratch, &.{.{ .cache = cache, .rows = 1 }}, ids[from + i ..][0..1], .{});
-        // Production commits each accepted row (backend.zig:472). Without this the reference keeps the pre-run conv
-        // history and every plain step after the first folds the wrong taps.
-        try cache.commit(1);
         try r.download(std.mem.sliceAsBytes(plain[i * vocab ..][0..vocab]), cache.logits);
         try r.sync();
         try grabBuf(r, scratch.att, patt[i * att_row ..][0..att_row]);
