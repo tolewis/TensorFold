@@ -84,7 +84,8 @@ pub fn globalSlots(capacity: usize) usize {
 pub fn partialStride(capacity: usize) usize {
     const sliding = ap.slotsFor(ap.Layer.sliding(1024, max_rows), 1024 + max_rows);
     const global = ap.slotsFor(ap.Layer.global(@intCast(capacity)), capacity);
-    return @max(sliding, global);
+    // 128 leaves room for a 64-split decode of a 1,024 window (chunk 16 needs 65 slots) without growing a long context.
+    return @max(@max(sliding, global), 128);
 }
 
 /// Bytes of every visit's K and V (values and scales) for a global capacity of `capacity` positions.
@@ -335,7 +336,7 @@ fn sizes(rows: usize, capacity: usize) [fields.len]usize {
         r * rel_width * bf,        r * 24 * bf,                        r * q * bf,                                r * kv * bf,                    r * kv * bf,    r * q * bf,     r * rel_width * bf,
         r * 24 * ap.extent * bf,   @max(a * stride, r) * 24 * ap.head_dim * fp, @max(a * stride, r) * 24 * 2 * fp,                  r * q * bf,                     r * h * bf,     r * h * bf,     r * h * bf,
         r * experts_per_token * 4, r * experts_per_token * fp,         r * experts_per_token * intermediate * bf, r * experts_per_token * h * bf, r * h * bf,     r * h * bf,     a * vocabulary * fp,
-        r * experts_per_token * 4, items * 3 * 4,                      4,                                         r * 64 * fp,                    (3 + r) * hidden * bf,
+        r * experts_per_token * 4, items * 3 * 4,                      4,                                         r * 4 * 64 * fp,                (3 + r) * hidden * bf,
         r * experts_per_token * 4, r * experts_per_token * h * bf, r * 2 * h * bf,
         8 * stageRows(r) * ap.head_dim * bf, 8 * stageRows(r) * ap.head_dim * bf,
     };

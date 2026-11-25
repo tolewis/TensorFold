@@ -233,6 +233,7 @@ pub fn main(init: std.process.Init) !void {
     var digest = false;
     var profile_steps: usize = 0;
     var profile_all = false;
+    var fuse_check = false;
     var verify_bench = false;
     var route_union = false;
     var bench_context: ?usize = null;
@@ -306,6 +307,18 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--route-union")) {
             // with --verify-bench: also count the distinct experts a window of real rows reads in each visit
             route_union = true;
+        } else if (std.mem.eql(u8, a, "--fuse")) {
+            ink.fuse.force = true;
+        } else if (std.mem.eql(u8, a, "--seg")) {
+            ink.fuse.seg = true;
+        } else if (std.mem.eql(u8, a, "--no-seg")) {
+            ink.fuse.seg = false;
+        } else if (std.mem.eql(u8, a, "--attn-splits")) {
+            i += 1;
+            ink.attention_plan.flash_splits = try std.fmt.parseInt(u32, argv[i], 10);
+            ink.attention_plan.flash_user_set = true;
+        } else if (std.mem.eql(u8, a, "--fuse-check")) {
+            fuse_check = true;
         } else if (std.mem.eql(u8, a, "--profile-all")) {
             // the first --ref prompt prefilled in --chunk row chunks (last row's logits only, as the server does), profiled per
             // chunk; then plain decode profiled greedy and sampled; then stop
@@ -370,6 +383,14 @@ pub fn main(init: std.process.Init) !void {
     defer m.deinit();
     try m.loadKernels(&ctx);
     std.debug.print("loaded {d:.2} GiB and built the kernels in {d:.1} s\n", .{ @as(f64, @floatFromInt(m.device_bytes)) / (1 << 30), secs(nowNs(init.io) - t_load) });
+    if (fuse_check) {
+        var scratch = try state.Scratch.init(&r, state.max_rows, 64);
+        defer scratch.deinit();
+        const bad = try ink.forward.checkPhaseA(m, &scratch, &r);
+        std.debug.print("FUSE-A-CHECK mismatches {d}\n", .{bad});
+        if (bad != 0) return error.FuseMismatch;
+        return;
+    }
     var scratch = try state.Scratch.init(&r, @max(chunk, state.max_rows), capacity);
     defer scratch.deinit();
     var prec = ink.model.precisions();

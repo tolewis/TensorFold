@@ -21,6 +21,11 @@ pub const prompt_threads = 16;
 pub const decode_threads = 16;
 pub const merge_threads = head_dim;
 
+/// When set, decode uses a chunk that yields about this many K/V splits a head, if the partial buffer can hold them.
+/// Zero keeps the layer chunk. The logits tool sets it for an A/B.
+pub var flash_splits: u32 = 0;
+pub var flash_user_set: bool = false;
+
 /// A stream's slice of the K/V cache: rows `row0 ..` hold positions `p0 ..`; `off` is in elements.
 pub const Seg = extern struct { row0: i32, n: i32, p0: i32, pad: i32 = 0, off: i64 };
 comptime {
@@ -98,7 +103,24 @@ pub fn attendAs(r: Rows, l: Layer, stride: u32, path: Path) Error!Launch {
         const slots = chunks(@as(usize, r.last_pos), prompt_chunk);
         return .{ .path = .prompt, .grid = .{ blocks, r.kv_heads, slots }, .threads = prompt_threads, .merge_grid = merge_grid, .partials_rh = stride, .chunk = prompt_chunk };
     }
-    return .{ .path = .decode, .grid = .{ r.rows * r.kv_heads, stride, 1 }, .threads = decode_threads, .merge_grid = merge_grid, .partials_rh = stride, .chunk = l.chunk };
+    return .{ .path = .decode, .grid = .{ r.rows * r.kv_heads, stride, 1 }, .threads = decode_threads, .merge_grid = merge_grid, .partials_rh = stride, .chunk = decodeChunk(l, r.last_pos, stride) };
+}
+
+/// A chunk no smaller than 16 that yields about `flash_splits` splits, or the layer chunk when that does not fit.
+fn decodeChunk(l: Layer, last_pos: u32, stride: u32) u32 {
+    if (flash_splits == 0) return l.chunk;
+    const keys: u32 = if (l.window > 0) @min(l.window, last_pos + 1) else last_pos + 1;
+    if (keys <= 16) return l.chunk;
+    var chunk: u32 = std.math.divCeil(u32, keys, flash_splits) catch l.chunk;
+    chunk = std.mem.alignForward(u32, @max(chunk, 16), 16);
+    var trial = l;
+    trial.chunk = chunk;
+    while (slotsFor(trial, @as(usize, last_pos) + 1) > stride and chunk < l.chunk) {
+        chunk += 16;
+        trial.chunk = chunk;
+    }
+    if (slotsFor(trial, @as(usize, last_pos) + 1) > stride) return l.chunk;
+    return chunk;
 }
 
 test {

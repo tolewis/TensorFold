@@ -17,6 +17,7 @@ test "inkling2 xpu ring and window boundaries" {
 }
 
 test "inkling2 xpu decode and prompt dispatch geometry" {
+    p.flash_splits = 0;
     const sl = p.Layer.sliding(1024, 8);
     const sr = p.Rows{ .rows = 8, .last_pos = 4095, .streams = 2 };
     const sd = try p.attend(sr, sl, 17);

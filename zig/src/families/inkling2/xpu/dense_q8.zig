@@ -17,6 +17,7 @@ pub const variants = [_]u32{ 1, 2, 4, 8, 16, 32 };
 pub const Kernels = struct {
     dense: [variants.len]xpu.Kernel,
     head: [variants.len]xpu.Kernel,
+    seg1: xpu.Kernel,
     /// Output columns a work-group covers.
     columns: u32 = group_threads / 16,
 
@@ -36,15 +37,18 @@ pub const Kernels = struct {
             made[n] = try module.kernel(symbol("head", rows, control), .{ threads, 1, 1 });
             n += 1;
         }
-        var out: Kernels = .{ .dense = undefined, .head = undefined, .columns = threads / 16 };
+        var out: Kernels = .{ .dense = undefined, .head = undefined, .seg1 = undefined, .columns = threads / 16 };
         for (0..variants.len) |i| {
             out.dense[i] = made[2 * i];
             out.head[i] = made[2 * i + 1];
         }
+        const seg_name = if (control) "tf_ctl_ink2_dense_q8_seg1" else "tf_ink2_dense_q8_seg1";
+        out.seg1 = try module.kernel(seg_name, .{ threads, 1, 1 });
         return out;
     }
 
     pub fn deinit(p: *Kernels) void {
+        p.seg1.deinit();
         for (&p.dense) |*k| k.deinit();
         for (&p.head) |*k| k.deinit();
     }
@@ -82,6 +86,17 @@ fn at(r: Ref, bytes: usize) Ref {
 /// One launch of the matvec kernel that takes `lead` rows of x: `rows` <= `lead` of them are stored, `ldy` values apart.
 /// `input` must hold `lead` rows (the kernel reads them all). `weight` is the matrix of `n` rows of `k` values in q8.zig's
 /// layout (k a multiple of 256).
+/// One launch of five one-row matvecs. Each segment has its own x, weight and n. k is shared. The dot matches `matvec` of one row.
+pub fn seg1(p: *const Kernels, s: xpu.Stream, x: [5]Ref, w: [5]Ref, y: [5]Ref, n: [5]u32, k: u32) !void {
+    var max_n: u32 = 0;
+    for (n) |ni| max_n = @max(max_n, ni);
+    const cols = (max_n + p.columns - 1) / p.columns;
+    try xpu.launch.dispatch(p.seg1, s, .{ cols, 5, 1 }, .{
+        x[0], x[1], x[2], x[3], x[4], w[0], w[1], w[2], w[3], w[4], y[0], y[1], y[2], y[3], y[4],
+        n[0], n[1], n[2], n[3], n[4], k,
+    });
+}
+
 pub fn matvec(p: *const Kernels, s: xpu.Stream, lead: u32, weight: Ref, input: Ref, out: Ref, rows: u32, n: u32, k: u32, ldy: u32) !void {
     std.debug.assert(rows > 0 and rows <= lead and n > 0 and k > 0 and k % 256 == 0 and ldy >= n);
     try xpu.launch.dispatch(p.dense[variantOf(lead)], s, .{ (n + p.columns - 1) / p.columns, 1, 1 }, .{ input, weight, out, rows, n, k, ldy });
