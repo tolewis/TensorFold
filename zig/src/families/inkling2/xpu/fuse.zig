@@ -12,16 +12,6 @@ pub var conv_fold: bool = false;
 pub var zeta_wide: bool = false;
 pub var kv_conv: bool = false;
 pub var down_epi: bool = false;
-pub var kv_cache: bool = false;
-
-pub fn kvCache() bool {
-    if (kv_cache) return true;
-    if (std.c.getenv("INK2_KV_CACHE")) |p| {
-        const s = std.mem.span(p);
-        return s.len > 0 and s[0] == '1';
-    }
-    return false;
-}
 pub var norm_router: bool = false;
 
 pub fn normRouter() bool {
@@ -184,12 +174,8 @@ pub fn downEpilogue(p: *const Pipelines, s: xpu.Stream, down: Ref, ids: Ref, wei
 }
 
 pub fn convKv(p: *const Pipelines, s: xpu.Stream, hk: Ref, ck: Ref, tk: Ref, wk: Ref, ok: Ref, hv: Ref, cv: Ref, tv: Ref, wv: Ref, ov: Ref, rows: u32, channels: u32) !void {
-    try convKvCache(p, s, hk, ck, tk, wk, ok, hv, cv, tv, wv, ov, ok, ok, ok, ok, ok, rows, channels, 0, 0, 0, 0);
-}
-
-pub fn convKvCache(p: *const Pipelines, s: xpu.Stream, hk: Ref, ck: Ref, tk: Ref, wk: Ref, ok: Ref, hv: Ref, cv: Ref, tv: Ref, wv: Ref, ov: Ref, rpos: Ref, rseg: Ref, segs: Ref, kc: Ref, vc: Ref, rows: u32, channels: u32, ring: u32, qk_clip: f32, eps: f32, do_cache: u32) !void {
     const groups = (channels + 255) / 256;
-    try xpu.launch.dispatch(p.conv_kv, s, .{ groups, rows, 1 }, .{ hk, ck, tk, wk, ok, hv, cv, tv, wv, ov, rpos, rseg, segs, kc, vc, rows, channels, ring, qk_clip, eps, do_cache });
+    try xpu.launch.dispatch(p.conv_kv, s, .{ groups, rows, 1 }, .{ hk, ck, tk, wk, ok, hv, cv, tv, wv, ov, rows, channels });
 }
 
 pub fn convMlpPartial(p: *const Pipelines, s: xpu.Stream, history: Ref, current: Ref, taps: Ref, weight: Ref, conv_out: Ref, t: Ref, out: Ref, rows: u32, channels: u32) !void {

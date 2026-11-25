@@ -60,17 +60,7 @@ pub const Kernels = struct {
 
 /// raw holds independent q/k/v rows followed by q-side relative rows; gated sliding visits never infer K or V from Q.
 pub fn prep(k: *const Kernels, s: xpu.Stream, r: planning.Rows, l: planning.Layer, c: planning.Prep, meta: RowMeta, raw: [4]Ref, scales: [2]Ref, q: Ref, rel: Ref, kv: Cache) xpu.Error!void {
-    try prepGrid(k, s, r, l, c, meta, raw, scales, q, rel, kv, false);
-}
-
-/// Query and relative prep only. The convolution epilogue already wrote the K/V cache.
-pub fn prepQuery(k: *const Kernels, s: xpu.Stream, r: planning.Rows, l: planning.Layer, c: planning.Prep, meta: RowMeta, raw: [4]Ref, scales: [2]Ref, q: Ref, rel: Ref, kv: Cache) xpu.Error!void {
-    try prepGrid(k, s, r, l, c, meta, raw, scales, q, rel, kv, true);
-}
-
-fn prepGrid(k: *const Kernels, s: xpu.Stream, r: planning.Rows, l: planning.Layer, c: planning.Prep, meta: RowMeta, raw: [4]Ref, scales: [2]Ref, q: Ref, rel: Ref, kv: Cache, skip_kv: bool) xpu.Error!void {
-    const units = if (skip_kv) r.heads else r.heads + 2 * r.kv_heads;
-    try xpu.launch.dispatch(k.prep, s, .{ r.rows, units, 1 }, .{
+    try xpu.launch.dispatch(k.prep, s, .{ r.rows, r.heads + 2 * r.kv_heads, 1 }, .{
         raw[0].at(),     raw[1].at(),  raw[2].at(), raw[3].at(),
         scales[0].at(),  scales[1].at(), meta.pos.at(), meta.seg_of.at(),
         meta.segs.at(),  q.at(),       rel.at(),    kv.k.at(),

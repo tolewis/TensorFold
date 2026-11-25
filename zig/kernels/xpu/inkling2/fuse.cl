@@ -438,44 +438,15 @@ KERNEL(256) void tf_ink2_conv_mlp_partial(
   p[at] = f2bf(t[at] + bf2f(y));
 }
 
-typedef struct { int row0, n, p0, pad; long off; } FuseSeg;
-
-// The prep K/V store: 16 lanes, each owning 8 elements, the same sum order as tf_ink2_prep.
-static void kv_store(global const ushort *src, global ushort *cache, global const int *rpos, global const int *rseg,
-                      global const FuseSeg *segs, uint row, uint channels, uint head, uint lane, uint ring,
-                      float qk_clip, float eps, int is_key) {
-  float x[8], ss = 0.0f;
-  const uint c0 = head * 128;
-  for (int j = 0; j < 8; ++j) {
-    x[j] = bf2f(src[(size_t)row * channels + c0 + lane * 8 + j]);
-    ss += x[j] * x[j];
-  }
-  ss = sub_group_reduce_add(ss);
-  const float scale = is_key ? fmin(qk_clip / (sqrt(ss) + 1e-6f), 1.0f) : rsqrt(ss / 128.0f + eps);
-  const uint pos = (uint)rpos[row];
-  const FuseSeg seg = segs[rseg[row]];
-  global ushort *dst = cache + seg.off + ((size_t)head * ring + pos % ring) * 128 + lane * 8;
-  for (int j = 0; j < 8; ++j) dst[j] = f2bf(x[j] * scale);
-}
-
-// Grid (ceil(channels/256), rows). K folded into the V convolution. do_cache writes the prep K/V cache from those rows.
+// Grid (ceil(channels/256), rows). K folded into the V convolution. Each channel of each is the static formula.
 KERNEL(256) void tf_ink2_conv_kv(
     global const ushort *hk, global const ushort *ck, global ushort *tk, global const ushort *wk, global ushort *ok,
     global const ushort *hv, global const ushort *cv, global ushort *tv, global const ushort *wv, global ushort *ov,
-    global const int *rpos, global const int *rseg, global const FuseSeg *segs, global ushort *kc, global ushort *vc,
-    uint rows, uint channels, uint ring, float qk_clip, float eps, uint do_cache) {
+    uint rows, uint channels) {
   const uint c = get_group_id(0) * 256 + get_local_id(0), r = get_group_id(1);
   if (c >= channels || r >= rows) return;
   ok[(size_t)r * channels + c] = conv_y(hk, ck, tk, wk, r, c, channels);
   ov[(size_t)r * channels + c] = conv_y(hv, cv, tv, wv, r, c, channels);
-  if (!do_cache) return;
-  barrier(CLK_GLOBAL_MEM_FENCE);
-  const uint sg = get_sub_group_id();
-  if (sg >= 2) return;
-  const uint head = get_group_id(0) * 2 + sg;
-  const uint lane = get_sub_group_local_id();
-  kv_store(ok, kc, rpos, rseg, segs, r, channels, head, lane, ring, qk_clip, eps, 1);
-  kv_store(ov, vc, rpos, rseg, segs, r, channels, head, lane, ring, qk_clip, eps, 0);
 }
 
 // Every row of the chunk. One thread owns a column and walks rows in order, so the convolution window
