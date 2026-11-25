@@ -18,16 +18,17 @@ pub const RowMeta = struct { pos: Ref, seg_of: Ref, segs: Ref };
 pub const Error = planning.Error || xpu.Error || error{OutOfMemory};
 
 /// The merge over eight sub-groups of chunk ranges. It regroups the fold, so it is bit-identical only where the row
-/// count is one; every other row count keeps the serial fold. Default; `INK2_MERGE_SPLIT=0` selects the serial fold.
+/// count is one; every other row count keeps the serial fold. Off by default: at long context a one-row decode regroups
+/// while a verify window keeps the serial fold, so drafted output parts from plain. `INK2_MERGE_SPLIT=1` selects it.
 pub var merge_split: bool = false;
 
 pub fn mergeSplit() bool {
     if (merge_split) return true;
     if (std.c.getenv("INK2_MERGE_SPLIT")) |p| {
         const s = std.mem.span(p);
-        if (s.len > 0 and s[0] == '0') return false;
+        return s.len > 0 and s[0] == '1';
     }
-    return true;
+    return false;
 }
 
 /// Kernel names, with the work-group size each is made at.
