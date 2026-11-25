@@ -37,6 +37,7 @@ pub const Sampler = struct {
     ctx: *const xpu.Context,
     module: xpu.Module,
     kernel: xpu.Kernel,
+    race: xpu.Kernel,
     cfg: rt.Buffer,
     out: rt.Buffer,
     zbuf: rt.Buffer,
@@ -50,6 +51,8 @@ pub const Sampler = struct {
         errdefer module.unload();
         var kernel = try module.kernel("tf_ink2_sample_top", .{ 256, 1, 1 });
         errdefer kernel.deinit();
+        var race = try module.kernel("tf_ink2_sample_race", .{ 256, 1, 1 });
+        errdefer race.deinit();
         var cfg = try r.alloc(rows_max * 8);
         errdefer cfg.free();
         var out = try r.alloc(rows_max * top_max * 8);
@@ -61,7 +64,7 @@ pub const Sampler = struct {
         const host_out = try gpa.alloc(u32, rows_max * top_max * 2);
         errdefer gpa.free(host_out);
         const host_z = try gpa.alloc(f32, rows_max);
-        return .{ .gpa = gpa, .r = r, .ctx = ctx, .module = module, .kernel = kernel, .cfg = cfg, .out = out, .zbuf = zbuf, .host_cfg = host_cfg, .host_out = host_out, .host_z = host_z, .rows_max = rows_max };
+        return .{ .gpa = gpa, .r = r, .ctx = ctx, .module = module, .kernel = kernel, .race = race, .cfg = cfg, .out = out, .zbuf = zbuf, .host_cfg = host_cfg, .host_out = host_out, .host_z = host_z, .rows_max = rows_max };
     }
 
     pub fn deinit(s: *Sampler) void {
@@ -71,6 +74,7 @@ pub const Sampler = struct {
         s.gpa.free(s.host_cfg);
         s.out.free();
         s.cfg.free();
+        s.race.deinit();
         s.kernel.deinit();
         s.module.unload();
         s.* = undefined;
@@ -96,6 +100,16 @@ pub const Sampler = struct {
         if (want_z) try s.r.download(std.mem.sliceAsBytes(s.host_z[0..rows.len]), s.zbuf);
         try s.r.sync();
         return .{ .words = s.host_out[0..words], .stride = stride, .z = s.host_z[0..rows.len] };
+    }
+
+    /// One token a row for top_k off and top_p 1. The host does not read the vocabulary.
+    pub fn raceRows(s: *Sampler, logits: ?*anyopaque, vocab: u32, positions: []const u32, seed: u64, inv_t: f32) ![]const u32 {
+        if (positions.len == 0 or positions.len > s.rows_max) return error.Inkling2SampleRows;
+        try s.r.upload(s.cfg, std.mem.sliceAsBytes(positions));
+        try xpu.launch.dispatch(s.race, s.r.stream(s.ctx), .{ @intCast(positions.len), 1, 1 }, .{ logits, s.cfg.ptr, s.out.ptr, vocab, @as(u32, @truncate(seed)), @as(u32, @truncate(seed >> 32)), inv_t });
+        try s.r.download(std.mem.sliceAsBytes(s.host_out[0..positions.len]), s.out);
+        try s.r.sync();
+        return s.host_out[0..positions.len];
     }
 };
 
