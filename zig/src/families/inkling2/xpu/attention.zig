@@ -37,7 +37,6 @@ const names = struct {
     const prep: Entry = .{ .name = "tf_ink2_prep", .threads = 16 };
     const rel_table: Entry = .{ .name = "tf_ink2_rel_table", .threads = 256 };
     const decode: Entry = .{ .name = "tf_ink2_attn_decode", .threads = planning.decode_threads };
-    const decode_rows: Entry = .{ .name = "tf_ink2_attn_decode_rows", .threads = planning.decode_threads };
     const merge: Entry = .{ .name = "tf_ink2_merge", .threads = planning.merge_threads };
     const merge_split: Entry = .{ .name = "tf_ink2_merge_split", .threads = planning.merge_threads };
     const prompt: Entry = .{ .name = "tf_ink2_attn_prompt", .threads = planning.prompt_threads };
@@ -48,7 +47,6 @@ pub const Kernels = struct {
     prep: xpu.Kernel,
     rel_table: xpu.Kernel,
     decode: xpu.Kernel,
-    decode_rows: xpu.Kernel,
     merge: xpu.Kernel,
     merge_split: xpu.Kernel,
     prompt: xpu.Kernel,
@@ -61,8 +59,6 @@ pub const Kernels = struct {
         errdefer k.rel_table.deinit();
         k.decode = try attention.kernel(names.decode.name, .{ names.decode.threads, 1, 1 });
         errdefer k.decode.deinit();
-        k.decode_rows = try attention.kernel(names.decode_rows.name, .{ names.decode_rows.threads, 1, 1 });
-        errdefer k.decode_rows.deinit();
         k.merge = try attention.kernel(names.merge.name, .{ names.merge.threads, 1, 1 });
         errdefer k.merge.deinit();
         k.merge_split = try attention.kernel(names.merge_split.name, .{ names.merge_split.threads, 1, 1 });
@@ -74,7 +70,6 @@ pub const Kernels = struct {
         k.prompt.deinit();
         k.merge_split.deinit();
         k.merge.deinit();
-        k.decode_rows.deinit();
         k.decode.deinit();
         k.rel_table.deinit();
         k.prep.deinit();
@@ -114,12 +109,7 @@ pub fn attendAs(k: *const Kernels, s: xpu.Stream, path: planning.Path, r: planni
         std.log.info("inkling2: attn {s} heads {d} kv {d} splits {d} grid {d},{d}", .{ @tagName(launch.path), r.heads, r.kv_heads, planning.flash_splits, launch.grid[0], launch.grid[1] });
     }
     const scale: f32 = 1.0 / @sqrt(@as(f32, planning.head_dim));
-    if (launch.path == .decode_rows) {
-        try xpu.launch.dispatch(k.decode_rows, s, launch.grid, .{
-            q.at(),          kv.k.at(),       kv.v.at(),         tab.at(),      meta.segs.at(), part_o.at(), part_ml.at(), meta.pos.at(), meta.seg_of.at(),
-            r.rows,          r.heads,         r.kv_heads,        l.ring,        l.window,       launch.chunk,  launch.c0,    launch.partials_rh, scale,
-        });
-    } else if (launch.path == .decode) {
+    if (launch.path == .decode) {
         try xpu.launch.dispatch(k.decode, s, launch.grid, .{
             q.at(),          kv.k.at(),       kv.v.at(),         tab.at(),      meta.segs.at(), part_o.at(), part_ml.at(), meta.pos.at(), meta.seg_of.at(),
             r.heads,         r.kv_heads,      l.ring,            l.window,      launch.chunk,   @as(u32, 0), launch.partials_rh, scale,

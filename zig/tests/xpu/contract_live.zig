@@ -96,7 +96,6 @@ fn argsOf(planted: []const u8) u32 {
         .{ "tf_ink2_prep", 22 },
         .{ "tf_ink2_rel_table", 3 },
         .{ "tf_ink2_attn_decode", 17 },
-        .{ "tf_ink2_attn_decode_rows", 18 },
         .{ "tf_ink2_merge", 12 },
         .{ "tf_ink2_merge_split", 12 },
         .{ "tf_ink2_attn_prompt", 14 },

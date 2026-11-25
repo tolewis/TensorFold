@@ -16,8 +16,6 @@ pub const global_chunk = 256;
 /// The prompt kernel's chunk. It is a multiple of the key tile and wider than the decode chunk to keep the partials small.
 pub const prompt_chunk = 1024;
 pub const split_rows = 64;
-/// The rows one decode launch serves as a verify window; more go one row a launch.
-pub const window_rows = 8;
 pub const prompt_pairs = 16;
 pub const prompt_threads = 16;
 pub const decode_threads = 16;
@@ -28,8 +26,9 @@ pub const merge_threads = head_dim;
 pub var flash_splits: u32 = 0;
 pub var flash_user_set: bool = false;
 
-/// A window of two to `window_rows` rows takes the one-launch row kernel. `INK2_ROWS_OLD=1` runs the one-row kernel
-/// one launch a row instead, for the A/B.
+/// A verify window runs its attention in one launch: the one-row decode kernel's grid is the rows' K/V heads, and each
+/// work-group reads its own row's position, first key and partial slots. `INK2_ROWS_OLD=1` runs one launch a row for the
+/// A/B.
 pub var rows_old: ?bool = null;
 pub fn rowBatched() bool {
     if (rows_old) |v| return !v;
@@ -94,19 +93,17 @@ pub fn partialBytes(rows: usize, heads: u32, n_chunks: u32) usize {
     return rows * heads * n_chunks * (head_dim * 4 + 8);
 }
 
-pub const Path = enum { decode, decode_rows, prompt };
+pub const Path = enum { decode, prompt };
 /// `chunk` is the key chunk the launched kernel and the merge both use; `partials_rh` the partial slots a row and head hold.
-/// `c0` is the first chunk a decode launch covers (zero for one row); the rows of a window share the launch.
-pub const Launch = struct { path: Path, grid: [3]u32, threads: u32, merge_grid: [3]u32, partials_rh: u32, chunk: u32, subs: u32 = 1, c0: u32 = 0 };
-pub const Error = error{ Inkling2Partials, Inkling2Heads, Inkling2Path, Inkling2Rows };
+pub const Launch = struct { path: Path, grid: [3]u32, threads: u32, merge_grid: [3]u32, partials_rh: u32, chunk: u32, subs: u32 = 1 };
+pub const Error = error{ Inkling2Partials, Inkling2Heads, Inkling2Path };
 
 /// `stride` is the partial slots a row and head the caller holds: at least `slotsFor` at the layer's chunk.
 pub fn attend(r: Rows, l: Layer, stride: u32) Error!Launch {
     return attendAs(r, l, stride, if (usePrompt(r, l)) .prompt else .decode);
 }
 
-/// The launch for a path the caller names; the prompt kernel serves global layers of one stream only. A window of two
-/// to `window_rows` rows takes the one-launch row kernel on the decode path.
+/// The launch for a path the caller names; the prompt kernel serves global layers of one stream only.
 pub fn attendAs(r: Rows, l: Layer, stride: u32, path: Path) Error!Launch {
     if (r.heads != r.kv_heads * group) return error.Inkling2Heads;
     if (slotsFor(l, @as(usize, r.last_pos) + 1) > stride) return error.Inkling2Partials;
@@ -117,23 +114,7 @@ pub fn attendAs(r: Rows, l: Layer, stride: u32, path: Path) Error!Launch {
         const slots = chunks(@as(usize, r.last_pos), prompt_chunk);
         return .{ .path = .prompt, .grid = .{ blocks, r.kv_heads, slots }, .threads = prompt_threads, .merge_grid = merge_grid, .partials_rh = stride, .chunk = prompt_chunk };
     }
-    if (path == .decode_rows) return attendRows(r, l, stride);
-    if (r.rows >= 2 and r.rows <= window_rows and rowBatched()) return attendRows(r, l, stride);
     return .{ .path = .decode, .grid = .{ r.rows * r.kv_heads, stride, 1 }, .threads = decode_threads, .merge_grid = merge_grid, .partials_rh = stride, .chunk = decodeChunk(l, r.last_pos, stride) };
-}
-
-/// One launch for every row of a verify window: a K/V head and a key chunk a work-group, all rows in it. The rows hold
-/// consecutive positions ending at `last_pos`, so the launch covers every chunk any row reads, from the lowest first key.
-pub fn attendRows(r: Rows, l: Layer, stride: u32) Error!Launch {
-    if (r.heads != r.kv_heads * group) return error.Inkling2Heads;
-    if (r.rows < 2 or r.rows > window_rows) return error.Inkling2Rows;
-    if (slotsFor(l, @as(usize, r.last_pos) + 1) > stride) return error.Inkling2Partials;
-    const chunk = decodeChunk(l, r.last_pos, stride);
-    const pos_min = r.last_pos - (r.rows - 1);
-    const lo_min: u32 = if (l.window > 0) (pos_min + 1) -| l.window else 0;
-    const cmin = lo_min / chunk;
-    const cmax = r.last_pos / chunk;
-    return .{ .path = .decode_rows, .grid = .{ r.kv_heads, cmax - cmin + 1, 1 }, .threads = decode_threads, .merge_grid = .{ r.rows * r.heads, 1, 1 }, .partials_rh = stride, .chunk = chunk, .c0 = cmin };
 }
 
 /// A chunk no smaller than 16 that yields about `flash_splits` splits, or the layer chunk when that does not fit.
