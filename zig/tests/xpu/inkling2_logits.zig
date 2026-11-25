@@ -885,6 +885,15 @@ fn verifyBits(gpa: std.mem.Allocator, io: std.Io, m: *const ink.model.Model, scr
     defer gpa.free(pmlp);
     const wmlp = try gpa.alloc(u8, n * att_row);
     defer gpa.free(wmlp);
+    const hist_bytes = 3 * state.kv_width * 2;
+    const pkconv = try gpa.alloc(u8, hist_bytes);
+    defer gpa.free(pkconv);
+    const pvconv = try gpa.alloc(u8, hist_bytes);
+    defer gpa.free(pvconv);
+    const wkconv = try gpa.alloc(u8, hist_bytes);
+    defer gpa.free(wkconv);
+    const wvconv = try gpa.alloc(u8, hist_bytes);
+    defer gpa.free(wvconv);
     var i: usize = 0;
     while (i < n) : (i += 1) {
         cache.len = from + i;
@@ -893,10 +902,13 @@ fn verifyBits(gpa: std.mem.Allocator, io: std.Io, m: *const ink.model.Model, scr
         try r.download(std.mem.sliceAsBytes(plain[i * vocab ..][0..vocab]), cache.logits);
         try r.sync();
         try grabBuf(r, scratch.att, patt[i * att_row ..][0..att_row]);
+
         try grabBuf(r, scratch.mlp_normed, pmlp[i * att_row ..][0..att_row]);
         try cache.rollback();
     }
     try grab(r, cache, 0, from, pk, pv);
+    try grabRef(r, cache.history(0, 2), pkconv);
+    try grabRef(r, cache.history(0, 3), pvconv);
     cache.len = from;
     try cache.begin(n);
     try ink.forward.runShared(m, scratch, &.{.{ .cache = cache, .rows = n }}, ids[from..][0..n], .{ .all = true, .taps = scratch.taps.?.ptr });
@@ -904,6 +916,8 @@ fn verifyBits(gpa: std.mem.Allocator, io: std.Io, m: *const ink.model.Model, scr
     try r.sync();
     try grab(r, cache, 0, from, wk, wv);
     try grabBuf(r, scratch.att, watt);
+    try grabRef(r, cache.history(0, 2), wkconv);
+    try grabRef(r, cache.history(0, 3), wvconv);
     try grabBuf(r, scratch.mlp_normed, wmlp);
     try cache.rollback();
     var diff: usize = 0;
@@ -972,6 +986,18 @@ fn verifyBits(gpa: std.mem.Allocator, io: std.Io, m: *const ink.model.Model, scr
         }
     }
     std.debug.print("VERIFY MLP: {d} of {d} mlp_normed bytes differ (first row {d})\n", .{ md, n * att_row, mrow });
+    var cd: usize = 0;
+    var cv: usize = 0;
+    for (0..hist_bytes) |b| {
+        if (pkconv[b] != wkconv[b]) cd += 1;
+        if (pvconv[b] != wvconv[b]) cv += 1;
+    }
+    std.debug.print("VERIFY CONV HIST: {d} of {d} state-2 bytes and {d} of {d} state-3 bytes differ\n", .{ cd, hist_bytes, cv, hist_bytes });
+}
+
+fn grabRef(r: *xpu.rt.Runtime, ref: state.Ref, out: []u8) !void {
+    const b = xpu.rt.Buffer{ .rt = r, .ptr = @ptrFromInt(@intFromPtr(ref.buf.ptr.?) + ref.off), .len = out.len };
+    try r.download(out, b);
 }
 
 fn grabBuf(r: *xpu.rt.Runtime, buf: xpu.rt.Buffer, out: []u8) !void {
