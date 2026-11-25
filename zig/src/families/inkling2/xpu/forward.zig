@@ -234,6 +234,7 @@ const Run = struct {
     }
 
     fn attendSegments(g: Run, v: *const layer_plan.Visit, segments: []const Segment) !void {
+        const dbgv: u32 = @intFromBool(dump_dir_len > 0 and dump_visit == 0 and v.layer == 0);
         const s = g.sc;
         const m = g.m;
         const w = &m.weights.layers[v.layer];
@@ -272,7 +273,7 @@ const Run = struct {
                 if (commit1 == 1) if (g.wrote) |mask| {
                     mask[v.cache_slot] = mask[v.cache_slot] | 0x3;
                 };
-                try fuse.convKv(&g.p.fuse, g.s, cache.history(v.cache_slot, 0).ptr(), at(s.k_raw, base * channels * 2), cache.staged(v.cache_slot, 0, 0).ptr(), tensor(wk), at(s.k_conv, base * channels * 2), cache.history(v.cache_slot, 1).ptr(), at(s.v_raw, base * channels * 2), cache.staged(v.cache_slot, 1, 0).ptr(), tensor(wv), at(s.v_conv, base * channels * 2), @intCast(rows), channels, commit1);
+                try fuse.convKv(&g.p.fuse, g.s, cache.history(v.cache_slot, 0).ptr(), at(s.k_raw, base * channels * 2), cache.staged(v.cache_slot, 0, 0).ptr(), tensor(wk), at(s.k_conv, base * channels * 2), cache.history(v.cache_slot, 1).ptr(), at(s.v_raw, base * channels * 2), cache.staged(v.cache_slot, 1, 0).ptr(), tensor(wv), at(s.v_conv, base * channels * 2), @intCast(rows), channels, commit1, dbgv);
             } else {
                 try g.convInputForAttention(cache, v, base, rows, true);
                 try g.convInputForAttention(cache, v, base, rows, false);
@@ -330,6 +331,7 @@ const Run = struct {
     }
 
     fn visit(g: Run, v: *const layer_plan.Visit, segments: []const Segment, rows: usize, taps: ?Ptr) !void {
+        const dbgv: u32 = @intFromBool(dump_dir_len > 0 and dump_visit == 0 and v.layer == 0);
         const s = g.sc;
         const m = g.m;
         const lp = m.weight_plan.at(v.layer);
@@ -443,6 +445,9 @@ const Run = struct {
                 var tb2: [16]u8 = undefined;
                 const t2 = std.fmt.bufPrint(&tb2, "kc{d}", .{kr}) catch "kc";
                 dumpBufAt(g.m, g.s, s.k_conv, kr * state.kv_width * 2, state.kv_width * 2, t2);
+                var tb3: [16]u8 = undefined;
+                const t3 = std.fmt.bufPrint(&tb3, "kr{d}", .{kr}) catch "kr";
+                dumpBufAt(g.m, g.s, s.k_raw, kr * state.kv_width * 2, state.kv_width * 2, t3);
             }
             dumpBufAt(g.m, g.s, s.k_conv, 0, state.kv_width * 2, "kc0");
             dumpBufAt(g.m, g.s, s.k_conv, state.kv_width * 2, state.kv_width * 2, "kc1");
@@ -472,7 +477,7 @@ const Run = struct {
             if (commit1 == 1) if (g.wrote) |mask| {
                 mask[v.cache_slot] = mask[v.cache_slot] | 0x4;
             };
-            try fuse.convAttnPartial(&g.p.fuse, g.s, seg.cache.history(v.cache_slot, 2).ptr(), at(s.attn_dense, 0), seg.cache.staged(v.cache_slot, 2, 0).ptr(), tensor(w.attn_conv), at(s.attn_conv, 0), at(s.p, 0), at(s.blocks, 0), at(s.partial, 0), @intCast(rows), channels, if (lp.boundary) lp.blocks_in + 1 else 0, commit1);
+            try fuse.convAttnPartial(&g.p.fuse, g.s, seg.cache.history(v.cache_slot, 2).ptr(), at(s.attn_dense, 0), seg.cache.staged(v.cache_slot, 2, 0).ptr(), tensor(w.attn_conv), at(s.attn_conv, 0), at(s.p, 0), at(s.blocks, 0), at(s.partial, 0), @intCast(rows), channels, if (lp.boundary) lp.blocks_in + 1 else 0, commit1, dbgv);
         } else {
             for (segments) |seg| {
                 try g.staticPostConv(seg.cache, v.cache_slot, 2, s.attn_dense, w.attn_conv, s.attn_conv, base, seg.rows);
@@ -514,7 +519,7 @@ const Run = struct {
             if (commit1 == 1) if (g.wrote) |mask| {
                 mask[v.cache_slot] = mask[v.cache_slot] | 0x8;
             };
-            try fuse.downEpilogue(&g.p.fuse, g.s, at(s.down, 0), at(s.route_ids, 0), at(s.route_weights, 0), seg.cache.history(v.cache_slot, 3).ptr(), seg.cache.staged(v.cache_slot, 3, 0).ptr(), tensor(w.mlp_conv), at(s.mlp_out, 0), at(s.mlp_conv, 0), at(s.partial, 0), at(s.p, 0), state.hidden, 8, channels, @intCast(rows), commit1);
+            try fuse.downEpilogue(&g.p.fuse, g.s, at(s.down, 0), at(s.route_ids, 0), at(s.route_weights, 0), seg.cache.history(v.cache_slot, 3).ptr(), seg.cache.staged(v.cache_slot, 3, 0).ptr(), tensor(w.mlp_conv), at(s.mlp_out, 0), at(s.mlp_conv, 0), at(s.partial, 0), at(s.p, 0), state.hidden, 8, channels, @intCast(rows), commit1, dbgv);
         } else if (fuse.convFold() and segments.len == 1) {
             const seg = segments[0];
             const channels: u32 = @intCast(state.convWidth(3));
@@ -522,7 +527,7 @@ const Run = struct {
             if (commit1 == 1) if (g.wrote) |mask| {
                 mask[v.cache_slot] = mask[v.cache_slot] | 0x8;
             };
-            try fuse.convMlpPartial(&g.p.fuse, g.s, seg.cache.history(v.cache_slot, 3).ptr(), at(s.mlp_out, 0), seg.cache.staged(v.cache_slot, 3, 0).ptr(), tensor(w.mlp_conv), at(s.mlp_conv, 0), at(s.partial, 0), at(s.p, 0), @intCast(rows), channels, commit1);
+            try fuse.convMlpPartial(&g.p.fuse, g.s, seg.cache.history(v.cache_slot, 3).ptr(), at(s.mlp_out, 0), seg.cache.staged(v.cache_slot, 3, 0).ptr(), tensor(w.mlp_conv), at(s.mlp_conv, 0), at(s.partial, 0), at(s.p, 0), @intCast(rows), channels, commit1, dbgv);
         } else {
             for (segments) |seg| {
                 try g.staticPostConv(seg.cache, v.cache_slot, 3, s.mlp_out, w.mlp_conv, s.mlp_conv, base, seg.rows);
@@ -532,6 +537,14 @@ const Run = struct {
         }
         if (v.cache_slot == 5) try g.copyBf16(at(s.p, 0), at(s.prelude, 0), rows * state.hidden);
         if (dump_dir_len > 0) {
+            var kp: usize = 0;
+            while (kp < 8) : (kp += 1) {
+                var t1: [16]u8 = undefined;
+                const a1 = std.fmt.bufPrint(&t1, "kcp{d}", .{kp}) catch "kcp";
+                dumpBufAt(g.m, g.s, s.k_conv, kp * state.kv_width * 2, state.kv_width * 2, a1);
+            }
+            dumpRowRef(g.m, g.s, segments[0].cache.keys(v.cache_slot), (501 % state.sliding_ring) * ap.head_dim * 2, ap.head_dim * 2, "r501");
+            dumpRowRef(g.m, g.s, segments[0].cache.values(v.cache_slot), (501 % state.sliding_ring) * ap.head_dim * 2, ap.head_dim * 2, "rv501");
             dump2(g.m, g.s, "p", s.p, state.hidden * 2, state.hidden * 2);
             dump2(g.m, g.s, "att", s.att, state.query_width * 2, state.query_width * 2);
             dump2(g.m, g.s, "pres", s.attn_dense, state.hidden * 2, state.hidden * 2);

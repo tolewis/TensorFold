@@ -398,7 +398,7 @@ __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_si
 #define SQRT5 0x1.1e377ap+1f
 
 static inline ushort conv_y(global const ushort *history, global const ushort *current, global ushort *taps,
-                            global const ushort *weight, uint r, uint c, uint channels) {
+                            global const ushort *weight, uint r, uint c, uint channels, uint dbg, uint st) {
   float window[4];
   for (uint tap = 0; tap < 4; ++tap) {
     const uint k = r + tap;
@@ -409,7 +409,9 @@ static inline ushort conv_y(global const ushort *history, global const ushort *c
   taps[(size_t)(r + 3) * channels + c] = current[(size_t)r * channels + c];
   float sum = bf2f(current[(size_t)r * channels + c]);
   for (uint tap = 0; tap < 4; ++tap) sum += bf2f(weight[c * 4 + tap]) * window[tap];
-  return f2bf(sum / SQRT5);
+  const ushort y = f2bf(sum / SQRT5);
+  if (dbg && c < 4 && (r == 0 || r == 1)) printf("CVY st %u r %u c %u h0 %.6g h1 %.6g h2 %.6g cur0 %.6g cur1 %.6g y %.6g\n", st, r, c, bf2f(history[c]), bf2f(history[channels + c]), bf2f(history[2 * channels + c]), bf2f(current[c]), bf2f(current[channels + c]), bf2f(y));
+  return y;
 }
 
 // The host commit for one row: the next history is history[1], history[2], current[0]. Read all three first.
@@ -426,10 +428,10 @@ static void commit3(global ushort *history, global const ushort *current, uint c
 KERNEL(256) void tf_ink2_conv_attn_partial(
     global const ushort *history, global const ushort *current, global ushort *taps, global const ushort *weight,
     global ushort *conv_out, global const ushort *p, global ushort *blocks, global float *partial, uint rows, uint channels,
-    uint boundary, uint commit1) {
+    uint boundary, uint commit1, uint dbg) {
   const uint c = get_group_id(0) * 256 + get_local_id(0), r = get_group_id(1);
   if (c >= channels || r >= rows) return;
-  const ushort y = conv_y(history, current, taps, weight, r, c, channels);
+  const ushort y = conv_y(history, current, taps, weight, r, c, channels, dbg, 2);
   conv_out[(size_t)r * channels + c] = y;
   const uint at = r * channels + c;
   partial[at] = boundary ? bf2f(y) : bf2f(p[at]) + bf2f(y);
@@ -440,10 +442,10 @@ KERNEL(256) void tf_ink2_conv_attn_partial(
 // Grid (ceil(channels/256), rows). The MLP convolution, then the partial add into p.
 KERNEL(256) void tf_ink2_conv_mlp_partial(
     global const ushort *history, global const ushort *current, global ushort *taps, global const ushort *weight,
-    global ushort *conv_out, global const float *t, global ushort *p, uint rows, uint channels, uint commit1) {
+    global ushort *conv_out, global const float *t, global ushort *p, uint rows, uint channels, uint commit1, uint dbg) {
   const uint c = get_group_id(0) * 256 + get_local_id(0), r = get_group_id(1);
   if (c >= channels || r >= rows) return;
-  const ushort y = conv_y(history, current, taps, weight, r, c, channels);
+  const ushort y = conv_y(history, current, taps, weight, r, c, channels, dbg, 3);
   conv_out[(size_t)r * channels + c] = y;
   const uint at = r * channels + c;
   p[at] = f2bf(t[at] + bf2f(y));
@@ -454,11 +456,11 @@ KERNEL(256) void tf_ink2_conv_mlp_partial(
 KERNEL(256) void tf_ink2_conv_kv(
     global const ushort *hk, global const ushort *ck, global ushort *tk, global const ushort *wk, global ushort *ok,
     global const ushort *hv, global const ushort *cv, global ushort *tv, global const ushort *wv, global ushort *ov,
-    uint rows, uint channels, uint commit1) {
+    uint rows, uint channels, uint commit1, uint dbg) {
   const uint c = get_group_id(0) * 256 + get_local_id(0), r = get_group_id(1);
   if (c >= channels || r >= rows) return;
-  ok[(size_t)r * channels + c] = conv_y(hk, ck, tk, wk, r, c, channels);
-  ov[(size_t)r * channels + c] = conv_y(hv, cv, tv, wv, r, c, channels);
+  ok[(size_t)r * channels + c] = conv_y(hk, ck, tk, wk, r, c, channels, dbg, 0);
+  ov[(size_t)r * channels + c] = conv_y(hv, cv, tv, wv, r, c, channels, dbg, 1);
   if (commit1 && rows == 1 && r == 0) {
     commit3(hk, ck, c, channels);
     commit3(hv, cv, c, channels);
@@ -471,7 +473,7 @@ KERNEL(256) void tf_ink2_conv_kv(
 KERNEL(256) void tf_ink2_down_epilogue(
     global const ushort *down, global const int *ids, global const float *weights,
     global const ushort *history, global ushort *taps, global const ushort *conv_w, global ushort *current,
-    global ushort *conv_out, global const float *partial, global ushort *p, uint n, uint topk, uint channels, uint rows, uint commit1) {
+    global ushort *conv_out, global const float *partial, global ushort *p, uint n, uint topk, uint channels, uint rows, uint commit1, uint dbg) {
   const uint c = get_group_id(0) * 256 + get_local_id(0);
   if (c >= n || c >= channels) return;
   for (uint r = 0; r < rows; ++r) {
@@ -498,7 +500,7 @@ KERNEL(256) void tf_ink2_down_epilogue(
     }
     const ushort y = f2bf(sum);
     current[(size_t)r * channels + c] = y;
-    const ushort cy = conv_y(history, current, taps, conv_w, r, c, channels);
+    const ushort cy = conv_y(history, current, taps, conv_w, r, c, channels, dbg, 3);
     conv_out[(size_t)r * channels + c] = cy;
     const uint at = r * channels + c;
     p[at] = FUSE_EPI ? f2bf(partial[at] + bf2f(cy)) : (ushort)0;
