@@ -261,7 +261,7 @@ static inline __attribute__((always_inline)) float4 P(nv_pass)(const uint live, 
 
 static inline void P(nv_decode_rows)(const uint ks, __global const ushort *X, __global const uchar *W, __global const uchar *S,
                                 __global const float *amax, __global const float *den, __global const int *ids,
-                                __global ushort *Y, uint k, uint n, uint topk, bool gu, local float *part,
+                                __global ushort *Y, uint k, uint n, uint topk, uint experts, __global int *fault, bool gu, local float *part,
                                 local uint *mem) {
   const uint lane = get_sub_group_local_id();
   const uint sg = get_sub_group_id();
@@ -271,6 +271,10 @@ static inline void P(nv_decode_rows)(const uint ks, __global const ushort *X, __
   const uint e = (uint)ids[route];
   const uint rows_total = gu ? 2u * n : n;
   const uint raw = tile * INK2_SG + lane;
+  if (e >= experts) {
+    if (lane == 0 && sg == 0) atomic_inc(fault);
+    return;
+  }
   const uint row = raw < rows_total ? raw : 0u;
   const uint nb = k / 16u;
   __global const uchar *wr = W + ((ulong)e * rows_total + row) * (k / 2u);
@@ -294,7 +298,7 @@ static inline void P(nv_decode_rows)(const uint ks, __global const ushort *X, __
 }
 
 static inline void P(mx_decode_rows)(const uint ks, __global const ushort *X, __global const uchar *W, __global const uchar *S,
-                                __global const int *ids, __global ushort *Y, uint k, uint n, uint topk, bool gu,
+                                __global const int *ids, __global ushort *Y, uint k, uint n, uint topk, uint experts, bool gu,
                                 local float *part, local uint *mem) {
   const uint lane = get_sub_group_local_id();
   const uint sg = get_sub_group_id();
@@ -302,6 +306,7 @@ static inline void P(mx_decode_rows)(const uint ks, __global const ushort *X, __
   const uint count = P(members)(ids, route, get_num_groups(1), mem, mem + INK2_MAX_MEMBERS);
   if (count == 0) return;
   const uint e = (uint)ids[route];
+  if (e >= experts) return;
   const uint rows_total = gu ? 2u * n : n;
   const uint raw = tile * INK2_SG + lane;
   const uint row = raw < rows_total ? raw : 0u;
@@ -450,26 +455,26 @@ static inline void P(mx_decode_one)(const uint ks, __global const ushort *X, __g
 
 static inline void P(nv_decode)(const uint ks, __global const ushort *X, __global const uchar *W, __global const uchar *S,
                                 __global const float *amax, __global const float *den, __global const int *ids,
-                                __global ushort *Y, uint k, uint n, uint topk, uint experts, bool gu, local float *part, local uint *mem) {
+                                __global ushort *Y, uint k, uint n, uint topk, uint experts, __global int *fault, bool gu, local float *part, local uint *mem) {
   if (get_num_groups(1) <= topk) P(nv_decode_one)(ks, X, W, S, amax, den, ids, Y, k, n, topk, experts, gu, part);
-  else P(nv_decode_rows)(ks, X, W, S, amax, den, ids, Y, k, n, topk, gu, part, mem);
+  else P(nv_decode_rows)(ks, X, W, S, amax, den, ids, Y, k, n, topk, experts, fault, gu, part, mem);
 }
 
 static inline void P(mx_decode)(const uint ks, __global const ushort *X, __global const uchar *W, __global const uchar *S,
                                 __global const int *ids, __global ushort *Y, uint k, uint n, uint topk, uint experts, bool gu,
                                 local float *part, local uint *mem) {
   if (get_num_groups(1) <= topk) P(mx_decode_one)(ks, X, W, S, ids, Y, k, n, topk, experts, gu, part);
-  else P(mx_decode_rows)(ks, X, W, S, ids, Y, k, n, topk, gu, part, mem);
+  else P(mx_decode_rows)(ks, X, W, S, ids, Y, k, n, topk, experts, gu, part, mem);
 }
 
 #if INK2_ONLY & INK2_NV_GU
 __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(16 * INK2_KS_NV_GU, 1, 1)))
 __kernel void P(nvfp4_gu)(__global const ushort *X, __global const uchar *W, __global const uchar *S,
                           __global const float *amax, __global const float *den, __global const int *ids,
-                          __global ushort *Y, uint k, uint n, uint topk, uint experts) {
+                          __global ushort *Y, uint k, uint n, uint topk, uint experts, __global int *fault) {
   local float part[INK2_RB * INK2_KS_NV_GU * INK2_SG];
   local uint mem[INK2_MAX_MEMBERS + 1];
-  P(nv_decode)(INK2_KS_NV_GU, X, W, S, amax, den, ids, Y, k, n, topk, experts, true, part, mem);
+  P(nv_decode)(INK2_KS_NV_GU, X, W, S, amax, den, ids, Y, k, n, topk, experts, fault, true, part, mem);
 }
 #endif
 
@@ -477,10 +482,10 @@ __kernel void P(nvfp4_gu)(__global const ushort *X, __global const uchar *W, __g
 __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(16 * INK2_KS_NV_DOWN, 1, 1)))
 __kernel void P(nvfp4_down)(__global const ushort *X, __global const uchar *W, __global const uchar *S,
                             __global const float *amax, __global const float *den, __global const int *ids,
-                            __global ushort *Y, uint k, uint n, uint topk, uint experts) {
+                            __global ushort *Y, uint k, uint n, uint topk, uint experts, __global int *fault) {
   local float part[INK2_RB * INK2_KS_NV_DOWN * INK2_SG];
   local uint mem[INK2_MAX_MEMBERS + 1];
-  P(nv_decode)(INK2_KS_NV_DOWN, X, W, S, amax, den, ids, Y, k, n, topk, experts, false, part, mem);
+  P(nv_decode)(INK2_KS_NV_DOWN, X, W, S, amax, den, ids, Y, k, n, topk, experts, fault, false, part, mem);
 }
 #endif
 
@@ -549,13 +554,15 @@ __kernel void P(mxfp8_quantize)(__global const uchar *W, __global const uchar *S
 #if INK2_ONLY & INK2_COMBINE
 __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(64, 1, 1)))
 __kernel void P(combine)(__global const ushort *down, __global const int *ids, __global const float *weights,
-                         __global ushort *Y, uint n, uint topk, uint experts) {
+                         __global ushort *Y, __global float *wide, uint n, uint topk, uint experts) {
   const uint col = get_global_id(0), token = get_group_id(1);
   if (col >= n) return;
   float sum = 0.0f;
 #ifdef INK2_PLANT_ORDER
-  for (uint slot = 0; slot < topk; slot++)
-    sum += weights[token * topk + slot] * P(bf_to_f)(down[(ulong)(token * topk + slot) * n + col]);
+  for (uint slot = 0; slot < topk; slot++) {
+    const float w = weights[token * topk + slot];
+    if (w != 0.0f) sum += w * P(bf_to_f)(down[(ulong)(token * topk + slot) * n + col]);
+  }
 #else
   // Outer expert order, then slot order, fixes the accumulation order: the next route is the least (expert, slot)
   // past the last one taken.
@@ -573,12 +580,14 @@ __kernel void P(combine)(__global const ushort *down, __global const int *ids, _
       }
     }
     if (best_slot < 0) break;
-    sum += weights[token * topk + best_slot] * P(bf_to_f)(down[(ulong)(token * topk + best_slot) * n + col]);
+    const float w = weights[token * topk + best_slot];
+    if (w != 0.0f) sum += w * P(bf_to_f)(down[(ulong)(token * topk + best_slot) * n + col]);
     last_id = best_id;
     last_slot = best_slot;
   }
 #endif
   Y[(ulong)token * n + col] = P(f_to_bf)(sum);
+  if (wide) wide[(ulong)token * n + col] = sum;
 }
 
 __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(64, 1, 1)))
@@ -601,7 +610,8 @@ __kernel void P(combine_f32)(__global const ushort *down, __global const int *id
       }
     }
     if (best_slot < 0) break;
-    sum += weights[token * topk + best_slot] * P(bf_to_f)(down[(ulong)(token * topk + best_slot) * n + col]);
+    const float w = weights[token * topk + best_slot];
+    if (w != 0.0f) sum += w * P(bf_to_f)(down[(ulong)(token * topk + best_slot) * n + col]);
     last_id = best_id;
     last_slot = best_slot;
   }

@@ -10,6 +10,33 @@ pub const intermediate: u32 = 1152;
 pub const expert_count: u32 = 128;
 pub const top_k: u32 = 8;
 
+var fault_ptr: ?*anyopaque = null;
+/// When set, the decode gather launches this many routes instead of every slot.
+var owned_routes: ?u32 = null;
+/// The last one-row count, kept after the launch override is cleared.
+pub var last_kept: i32 = -1;
+
+pub fn setOwnedRoutes(n: ?u32) void {
+    if (n) |k| last_kept = @intCast(k);
+    owned_routes = n;
+}
+
+fn faultWord() ?*anyopaque {
+    return fault_ptr;
+}
+
+pub fn faultHits() ?*anyopaque {
+    return fault_ptr;
+}
+
+pub fn armFault(r: *xpu.rt.Runtime) !void {
+    if (fault_ptr != null) return;
+    const buf = try r.alloc(4);
+    var zero = [_]u8{ 0, 0, 0, 0 };
+    try r.upload(buf, &zero);
+    fault_ptr = buf.ptr;
+}
+
 /// The kernels' reduction split: one decode work-group holds this many sub-groups, each over a slice of k
 /// (INK2_KS_NV_GU, INK2_KS_NV_DOWN, INK2_KS_MX_GU and INK2_KS_MX_DOWN in the source).
 pub const decode_subgroups = struct {
@@ -65,7 +92,7 @@ pub fn formatForLayer(layer: u32) !Format {
 
 /// The routes of a call: one per (row, slot).
 pub fn routes(c: Call) u32 {
-    return c.rows * c.topk;
+    return owned_routes orelse c.rows * c.topk;
 }
 
 /// The most prompt items the plan can list: every expert's last run is short, the others hold `run_routes` each.
@@ -82,6 +109,7 @@ pub const Op = enum {
     nvfp4_quantize,
     mxfp8_quantize,
     combine,
+    combine_f32,
     plan,
     nvfp4_gu_prompt,
     nvfp4_down_prompt,
@@ -101,7 +129,7 @@ pub const Op = enum {
             .mxfp8_gu => .{ 16 * decode_subgroups.mxfp8_gu, 1, 1 },
             .mxfp8_down => .{ 16 * decode_subgroups.mxfp8_down, 1, 1 },
             .nvfp4_quantize, .mxfp8_quantize, .plan => .{ 256, 1, 1 },
-            .combine => .{ 64, 1, 1 },
+            .combine, .combine_f32 => .{ 64, 1, 1 },
             .nvfp4_gu_prompt, .nvfp4_down_prompt, .mxfp8_gu_prompt, .mxfp8_down_prompt => .{ 16, 1, 1 },
         };
     }
@@ -148,7 +176,7 @@ pub const Kernels = struct {
     pub fn nvfp4Gu(self: *const Kernels, s: xpu.Stream, x: Ptr, w: Ptr, scales: Ptr, amax: Ptr, den: Ptr, ids: Ptr, out: Ptr, c: Call) !void {
         if (c.format != .nvfp4) return error.WrongExpertFormat;
         try check(c);
-        try xpu.launch.dispatch(try self.get(.nvfp4_gu), s, .{ tiles(c, true), routes(c), 1 }, .{ x, w, scales, amax, den, ids, out, c.k, c.n, c.topk, c.experts });
+        try xpu.launch.dispatch(try self.get(.nvfp4_gu), s, .{ tiles(c, true), routes(c), 1 }, .{ x, w, scales, amax, den, ids, out, c.k, c.n, c.topk, c.experts, faultWord() });
     }
 
     /// Packed MXFP8 GU with UE8M0 scales per row and block of 32.
@@ -162,7 +190,7 @@ pub const Kernels = struct {
     pub fn nvfp4Down(self: *const Kernels, s: xpu.Stream, act: Ptr, w: Ptr, scales: Ptr, amax: Ptr, den: Ptr, ids: Ptr, out: Ptr, c: Call) !void {
         if (c.format != .nvfp4) return error.WrongExpertFormat;
         try check(c);
-        try xpu.launch.dispatch(try self.get(.nvfp4_down), s, .{ tiles(c, false), routes(c), 1 }, .{ act, w, scales, amax, den, ids, out, c.k, c.n, c.topk, c.experts });
+        try xpu.launch.dispatch(try self.get(.nvfp4_down), s, .{ tiles(c, false), routes(c), 1 }, .{ act, w, scales, amax, den, ids, out, c.k, c.n, c.topk, c.experts, faultWord() });
     }
 
     pub fn mxfp8Down(self: *const Kernels, s: xpu.Stream, act: Ptr, w: Ptr, scales: Ptr, ids: Ptr, out: Ptr, c: Call) !void {
@@ -185,9 +213,15 @@ pub const Kernels = struct {
     }
 
     /// Sums each token's route outputs in ascending expert order (slot order on ties) in FP32, rounds once to BF16.
-    pub fn combine(self: *const Kernels, s: xpu.Stream, down: Ptr, ids: Ptr, weights: Ptr, out: Ptr, c: Call) !void {
+    pub fn combine(self: *const Kernels, s: xpu.Stream, down: Ptr, ids: Ptr, weights: Ptr, out: Ptr, wide: ?*anyopaque, c: Call) !void {
         try checkRoutes(c);
-        try xpu.launch.dispatch(try self.get(.combine), s, .{ (c.n + 63) / 64, c.rows, 1 }, .{ down, ids, weights, out, c.n, c.topk, c.experts });
+        try xpu.launch.dispatch(try self.get(.combine), s, .{ (c.n + 63) / 64, c.rows, 1 }, .{ down, ids, weights, out, wide, c.n, c.topk, c.experts });
+    }
+
+    /// Same sum, stored as f32, so a split rank can round once after the cross-rank add.
+    pub fn combineF32(self: *const Kernels, s: xpu.Stream, down: Ptr, ids: Ptr, weights: Ptr, out: Ptr, c: Call) !void {
+        try checkRoutes(c);
+        try xpu.launch.dispatch(try self.get(.combine_f32), s, .{ (c.n + 63) / 64, c.rows, 1 }, .{ down, ids, weights, out, c.n, c.topk, c.experts });
     }
 
     /// Groups the routes by expert: `members` [rows*topk] i32, `items` [maxItems,3] i32 (expert, first member, count),

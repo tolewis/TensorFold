@@ -15,10 +15,11 @@ __kernel void tp_up(__global float *out, __global const ushort *a, int n) {
   out[i] = bf_to_f(a[i]);
 }
 
-__kernel void tp_add_f32(__global float *out, __global const float *a, __global const float *b, int n) {
+// One launch: promote the local bf16 row, add the peer's f32 row, store bf16. The up and down launches are gone.
+__kernel void tp_add_f32(__global ushort *out, __global const ushort *local_bf, __global const float *peer_f32, int n) {
   const int i = get_global_id(0);
   if (i >= n) return;
-  out[i] = a[i] + b[i];
+  out[i] = f_to_bf(bf_to_f(local_bf[i]) + peer_f32[i]);
 }
 
 __kernel void tp_down(__global ushort *out, __global const float *a, int n) {
@@ -27,18 +28,48 @@ __kernel void tp_down(__global ushort *out, __global const float *a, int n) {
   out[i] = f_to_bf(a[i]);
 }
 
-// Zero the route weight when the expert is not in this rank's half, and write a packed id for the decode gather.
-// An unowned route gets `count`, which the gather treats as out of range and does not read.
-__kernel void tp_zero_unowned(__global int *ids, __global float *weights, __global int *local_ids, int routes, int base, int count) {
+// Compact each row to this rank's experts. The id buffer then holds only local ids, and counts[row] is how many.
+// A dropped slot is local id 0 with weight 0, so a kernel that still walks eight slots never reads a foreign expert.
+__kernel void tp_keep_local(__global int *ids, __global float *weights, __global int *counts, int rows, int base, int nlocal) {
+  const int row = get_global_id(0);
+  if (row >= rows) return;
+  int kept = 0;
+  int loc[8];
+  float w[8];
+  for (int j = 0; j < 8; ++j) {
+    const int id = ids[row * 8 + j];
+    if (id >= base && id < base + nlocal) {
+      loc[kept] = id - base;
+      w[kept] = weights[row * 8 + j];
+      kept++;
+    }
+  }
+  for (int j = 0; j < 8; ++j) {
+    if (j < kept) {
+      ids[row * 8 + j] = loc[j];
+      weights[row * 8 + j] = w[j];
+    } else {
+      ids[row * 8 + j] = nlocal;
+      weights[row * 8 + j] = 0.0f;
+    }
+  }
+  counts[row] = kept;
+}
+
+// Write the indirect launch size for one row: X is the tile count, Y is this rank's kept routes.
+__kernel void tp_set_launch(__global uint *gc, __global const int *counts, uint tiles) {
+  gc[0] = tiles;
+  const uint y = (uint)counts[0];
+  gc[1] = y == 0 ? 1 : y;
+  gc[2] = 1;
+}
+
+// A foreign route keeps its id and loses its weight. Combine then adds nothing and does not read the row.
+__kernel void tp_zero_foreign_weight(__global const int *ids, __global float *weights, int routes, int base, int nlocal) {
   const int i = get_global_id(0);
   if (i >= routes) return;
   const int id = ids[i];
-  if (id < base || id >= base + count) {
-    weights[i] = 0.0f;
-    local_ids[i] = count;
-  } else {
-    local_ids[i] = id - base;
-  }
+  if (id < base || id >= base + nlocal) weights[i] = 0.0f;
 }
 
 // Keep plan items this rank holds and rewrite the expert id to the packed table. Items past the new count are unused.
