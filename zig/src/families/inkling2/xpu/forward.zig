@@ -829,7 +829,7 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
         vdump_cur = seq;
         vdump_active = vdump;
         try g.visit(v, segments, rows, options.taps, vi);
-        if (vdump) try dumpVisit(m.r, m.options.place.rank, seq, vi, at(s.p, 0), rows);
+        if (vdump) try dumpVisit(m.r, m.options.place.rank, seq, vi, at(s.p, 0), rows, state.hidden);
     }
     vdump_active = false;
     if (vdump) {
