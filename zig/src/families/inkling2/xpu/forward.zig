@@ -400,6 +400,17 @@ const Run = struct {
             dumpRow(g.m, g.s, s.gate, state.query_width * 2, "gate");
             dumpRow(g.m, g.s, s.sink, 24 * 2, "sink");
         }
+        if (dump_dir_len > 0) {
+            // The window's own last row's K/V as the cache holds it right now, before attention reads it.
+            const seg0 = segments[0];
+            const ring = state.sliding_ring;
+            const kref = seg0.cache.keys(v.cache_slot);
+            const p0 = seg0.cache.len;
+            dumpRowRef(g.m, g.s, kref, (p0 % ring) * ap.head_dim * 2, ap.head_dim * 2, "kvp0");
+            dumpRowRef(g.m, g.s, kref, ((p0 + 1) % ring) * ap.head_dim * 2, ap.head_dim * 2, "kvp1");
+            dumpRow(g.m, g.s, s.rel_tab, state.query_width * 2, "reltab");
+            std.debug.print("ATT ARGS v{d}: rows {d} layer {d} extent {d}\n", .{ dump_visit, rows, v.layer, ap.extent });
+        }
         try g.attendSegments(v, segments);
         xpu.profile.label = "wo";
         try g.dense(w.attn.wo, at(s.att, 0), at(s.attn_dense, 0), rows);
@@ -512,6 +523,22 @@ pub fn dumpEnable(dir: []const u8, at_row: usize) void {
     @memcpy(dump_dir_buf[0..dump_dir_len], dir[0..dump_dir_len]);
     dump_row = at_row;
     dump_visit = 0;
+}
+
+fn dumpRowRef(m: *const Model, s: xpu.Stream, ref: state.Ref, off: usize, n: usize, tag: []const u8) void {
+    if (dump_dir_len == 0) return;
+    var stack: [state.hidden * 2]u8 = undefined;
+    const len = @min(n, stack.len);
+    const b = rt.Buffer{ .rt = m.r, .ptr = @ptrFromInt(@intFromPtr(ref.buf.ptr.?) + ref.off + off), .len = len };
+    s.synchronize() catch return;
+    m.r.download(stack[0..len], b) catch return;
+    var path_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/v{d}-{s}.bin", .{ dump_dir_buf[0..dump_dir_len], dump_visit, tag }) catch return;
+    path_buf[path.len] = 0;
+    const fd = std.c.open(path_buf[0..path.len :0], .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    if (fd < 0) return;
+    _ = std.c.write(fd, stack[0..len].ptr, len);
+    _ = std.c.close(fd);
 }
 
 fn dumpRow(m: *const Model, s: xpu.Stream, buf: rt.Buffer, row_bytes: usize, tag: []const u8) void {
