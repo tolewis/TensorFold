@@ -119,6 +119,7 @@ pub fn attendAs(k: *const Kernels, s: xpu.Stream, path: planning.Path, r: planni
     if (launch.path == .decode) {
         try xpu.launch.dispatch(k.decode, s, launch.grid, .{
             q.at(),          kv.k.at(),       kv.v.at(),         tab.at(),      meta.segs.at(), part_o.at(), part_ml.at(), meta.pos.at(), meta.seg_of.at(),
+            kv.k.at(),       kv.v.at(),       kv.ks.at(),        kv.vs.at(),    @intFromBool(kv8()),
             r.heads,         r.kv_heads,      l.ring,            l.window,      launch.chunk,   @as(u32, 0), launch.partials_rh, scale,
         });
     } else {

@@ -39,6 +39,29 @@ static inline float8 bf2f8(ushort8 h) { return as_float8(convert_uint8(h) << 16)
 static inline float8 abs8(float8 v) {
   return (float8)(fabs(v.s0), fabs(v.s1), fabs(v.s2), fabs(v.s3), fabs(v.s4), fabs(v.s5), fabs(v.s6), fabs(v.s7));
 }
+// One K or V row of eight values, dequantized when the cache is int8. The scale is a head a position, so a lane that
+// reads a different position also reads that position's scale.
+static inline float8 kv_row8(global const ushort *p, global const uchar *p8, global const float *sc, uint int8) {
+  if (int8) {
+    const uchar8 c = intel_sub_group_block_read_uc8(p8);
+    const float8 q = (float8)((float)(char)c.s0, (float)(char)c.s1, (float)(char)c.s2, (float)(char)c.s3,
+                              (float)(char)c.s4, (float)(char)c.s5, (float)(char)c.s6, (float)(char)c.s7);
+    return q * intel_sub_group_block_read(sc);
+  }
+  return bf2f8(intel_sub_group_block_read_us8(p));
+}
+
+// The same row for every lane, dequantized when the cache is int8.
+static inline float8 kv_bcast8(global const ushort *p, global const uchar *p8, float scale, uint int8) {
+  if (int8) {
+    const uchar8 c = vload8(0, p8);
+    const float8 q = (float8)((float)(char)c.s0, (float)(char)c.s1, (float)(char)c.s2, (float)(char)c.s3,
+                              (float)(char)c.s4, (float)(char)c.s5, (float)(char)c.s6, (float)(char)c.s7);
+    return q * scale;
+  }
+  return bf2f8(vload8(0, p));
+}
+
 static inline float max8(float8 v) {
   return fmax(fmax(fmax(v.s0, v.s1), fmax(v.s2, v.s3)), fmax(fmax(v.s4, v.s5), fmax(v.s6, v.s7)));
 }
@@ -137,7 +160,9 @@ KERNEL(256) void tf_ink2_rel_table(global const ushort *rel, global const ushort
 // P.V product, relative to the running maximum after the block. The chunk's (max, sum, P.V) are the partials.
 KERNEL(16) void tf_ink2_attn_decode(global const ushort *q, global const ushort *kc, global const ushort *vc, global const ushort *tab,
                                     global const InkSeg *segs, global float *part_o, global float2 *part_ml, global const int *rpos,
-                                    global const int *rseg, uint heads, uint kv_heads, uint ring, uint window, uint chunk, uint c0,
+                                    global const int *rseg, global const uchar *kc8, global const uchar *vc8,
+                                    global const float *ks, global const float *vs, uint int8,
+                                    uint heads, uint kv_heads, uint ring, uint window, uint chunk, uint c0,
                                     uint chunks, float scale) {
   const uint unit = get_group_id(0), row = unit / kv_heads, kvh = unit % kv_heads, lane = get_sub_group_local_id();
   const uint pos = (uint)rpos[row];
@@ -170,16 +195,20 @@ KERNEL(16) void tf_ink2_attn_decode(global const ushort *q, global const ushort 
     const uint kp = kp0 + (live ? lane : 0);
     // every row of the block is requested before any is used, so the latencies overlap; rows past the end read the last
     // key's row and enter as zero
-    ushort8 vr[BLOCK];
+    float8 vr[BLOCK];
     UNROLL
-    for (uint k = 0; k < BLOCK; ++k) vr[k] = intel_sub_group_block_read_us8(vh + (size_t)((kp0 + min(k, n - 1)) % ring) * D);
+    for (uint k = 0; k < BLOCK; ++k) {
+      const size_t at = (size_t)((kp0 + min(k, n - 1)) % ring) * D;
+      vr[k] = kv_row8(vh + at, vc8 + s.off + (size_t)kvh * ring * D + at, vs + s.off / D + (size_t)kvh * ring + (kp0 + min(k, n - 1)) % ring, int8);
+    }
     global const ushort *krow = kh + (size_t)(kp % ring) * D;
+    const float kscale = int8 ? ks[s.off / D + (size_t)kvh * ring + kp % ring] : 1.0f;
     float dot[GROUP];
     UNROLL
     for (uint g = 0; g < GROUP; ++g) dot[g] = 0.0f;
     UNROLL
     for (uint i = 0; i < D / 8; ++i) {
-      const float8 k = bf2f8(vload8(0, krow + i * 8));
+      const float8 k = kv_bcast8(krow + i * 8, kc8 + s.off + (size_t)kvh * ring * D + (size_t)(kp % ring) * D + i * 8, kscale, int8);
       UNROLL
       for (uint g = 0; g < GROUP; ++g) {
         const float8 w = vload8(0, &qs[g][i * 8]);
@@ -209,7 +238,7 @@ KERNEL(16) void tf_ink2_attn_decode(global const ushort *q, global const ushort 
     }
     UNROLL
     for (uint k = 0; k < BLOCK; ++k) {
-      const float8 v = k < n ? bf2f8(vr[k]) : (float8)(0.0f);
+      const float8 v = k < n ? vr[k] : (float8)(0.0f);
       UNROLL
       for (uint g = 0; g < GROUP; ++g) {
         const float w = sub_group_broadcast(p[g], k);
