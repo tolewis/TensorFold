@@ -356,7 +356,9 @@ const Run = struct {
                 .dynamic => false,
             };
             if (fuse.kvConv() and both_static) {
-                const channels: u32 = state.kv_width;
+                // A split rank convolves its own KV channels. The full width here staged the taps and read k_raw and
+                // v_raw at the wrong stride, so the follower's convolution differed from the leader's.
+                const channels: u32 = pl.kvWidth();
                 const wk = switch (w.attn.k_conv) {
                     .static => |weight| weight,
                     .dynamic => unreachable,
