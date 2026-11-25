@@ -565,8 +565,8 @@ fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) 
             try dumpVisit(m.r, m.options.place.rank, vdump_cur, 97, at(s.k_conv, 0), rows, m.options.place.kvWidth());
             try dumpVisit(m.r, m.options.place.rank, vdump_cur, 98, at(s.v_conv, 0), rows, m.options.place.kvWidth());
             try dumpVisit(m.r, m.options.place.rank, vdump_cur, 99, at(s.v_raw, 0), rows, m.options.place.kvWidth());
-            try dumpVisit(m.r, m.options.place.rank, vdump_cur, 100, at(cache.keys(v.cache_slot).buf, cache.keys(v.cache_slot).off), 1, 24 * m.options.place.kvWidth());
-            try dumpVisit(m.r, m.options.place.rank, vdump_cur, 101, at(cache.values(v.cache_slot).buf, cache.values(v.cache_slot).off), 1, 24 * m.options.place.kvWidth());
+            try dumpVisit(m.r, m.options.place.rank, vdump_cur, 100, at(segments[0].cache.keys(v.cache_slot).buf, segments[0].cache.keys(v.cache_slot).off), 1, 24 * m.options.place.kvWidth());
+            try dumpVisit(m.r, m.options.place.rank, vdump_cur, 101, at(segments[0].cache.values(v.cache_slot).buf, segments[0].cache.values(v.cache_slot).off), 1, 24 * m.options.place.kvWidth());
         }
         var base: usize = 0;
         if (fuse.convFold() and segments.len == 1) {
