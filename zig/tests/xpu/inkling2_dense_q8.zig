@@ -331,14 +331,14 @@ pub const Q8 = struct {
             return;
         }
         if (self.lead == 0) {
-            try host.dense(self.kernels, s, self.wr, self.xr, self.out, r, n, k);
+            try host.dense(self.kernels, s, self.wr, self.xr, self.out, null, r, n, k);
         } else {
             var base: u32 = 0;
             while (base < r) : (base += self.lead) {
                 const t = @min(self.lead, r - base);
                 const x = put(self.xr, @as(usize, base) * k * 2);
                 const y = put(self.out, @as(usize, base) * n * out_bytes);
-                if (self.head) try host.headLaunch(self.kernels, s, self.lead, self.wr, x, y, t, n) else try host.matvec(self.kernels, s, self.lead, self.wr, x, y, t, n, k, n);
+                if (self.head) try host.headLaunch(self.kernels, s, self.lead, self.wr, x, y, t, n) else try host.matvec(self.kernels, s, self.lead, self.wr, x, y, null, t, n, k, n);
             }
         }
         try s.synchronize();
@@ -511,7 +511,7 @@ pub fn ldyCheck(a: std.mem.Allocator, dev: *rig_.Dev, suite: *Suite) !usize {
     defer a.free(plain);
     const ldy = shape.n + 16;
     const out = try p.rig.output(shape.rows * ldy * 2);
-    try host.matvec(p.kernels, dev.s, 4, p.wr, p.xr, out, 4, @intCast(shape.n), @intCast(shape.k), @intCast(ldy));
+    try host.matvec(p.kernels, dev.s, 4, p.wr, p.xr, out, null, 4, @intCast(shape.n), @intCast(shape.k), @intCast(ldy));
     try dev.s.synchronize();
     const got = try p.rig.bytes(out, shape.rows * ldy * 2);
     var bad: usize = 0;

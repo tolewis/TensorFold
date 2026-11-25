@@ -562,9 +562,9 @@ pub const Probe = struct {
                 const w: host.Weights = .{ .w = p.d_w, .scales = p.d_s, .amax = p.d_amax, .den = p.d_den };
                 if (p.kind.isGu()) {
                     try host.gather(ks, s, p.d_x, p.d_order, p.d_xs, rows, kdim);
-                    try host.gu(ks, s, p.format(), p.d_xs, w, p.d_items, p.d_count, p.d_out, rows, kdim, n);
+                    try host.gu(ks, s, p.format(), p.d_xs, w, p.d_items, p.d_count, p.d_out, rows, kdim, n, 0, host.experts);
                 } else {
-                    try host.down(ks, s, p.format(), p.d_x, w, p.d_items, p.d_count, p.d_out, rows, kdim, n);
+                    try host.down(ks, s, p.format(), p.d_x, w, p.d_items, p.d_count, p.d_out, rows, kdim, n, 0, host.experts);
                 }
             },
             .combine => try host.combine(ks, s, p.d_x, p.d_inv, p.d_ids, p.d_weights, p.d_out, rows, n),

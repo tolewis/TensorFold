@@ -555,7 +555,7 @@ pub const Probe = struct {
             },
             .nv_quant => try ks.nvfp4Quantize(s, p.d_w, p.d_s, p.d_amax, p.d_den, p.d_out, @intCast(p.shape.rows), @intCast(p.shape.k)),
             .mx_quant => try ks.mxfp8Quantize(s, p.d_w, p.d_s, p.d_out, @intCast(p.shape.rows), @intCast(p.shape.k)),
-            .combine => try ks.combine(s, p.d_x, p.d_ids, p.d_weights, p.d_out, cl),
+            .combine => try ks.combine(s, p.d_x, p.d_ids, p.d_weights, p.d_out, null, cl),
             .plan => try ks.plan(s, p.d_ids, p.d_members, p.d_items, p.d_count, cl),
         }
         try p.rig.dev.s.synchronize();
