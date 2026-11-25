@@ -142,7 +142,6 @@ pub const Ptr = ?*anyopaque;
 
 pub const Kernels = struct {
     k: [std.enums.values(Op).len]?xpu.Kernel = @splat(null),
-
     /// The kernels of `module` named `<prefix><op>`; `only` loads one (a control image holds one a prefix).
     pub fn load(module: *xpu.Module, prefix: []const u8, only: ?Op) !Kernels {
         var out: Kernels = .{};

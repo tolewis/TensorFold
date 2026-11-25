@@ -86,7 +86,7 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
 
     const files = b.addWriteFiles();
     if (prebuilt) |dir| {
-        for ([_][]const u8{ "glue", "tp", "contract_controls", "contract_gate_controls", "decode", "contract_attn_upstream", "contract_merge_upstream", "contract_inkling2_loop", "contract_inkling2_loop_controls", "inkling2_dspark", "contract_inkling2_dspark_controls", "inkling2_dflash2", "contract_inkling2_dflash2_controls", "contract_inkling2_experts", "contract_inkling2_controls", "inkling2_dense", "contract_inkling2_dense_store", "contract_inkling2_dense_sums", "inkling2_dense_q8", "contract_inkling2_dense_q8_store", "contract_inkling2_dense_q8_sums", "contract_inkling2_dense_q8_scale", "inkling2_prefill_experts", "contract_inkling2_prefill_experts_controls" } ++ inkling2.names) |name| {
+        for ([_][]const u8{ "glue", "tp", "contract_controls", "contract_gate_controls", "decode", "contract_attn_upstream", "contract_merge_upstream", "contract_inkling2_loop", "contract_inkling2_loop_controls", "contract_inkling2_fuse", "contract_inkling2_fuse_controls", "inkling2_dspark", "contract_inkling2_dspark_controls", "inkling2_dflash2", "contract_inkling2_dflash2_controls", "contract_inkling2_experts", "contract_inkling2_controls", "inkling2_dense", "contract_inkling2_dense_store", "contract_inkling2_dense_sums", "inkling2_dense_q8", "contract_inkling2_dense_q8_store", "contract_inkling2_dense_q8_sums", "contract_inkling2_dense_q8_scale", "inkling2_prefill_experts", "contract_inkling2_prefill_experts_controls" } ++ inkling2.names) |name| {
             _ = files.addCopyFile(.{ .cwd_relative = b.fmt("{s}/{s}.bin", .{ dir, name }) }, b.fmt("{s}.bin", .{name}));
         }
         for (ink2_attn_images ++ ink2_attn_controls) |src| {
@@ -131,6 +131,8 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         \\pub const gate_controls align(8) = @embedFile("contract_gate_controls.bin").*;
         \\pub const inkling2_loop align(8) = @embedFile("contract_inkling2_loop.bin").*;
         \\pub const inkling2_loop_controls align(8) = @embedFile("contract_inkling2_loop_controls.bin").*;
+        \\pub const inkling2_fuse align(8) = @embedFile("contract_inkling2_fuse.bin").*;
+        \\pub const inkling2_fuse_controls align(8) = @embedFile("contract_inkling2_fuse_controls.bin").*;
         \\pub const inkling2_glue align(8) = @embedFile("inkling2_glue.bin").*;
         \\pub const inkling2_runtime align(8) = @embedFile("inkling2_runtime.bin").*;
         \\pub const inkling2_glue_ctl align(8) = @embedFile("inkling2_glue_ctl.bin").*;
@@ -314,6 +316,8 @@ const contract_images = [_]Source{
     // is the same source with the 1/48 scale and the bf16 zeta dropped.
     .{ .name = "contract_inkling2_loop", .path = "zig/kernels/xpu/inkling2/loop.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt" },
     .{ .name = "contract_inkling2_loop_controls", .path = "zig/kernels/xpu/inkling2/loop.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -DTF_CTL_LOOP_NO_SCALE -DTF_CTL_LOOP_NO_ZETA_ROUND" },
+    .{ .name = "contract_inkling2_fuse", .path = "zig/kernels/xpu/inkling2/fuse.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt", .inputs = &.{"zig/kernels/xpu/inkling2/fuse.cl"} },
+    .{ .name = "contract_inkling2_fuse_controls", .path = "zig/kernels/xpu/inkling2/fuse.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -DFUSE_CTL", .inputs = &.{"zig/kernels/xpu/inkling2/fuse.cl"} },
     .{ .name = "contract_inkling2_experts", .path = "zig/kernels/xpu/inkling2/experts.cl", .extra = inkling2_options, .inputs = &.{"zig/kernels/xpu/inkling2/experts.cl"} },
     .{ .name = "contract_inkling2_controls", .path = "zig/kernels/xpu/inkling2/contract_experts_controls.cl", .extra = inkling2_options, .inputs = &.{"zig/kernels/xpu/inkling2/experts.cl"} },
 };

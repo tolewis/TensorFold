@@ -528,6 +528,7 @@ __kernel void P(nvfp4_quantize)(__global const uchar *W, __global const uchar *S
   const float k1 = P(e4m3)((uint)S[row * (k / 16u) + col / 16u]) * 0x1p100f;
   Y[at] = P(f_to_bf)(P(nv_value)(nibble, k1, phi26));
 }
+
 #endif
 
 #if INK2_ONLY & INK2_MX_QUANT

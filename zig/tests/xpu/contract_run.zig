@@ -14,6 +14,7 @@ const controls_k = @import("contract_controls.zig");
 const attn_k = @import("contract_attn.zig");
 const merge_k = @import("contract_merge.zig");
 const loop_k = @import("inkling2_loop.zig");
+const fuse_k = @import("inkling2_fuse.zig");
 const ink2_glue_k = @import("inkling2_glue.zig");
 const ink2_runtime_k = @import("inkling2_runtime.zig");
 const dspark_k = @import("inkling2_dspark.zig");
@@ -110,6 +111,14 @@ pub fn main(init: std.process.Init) !u8 {
         made += 1;
     };
     for (loops[0..made]) |*x| try kernels.append(a, x.kernel());
+    var fuses: [2 * std.enums.values(fuse_k.Kind).len]fuse_k.Probe = undefined;
+    var fuse_n: usize = 0;
+    defer for (fuses[0..fuse_n]) |*x| x.deinit();
+    for (std.enums.values(fuse_k.Kind)) |kind| for ([_]bool{ false, true }) |control| {
+        fuses[fuse_n] = try fuse_k.Probe.init(a, &dev, kind, control);
+        fuse_n += 1;
+    };
+    for (fuses[0..fuse_n]) |*x| try kernels.append(a, x.kernel());
     var ink2_glue = ink2_glue_k.Suite{ .a = a, .dev = &dev, .kernels = &kernels };
     defer ink2_glue.deinit();
     try ink2_glue.collect(null);

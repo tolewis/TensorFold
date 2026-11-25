@@ -7,6 +7,21 @@
 #define H 2304
 #define EPS 1e-6f
 #define AR_SCALE 0x1.555556p-6f
+#ifdef FUSE_CTL
+#define FUSE_AR_SCALE 0.0f
+#define FUSE_PRE(acc) (0.0f)
+#define FUSE_ZETA(dot) (0.0f)
+#define FUSE_GATE 0.0f
+#define FUSE_EPI 0
+#define FUSE_NORM 0.0f
+#else
+#define FUSE_AR_SCALE AR_SCALE
+#define FUSE_PRE(acc) (acc)
+#define FUSE_ZETA(dot) rbf(dot)
+#define FUSE_GATE 1.0f
+#define FUSE_EPI 1
+#define FUSE_NORM 1.0f
+#endif
 #define RANK 64
 
 static inline float bf2f(ushort h) { return as_float((uint)h << 16); }
@@ -87,7 +102,7 @@ KERNEL(256) void tf_ink2_fuse_pre(
       for (uint s = 0; s < 5; ++s) {
         float dot = 0.0f;
         for (uint j = 0; j < 16; ++j) dot += dots[s * 16 + j];
-        weights[s] = dot * AR_SCALE;
+        weights[s] = dot * FUSE_AR_SCALE;
         if (s < sources) peak = peak < weights[s] ? weights[s] : peak;
       }
       float den = 0.0f;
@@ -101,7 +116,7 @@ KERNEL(256) void tf_ink2_fuse_pre(
         float acc = 0.0f;
         for (uint s = 0; s < 5; ++s)
           if (s < sources) acc += weights[s] * (v[s][i] * means[s]);
-        dst[t + 256 * i] = acc;
+        dst[t + 256 * i] = FUSE_PRE(acc);
       }
       barrier(CLK_LOCAL_MEM_FENCE);
     }
@@ -158,7 +173,7 @@ KERNEL(256) void tf_ink2_fuse_zeta(
       for (int j = 0; j < 8; ++j) dot += bf2f(w3[j]) * bf2f(x3[j]);
     }
     dot = sub_group_reduce_add(dot);
-    if (lane == 0) zeta[((size_t)row * 4 + role) * RANK + r] = rbf(dot);
+    if (lane == 0) zeta[((size_t)row * 4 + role) * RANK + r] = FUSE_ZETA(dot);
   }
 }
 
@@ -206,7 +221,7 @@ KERNEL(256) void tf_ink2_zeta_wide(
     for (int j = 0; j < 8; ++j) dot += bf2f(w3[j]) * bf2f(x3[j]);
   }
   dot = sub_group_reduce_add(dot);
-  if (lane == 0) zeta[pack4 ? ((size_t)row * 4 + role) * RANK + r : (size_t)row * RANK + r] = rbf(dot);
+  if (lane == 0) zeta[pack4 ? ((size_t)row * 4 + role) * RANK + r : (size_t)row * RANK + r] = FUSE_ZETA(dot);
 }
 
 // Grid (36, roles, rows). One work-item one channel, the same 64-term order as tf_inkling2_loop_gates.
@@ -240,7 +255,7 @@ KERNEL(64) void tf_ink2_fuse_gates(
   const float g = tanh(gdot);
   const float keep = 1.0f - f;
   const float left = keep * h[d];
-  const float right = g * m[d];
+  const float right = FUSE_GATE * g * m[d];
   gated[((size_t)role * rows + row) * H + d] = left + right;
 }
 
@@ -280,6 +295,56 @@ KERNEL(256) void tf_ink2_router_gemv(global const ushort *x, global const ushort
       const uint at = (part * 9 + u) * 16 + lane;
       const uint4 a = w[(part * 9 + u) * 16 + lane];
       const float4 b0 = rx4(xg, 2 * at), b1 = rx4(xg, 2 * at + 1);
+      dot += as_float(a.x << 16) * b0.x;
+      dot += as_float(a.x & 0xffff0000u) * b0.y;
+      dot += as_float(a.y << 16) * b0.z;
+      dot += as_float(a.y & 0xffff0000u) * b0.w;
+      dot += as_float(a.z << 16) * b1.x;
+      dot += as_float(a.z & 0xffff0000u) * b1.y;
+      dot += as_float(a.w << 16) * b1.z;
+      dot += as_float(a.w & 0xffff0000u) * b1.w;
+    }
+  }
+  dot = sub_group_reduce_add(dot);
+  if (lane == 0) scores[(size_t)row * 128 + expert] = rsig(dot);
+}
+
+static inline float4 rx4u(local const ushort *n, uint i) {
+  const uint b = i * 4;
+  return (float4)(bf2f(n[b]), bf2f(n[b + 1]), bf2f(n[b + 2]), bf2f(n[b + 3]));
+}
+
+// The dense norm, then the wide router GEMV. Group 0 stores the bf16 row. The GEMV reads that row from local.
+KERNEL(256) void tf_ink2_router_norm_gemv(
+    global const float *x, global const ushort *nw, global const ushort *weight, global ushort *normed_out,
+    global float *scores, uint rows) {
+  const uint row = get_group_id(1), lane = get_sub_group_local_id(), sg = get_sub_group_id(), t = get_local_id(0);
+  if (row >= rows) return;
+  local float red[16];
+  local ushort normed[H];
+  global const float *xr = x + (size_t)row * H;
+  float sum = 0.0f;
+  for (uint d = t; d < H; d += 256) sum = fma(xr[d], xr[d], sum);
+  const float s = sub_group_reduce_add(sum);
+  if (lane == 0) red[sg] = s;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float total = 0.0f;
+  for (uint i = 0; i < 16; ++i) total += red[i];
+  const float inverse = FUSE_NORM / sqrt(total / (float)H + EPS);
+  for (uint d = t; d < H; d += 256) normed[d] = f2bf(bf2f(nw[d]) * (xr[d] * inverse));
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (get_group_id(0) == 0) {
+    for (uint d = t; d < H; d += 256) normed_out[(size_t)row * H + d] = normed[d];
+  }
+  const uint expert = get_group_id(0) * 16 + sg;
+  if (expert >= 128) return;
+  global const uint4 *w = (global const uint4 *)(weight + (size_t)expert * H);
+  float dot = 0.0f;
+  for (uint part = 0; part < 2; ++part) {
+    for (uint u = 0; u < 9; ++u) {
+      const uint at = (part * 9 + u) * 16 + lane;
+      const uint4 a = w[(part * 9 + u) * 16 + lane];
+      const float4 b0 = rx4u(normed, 2 * at), b1 = rx4u(normed, 2 * at + 1);
       dot += as_float(a.x << 16) * b0.x;
       dot += as_float(a.x & 0xffff0000u) * b0.y;
       dot += as_float(a.y << 16) * b0.z;
@@ -347,11 +412,21 @@ static inline ushort conv_y(global const ushort *history, global const ushort *c
   return f2bf(sum / SQRT5);
 }
 
+// The host commit for one row: the next history is history[1], history[2], current[0]. Read all three first.
+static void commit3(global ushort *history, global const ushort *current, uint c, uint channels) {
+  const ushort h1 = history[channels + c];
+  const ushort h2 = history[2 * channels + c];
+  const ushort cur = current[c];
+  history[c] = h1;
+  history[channels + c] = h2;
+  history[2 * channels + c] = cur;
+}
+
 // Grid (ceil(channels/256), rows). The attention convolution, then the partial, with the bf16 round between them.
 KERNEL(256) void tf_ink2_conv_attn_partial(
     global const ushort *history, global const ushort *current, global ushort *taps, global const ushort *weight,
     global ushort *conv_out, global const ushort *p, global ushort *blocks, global float *partial, uint rows, uint channels,
-    uint boundary) {
+    uint boundary, uint commit1) {
   const uint c = get_group_id(0) * 256 + get_local_id(0), r = get_group_id(1);
   if (c >= channels || r >= rows) return;
   const ushort y = conv_y(history, current, taps, weight, r, c, channels);
@@ -359,16 +434,75 @@ KERNEL(256) void tf_ink2_conv_attn_partial(
   const uint at = r * channels + c;
   partial[at] = boundary ? bf2f(y) : bf2f(p[at]) + bf2f(y);
   if (boundary) blocks[(size_t)r * 4 * channels + (boundary - 1) * channels + c] = p[at];
+  if (commit1 && rows == 1 && r == 0) commit3(history, current, c, channels);
 }
 
 // Grid (ceil(channels/256), rows). The MLP convolution, then the partial add into p.
 KERNEL(256) void tf_ink2_conv_mlp_partial(
     global const ushort *history, global const ushort *current, global ushort *taps, global const ushort *weight,
-    global ushort *conv_out, global const float *t, global ushort *p, uint rows, uint channels) {
+    global ushort *conv_out, global const float *t, global ushort *p, uint rows, uint channels, uint commit1) {
   const uint c = get_group_id(0) * 256 + get_local_id(0), r = get_group_id(1);
   if (c >= channels || r >= rows) return;
   const ushort y = conv_y(history, current, taps, weight, r, c, channels);
   conv_out[(size_t)r * channels + c] = y;
   const uint at = r * channels + c;
   p[at] = f2bf(t[at] + bf2f(y));
+  if (commit1 && rows == 1 && r == 0) commit3(history, current, c, channels);
 }
+
+// Grid (ceil(channels/256), rows). K folded into the V convolution. Each channel of each is the static formula.
+KERNEL(256) void tf_ink2_conv_kv(
+    global const ushort *hk, global const ushort *ck, global ushort *tk, global const ushort *wk, global ushort *ok,
+    global const ushort *hv, global const ushort *cv, global ushort *tv, global const ushort *wv, global ushort *ov,
+    uint rows, uint channels, uint commit1) {
+  const uint c = get_group_id(0) * 256 + get_local_id(0), r = get_group_id(1);
+  if (c >= channels || r >= rows) return;
+  ok[(size_t)r * channels + c] = conv_y(hk, ck, tk, wk, r, c, channels);
+  ov[(size_t)r * channels + c] = conv_y(hv, cv, tv, wv, r, c, channels);
+  if (commit1 && rows == 1 && r == 0) {
+    commit3(hk, ck, c, channels);
+    commit3(hv, cv, c, channels);
+  }
+}
+
+// Every row of the chunk. One thread owns a column and walks rows in order, so the convolution window
+// sees this column's earlier combine results. The combine order matches the expert kernel. Row 0 matches the
+// old one-row formula because conv_y at row 0 is that formula.
+KERNEL(256) void tf_ink2_down_epilogue(
+    global const ushort *down, global const int *ids, global const float *weights,
+    global const ushort *history, global ushort *taps, global const ushort *conv_w, global ushort *current,
+    global ushort *conv_out, global const float *partial, global ushort *p, uint n, uint topk, uint channels, uint rows, uint commit1) {
+  const uint c = get_group_id(0) * 256 + get_local_id(0);
+  if (c >= n || c >= channels) return;
+  for (uint r = 0; r < rows; ++r) {
+    float sum = 0.0f;
+    int last_id = INT_MIN;
+    int last_slot = -1;
+    global const int *id_row = ids + (size_t)r * topk;
+    global const float *w_row = weights + (size_t)r * topk;
+    for (uint t = 0; t < topk; ++t) {
+      int best_id = INT_MAX;
+      int best_slot = -1;
+      for (uint slot = 0; slot < topk; ++slot) {
+        const int id = id_row[slot];
+        const bool after = id > last_id || (id == last_id && (int)slot > last_slot);
+        if (after && (best_slot < 0 || id < best_id)) {
+          best_id = id;
+          best_slot = (int)slot;
+        }
+      }
+      if (best_slot < 0) break;
+      sum += w_row[best_slot] * bf2f(down[((size_t)r * topk + (uint)best_slot) * n + c]);
+      last_id = best_id;
+      last_slot = best_slot;
+    }
+    const ushort y = f2bf(sum);
+    current[(size_t)r * channels + c] = y;
+    const ushort cy = conv_y(history, current, taps, conv_w, r, c, channels);
+    conv_out[(size_t)r * channels + c] = cy;
+    const uint at = r * channels + c;
+    p[at] = FUSE_EPI ? f2bf(partial[at] + bf2f(cy)) : (ushort)0;
+  }
+  if (commit1 && rows == 1) commit3(history, current, c, channels);
+}
+
