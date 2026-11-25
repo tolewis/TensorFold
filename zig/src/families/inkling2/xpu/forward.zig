@@ -250,8 +250,28 @@ const Run = struct {
                 .segs = aref(s.segs, si * @sizeOf(ap.Seg)),
             };
             const kv = attention.Cache{ .k = sref(cache.keys(v.cache_slot)), .v = sref(cache.values(v.cache_slot)) };
-            try g.convInputForAttention(cache, v, base, rows, true);
-            try g.convInputForAttention(cache, v, base, rows, false);
+            const both_static = switch (w.attn.k_conv) {
+                .static => switch (w.attn.v_conv) {
+                    .static => true,
+                    .dynamic => false,
+                },
+                .dynamic => false,
+            };
+            if (fuse.kvConv() and both_static) {
+                const channels: u32 = state.kv_width;
+                const wk = switch (w.attn.k_conv) {
+                    .static => |weight| weight,
+                    .dynamic => unreachable,
+                };
+                const wv = switch (w.attn.v_conv) {
+                    .static => |weight| weight,
+                    .dynamic => unreachable,
+                };
+                try fuse.convKv(&g.p.fuse, g.s, cache.history(v.cache_slot, 0).ptr(), at(s.k_raw, base * channels * 2), cache.staged(v.cache_slot, 0, 0).ptr(), tensor(wk), at(s.k_conv, base * channels * 2), cache.history(v.cache_slot, 1).ptr(), at(s.v_raw, base * channels * 2), cache.staged(v.cache_slot, 1, 0).ptr(), tensor(wv), at(s.v_conv, base * channels * 2), @intCast(rows), channels);
+            } else {
+                try g.convInputForAttention(cache, v, base, rows, true);
+                try g.convInputForAttention(cache, v, base, rows, false);
+            }
             const k = &g.p.attention;
             const q_at = base * state.query_width * 2;
             const tab_at = base * 24 * ap.extent * 2;

@@ -372,3 +372,14 @@ KERNEL(256) void tf_ink2_conv_mlp_partial(
   const uint at = r * channels + c;
   p[at] = f2bf(t[at] + bf2f(y));
 }
+
+// Grid (ceil(channels/256), rows). K folded into the V convolution. Each channel of each is the static formula.
+KERNEL(256) void tf_ink2_conv_kv(
+    global const ushort *hk, global const ushort *ck, global ushort *tk, global const ushort *wk, global ushort *ok,
+    global const ushort *hv, global const ushort *cv, global ushort *tv, global const ushort *wv, global ushort *ov,
+    uint rows, uint channels) {
+  const uint c = get_group_id(0) * 256 + get_local_id(0), r = get_group_id(1);
+  if (c >= channels || r >= rows) return;
+  ok[(size_t)r * channels + c] = conv_y(hk, ck, tk, wk, r, c, channels);
+  ov[(size_t)r * channels + c] = conv_y(hv, cv, tv, wv, r, c, channels);
+}
