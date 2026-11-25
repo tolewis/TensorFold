@@ -26,6 +26,8 @@ fn imageOf(name: []const u8) ?rig_.Image {
     if (std.mem.eql(u8, name, "contract_controls")) return .controls;
     if (std.mem.eql(u8, name, "contract_inkling2_loop")) return .inkling2_loop;
     if (std.mem.eql(u8, name, "contract_inkling2_loop_controls")) return .inkling2_loop_controls;
+    if (std.mem.eql(u8, name, "contract_inkling2_fuse")) return .inkling2_fuse;
+    if (std.mem.eql(u8, name, "contract_inkling2_fuse_controls")) return .inkling2_fuse_controls;
     if (std.mem.eql(u8, name, "inkling2_glue")) return .ink2_glue;
     if (std.mem.eql(u8, name, "inkling2_runtime")) return .ink2_runtime;
     if (std.mem.eql(u8, name, "inkling2_glue_ctl")) return .ink2_glue_ctl;
@@ -70,6 +72,11 @@ fn argsOf(planted: []const u8) u32 {
         .{ "tf_inkling2_loop_messages", 6 },
         .{ "tf_inkling2_loop_zeta", 6 },
         .{ "tf_inkling2_loop_gates", 8 },
+        .{ "tf_ink2_fuse_pre", 16 },
+        .{ "tf_ink2_zeta_wide", 12 },
+        .{ "tf_ink2_fuse_gates", 15 },
+        .{ "tf_ink2_down_epilogue", 15 },
+        .{ "tf_ink2_router_norm_gemv", 6 },
         .{ "tf_inkling2_embed_norm", 5 },
         .{ "tf_inkling2_ar", 8 },
         .{ "tf_inkling2_conv_static", 7 },

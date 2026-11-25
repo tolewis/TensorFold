@@ -270,56 +270,28 @@ const Source = struct {
         if (dims.len != 2 or !q8.admits(dims[1])) return error.UnexpectedInkling2Tensor;
         const n = rows orelse dims[0];
         const k = dims[1];
-        const head = rows != null;
-        var t: Tensor = .{ .buf = .{ .rt = s.l.r, .ptr = null, .len = 0 }, .bytes = if (head) q8.dpasBytes(n, k) else q8.bytes(n, k), .dtype = .u8, .shape = inf.shape, .rank = inf.rank, .q8 = true };
+        var t: Tensor = .{ .buf = .{ .rt = s.l.r, .ptr = null, .len = 0 }, .bytes = q8.bytes(n, k), .dtype = .u8, .shape = inf.shape, .rank = inf.rank, .q8 = true };
         t.shape[0] = n;
         if (s.dry) return t;
         try s.owned.ensureUnusedCapacity(s.gpa, 1);
         t.buf = try s.l.empty(t.bytes);
         errdefer t.buf.free();
-        if (head) try s.encodeDpas(t.buf, inf, n, k) else try s.encodeInto(t.buf, inf, n, k);
+        try s.encodeInto(t.buf, inf, n, k);
         s.owned.appendAssumeCapacity(t.buf);
         return t;
     }
 
-    /// The head only: plane codes, then one DPAS tile of 16 columns at a time.
-    fn encodeDpas(s: *Source, dst: rt.Buffer, inf: loader.Info, n: usize, k: usize) !void {
-        try s.ensureScratch();
-        const sc = s.scratch.?;
-        const nb = k / q8.block;
-        const tile = try s.gpa.alloc(u8, q8.dpasBytes(16, k));
-        defer s.gpa.free(tile);
-        const base: [*]u8 = @ptrCast(dst.ptr.?);
-        const sc_base = q8.dpasTiles(n) * nb * 512;
-        var row: usize = 0;
-        var ti: usize = 0;
-        while (row < n) {
-            const m = @min(16, n - row);
-            try loader.readExact(inf.fd, std.mem.sliceAsBytes(sc.raw[0 .. m * k]), inf.off + @as(u64, row) * k * 2);
-            q8.encodeRows(sc.raw[0 .. m * k], m, k, sc.codes[0 .. m * k], sc.scales[0 .. m * nb]);
-            q8.repackDpas(sc.codes[0 .. m * k], sc.scales[0 .. m * nb], m, k, tile);
-            try s.l.r.upload(.{ .rt = dst.rt, .ptr = base + ti * nb * 512, .len = nb * 512 }, tile[0 .. nb * 512]);
-            try s.l.r.upload(.{ .rt = dst.rt, .ptr = base + sc_base + ti * nb * 32, .len = nb * 32 }, tile[nb * 512 ..][0 .. nb * 32]);
-            try s.l.r.sync();
-            row += m;
-            ti += 1;
-        }
-    }
-
-    fn ensureScratch(s: *Source) !void {
-        if (s.scratch != null) return;
-        const sc = try s.gpa.create(Scratch);
-        errdefer s.gpa.destroy(sc);
-        sc.raw = try s.gpa.alloc(u16, Scratch.values);
-        errdefer s.gpa.free(sc.raw);
-        sc.codes = try s.gpa.alloc(u8, Scratch.values);
-        errdefer s.gpa.free(sc.codes);
-        sc.scales = try s.gpa.alloc(u16, Scratch.values / q8.block);
-        s.scratch = sc;
-    }
-
     fn encodeInto(s: *Source, dst: rt.Buffer, inf: loader.Info, n: usize, k: usize) !void {
-        try s.ensureScratch();
+        if (s.scratch == null) {
+            const sc = try s.gpa.create(Scratch);
+            errdefer s.gpa.destroy(sc);
+            sc.raw = try s.gpa.alloc(u16, Scratch.values);
+            errdefer s.gpa.free(sc.raw);
+            sc.codes = try s.gpa.alloc(u8, Scratch.values);
+            errdefer s.gpa.free(sc.codes);
+            sc.scales = try s.gpa.alloc(u16, Scratch.values / q8.block);
+            s.scratch = sc;
+        }
         const sc = s.scratch.?;
         const nb = k / q8.block;
         const per = @max(1, Scratch.values / k);

@@ -50,8 +50,8 @@ const Bench = struct {
         return try d.at(0);
     }
     /// A weight copy of `n` rows of `k` values: random codes and scales in a plausible range.
-    fn weight(b: *Bench, n: usize, k: usize, codes: []const u8, scales: []const u16, dpas: bool) !host.Ref {
-        var d = try b.alloc(if (dpas) q8.dpasBytes(n, k) else q8.bytes(n, k));
+    fn weight(b: *Bench, n: usize, k: usize, codes: []const u8, scales: []const u16) !host.Ref {
+        var d = try b.alloc(q8.bytes(n, k));
         var at: usize = 0;
         const plane = n * k;
         while (at < plane) {
@@ -168,17 +168,9 @@ fn check(b: *Bench, head: bool, rows: u32, n: u32, k: u32) !f64 {
     const xs = try a.alloc(u16, @as(usize, rows) * k);
     defer a.free(xs);
     for (xs) |*v| v.* = bf((rng.float(f32) - 0.5) * 4);
-    const nbytes = if (head) q8.dpasBytes(n, k) else q8.bytes(n, k);
-    var wd = try b.alloc(nbytes);
-    if (head) {
-        const tile = try a.alloc(u8, nbytes);
-        defer a.free(tile);
-        q8.repackDpas(codes, scales, n, k, tile);
-        try wd.upload(b.dev.s, 0, tile);
-    } else {
-        try wd.upload(b.dev.s, 0, codes);
-        try wd.upload(b.dev.s, @as(usize, n) * k, std.mem.sliceAsBytes(scales));
-    }
+    var wd = try b.alloc(q8.bytes(n, k));
+    try wd.upload(b.dev.s, 0, codes);
+    try wd.upload(b.dev.s, @as(usize, n) * k, std.mem.sliceAsBytes(scales));
     var xd = try b.alloc(xs.len * 2);
     try xd.upload(b.dev.s, 0, std.mem.sliceAsBytes(xs));
     const osize: usize = if (head) 4 else 2;
@@ -265,14 +257,14 @@ pub fn main(init: std.process.Init) !u8 {
     };
     for (shapes) |sh| {
         if (quick and sh.n == 384) continue;
-        const bytes = if (sh.head) q8.dpasBytes(sh.n, sh.k) else q8.bytes(sh.n, sh.k);
+        const bytes = q8.bytes(sh.n, sh.k);
         const copies = @max(2, (pool_bytes + bytes - 1) / bytes);
         const keep = b.bufs.items.len;
         const x = try b.noisyBf16(32 * @as(usize, sh.k) * 2, noise);
         const y = try b.buf(32 * @as(usize, sh.n) * 4, 0);
         var ws = try b.a.alloc(host.Ref, copies);
         defer b.a.free(ws);
-        for (ws) |*w| w.* = try b.weight(sh.n, sh.k, codes, scales, sh.head);
+        for (ws) |*w| w.* = try b.weight(sh.n, sh.k, codes, scales);
         try dev.s.synchronize();
         for ([_]u32{ 1, 2, 4, 8, 16, 32 }) |rows| {
             if (quick and rows != 1 and rows != 8) continue;

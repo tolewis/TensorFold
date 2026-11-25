@@ -168,11 +168,52 @@ Q8_MATVEC(1)
 
 // One launch, five projections, one row of x each. Grid (ceil(max_n / (Q8_WG/16)), 5). A group whose column is past its n returns.
 // The dot is Q8_DOT, the same lane order as dense_q8_1.
+// The sink weight is bf16, the same loop as dense_1. A sub-group owns one column. Lane l takes chunks l, l+16, ...
+static void q8_sink_bf16(global const ushort *x, global const ushort *w, global ushort *y, uint j, uint k) {
+  const uint lane = get_sub_group_local_id();
+  const uint chunks = k / 8;
+  global const uint4 *wr = (global const uint4 *)(w + (ulong)j * k);
+  float acc = 0.0f;
+  uint c = lane;
+  for (; c + 5 * 16 < chunks; c += 6 * 16) {
+    uint4 wv[6];
+    for (uint u = 0; u < 6; ++u) wv[u] = wr[c + u * 16];
+    for (uint u = 0; u < 6; ++u) {
+      const uint4 xv = ((global const uint4 *)x)[c + u * 16];
+      float part = as_float(wv[u].x << 16) * as_float(xv.x << 16);
+      part += as_float(wv[u].x & 0xffff0000u) * as_float(xv.x & 0xffff0000u);
+      part += as_float(wv[u].y << 16) * as_float(xv.y << 16);
+      part += as_float(wv[u].y & 0xffff0000u) * as_float(xv.y & 0xffff0000u);
+      part += as_float(wv[u].z << 16) * as_float(xv.z << 16);
+      part += as_float(wv[u].z & 0xffff0000u) * as_float(xv.z & 0xffff0000u);
+      part += as_float(wv[u].w << 16) * as_float(xv.w << 16);
+      part += as_float(wv[u].w & 0xffff0000u) * as_float(xv.w & 0xffff0000u);
+      acc += part;
+    }
+  }
+  for (; c < chunks; c += 16) {
+    const uint4 wv = wr[c];
+    const uint4 xv = ((global const uint4 *)x)[c];
+    float part = as_float(wv.x << 16) * as_float(xv.x << 16);
+    part += as_float(wv.x & 0xffff0000u) * as_float(xv.x & 0xffff0000u);
+    part += as_float(wv.y << 16) * as_float(xv.y << 16);
+    part += as_float(wv.y & 0xffff0000u) * as_float(xv.y & 0xffff0000u);
+    part += as_float(wv.z << 16) * as_float(xv.z << 16);
+    part += as_float(wv.z & 0xffff0000u) * as_float(xv.z & 0xffff0000u);
+    part += as_float(wv.w << 16) * as_float(xv.w << 16);
+    part += as_float(wv.w & 0xffff0000u) * as_float(xv.w & 0xffff0000u);
+    acc += part;
+  }
+  const float s = sub_group_reduce_add(acc);
+  if (lane == 0) y[j] = q8_f2bf(s);
+}
+
 Q8_KERNEL(Q8_WG) void Q8_NAME(dense_q8_seg1)(
     global const ushort *x0, global const ushort *x1, global const ushort *x2, global const ushort *x3, global const ushort *x4,
     global const uchar *w0, global const uchar *w1, global const uchar *w2, global const uchar *w3, global const uchar *w4,
     global ushort *y0, global ushort *y1, global ushort *y2, global ushort *y3, global ushort *y4,
-    uint n0, uint n1, uint n2, uint n3, uint n4, uint k) {
+    uint n0, uint n1, uint n2, uint n3, uint n4, uint k,
+    global const uchar *sink_w, global ushort *sink_y, uint sink_n, uint sink_on) {
   const uint seg = get_group_id(1);
   const uint j = get_group_id(0) * (Q8_WG / 16) + get_sub_group_id();
   uint n = n0;
@@ -190,6 +231,7 @@ Q8_KERNEL(Q8_WG) void Q8_NAME(dense_q8_seg1)(
   Q8_DOT(1, x, codes, scales, j, n, k)
   const float s = sub_group_reduce_add(acc[0]);
   if (get_sub_group_local_id() == 0) y[j] = Q8_STORE(s);
+  if (sink_on && seg == 0 && j < sink_n) q8_sink_bf16(x0, (global const ushort *)sink_w, sink_y, j, k);
 }
 
 Q8_MATVEC(2)
