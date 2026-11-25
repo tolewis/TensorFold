@@ -202,6 +202,73 @@ KERNEL(16) void tf_ink2_attn_decode(global const ushort *q, global const ushort 
 }
 
 // Folds the chunks and any sub-chunks in order, adds the sink logit, applies the gate and rounds once to bf16.
+// Grid (rows * heads). Eight sub-groups, each over one eighth of the chunks and every channel, so each thread folds eight
+// channels over eight chunks instead of one channel over sixty-four: the loads of the next channels run while the last
+// fold waits. The eight partials are merged in sub-group order, then the sink and the gate as tf_ink2_merge does.
+KERNEL(128) void tf_ink2_merge_split(global const float *part_o, global const float2 *part_ml, global const ushort *sink,
+                                     global const ushort *gate, global const int *rpos, global ushort *out, uint heads,
+                                     uint window, uint chunk, uint c0, uint chunks, uint subs) {
+  const uint rh = get_group_id(0), t = get_local_id(0), lane = get_sub_group_local_id(), sg = get_sub_group_id();
+  const uint row = rh / heads, pos = (uint)rpos[row];
+  const uint lo = window && pos + 1 > window ? pos + 1 - window : 0;
+  const uint first = lo / chunk, last_c = pos / chunk, n = last_c + 1 - first;
+  const uint per = (n + 7) / 8;
+  const uint a = first + sg * per, b = min(first + (sg + 1) * per, last_c + 1);
+  local float pmax[8][D], psum[8][D], po[8][D];
+  float m8[8], l8[8], o8[8];
+  for (uint i = 0; i < 8; ++i) { m8[i] = -INFINITY; l8[i] = 0.0f; o8[i] = 0.0f; }
+  for (uint c = a; c < b; ++c) {
+    float cm, cl, co8[8];
+    if (subs > 1) {
+      float sm = -INFINITY, sl = 0.0f;
+      float so8[8];
+      for (uint i = 0; i < 8; ++i) so8[i] = 0.0f;
+      const uint lastu = min(subs - 1, (pos - c * chunk) / 1024);
+      for (uint u = 0; u <= lastu; ++u) {
+        const size_t at = (size_t)rh * chunks + (c - c0) * subs + u;
+        const float2 ml = part_ml[at];
+        const float mn = fmax(sm, ml.x);
+        const float x = exp2(sm - mn), y = exp2(ml.x - mn);
+        sl = sl * x + ml.y * y;
+        for (uint i = 0; i < 8; ++i) so8[i] = so8[i] * x + part_o[at * D + lane * 8 + i] * y;
+        sm = mn;
+      }
+      cm = sm; cl = sl;
+      for (uint i = 0; i < 8; ++i) co8[i] = so8[i];
+    } else {
+      const size_t at = (size_t)rh * chunks + c - (window ? lo / chunk : c0);
+      const float2 ml = part_ml[at];
+      cm = ml.x; cl = ml.y;
+      for (uint i = 0; i < 8; ++i) co8[i] = part_o[at * D + lane * 8 + i];
+    }
+    for (uint i = 0; i < 8; ++i) {
+      const float mn = fmax(m8[i], cm), x = exp2(m8[i] - mn), y = exp2(cm - mn);
+      l8[i] = l8[i] * x + cl * y;
+      o8[i] = o8[i] * x + co8[i] * y;
+      m8[i] = mn;
+    }
+  }
+  for (uint i = 0; i < 8; ++i) {
+    pmax[sg][lane * 8 + i] = m8[i];
+    psum[sg][lane * 8 + i] = l8[i];
+    po[sg][lane * 8 + i] = o8[i];
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  // every thread owns one channel and reads the eight partials of that channel
+  float mm = pmax[0][t], ll = psum[0][t], o = po[0][t];
+  for (uint k = 1; k < 8; ++k) {
+    const float mn = fmax(mm, pmax[k][t]), x = exp2(mm - mn), y = exp2(pmax[k][t] - mn);
+    ll = ll * x + psum[k][t] * y;
+    o = o * x + po[k][t] * y;
+    mm = mn;
+  }
+  const float sk = bf2f(sink[rh]) * LOG2E;
+  const float mf = fmax(mm, sk), a0 = exp2(mm - mf);
+  const float y = o * a0 / (ll * a0 + exp2(sk - mf));
+  const float gv = bf2f(gate[(size_t)rh * D + t]);
+  out[(size_t)rh * D + t] = f2bf(y * (1.0f / (1.0f + exp(-gv))));
+}
+
 KERNEL(128) void tf_ink2_merge(global const float *part_o, global const float2 *part_ml, global const ushort *sink, global const ushort *gate,
                                global const int *rpos, global ushort *out, uint heads, uint window, uint chunk, uint c0, uint chunks,
                                uint subs) {

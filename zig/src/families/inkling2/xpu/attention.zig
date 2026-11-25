@@ -17,6 +17,18 @@ pub const RowMeta = struct { pos: Ref, seg_of: Ref, segs: Ref };
 
 pub const Error = planning.Error || xpu.Error || error{OutOfMemory};
 
+/// The merge over eight sub-groups of chunk ranges. Default; `INK2_MERGE_SPLIT=0` selects the serial fold.
+pub var merge_split: bool = false;
+
+pub fn mergeSplit() bool {
+    if (merge_split) return true;
+    if (std.c.getenv("INK2_MERGE_SPLIT")) |p| {
+        const s = std.mem.span(p);
+        if (s.len > 0 and s[0] == '0') return false;
+    }
+    return true;
+}
+
 /// Kernel names, with the work-group size each is made at.
 const Entry = struct { name: [:0]const u8, threads: u32 };
 const names = struct {
@@ -24,6 +36,7 @@ const names = struct {
     const rel_table: Entry = .{ .name = "tf_ink2_rel_table", .threads = 256 };
     const decode: Entry = .{ .name = "tf_ink2_attn_decode", .threads = planning.decode_threads };
     const merge: Entry = .{ .name = "tf_ink2_merge", .threads = planning.merge_threads };
+    const merge_split: Entry = .{ .name = "tf_ink2_merge_split", .threads = planning.merge_threads };
     const prompt: Entry = .{ .name = "tf_ink2_attn_prompt", .threads = planning.prompt_threads };
 };
 
@@ -33,6 +46,7 @@ pub const Kernels = struct {
     rel_table: xpu.Kernel,
     decode: xpu.Kernel,
     merge: xpu.Kernel,
+    merge_split: xpu.Kernel,
     prompt: xpu.Kernel,
 
     pub fn init(attention: xpu.Module, prompt: xpu.Module) xpu.Error!Kernels {
@@ -45,11 +59,14 @@ pub const Kernels = struct {
         errdefer k.decode.deinit();
         k.merge = try attention.kernel(names.merge.name, .{ names.merge.threads, 1, 1 });
         errdefer k.merge.deinit();
+        k.merge_split = try attention.kernel(names.merge_split.name, .{ names.merge_split.threads, 1, 1 });
+        errdefer k.merge_split.deinit();
         k.prompt = try prompt.kernel(names.prompt.name, .{ names.prompt.threads, 1, 1 });
         return k;
     }
     pub fn deinit(k: *Kernels) void {
         k.prompt.deinit();
+        k.merge_split.deinit();
         k.merge.deinit();
         k.decode.deinit();
         k.rel_table.deinit();
@@ -96,7 +113,8 @@ pub fn attendAs(k: *const Kernels, s: xpu.Stream, path: planning.Path, r: planni
             launch.chunk, @as(u32, 0), launch.partials_rh, scale,
         });
     }
-    try xpu.launch.dispatch(k.merge, s, launch.merge_grid, .{
+    const m = if (mergeSplit()) k.merge_split else k.merge;
+    try xpu.launch.dispatch(m, s, launch.merge_grid, .{
         part_o.at(), part_ml.at(), sink.at(), gate.at(), meta.pos.at(), out.at(),
         r.heads,     l.window,     launch.chunk, @as(u32, 0), launch.partials_rh, launch.subs,
     });
