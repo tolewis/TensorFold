@@ -36,10 +36,10 @@ pub var vdump_cur: u32 = 0;
 pub var vdump_active: bool = false;
 
 /// TF_TP_VDUMP: the hidden state after each visit of a short call (a verify window or a decode row), for the bisect.
-pub fn dumpVisit(r: *xpu.rt.Runtime, rank: u32, seq: u32, visit: usize, src: ?*anyopaque, rows: usize) !void {
+pub fn dumpVisit(r: *xpu.rt.Runtime, rank: u32, seq: u32, visit: usize, src: ?*anyopaque, rows: usize, width: usize) !void {
     const dir_z = std.c.getenv("TF_TP_VDUMP") orelse return;
     const ptr = src orelse return;
-    const bytes: usize = rows * 2304 * 2;
+    const bytes: usize = rows * width * 2;
     const host = try std.heap.page_allocator.alloc(u8, bytes);
     defer std.heap.page_allocator.free(host);
     try r.download(host, .{ .rt = r, .ptr = ptr, .len = bytes });
@@ -553,8 +553,10 @@ fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) 
             }
         }
         if (std.c.getenv("TF_TP_VDUMP") != null and visit_i == 0) {
-            try dumpVisit(m.r, m.options.place.rank, vdump_cur, 90, at(s.q_norm, 0), rows);
-            try dumpVisit(m.r, m.options.place.rank, vdump_cur, 91, at(s.attn_dense, 0), rows);
+            try dumpVisit(m.r, m.options.place.rank, vdump_cur, 90, at(s.q_norm, 0), rows, state.hidden);
+            try dumpVisit(m.r, m.options.place.rank, vdump_cur, 91, at(s.attn_dense, 0), rows, state.hidden);
+            try dumpVisit(m.r, m.options.place.rank, vdump_cur, 92, at(s.att, 0), rows, m.options.place.qWidth());
+            try dumpVisit(m.r, m.options.place.rank, vdump_cur, 93, at(s.q_raw, 0), rows, m.options.place.qWidth());
         }
         var base: usize = 0;
         if (fuse.convFold() and segments.len == 1) {
