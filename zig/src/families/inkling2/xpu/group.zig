@@ -48,7 +48,7 @@ fn watchPeer(pid: i32) void {
 const TsFn = *const fn (ze.H, *anyopaque, ze.H, u32, ?*ze.H) callconv(.c) u32;
 
 pub const Op = enum(u32) { forward = 1, close = 2 };
-pub const Rec = extern struct { seq: u64, op: Op, n: u32, flags: u32, base: u32, ids: [64]u32 };
+pub const Rec = extern struct { seq: u64, op: Op, n: u32, flags: u32, base: u32, ids: [2048]u32 };
 
 pub const Group = struct {
     tp: u32,
@@ -172,7 +172,7 @@ pub const Group = struct {
 
     pub fn note(g: *Group, op: Op, ids: []const u32, flags: u32, base: u32) !void {
         if (g.rank != 0) return;
-        if (ids.len > 64) return error.Inkling2Tp;
+        if (ids.len > 2048) return error.Inkling2Tp;
         g.rec_seq += 1;
         var rec: Rec = .{ .seq = g.rec_seq, .op = op, .n = @intCast(ids.len), .flags = flags, .base = base, .ids = @splat(0) };
         @memcpy(rec.ids[0..ids.len], ids);
