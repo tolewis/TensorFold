@@ -466,13 +466,12 @@ const Run = struct {
         }
     }
 
-    /// `INK2_SEG4=1`: a window's five projections in one launch (`dense_q8_seg4`). Measured at 1.390 ms against 2.262
-/// for the five separate launches at four rows, but the drafted stream of prompt 2 leaves the accepted one at token 16,
-/// so it is off until that difference is accounted for.
+    /// A window's five projections in one launch (`dense_q8_seg4`): 1.390 ms against 2.262 for the five separate launches
+/// at four rows, and the round's device busy at 40k falls 17.96 to 17.12 ms. `INK2_SEG4=0` keeps the separate ones.
 var seg4_on: ?bool = null;
 fn seg4() bool {
     if (seg4_on) |v| return v;
-    const v = if (std.c.getenv("INK2_SEG4")) |p| std.mem.eql(u8, std.mem.span(p), "1") else false;
+    const v = if (std.c.getenv("INK2_SEG4")) |p| !std.mem.eql(u8, std.mem.span(p), "0") else true;
     seg4_on = v;
     return v;
 }
