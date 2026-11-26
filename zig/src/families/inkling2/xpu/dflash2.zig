@@ -46,6 +46,18 @@ fn nowNs() u64 {
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
+/// A pseudo-random token id for the fuzz switch: a splitmix-style mix of the seed, the position and the step, so a run
+/// repeats exactly.
+fn fuzzId(seed: u64, position: u64, step: usize) u32 {
+    var x = seed ^ (position *% 0x9E3779B97F4A7C15) ^ (@as(u64, @intCast(step)) *% 0xBF58476D1CE4E5B9);
+    x ^= x >> 33;
+    x *%= 0xFF51AFD7ED558CCD;
+    x ^= x >> 33;
+    x *%= 0xC4CEB9FE1A85EC53;
+    x ^= x >> 33;
+    return @intCast(x % weight_loader.valid_vocabulary);
+}
+
 /// Encodes `n` host rows of `k` bf16 values to q8.zig's blocks on the card: codes, then the scales after `n * k` bytes.
 fn uploadQ8Rows(dev: *rt.Runtime, gpa: std.mem.Allocator, host: []const u16, n: usize, width: usize) !rt.Buffer {
     const q8 = @import("q8.zig");
@@ -129,6 +141,9 @@ pub const Drafter = struct {
     /// heads' top lists (a diagnostic, off by default).
     head_check: bool = false,
     head_checked: bool = false,
+    /// `TF_DFLASH2_FUZZ=<seed>`: every proposed token is replaced by a pseudo-random id, so acceptance is near 0. The
+    /// output must still equal plain decode; a difference means the verify's rollback misses state.
+    fuzz: ?u64 = null,
     /// The most drafts a round may ask (block length minus one); `TF_DFLASH2_DEPTH=1..7` sets it for measurement.
     /// Three drafts (a four-row window): the paired 40k/125k sweep of 2026-11-25 (same prompts each length, per prompt)
     /// puts the best at four rows at 125k (82.3 tok/s, 40.2 ms a round) and at four or six rows at 40k (82.6/92.7);
@@ -269,6 +284,7 @@ pub const Drafter = struct {
             if (std.mem.eql(u8, std.mem.span(v), "raw")) d.embed_mode = .raw;
         }
         if (std.c.getenv("TF_DFLASH2_FUSE")) |v| d.fuse = !std.mem.eql(u8, std.mem.span(v), "0");
+        if (std.c.getenv("TF_DFLASH2_FUZZ")) |v| d.fuzz = std.fmt.parseInt(u64, std.mem.span(v), 10) catch 1;
         return d;
     }
 
@@ -708,6 +724,9 @@ pub const Drafter = struct {
                 previous = try d.draw(step, previous, item.sampling, position);
                 if (previous >= state.vocabulary) return error.DraftNonfinite;
                 lane.held[step] = previous;
+            }
+            if (d.fuzz) |seed| {
+                for (0..depth) |step| lane.held[step] = fuzzId(seed, item.position, step);
             }
             lane.held_len = offered;
             if (d.trace != null) {
