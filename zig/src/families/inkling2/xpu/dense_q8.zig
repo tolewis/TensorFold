@@ -17,6 +17,8 @@ pub const variants = [_]u32{ 1, 2, 4, 8, 16, 32 };
 pub const Kernels = struct {
     dense: [variants.len]xpu.Kernel,
     head: [variants.len]xpu.Kernel,
+    /// The drafter's draft head: the same dot, logits BF16 without the soft cap.
+    draft_head: [variants.len]xpu.Kernel,
     seg1: xpu.Kernel,
     seg4: xpu.Kernel,
     /// The drafter's block: five segments, eight rows of x each (`dense_q8.cl`).
@@ -43,10 +45,18 @@ pub const Kernels = struct {
             made[n] = try module.kernel(symbol("head", rows, control), .{ threads, 1, 1 });
             n += 1;
         }
-        var out: Kernels = .{ .dense = undefined, .head = undefined, .seg1 = undefined, .seg4 = undefined, .seg8 = undefined, .head_dpas = undefined, .quant = undefined, .columns = threads / 16 };
+        var made_draft: [variants.len]xpu.Kernel = undefined;
+        var dn: usize = 0;
+        errdefer for (made_draft[0..dn]) |*k| k.deinit();
+        inline for (variants) |rows| {
+            made_draft[dn] = try module.kernel(symbol("draft_head", rows, control), .{ threads, 1, 1 });
+            dn += 1;
+        }
+        var out: Kernels = .{ .dense = undefined, .head = undefined, .draft_head = undefined, .seg1 = undefined, .seg4 = undefined, .seg8 = undefined, .head_dpas = undefined, .quant = undefined, .columns = threads / 16 };
         for (0..variants.len) |i| {
             out.dense[i] = made[2 * i];
             out.head[i] = made[2 * i + 1];
+            out.draft_head[i] = made_draft[i];
         }
         const seg_name = if (control) "tf_ctl_ink2_dense_q8_seg1" else "tf_ink2_dense_q8_seg1";
         out.seg1 = try module.kernel(seg_name, .{ threads, 1, 1 });
@@ -69,6 +79,7 @@ pub const Kernels = struct {
         p.quant.deinit();
         for (&p.dense) |*k| k.deinit();
         for (&p.head) |*k| k.deinit();
+        for (&p.draft_head) |*k| k.deinit();
     }
 };
 
@@ -210,6 +221,18 @@ pub fn head(p: *const Kernels, s: xpu.Stream, weight: Ref, h: Ref, out: Ref, row
     while (base < rows) {
         const t = take(rows - base);
         try headLaunch(p, s, t, weight, at(h, @as(usize, base) * hidden * 2), at(out, @as(usize, base) * vocab * 4), t, vocab);
+        base += t;
+    }
+}
+
+/// out[rows][vocab] = bf16(h[rows][2304] . dequant(unembed)[vocab][2304]) in BF16, the drafter's top-k layout (no cap).
+/// `weight` holds `vocab` rows. Rows go 32, 16, 8, 4, 2, 1 at a time.
+pub fn draftHead(p: *const Kernels, s: xpu.Stream, weight: Ref, h: Ref, out: Ref, rows: u32, vocab: u32) !void {
+    std.debug.assert(rows > 0);
+    var base: u32 = 0;
+    while (base < rows) {
+        const t = take(rows - base);
+        try xpu.launch.dispatch(p.draft_head[variantOf(t)], s, .{ (vocab + p.columns - 1) / p.columns, 1, 1 }, .{ at(h, @as(usize, base) * hidden * 2), weight, at(out, @as(usize, base) * vocab * 2), t, vocab });
         base += t;
     }
 }

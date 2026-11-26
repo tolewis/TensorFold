@@ -46,6 +46,30 @@ fn nowNs() u64 {
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
+/// Encodes `n` host rows of `k` bf16 values to q8.zig's blocks on the card: codes, then the scales after `n * k` bytes.
+fn uploadQ8Rows(dev: *rt.Runtime, gpa: std.mem.Allocator, host: []const u16, n: usize, width: usize) !rt.Buffer {
+    const q8 = @import("q8.zig");
+    const chunk: usize = 4096;
+    var buf = try dev.alloc(q8.bytes(n, width));
+    errdefer buf.free();
+    const codes = try gpa.alloc(u8, chunk * width);
+    defer gpa.free(codes);
+    const scales = try gpa.alloc(u16, chunk * (width / q8.block));
+    defer gpa.free(scales);
+    var row: usize = 0;
+    while (row < n) {
+        const m = @min(chunk, n - row);
+        q8.encodeRows(host[row * width ..][0 .. m * width], m, width, codes[0 .. m * width], scales[0 .. m * (width / q8.block)]);
+        const code_base = @intFromPtr(buf.ptr.?) + row * width;
+        try dev.upload(.{ .rt = dev, .ptr = @ptrFromInt(code_base), .len = m * width }, codes[0 .. m * width]);
+        const base = @intFromPtr(buf.ptr.?) + q8.scaleOffset(n, width) + row * (width / q8.block) * 2;
+        try dev.upload(.{ .rt = dev, .ptr = @ptrFromInt(base), .len = m * (width / q8.block) * 2 }, std.mem.sliceAsBytes(scales[0 .. m * (width / q8.block)]));
+        try dev.sync();
+        row += m;
+    }
+    return buf;
+}
+
 /// Where a drafted round's drafter time goes (`TF_DFLASH2_TIMES=1` logs a line every 50 holds).
 const Times = struct {
     on: bool = false,
@@ -83,6 +107,10 @@ pub const Drafter = struct {
     /// so the drafter holds the full matrix itself when the target's is a slice. The DFlash 2 file has no unembedding;
     /// the rows come from the target checkpoint.
     unembed: ?rt.Buffer = null,
+    /// The same rows re-encoded to q8.zig's Q8_0 blocks when `TF_DFLASH2_Q8=1`: the draft head then runs the target's q8
+    /// head, which reads about half the bytes of the bf16 table. Drafts only change speed, so the rounding cannot change
+    /// an output; it can change acceptance.
+    unembed_q8: ?rt.Buffer = null,
     /// The draft head's vocabulary: `TF_DFLASH2_VOCAB=N` keeps the first N rows of the unembedding, so a round reads
     /// N rows a position instead of every row. Drafts only change speed, so a smaller head cannot change an output.
     vocab: u32 = state.vocabulary,
@@ -97,6 +125,10 @@ pub const Drafter = struct {
     embed_mode: EmbedMode = .normed,
     /// `TF_DFLASH2_FUSE=0` keeps one launch a projection, for an A/B against the fused ones.
     fuse: bool = true,
+    /// `TF_DFLASH2_HEADCHECK=1`: the block's bf16 base head keeps its own table too, and one hold compares the two
+    /// heads' top lists (a diagnostic, off by default).
+    head_check: bool = false,
+    head_checked: bool = false,
     /// The most drafts a round may ask (block length minus one); `TF_DFLASH2_DEPTH=1..7` sets it for measurement.
     /// Three drafts (a four-row window): the paired 40k/125k sweep of 2026-11-25 (same prompts each length, per prompt)
     /// puts the best at four rows at 125k (82.3 tok/s, 40.2 ms a round) and at four or six rows at 40k (82.6/92.7);
@@ -126,11 +158,15 @@ pub const Drafter = struct {
         const full: usize = weight_loader.vocabulary * weight_loader.hidden;
         var own_unembed: ?rt.Buffer = null;
         errdefer if (own_unembed) |*b| b.free();
+        var own_unembed_q8: ?rt.Buffer = null;
+        errdefer if (own_unembed_q8) |*b| b.free();
+        const q8_head = if (std.c.getenv("TF_DFLASH2_Q8")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+        const head_check = q8_head and std.c.getenv("TF_DFLASH2_HEADCHECK") != null;
         var d_index: ?[]u32 = null;
         errdefer if (d_index) |ix| gpa.free(ix);
         var d_vocab: u32 = state.vocabulary;
         const want: usize = if (std.c.getenv("TF_DFLASH2_VOCAB")) |v| std.math.clamp(std.fmt.parseInt(usize, std.mem.span(v), 10) catch weight_loader.vocabulary, 256, weight_loader.vocabulary) else weight_loader.vocabulary;
-        if (target.weights.unembed.bytes / 2 != full or want < weight_loader.vocabulary) {
+        if (target.weights.unembed.bytes / 2 != full or want < weight_loader.vocabulary or q8_head) {
             const host = try gpa.alloc(u16, full);
             defer gpa.free(host);
             var ldr = try xpu.loader.Loader.init(gpa, target.r, target_dir);
@@ -138,9 +174,19 @@ pub const Drafter = struct {
             const inf = try ldr.info("model.llm.unembed.weight");
             try xpu.loader.readExact(inf.fd, std.mem.sliceAsBytes(host), inf.off);
             if (want >= weight_loader.vocabulary) {
-                own_unembed = try target.r.alloc(full * 2);
-                try target.r.upload(.{ .rt = target.r, .ptr = own_unembed.?.ptr, .len = full * 2 }, std.mem.sliceAsBytes(host));
-                try target.r.sync();
+                if (q8_head) {
+                    // The block's head reads `state.vocabulary` rows (200,058), not the codebook's padded 201,024.
+                    own_unembed_q8 = try uploadQ8Rows(target.r, gpa, host[0 .. state.vocabulary * weight_loader.hidden], state.vocabulary, weight_loader.hidden);
+                    if (head_check) {
+                        own_unembed = try target.r.alloc(full * 2);
+                        try target.r.upload(.{ .rt = target.r, .ptr = own_unembed.?.ptr, .len = full * 2 }, std.mem.sliceAsBytes(host));
+                        try target.r.sync();
+                    }
+                } else {
+                    own_unembed = try target.r.alloc(full * 2);
+                    try target.r.upload(.{ .rt = target.r, .ptr = own_unembed.?.ptr, .len = full * 2 }, std.mem.sliceAsBytes(host));
+                    try target.r.sync();
+                }
             }
             // `TF_DFLASH2_VOCAB=N`: keep the N rows with the largest norm, a stand-in for frequency, and remember their
             // ids so a kept column maps back to its real token. Drafts only change speed, so this cannot change output.
@@ -173,11 +219,19 @@ pub const Drafter = struct {
                     index[i] = idx[i];
                     @memcpy(small[i * hidden_n ..][0..hidden_n], host[idx[i] * hidden_n ..][0..hidden_n]);
                 }
-                const gath = try target.r.alloc(want * hidden_n * 2);
-                try target.r.upload(.{ .rt = target.r, .ptr = gath.ptr, .len = want * hidden_n * 2 }, std.mem.sliceAsBytes(small));
-                try target.r.sync();
-                if (own_unembed) |*b| b.free();
-                own_unembed = gath;
+                const gath = if (q8_head) try uploadQ8Rows(target.r, gpa, small, want, hidden_n) else blk: {
+                    const b = try target.r.alloc(want * hidden_n * 2);
+                    try target.r.upload(.{ .rt = target.r, .ptr = b.ptr, .len = want * hidden_n * 2 }, std.mem.sliceAsBytes(small));
+                    try target.r.sync();
+                    break :blk b;
+                };
+                if (q8_head) {
+                    if (own_unembed_q8) |*b| b.free();
+                    own_unembed_q8 = gath;
+                } else {
+                    if (own_unembed) |*b| b.free();
+                    own_unembed = gath;
+                }
                 d_index = index;
                 d_vocab = @intCast(want);
             }
@@ -198,7 +252,7 @@ pub const Drafter = struct {
         errdefer gpa.free(top_i);
         const sel = try gpa.alloc(u16, 7 * state.rank);
         errdefer gpa.free(sel);
-        d.* = .{ .gpa = gpa, .target = target, .ctx = ctx, .stream = stream, .weights = weights, .module = module, .kernels = kernels, .spark_module = spark_module, .spark = spark, .scratch = scratch, .top_v = top_v, .top_i = top_i, .sel = sel, .unembed = own_unembed, .index = d_index, .vocab = d_vocab };
+        d.* = .{ .gpa = gpa, .target = target, .ctx = ctx, .stream = stream, .weights = weights, .module = module, .kernels = kernels, .spark_module = spark_module, .spark = spark, .scratch = scratch, .top_v = top_v, .top_i = top_i, .sel = sel, .unembed = own_unembed, .unembed_q8 = own_unembed_q8, .index = d_index, .vocab = d_vocab, .head_check = head_check };
         d.times = .{ .on = std.c.getenv("TF_DFLASH2_TIMES") != null };
         if (std.c.getenv("TF_DFLASH2_TIMES")) |v| d.times.split = std.mem.eql(u8, std.mem.span(v), "2");
         d.full = std.c.getenv("TF_DFLASH2_FULL") != null;
@@ -229,6 +283,7 @@ pub const Drafter = struct {
         if (d.index) |ix| d.gpa.free(ix);
         d.gpa.free(d.top_v);
         if (d.unembed) |*b| b.free();
+        if (d.unembed_q8) |*b| b.free();
         d.scratch.deinit();
         d.spark.deinit();
         d.spark_module.unload();
@@ -509,7 +564,9 @@ pub const Drafter = struct {
             d.times.holds_split += 1;
         }
         const unembed_ptr = if (d.unembed) |b| b.ptr else target.weights.unembed.buf.ptr;
-        try ds.base(&d.spark, s, unembed_ptr, draft_rows, at(sc.base, 0), rows, d.vocab);
+        if (d.unembed_q8) |b| {
+            try dense_q8.draftHead(&p.dense_q8, s, b.ptr, draft_rows, at(sc.base, 0), rows, d.vocab);
+        } else try ds.base(&d.spark, s, unembed_ptr, draft_rows, at(sc.base, 0), rows, d.vocab);
         try k.topKeep(&d.kernels, s, at(sc.base, 0), d.vocab, d.vocab, rows, at(sc.top_v, 0), at(sc.top_i, 0));
         if (d.times.split) try d.stream.synchronize();
         const t_sel = nowNs();
@@ -588,6 +645,29 @@ pub const Drafter = struct {
         return gpu_rule.pick(&cands, m, z, sm, position, &ids);
     }
 
+    /// Diagnostic: the same rows through the bf16 base head, then how many of row 0's top-list ids match the q8 head's.
+    fn headCompare(d: *Drafter, lane: *const state.Lane, depth: u32) !void {
+        const s = d.stream;
+        const sc = &d.scratch;
+        var a_v: [state.lists]f32 = undefined;
+        var a_i: [state.lists]i32 = undefined;
+        @memcpy(&a_v, d.top_v[0..state.lists]);
+        @memcpy(&a_i, d.top_i[0..state.lists]);
+        const unembed = if (d.unembed) |b| b.ptr else d.target.weights.unembed.buf.ptr;
+        try ds.base(&d.spark, s, unembed, at(sc.final, hidden * 2), at(sc.base, 0), depth, d.vocab);
+        try k.topKeep(&d.kernels, s, at(sc.base, 0), d.vocab, d.vocab, depth, at(sc.top_v, 0), at(sc.top_i, 0));
+        try sc.top_v.downloadAsync(s, 0, std.mem.sliceAsBytes(d.top_v[0 .. depth * state.lists]));
+        try sc.top_i.downloadAsync(s, 0, std.mem.sliceAsBytes(d.top_i[0 .. depth * state.lists]));
+        try s.synchronize();
+        var same: usize = 0;
+        var sum: f64 = 0;
+        for (0..state.lists) |j| {
+            if (a_i[j] == d.top_i[j]) same += 1;
+            sum += @abs(@as(f64, a_v[j]) - @as(f64, d.top_v[j]));
+        }
+        std.log.info("dflash2 headcheck: row 0 top-list ids {d}/{d} match the bf16 head, mean |dv| {d:.3}, committed {d}", .{ same, state.lists, sum / @as(f64, @floatFromInt(state.lists)), lane.end });
+    }
+
     fn holdFn(ptr: *anyopaque, items: []const dr.Hold) anyerror!void {
         const d = cast(ptr);
         errdefer d.stream.synchronize() catch {};
@@ -609,6 +689,10 @@ pub const Drafter = struct {
             const t0 = nowNs();
             try d.encodeBlock(lane, item.pending, anchor, depth, debug);
             try d.stream.synchronize();
+            if (d.head_check and !d.head_checked) {
+                d.head_checked = true;
+                try d.headCompare(lane, depth);
+            }
             const t1 = nowNs();
             var previous = item.pending;
             const base_position = std.math.cast(u32, item.position) orelse return error.DraftDepth;

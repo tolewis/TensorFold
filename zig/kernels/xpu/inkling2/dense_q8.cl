@@ -294,6 +294,23 @@ Q8_KERNEL(Q8_WG) void Q8_NAME(dense_q8_seg8)(
   }
 }
 
+// The drafter's draft head: the same dot and plane-layout weight as the head, but the logit is stored BF16 without the
+// soft cap, the layout the block's top-k kernel reads (dspark.cl's base). `vocab` rows, stride `vocab`.
+#define Q8_DRAFT_HEAD(ROWS)                                                                                        \
+  Q8_KERNEL(Q8_WG) void Q8_NAME(draft_head_q8_##ROWS)(global const ushort *h, global const uchar *w,              \
+                                                     global ushort *out, uint rows, uint vocab) {                  \
+    const uint j = get_group_id(0) * (Q8_WG / 16) + get_sub_group_id();                                           \
+    if (j >= vocab) return;                                                                                        \
+    global const uchar *codes = w;                                                                                 \
+    global const half *scales = (global const half *)(w + (ulong)vocab * Q8_HIDDEN);                              \
+    float acc[ROWS];                                                                                               \
+    Q8_DOT(ROWS, h, codes, scales, j, vocab, Q8_HIDDEN)                                                           \
+    _Pragma("unroll") for (uint r = 0; r < ROWS; ++r) {                                                            \
+      const float s = sub_group_reduce_add(acc[r]);                                                                \
+      if (get_sub_group_local_id() == 0 && r < rows) out[(ulong)r * vocab + j] = Q8_STORE(s);                     \
+    }                                                                                                              \
+  }
+
 Q8_MATVEC(2)
 Q8_MATVEC(4)
 Q8_MATVEC(8)
@@ -306,6 +323,13 @@ Q8_HEAD(4)
 Q8_HEAD(8)
 Q8_HEAD(16)
 Q8_HEAD(32)
+
+Q8_DRAFT_HEAD(1)
+Q8_DRAFT_HEAD(2)
+Q8_DRAFT_HEAD(4)
+Q8_DRAFT_HEAD(8)
+Q8_DRAFT_HEAD(16)
+Q8_DRAFT_HEAD(32)
 
 // Head only. One sub-group reads one 512-byte tile a block. A tile past the buffer is not read.
 __attribute__((reqd_work_group_size(128, 1, 1)))
