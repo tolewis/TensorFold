@@ -25,6 +25,8 @@ pub const Kernels = struct {
     seg8: xpu.Kernel,
     /// The head tile kernel. One sub-group, 16 columns. Dense stays on `head`.
     head_dpas: xpu.Kernel,
+    /// The drafter's dense projections on the int8 DPAS path, one 16-column tile a sub-group.
+    dense_dpas: xpu.Kernel,
     quant: xpu.Kernel,
     /// Output columns a work-group covers.
     columns: u32 = group_threads / 16,
@@ -52,7 +54,7 @@ pub const Kernels = struct {
             made_draft[dn] = try module.kernel(symbol("draft_head", rows, control), .{ threads, 1, 1 });
             dn += 1;
         }
-        var out: Kernels = .{ .dense = undefined, .head = undefined, .draft_head = undefined, .seg1 = undefined, .seg4 = undefined, .seg8 = undefined, .head_dpas = undefined, .quant = undefined, .columns = threads / 16 };
+        var out: Kernels = .{ .dense = undefined, .head = undefined, .draft_head = undefined, .seg1 = undefined, .seg4 = undefined, .seg8 = undefined, .head_dpas = undefined, .dense_dpas = undefined, .quant = undefined, .columns = threads / 16 };
         for (0..variants.len) |i| {
             out.dense[i] = made[2 * i];
             out.head[i] = made[2 * i + 1];
@@ -67,6 +69,7 @@ pub const Kernels = struct {
         const dpas_name = if (control) "tf_ctl_ink2_head_dpas" else "tf_ink2_head_dpas";
         const qname = if (control) "tf_ctl_ink2_q8_quant" else "tf_ink2_q8_quant";
         out.head_dpas = try module.kernel(dpas_name, .{ 16, 1, 1 });
+        out.dense_dpas = try module.kernel(if (control) "tf_ctl_ink2_dense_q8_dpas" else "tf_ink2_dense_q8_dpas", .{ 128, 1, 1 });
         out.quant = try module.kernel(qname, .{ 128, 1, 1 });
         return out;
     }
@@ -76,6 +79,7 @@ pub const Kernels = struct {
         p.seg4.deinit();
         p.seg8.deinit();
         p.head_dpas.deinit();
+        p.dense_dpas.deinit();
         p.quant.deinit();
         for (&p.dense) |*k| k.deinit();
         for (&p.head) |*k| k.deinit();
@@ -235,6 +239,35 @@ pub fn draftHead(p: *const Kernels, s: xpu.Stream, weight: Ref, h: Ref, out: Ref
         try xpu.launch.dispatch(p.draft_head[variantOf(t)], s, .{ (vocab + p.columns - 1) / p.columns, 1, 1 }, .{ at(h, @as(usize, base) * hidden * 2), weight, at(out, @as(usize, base) * vocab * 2), t, vocab });
         base += t;
     }
+}
+
+/// One projection on the int8 DPAS path: `qc`/`qs` are q8_quant's codes and scales for `rows` rows of x (flags after the
+/// scales), `weight` is q8.zig's DPAS tiles of n columns, out BF16 stride n. Rows go eight a launch group.
+pub fn dpasDense(p: *const Kernels, s: xpu.Stream, qc: Ref, qs: Ref, weight: Ref, out: Ref, rows: u32, n: u32, k: u32) !void {
+    std.debug.assert(rows > 0 and n > 0 and k > 0 and k % 256 == 0);
+    try xpu.launch.dispatch(p.dense_dpas, s, .{ (n + 127) / 128, 1, 1 }, .{ qc, qs, weight, out, rows, n, k });
+}
+
+/// Quantizes `rows` rows of bf16 x to q8_quant's int8 codes and per-block scales (the flags go after the scales).
+pub fn quantRows(p: *const Kernels, s: xpu.Stream, x: Ref, sc: Scratch, rows: u32, k: u32) !void {
+    try xpu.launch.dispatch(p.quant, s, .{ rows, 1, 1 }, .{ x, sc.qc, sc.qs, rows, k });
+}
+
+/// Codes, scales and flags for `rows` rows of k values: the drafter's DPAS scratch, one buffer kept for the largest call.
+pub const Scratch = struct { qc: Ref, qs: Ref };
+
+var dpas_slot: ?struct { buf: xpu.DeviceBuffer, bytes: usize } = null;
+
+pub fn dpasScratch(s: xpu.Stream, rows: u32, k: u32) !Scratch {
+    const codes = @as(usize, rows) * k;
+    const scales = @as(usize, rows) * (k / 32) * 4 + @as(usize, rows) * 4;
+    const bytes = codes + scales;
+    if (dpas_slot == null or dpas_slot.?.bytes < bytes) {
+        if (dpas_slot) |*old| old.buf.free();
+        dpas_slot = .{ .buf = try xpu.DeviceBuffer.alloc(s.ctx, bytes), .bytes = bytes };
+    }
+    const b = dpas_slot.?.buf;
+    return .{ .qc = try b.at(0), .qs = try b.at(codes) };
 }
 
 test "rows split 32, 16, 8, 4, 2, 1" {

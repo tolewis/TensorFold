@@ -264,7 +264,7 @@ pub const Drafter = struct {
         if (std.c.getenv("TF_DFLASH2_FORCE")) |v| d.force = !std.mem.eql(u8, std.mem.span(v), "0") and std.mem.span(v).len != 0;
         if (std.c.getenv("TF_DFLASH2_PRICE")) |v| d.price = !std.mem.eql(u8, std.mem.span(v), "0");
         std.log.info("dflash2: {s}", .{if (d.force) "seven drafts a round" else if (d.price) "scheduler depth, deeper only when this request pays" else "scheduler depth"});
-        std.log.info("dflash2: dense weights {s}", .{if (d.weights.weights.fc.q8) "q8" else "bf16"});
+        std.log.info("dflash2: dense weights {s}", .{if (d.weights.weights.fc.dpas) "q8 DPAS tiles" else if (d.weights.weights.fc.q8) "q8" else "bf16"});
         if (std.c.getenv("TF_DFLASH2_EMBED")) |v| {
             if (std.mem.eql(u8, std.mem.span(v), "raw")) d.embed_mode = .raw;
         }
@@ -408,14 +408,21 @@ pub const Drafter = struct {
     /// the drafter's dense weights were re-encoded at load (`TF_DFLASH2_Q8=1`).
     fn project(d: *Drafter, weight: weight_loader.Tensor, input: Ref, out: Ref, rows: usize, n: u32, width: u32) !void {
         const p = if (d.target.pipelines) |*x| x else return error.Inkling2NoKernels;
-        if (weight.q8) return dense_q8.dense(&p.dense_q8, d.stream, r(weight), input, out, null, @intCast(rows), n, width);
+        if (weight.q8) {
+            if (weight.dpas) {
+                const sc = try dense_q8.dpasScratch(d.stream, @intCast(rows), width);
+                try dense_q8.quantRows(&p.dense_q8, d.stream, input, sc, @intCast(rows), width);
+                return dense_q8.dpasDense(&p.dense_q8, d.stream, sc.qc, sc.qs, r(weight), out, @intCast(rows), n, width);
+            }
+            return dense_q8.dense(&p.dense_q8, d.stream, r(weight), input, out, null, @intCast(rows), n, width);
+        }
         try dense_kernels.dense(&p.dense, d.stream, r(weight), input, out, @intCast(rows), n, width);
     }
 
     /// q, k and v of one layer in one launch (`dense_q8_seg8`, three segments), when all three weights are q8 and the
     /// fusion is on. Returns false when the caller must run the three separate launches.
     fn projectQkv(d: *Drafter, layer: weight_loader.Layer, input: Ref, q: Ref, kk: Ref, v: Ref, rows: usize) !bool {
-        if (!d.fuse or !(layer.q.q8 and layer.k.q8 and layer.v.q8)) return false;
+        if (!d.fuse or layer.q.dpas or !(layer.q.q8 and layer.k.q8 and layer.v.q8)) return false;
         const p = if (d.target.pipelines) |*x| x else return error.Inkling2NoKernels;
         try dense_q8.seg8(&p.dense_q8, d.stream, .{ input, input, input, null, null }, .{ r(layer.q), r(layer.k), r(layer.v), null, null }, .{ q, kk, v, null, null }, .{ state.query, state.kv, state.kv, 0, 0 }, hidden, @intCast(rows));
         return true;
@@ -423,7 +430,7 @@ pub const Drafter = struct {
 
     /// gate and up of one layer in one launch, the same rule.
     fn projectGateUp(d: *Drafter, layer: weight_loader.Layer, input: Ref, gate: Ref, up: Ref, rows: usize) !bool {
-        if (!d.fuse or !(layer.gate.q8 and layer.up.q8)) return false;
+        if (!d.fuse or layer.gate.dpas or !(layer.gate.q8 and layer.up.q8)) return false;
         const p = if (d.target.pipelines) |*x| x else return error.Inkling2NoKernels;
         try dense_q8.seg8(&p.dense_q8, d.stream, .{ input, input, null, null, null }, .{ r(layer.gate), r(layer.up), null, null, null }, .{ gate, up, null, null, null }, .{ state.intermediate, state.intermediate, 0, 0, 0 }, hidden, @intCast(rows));
         return true;

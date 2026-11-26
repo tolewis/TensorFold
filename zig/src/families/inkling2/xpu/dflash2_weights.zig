@@ -80,8 +80,9 @@ fn expectInt(o: std.json.ObjectMap, key: []const u8, want: i64) !void {
     if (v != .integer or v.integer != want) return error.UnsupportedDFlash2Config;
 }
 
-/// One tensor in device memory: BF16 as stored, or (`q8`) a matrix [n][k] as q8.zig's codes then scales.
-pub const Tensor = struct { buf: xpu.DeviceBuffer, q8: bool = false };
+/// One tensor in device memory: BF16 as stored, a matrix [n][k] as q8.zig's codes then scales (`q8`), or the same codes
+/// repacked to q8.zig's DPAS tiles (`dpas`).
+pub const Tensor = struct { buf: xpu.DeviceBuffer, q8: bool = false, dpas: bool = false };
 
 pub const Layer = struct {
     input_norm: Tensor,
@@ -195,9 +196,11 @@ const Uploader = struct {
     gpa: std.mem.Allocator,
     /// Encode a two-dimensional projection to Q8_0 blocks instead of uploading its bf16 bytes.
     q8: bool,
+    /// The same blocks repacked to the DPAS tiles (`dense_q8_dpas`), for the drafter's int8 path.
+    dpas: bool,
 
     fn tensor(u: Uploader, name: []const u8, dims: []const usize) !Tensor {
-        if (u.q8 and dims.len == 2 and q8.admits(dims[1])) return u.q8Tensor(name, dims);
+        if (u.q8 and dims.len == 2 and q8.admits(dims[1])) return if (u.dpas) u.dpasTensor(name, dims) else u.q8Tensor(name, dims);
         const e = try get(&u.file.names, name, dims);
         const raw = u.file.map.memory[u.file.data + e.begin ..][0 .. e.end - e.begin];
         try u.out.ensureUnusedCapacity(u.gpa, 1);
@@ -225,6 +228,40 @@ const Uploader = struct {
         try buf.upload(u.s, q8.scaleOffset(n, k), std.mem.sliceAsBytes(scales));
         u.out.appendAssumeCapacity(buf);
         return .{ .buf = buf, .q8 = true };
+    }
+
+    /// A matrix [n][k] of the mapped file as q8.zig's DPAS tiles: 16-column tiles of 512 code bytes a block, then their
+    /// scales (`q8.repackDpas`).
+    fn dpasTensor(u: Uploader, name: []const u8, dims: []const usize) !Tensor {
+        const e = try get(&u.file.names, name, dims);
+        const n = dims[0];
+        const k = dims[1];
+        const raw = u.file.map.memory[u.file.data + e.begin ..][0 .. e.end - e.begin];
+        const src: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, raw));
+        const nb = k / q8.block;
+        const tile = try u.gpa.alloc(u8, q8.dpasBytes(16, k));
+        defer u.gpa.free(tile);
+        try u.out.ensureUnusedCapacity(u.gpa, 1);
+        var buf = try xpu.DeviceBuffer.alloc(u.ctx, q8.dpasBytes(n, k));
+        errdefer buf.free();
+        const sc_base = q8.dpasTiles(n) * nb * 512;
+        const codes = try u.gpa.alloc(u8, 16 * k);
+        defer u.gpa.free(codes);
+        const scales = try u.gpa.alloc(u16, 16 * nb);
+        defer u.gpa.free(scales);
+        var row: usize = 0;
+        var ti: usize = 0;
+        while (row < n) {
+            const m = @min(16, n - row);
+            q8.encodeRows(src[row * k ..][0 .. m * k], m, k, codes[0 .. m * k], scales[0 .. m * nb]);
+            q8.repackDpas(codes[0 .. m * k], scales[0 .. m * nb], m, k, tile);
+            try buf.upload(u.s, ti * nb * 512, tile[0 .. nb * 512]);
+            try buf.upload(u.s, sc_base + ti * nb * 32, tile[nb * 512 ..][0 .. nb * 32]);
+            row += m;
+            ti += 1;
+        }
+        u.out.appendAssumeCapacity(buf);
+        return .{ .buf = buf, .q8 = true, .dpas = true };
     }
 
     fn layerTensor(u: Uploader, i: usize, suffix: []const u8, dims: []const usize) !Tensor {
@@ -257,7 +294,8 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const xpu.Context, s: xpu.
         owned.deinit(gpa);
     }
     const dense_q8 = if (std.c.getenv("TF_DFLASH2_Q8")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
-    const u: Uploader = .{ .file = &file, .ctx = ctx, .s = s, .out = &owned, .gpa = gpa, .q8 = dense_q8 };
+    const dpas = dense_q8 and std.c.getenv("TF_DFLASH2_DPAS") != null;
+    const u: Uploader = .{ .file = &file, .ctx = ctx, .s = s, .out = &owned, .gpa = gpa, .q8 = dense_q8, .dpas = dpas };
     var ls: [layers]Layer = undefined;
     for (&ls, 0..) |*l, i| {
         inline for (@typeInfo(Layer).@"struct".field_names, layer_tensors) |field, t| @field(l, field) = try u.layerTensor(i, t[0], t[1]);

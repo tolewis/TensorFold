@@ -361,6 +361,41 @@ __kernel void Q8_NAME(q8_quant)(global const ushort *x, global char *qc, global 
   }
 }
 
+// One projection of the drafter's block on the int8 DPAS path: the weight is q8.zig's DPAS tiles (repackDpas: per tile
+// of 16 columns, 512 code bytes a block then 16 scales), the activations are q8_quant's int8 codes and per-block scales.
+// out[r][j] = bf16(x[r] . dequant(W)[j]) for r < rows (eight a pass), j < n, stride n, no soft cap.
+__attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(128, 1, 1)))
+kernel void Q8_NAME(dense_q8_dpas)(global const char *qc, global const float *qs, global const uchar *w,
+                                   global ushort *out, uint rows, uint n, uint k) {
+  const uint lane = get_sub_group_local_id();
+  const uint tile = get_group_id(0) * 8 + get_sub_group_id();
+  const uint j = tile * 16 + lane;
+  const uint nb = k / 32, tiles = (n + 15) >> 4;
+  const int live = tile < tiles;
+  global const uchar *codes = w;
+  global const half *soa = (global const half *)(w + (ulong)tiles * nb * 512);
+  for (uint base = 0; base < rows; base += 8) {
+    const uint live_m = min(8u, rows - base);
+    float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (uint b = 0; b < nb; ++b) {
+      int8 bv = (int8)(0);
+      float ws = 1.0f;
+      if (live) {
+        bv = vload8(0, (global const int *)(codes + ((ulong)tile * nb + b) * 512 + lane * 32));
+        ws = convert_float(soa[((ulong)tile * nb + b) * 16 + lane]);
+      }
+      short8 a = (short8)(0);
+      for (uint m = 0; m < live_m; ++m)
+        a[m] = as_short(intel_sub_group_block_read_us((global const ushort *)(qc + ((ulong)(base + m) * k + b * 32))));
+      const int8 dot = intel_sub_group_i8_i8_matrix_mad_k32(a, bv, (int8)(0));
+      for (uint m = 0; m < live_m; ++m) acc[m] = Q8_ACC(acc[m], ws * qs[(base + m) * nb + b], (float)dot[m]);
+    }
+    if (j < n) {
+      for (uint m = 0; m < live_m; ++m) out[(ulong)(base + m) * n + j] = Q8_STORE(acc[m]);
+    }
+  }
+}
+
 __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(16, 1, 1)))
 kernel void Q8_NAME(head_dpas)(global const char *qc, global const float *qs, global const uchar *w, global float *out,
                                 global const ushort *x, uint rows, uint vocab) {
