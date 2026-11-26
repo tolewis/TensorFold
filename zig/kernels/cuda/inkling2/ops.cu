@@ -248,6 +248,119 @@ extern "C" __global__ void __launch_bounds__(512) tf_ink2_mix_rows(const MixArgs
     }
 }
 
+// Split-block mix: the same sums in the same order as tf_ink2_mix_rows, with the 16 warps of a row
+// spread over B blocks (global thread g = blockIdx.y * blockDim.x + threadIdx.x, stride 512).
+// Each part that needs a total ends a kernel; the per-warp partials go to a static device buffer.
+__device__ float g_mix_part_a[8 * 9 * 4 * 16];  // ((row * 9 + j) * 4 + i) * 16 + gw
+__device__ float g_mix_part_c[8 * 3 * 16];       // (row * 3 + q) * 16 + gw
+
+__device__ __forceinline__ float mixEntry(const MixArgs& a, size_t row, int j, int c) {
+    if (j < a.n_blocks) return bf(a.blocks[j][row * a.C + c]);
+    return a.partial_bf16 ? bf(static_cast<const uint16_t*>(a.partial)[row * a.C + c])
+                          : static_cast<const float*>(a.partial)[row * a.C + c];
+}
+
+// The last step of blockSums for each j, then rr, wts and the softmax (lines 211 to 225 of tf_ink2_mix_rows).
+__device__ void mixTotals(const MixArgs& a, size_t row, float* rr, float (*wts)[kMaxBlocks + 1]) {
+    const int lane = threadIdx.x & 31;
+    const int C = a.C, n = a.n_blocks + 1;
+    for (int j = 0; j < n; ++j) {
+        float v[1 + kMaxQueries];
+#pragma unroll
+        for (int i = 0; i < 1 + kMaxQueries; ++i) {
+            float t = lane < 16 ? g_mix_part_a[((row * 9 + j) * 4 + i) * 16 + lane] : 0.0f;
+            v[i] = __shfl_sync(0xffffffffu, warpSum(t), 0);
+        }
+        const float r = rsqrtf(v[0] / C + 1e-6f);
+        if (threadIdx.x == 0) {
+            rr[j] = r;
+            for (int q = 0; q < a.nq; ++q) wts[q][j] = v[1 + q] * r * rsqrtf(static_cast<float>(C));
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < a.nq) {
+        float* l = wts[threadIdx.x];
+        float m = -INFINITY, t = 0.0f;
+        for (int j = 0; j < n; ++j) m = fmaxf(m, l[j]);
+        for (int j = 0; j < n; ++j) t += expf(l[j] - m);
+        for (int j = 0; j < n; ++j) l[j] = expf(l[j] - m) / t;
+    }
+    __syncthreads();
+}
+
+// Part A: the per-source sums, one block per (row, warp group).
+extern "C" __global__ void __launch_bounds__(512) tf_ink2_mix_a(const MixArgs a) {
+    const size_t row = blockIdx.x;
+    const int C = a.C, n = a.n_blocks + 1;
+    const int g = blockIdx.y * blockDim.x + threadIdx.x;
+    const int gw = g >> 5;
+    const int lane = threadIdx.x & 31;
+    for (int j = 0; j < n; ++j) {
+        float v[1 + kMaxQueries] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int c = g; c < C; c += 512) {
+            const float x = mixEntry(a, row, j, c);
+            v[0] += x * x;
+            for (int q = 0; q < a.nq; ++q) v[1 + q] += x * a.query[static_cast<size_t>(q) * C + c];
+        }
+#pragma unroll
+        for (int i = 0; i < 1 + kMaxQueries; ++i) v[i] = warpSum(v[i]);
+        if (lane == 0)
+#pragma unroll
+            for (int i = 0; i < 1 + kMaxQueries; ++i)
+                g_mix_part_a[((row * 9 + j) * 4 + i) * 16 + gw] = v[i];
+    }
+}
+
+// Part B: the totals, the softmax, and the part C partials of h * h.
+extern "C" __global__ void __launch_bounds__(512) tf_ink2_mix_b(const MixArgs a) {
+    __shared__ float rr[kMaxBlocks + 1];
+    __shared__ float wts[kMaxQueries][kMaxBlocks + 1];
+    const size_t row = blockIdx.x;
+    const int C = a.C, n = a.n_blocks + 1;
+    const int g = blockIdx.y * blockDim.x + threadIdx.x;
+    const int gw = g >> 5;
+    const int lane = threadIdx.x & 31;
+    mixTotals(a, row, rr, wts);
+    for (int q = 0; q < a.nq; ++q) {
+        float s[1] = {0.0f};
+        for (int c = g; c < C; c += 512) {
+            float h = 0.0f;
+            if (a.query)
+                for (int j = 0; j < n; ++j) h += wts[q][j] * (mixEntry(a, row, j, c) * rr[j]);
+            else
+                h = mixEntry(a, row, a.n_blocks, c);
+            s[0] += h * h;
+        }
+        s[0] = warpSum(s[0]);
+        if (lane == 0) g_mix_part_c[(row * 3 + q) * 16 + gw] = s[0];
+    }
+}
+
+// Part C: the totals again, the norm, and the write.
+extern "C" __global__ void __launch_bounds__(512) tf_ink2_mix_c(const MixArgs a) {
+    __shared__ float rr[kMaxBlocks + 1];
+    __shared__ float wts[kMaxQueries][kMaxBlocks + 1];
+    const size_t row = blockIdx.x;
+    const int C = a.C, n = a.n_blocks + 1;
+    const int g = blockIdx.y * blockDim.x + threadIdx.x;
+    const int lane = threadIdx.x & 31;
+    mixTotals(a, row, rr, wts);
+    for (int q = 0; q < a.nq; ++q) {
+        float t = lane < 16 ? g_mix_part_c[(row * 3 + q) * 16 + lane] : 0.0f;
+        float s = __shfl_sync(0xffffffffu, warpSum(t), 0);
+        const float r = rsqrtf(s / C + a.eps);
+        uint16_t* o = a.out + (static_cast<size_t>(q) * a.rows + row) * C;
+        for (int c = g; c < C; c += 512) {
+            float h = 0.0f;
+            if (a.query)
+                for (int j = 0; j < n; ++j) h += wts[q][j] * (mixEntry(a, row, j, c) * rr[j]);
+            else
+                h = mixEntry(a, row, a.n_blocks, c);
+            o[c] = tobf(bf(a.norm[q][c]) * (h * r));
+        }
+    }
+}
+
 // out[row, j] = x[row, :] . W[j, :] in fp32 (bf16 inputs), a warp an output; act 1 takes the sigmoid; bf16 or fp32 out.
 extern "C" __global__ void __launch_bounds__(256) tf_ink2_rowdot(const uint16_t* __restrict__ x, const uint16_t* __restrict__ W,
                                                                 void* __restrict__ out, int J, int C, int out_bf16, int act) {

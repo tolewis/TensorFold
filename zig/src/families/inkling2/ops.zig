@@ -66,6 +66,9 @@ pub const Kernels = struct {
     embed: cuda.Function,
     mix: cuda.Function,
     mix_rows: cuda.Function,
+    mix_a: cuda.Function,
+    mix_b: cuda.Function,
+    mix_c: cuda.Function,
     rowdot: cuda.Function,
     topk: cuda.Function,
     topk_warp: cuda.Function,
@@ -102,6 +105,9 @@ pub const Kernels = struct {
             .embed = try mod.function("tf_ink2_embed"),
             .mix = try mod.function("tf_ink2_mix"),
             .mix_rows = try mod.function("tf_ink2_mix_rows"),
+            .mix_a = try mod.function("tf_ink2_mix_a"),
+            .mix_b = try mod.function("tf_ink2_mix_b"),
+            .mix_c = try mod.function("tf_ink2_mix_c"),
             .rowdot = try mod.function("tf_ink2_rowdot"),
             .topk = try mod.function("tf_ink2_topk"),
             .topk_warp = try mod.function("tf_ink2_topk_warp"),
@@ -175,6 +181,20 @@ pub fn mix(k: *const Kernels, s: cuda.Stream, m: MixArgs) !void {
     try mixFits(m.c);
     var a: cuda.Args = .{};
     a.add(m);
+    // split-block mix: the same sums in the same order, the 16 warps of a row spread over B blocks
+    if (m.rows <= 8 and m.query != 0) {
+        if (std.c.getenv("TF_INKLING2_MIX_SPLIT")) |v| {
+            const b = std.fmt.parseInt(i32, v, 10) catch 0;
+            if (b == 2 or b == 4 or b == 8 or b == 16) {
+                const grid: cuda.Dim3 = .{ .x = @intCast(m.rows), .y = @intCast(b) };
+                const threads: u32 = @intCast(512 / b);
+                try go(k.mix_a, s, grid, threads, &a);
+                try go(k.mix_b, s, grid, threads, &a);
+                try go(k.mix_c, s, grid, threads, &a);
+                return;
+            }
+        }
+    }
     // the narrow kernel measured slower on GB10 (38 vs 27 us a decode row); TF_INKLING2_MIX_NARROW=1 restores it
     const narrow = m.rows <= 16 and std.c.getenv("TF_INKLING2_MIX_NARROW") != null;
     try go(if (narrow) k.mix else k.mix_rows, s, .{ .x = @intCast(m.rows) }, 512, &a); // equal bits either way
