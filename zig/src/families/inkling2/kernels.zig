@@ -120,6 +120,7 @@ pub const Kernels = struct {
     attn_slide: cuda.Function,
     attn_slide8: cuda.Function,
     attn_db: cuda.Function, // tf_ink2_attn with the next K/V tile prefetched (bf16 caches, TF_INKLING2_ATTN_DB)
+    attn8_db: cuda.Function, // tf_ink2_attn8 with the next tile's codes and scales prefetched (fp8 caches, TF_INKLING2_ATTN8_DB)
 
     pub fn load(d: *const cuda.Driver) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -137,8 +138,11 @@ pub const Kernels = struct {
         try attn_slide8.allowDynamicShared(prompt_shared);
         const attn_db = try mod.function("tf_ink2_attn_db");
         try attn_db.allowDynamicShared(db_shared);
+        const attn8_db = try mod.function("tf_ink2_attn8_db");
+        try attn8_db.allowDynamicShared(db8_shared);
         return .{
             .attn_db = attn_db,
+            .attn8_db = attn8_db,
             .attn_slide = attn_slide,
             .attn_slide8 = attn_slide8,
             .mod = mod,
@@ -295,7 +299,7 @@ pub fn attend(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, stride: u32,
         a.add(scale);
         a.add(int(0));
         addScales(&a, kv);
-        try attnGo(k, s, kv, .{ .x = r.n_tiles, .y = r.kv_heads, .z = tileChunks(r.heads / r.kv_heads, l) }, &a);
+        try attnGo(k, s, kv, .{ .x = r.n_tiles, .y = r.kv_heads, .z = tileChunks(r.heads / r.kv_heads, l) }, &a, false);
     } else if (split(r, stride, slots)) {
         // every sub-chunk of `stride` chunks (past the rows return at once), so graphs replay by stride
         per = subs;
@@ -304,7 +308,7 @@ pub fn attend(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, stride: u32,
         a.add(scale);
         a.add(int(1));
         addScales(&a, kv);
-        try attnGo(k, s, kv, .{ .x = r.n_tiles, .y = r.kv_heads, .z = zBlocks(slots_rh, r.n_tiles * r.kv_heads) }, &a);
+        try attnGo(k, s, kv, .{ .x = r.n_tiles, .y = r.kv_heads, .z = zBlocks(slots_rh, r.n_tiles * r.kv_heads) }, &a, true);
     } else if (r.streams == 1) { // one stream's rows: 128 pairs a block share each K/V tile, the fold's bits
         var p: cuda.Args = .{};
         for ([_]u64{ q, kv.k, kv.v, tab, r.segs, part_o, part_ml }) |v| p.add(v);
@@ -370,8 +374,28 @@ fn dbOn() bool {
     return S.v.?;
 }
 
-fn attnGo(k: *const Kernels, s: cuda.Stream, kv: Cache, grid: cuda.Dim3, a: *cuda.Args) !void {
-    if (kv.fp8()) return go(k.attn8, s, grid, 128, a); // fp8: prefetching codes then dequantizing measured slower
+/// One 64-key K and V tile (2 x 17,408 bytes), then two stages of codes and scales (2 x 16,896 bytes):
+/// tf_ink2_attn8_db's dynamic shared memory (attention.cu stage8 after the tile).
+const db8_shared: u32 = 2 * tile_keys * (head_dim + 8) * 2 + 2 * (2 * tile_keys * head_dim + 2 * tile_keys * 4);
+
+/// TF_INKLING2_ATTN8_DB: which fp8 attention calls prefetch their next tile's codes and scales (tf_ink2_attn8_db).
+/// Unset or 0: none, as before. 1: every call. 2: sliding calls only. 3: global calls only.
+fn db8Mode() u8 {
+    const S = struct {
+        var v: ?u8 = null;
+    };
+    if (S.v == null) S.v = if (std.c.getenv("TF_INKLING2_ATTN8_DB")) |e| std.fmt.parseInt(u8, std.mem.span(e), 10) catch 0 else 0;
+    return @min(S.v.?, 3);
+}
+
+fn attnGo(k: *const Kernels, s: cuda.Stream, kv: Cache, grid: cuda.Dim3, a: *cuda.Args, global: bool) !void {
+    if (kv.fp8()) {
+        // fp8: TF_INKLING2_ATTN8_DB picks the prefetching form of the same tiles, codes and sums
+        const mode = db8Mode();
+        if (mode == 1 or (mode == 2 and !global) or (mode == 3 and global))
+            return goShared(k.attn8_db, s, grid, 128, db8_shared, a);
+        return go(k.attn8, s, grid, 128, a);
+    }
     if (dbOn()) return goShared(k.attn_db, s, grid, 128, db_shared, a);
     return go(k.attn, s, grid, 128, a);
 }
@@ -413,4 +437,10 @@ pub fn partialSlot(l: Layer, c: usize, pos: usize) ?usize {
 
 test {
     _ = @import("kernels_test.zig");
+}
+
+test "inkling2 kernels: the fp8 prefetching kernel's dynamic shared memory is 68,608 bytes" {
+    try std.testing.expectEqual(@as(u32, 68608), db8_shared);
+    try std.testing.expectEqual(@as(u32, 34816), 2 * tile_keys * (head_dim + 8) * 2); // one K and V tile
+    try std.testing.expectEqual(@as(u32, 33792), 2 * (2 * tile_keys * head_dim + 2 * tile_keys * 4)); // two stages
 }

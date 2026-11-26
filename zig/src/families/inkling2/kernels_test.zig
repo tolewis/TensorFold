@@ -60,7 +60,7 @@ test "inkling2 kernels: one decode row at 1M splits 64 chunks into sub-chunks fo
             return .{ .d = drv, .handle = @ptrFromInt(i) };
         }
     };
-    const kern: k.Kernels = .{ .mod = .{ .d = &d, .handle = null }, .prep = fun.of(&d, 1), .rel_table = fun.of(&d, 2), .attn = fun.of(&d, 3), .merge = fun.of(&d, 4), .attn_fold = fun.of(&d, 3), .pmod = .{ .d = &d, .handle = null }, .attn_prompt = fun.of(&d, 3) };
+    const kern: k.Kernels = .{ .mod = .{ .d = &d, .handle = null }, .prep = fun.of(&d, 1), .rel_table = fun.of(&d, 2), .attn = fun.of(&d, 3), .merge = fun.of(&d, 4), .attn_fold = fun.of(&d, 3), .pmod = .{ .d = &d, .handle = null }, .attn_prompt = fun.of(&d, 3), .attn8_db = fun.of(&d, 5) };
     const s: cuda.Stream = .{ .d = &d, .handle = null };
     const r: k.Rows = .{ .rows = 1, .heads = 24, .kv_heads = 4, .pos = 0, .seg_of = 0, .segs = 0, .tiles = 0, .n_tiles = 1, .last_pos = 1048575 };
     const l = k.Layer.global(1048576);
@@ -167,7 +167,7 @@ test "inkling2 kernels: Mini's 8 key heads launch a group of 3; heads that do no
             return .{ .d = drv, .handle = @ptrFromInt(i) };
         }
     };
-    const kern: k.Kernels = .{ .mod = .{ .d = &d, .handle = null }, .prep = fun.of(&d, 1), .rel_table = fun.of(&d, 2), .attn = fun.of(&d, 3), .merge = fun.of(&d, 4), .attn_fold = fun.of(&d, 3), .pmod = .{ .d = &d, .handle = null }, .attn_prompt = fun.of(&d, 3) };
+    const kern: k.Kernels = .{ .mod = .{ .d = &d, .handle = null }, .prep = fun.of(&d, 1), .rel_table = fun.of(&d, 2), .attn = fun.of(&d, 3), .merge = fun.of(&d, 4), .attn_fold = fun.of(&d, 3), .pmod = .{ .d = &d, .handle = null }, .attn_prompt = fun.of(&d, 3), .attn8_db = fun.of(&d, 5) };
     const s: cuda.Stream = .{ .d = &d, .handle = null };
     const cfg: k.Prep = .{ .qk_clip = 22.6, .rel_clip = 8, .floor = 8192, .alpha = 0.1, .eps = 1e-6 };
     const l = k.Layer.global(1048576);

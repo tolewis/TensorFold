@@ -584,3 +584,24 @@ extern "C" __global__ void __launch_bounds__(128)
         attnTile<false, false, true>(q, kc, vc, tab, segs, tiles, part_o, part_ml, heads, kv_heads, ring, window, chunk,
                                      c0, chunks, scale, split, ks, vs, nullptr, nullptr, zb);
 }
+
+// tf_ink2_attn8 with each block's next tile's codes and scales prefetched by cp.async while the current tile is
+// dequantized and summed (fp8 caches, TF_INKLING2_ATTN8_DB): the same tiles, codes and sums, so the same bits. One K
+// and V tile, then two stages of codes and scales, in dynamic shared memory.
+extern "C" __global__ void __launch_bounds__(128)
+    tf_ink2_attn8_db(const uint16_t* __restrict__ q, const uint16_t* __restrict__ kc, const uint16_t* __restrict__ vc,
+                     const uint16_t* __restrict__ tab, const Seg* __restrict__ segs, const int2* __restrict__ tiles,
+                     float* __restrict__ part_o, float2* __restrict__ part_ml, int heads, int kv_heads, int ring,
+                     int window, int chunk, int c0, int chunks, float scale, int split, const float* __restrict__ ksc,
+                     const float* __restrict__ vsc) {
+    using namespace ink2;
+    extern __shared__ __align__(16) uint16_t dsm[];
+    uint16_t* ks = dsm;
+    uint16_t* vs = dsm + kKeys * kPad;
+    // split global calls may run fewer z blocks than slots (TF_INKLING2_GLOBAL_ZCAP): each takes every gridDim.z-th
+    // sub-chunk in turn, the same per-slot math, so the partials' bits do not depend on the grid
+    const int zn = split ? chunks : static_cast<int>(gridDim.z);
+    for (int zb = blockIdx.z; zb < zn; zb += gridDim.z)
+        attnTile<false, true, true>(q, kc, vc, tab, segs, tiles, part_o, part_ml, heads, kv_heads, ring, window, chunk,
+                                    c0, chunks, scale, split, ks, vs, ksc, vsc, zb);
+}
