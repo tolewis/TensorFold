@@ -417,6 +417,55 @@ const Run = struct {
         }
     }
 
+    /// One row a launch: the A/B for the grouped decode expert path. `INK2_EXPERTS_ROW=1` sets it.
+    var experts_row_old: ?bool = null;
+    fn perRowExperts() bool {
+        if (experts_row_old) |v| return v;
+        const v = if (std.c.getenv("INK2_EXPERTS_ROW")) |p| std.mem.eql(u8, std.mem.span(p), "1") else false;
+        experts_row_old = v;
+        return v;
+    }
+
+    /// A decode call's experts. The kernel groups the routes by expert: one work-group an expert decodes its weights once
+    /// and runs every row that routes to it over them, so a window pays one read of an expert's weights, not one a row.
+    /// `INK2_EXPERTS_ROW=1` runs one row a launch (every route its own expert) for the A/B.
+    fn decodeExperts(g: Run, layer: usize, rows: usize, precision: experts.Format, expert_count: u32) !void {
+        const s = g.sc;
+        const w = &g.m.weights.layers[layer];
+        const ex = &g.p.experts;
+        const topk: usize = experts.top_k;
+        if (!perRowExperts()) {
+            const call = experts.Call{ .rows = @intCast(rows), .k = state.hidden, .n = state.intermediate, .format = precision, .experts = expert_count };
+            const down_call = experts.Call{ .rows = @intCast(rows), .k = state.intermediate, .n = state.hidden, .format = precision, .experts = expert_count };
+            switch (precision) {
+                .nvfp4 => try ex.nvfp4Gu(g.s, at(s.mlp_normed, 0), tensor(w.gu.weight), tensor(w.gu.scale), tensor(w.gu.amax.?), tensor(w.gu.denominator.?), at(s.route_ids, 0), at(s.gu, 0), call),
+                .mxfp8 => try ex.mxfp8Gu(g.s, at(s.mlp_normed, 0), tensor(w.gu.weight), tensor(w.gu.scale), at(s.route_ids, 0), at(s.gu, 0), call),
+            }
+            switch (precision) {
+                .nvfp4 => try ex.nvfp4Down(g.s, at(s.gu, 0), tensor(w.down.weight), tensor(w.down.scale), tensor(w.down.amax.?), tensor(w.down.denominator.?), at(s.route_ids, 0), at(s.down, 0), down_call),
+                .mxfp8 => try ex.mxfp8Down(g.s, at(s.gu, 0), tensor(w.down.weight), tensor(w.down.scale), at(s.route_ids, 0), at(s.down, 0), down_call),
+            }
+            return;
+        }
+        var i: usize = 0;
+        while (i < rows) : (i += 1) {
+            const call = experts.Call{ .rows = 1, .k = state.hidden, .n = state.intermediate, .format = precision, .experts = expert_count };
+            const down_call = experts.Call{ .rows = 1, .k = state.intermediate, .n = state.hidden, .format = precision, .experts = expert_count };
+            const x = at(s.mlp_normed, i * state.hidden * 2);
+            const ids = at(s.route_ids, i * topk * 4);
+            const act = at(s.gu, i * topk * state.intermediate * 2);
+            const down = at(s.down, i * topk * state.hidden * 2);
+            switch (precision) {
+                .nvfp4 => try ex.nvfp4Gu(g.s, x, tensor(w.gu.weight), tensor(w.gu.scale), tensor(w.gu.amax.?), tensor(w.gu.denominator.?), ids, act, call),
+                .mxfp8 => try ex.mxfp8Gu(g.s, x, tensor(w.gu.weight), tensor(w.gu.scale), ids, act, call),
+            }
+            switch (precision) {
+                .nvfp4 => try ex.nvfp4Down(g.s, act, tensor(w.down.weight), tensor(w.down.scale), tensor(w.down.amax.?), tensor(w.down.denominator.?), ids, down, down_call),
+                .mxfp8 => try ex.mxfp8Down(g.s, act, tensor(w.down.weight), tensor(w.down.scale), ids, down, down_call),
+            }
+        }
+    }
+
     fn routedExperts(g: Run, layer: usize, rows: usize) !void {
         const s = g.sc;
         const w = &g.m.weights.layers[layer];
@@ -439,16 +488,7 @@ const Run = struct {
                 try xpu.launch.dispatch(gp.zero, g.s, .{ @intCast(rows), 1, 1 }, .{ ids, at(s.route_weights, 0), counts, @as(u32, @intCast(rows)), pl.expertBase(), pl.expertCount() });
             }
             if (rows <= decode_rows) {
-                const local = experts.Call{ .rows = @intCast(rows), .k = state.hidden, .n = state.intermediate, .format = precision, .experts = pl.expertCount() };
-                const down_local = experts.Call{ .rows = @intCast(rows), .k = state.intermediate, .n = state.hidden, .format = precision, .experts = pl.expertCount() };
-                switch (precision) {
-                    .nvfp4 => try ex.nvfp4Gu(g.s, x, tensor(w.gu.weight), tensor(w.gu.scale), tensor(w.gu.amax.?), tensor(w.gu.denominator.?), ids, act, local),
-                    .mxfp8 => try ex.mxfp8Gu(g.s, x, tensor(w.gu.weight), tensor(w.gu.scale), ids, act, local),
-                }
-                switch (precision) {
-                    .nvfp4 => try ex.nvfp4Down(g.s, act, tensor(w.down.weight), tensor(w.down.scale), tensor(w.down.amax.?), tensor(w.down.denominator.?), ids, down, down_local),
-                    .mxfp8 => try ex.mxfp8Down(g.s, act, tensor(w.down.weight), tensor(w.down.scale), ids, down, down_local),
-                }
+                try decodeExperts(g, layer, rows, precision, pl.expertCount());
             } else {
                 const items = at(s.items, 0);
                 const count = at(s.count, 0);
@@ -473,14 +513,7 @@ const Run = struct {
             return;
         }
         if (rows <= decode_rows) {
-            switch (precision) {
-                .nvfp4 => try ex.nvfp4Gu(g.s, x, tensor(w.gu.weight), tensor(w.gu.scale), tensor(w.gu.amax.?), tensor(w.gu.denominator.?), ids, act, gu_call),
-                .mxfp8 => try ex.mxfp8Gu(g.s, x, tensor(w.gu.weight), tensor(w.gu.scale), ids, act, gu_call),
-            }
-            switch (precision) {
-                .nvfp4 => try ex.nvfp4Down(g.s, act, tensor(w.down.weight), tensor(w.down.scale), tensor(w.down.amax.?), tensor(w.down.denominator.?), ids, down, down_call),
-                .mxfp8 => try ex.mxfp8Down(g.s, act, tensor(w.down.weight), tensor(w.down.scale), ids, down, down_call),
-            }
+            try decodeExperts(g, layer, rows, precision, experts.expert_count);
         } else {
             const members = at(s.members, 0);
             const items = at(s.items, 0);
