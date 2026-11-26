@@ -332,7 +332,27 @@ pub const Xpu = struct {
         };
         if (token >= self.vocab()) return error.InvalidInklingToken;
         const generation = if (self.prepared) self.nextTapGeneration() else 0;
+        var profile_one = std.c.getenv("TF_TP_PROFILE") != null and xpu.profile.active == null;
+        var prof: xpu.profile.Profile = undefined;
+        if (profile_one) {
+            prof = xpu.profile.Profile.init(self.model.ctx.?, 131072, true) catch {
+                profile_one = false;
+                undefined;
+            };
+            if (profile_one) {
+                xpu.profile.active = &prof;
+                xpu.rt.Runtime.resetSyncLog();
+            }
+        }
         try fwd.run(self.model, &self.scratch, cache, &.{token}, .{ .taps = self.tapPtr() });
+        if (profile_one) {
+            prof.collect() catch {};
+            std.log.info("inkling2: one token, {d} launches", .{prof.launches});
+            prof.print();
+            xpu.rt.Runtime.logSync("rank 0");
+            xpu.profile.active = null;
+            prof.deinit();
+        }
         if (self.prepared) cache.tap = .{ .buf = self.scratch.taps, .start = @intCast(cache.len), .rows = 1, .gen = generation };
         cache.len += 1;
         return self.put(try self.drawLast(cache, stream.sampling, position, &.{}));
