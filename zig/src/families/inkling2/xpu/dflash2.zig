@@ -78,6 +78,8 @@ pub const Drafter = struct {
     /// The draft head's vocabulary: `TF_DFLASH2_VOCAB=N` keeps the first N rows of the unembedding, so a round reads
     /// N rows a position instead of every row. Drafts only change speed, so a smaller head cannot change an output.
     vocab: u32 = state.vocabulary,
+    /// The real token id of a kept column when the head covers only the top N rows of the unembedding.
+    index: ?[]u32 = null,
     capacity: usize = 1,
     contexts: std.AutoHashMapUnmanaged(*Stream, state.Lane) = .empty,
     host_ids: [2]u32 = .{ 0, mask_token },
@@ -114,16 +116,61 @@ pub const Drafter = struct {
         const full: usize = weight_loader.vocabulary * weight_loader.hidden;
         var own_unembed: ?rt.Buffer = null;
         errdefer if (own_unembed) |*b| b.free();
-        if (target.weights.unembed.bytes / 2 != full) {
+        var d_index: ?[]u32 = null;
+        errdefer if (d_index) |ix| gpa.free(ix);
+        var d_vocab: u32 = state.vocabulary;
+        const want: usize = if (std.c.getenv("TF_DFLASH2_VOCAB")) |v| std.math.clamp(std.fmt.parseInt(usize, std.mem.span(v), 10) catch weight_loader.vocabulary, 256, weight_loader.vocabulary) else weight_loader.vocabulary;
+        if (target.weights.unembed.bytes / 2 != full or want < weight_loader.vocabulary) {
             const host = try gpa.alloc(u16, full);
             defer gpa.free(host);
             var ldr = try xpu.loader.Loader.init(gpa, target.r, target_dir);
             defer ldr.deinit();
             const inf = try ldr.info("model.llm.unembed.weight");
             try xpu.loader.readExact(inf.fd, std.mem.sliceAsBytes(host), inf.off);
-            own_unembed = try target.r.alloc(full * 2);
-            try target.r.upload(.{ .rt = target.r, .ptr = own_unembed.?.ptr, .len = full * 2 }, std.mem.sliceAsBytes(host));
-            try target.r.sync();
+            if (want >= weight_loader.vocabulary) {
+                own_unembed = try target.r.alloc(full * 2);
+                try target.r.upload(.{ .rt = target.r, .ptr = own_unembed.?.ptr, .len = full * 2 }, std.mem.sliceAsBytes(host));
+                try target.r.sync();
+            }
+            // `TF_DFLASH2_VOCAB=N`: keep the N rows with the largest norm, a stand-in for frequency, and remember their
+            // ids so a kept column maps back to its real token. Drafts only change speed, so this cannot change output.
+            if (want < weight_loader.vocabulary) {
+                const hidden_n = weight_loader.hidden;
+                const norms = try gpa.alloc(f32, weight_loader.vocabulary);
+                defer gpa.free(norms);
+                for (0..weight_loader.vocabulary) |ri| {
+                    var n: f64 = 0;
+                    const row = host[ri * hidden_n ..][0..hidden_n];
+                    for (row) |v| {
+                        const f: f32 = @bitCast(@as(u32, v) << 16);
+                        n += @as(f64, f) * @as(f64, f);
+                    }
+                    norms[ri] = @floatCast(n);
+                }
+                const idx = try gpa.alloc(u32, weight_loader.vocabulary);
+                defer gpa.free(idx);
+                for (idx, 0..) |*v, i| v.* = @intCast(i);
+                const Ctx = struct {
+                    n: []const f32,
+                    fn less(c: @This(), a: u32, b: u32) bool { return c.n[a] > c.n[b] or (c.n[a] == c.n[b] and a < b); }
+                };
+                std.mem.sort(u32, idx, Ctx{ .n = norms }, Ctx.less);
+                const index = try gpa.alloc(u32, want);
+                errdefer gpa.free(index);
+                const small = try gpa.alloc(u16, want * hidden_n);
+                defer gpa.free(small);
+                for (0..want) |i| {
+                    index[i] = idx[i];
+                    @memcpy(small[i * hidden_n ..][0..hidden_n], host[idx[i] * hidden_n ..][0..hidden_n]);
+                }
+                const gath = try target.r.alloc(want * hidden_n * 2);
+                try target.r.upload(.{ .rt = target.r, .ptr = gath.ptr, .len = want * hidden_n * 2 }, std.mem.sliceAsBytes(small));
+                try target.r.sync();
+                if (own_unembed) |*b| b.free();
+                own_unembed = gath;
+                d_index = index;
+                d_vocab = @intCast(want);
+            }
         }
         var module = try xpu.Module.loadNative(ctx, &images.dflash2);
         errdefer module.unload();
@@ -141,17 +188,13 @@ pub const Drafter = struct {
         errdefer gpa.free(top_i);
         const sel = try gpa.alloc(u16, 7 * state.rank);
         errdefer gpa.free(sel);
-        d.* = .{ .gpa = gpa, .target = target, .ctx = ctx, .stream = stream, .weights = weights, .module = module, .kernels = kernels, .spark_module = spark_module, .spark = spark, .scratch = scratch, .top_v = top_v, .top_i = top_i, .sel = sel, .unembed = own_unembed };
+        d.* = .{ .gpa = gpa, .target = target, .ctx = ctx, .stream = stream, .weights = weights, .module = module, .kernels = kernels, .spark_module = spark_module, .spark = spark, .scratch = scratch, .top_v = top_v, .top_i = top_i, .sel = sel, .unembed = own_unembed, .index = d_index, .vocab = d_vocab };
         d.times = .{ .on = std.c.getenv("TF_DFLASH2_TIMES") != null };
         d.full = std.c.getenv("TF_DFLASH2_FULL") != null;
         if (std.c.getenv("TF_DFLASH2_TRACE")) |path| d.trace = std.c.fopen(path, "wb");
         if (std.c.getenv("TF_DFLASH2_DEPTH")) |v| {
             const n = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 7;
             d.depth_cap = std.math.clamp(n, 1, 7);
-        }
-        if (std.c.getenv("TF_DFLASH2_VOCAB")) |v| {
-            const n = std.fmt.parseInt(u32, std.mem.span(v), 10) catch state.vocabulary;
-            d.vocab = std.math.clamp(n, 256, state.vocabulary);
         }
         if (std.c.getenv("TF_DFLASH2_FORCE")) |v| d.force = !std.mem.eql(u8, std.mem.span(v), "0") and std.mem.span(v).len != 0;
         if (std.c.getenv("TF_DFLASH2_PRICE")) |v| d.price = !std.mem.eql(u8, std.mem.span(v), "0");
@@ -170,6 +213,7 @@ pub const Drafter = struct {
         d.contexts.deinit(d.gpa);
         d.gpa.free(d.sel);
         d.gpa.free(d.top_i);
+        if (d.index) |ix| d.gpa.free(ix);
         d.gpa.free(d.top_v);
         if (d.unembed) |*b| b.free();
         d.scratch.deinit();
@@ -448,7 +492,7 @@ pub const Drafter = struct {
             bi[at_] = ix;
         }
         for (0..topk) |j| {
-            ids[j] = if (bi[j] == std.math.maxInt(i32)) 0 else @intCast(bi[j]);
+            ids[j] = if (bi[j] == std.math.maxInt(i32)) 0 else if (d.index) |ix| ix[@intCast(bi[j])] else @intCast(bi[j]);
             vals[j] = bv[j];
         }
     }
@@ -517,7 +561,7 @@ pub const Drafter = struct {
             for (0..depth) |step| {
                 const position = std.math.add(u32, base_position, @intCast(step)) catch return error.DraftDepth;
                 previous = try d.draw(step, previous, item.sampling, position);
-                if (previous >= d.vocab) return error.DraftNonfinite;
+                if (previous >= state.vocabulary) return error.DraftNonfinite;
                 lane.held[step] = previous;
             }
             lane.held_len = offered;
