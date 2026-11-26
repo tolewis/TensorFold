@@ -466,7 +466,18 @@ const Run = struct {
         }
     }
 
-    fn routedExperts(g: Run, layer: usize, rows: usize) !void {
+    /// `INK2_SEG4=1`: a window's five projections in one launch (`dense_q8_seg4`). Measured at 1.390 ms against 2.262
+/// for the five separate launches at four rows, but the drafted stream of prompt 2 leaves the accepted one at token 16,
+/// so it is off until that difference is accounted for.
+var seg4_on: ?bool = null;
+fn seg4() bool {
+    if (seg4_on) |v| return v;
+    const v = if (std.c.getenv("INK2_SEG4")) |p| std.mem.eql(u8, std.mem.span(p), "1") else false;
+    seg4_on = v;
+    return v;
+}
+
+fn routedExperts(g: Run, layer: usize, rows: usize) !void {
         const s = g.sc;
         const w = &g.m.weights.layers[layer];
         const ex = &g.p.experts;
@@ -580,6 +591,18 @@ fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) 
             }, .{
                 g.projN(w.attn.wq), g.projN(w.attn.wk), g.projN(w.attn.wv), g.projN(w.attn.wr), g.projN(w.attn.gate),
             }, k);
+        } else if (fuse.seg and seg4() and rows == 4 and w.attn.wq.q8) {
+            xpu.profile.label = "wqkv";
+            const k: u32 = @intCast(w.attn.wq.shape[w.attn.wq.rank - 1]);
+            try dense_q8_kernels.seg4(&g.p.dense_q8, g.s, .{
+                at(s.q_norm, 0), knorm, vnorm, at(s.q_norm, 0), at(s.q_norm, 0),
+            }, .{
+                tensor(w.attn.wq), tensor(w.attn.wk), tensor(w.attn.wv), tensor(w.attn.wr), tensor(w.attn.gate),
+            }, .{
+                at(s.q_raw, 0), at(s.k_raw, 0), at(s.v_raw, 0), at(s.rel_raw, 0), at(s.gate, 0),
+            }, .{
+                g.projN(w.attn.wq), g.projN(w.attn.wk), g.projN(w.attn.wv), g.projN(w.attn.wr), g.projN(w.attn.gate),
+            }, k, @intCast(rows));
         } else {
             xpu.profile.label = "wq";
             try g.dense(w.attn.wq, at(s.q_norm, 0), at(s.q_raw, 0), null, rows);

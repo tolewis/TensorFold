@@ -18,6 +18,7 @@ pub const Kernels = struct {
     dense: [variants.len]xpu.Kernel,
     head: [variants.len]xpu.Kernel,
     seg1: xpu.Kernel,
+    seg4: xpu.Kernel,
     /// The head tile kernel. One sub-group, 16 columns. Dense stays on `head`.
     head_dpas: xpu.Kernel,
     quant: xpu.Kernel,
@@ -40,13 +41,15 @@ pub const Kernels = struct {
             made[n] = try module.kernel(symbol("head", rows, control), .{ threads, 1, 1 });
             n += 1;
         }
-        var out: Kernels = .{ .dense = undefined, .head = undefined, .seg1 = undefined, .head_dpas = undefined, .quant = undefined, .columns = threads / 16 };
+        var out: Kernels = .{ .dense = undefined, .head = undefined, .seg1 = undefined, .seg4 = undefined, .head_dpas = undefined, .quant = undefined, .columns = threads / 16 };
         for (0..variants.len) |i| {
             out.dense[i] = made[2 * i];
             out.head[i] = made[2 * i + 1];
         }
         const seg_name = if (control) "tf_ctl_ink2_dense_q8_seg1" else "tf_ink2_dense_q8_seg1";
         out.seg1 = try module.kernel(seg_name, .{ threads, 1, 1 });
+        const seg4_name = if (control) "tf_ctl_ink2_dense_q8_seg4" else "tf_ink2_dense_q8_seg4";
+        out.seg4 = try module.kernel(seg4_name, .{ threads, 1, 1 });
         const dpas_name = if (control) "tf_ctl_ink2_head_dpas" else "tf_ink2_head_dpas";
         const qname = if (control) "tf_ctl_ink2_q8_quant" else "tf_ink2_q8_quant";
         out.head_dpas = try module.kernel(dpas_name, .{ 16, 1, 1 });
@@ -56,6 +59,7 @@ pub const Kernels = struct {
 
     pub fn deinit(p: *Kernels) void {
         p.seg1.deinit();
+        p.seg4.deinit();
         p.head_dpas.deinit();
         p.quant.deinit();
         for (&p.dense) |*k| k.deinit();
@@ -107,6 +111,16 @@ pub fn seg1Sink(p: *const Kernels, s: xpu.Stream, x: [5]Ref, w: [5]Ref, y: [5]Re
     try xpu.launch.dispatch(p.seg1, s, .{ cols, 5, 1 }, .{
         x[0], x[1], x[2], x[3], x[4], w[0], w[1], w[2], w[3], w[4], y[0], y[1], y[2], y[3], y[4],
         n[0], n[1], n[2], n[3], n[4], k, sink_w, sink_y, sink_n, sink_on,
+    });
+}
+
+pub fn seg4(p: *const Kernels, s: xpu.Stream, x: [5]Ref, w: [5]Ref, y: [5]Ref, n: [5]u32, k: u32, rows: u32) !void {
+    var max_n: u32 = 0;
+    for (n) |ni| max_n = @max(max_n, ni);
+    const cols = (max_n + p.columns - 1) / p.columns;
+    try xpu.launch.dispatch(p.seg4, s, .{ cols, 5, 1 }, .{
+        x[0], x[1], x[2], x[3], x[4], w[0], w[1], w[2], w[3], w[4], y[0], y[1], y[2], y[3], y[4],
+        n[0], n[1], n[2], n[3], n[4], k, rows,
     });
 }
 

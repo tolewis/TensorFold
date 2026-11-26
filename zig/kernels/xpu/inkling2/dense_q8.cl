@@ -237,6 +237,34 @@ Q8_KERNEL(Q8_WG) void Q8_NAME(dense_q8_seg1)(
   if (sink_on && seg == 0 && j < sink_n) q8_sink_bf16(x0, (global const ushort *)sink_w, sink_y, j, k);
 }
 
+// The same five projections for a window: one launch, five segments, four rows of x each (a verify window's rows).
+// The dot is Q8_DOT(4), the lane order of dense_q8_4, so a row's bytes do not depend on the launch it came from.
+Q8_KERNEL(Q8_WG) void Q8_NAME(dense_q8_seg4)(
+    global const ushort *x0, global const ushort *x1, global const ushort *x2, global const ushort *x3, global const ushort *x4,
+    global const uchar *w0, global const uchar *w1, global const uchar *w2, global const uchar *w3, global const uchar *w4,
+    global ushort *y0, global ushort *y1, global ushort *y2, global ushort *y3, global ushort *y4,
+    uint n0, uint n1, uint n2, uint n3, uint n4, uint k, uint rows) {
+  const uint seg = get_group_id(1);
+  const uint j = get_group_id(0) * (Q8_WG / 16) + get_sub_group_id();
+  uint n = n0;
+  global const ushort *x = x0;
+  global const uchar *w = w0;
+  global ushort *y = y0;
+  if (seg == 1) { n = n1; x = x1; w = w1; y = y1; }
+  else if (seg == 2) { n = n2; x = x2; w = w2; y = y2; }
+  else if (seg == 3) { n = n3; x = x3; w = w3; y = y3; }
+  else if (seg == 4) { n = n4; x = x4; w = w4; y = y4; }
+  if (seg > 4 || j >= n) return;
+  global const uchar *codes = w;
+  global const half *scales = (global const half *)(w + (ulong)n * k);
+  float acc[4];
+  Q8_DOT(4, x, codes, scales, j, n, k)
+  _Pragma("unroll") for (uint r = 0; r < 4; ++r) {
+    const float s = sub_group_reduce_add(acc[r]);
+    if (get_sub_group_local_id() == 0 && r < rows) y[(ulong)r * n + j] = Q8_STORE(s);
+  }
+}
+
 Q8_MATVEC(2)
 Q8_MATVEC(4)
 Q8_MATVEC(8)
