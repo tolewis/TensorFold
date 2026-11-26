@@ -11,6 +11,7 @@ const images = @import("inkling2_xpu_images");
 const gpu_rule = lanes.gpu_rule;
 const Model = @import("model.zig").Model;
 const dense_kernels = @import("dense.zig");
+const dense_q8 = @import("dense_q8.zig");
 const glue = @import("glue.zig");
 const ds = @import("dspark_kernels.zig");
 const k = @import("dflash2_kernels.zig");
@@ -48,7 +49,14 @@ fn nowNs() u64 {
 /// Where a drafted round's drafter time goes (`TF_DFLASH2_TIMES=1` logs a line every 50 holds).
 const Times = struct {
     on: bool = false,
+    /// `TF_DFLASH2_TIMES=2`: wait after the layers and after the head, so each section's device time is measured.
+    split: bool = false,
     holds: u64 = 0,
+    holds_split: u64 = 0,
+    layers: u64 = 0,
+    head: u64 = 0,
+    selector: u64 = 0,
+    launches: u64 = 0,
     absorbs: u64 = 0,
     absorb: u64 = 0,
     block: u64 = 0,
@@ -87,6 +95,8 @@ pub const Drafter = struct {
     top_i: []i32,
     sel: []u16,
     embed_mode: EmbedMode = .normed,
+    /// `TF_DFLASH2_FUSE=0` keeps one launch a projection, for an A/B against the fused ones.
+    fuse: bool = true,
     /// The most drafts a round may ask (block length minus one); `TF_DFLASH2_DEPTH=1..7` sets it for measurement.
     /// Three drafts (a four-row window): the paired 40k/125k sweep of 2026-11-25 (same prompts each length, per prompt)
     /// puts the best at four rows at 125k (82.3 tok/s, 40.2 ms a round) and at four or six rows at 40k (82.6/92.7);
@@ -190,6 +200,7 @@ pub const Drafter = struct {
         errdefer gpa.free(sel);
         d.* = .{ .gpa = gpa, .target = target, .ctx = ctx, .stream = stream, .weights = weights, .module = module, .kernels = kernels, .spark_module = spark_module, .spark = spark, .scratch = scratch, .top_v = top_v, .top_i = top_i, .sel = sel, .unembed = own_unembed, .index = d_index, .vocab = d_vocab };
         d.times = .{ .on = std.c.getenv("TF_DFLASH2_TIMES") != null };
+        if (std.c.getenv("TF_DFLASH2_TIMES")) |v| d.times.split = std.mem.eql(u8, std.mem.span(v), "2");
         d.full = std.c.getenv("TF_DFLASH2_FULL") != null;
         if (std.c.getenv("TF_DFLASH2_TRACE")) |path| d.trace = std.c.fopen(path, "wb");
         if (std.c.getenv("TF_DFLASH2_DEPTH")) |v| {
@@ -199,9 +210,11 @@ pub const Drafter = struct {
         if (std.c.getenv("TF_DFLASH2_FORCE")) |v| d.force = !std.mem.eql(u8, std.mem.span(v), "0") and std.mem.span(v).len != 0;
         if (std.c.getenv("TF_DFLASH2_PRICE")) |v| d.price = !std.mem.eql(u8, std.mem.span(v), "0");
         std.log.info("dflash2: {s}", .{if (d.force) "seven drafts a round" else if (d.price) "scheduler depth, deeper only when this request pays" else "scheduler depth"});
+        std.log.info("dflash2: dense weights {s}", .{if (d.weights.weights.fc.q8) "q8" else "bf16"});
         if (std.c.getenv("TF_DFLASH2_EMBED")) |v| {
             if (std.mem.eql(u8, std.mem.span(v), "raw")) d.embed_mode = .raw;
         }
+        if (std.c.getenv("TF_DFLASH2_FUSE")) |v| d.fuse = !std.mem.eql(u8, std.mem.span(v), "0");
         return d;
     }
 
@@ -336,10 +349,29 @@ pub const Drafter = struct {
         }
     }
 
-    /// out[rows][n] = bf16(input[rows][width] . weight[n][width]) on the target's dense matvec.
+    /// out[rows][n] = bf16(input[rows][width] . weight[n][width]) on the target's dense matvec, or on its q8 matvec when
+    /// the drafter's dense weights were re-encoded at load (`TF_DFLASH2_Q8=1`).
     fn project(d: *Drafter, weight: weight_loader.Tensor, input: Ref, out: Ref, rows: usize, n: u32, width: u32) !void {
         const p = if (d.target.pipelines) |*x| x else return error.Inkling2NoKernels;
+        if (weight.q8) return dense_q8.dense(&p.dense_q8, d.stream, r(weight), input, out, null, @intCast(rows), n, width);
         try dense_kernels.dense(&p.dense, d.stream, r(weight), input, out, @intCast(rows), n, width);
+    }
+
+    /// q, k and v of one layer in one launch (`dense_q8_seg8`, three segments), when all three weights are q8 and the
+    /// fusion is on. Returns false when the caller must run the three separate launches.
+    fn projectQkv(d: *Drafter, layer: weight_loader.Layer, input: Ref, q: Ref, kk: Ref, v: Ref, rows: usize) !bool {
+        if (!d.fuse or !(layer.q.q8 and layer.k.q8 and layer.v.q8)) return false;
+        const p = if (d.target.pipelines) |*x| x else return error.Inkling2NoKernels;
+        try dense_q8.seg8(&p.dense_q8, d.stream, .{ input, input, input, null, null }, .{ r(layer.q), r(layer.k), r(layer.v), null, null }, .{ q, kk, v, null, null }, .{ state.query, state.kv, state.kv, 0, 0 }, hidden, @intCast(rows));
+        return true;
+    }
+
+    /// gate and up of one layer in one launch, the same rule.
+    fn projectGateUp(d: *Drafter, layer: weight_loader.Layer, input: Ref, gate: Ref, up: Ref, rows: usize) !bool {
+        if (!d.fuse or !(layer.gate.q8 and layer.up.q8)) return false;
+        const p = if (d.target.pipelines) |*x| x else return error.Inkling2NoKernels;
+        try dense_q8.seg8(&p.dense_q8, d.stream, .{ input, input, null, null, null }, .{ r(layer.gate), r(layer.up), null, null, null }, .{ gate, up, null, null, null }, .{ state.intermediate, state.intermediate, 0, 0, 0 }, hidden, @intCast(rows));
+        return true;
     }
 
     /// Committed rows enter every layer's key and value ring: fc over the four taps, its norm, then each layer's k and v.
@@ -425,14 +457,18 @@ pub const Drafter = struct {
             },
         }
         try ds.residualNorm(&d.spark, s, at(sc.x, 0), at(sc.resid, 0), r(w.layers[0].input_norm), at(sc.resid, 0), at(sc.y, 0), 8, true);
+        const t_layers = nowNs();
+        const l0 = xpu.profile.launches;
         if (debug) d.traceDevice('X', &.{0xff}, at(sc.x, 0), 8 * hidden * 2);
         for (w.layers, 0..) |layer, i| {
             // attention: dynamic conv in, q k v, block attention, o, dynamic conv out
             try d.project(layer.attn_kernel, at(sc.y, 0), at(sc.dyn, 0), 8, k.dyn_width, hidden);
             try k.conv(&d.kernels, s, at(sc.y, 0), at(sc.dyn, 0), r(layer.attn_base), at(sc.conv, 0), 8);
-            try d.project(layer.q, at(sc.conv, 0), at(sc.q_raw, 0), 8, state.query, hidden);
-            try d.project(layer.k, at(sc.conv, 0), at(sc.k_raw, 0), 8, state.kv, hidden);
-            try d.project(layer.v, at(sc.conv, 0), at(sc.v_raw, 0), 8, state.kv, hidden);
+            if (!(try d.projectQkv(layer, at(sc.conv, 0), at(sc.q_raw, 0), at(sc.k_raw, 0), at(sc.v_raw, 0), 8))) {
+                try d.project(layer.q, at(sc.conv, 0), at(sc.q_raw, 0), 8, state.query, hidden);
+                try d.project(layer.k, at(sc.conv, 0), at(sc.k_raw, 0), 8, state.kv, hidden);
+                try d.project(layer.v, at(sc.conv, 0), at(sc.v_raw, 0), 8, state.kv, hidden);
+            }
             try k.blockQk(&d.kernels, s, at(sc.q_raw, 0), at(sc.k_raw, 0), r(layer.q_norm), r(layer.k_norm), at(sc.q, 0), at(sc.kb, 0), @intCast(anchor));
             try k.attend(&d.kernels, s, at(sc.q, 0), at(sc.kb, 0), at(sc.v_raw, 0), at(lane.k[i], 0), at(lane.v[i], 0), at(sc.part, 0), at(sc.attn, 0), committed, state.ring, from);
             if (debug) {
@@ -448,8 +484,10 @@ pub const Drafter = struct {
             // MLP
             try d.project(layer.mlp_kernel, at(sc.y, 0), at(sc.dyn, 0), 8, k.dyn_width, hidden);
             try k.conv(&d.kernels, s, at(sc.y, 0), at(sc.dyn, 0), r(layer.mlp_base), at(sc.conv, 0), 8);
-            try d.project(layer.gate, at(sc.conv, 0), at(sc.gate, 0), 8, state.intermediate, hidden);
-            try d.project(layer.up, at(sc.conv, 0), at(sc.up, 0), 8, state.intermediate, hidden);
+            if (!(try d.projectGateUp(layer, at(sc.conv, 0), at(sc.gate, 0), at(sc.up, 0), 8))) {
+                try d.project(layer.gate, at(sc.conv, 0), at(sc.gate, 0), 8, state.intermediate, hidden);
+                try d.project(layer.up, at(sc.conv, 0), at(sc.up, 0), 8, state.intermediate, hidden);
+            }
             try xpu.launch.dispatch(d.spark.swiglu, s, .{ (8 * state.intermediate + 255) / 256, 1, 1 }, .{ at(sc.gate, 0), at(sc.up, 0), at(sc.act, 0), @as(u32, 8 * state.intermediate) });
             try d.project(layer.down, at(sc.act, 0), at(sc.out, 0), 8, hidden, state.intermediate);
             try k.conv(&d.kernels, s, at(sc.out, 0), at(sc.dyn, 288 * 2), offset(r(layer.mlp_base), 2 * hidden * 2), at(sc.conv, 0), 8);
@@ -464,13 +502,29 @@ pub const Drafter = struct {
         }
         // rows 1 .. rows of the final norm: the unembedding once for all of them, the 16 best of each, the selector rows
         const draft_rows = at(sc.final, row_bytes);
+        if (d.times.split) try d.stream.synchronize();
+        const t_head = nowNs();
+        if (d.times.split) {
+            d.times.layers += t_head - t_layers;
+            d.times.holds_split += 1;
+        }
         const unembed_ptr = if (d.unembed) |b| b.ptr else target.weights.unembed.buf.ptr;
         try ds.base(&d.spark, s, unembed_ptr, draft_rows, at(sc.base, 0), rows, d.vocab);
         try k.topKeep(&d.kernels, s, at(sc.base, 0), d.vocab, d.vocab, rows, at(sc.top_v, 0), at(sc.top_i, 0));
+        if (d.times.split) try d.stream.synchronize();
+        const t_sel = nowNs();
+        if (d.times.split) {
+            d.times.head += t_sel - t_head;
+        }
         try d.project(w.selector, draft_rows, at(sc.sel, 0), rows, state.rank, hidden);
         try sc.top_v.downloadAsync(s, 0, std.mem.sliceAsBytes(d.top_v[0 .. rows * state.lists]));
         try sc.top_i.downloadAsync(s, 0, std.mem.sliceAsBytes(d.top_i[0 .. rows * state.lists]));
         try sc.sel.downloadAsync(s, 0, std.mem.sliceAsBytes(d.sel[0 .. rows * state.rank]));
+        if (d.times.split) {
+            try d.stream.synchronize();
+            d.times.selector += nowNs() - t_sel;
+        }
+        if (d.times.on) d.times.launches += xpu.profile.launches - l0;
     }
 
     /// Row `row`'s 16 best (value, id) from its 256 lists, value descending then id ascending.
@@ -582,6 +636,7 @@ pub const Drafter = struct {
                         }
                     }.of;
                     std.log.info("dflash2 times: holds {d} | per hold: block + download {d:.2} ms, host chain {d:.2} ms | absorb {d:.2} ms each ({d})", .{ t.holds, ms(t.block, t.holds), ms(t.chain, t.holds), ms(t.absorb, t.absorbs), t.absorbs });
+                    if (t.split and t.holds_split > 0) std.log.info("dflash2 split: holds {d} | per hold: layers {d:.2} ms, head {d:.2} ms, selector and download {d:.2} ms | launches {d} ({d:.1} us each)", .{ t.holds_split, ms(t.layers, t.holds_split), ms(t.head, t.holds_split), ms(t.selector, t.holds_split), t.launches / t.holds_split, @as(f64, @floatFromInt(t.block)) / 1e3 / @as(f64, @floatFromInt(t.launches)) });
                 }
             }
         }

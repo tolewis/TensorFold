@@ -18,6 +18,9 @@ pub var label: []const u8 = "";
 /// The kernel queued most recently. The exchange wait log names this as the work before the wait.
 pub var last_kernel: []const u8 = "";
 
+/// Every kernel queued through `launch.launchSignal` since the process started (indirect launches are not counted).
+pub var launches: u64 = 0;
+
 /// Host time of the exchange appends, when TF_TP_APPEND=1. Sites: copy, flag write, event create, event wait, kernel launch.
 pub var host_append_ns: [5]u64 = @splat(0);
 pub var append_n: [5]u64 = @splat(0);

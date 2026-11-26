@@ -1,9 +1,11 @@
 //! Mini's DFlash 2 drafter checkpoint (incoai/Inkling-2-Mini-DFlash2) on XPU: the config it must carry, every tensor
-//! name and shape checked before a byte is read, the BF16 weights in device memory as stored, and the two candidate
-//! codebooks left in the mapped file (the host reads a few rows of them a round).
+//! name and shape checked before a byte is read, the weights in device memory (BF16 as stored, or the dense projections
+//! re-encoded to q8.zig's Q8_0 blocks with `TF_DFLASH2_Q8=1`), and the two candidate codebooks left in the mapped file
+//! (the host reads a few rows of them a round).
 const std = @import("std");
 const xpu = @import("xpu");
 const st = @import("core").safetensors;
+const q8 = @import("q8.zig");
 
 pub const hidden = 2304;
 pub const query = 4096;
@@ -78,8 +80,8 @@ fn expectInt(o: std.json.ObjectMap, key: []const u8, want: i64) !void {
     if (v != .integer or v.integer != want) return error.UnsupportedDFlash2Config;
 }
 
-/// One tensor in device memory: BF16, as stored.
-pub const Tensor = struct { buf: xpu.DeviceBuffer };
+/// One tensor in device memory: BF16 as stored, or (`q8`) a matrix [n][k] as q8.zig's codes then scales.
+pub const Tensor = struct { buf: xpu.DeviceBuffer, q8: bool = false };
 
 pub const Layer = struct {
     input_norm: Tensor,
@@ -191,14 +193,38 @@ const Uploader = struct {
     s: xpu.Stream,
     out: *std.ArrayList(xpu.DeviceBuffer),
     gpa: std.mem.Allocator,
+    /// Encode a two-dimensional projection to Q8_0 blocks instead of uploading its bf16 bytes.
+    q8: bool,
 
     fn tensor(u: Uploader, name: []const u8, dims: []const usize) !Tensor {
+        if (u.q8 and dims.len == 2 and q8.admits(dims[1])) return u.q8Tensor(name, dims);
         const e = try get(&u.file.names, name, dims);
         const raw = u.file.map.memory[u.file.data + e.begin ..][0 .. e.end - e.begin];
         try u.out.ensureUnusedCapacity(u.gpa, 1);
         const buf = try xpu.DeviceBuffer.fromHost(u.ctx, u.s, raw);
         u.out.appendAssumeCapacity(buf);
         return .{ .buf = buf };
+    }
+
+    /// A matrix [n][k] of the mapped file encoded to q8.zig's blocks: codes, then the fp16 scales, one buffer.
+    fn q8Tensor(u: Uploader, name: []const u8, dims: []const usize) !Tensor {
+        const e = try get(&u.file.names, name, dims);
+        const n = dims[0];
+        const k = dims[1];
+        const raw = u.file.map.memory[u.file.data + e.begin ..][0 .. e.end - e.begin];
+        const src: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, raw));
+        const codes = try u.gpa.alloc(u8, n * k);
+        defer u.gpa.free(codes);
+        const scales = try u.gpa.alloc(u16, n * (k / q8.block));
+        defer u.gpa.free(scales);
+        q8.encodeRows(src, n, k, codes, scales);
+        try u.out.ensureUnusedCapacity(u.gpa, 1);
+        var buf = try xpu.DeviceBuffer.alloc(u.ctx, q8.bytes(n, k));
+        errdefer buf.free();
+        try buf.upload(u.s, 0, codes);
+        try buf.upload(u.s, q8.scaleOffset(n, k), std.mem.sliceAsBytes(scales));
+        u.out.appendAssumeCapacity(buf);
+        return .{ .buf = buf, .q8 = true };
     }
 
     fn layerTensor(u: Uploader, i: usize, suffix: []const u8, dims: []const usize) !Tensor {
@@ -230,7 +256,8 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const xpu.Context, s: xpu.
         for (owned.items) |*b| b.free();
         owned.deinit(gpa);
     }
-    const u: Uploader = .{ .file = &file, .ctx = ctx, .s = s, .out = &owned, .gpa = gpa };
+    const dense_q8 = if (std.c.getenv("TF_DFLASH2_Q8")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+    const u: Uploader = .{ .file = &file, .ctx = ctx, .s = s, .out = &owned, .gpa = gpa, .q8 = dense_q8 };
     var ls: [layers]Layer = undefined;
     for (&ls, 0..) |*l, i| {
         inline for (@typeInfo(Layer).@"struct".field_names, layer_tensors) |field, t| @field(l, field) = try u.layerTensor(i, t[0], t[1]);
