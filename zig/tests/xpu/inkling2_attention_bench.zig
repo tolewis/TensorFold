@@ -117,12 +117,14 @@ pub fn main(init: std.process.Init) !u8 {
             const vs = try a.alloc(f32, KV * ring);
             defer a.free(vs);
             var codes: [D]u8 = undefined;
-            for (0..KV) |h| for (0..ring) |p| {
-                const at = (h * ring + p) * D;
-                ks[h * ring + p] = quantize(host_k[at..][0..D], &codes);
-                for (0..D) |d| kc[plan.kCodeOffset(h, p, d, ring)] = codes[d];
-                vs[h * ring + p] = quantize(host_v[at..][0..D], &codes);
-                for (0..D) |d| vc[plan.vCodeOffset(h, p, d, ring)] = codes[d];
+            for (0..KV) |h| {
+                for (0..ring) |p| {
+                    const at = (h * ring + p) * D;
+                    ks[h * ring + p] = quantize(host_k[at..][0..D], &codes);
+                    for (0..D) |d| kc[plan.kCodeOffset(h, p, d, ring)] = codes[d];
+                    vs[h * ring + p] = quantize(host_v[at..][0..D], &codes);
+                    for (0..D) |d| vc[plan.vCodeOffset(h, p, d, ring)] = codes[d];
+                }
             }
             const ksd: attn.Ref = .{ .ptr = try rig.input(std.mem.sliceAsBytes(ks)) };
             const vsd: attn.Ref = .{ .ptr = try rig.input(std.mem.sliceAsBytes(vs)) };
