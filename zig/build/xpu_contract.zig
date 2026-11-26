@@ -224,6 +224,28 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         },
     }) });
     b.step("tf-xpu-inkling2-attention-bench", "Build the Inkling 2 Mini XPU attention bandwidth bench").dependOn(&b.addInstallArtifact(attn_bench, .{}).step);
+    // The barrier bench's image: one kernel that waits at a grid-wide barrier a set number of rounds.
+    const barrier_opts = "-cl-std=CL3.0 -cl-intel-256-GRF-per-thread -cl-fp32-correctly-rounded-divide-sqrt";
+    const barrier_obj = b.addSystemCommand(&.{ ocloc, "compile", "-q", "-file" });
+    barrier_obj.addFileArg(b.path("zig/kernels/xpu/barrier_bench.cl"));
+    barrier_obj.addArgs(&.{ "-device", device, "-options", barrier_opts, "-output_no_suffix", "-output", "barrier_bench", "-out_dir" });
+    barrier_obj.setCwd(b.path("."));
+    const barrier_dir = barrier_obj.addOutputDirectoryArg("ocloc-barrier");
+    const barrier_install = b.addInstallFile(barrier_dir.path(b, "barrier_bench.bin"), "xpu-bench/barrier_bench.bin");
+    const barrier_bench = b.addExecutable(.{ .name = "tf-xpu-barrier-bench", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/xpu/barrier_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "core", .module = core },
+            .{ .name = "xpu", .module = xpu },
+            .{ .name = "ze", .module = ze },
+        },
+    }) });
+    const barrier_step = b.step("tf-xpu-barrier-bench", "Build the grid-wide barrier cost bench");
+    barrier_step.dependOn(&b.addInstallArtifact(barrier_bench, .{}).step);
+    barrier_step.dependOn(&barrier_install.step);
     b.step("tf-xpu-contract-run", "Build the XPU kernel-contract runner: gates 1 to 4 and gate 5 live on a card").dependOn(&b.addInstallArtifact(exe, .{}).step);
     const dspark_bench = b.addExecutable(.{ .name = "tf-xpu-dspark-bench", .root_module = b.createModule(.{
         .root_source_file = b.path("zig/tests/xpu/inkling2_dspark_bench.zig"),
