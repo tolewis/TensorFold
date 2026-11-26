@@ -750,7 +750,7 @@ pub const Model = struct {
     /// Builds the production kernels on `ctx` (the context `r` runs on); the forward needs them.
     pub fn loadKernels(m: *Model, ctx: *const xpu.Context) !void {
         if (m.pipelines != null) return;
-        if (!attention_plan.flash_user_set) attention_plan.flash_splits = 64;
+        if (!attention_plan.flash_user_set) attention_plan.flash_splits = 128;
         m.pipelines = try Pipelines.load(ctx);
         m.ctx = ctx;
     }
