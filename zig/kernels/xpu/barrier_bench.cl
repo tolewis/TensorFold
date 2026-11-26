@@ -1,5 +1,3 @@
-#pragma OPENCL EXTENSION cl_intel_reqd_sub_group_size : enable
-
 __attribute__((intel_reqd_sub_group_size(16)))
 __attribute__((reqd_work_group_size(16, 1, 1)))
 __kernel void tf_barrier_bench(global atomic_uint *arrive, global atomic_uint *gen,
