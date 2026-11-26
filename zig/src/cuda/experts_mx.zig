@@ -71,18 +71,31 @@ pub fn argsOf(in: Rows, gate: bool, w: u64, scale: ?u64, kg: usize, nb: usize, p
     return a;
 }
 
+/// TF_INKLING2_PREFILL_TC: Blackwell native FP4/MXFP8 block-scaled tensor cores for prefill experts (pre-quantized X).
+/// 0 (default in engine): exact BF16 MMA; 1: pre-quantized NVFP4 W4A4 + MXFP8 W8A8 on sm_120a / sm_121a.
+pub fn prefillTcMode() u8 {
+    const S = struct {
+        var v: ?u8 = null;
+    };
+    if (S.v == null) {
+        S.v = if (std.c.getenv("TF_INKLING2_PREFILL_TC")) |e| (if (e[0] != '0') @as(u8, 1) else 0) else 0;
+    }
+    return S.v.?;
+}
+
 /// nvfp4_experts.cu's soft-capped SwiGLU gate-up: decode units of 4 warps, and the prompt tiles of 4 warps.
 pub const Softcap = struct {
-    fns: [2]Function = undefined, // decode, prompt
+    fns: [3]Function = undefined, // decode, prompt, prompt_tc_q
     resident: usize = 0,
 
-    pub const symbols = [2][:0]const u8{ "tf_nvfp4_softcap", "tf_nvfp4_prompt_softcap" };
+    pub const symbols = [3][:0]const u8{ "tf_nvfp4_softcap", "tf_nvfp4_prompt_softcap", "tf_nvfp4_prompt_softcap_tc_q" };
     pub const prompt_wn = 4;
 
     pub fn resolve(mod: Module, sms: usize) !Softcap {
         var c: Softcap = .{};
         for (symbols, &c.fns) |name, *f| f.* = try mod.function(name);
         try c.fns[1].allowDynamicShared(experts.Nvfp4Experts.promptSmem(2, prompt_wn));
+        try c.fns[2].allowDynamicShared(experts.Nvfp4Experts.promptQSmem(2, prompt_wn));
         c.resident = @max(1, try c.fns[0].occupancy(128, 0)) * sms;
         return c;
     }
@@ -97,17 +110,40 @@ pub const Softcap = struct {
         const cfg: launch_.Config = .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 128 }, .shared = smem };
         try launch_.launch(c.fns[@intFromBool(prompt)], cfg, s, &a);
     }
+
+    pub fn runTcQ(c: Softcap, s: Stream, xc: u64, xsc: u64, x_stride: usize, slots: usize, l: Layer, p: Plan, out: u64, items: usize, skip: i32) !void {
+        const nb = l.width / 32;
+        const grid = items * ((nb + prompt_wn - 1) / prompt_wn);
+        if (grid < 1) return;
+        const caps = kernelCaps(l);
+        var a: launch_.Args = .{};
+        a.add(xc);
+        a.add(xsc);
+        a.add(@as(i32, @intCast(x_stride)));
+        a.add(@as(i32, @intCast(slots)));
+        a.add(l.up);
+        a.add(l.up_scale);
+        a.add(@as(i32, @intCast(l.dims / 32)));
+        a.add(@as(i32, @intCast(nb)));
+        for ([_]u64{ p.items, p.counts, p.members, out }) |v| a.add(v);
+        a.add(@as(i32, @intCast(l.width)));
+        a.add(caps[0]);
+        a.add(caps[1]);
+        a.add(skip);
+        const cfg: launch_.Config = .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 128 }, .shared = experts.Nvfp4Experts.promptQSmem(2, prompt_wn) };
+        try launch_.launch(c.fns[2], cfg, s, &a);
+    }
 };
 
 /// MXFP8 experts: e4m3 codes with one E8M0 scale per output row per 32 inputs, blocks of 32 columns by 32 inputs.
 pub const Mxfp8Experts = struct {
     mod: Module,
-    fns: [5]Function, // decode: soft-capped gate-up, fp32 down, bf16 down; prompt: soft-capped gate-up, bf16 down
+    fns: [8]Function, // decode: 0..2; prompt: 3..4; tc_q: 5..6; quant_x: 7
     resident: [3]usize, // the decode entries' blocks a grid may hold
 
     pub const words = 264; // int32 a block: fp8g's 256 code words ([32 lanes][2][4]), then 32 E8M0 bytes
     pub const prompt_cw = [2]usize{ 2, 4 }; // column warps a prompt CTA: gate-up, down (64 pairs an item)
-    pub const symbols = [5][:0]const u8{ "tf_mxfp8_softcap", "tf_mxfp8_down_f32", "tf_mxfp8_down_bf16", "tf_mxfp8_prompt_softcap", "tf_mxfp8_prompt_down" };
+    pub const symbols = [8][:0]const u8{ "tf_mxfp8_softcap", "tf_mxfp8_down_f32", "tf_mxfp8_down_bf16", "tf_mxfp8_prompt_softcap", "tf_mxfp8_prompt_down", "tf_mxfp8_prompt_softcap_tc_q", "tf_mxfp8_prompt_down_tc_q", "tf_mxfp8_quant_x" };
 
     pub fn load(d: *const driver.Driver, sms: usize) !Mxfp8Experts {
         if (!kernels.available) return error.BuiltWithoutKernels;
@@ -121,6 +157,48 @@ pub const Mxfp8Experts = struct {
 
     pub fn unload(e: *Mxfp8Experts) void {
         e.mod.unload();
+    }
+
+    pub fn quantX(e: *const Mxfp8Experts, s: Stream, x: u64, stride: usize, rows: usize, cols: usize, codes: u64, scales: u64) !void {
+        const blocks = rows * (cols / 32);
+        const grid = (blocks + 255) / 256;
+        if (grid < 1) return;
+        var a: launch_.Args = .{};
+        a.add(x);
+        a.add(@as(i32, @intCast(stride)));
+        a.add(@as(i32, @intCast(rows)));
+        a.add(@as(i32, @intCast(cols)));
+        a.add(codes);
+        a.add(scales);
+        try launch_.launch(e.fns[7], .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    pub fn runPromptTc(e: *const Mxfp8Experts, s: Stream, epi: Epi, xc: u64, xsc: u64, x_stride: usize, slots: usize, l: Layer, p: Plan, out: u64, items: usize, skip: i32) !void {
+        const gate = epi == .up;
+        const fi: usize = if (gate) 5 else 6;
+        const n = if (gate) l.width else l.dims;
+        const k = if (gate) l.dims else l.width;
+        if (n % 32 != 0 or k % 32 != 0) return error.UnexpectedShape;
+        const nb = n / 32;
+        const cw = prompt_cw[@intFromBool(!gate)];
+        if (nb % cw != 0) return error.UnexpectedShape;
+        const grid = items * (nb / cw);
+        if (grid < 1) return;
+        const caps = kernelCaps(l);
+        var a: launch_.Args = .{};
+        a.add(xc);
+        a.add(xsc);
+        a.add(@as(i32, @intCast(x_stride)));
+        a.add(@as(i32, @intCast(if (gate) slots else 0)));
+        a.add(if (gate) l.up else l.down);
+        a.add(@as(i32, @intCast(k / 32)));
+        a.add(@as(i32, @intCast(nb)));
+        for ([_]u64{ p.items, p.counts, p.members, out }) |v| a.add(v);
+        a.add(@as(i32, @intCast(n)));
+        a.add(caps[0]);
+        a.add(caps[1]);
+        a.add(skip);
+        try launch_.launch(e.fns[fi], .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 128 } }, s, &a);
     }
 
     /// The entry a call takes, or the refusal: prompt rows have no fp32 down.

@@ -171,7 +171,7 @@ test "structure field: each structured-output body field reaches the engine by i
         compile.kind = -1;
         var cx: errors.Cx = .{ .a = g };
         var request: api.Request = .{ .prompt = &.{1}, .max_tokens = 64 };
-        try srv.checkFeatures(&cx, try value(g, c.body), false, false, &.{1}, &.{}, &request);
+        try srv.checkFeatures(&cx, try value(g, c.body), false, false, false, &.{1}, &.{}, &request);
         const structure = request.structure orelse return error.TestExpectedStructure;
         try std.testing.expectEqualStrings(c.kind, @tagName(structure.kind));
         try std.testing.expectEqualStrings(c.field, structure.field);
@@ -193,7 +193,7 @@ test "structure field: a plain request keeps no structure" {
     srv.grammars = &compiler;
     var cx: errors.Cx = .{ .a = g };
     var request: api.Request = .{ .prompt = &.{1}, .max_tokens = 64 };
-    try srv.checkFeatures(&cx, try value(g, "{}"), false, false, &.{1}, &.{}, &request);
+    try srv.checkFeatures(&cx, try value(g, "{}"), false, false, false, &.{1}, &.{}, &request);
     try std.testing.expect(request.structure == null);
 }
 
@@ -212,7 +212,7 @@ test "structure field: a required tool call names tool_choice" {
     var cx: errors.Cx = .{ .a = g };
     var request: api.Request = .{ .prompt = &.{1}, .max_tokens = 200 };
     const offered = (try value(g, specs)).array;
-    try srv.checkFeatures(&cx, try value(g, "{\"tool_call_required\":true}"), true, false, &.{1}, offered, &request);
+    try srv.checkFeatures(&cx, try value(g, "{\"tool_call_required\":true}"), true, false, false, &.{1}, offered, &request);
     const structure = request.structure orelse return error.TestExpectedStructure;
     try std.testing.expectEqualStrings("structural_tag", @tagName(structure.kind));
     try std.testing.expectEqualStrings("tool_choice", structure.field);
@@ -233,7 +233,7 @@ test "structure field: strict tools under auto name tool_choice" {
     var cx: errors.Cx = .{ .a = g };
     var request: api.Request = .{ .prompt = &.{1}, .max_tokens = 200 };
     const strict_tools = (try value(g, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"strict\":true,\"parameters\":{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}},\"required\":[\"q\"]}}}]")).array;
-    try srv.checkFeatures(&cx, try value(g, "{}"), true, false, &.{1}, strict_tools, &request);
+    try srv.checkFeatures(&cx, try value(g, "{}"), true, false, false, &.{1}, strict_tools, &request);
     const structure = request.structure orelse return error.TestExpectedStructure;
     try std.testing.expectEqualStrings("structural_tag", @tagName(structure.kind));
     try std.testing.expectEqualStrings("tool_choice", structure.field);
@@ -250,7 +250,7 @@ test "structure field: the refusal still names the backend" {
     srv.info.structures = true;
     var cx: errors.Cx = .{ .a = g };
     var request: api.Request = .{ .prompt = &.{1}, .max_tokens = 200 };
-    try std.testing.expectError(error.Refused, srv.checkFeatures(&cx, try value(g, "{\"tool_call_required\":true}"), true, false, &.{1}, (try value(g, specs)).array, &request));
+    try std.testing.expectError(error.Refused, srv.checkFeatures(&cx, try value(g, "{\"tool_call_required\":true}"), true, false, false, &.{1}, (try value(g, specs)).array, &request));
     try std.testing.expect(std.mem.indexOf(u8, cx.message, "tool_choice \"required\" or a named function on backend 'qwen27'") != null);
     try std.testing.expectEqual(@as(u16, 400), cx.status());
 }
@@ -279,7 +279,7 @@ test "structure field: a Responses text.format reaches the engine as its own nam
     var input = try openai.chatInput(srv, &cx, r.chat);
     input.format = r.format;
     var request: api.Request = .{ .prompt = &.{1}, .max_tokens = 64 };
-    try srv.checkFeatures(&cx, input.fields, input.tools.len > 0, false, &.{1}, input.tools, &request);
+    try srv.checkFeatures(&cx, input.fields, input.tools.len > 0, false, false, &.{1}, input.tools, &request);
     nameStructure(input.format, &request);
     const structure = request.structure orelse return error.TestExpectedStructure;
     try std.testing.expectEqualStrings("text.format", structure.field);
@@ -306,7 +306,7 @@ test "structure field: a Messages output_config.format reaches the engine as its
     var input = try openai.chatInput(srv, &cx, chat_body);
     input.format = name;
     var request: api.Request = .{ .prompt = &.{1}, .max_tokens = 64 };
-    try srv.checkFeatures(&cx, input.fields, input.tools.len > 0, false, &.{1}, input.tools, &request);
+    try srv.checkFeatures(&cx, input.fields, input.tools.len > 0, false, false, &.{1}, input.tools, &request);
     nameStructure(input.format, &request);
     const structure = request.structure orelse return error.TestExpectedStructure;
     try std.testing.expectEqualStrings("output_config.format", structure.field);

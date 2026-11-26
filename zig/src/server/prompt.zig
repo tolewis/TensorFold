@@ -53,6 +53,7 @@ pub fn renderStarts(srv: *Server, cx: *Cx, messages: Value, tools: []const Value
         .clear_thinking = cx.clear_thinking,
         .tool_choice = cx.template_fields.get("tool_choice"),
         .response_format = cx.template_fields.get("response_format"),
+        .tool_instruction = if (srv.text.vtable.format == .inkling) try @import("inkling_structure.zig").instructionOf(cx.a, cx.template_fields) else null,
         .images = srv.info.vision != null,
     };
     const rendered = render(srv, cx.a, normalized, options, &problem, starts) catch |e| switch (e) {

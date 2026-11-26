@@ -102,6 +102,11 @@ pub fn autoWanted(tools: []const Value, all: bool) bool {
 }
 
 /// OpenAI's function.strict (or a bare tool's strict) is true.
+/// Whether the tool asks for strict arguments (inkling_structure.zig's call blocks too).
+pub fn isStrict(tool: Value) bool {
+    return strict(tool);
+}
+
 fn strict(tool: Value) bool {
     const function = if (tool.get("function")) |f| (if (f == .object) f else tool) else tool;
     const s = function.get("strict") orelse return false;
@@ -223,6 +228,10 @@ fn call(a: Allocator, s: Style, name: []const u8, schema: Value) Allocator.Error
         }),
     };
     return node(a, "sequence", &.{.{ "elements", elements }});
+}
+
+pub fn parametersOf(a: Allocator, tool: Value) Allocator.Error!Value {
+    return parameters(a, tool);
 }
 
 /// The tool's parameter schema (OpenAI's function.parameters, a bare tool's parameters or input_schema).

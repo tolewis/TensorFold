@@ -84,6 +84,89 @@ pub const Config = struct {
 
 /// cuLaunchKernel for plain launches, cuLaunchKernelEx when a cluster, PDL or cooperative attribute is set.
 pub fn launch(f: Function, cfg: Config, stream: Stream, args: *Args) Error!void {
+    if (prof.on()) return prof.timed(f, cfg, stream, args);
+    return launchRaw(f, cfg, stream, args);
+}
+
+/// TF_KPROF=1: every uncaptured launch is bracketed by events; per-kernel totals print every TF_KPROF_EVERY launches.
+/// Debug-only timing (adds event records between kernels); run with TF_INKLING2_GRAPHS=0 to time decode.
+pub const prof = struct {
+    const cap = 8192;
+    var state: enum(u8) { unknown, off, enabled } = .unknown;
+    var evs: [cap * 2]abi.Event = @splat(null);
+    var funcs: [cap]abi.Function = undefined;
+    var n: usize = 0;
+    var made: usize = 0;
+    var every: usize = 20000;
+    var seen: usize = 0;
+    const Agg = struct { f: abi.Function, ms: f64 = 0, calls: u64 = 0 };
+    var aggs: [512]Agg = undefined;
+    var n_aggs: usize = 0;
+
+    pub fn on() bool {
+        if (state == .unknown) {
+            state = .off;
+            if (std.c.getenv("TF_KPROF")) |v| if (v[0] == '1') {
+                state = .enabled;
+            };
+            if (std.c.getenv("TF_KPROF_EVERY")) |v| every = std.fmt.parseInt(usize, std.mem.span(v), 10) catch every;
+        }
+        return state == .enabled;
+    }
+
+    fn timed(f: Function, cfg: Config, stream: Stream, args: *Args) Error!void {
+        const d = f.d;
+        var cs: abi.CaptureStatus = .none;
+        _ = d.api.cuStreamIsCapturing(stream.handle, &cs);
+        if (cs != .none) return launchRaw(f, cfg, stream, args);
+        if (n == cap) flush(d);
+        while (made < 2 * n + 2) : (made += 1) _ = d.api.cuEventCreate(&evs[made], 0);
+        _ = d.api.cuEventRecord(evs[2 * n], stream.handle);
+        try launchRaw(f, cfg, stream, args);
+        _ = d.api.cuEventRecord(evs[2 * n + 1], stream.handle);
+        funcs[n] = f.handle;
+        n += 1;
+        seen += 1;
+        if (seen % every == 0) {
+            flush(d);
+            report(d);
+        }
+    }
+
+    fn flush(d: *const driver.Driver) void {
+        if (n == 0) return;
+        _ = d.api.cuEventSynchronize(evs[2 * n - 1]);
+        for (0..n) |i| {
+            var ms: f32 = 0;
+            _ = d.api.cuEventElapsedTime(&ms, evs[2 * i], evs[2 * i + 1]);
+            var j: usize = 0;
+            while (j < n_aggs and aggs[j].f != funcs[i]) j += 1;
+            if (j == n_aggs) {
+                if (n_aggs == aggs.len) continue;
+                aggs[j] = .{ .f = funcs[i] };
+                n_aggs += 1;
+            }
+            aggs[j].ms += ms;
+            aggs[j].calls += 1;
+        }
+        n = 0;
+    }
+
+    fn report(d: *const driver.Driver) void {
+        std.mem.sort(Agg, aggs[0..n_aggs], {}, struct {
+            fn lt(_: void, a: Agg, b: Agg) bool {
+                return a.ms > b.ms;
+            }
+        }.lt);
+        var total: f64 = 0;
+        for (aggs[0..n_aggs]) |a| total += a.ms;
+        std.debug.print("[kprof] {d} launches, {d:.1} ms in kernels\n", .{ seen, total });
+        for (aggs[0..n_aggs]) |a| std.debug.print("[kprof] {d:9.2} ms {d:5.1}% {d:8} calls {d:8.2} us/call  {s}\n", .{ a.ms, 100 * a.ms / total, a.calls, 1000 * a.ms / @as(f64, @floatFromInt(a.calls)), d.functionName(a.f) });
+        n_aggs = 0;
+    }
+};
+
+fn launchRaw(f: Function, cfg: Config, stream: Stream, args: *Args) Error!void {
     try cfg.validate();
     const d = f.d;
     const g = cfg.grid;

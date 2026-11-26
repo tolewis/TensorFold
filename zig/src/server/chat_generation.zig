@@ -61,6 +61,7 @@ pub const Generation = struct {
     collected: std.ArrayList(u32) = .empty,
     visible: reply_text.Incremental = .{},
     kimi: ?@import("kimi_reply.zig").Stream = null,
+    inkling: ?@import("inkling_reply.zig").Stream = null,
     hidden: std.ArrayList(u8) = .empty, // reused for the answer without its call blocks
     streamed: reply_text.Shown = .{}, // what content streamed, kept apart from the decode buffer that grows under slices
     streamed_reasoning: reply_text.Shown = .{},
@@ -152,6 +153,7 @@ pub const Generation = struct {
         const all = try g.visible.extend(g.a, g.srv.text, reply_text.decodeText, fresh.items);
         if (g.visible.pending()) return; // a character still split across tokens
         if (g.srv.text.vtable.format == .kimi) return @import("chat_kimi.zig").stream(g, sink);
+        if (g.srv.text.vtable.format == .inkling) return @import("chat_inkling.zig").stream(g, sink);
         const raw_visible = g.stops.visible(all, true);
         const text = try @import("tool_minimax.zig").dsml(g.a, raw_visible, g.tools); // MiniMax-M3's calls as DSML
         var answer = text;
@@ -176,7 +178,7 @@ pub const Generation = struct {
         const rows = if (live) |l| try l.settle(g.srv, g.a, g.collected.items[0..l.spelled.ends.items.len], g.thinking, g.stops, g.streamed.text.items, g.streamed_reasoning.text.items) else null;
         const thought_rows = if (rows) |r| r.get("reasoning_content") else null;
         if (thought.len > 0 or thought_rows != null) {
-            const d: Value = if (thought.len > 0) try deltaOf(g.a, "reasoning_content", thought) else .{ .object = try json.newObject(g.a) };
+            const d: Value = if (thought.len > 0) try @import("reply_text.zig").reasoningDelta(g.a, thought) else .{ .object = try json.newObject(g.a) };
             if (thought_rows != null) try putRows(g.a, d, rows.?, "reasoning_content");
             try g.emit(sink, d);
         }
@@ -310,7 +312,7 @@ pub const Generation = struct {
         const finished_ns = nowNs(g.srv.io);
         const content_tokens = if (g.ignore_eos) g.collected.items else reply_text.stripTrailing(g.collected.items, g.srv.eos);
         const raw = try g.srv.text.decode(a, content_tokens);
-        const native = if (g.srv.text.vtable.format == .kimi) try @import("chat_kimi.zig").read(g, content_tokens, true) else null;
+        const native = if (g.srv.text.vtable.format == .kimi) try @import("chat_kimi.zig").read(g, content_tokens, true) else if (g.srv.text.vtable.format == .inkling) try @import("chat_inkling.zig").read(g, content_tokens, true) else null;
         const raw_visible = g.stops.visible(raw, false);
         const visible = if (native) |n| n.content else try @import("tool_minimax.zig").dsml(a, raw_visible, g.tools);
         const close_at: ?reply_text.Close = if (native == null and g.thinking)
@@ -353,7 +355,7 @@ pub const Generation = struct {
         if (g.sink) |sink| {
             const thought = g.streamed_reasoning.text.items;
             if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)
-                try g.emit(sink, try deltaOf(a, "reasoning_content", r[thought.len..]));
+                try g.emit(sink, try @import("reply_text.zig").reasoningDelta(a, r[thought.len..]));
             const shown = if (g.calls != null) try tool_stream.endProse(a, content, if (read) content else text, g.tools, reason, g.single) else content;
             const sent = g.streamed.text.items;
             const rest = if (std.mem.startsWith(u8, shown, sent) and shown.len > sent.len) shown[sent.len..] else "";

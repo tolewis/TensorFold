@@ -472,7 +472,172 @@ __device__ __forceinline__ void prompt_body(const __nv_bfloat16* __restrict__ X,
   }
 }
 
+#if defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL)
+__device__ __forceinline__ void mma_mxfp8(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1,
+                                          uint32_t sfa, uint32_t sfb) {
+  const uint16_t z = 0;
+  asm volatile(
+      "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1),
+        "r"(sfa), "h"(z), "h"(z), "r"(sfb), "h"(z), "h"(z));
+}
+#else
+__device__ __forceinline__ void mma_mxfp8(float (&)[4], const uint32_t (&)[4], uint32_t, uint32_t, uint32_t,
+                                          uint32_t) {
+  __trap();
+}
+#endif
+
+// Pre-quantized MXFP8 prompt rows on Blackwell native MXFP8 block-scaled tensor cores (sm_120a / sm_121a).
+template <int M, int EPI, int RT, int CW>
+__device__ __forceinline__ void prompt_body_tc_q(const uint8_t* __restrict__ xc, const uint8_t* __restrict__ xsc,
+                                                 int x_stride, int slots, const uint4* __restrict__ W, int KG, int NB,
+                                                 const int* __restrict__ items, const int* __restrict__ counts,
+                                                 const int* __restrict__ members, void* __restrict__ out, int N,
+                                                 float cap0, float cap1, int skip) {
+  static_assert((PWARPS / CW) * RT * 16 == 64, "a prompt item holds 64 pairs");
+  __shared__ uint4 sw[PSTAGES][CW][M * MXB];
+  __shared__ uint4 sx[PSTAGES][64][2];
+  __shared__ uint8_t asc[PSTAGES][64];
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gq = lane >> 2, t = lane & 3;
+  const int cw = warp % CW, rw = warp / CW;
+  const int groups = NB / CW, units = __ldg(counts) * groups;
+  const int s_stride = x_stride >> 5;
+  for (int unit = blockIdx.x; unit < units; unit += gridDim.x) {
+    const int it = unit / groups, cg = unit - it * groups;
+    const int e = __ldg(items + 3 * it), first = __ldg(items + 3 * it + 1), cnt = __ldg(items + 3 * it + 2);
+    if (e == skip) continue;
+    const int cb = cg * CW + cw;
+    int pr0[RT], pr1[RT];
+    bool v0[RT], v1[RT];
+#pragma unroll
+    for (int r = 0; r < RT; ++r) {
+      const int r0 = (rw * RT + r) * 16;
+      v0[r] = r0 + gq < cnt;
+      v1[r] = r0 + gq + 8 < cnt;
+      pr0[r] = v0[r] ? __ldg(members + first + r0 + gq) : 0;
+      pr1[r] = v1[r] ? __ldg(members + first + r0 + gq + 8) : 0;
+    }
+    const int pr_c = __ldg(members + first + min(tid >> 1, cnt - 1));
+    const uint8_t* xrow = xc + (size_t)(slots ? pr_c / slots : pr_c) * x_stride + (tid & 1) * 16;
+    const uint8_t* srow = nullptr;
+    if (tid < 64) {
+      const int pr_s = __ldg(members + first + min(tid, cnt - 1));
+      srow = xsc + (size_t)(slots ? pr_s / slots : pr_s) * s_stride;
+    }
+    const uint4* base = W + ((size_t)e * NB + cg * CW) * (size_t)KG * (M * MXB);
+    auto stage = [&](int g) {
+      cp16(&sx[g % PSTAGES][tid >> 1][tid & 1], xrow + g * 32);
+      if (tid < 64) asc[g % PSTAGES][tid] = srow[g];
+      for (int i = tid; i < CW * M * MXB; i += PWARPS * 32) {
+        const int c = i / (M * MXB), j = i % (M * MXB);
+        cp16(&sw[g % PSTAGES][c][j], base + ((size_t)c * KG + g) * (M * MXB) + j);
+      }
+    };
+    __syncthreads();
+#pragma unroll
+    for (int g = 0; g < PSTAGES - 1; ++g) {
+      if (g < KG) stage(g);
+      cp_commit();
+    }
+    float acc[M][RT][NTW][4];
+#pragma unroll
+    for (int m = 0; m < M; ++m)
+#pragma unroll
+      for (int r = 0; r < RT; ++r)
+#pragma unroll
+        for (int j = 0; j < NTW; ++j) acc[m][r][j][0] = acc[m][r][j][1] = acc[m][r][j][2] = acc[m][r][j][3] = 0.f;
+    const bool live = rw * RT * 16 < cnt;
+    for (int g = 0; g < KG; ++g) {
+      cp_wait<PSTAGES - 2>();
+      __syncthreads();
+      if (g + PSTAGES - 1 < KG) stage(g + PSTAGES - 1);
+      cp_commit();
+      if (!live) continue;
+      const int sg = g % PSTAGES;
+      uint32_t a[RT][4];
+      uint32_t sfa[RT];
+#pragma unroll
+      for (int r = 0; r < RT; ++r) {
+        const int r0 = (rw * RT + r) * 16;
+        const uint32_t* p0 = reinterpret_cast<const uint32_t*>(&sx[sg][r0 + gq][0]);
+        const uint32_t* p1 = reinterpret_cast<const uint32_t*>(&sx[sg][r0 + gq + 8][0]);
+        a[r][0] = p0[t];
+        a[r][1] = p1[t];
+        a[r][2] = p0[4 + t];
+        a[r][3] = p1[4 + t];
+        sfa[r] = (lane & 1) ? static_cast<uint32_t>(asc[sg][r0 + gq + 8]) : static_cast<uint32_t>(asc[sg][r0 + gq]);
+      }
+#pragma unroll
+      for (int m = 0; m < M; ++m) {
+        const uint4 wv0 = sw[sg][cw][m * MXB + 2 * lane];
+        const uint4 wv1 = sw[sg][cw][m * MXB + 2 * lane + 1];
+        const uint32_t s4 = reinterpret_cast<const uint32_t*>(&sw[sg][cw][m * MXB + 64])[gq];
+#pragma unroll
+        for (int j = 0; j < NTW; ++j) {
+          const uint32_t b0 = comp(wv0, j), b1 = comp(wv1, j);
+          const uint32_t sfb = (s4 >> (8 * j)) & 0xFFu;
+#pragma unroll
+          for (int r = 0; r < RT; ++r) mma_mxfp8(acc[m][r][j], a[r], b0, b1, sfa[r], sfb);
+        }
+      }
+    }
+    cp_wait<0>();
+    if (live) {
+#pragma unroll
+      for (int r = 0; r < RT; ++r)
+        epilogue<EPI, M, RT>(acc, r, out, N, cb * COLS + 2 * t, pr0[r], pr1[r], v0[r], v1[r], cap0, cap1);
+    }
+  }
+}
+
 }  // namespace tf_mxfp8_experts
+
+// Pre-quantize BF16 rows [M, K] into E4M3 codes [M, K] and UE8M0 scales [M, K/32] (one thread per 32-value block).
+extern "C" __global__ void __launch_bounds__(256)
+    tf_mxfp8_quant_x(const __nv_bfloat16* __restrict__ X, int x_stride, int M, int K, uint8_t* __restrict__ codes,
+                     uint8_t* __restrict__ scales) {
+  const long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int kb = K >> 5;
+  if (idx >= static_cast<long long>(M) * kb) return;
+  const int row = static_cast<int>(idx / kb), blk = static_cast<int>(idx % kb);
+  const __nv_bfloat16* src = X + static_cast<size_t>(row) * x_stride + blk * 32;
+  float f[32];
+  float amax = 0.f;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const uint4 v = *reinterpret_cast<const uint4*>(src + i * 8);
+    const __nv_bfloat162* p = reinterpret_cast<const __nv_bfloat162*>(&v);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float2 ab = __bfloat1622float2(p[j]);
+      f[i * 8 + 2 * j] = ab.x;
+      f[i * 8 + 2 * j + 1] = ab.y;
+      amax = fmaxf(amax, fmaxf(fabsf(ab.x), fabsf(ab.y)));
+    }
+  }
+  uint32_t ue = 127u;
+  float inv = 1.f;
+  if (amax > 0.f) {
+    const uint32_t u = __float_as_uint(amax * (1.f / 448.f));
+    ue = ((u >> 23) & 0xFFu) + ((u & 0x7FFFFFu) != 0u ? 1u : 0u);
+    if (ue < 1u) ue = 1u;
+    if (ue > 254u) ue = 254u;
+    inv = __uint_as_float((254u - ue) << 23);
+  }
+  scales[static_cast<size_t>(row) * kb + blk] = static_cast<uint8_t>(ue);
+  uint32_t* dst = reinterpret_cast<uint32_t*>(codes + static_cast<size_t>(row) * K + blk * 32);
+#pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    const uint32_t b0 = __nv_cvt_float_to_fp8(f[4 * k + 0] * inv, __NV_SATFINITE, __NV_E4M3);
+    const uint32_t b1 = __nv_cvt_float_to_fp8(f[4 * k + 1] * inv, __NV_SATFINITE, __NV_E4M3);
+    const uint32_t b2 = __nv_cvt_float_to_fp8(f[4 * k + 2] * inv, __NV_SATFINITE, __NV_E4M3);
+    const uint32_t b3 = __nv_cvt_float_to_fp8(f[4 * k + 3] * inv, __NV_SATFINITE, __NV_E4M3);
+    dst[k] = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+  }
+}
 
 // The MXFP8 entries (cap0, cap1: the gate's and the up's caps; the downs ignore them), 128 threads each.
 #define TF_MX_ENTRY(NAME, BODY)                                                                                     \
@@ -488,3 +653,14 @@ TF_MX_ENTRY(tf_mxfp8_down_f32, decode_body<TF_MX_ARGS(1, 0)>)
 TF_MX_ENTRY(tf_mxfp8_down_bf16, decode_body<TF_MX_ARGS(1, 3)>)
 TF_MX_ENTRY(tf_mxfp8_prompt_softcap, prompt_body<TF_MX_ARGS(2, 4, 2, 2)>)
 TF_MX_ENTRY(tf_mxfp8_prompt_down, prompt_body<TF_MX_ARGS(1, 3, 4, 4)>)
+
+#define TF_MX_TCQ(NAME, BODY)                                                                                        \
+  extern "C" __global__ void __launch_bounds__(128)                                                                  \
+      NAME(const uint8_t* __restrict__ xc, const uint8_t* __restrict__ xsc, int x_stride, int slots,                 \
+           const uint4* __restrict__ W, int KG, int NB, const int* __restrict__ items,                               \
+           const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out, int N,           \
+           float cap0, float cap1, int skip) {                                                                       \
+    tf_mxfp8_experts::BODY(xc, xsc, x_stride, slots, W, KG, NB, items, counts, members, out, N, cap0, cap1, skip);  \
+  }
+TF_MX_TCQ(tf_mxfp8_prompt_softcap_tc_q, prompt_body_tc_q<TF_MX_ARGS(2, 4, 2, 2)>)
+TF_MX_TCQ(tf_mxfp8_prompt_down_tc_q, prompt_body_tc_q<TF_MX_ARGS(1, 3, 4, 4)>)

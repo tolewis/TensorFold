@@ -17,8 +17,9 @@ pub fn tail(window: usize, at: usize) usize {
     return @min(at, window - 1);
 }
 
+/// A cached position's bytes a key head: bf16 rows, or fp8 codes (their scale copied beside them).
 fn rowBytes(m: *const mm.Model) usize {
-    return @as(usize, m.c.local.dim) * 2;
+    return @as(usize, m.c.local.dim) * @as(usize, if (m.kv8) 1 else 2);
 }
 
 fn convWidth(m: *const mm.Model, site: mm.Site) usize {
@@ -26,7 +27,7 @@ fn convWidth(m: *const mm.Model, site: mm.Site) usize {
 }
 
 /// Each copy of `slot`'s state at `at`, in order: per visit K then V, each head's kept positions in runs of
-/// consecutive ring rows; then the visit's four conv states ([3][C] fp32).
+/// consecutive ring rows (fp8 caches: each run's codes, then its scales); then the visit's four conv states.
 pub fn each(m: *const mm.Model, slot: usize, at: usize, ctx: anytype, comptime f: fn (@TypeOf(ctx), dev: u64, off: usize, len: usize) anyerror!void) !void {
     const rb = rowBytes(m);
     const kvh: usize = m.c.local.kv;
@@ -43,6 +44,11 @@ pub fn each(m: *const mm.Model, slot: usize, at: usize, ctx: anytype, comptime f
                 const run = @min(at - p, len - row);
                 try f(ctx, base + row * rb, off, run * rb);
                 off += run * rb;
+                if (m.kv8) { // the run's scales: an fp32 a position, [slots][kv][len] as the codes
+                    const sb = m.kvs[side][v] + ((slot * kvh + h) * len + row) * 4;
+                    try f(ctx, sb, off, run * 4);
+                    off += run * 4;
+                }
                 p += run;
             }
         };

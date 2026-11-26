@@ -10,6 +10,7 @@ const messages = @import("messages.zig");
 const tool_specs = @import("tool_specs.zig");
 const tool_parse = @import("tool_parse.zig");
 const tool_stream = @import("tool_stream.zig");
+const tool_guard = @import("tool_guard.zig");
 const token_stream = @import("token_stream.zig");
 const ids = @import("ids.zig");
 const log = @import("log.zig");
@@ -108,7 +109,7 @@ pub fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value, format: ?[]const u
     const exact_bytes = asked and try @import("logprobs.zig").offered(srv, cx.a);
     const logprobs = if (is_chat) try fields.probabilityOptions(cx, body, exact_bytes) else try fields.legacyLogprobs(cx, body, exact_bytes);
     if (!cx.skip_request_log) if (srv.config.request_log) |path| request_log.append(cx.a, path, body);
-    var input: chat.Input = .{ .fields = undefined, .format = format, .execution_witness = try @import("witness_reply.zig").asked(srv, cx, body) };
+    var input: chat.Input = .{ .fields = undefined, .format = format, .chat_route = is_chat, .execution_witness = try @import("witness_reply.zig").asked(srv, cx, body) };
     if (is_chat) {
         input.messages = try messages.normalizeWith(cx, body.get("messages"), "system", srv.needs_user_after_tool, srv.media());
         input.tools = if (srv.text.native_deepseek) try @import("deepseek_request.zig").active(cx, body.get("tools"), body.get("tool_choice")) else try tool_specs.active(cx, body.get("tools"), body.get("tool_choice"));
@@ -134,6 +135,12 @@ pub fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value, format: ?[]const u
     try grammar.refusal(cx, body);
     if (input.tools.len > 0 and try tool_specs.choiceRequiresCall(cx.a, body.get("tool_choice"))) try sampling.put(cx.a, "tool_call_required", .{ .bool = true });
     if (body.field("parallel_tool_calls")) |p| if (p == .bool and !p.bool) try sampling.put(cx.a, "tool_call_single", .{ .bool = true });
+    if (is_chat and srv.text.vtable.format == .inkling) {
+        const inkling_structure = @import("inkling_structure.zig");
+        const p = body.field("parallel_tool_calls");
+        if (input.tools.len > 0) if (try inkling_structure.instruction(cx.a, body.get("tool_choice"), !(p != null and p.? == .bool and !p.?.bool))) |text|
+            try sampling.put(cx.a, inkling_structure.instruction_field, .{ .string = text });
+    }
     const thinking = try fields.thinkingFields(cx, body, srv.effort_levels);
     if (thinking.effort) |e| try sampling.put(cx.a, "reasoning_effort", .{ .string = e });
     if (thinking.enable) |on| try sampling.put(cx.a, "enable_thinking", .{ .bool = on });
@@ -148,6 +155,11 @@ pub fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value, format: ?[]const u
         if (p != .bool) return cx.refuse("parallel_tool_calls must be a boolean");
         policy.single = !p.bool;
     }
+    // TF_TOOL_CALL_GUARD: no tools offered, but the history called them
+    if (is_chat and input.tools.len == 0 and tool_guard.on() and tool_guard.usedTools(input.messages)) {
+        input.messages = try tool_guard.withNote(cx.a, input.messages);
+        policy.guard = true;
+    } else if (is_chat and input.tools.len > 0 and tool_guard.on()) policy.drop_rejected = true;
     const options = body.get("stream_options");
     return .{
         .input = input,
@@ -350,7 +362,7 @@ pub const Run = struct {
             const message = try json.newObject(a);
             try message.put(a, "role", .{ .string = "assistant" });
             try message.put(a, "content", if (calls != null and reply.content.len == 0) .null else .{ .string = reply.content });
-            if (reply.reasoning) |t| if (t.len > 0) try message.put(a, "reasoning_content", .{ .string = t });
+            if (reply.reasoning) |t| if (t.len > 0) try @import("reply_text.zig").putReasoning(a, message, t);
             if (calls) |c| try message.put(a, "tool_calls", .{ .array = c });
             try choice.put(a, "message", .{ .object = message });
             try choice.put(a, "finish_reason", .{ .string = reply.finish_reason });
@@ -395,6 +407,10 @@ pub const Run = struct {
             if (!s.tools) {
                 // completions stream text only, with its logprob rows when asked
                 if (!r.is_chat and delta != .string and (delta != .object or delta.object.get("content") == null)) return;
+                if (r.plan.policy.guard) {
+                    const d = (r.policyDelta(delta) catch return error.Closed) orelse return;
+                    return r.emit(r.chunk(d, null) catch return error.Closed);
+                }
                 return r.emit(r.chunk(delta, null) catch return error.Closed);
             }
             @import("openai_calls.zig").streamed(r, delta) catch return error.Closed;
@@ -408,7 +424,7 @@ pub const Run = struct {
 
     /// The one-call policy on a streamed delta: text filtered, tool_calls dropped; null when nothing is left.
     fn policyDelta(r: *Run, delta: Value) Allocator.Error!?Value {
-        if (!r.plan.policy.single) return if (delta.truthy()) delta else null;
+        if (!r.plan.policy.filtering()) return if (delta.truthy()) delta else null;
         if (delta == .string) {
             const t = try r.plan.policy.text(r.a, delta.string);
             return if (t.len > 0) Value{ .string = t } else null;
@@ -513,6 +529,10 @@ pub const Run = struct {
             } else if (r.plan.policy.kept(reply.content, r.prose_sent.items)) |rest| {
                 r.emit(r.chunk(.{ .string = rest }, null) catch return) catch return;
             }
+        } else if (r.plan.policy.guard) {
+            const tail = r.plan.policy.flush();
+            if (tail.len > 0) r.emit(r.chunk(.{ .string = tail }, null) catch return) catch return;
+            if (r.plan.policy.filter.hid) log.line("tool-call guard: hid call markup from {s}, a streamed reply to a request without tools", .{r.id});
         }
         @import("logprobs.zig").project(r.srv, &cx, &reply, r.plan.input.tools, calls) catch |e| return r.streamFailed(if (e == error.Refused) cx.message else "out of memory");
         // the entries no chunk carried yet, once the stop and tool policies are final

@@ -25,7 +25,7 @@ pub const Rig = struct {
         errdefer r.k.deinit();
         r.s = try cuda.Stream.init(gpu.d, false);
         errdefer r.s.deinit();
-        r.m = try mm.Model.init(gpu.gpa, gpu.d, r.s, &r.w, &r.k, context, slots);
+        r.m = try mm.Model.init(gpu.gpa, gpu.d, r.s, &r.w, &r.k, context, slots, false);
     }
 
     pub fn deinit(r: *Rig) void {

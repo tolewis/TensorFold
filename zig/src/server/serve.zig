@@ -149,6 +149,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         std.debug.print("tensorfold: {s}\n", .{if (problem.len > 0) problem else "API key file cannot be opened safely"});
         return 1;
     };
+    store.dashboard_open = args.dashboard_open;
     defer store.deinit();
     if (witness.refusal(args, store.enabled())) |why| {
         std.debug.print("tensorfold: {s}\n", .{why});

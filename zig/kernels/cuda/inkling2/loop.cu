@@ -47,11 +47,24 @@ struct LoopMixArgs {
 };
 
 // Per row: each source's 1/rms, each query's softmax over (q . source) / rms * scale, then the fp32 mixes.
-extern "C" __global__ void __launch_bounds__(kThreads) tf_ink2_loop_mix(const LoopMixArgs a) {
+__device__ __forceinline__ void loopMixRow(const LoopMixArgs& a, size_t row);
+
+extern "C" __global__ void __launch_bounds__(kThreads) tf_ink2_loop_mix(const LoopMixArgs a) { loopMixRow(a, blockIdx.x); }
+
+// tf_ink2_loop_mix for several layers at once (blockIdx.y): layer y's queries sit query_step bytes past layer 0's,
+// its output planes out_step floats past. Each (row, layer) block does exactly what tf_ink2_loop_mix's would.
+extern "C" __global__ void __launch_bounds__(kThreads) tf_ink2_loop_mix_layers(const LoopMixArgs a0, long long query_step, long long out_step) {
+    LoopMixArgs a = a0;
+    for (int q = 0; q < kMaxQueries; ++q)
+        if (a.query[q]) a.query[q] = reinterpret_cast<const float*>(reinterpret_cast<const char*>(a.query[q]) + blockIdx.y * query_step);
+    a.out = a.out + blockIdx.y * out_step;
+    loopMixRow(a, blockIdx.x);
+}
+
+__device__ __forceinline__ void loopMixRow(const LoopMixArgs& a, size_t row) {
     __shared__ float sh[kWarps];
     __shared__ float inv[kMaxBlocks + 1];
     __shared__ float coef[kMaxQueries][kMaxBlocks + 1];
-    const size_t row = blockIdx.x;
     const int H = a.H, S = a.n_blocks + 1;
     auto src = [&](int s, int i) -> float {
         if (s < a.n_blocks) return bf(a.blocks[s][row * H + i]);
@@ -179,4 +192,131 @@ extern "C" __global__ void __launch_bounds__(kThreads) tf_ink2_loop_gate_mix(con
     const float inv = rsqrtf(blockSum(ss, sh) / static_cast<float>(H) + a.eps);
     uint16_t* dst = a.out + g * a.out_stride + row * H;
     for (int i = threadIdx.x; i < H; i += kThreads) dst[i] = tobf(bf(a.norm[g][i]) * (ys[i] * inv));
+}
+
+// ---- Row-tiled, coalesced gates (bitwise the same as gate_down / gate_lin above: every output keeps its order). ----
+
+// The normed, bf16-rounded [state, message] inputs of gate_down, once per (row, gate): xs[g][row][2H] bf16 into `xs`
+// (the ys scratch, free until gate_lin writes it). Same 256-thread strides and block sums as gate_down.
+extern "C" __global__ void __launch_bounds__(kThreads) tf_ink2_loop_gate_prep(const LoopGateArgs a, uint16_t* xs) {
+    __shared__ float sh[kWarps];
+    const size_t row = blockIdx.x;
+    const int g = blockIdx.y, H = a.H;
+    const float* h = a.h[g] + row * H;
+    const float* m = a.msg + a.slot[g] * a.msg_stride + row * H;
+    float sh_acc = 0.0f, sm_acc = 0.0f;
+    for (int i = threadIdx.x; i < H; i += kThreads) {
+        sh_acc = fmaf(h[i], h[i], sh_acc);
+        sm_acc = fmaf(m[i], m[i], sm_acc);
+    }
+    const float ih = rsqrtf(blockSum(sh_acc, sh) / static_cast<float>(H) + a.eps_unit);
+    const float im = rsqrtf(blockSum(sm_acc, sh) / static_cast<float>(H) + a.eps_unit);
+    uint16_t* dst = xs + (static_cast<size_t>(g) * a.rows + row) * 2 * H;
+    for (int i = threadIdx.x; i < H; i += kThreads) {
+        dst[i] = tobf(h[i] * ih);
+        dst[H + i] = tobf(m[i] * im);
+    }
+}
+
+// down for a tile of kDR rows: warp w owns rank rows [8 w, 8 w + 8); lane l accumulates i = l + 32 k over 2H in ascending
+// order as gate_down's warps do (chunks of kDC staged in shared memory with 16-byte loads), then the same XOR tree.
+constexpr int kDR = 8;
+constexpr int kDK = 8;
+constexpr int kDC = 256;
+extern "C" __global__ void __launch_bounds__(kThreads) tf_ink2_loop_gate_down_rows(const LoopGateArgs a, const uint16_t* xs) {
+    __shared__ __align__(16) uint16_t sx[kDR][kDC];
+    __shared__ __align__(16) uint16_t sw[kWarps * kDK][kDC];
+    const int g = blockIdx.y, H = a.H, R = a.rank, H2 = 2 * H;
+    const size_t row0 = static_cast<size_t>(blockIdx.x) * kDR;
+    const int nr = min(kDR, a.rows - static_cast<int>(row0));
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    const int rb = blockIdx.z * kWarps * kDK;  // the block's first rank
+    const int nrk = min(kWarps * kDK, R - rb);
+    float acc[kDK][kDR];
+#pragma unroll
+    for (int k = 0; k < kDK; ++k)
+#pragma unroll
+        for (int j = 0; j < kDR; ++j) acc[k][j] = 0.0f;
+    const uint16_t* x0 = xs + (static_cast<size_t>(g) * a.rows + row0) * H2;
+    const uint16_t* w0 = a.down_w[g] + static_cast<size_t>(rb) * H2;
+    constexpr int V = kDC / 8;  // uint4 per staged row
+    for (int c0 = 0; c0 < H2; c0 += kDC) {
+        __syncthreads();
+        for (int e = threadIdx.x; e < kDR * V; e += kThreads) {
+            const int j = e / V, v = e - j * V;
+            uint4 val = make_uint4(0, 0, 0, 0);
+            if (j < nr) val = *reinterpret_cast<const uint4*>(x0 + static_cast<size_t>(j) * H2 + c0 + v * 8);
+            *reinterpret_cast<uint4*>(&sx[j][v * 8]) = val;
+        }
+        for (int e = threadIdx.x; e < kWarps * kDK * V; e += kThreads) {
+            const int k = e / V, v = e - k * V;
+            uint4 val = make_uint4(0, 0, 0, 0);
+            if (k < nrk) val = *reinterpret_cast<const uint4*>(w0 + static_cast<size_t>(k) * H2 + c0 + v * 8);
+            *reinterpret_cast<uint4*>(&sw[k][v * 8]) = val;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int c = 0; c < kDC / 32; ++c) {
+            const int i = lane + 32 * c;
+            float xv[kDR];
+#pragma unroll
+            for (int j = 0; j < kDR; ++j) xv[j] = bf(sx[j][i]);
+#pragma unroll
+            for (int k = 0; k < kDK; ++k) {
+                const float wv = bf(sw[w * kDK + k][i]);
+#pragma unroll
+                for (int j = 0; j < kDR; ++j) acc[k][j] = fmaf(wv, xv[j], acc[k][j]);
+            }
+        }
+    }
+    const int r0 = rb + w * kDK;
+#pragma unroll
+    for (int k = 0; k < kDK; ++k)
+#pragma unroll
+        for (int j = 0; j < kDR; ++j) {
+            const float v = warpSum(acc[k][j]);
+            if (lane == 0 && r0 + k < R && j < nr) a.down[(static_cast<size_t>(g) * a.rows + row0 + j) * R + r0 + k] = tobf(v);
+        }
+}
+
+// gate_lin for a tile of kLR rows: thread t owns output i0 + t with its forget and gain rows in registers (R = 64 only),
+// the tile's down rows in shared memory; each output's ascending-rank chain per row, as gate_lin.
+constexpr int kLR = 64;
+constexpr int kLRank = 64;
+extern "C" __global__ void __launch_bounds__(kLin) tf_ink2_loop_gate_lin_rows(const LoopGateArgs a) {
+    __shared__ float dn[kLR][kLRank];
+    const int g = blockIdx.y, H = a.H;
+    const int i = blockIdx.z * kLin + threadIdx.x;
+    const size_t row0 = static_cast<size_t>(blockIdx.x) * kLR;
+    const int nr = min(kLR, a.rows - static_cast<int>(row0));
+    const uint16_t* dsrc = a.down + (static_cast<size_t>(g) * a.rows + row0) * kLRank;
+    for (int e = threadIdx.x; e < nr * kLRank; e += kLin) dn[e / kLRank][e % kLRank] = bf(dsrc[e]);
+    uint32_t wf[kLRank / 2], wg[kLRank / 2];
+    if (i < H) {
+        const uint4* pf = reinterpret_cast<const uint4*>(a.forget[g] + static_cast<size_t>(i) * kLRank);
+        const uint4* pg = reinterpret_cast<const uint4*>(a.gain[g] + static_cast<size_t>(i) * kLRank);
+#pragma unroll
+        for (int v = 0; v < kLRank / 8; ++v) {
+            const uint4 f = pf[v], q = pg[v];
+            wf[4 * v] = f.x; wf[4 * v + 1] = f.y; wf[4 * v + 2] = f.z; wf[4 * v + 3] = f.w;
+            wg[4 * v] = q.x; wg[4 * v + 1] = q.y; wg[4 * v + 2] = q.z; wg[4 * v + 3] = q.w;
+        }
+    }
+    __syncthreads();
+    if (i >= H) return;
+    for (int j = 0; j < nr; ++j) {
+        float f = 0.0f, gn = 0.0f;
+#pragma unroll
+        for (int r = 0; r < kLRank; ++r) {
+            const uint32_t pf = wf[r >> 1], pg = wg[r >> 1];
+            const float fw = (r & 1) ? __uint_as_float(pf & 0xFFFF0000u) : __uint_as_float(pf << 16);
+            const float gw = (r & 1) ? __uint_as_float(pg & 0xFFFF0000u) : __uint_as_float(pg << 16);
+            f = fmaf(fw, dn[j][r], f);
+            gn = fmaf(gw, dn[j][r], gn);
+        }
+        const size_t row = row0 + j;
+        const float* h = a.h[g] + row * H;
+        const float* m = a.msg + a.slot[g] * a.msg_stride + row * H;
+        a.ys[(static_cast<size_t>(g) * a.rows + row) * H + i] = (1.0f - tanhf(f)) * h[i] + tanhf(gn) * m[i];
+    }
 }

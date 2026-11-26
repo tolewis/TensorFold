@@ -20,6 +20,7 @@ const responses = @import("responses.zig");
 const grammar = @import("grammar.zig");
 const clock = @import("clock.zig");
 const tool_grammar = @import("tool_grammar.zig");
+const inkling_structure = @import("inkling_structure.zig");
 const chunk_plan = @import("chunk_plan.zig");
 const log = @import("log.zig");
 const live = @import("live.zig");
@@ -236,6 +237,9 @@ pub const Server = struct {
         const source = text.templateSource();
         srv.effort_levels = try fields.effortLevels(a, source);
         if (srv.recipients and srv.effort_levels.len > 0) srv.off_effort = fields.coerceEffort("minimal", srv.effort_levels);
+        // Inkling 2's template has no enable_thinking: thinking off is its lowest effort, "none" (0.0); left unset the
+        // template writes its default 0.9 and the model thinks at full effort whatever the request asked
+        if (text.vtable.format == .inkling and std.mem.indexOf(u8, source, "reasoning_effort") != null) srv.off_effort = "none";
         // MiniMax-M3's template decides on its own; thinking off closes the block in the prompt (prompt.zig)
         srv.thinking_switch = minimax or std.mem.indexOf(u8, source, "enable_thinking") != null or
             std.mem.indexOf(u8, source, "thinking_mode") != null;
@@ -348,23 +352,36 @@ pub const Server = struct {
     }
 
     /// The grammar a request asks for, or its refusal when the engine cannot enforce it.
-    pub fn checkFeatures(srv: *Server, cx: *Cx, f: Value, has_tools: bool, thinking: bool, prompt_ids: []const u32, tools: []const Value, request: *api.Request) errors.Refused!void {
+    pub fn checkFeatures(srv: *Server, cx: *Cx, f: Value, has_tools: bool, thinking: bool, chat: bool, prompt_ids: []const u32, tools: []const Value, request: *api.Request) errors.Refused!void {
         _ = prompt_ids;
         errdefer srv.release(false, request.*); // a refused request frees what it compiled here
         const required = if (f.get("tool_call_required")) |r| r.truthy() else false;
         const one_call = if (f.get("tool_call_single")) |x| x.truthy() else false;
         const all = has_tools and !required and (tool_grammar.autoAllEnv() catch return cx.fail(.server, "invalid TF_DSV41_TOOL_GRAMMAR: expected 0 or 1", .{}));
+        // Inkling 2's chat replies are blocks: its grammars frame the payload in them, from the reply's first token
+        const inkling = srv.text.vtable.format == .inkling;
+        const inkling_chat = inkling and chat;
         if (has_tools and required) {
             if (!srv.info.capability(.structures)) return cx.fail(.request, "backend '{s}' cannot enforce tool_choice \"required\" or a named function: it has no token grammar support; send \"auto\" or \"none\"", .{srv.backendName()});
-            request.structure = try tool_grammar.structure(srv, cx, tools, !one_call, thinking);
-        } else if (has_tools and srv.info.capability(.structures) and tool_grammar.autoWanted(tools, all) and srv.grammarCompiler() != null) {
+            if (inkling) {
+                const text = try inkling_structure.calls(srv, cx, tools, !one_call, true);
+                if (text.len > grammar.max_text) return cx.fail(.request, "tools: the tools' names and schemas make a {d}-byte grammar, more than the {d} KiB a grammar may be", .{ text.len, grammar.max_text / 1024 });
+                const reason = try std.fmt.allocPrint(cx.a, "tool_choice \"required\" or a named function on backend '{s}'", .{srv.backendName()});
+                var st = try srv.compiledStructure(cx, .structural_tag, text, reason, false);
+                st.field = "tool_choice";
+                request.structure = st;
+            } else request.structure = try tool_grammar.structure(srv, cx, tools, !one_call, thinking);
+        } else if (!inkling and has_tools and srv.info.capability(.structures) and tool_grammar.autoWanted(tools, all) and srv.grammarCompiler() != null) {
             // auto with a strict tool (any, TENSORFOLD_TOOL_GRAMMAR=1): text or calls; no grammar library, no grammar
             request.structure = try tool_grammar.optionalStructure(srv, cx, tools, all, !one_call, thinking);
         }
         if (try grammar.spec(cx, f)) |s| {
             if (!srv.info.capability(.structures)) return cx.refuse("structured output (response_format and the guided_* fields) is not supported by this engine yet");
             if (s.text.len > grammar.max_text) return cx.fail(.request, "{s}: the grammar is {d} bytes, more than the {d} KiB a grammar may be", .{ s.field, s.text.len, grammar.max_text / 1024 });
-            const st = try srv.compiledStructure(cx, s.kind, s.text, s.field, thinking);
+            const st = if (inkling_chat and s.kind != .structural_tag)
+                try srv.compiledStructure(cx, .structural_tag, try inkling_structure.framed(srv, cx, s), s.field, false)
+            else
+                try srv.compiledStructure(cx, s.kind, s.text, s.field, thinking and !inkling_chat);
             if (request.structure) |tool| tool.free();
             request.structure = st;
         }
@@ -513,7 +530,7 @@ pub const Server = struct {
             conn.key_digest = m.digest;
             conn.key_scopes = m.scopes;
         }
-        if (!auth.gatedRequest(conn.method, conn.path, keys.metrics_open)) return true;
+        if (!auth.gatedRequestWith(conn.method, conn.path, keys.metrics_open, keys.dashboard_open)) return true;
         const path = auth.routePath(conn.path);
         // a Responses WebSocket upgrade opens with an inference key; the socket checks each response.create again
         const upgrade = @import("ws_upgrade.zig").requested(conn) and std.mem.eql(u8, responses.route(path) orelse "-", "");

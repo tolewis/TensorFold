@@ -49,6 +49,8 @@ pub const Input = struct {
     prompt_logprobs: ?u8 = null,
     /// The client's own name for the grammar field (text.format, output_config.format); null on chat and completions.
     format: ?[]const u8 = null,
+    /// POST /v1/chat/completions: Inkling 2 frames its grammars in reply blocks only on this route.
+    chat_route: bool = false,
     /// The encoded image bytes the request may send; chat's limits unless a route (OCR) sets its own.
     image_bytes: images.ByteLimits = .{},
     /// With a known window, the reply may fill all the room the prompt leaves; max_tokens otherwise.
@@ -213,7 +215,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         .images = rendered.images,
         .cache_key = rendered.cache_key,
     };
-    try srv.checkFeatures(cx, f, input.tools.len > 0, reasoning, rendered.ids, input.tools, &request);
+    try srv.checkFeatures(cx, f, input.tools.len > 0, reasoning, input.chat_route, rendered.ids, input.tools, &request);
     server_mod.nameStructure(input.format, &request);
     errdefer srv.release(false, request);
     if (reasoning) {

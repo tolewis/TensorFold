@@ -105,14 +105,14 @@ test "required tools: unsupported required tools name the actual backend before 
     const f = try value(cx.a, "{\"tool_call_required\":true}");
     var request: api.Request = .{ .prompt = &.{1}, .max_tokens = 200 };
     const offered = (try value(cx.a, specs)).array;
-    try std.testing.expectError(error.Refused, srv.checkFeatures(&cx, f, true, false, &.{1}, offered, &request));
+    try std.testing.expectError(error.Refused, srv.checkFeatures(&cx, f, true, false, false, &.{1}, offered, &request));
     try std.testing.expectEqual(@as(u16, 400), cx.status());
     try std.testing.expect(std.mem.indexOf(u8, cx.message, "qwen27") != null);
     try std.testing.expect(std.mem.indexOf(u8, cx.message, "grammar") != null);
     try std.testing.expect(request.structure == null and request.call == null);
     srv.info.name = "lanes";
     srv.config.identity.backend = "cuda";
-    try std.testing.expectError(error.Refused, srv.checkFeatures(&cx, f, true, false, &.{1}, offered, &request));
+    try std.testing.expectError(error.Refused, srv.checkFeatures(&cx, f, true, false, false, &.{1}, offered, &request));
     try std.testing.expect(std.mem.indexOf(u8, cx.message, "cuda") != null);
 }
 
@@ -131,7 +131,7 @@ test "required tools: Gemma and unknown templates can constrain required calls o
         srv.grammars = &compiler;
         var cx: errors.Cx = .{ .a = g };
         var request: api.Request = .{ .prompt = &.{1}, .max_tokens = 200 };
-        try srv.checkFeatures(&cx, try value(g, "{\"tool_call_required\":true}"), true, false, &.{1}, (try value(g, specs)).array, &request);
+        try srv.checkFeatures(&cx, try value(g, "{\"tool_call_required\":true}"), true, false, false, &.{1}, (try value(g, specs)).array, &request);
         try std.testing.expect(request.structure != null);
     }
 }
@@ -152,7 +152,7 @@ test "required tools: an LFM2 template gets the Pythonic grammar, one call or se
         var cx: errors.Cx = .{ .a = g };
         const fields = try value(g, if (single) "{\"tool_call_required\":true,\"tool_call_single\":true}" else "{\"tool_call_required\":true}");
         var request: api.Request = .{ .prompt = &.{1}, .max_tokens = 200 };
-        try srv.checkFeatures(&cx, fields, true, false, &.{1}, (try value(g, specs)).array, &request);
+        try srv.checkFeatures(&cx, fields, true, false, false, &.{1}, (try value(g, specs)).array, &request);
         const structure = request.structure.?;
         try std.testing.expectEqualStrings("structural_tag", @tagName(structure.kind));
         const python = std.mem.indexOf(u8, structure.text, "<|tool_call_start|>") != null;
@@ -208,7 +208,7 @@ test "required tools: both routes parse required and named calls and enforce a c
         try std.testing.expect(input.fields.get("tool_call_required").?.truthy());
         try std.testing.expectEqual(@as(usize, if (named) 1 else 2), input.tools.len);
         var request: api.Request = .{ .prompt = &.{1}, .max_tokens = 512 };
-        try srv.checkFeatures(&cx, input.fields, true, false, &.{1}, input.tools, &request);
+        try srv.checkFeatures(&cx, input.fields, true, false, false, &.{1}, input.tools, &request);
         const structure = request.structure.?;
         const root = try value(g, structure.text);
         const format = root.get("format").?;
@@ -257,7 +257,7 @@ test "required tools: required without tools, unknown names and competing gramma
             const input = try openai.chatInput(srv, &cx, try body(&cx, response, choice));
             try std.testing.expect(input.fields.get("tool_call_required") == null);
             var request: api.Request = .{ .prompt = &.{1}, .max_tokens = 20 };
-            try srv.checkFeatures(&cx, input.fields, input.tools.len > 0, false, &.{1}, input.tools, &request);
+            try srv.checkFeatures(&cx, input.fields, input.tools.len > 0, false, false, &.{1}, input.tools, &request);
             try std.testing.expect(request.structure == null);
         }
     }
@@ -294,7 +294,7 @@ test "qwen27 tool calls: required and named calls use the masked lane fake throu
         try std.testing.expect(input.fields.get("tool_call_required").?.truthy());
         try std.testing.expectEqual(@as(usize, if (named) 1 else 2), input.tools.len);
         var request: api.Request = .{ .prompt = &.{1}, .max_tokens = 512 };
-        try srv.checkFeatures(&cx, input.fields, true, false, &.{1}, input.tools, &request);
+        try srv.checkFeatures(&cx, input.fields, true, false, false, &.{1}, input.tools, &request);
         const structure = request.structure.?;
         const root = try value(g, structure.text);
         const format = root.get("format").?;
@@ -340,7 +340,7 @@ test "a request's compiled grammar is kept for the engine, freed once at release
     var cx: errors.Cx = .{ .a = g };
     const offered = (try value(g, specs)).array;
     var one: api.Request = .{ .prompt = &.{1}, .max_tokens = 200 };
-    try srv.checkFeatures(&cx, try value(g, "{\"response_format\":{\"type\":\"json_object\"}}"), false, false, &.{1}, &.{}, &one);
+    try srv.checkFeatures(&cx, try value(g, "{\"response_format\":{\"type\":\"json_object\"}}"), false, false, false, &.{1}, &.{}, &one);
     try std.testing.expect(one.structure.?.compiled != null);
     try std.testing.expectEqual(@as(usize, 1), fake.compiles);
     try std.testing.expectEqual(@as(usize, 0), fake.frees);
@@ -349,7 +349,7 @@ test "a request's compiled grammar is kept for the engine, freed once at release
     // a required tool's grammar, then response_format's: the first is freed when the second replaces it
     var both: api.Request = .{ .prompt = &.{1}, .max_tokens = 200 };
     const fields = try value(g, "{\"tool_call_required\":true,\"response_format\":{\"type\":\"json_object\"}}");
-    try srv.checkFeatures(&cx, fields, true, false, &.{1}, offered, &both);
+    try srv.checkFeatures(&cx, fields, true, false, false, &.{1}, offered, &both);
     try std.testing.expectEqual(@as(usize, 3), fake.compiles);
     try std.testing.expectEqual(@as(usize, 2), fake.frees);
     srv.release(false, both);
@@ -357,7 +357,7 @@ test "a request's compiled grammar is kept for the engine, freed once at release
     // a refused second grammar frees the first
     var refused: api.Request = .{ .prompt = &.{1}, .max_tokens = 200 };
     const bad = try value(g, "{\"tool_call_required\":true,\"guided_regex\":\"bad\"}");
-    try std.testing.expectError(error.Refused, srv.checkFeatures(&cx, bad, true, false, &.{1}, offered, &refused));
+    try std.testing.expectError(error.Refused, srv.checkFeatures(&cx, bad, true, false, false, &.{1}, offered, &refused));
     try std.testing.expectEqual(@as(usize, 4), fake.compiles);
     try std.testing.expectEqual(@as(usize, 4), fake.frees);
 }
@@ -383,7 +383,7 @@ test "security: a grammar over the size limit is refused before the compiler see
         var cx: errors.Cx = .{ .a = g };
         var request: api.Request = .{ .prompt = &.{1}, .max_tokens = 64 };
         const fields = try value(g, try std.fmt.allocPrint(g, "{{\"guided_regex\":\"{s}\"}}", .{letters[0..len]}));
-        const result = srv.checkFeatures(&cx, fields, false, false, &.{1}, &.{}, &request);
+        const result = srv.checkFeatures(&cx, fields, false, false, false, &.{1}, &.{}, &request);
         if (len <= most) {
             try result;
             srv.release(false, request);
@@ -435,7 +435,7 @@ test "security: tools count once against the grammar size limit: 300 KiB of requ
         var cx: errors.Cx = .{ .a = g };
         var request: api.Request = .{ .prompt = &.{1}, .max_tokens = 64 };
         // parallel calls: the structural tag holds the call twice, for the first call and the further ones
-        const result = srv.checkFeatures(&cx, try value(g, "{\"tool_call_required\":true}"), true, false, &.{1}, offered, &request);
+        const result = srv.checkFeatures(&cx, try value(g, "{\"tool_call_required\":true}"), true, false, false, &.{1}, offered, &request);
         if (case.kib == 300) {
             try result;
             try std.testing.expect(request.structure.?.text.len > 2 * 300 * 1024); // over 512 KiB, and served
@@ -478,7 +478,7 @@ test "grammar_budget: a boolean that marks a covered grammar, refused when malfo
     for (cases) |c| {
         var cx: errors.Cx = .{ .a = g };
         var request: api.Request = .{ .prompt = &.{1}, .max_tokens = 64 };
-        const result = srv.checkFeatures(&cx, try value(g, c.fields), true, false, &.{1}, offered, &request);
+        const result = srv.checkFeatures(&cx, try value(g, c.fields), true, false, false, &.{1}, offered, &request);
         if (c.refusal.len > 0) { // a refusal frees what it compiled
             try std.testing.expectError(error.Refused, result);
             try std.testing.expect(std.mem.indexOf(u8, cx.message, c.refusal) != null);
@@ -493,7 +493,7 @@ test "grammar_budget: a boolean that marks a covered grammar, refused when malfo
         compiler.f.budget_ready = ready;
         var cx: errors.Cx = .{ .a = g };
         var request: api.Request = .{ .prompt = &.{1}, .max_tokens = 64 };
-        try std.testing.expectError(error.Refused, srv.checkFeatures(&cx, try value(g, cases[0].fields), true, false, &.{1}, offered, &request));
+        try std.testing.expectError(error.Refused, srv.checkFeatures(&cx, try value(g, cases[0].fields), true, false, false, &.{1}, offered, &request));
         try std.testing.expectEqual(@as(u16, 400), cx.status());
         try std.testing.expect(std.mem.indexOf(u8, cx.message, why) != null);
     }
@@ -516,7 +516,7 @@ test "auto tools: a strict tool gets the optional-call grammar, other auto reque
         srv.grammars = &compiler;
         var cx: errors.Cx = .{ .a = g };
         var request: api.Request = .{ .prompt = &.{1}, .max_tokens = 200 };
-        try srv.checkFeatures(&cx, try value(g, "{}"), true, false, &.{1}, (try value(g, offered)).array, &request);
+        try srv.checkFeatures(&cx, try value(g, "{}"), true, false, false, &.{1}, (try value(g, offered)).array, &request);
         if (std.mem.eql(u8, offered, specs) or form == .lfm2) {
             try std.testing.expect(request.structure == null);
             continue;
@@ -526,10 +526,10 @@ test "auto tools: a strict tool gets the optional-call grammar, other auto reque
         try std.testing.expect(!format.get("stop_after_first").?.bool);
         try std.testing.expect(std.mem.indexOf(u8, request.structure.?.text, "\"required\":[\"q\"]") != null);
         var single: api.Request = .{ .prompt = &.{1}, .max_tokens = 200 };
-        try srv.checkFeatures(&cx, try value(g, "{\"tool_call_single\":true}"), true, false, &.{1}, (try value(g, offered)).array, &single);
+        try srv.checkFeatures(&cx, try value(g, "{\"tool_call_single\":true}"), true, false, false, &.{1}, (try value(g, offered)).array, &single);
         try std.testing.expect((try value(g, single.structure.?.text)).get("format").?.get("stop_after_first").?.bool);
         var required: api.Request = .{ .prompt = &.{1}, .max_tokens = 200 };
-        try srv.checkFeatures(&cx, try value(g, "{\"tool_call_required\":true}"), true, false, &.{1}, (try value(g, offered)).array, &required);
+        try srv.checkFeatures(&cx, try value(g, "{\"tool_call_required\":true}"), true, false, false, &.{1}, (try value(g, offered)).array, &required);
         try std.testing.expectEqualStrings("sequence", (try value(g, required.structure.?.text)).get("format").?.strField("type").?);
     };
 }

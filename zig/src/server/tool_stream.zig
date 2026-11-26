@@ -451,4 +451,5 @@ const wrap = @import("tool_parse.zig").wrapCalls;
 
 test {
     _ = @import("tool_stream_test.zig");
+    _ = @import("tool_guard.zig");
 }

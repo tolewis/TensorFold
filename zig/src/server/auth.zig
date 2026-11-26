@@ -30,6 +30,7 @@ pub const Store = struct {
     static: std.ArrayList(Key) = .empty,
     path: ?[]const u8,
     metrics_open: bool,
+    dashboard_open: bool = false,
     mutex: std.Io.Mutex = .init,
     file: []Key = &.{},
     file_arena: ?std.heap.ArenaAllocator = null,
@@ -269,11 +270,16 @@ fn isSpace(cp: u21) bool {
     };
 }
 
-/// Every route needs a key except the explicit public page, health and opened metrics paths.
+/// Every route needs a key except the explicit public page, health and opened metrics/dashboard paths.
 pub fn gated(raw_path: []const u8, metrics_open: bool) bool {
+    return gatedWith(raw_path, metrics_open, false);
+}
+
+pub fn gatedWith(raw_path: []const u8, metrics_open: bool, dashboard_open: bool) bool {
     const path = routePath(raw_path);
     if (path.len == 0 or std.mem.eql(u8, path, "/health") or std.mem.eql(u8, path, "/slide") or publicAsset(path)) return false;
     if (metrics_open and (std.mem.eql(u8, path, "/metrics") or std.mem.eql(u8, path, "/v1/metrics") or std.mem.eql(u8, path, "/v1/load"))) return false;
+    if (dashboard_open and (std.mem.eql(u8, path, "/dashboard") or std.mem.eql(u8, path, "/stats"))) return false;
     return true;
 }
 
@@ -469,7 +475,11 @@ test {
 }
 
 pub fn gatedRequest(method: []const u8, raw_path: []const u8, metrics_open: bool) bool {
-    return !std.mem.eql(u8, method, "GET") or gated(raw_path, metrics_open);
+    return gatedRequestWith(method, raw_path, metrics_open, false);
+}
+
+pub fn gatedRequestWith(method: []const u8, raw_path: []const u8, metrics_open: bool, dashboard_open: bool) bool {
+    return !std.mem.eql(u8, method, "GET") or gatedWith(raw_path, metrics_open, dashboard_open);
 }
 
 fn publicAsset(path: []const u8) bool {

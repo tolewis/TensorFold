@@ -14,6 +14,8 @@ pub const RenderOptions = struct {
     clear_thinking: ?bool = null,
     tool_choice: ?json.Value = null,
     response_format: ?json.Value = null,
+    /// Inkling 2: vLLM's tool_choice sentence, added to message 0 (system or developer) or to the effort block.
+    tool_instruction: ?[]const u8 = null,
     /// The server serves images: native image parts may render.
     images: bool = false,
     /// Set to the byte where each message's own output starts (sorted); left empty by renderers that can't say.
@@ -150,8 +152,11 @@ pub const Text = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
 
+    /// How replies read: a chat template's markup, Kimi's XTML, or Inkling 2's blocks (chat_inkling.zig).
+    pub const Format = enum { template, kimi, inkling };
+
     pub const VTable = struct {
-        format: enum { template, kimi } = .template,
+        format: Format = .template,
         /// Ids of ``text``, special-token text included as its token; ``add_special`` adds what the tokenizer prepends.
         encode: *const fn (ctx: *anyopaque, a: Allocator, text: []const u8, add_special: bool) Error![]u32,
         /// UTF-8 of ``ids`` with special tokens; bytes ending mid-character decode as U+FFFD, as Python's replace does.

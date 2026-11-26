@@ -72,7 +72,10 @@ struct CompilerState {
     tfb::Cache budgets;
     tfc::Cache<xgrammar::CompiledGrammar> compiles;
     CompilerState(const xgrammar::TokenizerInfo& i, int v)
-        : info(i), compiler(i, 8, true, CACHE_BYTES), vocab(v), spell(spellings(i)), budgets(i) {}
+        // xgrammar's own compile cache stays off: v0.2.8 reuses a cached sub-grammar across different structural
+        // tags with token formats and hands the second one the first one's masks (Inkling 2's framed reply then a
+        // tool-call tag; fixed upstream in v0.2.9). `compiles` still caches whole grammars by their kind and text.
+        : info(i), compiler(i, 8, false, CACHE_BYTES), vocab(v), spell(spellings(i)), budgets(i) {}
 };
 
 struct Compiler {

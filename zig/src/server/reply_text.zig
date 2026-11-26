@@ -588,6 +588,35 @@ test "reply text: MiniMax-M3's call opener is watched for only under MiniMax-M3'
 }
 
 /// ``{key: text}``: a streamed delta (role, content or reasoning_content).
+/// TF_REASONING_FIELD: the reply field reasoning goes in. "reasoning_content" (default), "reasoning" (vLLM's
+/// reasoning parsers, e.g. Inkling's), or "both".
+pub const ReasoningField = enum { reasoning_content, reasoning, both };
+
+pub fn reasoningField() ReasoningField {
+    const S = struct {
+        var v: ?ReasoningField = null;
+    };
+    if (S.v == null) {
+        const e = if (std.c.getenv("TF_REASONING_FIELD")) |p| std.mem.span(p) else "";
+        S.v = if (std.mem.eql(u8, e, "reasoning")) .reasoning else if (std.mem.eql(u8, e, "both")) .both else .reasoning_content;
+    }
+    return S.v.?;
+}
+
+/// Reasoning text under the field(s) TF_REASONING_FIELD names, into `o`.
+pub fn putReasoning(a: Allocator, o: anytype, text: []const u8) Allocator.Error!void {
+    const f = reasoningField();
+    if (f != .reasoning) try o.put(a, "reasoning_content", .{ .string = text });
+    if (f != .reasoning_content) try o.put(a, "reasoning", .{ .string = text });
+}
+
+/// A stream delta of reasoning text under the configured field(s).
+pub fn reasoningDelta(a: Allocator, text: []const u8) Allocator.Error!Value {
+    const o = try json.newObject(a);
+    try putReasoning(a, o, text);
+    return .{ .object = o };
+}
+
 pub fn deltaOf(a: Allocator, key: []const u8, text: []const u8) Allocator.Error!Value {
     const o = try json.newObject(a);
     try o.put(a, key, .{ .string = text });

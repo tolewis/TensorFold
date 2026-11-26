@@ -4,6 +4,7 @@ const tokenizer = @import("tokenizer");
 const template = @import("template");
 const json = @import("json");
 const model_text = @import("model_text.zig");
+const inkling_structure = @import("inkling_structure.zig");
 const KimiText = @import("kimi_text.zig").KimiText;
 const dsv41_chat = @import("dsv41_chat");
 const dsv41 = if (@hasDecl(dsv41_chat, "template")) dsv41_chat.template else dsv41_chat;
@@ -31,6 +32,7 @@ pub const HfText = struct {
     native_kimi: ?*KimiText = null,
     source: []const u8 = "",
     native_deepseek: bool = false,
+    inkling: bool = false, // the tokenizer holds Inkling 2's block markers: replies read as .inkling
     schema_prompt: bool = true, // TF_DSV41_SCHEMA_PROMPT: response_format's schema as the encoder's ``## Response Format``
     overridden: bool = false, // the chat template is --chat-template's file
     unread_template: bool = false, // a native DeepSeek checkpoint's own Jinja, which its encoder replaces
@@ -135,6 +137,7 @@ pub const HfText = struct {
             };
         }
         if (t.tool_source.len > 0) t.tool_compiled = template.compile(gpa, t.tool_source, null) catch null;
+        t.inkling = @import("inkling_reply.zig").speaks(t.text());
         return t;
     }
 
@@ -287,7 +290,12 @@ pub const HfText = struct {
 
     pub fn text(t: *HfText) model_text.Text {
         if (t.native_kimi) |kimi| return kimi.text();
-        return .{ .native_deepseek = t.native_deepseek and t.compiled == null, .deferred_native = @import("deferred_tools.zig").native(if (t.tool_source.len > 0) t.tool_source else t.source), .ctx = t, .vtable = &.{
+        return .{ .native_deepseek = t.native_deepseek and t.compiled == null, .deferred_native = @import("deferred_tools.zig").native(if (t.tool_source.len > 0) t.tool_source else t.source), .ctx = t, .vtable = if (t.inkling) &comptime table(.inkling) else &comptime table(.template) };
+    }
+
+    fn table(comptime format: model_text.Text.Format) model_text.Text.VTable {
+        return .{
+            .format = format,
             .encode = encodeFn,
             .decode = decodeFn,
             .token_id = tokenIdFn,
@@ -301,7 +309,7 @@ pub const HfText = struct {
             .token_bytes = tokenBytesFn,
             .encode_plain = encodePlainFn,
             .encode_masked = encodeMaskedFn,
-        } };
+        };
     }
 
     pub fn identity(t: *const HfText, a: Allocator) Allocator.Error![32]u8 {
@@ -433,15 +441,51 @@ pub const HfText = struct {
         try globals.put(a, "thinking_mode", .{ .string = if (options.enable_thinking) "thinking" else "chat" });
         var context: std.json.ObjectMap = .empty;
         try context.put(a, "enable_thinking", .{ .bool = options.enable_thinking });
-        if (options.reasoning_effort) |e| try context.put(a, "reasoning_effort", .{ .string = e });
+        if (options.reasoning_effort) |e| try context.put(a, "reasoning_effort", if (@import("fields.zig").effortNumber(e)) |x| .{ .float = x } else .{ .string = e });
         if (t.clear_thinking) |clear| try context.put(a, "clear_thinking", .{ .bool = options.clear_thinking orelse clear });
         var diag: template.Diag = .{};
         const tools: std.json.Value = if (options.tools) |tl| try toStd(a, tl) else .null;
-        const out = template.renderMarked(a, compiled, try toStd(a, messages), tools, .{ .object = context }, .{ .object = globals }, options.add_generation_prompt, &diag, options.message_starts) catch |e| {
+        // Inkling 2: vLLM's tool_choice sentence joins message 0 when it is a system or developer message, else the
+        // effort block the template writes before message 0
+        var rendered_messages = messages;
+        var effort_sentence: ?[]const u8 = null;
+        const declared = if (options.tools) |tl| tl == .array and tl.array.len > 0 else false;
+        if (t.inkling and declared) if (options.tool_instruction) |sentence| {
+            if (try inkling_structure.withInstruction(a, messages, sentence)) |m| rendered_messages = m else effort_sentence = sentence;
+        };
+        const out = template.renderMarked(a, compiled, try toStd(a, rendered_messages), tools, .{ .object = context }, .{ .object = globals }, options.add_generation_prompt, &diag, options.message_starts) catch |e| {
             if (e == error.OutOfMemory) return error.OutOfMemory;
             problem.* = diag.msg;
             return error.Template;
         };
+        if (effort_sentence) |sentence| {
+            // the same tools and context with no messages render exactly what precedes message 0: the tool
+            // declaration, then the effort block, whose <|end_message|> the sentence goes before
+            const head = template.renderMarked(a, compiled, try toStd(a, .{ .array = &.{} }), tools, .{ .object = context }, .{ .object = globals }, false, &diag, null) catch |e| {
+                if (e == error.OutOfMemory) return error.OutOfMemory;
+                problem.* = diag.msg;
+                return error.Template;
+            };
+            const end = @import("inkling_reply.zig").markers.end;
+            // the last block before message 0 must be the effort block itself, never the tool declaration
+            const last = std.mem.lastIndexOf(u8, head.s, "<|message_system|>") orelse head.s.len;
+            const effort_block = std.mem.startsWith(u8, head.s[last..], "<|message_system|><|content_text|>Thinking effort level: ");
+            if (!std.mem.startsWith(u8, out.s, head.s) or !std.mem.endsWith(u8, head.s, end) or !effort_block) {
+                problem.* = "tool_choice: the template's effort block was not where Inkling 2 writes it";
+                return error.Template;
+            }
+            const at = head.s.len - end.len;
+            const add = try std.mem.concat(a, u8, &.{ "\n\n", sentence });
+            const joined = try std.mem.concat(a, u8, &.{ out.s[0..at], add, out.s[at..] });
+            const spans = try a.dupe(model_text.Span, out.spans);
+            for (spans) |*sp| for (sp) |*x| {
+                if (x.* > at) x.* += add.len;
+            };
+            if (options.message_starts) |starts| for (starts.*) |*x| {
+                if (x.* > at) x.* += add.len;
+            };
+            return .{ .text = joined, .spans = spans };
+        }
         return .{ .text = out.s, .spans = out.spans };
     }
 };
@@ -570,26 +614,6 @@ test "GLM-5.3 gives its template clear_thinking: earlier reasoning kept unless T
     glm.clear_thinking = false;
     try std.testing.expectEqualStrings("uav", (try glm.text().render(a, messages, .{ .clear_thinking = true }, &problem)).text);
     try std.testing.expectEqualStrings("uav", (try other.text().render(a, messages, .{ .clear_thinking = false }, &problem)).text);
-}
-
-test "chat_template_kwargs.clear_thinking: a bool, null as unset, anything else refused" {
-    const fields = @import("fields.zig");
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var cx: @import("errors.zig").Cx = .{ .a = a };
-    const cases = [_]struct { body: []const u8, want: ?bool }{
-        .{ .body = "{}", .want = null },
-        .{ .body = "{\"chat_template_kwargs\":{\"clear_thinking\":null}}", .want = null },
-        .{ .body = "{\"chat_template_kwargs\":{\"clear_thinking\":true}}", .want = true },
-        .{ .body = "{\"chat_template_kwargs\":{\"clear_thinking\":false,\"enable_thinking\":true}}", .want = false },
-    };
-    for (cases) |c| try std.testing.expectEqual(c.want, (try fields.thinkingFields(&cx, (try json.parse(a, c.body)).ok, &.{})).clear);
-    for ([_][]const u8{ "1", "\"true\"", "{}" }) |bad| {
-        const body = try std.fmt.allocPrint(a, "{{\"chat_template_kwargs\":{{\"clear_thinking\":{s}}}}}", .{bad});
-        try std.testing.expectError(error.Refused, fields.thinkingFields(&cx, (try json.parse(a, body)).ok, &.{}));
-        try std.testing.expectEqualStrings("chat_template_kwargs.clear_thinking must be true or false", cx.message);
-    }
 }
 
 test {

@@ -6,6 +6,8 @@
 
 #include "experts.cuh"
 #include "common/fp_pairs.cuh"
+#include "mma4.cuh"
+#include "nvfp4q.cuh"
 
 namespace tf_nvfp4_experts {
 
@@ -78,7 +80,10 @@ struct Ring {
   template <typename Sum>
   __device__ __forceinline__ void run(int KG, int, int lane, int t, int jh, const uint4* blk, const __nv_bfloat16* x0,
                                       const __nv_bfloat16* x1, bool v0, bool v1, Sum sum) {
-    constexpr int D = 2;
+#ifndef TF_NVFP4_RING_D
+#define TF_NVFP4_RING_D 2
+#endif
+    constexpr int D = TF_NVFP4_RING_D;  // stages in flight: the sums and their k order do not depend on it
     Stage<M, Word> st[D];
 #pragma unroll
     for (int d = 0; d < D; ++d)
@@ -262,7 +267,7 @@ __device__ __forceinline__ void compute_half(float (&acc)[M][2][4], const Half<M
 // experts.cuh's epilogue on a half unit's two n8 tiles.
 template <int EPI, int M>
 __device__ __forceinline__ void epilogue_half(const float (&acc)[M][2][4], void* out, int N, int col0, int pr0, int pr1,
-                                              bool v0, bool v1, float limit) {
+                                              bool v0, bool v1, float limit, float limit2 = 0.f) {
 #pragma unroll
   for (int h = 0; h < 2; ++h) {
     if (!(h ? v1 : v0)) continue;
@@ -281,6 +286,14 @@ __device__ __forceinline__ void epilogue_half(const float (&acc)[M][2][4], void*
         } else if constexpr (EPI == 2) {
           o0 = swiglu(a0, acc[M - 1][j][2 * h], limit);
           o1 = swiglu(a1, acc[M - 1][j][2 * h + 1], limit);
+        } else if constexpr (EPI == 4) {  // experts.cuh's epilogue 4, as written there
+          if (limit2 < 0.f) {
+            o0 = softcap_swiglu(bf(a0), bf(acc[M - 1][j][2 * h]), limit, -limit2);
+            o1 = softcap_swiglu(bf(a1), bf(acc[M - 1][j][2 * h + 1]), limit, -limit2);
+          } else {
+            o0 = softcap_swiglu(a0, acc[M - 1][j][2 * h], limit, limit2);
+            o1 = softcap_swiglu(a1, acc[M - 1][j][2 * h + 1], limit, limit2);
+          }
         } else {
           o0 = a0;
           o1 = a1;
@@ -294,11 +307,25 @@ __device__ __forceinline__ void epilogue_half(const float (&acc)[M][2][4], void*
 
 // The decode form with two warps a unit (16 columns each): the same sums, twice the warps for few items.
 template <int M, int EPI, int WARPS>
+__device__ __forceinline__ void half_body(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
+                                          const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
+                                          const int* __restrict__ counts, const int* __restrict__ members,
+                                          void* __restrict__ out, int N, float limit, int skip, float limit2);
+
+template <int M, int EPI, int WARPS>
 __global__ void __launch_bounds__(WARPS * 32)
     nvfp4_expert_half(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
                       const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
                       const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out, int N,
                       float limit, int skip) {
+  half_body<M, EPI, WARPS>(X, x_stride, slots, W, scale, KG, NB, items, counts, members, out, N, limit, skip, 0.f);
+}
+
+template <int M, int EPI, int WARPS>
+__device__ __forceinline__ void half_body(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
+                                          const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
+                                          const int* __restrict__ counts, const int* __restrict__ members,
+                                          void* __restrict__ out, int N, float limit, int skip, float limit2) {
   TF_RING_STORAGE Ring<M, WARPS, uint2> ring;
   const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3, wi = threadIdx.x >> 5;
   const int units = __ldg(counts) * NB * 2;
@@ -328,7 +355,7 @@ __global__ void __launch_bounds__(WARPS * 32)
 #pragma unroll
           for (int q = 0; q < 4; ++q) acc[m][j][q] *= g;
       }
-      epilogue_half<EPI, M>(acc, out, N, cb * COLS + 16 * jh + 2 * t, pr0, pr1, v0, v1, limit);
+      epilogue_half<EPI, M>(acc, out, N, cb * COLS + 16 * jh + 2 * t, pr0, pr1, v0, v1, limit, limit2);
     }
   }
 }
@@ -544,6 +571,214 @@ template __global__ void nvfp4_expert_kernel<2, 2, 1>(const __nv_bfloat16* __res
 template __global__ void nvfp4_expert_kernel<1, 0, 1>(const __nv_bfloat16* __restrict__, int, int, const uint4* __restrict__, const float* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__, void* __restrict__, int, float, int);
 template __global__ void nvfp4_expert_kernel<1, 3, 1>(const __nv_bfloat16* __restrict__, int, int, const uint4* __restrict__, const float* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__, void* __restrict__, int, float, int);
 template __global__ void nvfp4_expert_kernel<1, 1, 1>(const __nv_bfloat16* __restrict__, int, int, const uint4* __restrict__, const float* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__, void* __restrict__, int, float, int);
+// Extract 4 consecutive FP4 nibbles [4t..4t+3] (half=0) or [16+4t..16+4t+3] (half=1) from fp4pair's word order.
+__device__ __forceinline__ uint32_t unpack_k4(uint32_t w, int half) {
+  const uint32_t v = half ? (w >> 8) : w;
+  return (v & 0x000Fu) | ((v >> 12) & 0x00F0u) | ((v << 4) & 0x0F00u) | ((v >> 8) & 0xF000u);
+}
+
+// Pre-quantized FP4 prompt tile: 64 rows x 64 inputs (2 uint4 of codes + 1 uint32 of scales per row), STAGES=4 in 46 KiB.
+template <int M, int RT, int WM, int WN>
+struct Prompt4Q {
+  static constexpr int THREADS = WM * WN * 32, BM = 16 * RT * WM, XC = 2, SG = 2, WB = M * BLOCK4;
+  static constexpr int XU = BM * XC, XSU = BM / 4, WU = WN * SG * WB, SU = XU + XSU + WU;
+  static constexpr int XPT = (XU + THREADS - 1) / THREADS;
+  static constexpr int STAGES = SU * 16 * 4 <= 49152 ? 4 : SU * 16 * 3 <= 49152 ? 3 : 2;
+};
+
+template <int M, int EPI, int RT, int WM, int WN, int NT>
+__device__ __forceinline__ void prompt_tiles_tc_q(const uint8_t* __restrict__ xc, const uint8_t* __restrict__ xsc,
+                                                  int x_stride, int slots, const uint4* __restrict__ W,
+                                                  const float* __restrict__ scale, int KG, int NB,
+                                                  const int* __restrict__ members, void* __restrict__ out, int N,
+                                                  float limit, int cbt, int e, int first, int cnt, float limit2 = 0.f) {
+  using P = Prompt4Q<M, RT, WM, WN>;
+  constexpr int STAGES = P::STAGES;
+  extern __shared__ uint4 sm[];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, wm = warp / WN, wn = warp - wm * WN;
+  const int t = lane & 31 & 3, gq = lane >> 2, cb = cbt * WN + wn, cbs = min(WN, NB - cbt * WN);
+  const int c_stride = x_stride >> 1;   // bytes per row of FP4 codes (K / 2)
+  const int s_stride = x_stride >> 4;   // bytes per row of UE4M3 scales (K / 16)
+  const uint8_t* xsrc[P::XPT];
+  int xdst[P::XPT];
+#pragma unroll
+  for (int i = 0; i < P::XPT; ++i) {
+    const int q = tid + i * P::THREADS, r = q / P::XC, c = q - r * P::XC;
+    xdst[i] = r * P::XC + c;
+    xsrc[i] = nullptr;
+    if (q < P::XU && r < cnt) {
+      const int p = __ldg(members + first + r);
+      xsrc[i] = xc + (size_t)(slots ? p / slots : p) * c_stride + 16 * c;
+    }
+  }
+  const uint8_t* ssrc = nullptr;
+  if (tid < P::BM && tid < cnt) {
+    const int p = __ldg(members + first + tid);
+    ssrc = xsc + (size_t)(slots ? p / slots : p) * s_stride;
+  }
+  const uint4* wsrc = W + ((size_t)e * NB + cbt * WN) * (size_t)KG * P::WB;
+  auto stage = [&](int s, int g0) {
+    uint4* xcs = sm + s * P::SU;
+    uint32_t* xss = reinterpret_cast<uint32_t*>(xcs + P::XU);
+    uint4* ws = xcs + P::XU + P::XSU;
+#pragma unroll
+    for (int i = 0; i < P::XPT; ++i)
+      if (xsrc[i]) cp16(xcs + xdst[i], xsrc[i] + (size_t)g0 * 16);
+    if (tid < P::BM)
+      xss[tid] = ssrc ? *reinterpret_cast<const uint32_t*>(ssrc + (size_t)g0 * 2) : 0u;
+    for (int q = tid; q < cbs * P::SG * P::WB; q += P::THREADS) {
+      const int j = q / (P::SG * P::WB), o = q - j * P::SG * P::WB;
+      cp16(ws + q, wsrc + ((size_t)j * KG + g0) * P::WB + o);
+    }
+  };
+  constexpr int TA = NT > 0 ? NT : 1;
+  const int base = 16 * RT * wm;
+  const bool active = NT > 0 && cb < NB;
+  float acc[M][TA][NTW][4];
+#pragma unroll
+  for (int m = 0; m < M; ++m)
+#pragma unroll
+    for (int r = 0; r < NT; ++r)
+#pragma unroll
+      for (int j = 0; j < NTW; ++j) acc[m][r][j][0] = acc[m][r][j][1] = acc[m][r][j][2] = acc[m][r][j][3] = 0.f;
+  const int steps = KG >> 1;
+#pragma unroll
+  for (int s = 0; s < STAGES - 1; ++s) {
+    if (s < steps) stage(s, s * P::SG);
+    cp_commit();
+  }
+  const int t_lo = (t & 1) * 2, t_hi = t_lo + 1, thalf = t >> 1;
+  for (int k = 0; k < steps; ++k) {
+    cp_wait<STAGES - 2>();
+    __syncthreads();
+    if (k + STAGES - 1 < steps) stage((k + STAGES - 1) % STAGES, (k + STAGES - 1) * P::SG);
+    cp_commit();
+    if (!active) continue;
+    const uint4* xcs = sm + (k % STAGES) * P::SU;
+    const uint32_t* xss = reinterpret_cast<const uint32_t*>(xcs + P::XU);
+    const uint4* ws0 = xcs + P::XU + P::XSU + (wn * P::SG) * P::WB;
+    const uint4* ws1 = ws0 + P::WB;
+    uint32_t a[TA][4], sa[TA];
+#pragma unroll
+    for (int r = 0; r < NT; ++r) {
+      const int r0 = base + 16 * r;
+      const uint32_t* p0 = reinterpret_cast<const uint32_t*>(xcs + (r0 + gq) * P::XC);
+      const uint32_t* p1 = reinterpret_cast<const uint32_t*>(xcs + (r0 + gq + 8) * P::XC);
+      a[r][0] = p0[t];
+      a[r][1] = p1[t];
+      a[r][2] = p0[4 + t];
+      a[r][3] = p1[4 + t];
+      sa[r] = (t & 1) ? xss[r0 + gq + 8] : xss[r0 + gq];
+    }
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+      const uint4 w0_lo = ws0[m * BLOCK4 + gq * 4 + t_lo];
+      const uint4 w0_hi = ws0[m * BLOCK4 + gq * 4 + t_hi];
+      const uint4 w1_lo = ws1[m * BLOCK4 + gq * 4 + t_lo];
+      const uint4 w1_hi = ws1[m * BLOCK4 + gq * 4 + t_hi];
+      const uint2 sc0_0 = reinterpret_cast<const uint2*>(ws0 + m * BLOCK4 + 32)[(gq >> 1) * 2 + 0];
+      const uint2 sc0_1 = reinterpret_cast<const uint2*>(ws0 + m * BLOCK4 + 32)[(gq >> 1) * 2 + 1];
+      const uint2 sc1_0 = reinterpret_cast<const uint2*>(ws1 + m * BLOCK4 + 32)[(gq >> 1) * 2 + 0];
+      const uint2 sc1_1 = reinterpret_cast<const uint2*>(ws1 + m * BLOCK4 + 32)[(gq >> 1) * 2 + 1];
+#pragma unroll
+      for (int j = 0; j < NTW; ++j) {
+        const uint32_t b0 = unpack_k4(comp(w0_lo, j), thalf) | (unpack_k4(comp(w0_hi, j), thalf) << 16);
+        const uint32_t b1 = unpack_k4(comp(w1_lo, j), thalf) | (unpack_k4(comp(w1_hi, j), thalf) << 16);
+        const int sh = (2 * (j & 1) + (gq & 1)) * 8;
+        const uint32_t u00 = ((j < 2 ? sc0_0.x : sc0_0.y) >> sh) & 0xFFu;
+        const uint32_t u01 = ((j < 2 ? sc0_1.x : sc0_1.y) >> sh) & 0xFFu;
+        const uint32_t u10 = ((j < 2 ? sc1_0.x : sc1_0.y) >> sh) & 0xFFu;
+        const uint32_t u11 = ((j < 2 ? sc1_1.x : sc1_1.y) >> sh) & 0xFFu;
+        const uint32_t sb = u00 | (u01 << 8) | (u10 << 16) | (u11 << 24);
+#pragma unroll
+        for (int r = 0; r < NT; ++r) mma4::mma_fp4(acc[m][r][j], a[r], b0, b1, sa[r], sb);
+      }
+    }
+  }
+  if (!active) return;
+  if constexpr (NT > 0) {
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+      const float g = __ldg(scale + e * M + m);
+#pragma unroll
+      for (int r = 0; r < NT; ++r)
+#pragma unroll
+        for (int j = 0; j < NTW; ++j)
+#pragma unroll
+          for (int q = 0; q < 4; ++q) acc[m][r][j][q] *= g;
+    }
+#pragma unroll
+    for (int r = 0; r < NT; ++r) {
+      const int m0 = base + 16 * r + gq, m1 = m0 + 8;
+      const bool v0 = m0 < cnt, v1 = m1 < cnt;
+      const int p0 = v0 ? __ldg(members + first + m0) : 0, p1 = v1 ? __ldg(members + first + m1) : 0;
+      epilogue<EPI, M, TA>(acc, r, out, N, cb * COLS + 2 * t, p0, p1, v0, v1, limit, limit2);
+    }
+  }
+}
+
+template <int M, int EPI, int RT, int WM, int WN>
+__device__ __forceinline__ void prompt_body_tc_q(const uint8_t* __restrict__ xc, const uint8_t* __restrict__ xsc,
+                                                 int x_stride, int slots, const uint4* __restrict__ W,
+                                                 const float* __restrict__ scale, int KG, int NB,
+                                                 const int* __restrict__ items, const int* __restrict__ counts,
+                                                 const int* __restrict__ members, void* __restrict__ out, int N,
+                                                 float limit, int skip, float limit2 = 0.f) {
+  static_assert(RT == 4, "the dispatch below spells out 0 .. 4 row tiles");
+  const int nbt = (NB + WN - 1) / WN, it = blockIdx.x / nbt, cbt = blockIdx.x - it * nbt;
+  if (it >= __ldg(counts)) return;
+  const int e = __ldg(items + 3 * it), first = __ldg(items + 3 * it + 1), cnt = __ldg(items + 3 * it + 2);
+  if (e == skip) return;
+  const int nt = max(0, min(RT, (cnt - 16 * RT * ((threadIdx.x >> 5) / WN) + 15) >> 4));
+#define TF_TILES_TCQ(NT) \
+  prompt_tiles_tc_q<M, EPI, RT, WM, WN, NT>(xc, xsc, x_stride, slots, W, scale, KG, NB, members, out, N, limit, cbt, \
+                                            e, first, cnt, limit2)
+  switch (nt) {
+    case 4: TF_TILES_TCQ(4); break;
+    case 3: TF_TILES_TCQ(3); break;
+    case 2: TF_TILES_TCQ(2); break;
+    case 1: TF_TILES_TCQ(1); break;
+    default: TF_TILES_TCQ(0);
+  }
+#undef TF_TILES_TCQ
+}
+
+}  // namespace tf_nvfp4_experts
+
+// Pre-quantize BF16 rows [M, K] into NVFP4 codes [M, K/2] and UE4M3 scales [M, K/16] (one thread per 16-value block).
+extern "C" __global__ void __launch_bounds__(256)
+    tf_nvfp4_quant_x(const __nv_bfloat16* __restrict__ X, int x_stride, int M, int K, uint8_t* __restrict__ codes,
+                     uint8_t* __restrict__ scales) {
+  const long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int kb = K >> 4;
+  if (idx >= static_cast<long long>(M) * kb) return;
+  const int row = static_cast<int>(idx / kb), blk = static_cast<int>(idx % kb);
+  const __nv_bfloat16* src = X + static_cast<size_t>(row) * x_stride + blk * 16;
+  const uint4 v0 = *reinterpret_cast<const uint4*>(src);
+  const uint4 v1 = *reinterpret_cast<const uint4*>(src + 8);
+  const __nv_bfloat162* p0 = reinterpret_cast<const __nv_bfloat162*>(&v0);
+  const __nv_bfloat162* p1 = reinterpret_cast<const __nv_bfloat162*>(&v1);
+  float f[16];
+  float amax = 0.f;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const float2 a = __bfloat1622float2(p0[i]);
+    const float2 b = __bfloat1622float2(p1[i]);
+    f[2 * i] = a.x;
+    f[2 * i + 1] = a.y;
+    f[8 + 2 * i] = b.x;
+    f[8 + 2 * i + 1] = b.y;
+    amax = fmaxf(amax, fmaxf(fmaxf(fabsf(a.x), fabsf(a.y)), fmaxf(fabsf(b.x), fabsf(b.y))));
+  }
+  const nvfp4q::Scale sc = nvfp4q::block_scale(amax, 1.0f);
+  uint32_t w0 = 0u, w1 = 0u;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    w0 |= nvfp4q::e2m1(f[i] * sc.mul) << (4 * i);
+    w1 |= nvfp4q::e2m1(f[8 + i] * sc.mul) << (4 * i);
+  }
+  *reinterpret_cast<uint2*>(codes + static_cast<size_t>(row) * (K >> 1) + blk * 8) = make_uint2(w0, w1);
+  scales[static_cast<size_t>(row) * kb + blk] = static_cast<uint8_t>(sc.sf8);
 }
 
 // The prompt form's entries, 4 row tiles a warp in one row of WN warps: relu^2 up, SwiGLU gate-up, bf16 sums down.
@@ -592,4 +827,43 @@ extern "C" __global__ void __launch_bounds__(128)
                             int N, float gate_cap, float up_cap, int skip) {
   tf_nvfp4_experts::prompt_body<2, 4, 4, 1, 4>(X, x_stride, slots, W, scale, KG, NB, items, counts, members, out, N,
                                                gate_cap, skip, up_cap);
+}
+
+extern "C" __global__ void __launch_bounds__(128)
+    tf_nvfp4_prompt_softcap_tc_q(const uint8_t* __restrict__ xc, const uint8_t* __restrict__ xsc, int x_stride,
+                                 int slots, const uint4* __restrict__ W, const float* __restrict__ scale, int KG,
+                                 int NB, const int* __restrict__ items, const int* __restrict__ counts,
+                                 const int* __restrict__ members, void* __restrict__ out, int N, float gate_cap,
+                                 float up_cap, int skip) {
+  tf_nvfp4_experts::prompt_body_tc_q<2, 4, 4, 1, 4>(xc, xsc, x_stride, slots, W, scale, KG, NB, items, counts, members,
+                                                    out, N, gate_cap, skip, up_cap);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+    tf_nvfp4_prompt_down_tc_q(const uint8_t* __restrict__ xc, const uint8_t* __restrict__ xsc, int x_stride, int slots,
+                              const uint4* __restrict__ W, const float* __restrict__ scale, int KG, int NB,
+                              const int* __restrict__ items, const int* __restrict__ counts,
+                              const int* __restrict__ members, void* __restrict__ out, int N, float limit, int skip) {
+  tf_nvfp4_experts::prompt_body_tc_q<1, 3, 4, 1, 8>(xc, xsc, x_stride, slots, W, scale, KG, NB, items, counts, members,
+                                                    out, N, limit, skip);
+}
+
+// Inkling 2 Mini's decode experts two warps a unit (16 columns each): tf_nvfp4_softcap's and
+// nvfp4_expert_kernel<1, 0, 4>'s outputs bit for bit (each output's MMA tile, scale word and k-ordered fmaf chain).
+extern "C" __global__ void __launch_bounds__(128)
+    tf_nvfp4_softcap_half(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
+                          const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
+                          const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out, int N,
+                          float gate_cap, float up_cap, int skip) {
+  tf_nvfp4_experts::half_body<2, 4, 4>(X, x_stride, slots, W, scale, KG, NB, items, counts, members, out, N, gate_cap,
+                                       skip, up_cap);
+}
+
+extern "C" __global__ void __launch_bounds__(128)
+    tf_nvfp4_down_half(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
+                       const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
+                       const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out, int N,
+                       float limit, int skip) {
+  tf_nvfp4_experts::half_body<1, 0, 4>(X, x_stride, slots, W, scale, KG, NB, items, counts, members, out, N, limit,
+                                       skip, 0.f);
 }

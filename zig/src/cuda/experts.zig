@@ -352,9 +352,62 @@ pub const Nvfp4Experts = struct {
     fns: [7]Function, // by Epi, then relu^2 up, then experts_waves.zig's
     resident: [7]usize, // blocks the grid may hold: per SM times SMs
     prompt_fns: [3]Function, // relu^2 up, SwiGLU gate-up, bf16 sums down
+    quant_x_fn: Function = undefined, // tf_nvfp4_quant_x
+    prompt_down_tc_q: Function = undefined, // tf_nvfp4_prompt_down_tc_q
     fact_fns: [2]Function, // the decode form's sums on prompt tiles: SwiGLU gate-up, fp32 down
     softcap: mx.Softcap = .{}, // Inkling's soft-capped SwiGLU gate-up, decode and prompt (experts_mx.zig)
     warps: usize = 4,
+    split: ?Split = null, // loadSplit: soft-capped gate-up and fp32 down decode units two warps each (same bits)
+
+    /// tf_nvfp4_softcap_half and tf_nvfp4_down_half: 16 columns a warp, so a decode row's few units fill the GPU.
+    pub const Split = struct { fns: [2]Function, resident: [2]usize };
+
+    fn splitDown() bool {
+        const v = std.c.getenv("TF_NVFP4_SPLIT_DOWN") orelse return false;
+        return v[0] == '1';
+    }
+
+    pub fn loadSplit(e: *Nvfp4Experts, sms: usize) !void {
+        var sp: Split = undefined;
+        for ([2][:0]const u8{ "tf_nvfp4_softcap_half", "tf_nvfp4_down_half" }, &sp.fns, &sp.resident) |name, *f, *r| {
+            f.* = try e.mod.function(name);
+            r.* = @max(1, try f.occupancy(128, 0)) * sms;
+        }
+        e.split = sp;
+    }
+
+    /// The split entries while every half unit fits their resident warps (soft-capped gate-up, fp32 down), else null.
+    fn runSplit(e: *const Nvfp4Experts, s: Stream, epi: Epi, in: Rows, l: Layer, p: Plan, out: u64, items: usize, skip: i32) !?void {
+        const sp = e.split orelse return null;
+        const gate = epi == .up;
+        if (!(gate and l.caps[0] != 0) and epi != .down_f32) return null;
+        // GB10, one decode row: gate-up 121 -> 113 us a call; down 60.8 -> 61.4 (TF_NVFP4_SPLIT_DOWN=1 still takes it)
+        if (!gate and !splitDown()) return null;
+        const nb = (if (gate) l.width else l.dims) / cols;
+        const fi: usize = if (gate) 0 else 1;
+        const units = 2 * items * nb;
+        if (units > sp.resident[fi] * 4) return null;
+        var a = if (gate)
+            mx.argsOf(in, true, l.up, l.up_scale, l.dims / 32, nb, p, out, l.width, mx.kernelCaps(l), skip)
+        else blk: {
+            var b: launch_.Args = .{};
+            b.add(in.x);
+            b.add(@as(i32, @intCast(in.stride)));
+            b.add(@as(i32, 0));
+            b.add(l.down);
+            b.add(l.down_scale);
+            b.add(@as(i32, @intCast(l.width / 32)));
+            b.add(@as(i32, @intCast(nb)));
+            for ([_]u64{ p.items, p.counts, p.members, out }) |v| b.add(v);
+            b.add(@as(i32, @intCast(l.dims)));
+            b.add(@as(f32, 0.0));
+            b.add(skip);
+            break :blk b;
+        };
+        const grid = (units + 3) / 4;
+        if (grid < 1) return;
+        try launch_.launch(sp.fns[fi], .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &a);
+    }
 
     pub const cols = 32; // output columns a block
     pub const words = 144; // int32 a (32 columns, 32 inputs) block: 128 code words, then 16 of e4m3 scales
@@ -416,6 +469,9 @@ pub const Nvfp4Experts = struct {
             f.* = try mod.function(name);
             try f.allowDynamicShared(promptSmem(parts, wn));
         }
+        e.quant_x_fn = try mod.function("tf_nvfp4_quant_x");
+        e.prompt_down_tc_q = try mod.function("tf_nvfp4_prompt_down_tc_q");
+        try e.prompt_down_tc_q.allowDynamicShared(promptQSmem(1, prompt_wn[2]));
         for (symbols.fact, &e.fact_fns, [2]usize{ 2, 1 }, fact_wn) |name, *f, parts, wn| {
             f.* = try mod.function(name);
             try f.allowDynamicShared(promptSmem(parts, wn));
@@ -430,6 +486,7 @@ pub const Nvfp4Experts = struct {
 
     /// One call of nvfp4/experts.py's _run on a plan of at most `items` items.
     pub fn run(e: *const Nvfp4Experts, s: Stream, epi: Epi, in: Rows, l: Layer, p: Plan, out: u64, items: usize, skip: i32) !void {
+        if (try e.runSplit(s, epi, in, l, p, out, items, skip)) |_| return;
         if (epi == .up and l.caps[0] != 0) return e.softcap.run(s, false, in, l, p, out, items, skip);
         const gate = epi == .up;
         const kg = (if (gate) l.dims else l.width) / 32;
@@ -450,6 +507,49 @@ pub const Nvfp4Experts = struct {
         a.add(if (gate) l.limit else @as(f32, 0.0));
         a.add(skip);
         try launch_.launch(e.fns[ei], .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = @intCast(e.warps * 32), .y = 1, .z = 1 } }, s, &a);
+    }
+
+    pub fn promptQSmem(parts: usize, wn: usize) u32 {
+        const su = 64 * 2 + 16 + wn * 2 * parts * 36;
+        const stages: usize = if (su * 16 * 4 <= 49152) 4 else if (su * 16 * 3 <= 49152) 3 else 2;
+        return @intCast(stages * su * 16);
+    }
+
+    pub fn quantX(e: *const Nvfp4Experts, s: Stream, x: u64, stride: usize, rows: usize, kcols: usize, codes: u64, scales: u64) !void {
+        const blocks = rows * (kcols / 16);
+        const grid = (blocks + 255) / 256;
+        if (grid < 1) return;
+        var a: launch_.Args = .{};
+        a.add(x);
+        a.add(@as(i32, @intCast(stride)));
+        a.add(@as(i32, @intCast(rows)));
+        a.add(@as(i32, @intCast(kcols)));
+        a.add(codes);
+        a.add(scales);
+        try launch_.launch(e.quant_x_fn, .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    pub fn runPromptTc(e: *const Nvfp4Experts, s: Stream, epi: Epi, xc: u64, xsc: u64, x_stride: usize, slots: usize, l: Layer, p: Plan, out: u64, items: usize, skip: i32) !void {
+        if (epi == .up and l.caps[0] != 0) return e.softcap.runTcQ(s, xc, xsc, x_stride, slots, l, p, out, items, skip);
+        if (epi != .down_bf16) return error.EpilogueNotBuilt;
+        const nb = l.dims / cols;
+        if (items < 1) return;
+        var a: launch_.Args = .{};
+        a.add(xc);
+        a.add(xsc);
+        a.add(@as(i32, @intCast(x_stride)));
+        a.add(@as(i32, 0));
+        a.add(l.down);
+        a.add(l.down_scale);
+        a.add(@as(i32, @intCast(l.width / 32)));
+        a.add(@as(i32, @intCast(nb)));
+        for ([_]u64{ p.items, p.counts, p.members, out }) |v| a.add(v);
+        a.add(@as(i32, @intCast(l.dims)));
+        a.add(@as(f32, 0.0));
+        a.add(skip);
+        const wn = prompt_wn[2];
+        const cfg: launch_.Config = .{ .grid = .{ .x = @intCast(items * ((nb + wn - 1) / wn)), .y = 1, .z = 1 }, .block = .{ .x = @intCast(wn * 32), .y = 1, .z = 1 }, .shared = promptQSmem(1, wn) };
+        try launch_.launch(e.prompt_down_tc_q, cfg, s, &a);
     }
 
     /// Prompt rows on a plan of at most `items` items of 64 pairs: up (relu^2 or SwiGLU by the layer), bf16 sums down.

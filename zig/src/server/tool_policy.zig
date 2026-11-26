@@ -24,7 +24,9 @@ pub const TextFilter = struct {
     scan: usize = 0,
     hidden: ?[2]usize = null,
     hidden_from: usize = 0,
+    hid: bool = false, // an envelope was hidden (TF_TOOL_CALL_GUARD logs it)
     deferred: bool = false, // a closed envelope was hidden: later prose waits for the reply's final content
+    defer_after_close: bool = true,
     code: reply_code.Scanner = .{},
 
     pub fn feed(f: *TextFilter, a: Allocator, text: []const u8) Allocator.Error![]const u8 {
@@ -40,11 +42,12 @@ pub const TextFilter = struct {
     }
 
     fn step(f: *TextFilter, finished: bool) []const u8 {
-        const b = f.buf.items;
+        var b = f.buf.items;
         const emit_start = f.sent;
         if (f.hidden) |tag| {
             f.matchCloser(b, tag);
-            return b[emit_start..f.sent];
+            if (f.hidden != null or f.deferred) return f.buf.items[emit_start..f.sent];
+            b = f.buf.items;
         }
         while (std.mem.indexOfScalarPos(u8, b, f.scan, '<')) |start| {
             switch (f.code.check(b, start, finished)) {
@@ -80,9 +83,12 @@ pub const TextFilter = struct {
             if (callTag(rest[1..end])) {
                 f.sent = start;
                 f.hidden = .{ start + 1, start + end };
+                f.hid = true;
                 f.hidden_from = start + end + 1;
                 f.matchCloser(b, f.hidden.?);
-                return b[emit_start..f.sent];
+                if (f.hidden != null or f.deferred) return f.buf.items[emit_start..f.sent];
+                b = f.buf.items;
+                continue;
             }
             f.sent = start + 1;
             f.scan = start + 1;
@@ -102,7 +108,16 @@ pub const TextFilter = struct {
             }
             if (b[i + 1] == '/' and std.ascii.eqlIgnoreCase(b[i + 2 .. i + 2 + name.len], name) and b[i + 2 + name.len] == '>') {
                 f.hidden = null;
-                f.deferred = true;
+                if (f.defer_after_close) {
+                    f.deferred = true;
+                } else {
+                    const close_end = i + 3 + name.len;
+                    const rest = f.buf.items[close_end..];
+                    std.mem.copyForwards(u8, f.buf.items[f.sent..][0..rest.len], rest);
+                    f.buf.items.len = f.sent + rest.len;
+                    f.scan = f.sent;
+                    f.code.jumpTo(f.sent);
+                }
                 return;
             }
             at = i + 1;
@@ -111,10 +126,17 @@ pub const TextFilter = struct {
     }
 };
 
-/// ``parallel_tool_calls: false`` keeps one call and hides call markup from streamed prose.
+/// ``parallel_tool_calls: false`` keeps one call and hides call markup from streamed prose; ``guard``
+/// (TF_TOOL_CALL_GUARD, tool_guard.zig) hides it from a reply to a request that offers no tools.
 pub const Policy = struct {
     single: bool = false,
+    guard: bool = false,
+    drop_rejected: bool = false, // TF_TOOL_CALL_GUARD with tools offered: unoffered or malformed envelopes leave the reply
     filter: TextFilter = .{},
+
+    pub fn filtering(p: *const Policy) bool {
+        return p.single or p.guard;
+    }
 
     pub fn maxCalls(p: *const Policy) ?usize {
         return if (p.single) 1 else null;
@@ -122,23 +144,25 @@ pub const Policy = struct {
 
     /// Filters a str delta's text (dict deltas lose tool_calls and filter content), or passes it through.
     pub fn text(p: *Policy, a: Allocator, s: []const u8) Allocator.Error![]const u8 {
-        return if (p.single) p.filter.feed(a, s) else s;
+        if (!p.filtering()) return s;
+        if (!p.single) p.filter.defer_after_close = false;
+        return p.filter.feed(a, s);
     }
 
     pub fn flush(p: *Policy) []const u8 {
-        return if (p.single) p.filter.finish() else "";
+        return if (p.filtering()) p.filter.finish() else "";
     }
 
     pub fn content(p: *const Policy, a: Allocator, s: []const u8) Allocator.Error![]const u8 {
-        if (!p.single) return s;
-        var f: TextFilter = .{};
+        if (!p.filtering()) return s;
+        var f: TextFilter = .{ .defer_after_close = p.single };
         const head = try f.feed(a, s);
         return std.mem.concat(a, u8, &.{ head, f.finish() });
     }
 
     /// parsed_content: parsed reply content; whole envelopes left as text kept, rest filtered; unclosed stays hidden.
     pub fn parsedContent(p: *const Policy, a: Allocator, s: []const u8) Allocator.Error![]const u8 {
-        if (!p.single) return s;
+        if (!p.filtering()) return s;
         var out: std.ArrayList(u8) = .empty;
         var cursor: usize = 0;
         var code: reply_code.Scanner = .{};
@@ -156,10 +180,17 @@ pub const Policy = struct {
         const shown = if (std.mem.startsWith(u8, final, sent)) sent else reply_text.pyLstrip(sent);
         if (!std.mem.startsWith(u8, final, shown)) return null;
         const rest = final[shown.len..];
-        if (p.single) return if (rest.len > 0) rest else null;
+        if (p.filtering()) return if (rest.len > 0) rest else null;
         return if (reply_text.pyStrip(rest).len > 0) rest else null;
     }
 };
+
+/// ``s`` without its call envelopes (whole ones, and an unclosed one to the end).
+pub fn hideCalls(a: Allocator, s: []const u8) Allocator.Error![]const u8 {
+    var f: TextFilter = .{ .defer_after_close = false };
+    const head = try f.feed(a, s);
+    return std.mem.concat(a, u8, &.{ head, f.finish() });
+}
 
 /// The first whole envelope from ``from`` (``<((?:NAME:)?tool_call)>.*?</\1>``, any case).
 fn wholeEnvelope(a: Allocator, s: []const u8, from: usize, code: *reply_code.Scanner) Allocator.Error!?struct { start: usize, end: usize } {

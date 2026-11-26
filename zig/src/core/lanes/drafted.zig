@@ -72,7 +72,7 @@ pub const Drafted = struct {
     };
     pub fn backend(x: *Drafted) be.Backend {
         const planned = if (x.drafter.proposal_head) |service| service.mode != .legacy and x.drafter.vtable.hold_planned != null and x.drafter.vtable.clear_proposals != null else false;
-        return .{ .proposal_head = x.drafter.proposal_head, .ptr = x, .round_observer = x.target.round_observer, .first_before_draft = x.target.first_before_draft, .penalties = x.target.penalties, .chunk_invariant = x.target.chunk_invariant, .vtable = vtableFor(planned, x.target.vtable.prefill_step != null and x.target.vtable.reports_fill and x.target.vtable.features != null, x.target.vtable.cancel_prefill != null, x.first_rows) };
+        return .{ .proposal_head = x.drafter.proposal_head, .ptr = x, .round_observer = x.target.round_observer, .first_before_draft = x.target.first_before_draft, .penalties = x.target.penalties, .chunk_invariant = x.target.chunk_invariant, .vtable = vtableFor(planned, x.target.vtable.prefill_step != null and x.target.vtable.reports_fill and x.target.vtable.features != null, x.target.vtable.cancel_prefill != null, x.first_rows, x.target.vtable.first_masked != null) };
     }
 
     const cancellable: [4]be.Backend.VTable = blk: {
@@ -87,11 +87,18 @@ pub const Drafted = struct {
         break :blk tables;
     };
 
-    fn vtableFor(planned: bool, steps: bool, cancels: bool, rows: bool) *const be.Backend.VTable {
-        if (rows) return &row_tables[@as(usize, @intFromBool(cancels)) * 4 + @as(usize, @intFromBool(steps)) * 2 + @intFromBool(planned)];
-        if (cancels) return &cancellable[@as(usize, @intFromBool(steps)) * 2 + @intFromBool(planned)];
-        if (steps) return if (planned) &stepped_planned else &stepped_legacy;
-        return if (planned) &planned_vtable else &legacy_vtable;
+    /// Every table above, in vtableFor's order: plain (4), cancellable (4), with first rows (8).
+    const all_tables: [16]be.Backend.VTable = .{ legacy_vtable, planned_vtable, stepped_legacy, stepped_planned } ++ cancellable ++ row_tables;
+    /// The same without first_masked, for a target with no grammar draws: structured output is then not offered.
+    const unmasked_tables: [16]be.Backend.VTable = blk: {
+        var tables = all_tables;
+        for (&tables) |*v| v.first_masked = null;
+        break :blk tables;
+    };
+
+    fn vtableFor(planned: bool, steps: bool, cancels: bool, rows: bool, masks: bool) *const be.Backend.VTable {
+        const at: usize = if (rows) 8 + @as(usize, @intFromBool(cancels)) * 4 + @as(usize, @intFromBool(steps)) * 2 + @intFromBool(planned) else if (cancels) 4 + @as(usize, @intFromBool(steps)) * 2 + @intFromBool(planned) else @as(usize, @intFromBool(steps)) * 2 + @intFromBool(planned);
+        return if (masks) &all_tables[at] else &unmasked_tables[at];
     }
 
     fn cancelPrefill(ptr: *anyopaque, s: *Stream) anyerror!void {

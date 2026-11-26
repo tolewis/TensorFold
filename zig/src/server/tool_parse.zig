@@ -29,7 +29,27 @@ pub const Parsed = struct {
     kept_malformed: usize = 0,
     /// The names the model wrote for kept calls that named an unoffered tool: eight at most, 64 bytes each.
     unoffered_names: []const []const u8 = &.{},
+    rejections: []const Rejection = &.{},
 };
+
+/// Why a whole envelope did not become a call: it names a tool the request did not offer (it parses as a call), or it
+/// is not a call in any spelling the parser reads (a missing key, a stray tag, an empty name, broken JSON).
+pub const Reason = enum {
+    unknown_tool_name,
+    malformed,
+
+    pub fn label(r: Reason) []const u8 {
+        return @tagName(r);
+    }
+};
+
+/// One rejected envelope: why, the tool name it carries (empty when none can be read), its text, and whether
+/// ``Options.hide_unoffered`` left it out of the content.
+pub const Rejection = struct { reason: Reason, name: []const u8, envelope: []const u8, hidden: bool = false };
+
+/// ``hide_unoffered`` (TF_TOOL_CALL_GUARD with tools offered): a well-formed call to a tool the request did not offer
+/// leaves the content; a malformed envelope always stays, so the client and the log can see what the model wrote.
+pub const Options = struct { hide_unoffered: bool = false };
 
 fn findCI(hay: []const u8, needle: []const u8, from: usize) ?usize {
     if (from > hay.len) return null;
@@ -102,12 +122,13 @@ pub fn envelopes(a: Allocator, text: []const u8) Allocator.Error![]Envelope {
 
 /// ``parse_tool_calls_from_content``: the reply's content and its calls (null when it makes none).
 pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?usize) Allocator.Error!Parsed {
+    return parseWith(a, text, tools, max_calls, .{});
+}
+
+/// ``parse`` with its ``Options``.
+pub fn parseWith(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?usize, opts: Options) Allocator.Error!Parsed {
     if (tools.len == 0) return .{ .content = text, .calls = null };
-    var known: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
-    for (tools) |tool| {
-        const name = try tool_specs.toolName(a, tool);
-        try known.put(a, try std.ascii.allocLowerString(a, name), name);
-    }
+    var known = try knownNames(a, tools);
     if (try bareCalls(a, text, &known, max_calls)) |calls| return .{ .content = "", .calls = calls };
     const schemas = try tool_params.schemas(a, tools);
     const envs = try envelopes(a, text);
@@ -119,6 +140,7 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
     var rejected: usize = 0;
     var kept_unoffered: usize = 0;
     var kept_malformed: usize = 0;
+    var rejections: std.ArrayList(Rejection) = .empty;
     for (envs) |env| {
         try residue.appendSlice(a, text[cursor..env.start]);
         cursor = env.end;
@@ -145,24 +167,33 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
             }
             break :blk null;
         };
+        var unoffered_name: []const u8 = "";
         const reject: enum { none, unoffered, malformed } = blk: {
             const list = parsed orelse break :blk .malformed;
             if (list.len == 0) break :blk .malformed;
             var unoffered = false;
-            for (list) |c| if ((try callName(a, c, &known)) == null) {
+            for (list) |c| if ((try callName(a, c.name, &known)) == null) {
                 unoffered = true;
+                if (unoffered_name.len == 0) unoffered_name = strip(c.name);
                 try keepName(a, &kept_names, strip(c.name));
             };
             break :blk if (unoffered) .unoffered else .none;
         };
         if (reject != .none) {
-            try residue.appendSlice(a, text[env.start..env.end]);
+            const hide = opts.hide_unoffered and reject == .unoffered;
+            if (!hide) try residue.appendSlice(a, text[env.start..env.end]);
+            try rejections.append(a, .{
+                .reason = if (reject == .unoffered) .unknown_tool_name else .malformed,
+                .name = if (reject == .unoffered) unoffered_name else leadName(env.payload),
+                .envelope = text[env.start..env.end],
+                .hidden = hide,
+            });
             rejected += 1;
             if (reject == .unoffered) kept_unoffered += 1 else kept_malformed += 1;
             continue;
         }
         for (parsed.?) |c| {
-            if (max_calls == null or calls.items.len < max_calls.?) try calls.append(a, try openaiCall(a, (try callName(a, c, &known)).?, c.arguments));
+            if (max_calls == null or calls.items.len < max_calls.?) try calls.append(a, try openaiCall(a, (try callName(a, c.name, &known)).?, c.arguments));
         }
     }
     try residue.appendSlice(a, text[cursor..]);
@@ -173,7 +204,15 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
         .kept_unoffered = kept_unoffered,
         .kept_malformed = kept_malformed,
         .unoffered_names = kept_names.items,
+        .rejections = rejections.items,
     };
+}
+
+/// The one-line name a GLM payload starts with (``NAME<arg_key>...``), or "" when it starts with none.
+pub fn leadName(block: []const u8) []const u8 {
+    const cut = std.mem.indexOfAny(u8, block, "<{[\n\r") orelse block.len;
+    const name = strip(block[0..cut]);
+    return if (name.len <= 64) name else "";
 }
 
 /// Keeps one unoffered name as the model wrote it: once, eight names at most, 64 UTF-8 bytes each.
@@ -235,9 +274,19 @@ fn argumentsClose(a: Allocator, body: []const u8) Allocator.Error![]const u8 {
     return closed[body.len..];
 }
 
-/// The offered tool's spelling, or null when the request did not declare that name.
-fn callName(a: Allocator, c: Call, known: *const std.StringArrayHashMapUnmanaged([]const u8)) Allocator.Error!?[]const u8 {
-    const name = strip(c.name);
+/// The offered tools' names, each under its lowercase spelling, for ``callName``.
+pub fn knownNames(a: Allocator, tools: []const Value) Allocator.Error!std.StringArrayHashMapUnmanaged([]const u8) {
+    var known: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+    for (tools) |tool| {
+        const name = try tool_specs.toolName(a, tool);
+        try known.put(a, try std.ascii.allocLowerString(a, name), name);
+    }
+    return known;
+}
+
+/// The offered tool's spelling of a written name, or null when the request did not declare that name.
+pub fn callName(a: Allocator, written: []const u8, known: *const std.StringArrayHashMapUnmanaged([]const u8)) Allocator.Error!?[]const u8 {
+    const name = strip(written);
     return if (known.get(try std.ascii.allocLowerString(a, name))) |offered| offered else null;
 }
 

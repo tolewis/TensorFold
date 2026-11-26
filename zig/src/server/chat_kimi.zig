@@ -26,16 +26,21 @@ pub fn stream(g: anytype, sink: chat.Sink) chat.Failure!void {
         break :blk parsed;
     } else try read(g, ids, false);
     const stable = if (g.kimi) |k| !k.revised and !k.fallback else false;
+    try emitDeltas(g, sink, result, stable);
+    // Calls wait for the finished native parse; later malformed controls cannot retract an executed call.
+}
+
+/// A native split's new reasoning and content as stream deltas; `stable`: both lie in append-only buffers.
+pub fn emitDeltas(g: anytype, sink: chat.Sink, result: native.Result, stable: bool) chat.Failure!void {
     const thought = reply_text.pyStrip(result.reasoning);
     const reason = g.streamed_reasoning.after(thought, stable);
     if (reason.len > 0) {
         try g.streamed_reasoning.set(g.a, thought, reason);
-        try g.emit(sink, try reply_text.deltaOf(g.a, "reasoning_content", reason));
+        try g.emit(sink, try reply_text.reasoningDelta(g.a, reason));
     }
     const delta = g.streamed.after(result.content, stable);
     if (delta.len > 0) {
         try g.streamed.set(g.a, result.content, delta);
         try g.emit(sink, .{ .string = delta });
     }
-    // Calls wait for the finished native parse; later malformed controls cannot retract an executed call.
 }

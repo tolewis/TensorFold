@@ -220,6 +220,14 @@ pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8) errors.R
     if (effort == null and kw_object) if (kwargs) |k| {
         effort = k.field("reasoning_effort");
     };
+    if (effort) |e| if (numericEffort(e)) |x| {
+        // a number in [0, 0.99] (vLLM's Inkling renderer accepts them too): quantized as it quantizes them
+        if (!(x >= 0.0 and x <= 0.99)) return cx.refuse("reasoning_effort must be a number in [0, 0.99] or none, minimal, low, medium, high, xhigh or max");
+        const q = @round(@round(x * 1000.0) / 1000.0 * 100.0) / 100.0;
+        out.effort = std.fmt.allocPrint(cx.a, "{d}", .{q}) catch return cx.refuse("reasoning_effort: out of memory");
+        out.enable = true;
+        effort = null;
+    };
     if (effort) |e| {
         if (e != .string or !isEffort(e.string)) return cx.refuse("reasoning_effort must be none, minimal, low, medium, high, xhigh or max");
         out.effort = coerceEffort(e.string, levels);
@@ -238,6 +246,22 @@ pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8) errors.R
         out.clear = c.bool;
     };
     return out;
+}
+
+/// A numeric reasoning_effort (a JSON number, or a string holding one); null for names and anything else.
+fn numericEffort(e: Value) ?f64 {
+    return switch (e) {
+        .float => |f| f,
+        .int => |t| std.fmt.parseFloat(f64, t) catch null,
+        .string => |t| if (t.len > 0 and (std.ascii.isDigit(t[0]) or t[0] == '.')) (std.fmt.parseFloat(f64, t) catch null) else null,
+        else => null,
+    };
+}
+
+/// Whether an effort the request resolved to is numeric text (numericEffort's output): the template takes a number.
+pub fn effortNumber(s: []const u8) ?f64 {
+    if (s.len == 0 or !(std.ascii.isDigit(s[0]) or s[0] == '.')) return null;
+    return std.fmt.parseFloat(f64, s) catch null;
 }
 
 fn isEffort(s: []const u8) bool {
@@ -360,4 +384,23 @@ test "efforts and numbers" {
     defer arena.deinit();
     try std.testing.expectEqualStrings("-12", (try pyIntText(arena.allocator(), " -0_12 ")).?);
     try std.testing.expect(try pyIntText(arena.allocator(), "8.0") == null);
+}
+
+test "chat_template_kwargs.clear_thinking: a bool, null as unset, anything else refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cx: Cx = .{ .a = a };
+    const cases = [_]struct { body: []const u8, want: ?bool }{
+        .{ .body = "{}", .want = null },
+        .{ .body = "{\"chat_template_kwargs\":{\"clear_thinking\":null}}", .want = null },
+        .{ .body = "{\"chat_template_kwargs\":{\"clear_thinking\":true}}", .want = true },
+        .{ .body = "{\"chat_template_kwargs\":{\"clear_thinking\":false,\"enable_thinking\":true}}", .want = false },
+    };
+    for (cases) |c| try std.testing.expectEqual(c.want, (try thinkingFields(&cx, (try json.parse(a, c.body)).ok, &.{})).clear);
+    for ([_][]const u8{ "1", "\"true\"", "{}" }) |bad| {
+        const body = try std.fmt.allocPrint(a, "{{\"chat_template_kwargs\":{{\"clear_thinking\":{s}}}}}", .{bad});
+        try std.testing.expectError(error.Refused, thinkingFields(&cx, (try json.parse(a, body)).ok, &.{}));
+        try std.testing.expectEqualStrings("chat_template_kwargs.clear_thinking must be true or false", cx.message);
+    }
 }

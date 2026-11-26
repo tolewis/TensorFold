@@ -99,7 +99,7 @@ pub const kernels = [_]Kernel{
     .{ .name = "exlr8_dense", .flags = &.{ "-O3", "--fmad=false" } }, // ours: EXLR8 dense matrices by row, the Metal order
     .{ .name = "nvfp4_experts_tile", .flags = &.{"-O3"}, .min_sm = 80 },
     .{ .name = "experts_bf16", .flags = &.{"-O3"} }, // ours: grouped bf16 experts on the plan, mma fragment blocks
-    .{ .name = "nvfp4_experts", .flags = &.{"-O3"} }, // nvfp4/experts.cu's device code, the NVFP4 expert kernels
+    .{ .name = "nvfp4_experts", .flags = &.{"-O3"}, .arch_specific = true }, // nvfp4/experts.cu's device code, the NVFP4 expert kernels
     .{ .name = "nvfp4_experts32", .flags = &.{"-O3"} }, // ours: GLM's routed experts at block 32 with csf0 scales
     .{ .name = "rank_sum", .flags = &.{"-O3"} }, // ours: the rank-order sum of a reduce-scatter (rank_scatter.zig)
     .{ .name = "lane_gemv", .flags = &.{"-O3"} }, // ours: qmm_group's arithmetic, a column tile's K slices in one CTA
@@ -165,6 +165,8 @@ pub const kernels = [_]Kernel{
     .{ .name = "inkling2_ops", .src = "inkling2/ops", .flags = glue }, // ours: Inkling 2's residual mix, convs, router, SwiGLU
     .{ .name = "inkling2_rows", .src = "inkling2/rows", .flags = glue }, // ours: Inkling 2's router row dots on prompt rows
     .{ .name = "inkling2_loop", .src = "inkling2/loop", .flags = glue }, // Inkling 2 Mini: loop messages, gates
+    .{ .name = "inkling2_mtp", .src = "inkling2/mtp", .flags = glue }, // Inkling 2 Mini: DSpark drafter, taps, conv backups
+    .{ .name = "inkling2_dflash", .src = "inkling2/dflash", .flags = glue }, // Inkling 2 Mini: DFlash2 drafter
     .{ .name = "glm_quant", .flags = torch_ops }, // ours: GLM's draft-only weight quantizers, torch at load in the Python family
     .{ .name = "exl3_linear", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/linear.cu's device code, tensorfold_exl3_linear_v5
     .{ .name = "exl3_experts", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/experts.cu's device code, tensorfold_exl3_experts
