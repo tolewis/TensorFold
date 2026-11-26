@@ -84,6 +84,7 @@ pub const Group = struct {
     conn: linux.fd_t = -1,
     ex: u8 = 0,
     rec_seq: u64 = 0,
+    idle_logged: bool = false,
     qdev: qg.dev.Dev = undefined,
     qgroup: ?qg.tp.Group = null,
 
@@ -226,11 +227,31 @@ pub const Group = struct {
         std.log.info("inkling2: note seq {d} base {d} n {d}", .{ g.rec_seq, base, ids.len });
     }
 
+    /// Poll the pair socket of the handshake. Any hang-up or error bit means the peer is gone.
+    fn peerAlive(g: *Group) bool {
+        if (g.conn < 0) return false;
+        const rdhup: i16 = 0x2000;
+        var fd = [1]linux.pollfd{.{ .fd = g.conn, .events = linux.POLL.IN, .revents = 0 }};
+        const rc = linux.poll(&fd, 1, 0);
+        if (linux.errno(rc) != .SUCCESS) return false;
+        if (rc == 0) return true;
+        return (fd[0].revents & (linux.POLL.HUP | rdhup | linux.POLL.ERR)) == 0;
+    }
+
     pub fn wait(g: *Group) !Rec {
         const want = g.rec_seq + 1;
-        const deadline = now() + 180.0;
+        var deadline = now() + 180.0;
         while (g.recWord().* < want) {
             if (now() > deadline) {
+                // An idle pair sends no next record. A live peer gets a new period. A lost peer does not.
+                if (peerAlive(g)) {
+                    if (!g.idle_logged) {
+                        g.idle_logged = true;
+                        std.log.info("inkling2: follower idle, peer alive", .{});
+                    }
+                    deadline = now() + 180.0;
+                    continue;
+                }
                 std.log.err("inkling2: wait saw seq {d}, wanted {d}", .{ g.recWord().*, want });
                 return error.PeerLost;
             }
