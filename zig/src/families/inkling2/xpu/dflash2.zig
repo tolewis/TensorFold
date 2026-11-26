@@ -82,8 +82,11 @@ pub const Drafter = struct {
     top_i: []i32,
     sel: []u16,
     embed_mode: EmbedMode = .normed,
-    /// The most drafts a round may ask (block length minus one); `TF_DFLASH2_DEPTH=1..7` shortens the block for measurement.
-    depth_cap: u32 = 7,
+    /// The most drafts a round may ask (block length minus one); `TF_DFLASH2_DEPTH=1..7` sets it for measurement.
+    /// Three drafts (a four-row window): the paired 40k/125k sweep of 2026-11-25 (same prompts each length, per prompt)
+    /// puts the best at four rows at 125k (82.3 tok/s, 40.2 ms a round) and at four or six rows at 40k (82.6/92.7);
+    /// eight rows costs 41.1 ms at 40k and 59.1 ms at 125k for no more tokens a round than six.
+    depth_cap: u32 = 3,
     /// `TF_DFLASH2_FORCE=1`: seven drafts every round. Unset keeps the scheduler. Code wins, chat loses (2026-11-24).
     force: bool = false,
     /// `TF_DFLASH2_PRICE=0`: the old 1/2/3 scheduler, for a control run.
