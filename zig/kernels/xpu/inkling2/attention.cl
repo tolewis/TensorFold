@@ -280,11 +280,11 @@ KERNEL(16) void tf_ink2_attn_decode(global const ushort *q, global const ushort 
 }
 
 // The int8 decode read: the grid, the chunk partials and the merge of tf_ink2_attn_decode. The chunk is walked in 16-key
-// tiles, lane `l` serves key `kp0 + l` of the tile and is live when it lies in [from, to). K codes come from the tile: eight
-// 64-byte block reads a 32-dim slab, four slabs, all issued before the dot, so each lane holds its own key's 128 codes. The
-// dot runs in fp32 in dim order and takes the key's scale after it. V codes are read a row a time with the row's scale
-// broadcast. A dead key enters as an exact zero by a select, never by a multiply: a position never written can hold any
-// bits, also an inf or a NaN scale.
+// tiles, lane `l` serves key `kp0 + l` of the tile and is live when it lies in [from, to). K codes come from the tile: four
+// 32-dim slabs, one block read a slab, all issued before the dot, so each lane holds its own key's 128 codes. The dot runs
+// in fp32 in dim order and takes the key's scale after it. V codes are read a row a time with the row's scale broadcast. A
+// dead key enters as an exact zero by a select, never by a multiply: a position never written can hold any bits, also an
+// inf or a NaN scale.
 KERNEL(16) void tf_ink2_attn_decode8(global const ushort *q, global const char *kc, global const float *ksc, global const char *vc,
                                      global const float *vsc, global const ushort *tab, global const InkSeg *segs, global float *part_o,
                                      global float2 *part_ml, global const int *rpos, global const int *rseg, uint heads, uint kv_heads,
@@ -324,13 +324,16 @@ KERNEL(16) void tf_ink2_attn_decode8(global const ushort *q, global const char *
     uchar8 vr[16];
     UNROLL
     for (uint k = 0; k < 16; ++k) vr[k] = intel_sub_group_block_read_uc8(vh + (size_t)((kp0 + k) % ring) * D);
-    // the tile's K codes: lane `l` reads dims 4g .. 4g + 3 of key kp0 + l from the 64-byte group g of each slab
+    // the tile's K codes: four 32-dim slabs, one block read a slab, all issued before the dot. Lane `l` gets dims
+    // 32j .. 32j + 31 of its own key: word i of the read sits at byte 64i + 4l, which is dim group 8j + i at position l.
     global const char *kt = kh + (size_t)((kp0 % ring) / 16) * 2048;
     uint kr[4][8];
     UNROLL
-    for (uint j = 0; j < 4; ++j)
-      UNROLL
-      for (uint gi = 0; gi < 8; ++gi) kr[j][gi] = intel_sub_group_block_read_ui((global const uint *)(kt + (size_t)j * 512 + (size_t)gi * 64));
+    for (uint j = 0; j < 4; ++j) {
+      const uint8 x = intel_sub_group_block_read_ui8((global const uint *)(kt + (size_t)j * 512));
+      kr[j][0] = x.s0; kr[j][1] = x.s1; kr[j][2] = x.s2; kr[j][3] = x.s3;
+      kr[j][4] = x.s4; kr[j][5] = x.s5; kr[j][6] = x.s6; kr[j][7] = x.s7;
+    }
     float dot[GROUP];
     UNROLL
     for (uint g = 0; g < GROUP; ++g) dot[g] = 0.0f;
