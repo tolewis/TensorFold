@@ -251,7 +251,7 @@ pub fn main(init: std.process.Init) !void {
     var device: ?u32 = null;
     var dump_prefix: ?[]const u8 = null;
     var compare_prefix: ?[]const u8 = null;
-    /// Only the rows at or past this one are dumped and compared: a 125k dump of every row is 100 GB.
+    // Only the rows at or past this one are dumped and compared: a 125k dump of every row is 100 GB.
     var dump_from: usize = 0;
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
