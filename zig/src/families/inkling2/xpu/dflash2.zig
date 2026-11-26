@@ -75,6 +75,9 @@ pub const Drafter = struct {
     /// so the drafter holds the full matrix itself when the target's is a slice. The DFlash 2 file has no unembedding;
     /// the rows come from the target checkpoint.
     unembed: ?rt.Buffer = null,
+    /// The draft head's vocabulary: `TF_DFLASH2_VOCAB=N` keeps the first N rows of the unembedding, so a round reads
+    /// N rows a position instead of every row. Drafts only change speed, so a smaller head cannot change an output.
+    vocab: u32 = state.vocabulary,
     capacity: usize = 1,
     contexts: std.AutoHashMapUnmanaged(*Stream, state.Lane) = .empty,
     host_ids: [2]u32 = .{ 0, mask_token },
@@ -145,6 +148,10 @@ pub const Drafter = struct {
         if (std.c.getenv("TF_DFLASH2_DEPTH")) |v| {
             const n = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 7;
             d.depth_cap = std.math.clamp(n, 1, 7);
+        }
+        if (std.c.getenv("TF_DFLASH2_VOCAB")) |v| {
+            const n = std.fmt.parseInt(u32, std.mem.span(v), 10) catch state.vocabulary;
+            d.vocab = std.math.clamp(n, 256, state.vocabulary);
         }
         if (std.c.getenv("TF_DFLASH2_FORCE")) |v| d.force = !std.mem.eql(u8, std.mem.span(v), "0") and std.mem.span(v).len != 0;
         if (std.c.getenv("TF_DFLASH2_PRICE")) |v| d.price = !std.mem.eql(u8, std.mem.span(v), "0");
@@ -414,8 +421,8 @@ pub const Drafter = struct {
         // rows 1 .. rows of the final norm: the unembedding once for all of them, the 16 best of each, the selector rows
         const draft_rows = at(sc.final, row_bytes);
         const unembed_ptr = if (d.unembed) |b| b.ptr else target.weights.unembed.buf.ptr;
-        try ds.base(&d.spark, s, unembed_ptr, draft_rows, at(sc.base, 0), rows, state.vocabulary);
-        try k.topKeep(&d.kernels, s, at(sc.base, 0), state.vocabulary, state.vocabulary, rows, at(sc.top_v, 0), at(sc.top_i, 0));
+        try ds.base(&d.spark, s, unembed_ptr, draft_rows, at(sc.base, 0), rows, d.vocab);
+        try k.topKeep(&d.kernels, s, at(sc.base, 0), d.vocab, d.vocab, rows, at(sc.top_v, 0), at(sc.top_i, 0));
         try d.project(w.selector, draft_rows, at(sc.sel, 0), rows, state.rank, hidden);
         try sc.top_v.downloadAsync(s, 0, std.mem.sliceAsBytes(d.top_v[0 .. rows * state.lists]));
         try sc.top_i.downloadAsync(s, 0, std.mem.sliceAsBytes(d.top_i[0 .. rows * state.lists]));
@@ -510,7 +517,7 @@ pub const Drafter = struct {
             for (0..depth) |step| {
                 const position = std.math.add(u32, base_position, @intCast(step)) catch return error.DraftDepth;
                 previous = try d.draw(step, previous, item.sampling, position);
-                if (previous >= state.vocabulary) return error.DraftNonfinite;
+                if (previous >= d.vocab) return error.DraftNonfinite;
                 lane.held[step] = previous;
             }
             lane.held_len = offered;
