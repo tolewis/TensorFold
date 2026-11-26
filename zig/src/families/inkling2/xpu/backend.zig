@@ -337,7 +337,7 @@ pub const Xpu = struct {
         if (profile_one) {
             prof = xpu.profile.Profile.init(self.model.ctx.?, 131072, true) catch {
                 profile_one = false;
-                undefined;
+                undefined
             };
             if (profile_one) {
                 xpu.profile.active = &prof;
