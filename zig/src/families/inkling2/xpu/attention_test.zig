@@ -41,3 +41,24 @@ test "inkling2 xpu decode and prompt dispatch geometry" {
     try t.expectError(error.Inkling2Path, p.attendAs(.{ .rows = 4, .last_pos = 99, .streams = 2 }, gl, 4096, .prompt));
     try t.expectError(error.Inkling2Path, p.attendAs(.{ .rows = 4, .last_pos = 99 }, sl, 17, .prompt));
 }
+
+test "inkling2 xpu int8 K tile bytes: a sliding ring and a global ring" {
+    // one head's ring: 128 bytes a position, 2,048 a tile of 16 positions
+    try t.expectEqual(@as(usize, 2048), p.kv_tile_bytes);
+    for ([_]usize{ 1088, 65536 }) |ring| {
+        // head 0, tile 0: dim 0 of position 0 is the first byte, dim 127 of position 15 the last
+        try t.expectEqual(@as(usize, 0), p.kCodeOffset(0, 0, 0, ring));
+        try t.expectEqual(@as(usize, 2047), p.kCodeOffset(0, 15, 127, ring));
+        // dim d of a position sits at (d / 4) * 64 + (p % 16) * 4 + d % 4 inside its tile
+        try t.expectEqual(@as(usize, 2048 + 3 * 64 + 5 * 4 + 2), p.kCodeOffset(0, 21, 14, ring));
+        try t.expectEqual(@as(usize, 2048 + 7 * 64 + 0 * 4 + 1), p.kCodeOffset(0, 16, 29, ring));
+        // head 3 starts after three head rings, and the position wraps at the ring
+        try t.expectEqual(@as(usize, 3 * ring * 128 + 2048 + 2 * 64 + 9 * 4 + 3), p.kCodeOffset(3, ring + 25, 11, ring));
+        // whole tiles a head: 100 live positions take 112
+        try t.expectEqual(@as(usize, 112 * 128), p.kCodeBytes(100));
+        try t.expectEqual(@as(usize, 128 * 128), p.kCodeBytes(128));
+    }
+    // V codes are row-major and scales head-major
+    try t.expectEqual(@as(usize, 5 * 1088 * 128 + 7 * 128 + 96), p.vCodeOffset(5, 1088 + 7, 96, 1088));
+    try t.expectEqual(@as(usize, (5 * 1088 + 7) * 4), p.kvScaleOffset(5, 1088 + 7, 1088));
+}

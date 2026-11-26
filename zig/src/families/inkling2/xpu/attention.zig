@@ -12,7 +12,14 @@ pub const Ref = struct {
         return if (r.ptr) |p| @ptrFromInt(@intFromPtr(p) + r.off) else null;
     }
 };
-pub const Cache = struct { k: Ref, v: Ref };
+pub const Cache = struct {
+    k: Ref,
+    v: Ref,
+    /// An int8 cache keeps one fp32 scale a position and K/V head next to its codes: the prep and decode entries read these.
+    int8: bool = false,
+    kscale: Ref = .{ .ptr = null },
+    vscale: Ref = .{ .ptr = null },
+};
 pub const RowMeta = struct { pos: Ref, seg_of: Ref, segs: Ref };
 
 pub const Error = planning.Error || xpu.Error || error{OutOfMemory};
@@ -35,8 +42,10 @@ pub fn mergeSplit() bool {
 const Entry = struct { name: [:0]const u8, threads: u32 };
 const names = struct {
     const prep: Entry = .{ .name = "tf_ink2_prep", .threads = 16 };
+    const prep8: Entry = .{ .name = "tf_ink2_prep8", .threads = 16 };
     const rel_table: Entry = .{ .name = "tf_ink2_rel_table", .threads = 256 };
     const decode: Entry = .{ .name = "tf_ink2_attn_decode", .threads = planning.decode_threads };
+    const decode8: Entry = .{ .name = "tf_ink2_attn_decode8", .threads = planning.decode_threads };
     const merge: Entry = .{ .name = "tf_ink2_merge", .threads = planning.merge_threads };
     const merge_split: Entry = .{ .name = "tf_ink2_merge_split", .threads = planning.merge_threads };
     const prompt: Entry = .{ .name = "tf_ink2_attn_prompt", .threads = planning.prompt_threads };
@@ -45,8 +54,10 @@ const names = struct {
 /// The five kernels of two loaded images: `attention` holds prep, relative table, decode and merge; `prompt` the prompt kernel.
 pub const Kernels = struct {
     prep: xpu.Kernel,
+    prep8: xpu.Kernel,
     rel_table: xpu.Kernel,
     decode: xpu.Kernel,
+    decode8: xpu.Kernel,
     merge: xpu.Kernel,
     merge_split: xpu.Kernel,
     prompt: xpu.Kernel,
@@ -55,10 +66,14 @@ pub const Kernels = struct {
         var k: Kernels = undefined;
         k.prep = try attention.kernel(names.prep.name, .{ names.prep.threads, 1, 1 });
         errdefer k.prep.deinit();
+        k.prep8 = try attention.kernel(names.prep8.name, .{ names.prep8.threads, 1, 1 });
+        errdefer k.prep8.deinit();
         k.rel_table = try attention.kernel(names.rel_table.name, .{ names.rel_table.threads, 1, 1 });
         errdefer k.rel_table.deinit();
         k.decode = try attention.kernel(names.decode.name, .{ names.decode.threads, 1, 1 });
         errdefer k.decode.deinit();
+        k.decode8 = try attention.kernel(names.decode8.name, .{ names.decode8.threads, 1, 1 });
+        errdefer k.decode8.deinit();
         k.merge = try attention.kernel(names.merge.name, .{ names.merge.threads, 1, 1 });
         errdefer k.merge.deinit();
         k.merge_split = try attention.kernel(names.merge_split.name, .{ names.merge_split.threads, 1, 1 });
@@ -70,8 +85,10 @@ pub const Kernels = struct {
         k.prompt.deinit();
         k.merge_split.deinit();
         k.merge.deinit();
+        k.decode8.deinit();
         k.decode.deinit();
         k.rel_table.deinit();
+        k.prep8.deinit();
         k.prep.deinit();
         k.* = undefined;
     }
@@ -79,6 +96,17 @@ pub const Kernels = struct {
 
 /// raw holds independent q/k/v rows followed by q-side relative rows; gated sliding visits never infer K or V from Q.
 pub fn prep(k: *const Kernels, s: xpu.Stream, r: planning.Rows, l: planning.Layer, c: planning.Prep, meta: RowMeta, raw: [4]Ref, scales: [2]Ref, q: Ref, rel: Ref, kv: Cache) xpu.Error!void {
+    if (kv.int8) {
+        try xpu.launch.dispatch(k.prep8, s, .{ r.rows, r.heads + 2 * r.kv_heads, 1 }, .{
+            raw[0].at(),     raw[1].at(),     raw[2].at(), raw[3].at(),
+            scales[0].at(),  scales[1].at(),  meta.pos.at(), meta.seg_of.at(),
+            meta.segs.at(),  q.at(),          rel.at(),    kv.k.at(),
+            kv.kscale.at(),  kv.v.at(),       kv.vscale.at(), r.heads,
+            r.kv_heads,      l.ring,          @intFromBool(l.tau), c.qk_clip,
+            c.rel_clip,      c.floor,         c.alpha,     c.eps,
+        });
+        return;
+    }
     try xpu.launch.dispatch(k.prep, s, .{ r.rows, r.heads + 2 * r.kv_heads, 1 }, .{
         raw[0].at(),     raw[1].at(),  raw[2].at(), raw[3].at(),
         scales[0].at(),  scales[1].at(), meta.pos.at(), meta.seg_of.at(),
@@ -103,17 +131,27 @@ var attn_logged = false;
 
 /// `attend` on a path the caller names (the contract runs the prompt kernel at a few rows too).
 pub fn attendAs(k: *const Kernels, s: xpu.Stream, path: planning.Path, r: planning.Rows, l: planning.Layer, stride: u32, meta: RowMeta, q: Ref, kv: Cache, tab: Ref, part_o: Ref, part_ml: Ref, sink: Ref, gate: Ref, out: Ref) Error!void {
-    const launch = try planning.attendAs(r, l, stride, path);
+    // An int8 cache has no prompt kernel in this lane: the prompt path of prefill refuses int8, so the decode kernel serves.
+    const launch = try planning.attendAs(r, l, stride, if (kv.int8) .decode else path);
     if (!attn_logged) {
         attn_logged = true;
         std.log.info("inkling2: attn {s} heads {d} kv {d} splits {d} grid {d},{d}", .{ @tagName(launch.path), r.heads, r.kv_heads, planning.flash_splits, launch.grid[0], launch.grid[1] });
     }
     const scale: f32 = 1.0 / @sqrt(@as(f32, planning.head_dim));
     if (launch.path == .decode) {
-        try xpu.launch.dispatch(k.decode, s, launch.grid, .{
-            q.at(),          kv.k.at(),       kv.v.at(),         tab.at(),      meta.segs.at(), part_o.at(), part_ml.at(), meta.pos.at(), meta.seg_of.at(),
-            r.heads,         r.kv_heads,      l.ring,            l.window,      launch.chunk,   @as(u32, 0), launch.partials_rh, scale,
-        });
+        if (kv.int8) {
+            try xpu.launch.dispatch(k.decode8, s, launch.grid, .{
+                q.at(),          kv.k.at(),        kv.kscale.at(),    kv.v.at(),         kv.vscale.at(),
+                tab.at(),        meta.segs.at(),   part_o.at(),       part_ml.at(),      meta.pos.at(),
+                meta.seg_of.at(), r.heads,         r.kv_heads,        l.ring,            l.window,
+                launch.chunk,    @as(u32, 0),      launch.partials_rh, scale,
+            });
+        } else {
+            try xpu.launch.dispatch(k.decode, s, launch.grid, .{
+                q.at(),          kv.k.at(),       kv.v.at(),         tab.at(),      meta.segs.at(), part_o.at(), part_ml.at(), meta.pos.at(), meta.seg_of.at(),
+                r.heads,         r.kv_heads,      l.ring,            l.window,      launch.chunk,   @as(u32, 0), launch.partials_rh, scale,
+            });
+        }
     } else {
         try xpu.launch.dispatch(k.prompt, s, launch.grid, .{
             q.at(),     kv.k.at(),   kv.v.at(),       tab.at(),     meta.segs.at(),

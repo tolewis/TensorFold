@@ -9,6 +9,9 @@
 //! does the same) and `--drop-bf16-head` leaves the BF16 head off the device in Q8 mode. `--dump-logits PREFIX` writes every
 //! row's full logits (raw f32) of each reference prompt to PREFIX.<reference file name>.f32; `--compare-logits PREFIX`
 //! reads those files back and prints, per prompt, KL(dumped || ours) per row (mean, max) and top-1 agreement with the dump.
+//! `--dump-from N` writes and reads only the rows at or past N of each prompt (a 125k dump of every row is 100 GB).
+//! `XPU_KV_INT8=1` makes every cache of the run int8: one signed byte a value and one fp32 scale a position and K/V head.
+//! Unset or any other value keeps bf16.
 //!
 //! `--digest` prints SHA-256 digests of the bits of every logit row computed (prompt rows, then decode steps), to compare
 //! two builds for bit identity. `--profile` adds eight profiled decode steps: launches by kernel, host and device time.
@@ -248,6 +251,8 @@ pub fn main(init: std.process.Init) !void {
     var device: ?u32 = null;
     var dump_prefix: ?[]const u8 = null;
     var compare_prefix: ?[]const u8 = null;
+    /// Only the rows at or past this one are dumped and compared: a 125k dump of every row is 100 GB.
+    var dump_from: usize = 0;
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
@@ -372,11 +377,16 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--rank")) {
             i += 1;
             rank = try std.fmt.parseInt(u32, argv[i], 10);
+        } else if (std.mem.eql(u8, a, "--dump-from")) {
+            i += 1;
+            dump_from = try std.fmt.parseInt(usize, argv[i], 10);
         } else if (std.mem.eql(u8, a, "--device")) {
             i += 1;
             device = try std.fmt.parseInt(u32, argv[i], 10);
         } else dir = a;
     }
+    kv_dtype = state.kvFromEnv();
+    std.debug.print("kv {s}\n", .{@tagName(kv_dtype)});
     const path = dir orelse {
         std.debug.print("skipped: no model directory (argument or TF_XPU_INKLING2)\n", .{});
         return;
@@ -461,7 +471,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (bench_prefill > 0 and !profile_all) {
-        var cache = try state.Cache.init(&r, capacity, &schedule, .bf16);
+        var cache = try state.Cache.init(&r, capacity, &schedule, kv_dtype);
         defer cache.deinit();
         const ids = loaded_refs.items[0].ids;
         var pos: usize = 0;
@@ -485,7 +495,7 @@ pub fn main(init: std.process.Init) !void {
     var prefill_digest = std.crypto.hash.sha2.Sha256.init(.{});
     var decode_digest = std.crypto.hash.sha2.Sha256.init(.{});
     for (loaded_refs.items, refs.items) |ref, ref_path| {
-        var cache = try state.Cache.init(&r, capacity, &schedule, .bf16);
+        var cache = try state.Cache.init(&r, capacity, &schedule, kv_dtype);
         defer cache.deinit();
         var st: Stats = .{};
         // the largest |ours - reference| over each row's reference top 16, to see where the error sits
@@ -526,11 +536,13 @@ pub fn main(init: std.process.Init) !void {
                 const row = host_logits[j * vocab ..][0..vocab];
                 const t = top2(row);
                 st.rows += 1;
-                if (dump_file) |f| if (std.c.fwrite(@ptrCast(row.ptr), 4, vocab, f) != vocab) return error.DumpWrite;
-                if (compare_file) |f| {
+                if (dump_file) |f| if (p >= dump_from) {
+                    if (std.c.fwrite(@ptrCast(row.ptr), 4, vocab, f) != vocab) return error.DumpWrite;
+                };
+                if (compare_file) |f| if (p >= dump_from) {
                     if (std.c.fread(@ptrCast(other.ptr), 4, vocab, f) != vocab) return error.DumpRead;
                     kl.add(other, row);
-                }
+                };
                 const ref_top = ref.top_ids[p * top_n ..][0..top_n];
                 const ref_logit = ref.top_logits[p * top_n ..][0..top_n];
                 if (!std.math.isFinite(t.first)) st.nan += 1;
@@ -617,7 +629,7 @@ pub fn main(init: std.process.Init) !void {
     if (ids_path != null and resume_at > 0) {
         // A prompt prefilled in one pass, against the same prompt resumed from a snapshot taken at `resume_at`.
         if (resume_at >= prompt.len) return error.BadResume;
-        var fresh = try state.Cache.init(&r, capacity, &schedule, .bf16);
+        var fresh = try state.Cache.init(&r, capacity, &schedule, kv_dtype);
         defer fresh.deinit();
         var snap: ?ink.snapshot.Snap = null;
         defer if (snap) |*sn| sn.free();
@@ -633,7 +645,7 @@ pub fn main(init: std.process.Init) !void {
         const logits_fresh = try gpa.alloc(f32, vocab);
         defer gpa.free(logits_fresh);
         try fresh.readLogits(logits_fresh);
-        var resumed = try state.Cache.init(&r, capacity, &schedule, .bf16);
+        var resumed = try state.Cache.init(&r, capacity, &schedule, kv_dtype);
         defer resumed.deinit();
         try ink.snapshot.restore(&resumed, &snap.?);
         pos = resume_at;
@@ -657,7 +669,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (ids_path != null) {
-        var cache = try state.Cache.init(&r, capacity, &schedule, .bf16);
+        var cache = try state.Cache.init(&r, capacity, &schedule, kv_dtype);
         defer cache.deinit();
         var pos: usize = 0;
         const t0 = nowNs(init.io);
@@ -685,7 +697,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("\n", .{});
     }
     if (bench_context) |context| {
-        var cache = try state.Cache.init(&r, capacity, &schedule, .bf16);
+        var cache = try state.Cache.init(&r, capacity, &schedule, kv_dtype);
         defer cache.deinit();
         // zeroed K/V: every global position reads as a valid, empty row
         for (&cache.slots) |*sl| try state.zero(&r, sl.buf, sl.buf.len);
@@ -768,6 +780,8 @@ fn profileDecode(ctx: *xpu.Context, io: std.Io, m: *const ink.model.Model, scrat
 
 /// The old forward (64-row chunks, a launch a row) with `--old-forward`, else the prompt-chunk forward.
 var old_forward = false;
+/// The K/V format every cache of this run takes: `XPU_KV_INT8=1` selects int8, anything else bf16.
+var kv_dtype: state.KvDtype = .bf16;
 var old_experts = false;
 var old_dense = false;
 var old_loop = false;
@@ -784,7 +798,7 @@ fn promptRun(m: *const ink.model.Model, scratch: *state.Scratch, cache: *state.C
 /// The first reference prompt in chunks of `chunk` rows with the last row's logits only (the server's prompt path), a
 /// profile of every chunk (the table after the first 512 rows, then after the whole prompt), then decode at that context.
 fn profileAll(gpa: std.mem.Allocator, io: std.Io, ctx: *xpu.Context, m: *const ink.model.Model, scratch: *state.Scratch, r: *xpu.rt.Runtime, schedule: anytype, capacity: usize, ids: []const u32, chunk: usize, logits: []f32, steps: usize) !void {
-    var cache = try state.Cache.init(r, capacity, schedule, .bf16);
+    var cache = try state.Cache.init(r, capacity, schedule, kv_dtype);
     defer cache.deinit();
     var prof = try xpu.profile.Profile.init(ctx, 131072, true);
     defer prof.deinit();
@@ -830,7 +844,7 @@ fn profileAll(gpa: std.mem.Allocator, io: std.Io, ctx: *xpu.Context, m: *const i
 /// verify runs them: all rows' logits, the taps, begin and rollback around each. Median of the reps, in ms: the forward,
 /// then the forward and the host argmax of every row's downloaded logits (the greedy verify today).
 fn verifyBench(gpa: std.mem.Allocator, io: std.Io, ctx: *xpu.Context, m: *const ink.model.Model, scratch: *state.Scratch, r: *xpu.rt.Runtime, schedule: anytype, capacity: usize, ids: []const u32, host: []f32, profile: bool, route_union: bool) !void {
-    var cache = try state.Cache.init(r, capacity, schedule, .bf16);
+    var cache = try state.Cache.init(r, capacity, schedule, kv_dtype);
     defer cache.deinit();
     scratch.taps = try r.alloc(state.captureBytes(state.max_rows));
     const prefix: usize = @min(ids.len / 2, 512);
@@ -891,7 +905,8 @@ fn verifyBench(gpa: std.mem.Allocator, io: std.Io, ctx: *xpu.Context, m: *const 
     }
 }
 
-/// Every verify row's logits against plain decode of that row at that position, bit for bit.
+/// Every verify row's logits against plain decode of that row at that position, bit for bit. For an int8 cache the K and V
+/// bytes are compared whole, each slot's codes and scales, because its K codes sit in 16-position tiles.
 fn verifyBits(gpa: std.mem.Allocator, io: std.Io, m: *const ink.model.Model, scratch: *state.Scratch, r: *xpu.rt.Runtime, cache: *state.Cache, ids: []const u32, host: []f32, prefix: usize) !void {
     _ = io;
     const n = 8;
@@ -900,13 +915,15 @@ fn verifyBits(gpa: std.mem.Allocator, io: std.Io, m: *const ink.model.Model, scr
     defer gpa.free(plain);
     const row_bytes = state.kv_width * 2;
     const kv_bytes = n * row_bytes;
-    const pk = try gpa.alloc(u8, kv_bytes);
+    const ring = cache.ring(0);
+    const slot_bytes = if (cache.kv == .int8) ring * cache.kv.rowBytes() + ring * cache.kv.scaleBytes() else kv_bytes;
+    const pk = try gpa.alloc(u8, slot_bytes);
     defer gpa.free(pk);
-    const pv = try gpa.alloc(u8, kv_bytes);
+    const pv = try gpa.alloc(u8, slot_bytes);
     defer gpa.free(pv);
-    const wk = try gpa.alloc(u8, kv_bytes);
+    const wk = try gpa.alloc(u8, slot_bytes);
     defer gpa.free(wk);
-    const wv = try gpa.alloc(u8, kv_bytes);
+    const wv = try gpa.alloc(u8, slot_bytes);
     defer gpa.free(wv);
     const att_row = state.hidden * 4;
     const patt = try gpa.alloc(u8, n * att_row);
@@ -925,13 +942,13 @@ fn verifyBits(gpa: std.mem.Allocator, io: std.Io, m: *const ink.model.Model, scr
         try grab(r, cache, 0, 0, patt[i * att_row ..][0..att_row], vv[0..0]);
         try cache.rollback();
     }
-    try grab(r, cache, 0, from, pk, pv);
+    try grabAny(r, cache, 0, from, pk, pv);
     cache.len = from;
     try cache.begin(n);
     try ink.forward.runShared(m, scratch, &.{.{ .cache = cache, .rows = n }}, ids[from..][0..n], .{ .all = true, .taps = scratch.taps.?.ptr });
     try r.download(std.mem.sliceAsBytes(host[0 .. n * vocab]), scratch.logits_all);
     try r.sync();
-    try grab(r, cache, 0, from, wk, wv);
+    try grabAny(r, cache, 0, from, wk, wv);
     try grabAtt(r, scratch, watt, n);
     try cache.rollback();
     var diff: usize = 0;
@@ -954,17 +971,32 @@ fn verifyBits(gpa: std.mem.Allocator, io: std.Io, m: *const ink.model.Model, scr
     var vd: usize = 0;
     var krow: usize = 0;
     var vrow: usize = 0;
-    for (0..kv_bytes) |b| {
-        if (pk[b] != wk[b]) {
-            if (kd == 0) krow = b / row_bytes;
-            kd += 1;
+    if (cache.kv == .int8) {
+        // whole slots: codes and scales, every head and every position of the ring
+        for (0..slot_bytes) |b| {
+            if (pk[b] != wk[b]) {
+                if (kd == 0) krow = b;
+                kd += 1;
+            }
+            if (pv[b] != wv[b]) {
+                if (vd == 0) vrow = b;
+                vd += 1;
+            }
         }
-        if (pv[b] != wv[b]) {
-            if (vd == 0) vrow = b / row_bytes;
-            vd += 1;
+        std.debug.print("VERIFY KV: {d} of {d} K bytes and {d} of {d} V bytes differ (codes and scales, whole slot; first K byte {d}, first V byte {d})\n", .{ kd, slot_bytes, vd, slot_bytes, krow, vrow });
+    } else {
+        for (0..kv_bytes) |b| {
+            if (pk[b] != wk[b]) {
+                if (kd == 0) krow = b / row_bytes;
+                kd += 1;
+            }
+            if (pv[b] != wv[b]) {
+                if (vd == 0) vrow = b / row_bytes;
+                vd += 1;
+            }
         }
+        std.debug.print("VERIFY KV: {d} of {d} K bytes and {d} of {d} V bytes differ (first K row {d}, first V row {d})\n", .{ kd, kv_bytes, vd, kv_bytes, krow, vrow });
     }
-    std.debug.print("VERIFY KV: {d} of {d} K bytes and {d} of {d} V bytes differ (first K row {d}, first V row {d})\n", .{ kd, kv_bytes, vd, kv_bytes, krow, vrow });
     var ad: usize = 0;
     var arow: usize = 0;
     for (0..n * att_row) |b| {
@@ -989,6 +1021,19 @@ fn grab(r: *xpu.rt.Runtime, cache: *state.Cache, slot: usize, from: usize, k: []
     const vb = xpu.rt.Buffer{ .rt = r, .ptr = @ptrFromInt(@intFromPtr(vref.buf.ptr.?) + vref.off + from * state.kv_width * 2), .len = v.len };
     try r.download(k, kb);
     try r.download(v, vb);
+}
+
+/// The K/V bytes the two paths wrote: for bf16 the `n` rows from `from`, for int8 each whole slot (codes and scales), since
+/// an int8 slot's K codes sit in 16-position tiles and its scales are head-major.
+fn grabAny(r: *xpu.rt.Runtime, cache: *state.Cache, slot: usize, from: usize, k: []u8, v: []u8) !void {
+    if (cache.kv != .int8) return grab(r, cache, slot, from, k, v);
+    const s = &cache.slots[slot];
+    const ring = cache.ring(slot);
+    const n = ring * cache.kv.rowBytes() + ring * cache.kv.scaleBytes();
+    const kb = xpu.rt.Buffer{ .rt = r, .ptr = @ptrFromInt(@intFromPtr(s.buf.ptr.?) + s.key_at), .len = n };
+    const vb = xpu.rt.Buffer{ .rt = r, .ptr = @ptrFromInt(@intFromPtr(s.buf.ptr.?) + s.value_at), .len = n };
+    try r.download(k[0..n], kb);
+    try r.download(v[0..n], vb);
 }
 
 /// The distinct experts a window of n real rows reads in a visit, averaged over the visits of the same precision and over

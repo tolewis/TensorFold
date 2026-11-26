@@ -75,6 +75,23 @@ pub const KvDtype = enum {
     }
 };
 
+/// The K/V format a run asks for: `XPU_KV_INT8=1` selects int8. Unset or any other value keeps bf16, so the binary does
+/// what it did before the switch.
+pub fn kvFromEnv() KvDtype {
+    if (std.c.getenv("XPU_KV_INT8")) |p| {
+        const s = std.mem.span(p);
+        if (std.mem.eql(u8, s, "1")) return .int8;
+    }
+    return .bf16;
+}
+
+/// Byte offsets of a slot's four pieces: [K values][K scales][V values][V scales]. Scales are empty for bf16.
+pub fn slotOffsets(positions: usize, kv: KvDtype) [4]usize {
+    const val_bytes = positions * kv.rowBytes();
+    const scale_bytes = positions * kv.scaleBytes();
+    return .{ 0, val_bytes, val_bytes + scale_bytes, 2 * val_bytes + scale_bytes };
+}
+
 pub fn globalSlots(capacity: usize) usize {
     return std.mem.alignForward(usize, capacity, ap.tile_keys);
 }
@@ -201,7 +218,8 @@ pub const Cache = struct {
             const val_bytes = positions * kv.rowBytes();
             const scale_bytes = positions * kv.scaleBytes();
             const s = &out.slots[i];
-            s.* = .{ .buf = try r.alloc(@max(2 * (val_bytes + scale_bytes), 16)), .ring = @intCast(positions), .global = global, .key_at = 0, .key_scale_at = val_bytes, .value_at = val_bytes + scale_bytes, .value_scale_at = 2 * val_bytes + scale_bytes };
+            const o = slotOffsets(positions, kv);
+            s.* = .{ .buf = try r.alloc(@max(2 * (val_bytes + scale_bytes), 16)), .ring = @intCast(positions), .global = global, .key_at = o[0], .key_scale_at = o[1], .value_at = o[2], .value_scale_at = o[3] };
             made += 1;
             total += 2 * (val_bytes + scale_bytes);
         }
@@ -470,6 +488,26 @@ test "capacity math: bytes a context costs and the largest one a budget holds" {
         try t.expectEqual(@as(usize, 0), largestCapacity(1 << 20, kv));
         try t.expectEqual(@as(usize, max_capacity), largestCapacity(1 << 40, kv));
     }
+}
+
+test "int8 slot offsets: codes, then scales, then the V pieces" {
+    const t = std.testing;
+    const ring = sliding_ring;
+    const o = slotOffsets(ring, .int8);
+    try t.expectEqual(@as(usize, 0), o[0]);
+    try t.expectEqual(ring * 1024, o[1]);
+    try t.expectEqual(ring * 1024 + ring * 32, o[2]);
+    try t.expectEqual(2 * ring * 1024 + ring * 32, o[3]);
+    try t.expectEqual(2 * (ring * 1024 + ring * 32), o[3] + ring * 32);
+    // the K codes and the K scales hold every head: 8 * ring * 128 codes and 8 * ring * 4 scale bytes
+    try t.expectEqual(@as(usize, 8 * ring * ap.head_dim), o[1] - o[0]);
+    try t.expectEqual(@as(usize, 8 * ring * 4), o[2] - o[1]);
+    // bf16 keeps the same value region and no scales
+    const b = slotOffsets(ring, .bf16);
+    try t.expectEqual(@as(usize, 0), b[0]);
+    try t.expectEqual(@as(usize, 8 * ring * ap.head_dim * 2), b[1]);
+    try t.expectEqual(b[1], b[2]);
+    try t.expectEqual(@as(usize, 2 * ring * 2048), b[3]);
 }
 
 test "conv offsets tile one slot exactly" {

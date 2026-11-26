@@ -34,6 +34,7 @@ pub var vdump_seq: u32 = 0;
 pub var vdump_visit: usize = 0;
 pub var vdump_cur: u32 = 0;
 pub var vdump_active: bool = false;
+var vdump_int8_logged = false;
 
 /// TF_TP_VDUMP: the hidden state after each visit of a short call (a verify window or a decode row), for the bisect.
 pub fn dumpVisit(r: *xpu.rt.Runtime, rank: u32, seq: u32, visit: usize, src: ?*anyopaque, rows: usize, width: usize) !void {
@@ -347,7 +348,13 @@ const Run = struct {
                 .seg_of = aref(s.seg_of, base * 4),
                 .segs = aref(s.segs, si * @sizeOf(ap.Seg)),
             };
-            const kv = attention.Cache{ .k = sref(cache.keys(v.cache_slot)), .v = sref(cache.values(v.cache_slot)) };
+            const kv = attention.Cache{
+                .k = sref(cache.keys(v.cache_slot)),
+                .v = sref(cache.values(v.cache_slot)),
+                .int8 = cache.kv == .int8,
+                .kscale = sref(cache.keyScales(v.cache_slot)),
+                .vscale = sref(cache.valueScales(v.cache_slot)),
+            };
             const both_static = switch (w.attn.k_conv) {
                 .static => switch (w.attn.v_conv) {
                     .static => true,
@@ -644,7 +651,13 @@ fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) 
             const ring_k = segments[0].cache.keys(v.cache_slot);
             const ring_v = segments[0].cache.values(v.cache_slot);
             const ring_n = segments[0].cache.ring(v.cache_slot);
-            for (0..4) |h| {
+            if (segments[0].cache.kv == .int8) {
+                // the dump reads the rings as bf16, so an int8 cache skips it
+                if (!vdump_int8_logged) {
+                    vdump_int8_logged = true;
+                    std.log.info("inkling2: TF_TP_VDUMP skips the K/V ring dumps of an int8 cache", .{});
+                }
+            } else for (0..4) |h| {
                 try dumpVisit(m.r, m.options.place.rank, vdump_cur, 110 + h, at(ring_k.buf, ring_k.off + h * ring_n * ap.head_dim * 2), 1, 48 * ap.head_dim);
                 try dumpVisit(m.r, m.options.place.rank, vdump_cur, 120 + h, at(ring_v.buf, ring_v.off + h * ring_n * ap.head_dim * 2), 1, 48 * ap.head_dim);
             }
@@ -896,7 +909,6 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     var total: usize = 0;
     var base: usize = 0;
     for (segments, 0..) |seg, si| {
-        if (seg.cache.kv != .bf16) return error.Inkling2KvDtype;
         if (seg.cache.capacity > s.capacity) return error.Inkling2ScratchCapacity;
         if (seg.rows == 0 or seg.rows > state.max_rows or seg.cache.len + seg.rows > seg.cache.capacity) return error.Inkling2ContextFull;
         if (seg.rows > state.window_rows and seg.cache.pending != null) return error.Inkling2CacheTransaction;

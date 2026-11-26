@@ -15,6 +15,32 @@ pub const sliding_chunk = 64;
 pub const global_chunk = 256;
 /// The prompt kernel's chunk. It is a multiple of the key tile and wider than the decode chunk to keep the partials small.
 pub const prompt_chunk = 1024;
+
+/// Positions one K code tile holds and its bytes, for an int8 cache: [dim / 4][16 positions][4 int8] inside a head's ring.
+/// `ring` is a multiple of 16 for every slot, so a tile never straddles the ring end.
+pub const kv_tile = 16;
+pub const kv_tile_bytes = head_dim * kv_tile;
+
+/// Byte of dim `d` of the position `p` in the K codes of head `h` of a ring of `ring` positions.
+pub fn kCodeOffset(h: usize, p: usize, d: usize, ring: usize) usize {
+    const at = p % ring;
+    return h * ring * head_dim + (at / kv_tile) * kv_tile_bytes + (d / 4) * 64 + (at % kv_tile) * 4 + d % 4;
+}
+
+/// Bytes a head's K codes take for `live` positions: whole tiles, so the last tile is padded to 16 positions.
+pub fn kCodeBytes(live: usize) usize {
+    return std.mem.alignForward(usize, live, kv_tile) * head_dim;
+}
+
+/// Byte of dim `d` of the position `p` in the V codes of head `h`: row-major, one byte a value.
+pub fn vCodeOffset(h: usize, p: usize, d: usize, ring: usize) usize {
+    return h * ring * head_dim + (p % ring) * head_dim + d;
+}
+
+/// Byte of the fp32 scale of the position `p` of K or V head `h`: head-major, as the snapshot expects.
+pub fn kvScaleOffset(h: usize, p: usize, ring: usize) usize {
+    return (h * ring + p % ring) * 4;
+}
 pub const split_rows = 64;
 pub const prompt_pairs = 16;
 pub const prompt_threads = 16;
