@@ -310,3 +310,91 @@ test "an Inkling 2 stream fed a byte at a time keeps a character split across st
         try t.expectEqualStrings("D\u{e9}j\u{e0} vu \u{1f600}", got.content.items);
     }
 }
+
+/// Inkling 2's block markers at the release's own ids (tokenizer_config.json); a byte is its own id.
+const release = [_]struct { piece: []const u8, id: u32 }{
+    .{ .piece = markers.model, .id = 200001 },
+    .{ .piece = markers.text, .id = 200004 },
+    .{ .piece = markers.thinking, .id = 200008 },
+    .{ .piece = markers.end, .id = 200010 },
+    .{ .piece = markers.end_sampling, .id = 200006 },
+};
+
+/// A tokenizer that holds the release's markers, and renders every prompt as "prompt".
+const Release = struct {
+    fn text(x: *Release) model_text.Text {
+        return .{ .ctx = x, .vtable = &.{ .format = .inkling, .encode = encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocabSize, .eos_ids = eosIds, .render = render, .template_source = templateSource } };
+    }
+    fn tokenId(_: *anyopaque, piece: []const u8) ?u32 {
+        for (release) |m| if (std.mem.eql(u8, m.piece, piece)) return m.id;
+        return null;
+    }
+    fn encode(_: *anyopaque, a: A, input: []const u8, _: bool) model_text.Error![]u32 {
+        var out: std.ArrayList(u32) = .empty;
+        var i: usize = 0;
+        while (i < input.len) {
+            var hit: ?usize = null;
+            for (release, 0..) |m, k| if (std.mem.startsWith(u8, input[i..], m.piece)) {
+                hit = k;
+                break;
+            };
+            if (hit) |k| {
+                try out.append(a, release[k].id);
+                i += release[k].piece.len;
+            } else {
+                try out.append(a, input[i]);
+                i += 1;
+            }
+        }
+        return out.items;
+    }
+    fn decode(_: *anyopaque, a: A, ids: []const u32) A.Error![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        for (ids) |id| {
+            var found = false;
+            for (release) |m| if (m.id == id) {
+                try out.appendSlice(a, m.piece);
+                found = true;
+                break;
+            };
+            if (!found) try out.append(a, @intCast(id));
+        }
+        return out.items;
+    }
+    fn tokenString(_: *anyopaque, a: A, id: u32) A.Error![]u8 {
+        for (release) |m| if (m.id == id) return a.dupe(u8, m.piece);
+        return std.fmt.allocPrint(a, "{d}", .{id});
+    }
+    fn vocabSize(_: *anyopaque) u32 {
+        return 200058;
+    }
+    fn eosIds(_: *anyopaque) []const u32 {
+        return &.{};
+    }
+    fn render(_: *anyopaque, a: A, _: json.Value, _: model_text.RenderOptions, _: *[]const u8) model_text.Error!model_text.Rendered {
+        return .{ .text = try a.dupe(u8, "prompt") };
+    }
+    fn templateSource(_: *anyopaque) []const u8 {
+        return "";
+    }
+};
+
+test "Inkling 2 thinking off opens the answer message:" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var backend: OneByOne = .{ .tokens = &.{} };
+    var text: Release = .{};
+    var key: call_ids.Key = .of(call_ids.test_key_text);
+    const srv = try server.Server.init(t.allocator, t.io, backend.engine(), text.text(), .{ .served_name = "test-model", .model_ids = &.{"test-model"}, .enable_thinking = false, .use_drafts = false, .tool_id_key = &key }, null);
+    defer srv.deinit();
+    var cx: @import("errors.zig").Cx = .{ .a = a };
+    const messages = (try json.parse(a, "{\"messages\":[{\"role\":\"user\",\"content\":\"What is 2+2?\"}]}")).ok.get("messages").?;
+    const offered = (try json.parse(a, "{\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"parameters\":{\"type\":\"object\"}}}]}")).ok.get("tools").?;
+    const off = try @import("prompt.zig").renderIds(srv, &cx, messages, &.{}, false, null, true);
+    try t.expectEqualSlices(u32, &.{ 200001, 200004 }, off[off.len - 2 ..]);
+    const with_tools = try @import("prompt.zig").renderIds(srv, &cx, messages, offered.items().?, false, null, true);
+    try t.expect(!std.mem.eql(u32, with_tools[with_tools.len - 2 ..], &.{ 200001, 200004 }));
+    const on = try @import("prompt.zig").renderIds(srv, &cx, messages, &.{}, true, "low", true);
+    try t.expect(!std.mem.eql(u32, on[on.len - 2 ..], &.{ 200001, 200004 }));
+}
