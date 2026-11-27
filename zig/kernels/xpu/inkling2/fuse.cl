@@ -703,16 +703,20 @@ __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_si
 
 #define SQRT5 0x1.1e377ap+1f
 
+// commit1 bit 0: the kernel commits the history of a one-row launch. Bit 1: no reader needs the staged window (no
+// transaction is open), so the tap stores are skipped.
 static inline ushort conv_y(global const ushort *history, global const ushort *current, global ushort *taps,
-                            global const ushort *weight, uint r, uint c, uint channels) {
+                            global const ushort *weight, uint r, uint c, uint channels, uint commit1) {
   float window[4];
   for (uint tap = 0; tap < 4; ++tap) {
     const uint k = r + tap;
     window[tap] = bf2f(k < 3 ? history[(size_t)k * channels + c] : current[(size_t)(k - 3) * channels + c]);
   }
-  if (r == 0)
-    for (uint k = 0; k < 3; ++k) taps[(size_t)k * channels + c] = history[(size_t)k * channels + c];
-  taps[(size_t)(r + 3) * channels + c] = current[(size_t)r * channels + c];
+  if ((commit1 & 2) == 0) {
+    if (r == 0)
+      for (uint k = 0; k < 3; ++k) taps[(size_t)k * channels + c] = history[(size_t)k * channels + c];
+    taps[(size_t)(r + 3) * channels + c] = current[(size_t)r * channels + c];
+  }
   float sum = bf2f(current[(size_t)r * channels + c]);
   for (uint tap = 0; tap < 4; ++tap) sum += bf2f(weight[c * 4 + tap]) * window[tap];
   return f2bf(sum / SQRT5);
@@ -735,12 +739,12 @@ KERNEL(256) void tf_ink2_conv_attn_partial(
     uint boundary, uint commit1) {
   const uint c = get_group_id(0) * 256 + get_local_id(0), r = get_group_id(1);
   if (c >= channels || r >= rows) return;
-  const ushort y = conv_y(history, current, taps, weight, r, c, channels);
+  const ushort y = conv_y(history, current, taps, weight, r, c, channels, commit1);
   conv_out[(size_t)r * channels + c] = y;
   const uint at = r * channels + c;
   partial[at] = boundary ? bf2f(y) : bf2f(p[at]) + bf2f(y);
   if (boundary) blocks[(size_t)r * 4 * channels + (boundary - 1) * channels + c] = p[at];
-  if (commit1 && rows == 1 && r == 0) commit3(history, current, c, channels);
+  if ((commit1 & 1) && rows == 1 && r == 0) commit3(history, current, c, channels);
 }
 
 // Grid (ceil(channels/256), rows). The MLP convolution, then the partial add into p.
@@ -749,11 +753,11 @@ KERNEL(256) void tf_ink2_conv_mlp_partial(
     global ushort *conv_out, global const float *t, global ushort *p, uint rows, uint channels, uint commit1) {
   const uint c = get_group_id(0) * 256 + get_local_id(0), r = get_group_id(1);
   if (c >= channels || r >= rows) return;
-  const ushort y = conv_y(history, current, taps, weight, r, c, channels);
+  const ushort y = conv_y(history, current, taps, weight, r, c, channels, commit1);
   conv_out[(size_t)r * channels + c] = y;
   const uint at = r * channels + c;
   p[at] = f2bf(t[at] + bf2f(y));
-  if (commit1 && rows == 1 && r == 0) commit3(history, current, c, channels);
+  if ((commit1 & 1) && rows == 1 && r == 0) commit3(history, current, c, channels);
 }
 
 // Grid (ceil(channels/256), rows). K folded into the V convolution. Each channel of each is the static formula.
@@ -763,9 +767,9 @@ KERNEL(256) void tf_ink2_conv_kv(
     uint rows, uint channels, uint commit1) {
   const uint c = get_group_id(0) * 256 + get_local_id(0), r = get_group_id(1);
   if (c >= channels || r >= rows) return;
-  ok[(size_t)r * channels + c] = conv_y(hk, ck, tk, wk, r, c, channels);
-  ov[(size_t)r * channels + c] = conv_y(hv, cv, tv, wv, r, c, channels);
-  if (commit1 && rows == 1 && r == 0) {
+  ok[(size_t)r * channels + c] = conv_y(hk, ck, tk, wk, r, c, channels, commit1);
+  ov[(size_t)r * channels + c] = conv_y(hv, cv, tv, wv, r, c, channels, commit1);
+  if ((commit1 & 1) && rows == 1 && r == 0) {
     commit3(hk, ck, c, channels);
     commit3(hv, cv, c, channels);
   }
@@ -805,14 +809,14 @@ KERNEL(256) void tf_ink2_down_epilogue(
       }
       const ushort y = f2bf(sum);
       current[(size_t)r * channels + c] = y;
-      const ushort cy = conv_y(history, current, taps, conv_w, r, c, channels);
+      const ushort cy = conv_y(history, current, taps, conv_w, r, c, channels, commit1);
       conv_out[(size_t)r * channels + c] = cy;
       const uint at = r * channels + c;
       p[at] = FUSE_EPI ? f2bf(partial[at] + bf2f(cy)) : (ushort)0;
     }
     barrier(CLK_LOCAL_MEM_FENCE);
   }
-  if (commit1 && rows == 1 && c < n && c < channels) commit3(history, current, c, channels);
+  if ((commit1 & 1) && rows == 1 && c < n && c < channels) commit3(history, current, c, channels);
 }
 
 // Empty bodies at the three work-group sizes of the decode kernels: the fixed cost of a launch at a grid

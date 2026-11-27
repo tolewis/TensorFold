@@ -180,6 +180,14 @@ const Run = struct {
     s: xpu.Stream,
     sc: *state.Scratch,
     wrote: ?*[state.visit_slots]u8 = null,
+    /// An open transaction can roll back a one-row launch and then reads the staged conv taps (`Cache.commit`).
+    keep_taps: bool = true,
+
+    /// The commit1 argument of the conv kernels: bit 0 commits the history in the kernel, bit 1 skips the tap stores.
+    fn commitArg(g: Run, rows: usize) u32 {
+        if (!(fuse.roleConv() and rows == 1)) return 0;
+        return if (g.keep_taps) 1 else 3;
+    }
 
     fn copyBf16(g: Run, from: Ptr, to: Ptr, count: usize) !void {
         try runtime.copyBf16(&g.p.runtime, g.s, from, to, 1, count);
@@ -371,8 +379,8 @@ const Run = struct {
                     .static => |weight| weight,
                     .dynamic => unreachable,
                 };
-                const commit1: u32 = if (fuse.roleConv() and rows == 1) 1 else 0;
-                if (commit1 == 1) if (g.wrote) |mask| {
+                const commit1: u32 = g.commitArg(rows);
+                if (commit1 != 0) if (g.wrote) |mask| {
                     mask[v.cache_slot] = mask[v.cache_slot] | 0x3;
                 };
                 try fuse.convKv(&g.p.fuse, g.s, cache.history(v.cache_slot, 0).ptr(), at(s.k_raw, base * channels * 2), cache.staged(v.cache_slot, 0, 0).ptr(), tensor(wk), at(s.k_conv, base * channels * 2), cache.history(v.cache_slot, 1).ptr(), at(s.v_raw, base * channels * 2), cache.staged(v.cache_slot, 1, 0).ptr(), tensor(wv), at(s.v_conv, base * channels * 2), @intCast(rows), channels, commit1);
@@ -663,8 +671,8 @@ fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) 
         if (fuse.convFold() and segments.len == 1) {
             const seg = segments[0];
             const channels: u32 = @intCast(state.convWidth(2));
-            const commit1: u32 = if (fuse.roleConv() and rows == 1) 1 else 0;
-            if (commit1 == 1) if (g.wrote) |mask| {
+            const commit1: u32 = g.commitArg(rows);
+            if (commit1 != 0) if (g.wrote) |mask| {
                 mask[v.cache_slot] = mask[v.cache_slot] | 0x4;
             };
             try fuse.convAttnPartial(&g.p.fuse, g.s, seg.cache.history(v.cache_slot, 2).ptr(), at(s.attn_dense, 0), seg.cache.staged(v.cache_slot, 2, 0).ptr(), tensor(w.attn_conv), at(s.attn_conv, 0), at(s.p, 0), at(s.blocks, 0), at(s.partial, 0), @intCast(rows), channels, if (lp.boundary) lp.blocks_in + 1 else 0, commit1);
@@ -722,8 +730,8 @@ fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) 
         // offset and with its own history, so every stream combines the way it does alone (B16: C1).
         if (fuse.downEpi() and !g.m.options.place.split()) {
             const channels: u32 = @intCast(state.convWidth(3));
-            const commit1: u32 = if (fuse.roleConv() and rows == 1) 1 else 0;
-            if (commit1 == 1) if (g.wrote) |mask| {
+            const commit1: u32 = g.commitArg(rows);
+            if (commit1 != 0) if (g.wrote) |mask| {
                 mask[v.cache_slot] = mask[v.cache_slot] | 0x8;
             };
             var b: usize = 0;
@@ -734,8 +742,8 @@ fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) 
         } else if (fuse.convFold() and segments.len == 1) {
             const seg = segments[0];
             const channels: u32 = @intCast(state.convWidth(3));
-            const commit1: u32 = if (fuse.roleConv() and rows == 1) 1 else 0;
-            if (commit1 == 1) if (g.wrote) |mask| {
+            const commit1: u32 = g.commitArg(rows);
+            if (commit1 != 0) if (g.wrote) |mask| {
                 mask[v.cache_slot] = mask[v.cache_slot] | 0x8;
             };
             try fuse.convMlpPartial(&g.p.fuse, g.s, seg.cache.history(v.cache_slot, 3).ptr(), at(s.mlp_out, 0), seg.cache.staged(v.cache_slot, 3, 0).ptr(), tensor(w.mlp_conv), at(s.mlp_conv, 0), at(s.partial, 0), at(s.p, 0), @intCast(rows), channels, commit1);
@@ -971,6 +979,12 @@ pub fn run(m: *const Model, s: *state.Scratch, cache: *state.Cache, ids: []const
 /// One forward over `ids` (the rows of every segment in order); returns when the stream has finished it. With
 /// `options.all` the logits of every row are in `s.logits_all` ([row][200058] f32), otherwise the last row's are in the
 /// first segment's `cache.logits`.
+/// A segment with an open transaction (the leader's verify window, rank 1's begin record) can roll back its rows.
+fn anyPending(segments: []const Segment) bool {
+    for (segments) |seg| if (seg.cache.pending != null) return true;
+    return false;
+}
+
 pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, ids: []const u32, options: Options) !void {
     const p: *const model_file.Pipelines = if (m.pipelines) |*x| x else return error.Inkling2NoKernels;
     const ctx = m.ctx orelse return error.Inkling2NoKernels;
@@ -1007,7 +1021,7 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     try m.r.upload(s.segs, std.mem.sliceAsBytes(segs[0..segments.len]));
     if (xpu.profile.active) |prof| prof.uploaded();
     var wrote: [state.visit_slots]u8 = @splat(0);
-    const g = Run{ .m = m, .p = p, .s = stream, .sc = s, .wrote = if (fuse.roleConv() and rows == 1) &wrote else null };
+    const g = Run{ .m = m, .p = p, .s = stream, .sc = s, .wrote = if (fuse.roleConv() and rows == 1) &wrote else null, .keep_taps = options.txn or anyPending(segments) };
     if (m.options.place.rank == 0) if (group.live) |gp| {
         // Each stream's rows name their own slot, base and capacity: rank 1 runs a stream's state in a cache of its own.
         var table: [state.max_segments]group.Seg = undefined;
