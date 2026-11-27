@@ -52,6 +52,40 @@ pub fn dispatchIndirect(k: Kernel, s: Stream, groups: *anyopaque, args: anytype)
     try k.ctx.d.check(fnp(s.list, k.handle, groups, null, 0, null), "zeCommandListAppendLaunchKernelIndirect");
 }
 
+const SuggestCoopFn = *const fn (ze.H, *u32) callconv(.c) u32;
+const CoopFn = *const fn (ze.H, ze.H, *const ze.GroupCount, ze.H, u32, ?[*]ze.H) callconv(.c) u32;
+var coop_fn: ?CoopFn = null;
+
+/// zeKernelSuggestMaxCooperativeGroupCount at the group size set on `k`: the most work-groups that can all be resident.
+pub fn suggestCooperative(k: Kernel) Error!u32 {
+    const fnp = @constCast(k.ctx.d).lib.lookup(SuggestCoopFn, "zeKernelSuggestMaxCooperativeGroupCount") orelse return error.MissingSymbol;
+    var n: u32 = 0;
+    try k.ctx.d.check(fnp(k.handle, &n), "zeKernelSuggestMaxCooperativeGroupCount");
+    return n;
+}
+
+/// Sets the arguments as `dispatch` does, then queues a cooperative launch: every work-group resident at once.
+pub fn dispatchCooperative(k: Kernel, s: Stream, groups: [3]u32, args: anytype) Error!void {
+    inline for (args, 0..) |v, i| {
+        const idx: u32 = i;
+        switch (comptime argKind(@TypeOf(v))) {
+            .buffer => try k.setPtr(idx, v.ptr),
+            .pointer => try k.setPtr(idx, v),
+            .float => try k.setF32(idx, v),
+            .integer => try k.setU32(idx, @intCast(v)),
+        }
+    }
+    const fnp = coop_fn orelse blk: {
+        const f = @constCast(k.ctx.d).lib.lookup(CoopFn, "zeCommandListAppendLaunchCooperativeKernel") orelse return error.MissingSymbol;
+        coop_fn = f;
+        break :blk f;
+    };
+    const g: ze.GroupCount = .{ .x = groups[0], .y = groups[1], .z = groups[2] };
+    if (g.x == 0 or g.y == 0 or g.z == 0) return error.Invalid;
+    try k.ctx.d.check(fnp(s.list, k.handle, &g, null, 0, null), "zeCommandListAppendLaunchCooperativeKernel");
+    profile.launches += 1;
+}
+
 /// Sets every argument of the tuple in order (buffer, device pointer, f32 or u32) and queues the kernel.
 pub fn dispatch(k: Kernel, s: Stream, groups: [3]u32, args: anytype) Error!void {
     if (profile.active) |p| return dispatchProfiled(p, k, s, groups, args);

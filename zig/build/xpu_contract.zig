@@ -246,6 +246,29 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     const barrier_step = b.step("tf-xpu-barrier-bench", "Build the grid-wide barrier cost bench");
     barrier_step.dependOn(&b.addInstallArtifact(barrier_bench, .{}).step);
     barrier_step.dependOn(&barrier_install.step);
+    // The fused-visit benches (lane fused-visit Part 1): one source, built at 256 GRF and at the default 128 GRF.
+    const fused_step = b.step("tf-xpu-fused-bench", "Build the fused-visit resident-kernel benches");
+    for ([_][2][]const u8{ .{ "fused_bench", " -cl-intel-256-GRF-per-thread" }, .{ "fused_bench128", "" } }) |img| {
+        const obj = b.addSystemCommand(&.{ ocloc, "compile", "-q", "-file" });
+        obj.addFileArg(b.path("zig/kernels/xpu/fused_bench.cl"));
+        obj.addArgs(&.{ "-device", device, "-options", b.fmt("-cl-std=CL3.0{s} -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2", .{img[1]}), "-output_no_suffix", "-output", img[0], "-out_dir" });
+        obj.setCwd(b.path("."));
+        obj.addFileInput(b.path("zig/kernels/xpu/inkling2/dense_q8.cl"));
+        const dir = obj.addOutputDirectoryArg(b.fmt("ocloc-{s}", .{img[0]}));
+        fused_step.dependOn(&b.addInstallFile(dir.path(b, b.fmt("{s}.bin", .{img[0]})), b.fmt("xpu-bench/{s}.bin", .{img[0]})).step);
+    }
+    const fused_bench = b.addExecutable(.{ .name = "tf-xpu-fused-bench", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/xpu/fused_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "core", .module = core },
+            .{ .name = "xpu", .module = xpu },
+            .{ .name = "ze", .module = ze },
+        },
+    }) });
+    fused_step.dependOn(&b.addInstallArtifact(fused_bench, .{}).step);
     b.step("tf-xpu-contract-run", "Build the XPU kernel-contract runner: gates 1 to 4 and gate 5 live on a card").dependOn(&b.addInstallArtifact(exe, .{}).step);
     const dspark_bench = b.addExecutable(.{ .name = "tf-xpu-dspark-bench", .root_module = b.createModule(.{
         .root_source_file = b.path("zig/tests/xpu/inkling2_dspark_bench.zig"),
