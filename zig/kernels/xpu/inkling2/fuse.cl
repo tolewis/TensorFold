@@ -302,7 +302,8 @@ KERNEL(256) void tf_ink2_pre_zeta(
     hv[i] = FUSE_PRE(acc);
     if (store_ar) ar[((size_t)src * rows + row) * H + t + 256 * i] = hv[i];
   }
-  barrier(CLK_GLOBAL_MEM_FENCE);
+  // No barrier here: hv is in registers, and the red entries that wg_sum writes next were last read before the
+  // barrier of the dots.
   global const float *m = messages + ((size_t)row * msg_entries + core * 4 + role) * H;
   float mv[H / 256];
   float ss1 = 0.0f, ss0 = 0.0f;
