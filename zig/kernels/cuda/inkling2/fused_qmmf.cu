@@ -10,10 +10,11 @@ struct FusedBI {
     int x, y, z;
 };
 
+template <int MODE>
 __device__ __forceinline__ void fused_unit(const __nv_bfloat16* __restrict__ x, const unsigned char* __restrict__ w,
                                         const uint8_t* __restrict__ bs, float scale, void* __restrict__ out,
                                         float* __restrict__ part, int N, int K, int SK, int npad, int tile, int slc) {
-    constexpr int MODE = MXFP8, BM = 16, BN = 64, WM = 1, WN = 4, STAGES = 4;
+    constexpr int BM = 16, BN = 64, WM = 1, WN = 4, STAGES = 4;
     constexpr bool F32 = false, CLUSTER = false, FUSE = false;
     const int M = 1, ldx = K, group = 1;
     const FusedBI fbi = {tile, 0, slc};
@@ -26,9 +27,14 @@ __device__ __forceinline__ void fused_unit(const __nv_bfloat16* __restrict__ x, 
 // Unit (tile, slc) of a one-row MXFP8 call. `part` is [SK][N] fp32 when SK > 1. Dynamic shared memory: the body's.
 extern "C" __device__ void fz_qmmf_unit(const __nv_bfloat16* __restrict__ x, const unsigned char* __restrict__ w,
                                         const uint8_t* __restrict__ bs, float scale, void* __restrict__ out,
-                                        float* __restrict__ part, int N, int K, int SK, int npad, int tile, int slc) {
+                                        float* __restrict__ part, int N, int K, int SK, int npad, int tile, int slc,
+                                        int mode) {
     __syncthreads();
-    tf_qmmf::fused_unit(x, w, bs, scale, out, part, N, K, SK, npad, tile, slc);
+    // the attention lanes are per-tensor FP8 (mini_model fp8Lane), the head MXFP8
+    if (mode == tf_qmmf::FP8)
+        tf_qmmf::fused_unit<tf_qmmf::FP8>(x, w, bs, scale, out, part, N, K, SK, npad, tile, slc);
+    else
+        tf_qmmf::fused_unit<tf_qmmf::MXFP8>(x, w, bs, scale, out, part, N, K, SK, npad, tile, slc);
 }
 
 // The tile sum of tile `tile`, threads 0 to 63 a column each, after every slice of the tile stored its part.

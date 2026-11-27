@@ -12,7 +12,7 @@ struct FzProj {          // one MXFP8 qmmf call of one row: out[N] = bf16(scale 
     void* out;            // bf16 [N]
     float* part;          // fp32 [SK][N] scratch
     float scale;
-    int N, K, SK, npad, pad;
+    int N, K, SK, npad, mode;  // mode: qmmf Mode (1 FP8, 2 MXFP8)
 };
 
 struct FzPrep {          // tf_ink2_prep8 (kernels.zig prep)

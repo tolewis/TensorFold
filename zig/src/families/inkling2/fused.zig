@@ -56,7 +56,7 @@ pub fn checking() bool {
 
 // ---- the table (fused_visit.cuh, field for field) ----
 
-pub const Proj = extern struct { x: u64 = 0, codes: u64 = 0, scales: u64 = 0, out: u64 = 0, part: u64 = 0, scale: f32 = 0, n: i32 = 0, k: i32 = 0, sk: i32 = 0, npad: i32 = 0, pad: i32 = 0 };
+pub const Proj = extern struct { x: u64 = 0, codes: u64 = 0, scales: u64 = 0, out: u64 = 0, part: u64 = 0, scale: f32 = 0, n: i32 = 0, k: i32 = 0, sk: i32 = 0, npad: i32 = 0, mode: i32 = 0 };
 
 pub const Prep = extern struct {
     q_raw: u64,
@@ -230,7 +230,7 @@ pub const State = struct {
         var mod = try cuda.Module.load(d, cuda.kernels.inkling2_fused);
         errdefer mod.unload();
         const f = try mod.function("tf_ink2_fused_visit");
-        const dyn: u32 = @max(attn.db8_shared, cuda.qmmf.sharedBytes(.mxfp8, 16), 4 * 5760);
+        const dyn: u32 = @max(@max(attn.db8_shared, cuda.qmmf.sharedBytes(.mxfp8, 16)), @max(cuda.qmmf.sharedBytes(.fp8, 16), 4 * 5760));
         try f.allowDynamicShared(dyn);
         var dev: cuda.abi.Device = 0;
         try d.check(d.api.cuCtxGetDevice(&dev), "cuCtxGetDevice");
@@ -289,11 +289,11 @@ pub fn takes(m: *const Model, r: anytype) bool {
 }
 
 fn proj1(m: *const Model, w: cuda.qmmf.Weight, x: u64, out: u64, part: u64) !Proj {
-    if (w.mode != .mxfp8) return error.FusedWeightMode;
+    if (w.mode != .mxfp8 and w.mode != .fp8) return error.FusedWeightMode;
     const p = cuda.qmmf.planFor(1, w, true);
     if (p.fused or p.bm != 16) return error.FusedPlan;
     _ = m;
-    return .{ .x = x, .codes = w.codes, .scales = w.scales, .out = out, .part = part, .scale = w.scale, .n = @intCast(w.n), .k = @intCast(w.k), .sk = @intCast(p.sk), .npad = @intCast(w.npad) };
+    return .{ .x = x, .codes = w.codes, .scales = w.scales, .out = out, .part = part, .scale = w.scale, .n = @intCast(w.n), .k = @intCast(w.k), .sk = @intCast(p.sk), .npad = @intCast(w.npad), .mode = @intCast(@backingInt(w.mode)) };
 }
 
 fn scaleOf(h: usize) f32 {

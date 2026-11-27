@@ -39,7 +39,8 @@ extern "C" __device__ void fz_merge(int rh, const float* part_o, const float2* p
                                     const uint16_t* gate, const int* rpos, uint16_t* out, int heads, int window,
                                     int chunk, int c0, int chunks, int subs);
 extern "C" __device__ void fz_qmmf_unit(const __nv_bfloat16* x, const unsigned char* w, const uint8_t* bs, float scale,
-                                        void* out, float* part, int N, int K, int SK, int npad, int tile, int slc);
+                                        void* out, float* part, int N, int K, int SK, int npad, int tile, int slc,
+                                        int mode);
 extern "C" __device__ void fz_qmmf_tile_sum(const float* part, __nv_bfloat16* out, int N, int SK, float scale,
                                             int tile);
 extern "C" __device__ void fz_gate_down(const LoopGateArgs& a, int g, int z, float* xs, float* sh);
@@ -133,7 +134,7 @@ __device__ void proj_phase(const FzProj* p, int n, const Ctx& c, int call0) {
         const FzProj& q = p[i];
         const int tile = (u - base) / q.SK, slc = (u - base) % q.SK;
         fz_qmmf_unit(static_cast<const __nv_bfloat16*>(q.x), q.codes, q.scales, q.scale, q.out, q.part, q.N, q.K, q.SK,
-                     q.npad, tile, slc);
+                     q.npad, tile, slc, q.mode);
         if (q.SK > 1) {
             __syncthreads();
             if (threadIdx.x == 0) {
