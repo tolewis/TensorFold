@@ -22,7 +22,7 @@ pub const Cache = struct {
 };
 pub const RowMeta = struct { pos: Ref, seg_of: Ref, segs: Ref };
 
-pub const Error = planning.Error || xpu.Error || error{OutOfMemory};
+pub const Error = planning.Error || xpu.Error || error{ OutOfMemory, Inkling2Int8Prompt };
 
 /// The merge over eight sub-groups of chunk ranges. It regroups the fold, so it is bit-identical only where the row
 /// count is one; every other row count keeps the serial fold. Off by default: at long context a one-row decode regroups
@@ -51,7 +51,6 @@ const names = struct {
     const merge: Entry = .{ .name = "tf_ink2_merge", .threads = planning.merge_threads };
     const merge_split: Entry = .{ .name = "tf_ink2_merge_split", .threads = planning.merge_threads };
     const prompt: Entry = .{ .name = "tf_ink2_attn_prompt", .threads = planning.prompt_threads };
-    const prompt8: Entry = .{ .name = "tf_ink2_attn_prompt8", .threads = planning.prompt_threads };
 };
 
 /// The kernels of two loaded images: `attention` holds prep, relative table, decode and merge (bf16 and int8 entries);
@@ -67,7 +66,6 @@ pub const Kernels = struct {
     merge: xpu.Kernel,
     merge_split: xpu.Kernel,
     prompt: xpu.Kernel,
-    prompt8: xpu.Kernel,
 
     pub fn init(attention: xpu.Module, prompt: xpu.Module) xpu.Error!Kernels {
         var k: Kernels = undefined;
@@ -90,12 +88,9 @@ pub const Kernels = struct {
         k.merge_split = try attention.kernel(names.merge_split.name, .{ names.merge_split.threads, 1, 1 });
         errdefer k.merge_split.deinit();
         k.prompt = try prompt.kernel(names.prompt.name, .{ names.prompt.threads, 1, 1 });
-        errdefer k.prompt.deinit();
-        k.prompt8 = try prompt.kernel(names.prompt8.name, .{ names.prompt8.threads, 1, 1 });
         return k;
     }
     pub fn deinit(k: *Kernels) void {
-        k.prompt8.deinit();
         k.prompt.deinit();
         k.merge_split.deinit();
         k.merge.deinit();
@@ -191,12 +186,8 @@ pub fn attendAs(k: *const Kernels, s: xpu.Stream, path: planning.Path, r: planni
             });
         }
     } else if (kv.int8) {
-        try xpu.launch.dispatch(k.prompt8, s, launch.grid, .{
-            q.at(),       kv.k.at(),   kv.kscale.at(),    kv.v.at(),    kv.vscale.at(),
-            tab.at(),     meta.segs.at(), part_o.at(),    part_ml.at(), r.heads,
-            r.kv_heads,   l.ring,      launch.chunk,      @as(u32, 0),  launch.partials_rh,
-            scale,
-        });
+        // the prompt kernel reads bf16 only: an int8 cache enters it as a bf16 copy (`dequant8`, the prefill's global visit)
+        return error.Inkling2Int8Prompt;
     } else {
         try xpu.launch.dispatch(k.prompt, s, launch.grid, .{
             q.at(),     kv.k.at(),   kv.v.at(),       tab.at(),     meta.segs.at(),

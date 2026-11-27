@@ -4,12 +4,12 @@
 //! default. `--splits N` sets the decode chunk the server uses (`flash_splits`, 64 live), zero keeps the layer chunk.
 //! `--check` times nothing: it fills int8 codes with power-of-two scales and a bf16 cache that holds each code times its
 //! scale exactly, then requires `tf_ink2_attn_decode8` to give the partials and the output of `tf_ink2_attn_decode` bit
-//! for bit, at the layer chunk and at 128 splits, and `tf_ink2_attn_prompt8` those of `tf_ink2_attn_prompt` (a code times
-//! a power-of-two scale rounds to itself in bf16, so the prompt read's V rounding changes nothing). Exit 1 on a difference.
+//! for bit, at the layer chunk and at 128 splits. An int8 prompt case reads the bf16 copy (`tf_ink2_kv_dequant8`, then
+//! `tf_ink2_attn_prompt`, the prefill's global visit) and must give the bf16 cache's bits. Exit 1 on a difference.
 //! `--check-real` uses the prep rule's own scales (`amax / 127`, rows of very different size) and a host reference for
-//! each of the five int8 kernels: `tf_ink2_prep8` (codes and scales), `tf_ink2_prep8q` (the bf16 stage) and
+//! each int8 kernel: `tf_ink2_prep8` (codes and scales), `tf_ink2_prep8q` (the bf16 stage) and
 //! `tf_ink2_kv_dequant8` must equal the bf16 prep followed by the host quantize rule bit for bit, and the prep8q stage
-//! must equal dequant8 of the prep8 ring. `tf_ink2_attn_decode8` and `tf_ink2_attn_prompt8` go against an fp64 host
+//! must equal dequant8 of the prep8 ring. `tf_ink2_attn_decode8` and the int8 prompt read go against an fp64 host
 //! partial (top, weight sum, weighted mean of V) on the exact values `code * scale`, beside the bf16 kernels on
 //! `bf16(code * scale)`. Exit 1 on a difference or an error above the bounds of `real_bounds`.
 const std = @import("std");
@@ -169,11 +169,12 @@ fn check(a: std.mem.Allocator, dev: *rig_.Dev, k: *const attn.Kernels, rng: std.
             defer a.free(zeros);
             @memset(zeros, 0);
             var got: [2][3][]u8 = undefined;
+            const copy = try promptCopy(&rig, ring);
             for ([_]attn.Cache{ bf, i8c }, 0..) |c, w| {
                 // a slot no chunk writes keeps its bytes from the first kernel: clear both before each
                 try rig.put(po.ptr, zeros);
                 try rig.put(pml.ptr, zeros[0..pml_n]);
-                try attn.attendAs(k, dev.s, path, r, layer, stride, meta, qd, c, tabd, po, pml, sinkd, gated, out);
+                try attn.attendAs(k, dev.s, path, r, layer, stride, meta, qd, try readAs(k, dev, c, copy, cs, layer), tabd, po, pml, sinkd, gated, out);
                 got[w][0] = try a.dupe(u8, try rig.bytes(po.ptr, po_n));
                 got[w][1] = try a.dupe(u8, try rig.bytes(pml.ptr, pml_n));
                 got[w][2] = try a.dupe(u8, try rig.bytes(out.ptr, out_n));
@@ -537,8 +538,9 @@ fn checkReal(a: std.mem.Allocator, dev: *rig_.Dev, k: *const attn.Kernels, rng: 
             const path: plan.Path = if (cs.prompt) .prompt else .decode;
             const launch = try plan.attendAs(r, layer, stride, path);
             var errs: [2]RealErr = undefined;
+            const copy = try promptCopy(&rig, ring);
             for ([_]attn.Cache{ bf, i8c }, 0..) |c, w| {
-                try attn.attendAs(k, dev.s, path, r, layer, stride, meta, qd, c, tabd, po, pml, sinkd, gated, out);
+                try attn.attendAs(k, dev.s, path, r, layer, stride, meta, qd, try readAs(k, dev, c, copy, cs, layer), tabd, po, pml, sinkd, gated, out);
                 const pob = try a.dupe(u8, try rig.bytes(po.ptr, po_n));
                 defer a.free(pob);
                 const pmlb = try a.dupe(u8, try rig.bytes(pml.ptr, pml_n));
@@ -546,13 +548,26 @@ fn checkReal(a: std.mem.Allocator, dev: *rig_.Dev, k: *const attn.Kernels, rng: 
                 errs[w] = realErrors(cs, layer, launch.chunk, stride, q, tab, pos, kref, vref, vrms, @alignCast(std.mem.bytesAsSlice(f32, pob)), @alignCast(std.mem.bytesAsSlice([2]f32, pmlb)));
             }
             const ok = errs[1].ok();
-            std.debug.print("CHECK-REAL splits {d} chunk {d}, {s}, {s}: against fp64, top / sum / mean error: int8 {e:.2} / {e:.2} / {e:.2}, bf16 cache of bf16(code * scale) {e:.2} / {e:.2} / {e:.2}{s}\n", .{ splits, launch.chunk, cs.name, if (cs.prompt) "tf_ink2_attn_prompt8" else "tf_ink2_attn_decode8", errs[1].top, errs[1].sum, errs[1].mean, errs[0].top, errs[0].sum, errs[0].mean, if (ok) "" else ", ABOVE BOUND" });
+            std.debug.print("CHECK-REAL splits {d} chunk {d}, {s}, {s}: against fp64, top / sum / mean error: int8 {e:.2} / {e:.2} / {e:.2}, bf16 cache of bf16(code * scale) {e:.2} / {e:.2} / {e:.2}{s}\n", .{ splits, launch.chunk, cs.name, if (cs.prompt) "tf_ink2_kv_dequant8 then tf_ink2_attn_prompt" else "tf_ink2_attn_decode8", errs[1].top, errs[1].sum, errs[1].mean, errs[0].top, errs[0].sum, errs[0].mean, if (ok) "" else ", ABOVE BOUND" });
             if (!ok) failed += 1;
             cases_run += 1;
         }
     }
     std.debug.print("CHECK-REAL {s}: {d} of {d} cases fail (bounds: top {e:.1}, sum {e:.1}, mean {e:.1})\n", .{ if (failed == 0) "PASS" else "FAIL", failed, cases_run, real_bounds.top, real_bounds.sum, real_bounds.mean });
     return failed;
+}
+
+/// The bf16 copy an int8 cache's global prompt visit reads: K and V of KV heads over `ring` positions.
+fn promptCopy(rig: anytype, ring: usize) !attn.Cache {
+    return .{ .k = .{ .ptr = try rig.scratch(KV * ring * D * 2) }, .v = .{ .ptr = try rig.scratch(KV * ring * D * 2) } };
+}
+
+/// The cache a launch reads: an int8 cache on the prompt path enters as its bf16 copy, `tf_ink2_kv_dequant8` of every
+/// key up to the case's last one, as the prefill does a global visit. Every other launch reads the cache itself.
+fn readAs(k: *const attn.Kernels, dev: anytype, c: attn.Cache, copy: attn.Cache, cs: Case, layer: plan.Layer) !attn.Cache {
+    if (!c.int8 or !cs.prompt) return c;
+    try attn.dequant8(k, dev.s, c, copy, 0, layer.ring, layer.ring, cs.k, KV);
+    return copy;
 }
 
 pub fn main(init: std.process.Init) !u8 {
@@ -595,7 +610,7 @@ pub fn main(init: std.process.Init) !u8 {
         const d8 = try dev.properties(k.decode8);
         std.debug.print("BENCH kernel properties: tf_ink2_prep8 {d} spill bytes, {d} private bytes; tf_ink2_attn_decode8 {d} spill bytes, {d} private bytes\n", .{ p8.spillMemSize, p8.privateMemSize, d8.spillMemSize, d8.privateMemSize });
     }
-    for ([_]struct { []const u8, xpu.Kernel }{ .{ "tf_ink2_attn_prompt", k.prompt }, .{ "tf_ink2_attn_prompt8", k.prompt8 } }) |e| {
+    for ([_]struct { []const u8, xpu.Kernel }{.{ "tf_ink2_attn_prompt", k.prompt }}) |e| {
         const p = try dev.properties(e[1]);
         std.debug.print("BENCH kernel properties: {s} {d} spill bytes, {d} private bytes, {d} local bytes, {d} arguments\n", .{ e[0], p.spillMemSize, p.privateMemSize, p.localMemSize, p.numKernelArgs });
         const occ = occupancy(&dev, e[1]);
@@ -700,12 +715,13 @@ pub fn main(init: std.process.Init) !u8 {
         const out: attn.Ref = .{ .ptr = try rig.output(@as(usize, rows) * H * D * 2) };
         const r: plan.Rows = .{ .rows = rows, .last_pos = cs.k - 1 };
         const path: plan.Path = if (cs.prompt) .prompt else .decode;
+        const copy = try promptCopy(&rig, ring);
         var t_decode: i96 = 0;
         var t_enqueue: i96 = 0;
         for (0..2) |pass| {
             const t0 = ms(init.io);
             for (0..reps) |i| {
-                try attn.attendAs(&k, dev.s, path, r, layer, stride, meta, qd, kv[i % sets], tabd, po, pml, sinkd, gated, out);
+                try attn.attendAs(&k, dev.s, path, r, layer, stride, meta, qd, try readAs(&k, &dev, kv[i % sets], copy, cs, layer), tabd, po, pml, sinkd, gated, out);
                 if (sync_each) try dev.s.synchronize();
             }
             const t1 = ms(init.io);
@@ -735,15 +751,10 @@ pub fn main(init: std.process.Init) !u8 {
                         } else {
                             try xpu.launch.dispatch(k.decode, dev.s, launch.grid, .{ qd.at(), c.k.at(), c.v.at(), tabd.at(), meta.segs.at(), po.at(), pml.at(), meta.pos.at(), meta.seg_of.at(), @as(u32, H), @as(u32, KV), layer.ring, layer.window, launch.chunk, @as(u32, 0), launch.partials_rh, sc });
                         }
-                    } else if (which == 0 and kv_int8) {
-                        try xpu.launch.dispatch(k.prompt8, dev.s, launch.grid, .{
-                            qd.at(),          c.k.at(),      c.kscale.at(), c.v.at(),         c.vscale.at(),
-                            tabd.at(),        meta.segs.at(), po.at(),       pml.at(),        @as(u32, H),
-                            @as(u32, KV),     layer.ring,    launch.chunk,  @as(u32, 0),     launch.partials_rh,
-                            sc,
-                        });
                     } else if (which == 0) {
-                        try xpu.launch.dispatch(k.prompt, dev.s, launch.grid, .{ qd.at(), c.k.at(), c.v.at(), tabd.at(), meta.segs.at(), po.at(), pml.at(), @as(u32, H), @as(u32, KV), layer.ring, launch.chunk, @as(u32, 0), launch.partials_rh, sc });
+                        // an int8 cache: the dequant of every key to the bf16 copy, then the prompt kernel (the prefill's order)
+                        const b = try readAs(&k, &dev, c, copy, cs, layer);
+                        try xpu.launch.dispatch(k.prompt, dev.s, launch.grid, .{ qd.at(), b.k.at(), b.v.at(), tabd.at(), meta.segs.at(), po.at(), pml.at(), @as(u32, H), @as(u32, KV), layer.ring, launch.chunk, @as(u32, 0), launch.partials_rh, sc });
                     } else {
                         try xpu.launch.dispatch(k.merge, dev.s, launch.merge_grid, .{ po.at(), pml.at(), sinkd.at(), gated.at(), meta.pos.at(), out.at(), @as(u32, H), layer.window, launch.chunk, @as(u32, 0), launch.partials_rh, @as(u32, 1) });
                     }

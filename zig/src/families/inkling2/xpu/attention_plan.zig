@@ -69,7 +69,7 @@ comptime {
     if (@sizeOf(Seg) != 24) @compileError("Inkling attention segment ABI drift");
 }
 
-/// The int8 kernels add `off` to the code pointers only (bytes in prep8, decode8 and prompt8, bf16 values in prep8q) and
+/// The int8 kernels add `off` to the code pointers only (bytes in prep8 and decode8, bf16 values in prep8q) and
 /// not to the scale pointers, and dequant8 reads no segment. So an int8 cache takes no segment offset: refuse one.
 pub fn checkSegs(segs: []const Seg, int8: bool) error{Inkling2Int8SegmentOffset}!void {
     if (!int8) return;
