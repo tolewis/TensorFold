@@ -39,6 +39,29 @@ test "inkling2 xpu decode and prompt dispatch geometry" {
     try t.expectEqual(p.Path.decode, gd.path);
     try t.expectEqual([3]u32{ 8, 4096, 1 }, gd.grid);
     try t.expectError(error.Inkling2Partials, p.attend(one, gl, 4095));
+    // R7: the grid holds the live chunks, not the partial stride
+    const short = try p.attend(.{ .rows = 1, .last_pos = 1023 }, gl, 4096);
+    try t.expectEqual([3]u32{ 8, 4, 1 }, short.grid);
+    try t.expectEqual(@as(u32, 1), (try p.attend(.{ .rows = 1, .last_pos = 0 }, gl, 4096)).grid[1]);
+    try t.expectEqual(@as(u32, 1), (try p.attend(.{ .rows = 1, .last_pos = 0 }, sl, 17)).grid[1]);
+    // a window: positions 1024 (lo 1, chunk 0 .. 16) and 1023 (chunk 0 .. 15) at chunk 64
+    try t.expectEqual(@as(u32, 17), (try p.attend(.{ .rows = 2, .last_pos = 1024 }, sl, 17)).grid[1]);
+    try t.expectEqual(@as(u32, 16), (try p.attend(.{ .rows = 1, .last_pos = 1023 }, sl, 17)).grid[1]);
+    try t.expectEqual(@as(u32, 16), (try p.attend(.{ .rows = 1, .last_pos = 1087 }, sl, 17)).grid[1]);
+    // 128 splits: a 40,001-key global visit at chunk 320 (126 chunks), a 1,024-key window at chunk 16 (65 at most)
+    p.flash_splits = 128;
+    defer p.flash_splits = 0;
+    const g40 = try p.attend(.{ .rows = 1, .last_pos = 40000 }, p.Layer.global(40072), 157);
+    try t.expectEqual(@as(u32, 320), g40.chunk);
+    try t.expectEqual(@as(u32, 126), g40.grid[1]);
+    const s40 = try p.attend(.{ .rows = 1, .last_pos = 40000 }, p.Layer.sliding(1024, 1), 157);
+    try t.expectEqual(@as(u32, 16), s40.chunk);
+    try t.expectEqual(@as(u32, 65), s40.grid[1]);
+    for ([_]u32{ 39999, 40000, 40015, 40016 }) |pos| {
+        const s1 = try p.attend(.{ .rows = 1, .last_pos = pos }, p.Layer.sliding(1024, 1), 157);
+        const lo = pos + 1 - 1024;
+        try t.expectEqual(pos / s1.chunk + 1 - lo / s1.chunk, s1.grid[1]);
+    }
     try t.expectError(error.Inkling2Heads, p.attend(.{ .rows = 1, .last_pos = 5, .heads = 16 }, gl, 4096));
     const prompt = try p.attend(.{ .rows = 130, .last_pos = 20000 }, gl, 79);
     try t.expectEqual(p.Path.prompt, prompt.path);
