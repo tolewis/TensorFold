@@ -187,7 +187,7 @@ pub fn mix(k: *const Kernels, s: cuda.Stream, m: MixArgs) !void {
             const b = std.fmt.parseInt(i32, std.mem.span(v), 10) catch 0;
             if (b == 2 or b == 4 or b == 8 or b == 16) {
                 const grid: cuda.Dim3 = .{ .x = @intCast(m.rows), .y = @intCast(b) };
-                const threads: u32 = @intCast(512 / b);
+                const threads: u32 = @intCast(@divTrunc(512, b));
                 try go(k.mix_a, s, grid, threads, &a);
                 try go(k.mix_b, s, grid, threads, &a);
                 try go(k.mix_c, s, grid, threads, &a);
