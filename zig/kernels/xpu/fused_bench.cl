@@ -31,6 +31,7 @@ FB_SGA kernel void fb_phase(global uint *sync, global uint *stamp, global uint *
   fb_enter(mech, sync);
   fb_enter(mech, sync);
   fb_enter(mech, sync);
+  fb_enter(mech, sync);
   for (uint r = 1u; r <= rounds; ++r) {
     if (work_u4 != 0u) {
       const ulong base = (ulong)((r * G + g) % nwin) * work_u4;
@@ -45,7 +46,8 @@ FB_SGA kernel void fb_phase(global uint *sync, global uint *stamp, global uint *
       return;
     }
     if (mech != FB_NONE && lid == checker) {
-      const uint v = stamp[((g + 1u) % G) * FB_LINE];
+// local barrier, 3 the device-scope fence alone, 4 the release fence of fb_arrive alone (fb_rel), 5 the acquire fence
+// of fb_wait alone (fb_acq) (review C8). Two local buffers alternate, so one barrier a round is enough.
       if (v < r) atomic_inc(fault + 1);
     }
   }
@@ -56,6 +58,16 @@ FB_SGA kernel void fb_phase(global uint *sync, global uint *stamp, global uint *
 // local barrier, 3 the device-scope fence alone. Two local buffers alternate, so one barrier a round is enough.
 FB_SGA kernel void fb_wgbar(global uint *sink, uint rounds, uint mode) {
   local uint s[2048];
+    if (mode == 4u) {
+      fb_rel();
+      acc += r;
+      continue;
+    }
+    if (mode == 5u) {
+      fb_acq();
+      acc += r;
+      continue;
+    }
   const uint lid = get_local_id(0), L = get_local_size(0);
   uint acc = lid;
   for (uint r = 0u; r < rounds; ++r) {
@@ -92,6 +104,7 @@ static inline ushort fb_q8_col(global const ushort *x, global const uchar *codes
   Q8_DOT(1, x, codes, scales, j, n, FB_ROW)
   return Q8_STORE(sub_group_reduce_add(acc[0]));
 }
+  fb_enter(mech, sync);
 
   fb_enter(mech, sync);
 // B4: `reps` Q8 matvec phases of n columns, each on its own weight window (win_stride bytes apart, nwin windows),
@@ -119,6 +132,7 @@ FB_SGA kernel void fb_q8(global const uchar *w, global const ushort *x, global u
     if (fb_wait(mech, sync, fault, r + 1u, spin_cap, &lf) != 0u) {
       return;
     }
+  fb_enter(mech, sync);
   }
 }
   fb_enter(mech, sync);
@@ -160,6 +174,7 @@ FB_SGA kernel void fb_stream(global const uchar *w, global ushort *xbuf, global 
     if (pf_lines != 0u) {
       const uint k = i + 1u;
       global const uchar *nc = w + (ulong)((k / phases) % 24u) * pass_stride + (ulong)(k % phases) * win_stride;
+  fb_enter(FB_A, sync);
       for (uint l = lane; l < pf_lines; l += 16u) {
         const uint col = gs + (l / 36u) * T;
         if (col < n) prefetch(nc + (ulong)col * FB_ROW + (l % 36u) * 64u, 64);
@@ -280,6 +295,7 @@ FB_SGA kernel void fb_nv_check(global const uint2 *w, global const float *phis, 
       for (uint p = 0u; p < nphi; ++p) {
         const int8 o = tf_ink2_nv_frag(v.x, v.y, scale, phis[p]);
         const int8 n = fb_nv_frag_new(v.x, v.y, scale, phis[p], &guard);
+  fb_enter(FB_A, sync);
         const int8 d = o ^ n;
         bad += (uint)(d.s0 != 0) + (uint)(d.s1 != 0) + (uint)(d.s2 != 0) + (uint)(d.s3 != 0) + (uint)(d.s4 != 0) +
                (uint)(d.s5 != 0) + (uint)(d.s6 != 0) + (uint)(d.s7 != 0);
@@ -332,6 +348,26 @@ FB_SGA kernel void fb_nv_phase(global const uchar *w, global const ushort *x, gl
         global const uchar *sr = scales + (ulong)row * nb;
         for (uint c = ks; c < nb / 8u; c += 3u) {
           const uint16 v = vload16(0, (global const uint *)(wr + 64u * c));
+
+// Review C1: the tm0 rate beside a full grid. Every work-item of every group reads its group's window of `work_u4`
+// uint4 `passes` times. Lane 0 of group 0 stores its tm0 ticks from its start to its end; the host divides by the
+// event time of the launch (all groups do the same reads, so group 0 runs about as long as the launch).
+FB_SGA kernel void fb_tsc_grid(global const uint4 *data, global ulong *o, uint passes, uint work_u4) {
+  const ulong t0 = __builtin_IB_read_cycle_counter();
+  const uint g = get_group_id(0), lid = get_local_id(0), L = get_local_size(0);
+  const ulong base = (ulong)g * work_u4;
+  uint acc = 0u;
+  for (uint p = 0u; p < passes; ++p) {
+    __attribute__((opencl_unroll_hint(8))) for (uint i = lid; i < work_u4; i += L) {
+      const uint4 v = data[base + i];
+      acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    acc += p;
+  }
+  work_group_barrier(CLK_LOCAL_MEM_FENCE);
+  if (g == 0u && lid == 0u) o[0] = __builtin_IB_read_cycle_counter() - t0;
+  if (acc == 0x9e3779b9u) o[2 + g] = acc;
+}
           const uint2 s2 = vload2(0, (global const uint *)(sr + 8u * c));
 #pragma unroll
           for (int u = 0; u < 8; u++) {
