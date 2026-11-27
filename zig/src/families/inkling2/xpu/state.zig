@@ -300,6 +300,7 @@ pub const Cache = struct {
     pub fn saveAt(c: *Cache, at: usize) !void {
         if (c.pending != null) return error.Inkling2CacheTransaction;
         if (at > c.capacity or at < c.len) return error.Inkling2SnapshotGeometry;
+        c.len = at;
     }
 
     /// Commit accepted rows: staged taps select the new state; rejected KV positions are overwritten on replay.

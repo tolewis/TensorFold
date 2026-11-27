@@ -26,7 +26,8 @@ const magic_at: usize = 8;
 /// Rank 1 checks the map's magic when it attaches: a rank 0 of another binary maps the ring at other offsets, so every
 /// record it reads is garbage. A mismatch stops the follower at start with a clear line.
 pub fn checkMagic(map: []const u8) !void {
-    _ = map;
+    if (map.len < magic_at + 8) return error.Inkling2TpMagic;
+    if (std.mem.readInt(u64, map[magic_at..][0..8], .little) != magic) return error.Inkling2TpMagic;
 }
 
 const IpcHandle = extern struct { data: [64]u8 };
@@ -824,4 +825,23 @@ test "finding 1: the production shape, a lone round with no drafts at TP 2" {
     try h.feed(recOf(.forward, 1 | 8, 1, &.{.{ .slot = 0, .rows = 1, .base = 2056, .capacity = 4096 }}));
     try h.feed(recOf(.keep, 0, 0, &.{.{ .slot = 0, .rows = 1, .base = 2056, .capacity = 4096, .accepted = 1 }}));
     try t.expectEqual(@as(usize, 2057), h.cache[0].len);
+}
+
+test "finding 2: a follower's save covers the rows past its last chunk base" {
+    const t = std.testing;
+    var h: Host = .{};
+    // A prompt in two chunks of an 8k stream: 2048 rows at 0, then 1898 at 2048.
+    try h.feed(recOf(.forward, 4, 2048, &.{.{ .slot = 0, .rows = 2048, .base = 0, .capacity = 8192 }}));
+    try h.feed(recOf(.forward, 4, 1898, &.{.{ .slot = 0, .rows = 1898, .base = 2048, .capacity = 8192 }}));
+    try t.expectEqual(@as(usize, 2048), h.cache[0].len);
+    // The leader saves at 3946: the follower's snapshot must carry all 3946 rows, not the last chunk base.
+    try h.feed(recOf(.save, 0, 7, &.{.{ .slot = 0, .rows = 0, .base = 3946, .capacity = 8192 }}));
+    try t.expectEqual(@as(usize, 3946), h.cache[0].len);
+    try t.expectEqual(@as(usize, 3946), h.snap[3].at);
+    try t.expectEqual(snapshot.bytes(3946, .bf16), h.snap[3].bytes);
+    // The rows between the last chunk base and the save position are the rows that were fed.
+    try t.expectEqual(@as(usize, 1898), h.snap[3].at - 2048);
+    // A restore into a new slot takes that length, so the cached prompt starts at 3946.
+    try h.feed(recOf(.restore, 0, 7, &.{.{ .slot = 2, .rows = 0, .base = 0, .capacity = 8192 }}));
+    try t.expectEqual(@as(usize, 3946), h.cache[2].len);
 }

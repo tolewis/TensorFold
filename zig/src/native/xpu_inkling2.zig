@@ -582,6 +582,12 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
                     std.log.err("inkling2_loop: rank 1 save ({s})", .{@errorName(err)});
                     return false;
                 };
+                // The follower's own length stops at the last chunk base: the leader's `at` covers the rows it ran past it.
+                c.saveAt(e.at) catch |err| {
+                    std.log.err("inkling2_loop: rank 1 save position ({s})", .{@errorName(err)});
+                    gpa.destroy(snap);
+                    return false;
+                };
                 snap.* = ink.snapshot.save(&rt, c) catch |err| {
                     std.log.err("inkling2_loop: rank 1 save ({s})", .{@errorName(err)});
                     gpa.destroy(snap);
