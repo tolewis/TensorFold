@@ -222,6 +222,7 @@ pub const State = struct {
     ref: cuda.DeviceBuffer, // check: today's bytes of each compared buffer
     save: cuda.DeviceBuffer, // check: the conv states before the visit
     ev: [4]cuda.abi.Event = @splat(null),
+    at: []const u8 = "",
     steps: [visits_max]usize = @splat(0),
     bad: [visits_max]usize = @splat(0),
 
@@ -544,15 +545,16 @@ pub fn fill(f: *const State, m: *Model, r: anytype, v: u32, hin: u64, hout: u64,
 // ---- check mode ----
 
 const Kind = enum { bf16, f32, f16, i32, u8 };
+const list_max = 96; // a gated global visit lists 65 buffers
 const Buf = struct { name: []const u8, ptr: u64, len: usize, kind: Kind };
 
-fn buffers(m: *Model, r: anytype, v: u32, hout: u64, vis: *const Visit, out: *[48]Buf) usize {
+fn buffers(m: *Model, r: anytype, v: u32, hout: u64, vis: *const Visit, out: *[list_max]Buf) usize {
     const t = m.c;
     const h: usize = t.hidden;
     var n: usize = 0;
     const add = struct {
-        fn add(o: *[48]Buf, k: *usize, name: []const u8, ptr: u64, len: usize, kind: Kind) void {
-            if (ptr == 0 or len == 0) return;
+        fn add(o: *[list_max]Buf, k: *usize, name: []const u8, ptr: u64, len: usize, kind: Kind) void {
+            if (ptr == 0 or len == 0 or k.* == list_max) return;
             o[k.*] = .{ .name = name, .ptr = ptr, .len = len, .kind = kind };
             k.* += 1;
         }
@@ -647,17 +649,27 @@ fn every() usize {
 
 /// Visit `v` by today's kernels (`today`), then by the fused kernel from the same state; compare; keep today's bytes.
 pub fn check(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytype, v: u32, hin: u64, hout: u64, today: anytype) !void {
+    checkSteps(f, m, k, s, r, v, hin, hout, today) catch |e| {
+        std.debug.print("[fused-check] visit {d} pos {d}: {s} at step {s}\n", .{ v, r.last_pos, @errorName(e), f.at });
+        return e;
+    };
+}
+
+fn checkSteps(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytype, v: u32, hin: u64, hout: u64, today: anytype) !void {
     const d = f.d;
-    const gpa = m.gpa;
+    const gpa = std.heap.page_allocator; // not the model's allocator: the check's buffers live for one visit
+    f.at = "fill";
     var host: [arg_bytes]u8 = undefined;
     const vis = fill(f, m, r, v, hin, hout, &host) catch |e| {
         if (f.steps[v] == 0) std.debug.print("[fused-check] visit {d}: not a Part 2 visit ({s}), today's kernels\n", .{ v, @errorName(e) });
         f.steps[v] += 1;
         return today.run(m, k, s, r, v, hin, hout);
     };
-    try m.upload(s, f.args.ptr + @as(u64, v) * arg_bytes, &host);
-    try m.upload(s, f.table.ptr + @as(u64, v) * @sizeOf(Visit), std.mem.asBytes(&vis));
-    var list: [48]Buf = undefined;
+    f.at = "upload";
+    try s.synchronize();
+    try f.args.upload(@as(usize, v) * arg_bytes, &host);
+    try f.table.upload(@as(usize, v) * @sizeOf(Visit), std.mem.asBytes(&vis));
+    var list: [list_max]Buf = undefined;
     const nbuf = buffers(m, r, v, hout, &vis, &list);
     // the conv states before the visit
     var saved: usize = 0;
@@ -665,9 +677,11 @@ pub fn check(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytype
         try m.copy(s, f.save.ptr + saved, b.ptr, b.len);
         saved += b.len;
     };
+    f.at = "today";
     try s.synchronize();
     try d.check(d.api.cuEventRecord(f.ev[0], s.handle), "cuEventRecord");
     try today.run(m, k, s, r, v, hin, hout);
+    f.at = "ref";
     try d.check(d.api.cuEventRecord(f.ev[1], s.handle), "cuEventRecord");
     var at: usize = 0;
     for (list[0..nbuf]) |b| {
@@ -681,6 +695,7 @@ pub fn check(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytype
         saved += b.len;
     };
     try d.check(d.api.cuEventRecord(f.ev[2], s.handle), "cuEventRecord");
+    f.at = "fused";
     try f.launch(s, v, 1);
     try d.check(d.api.cuEventRecord(f.ev[3], s.handle), "cuEventRecord");
     try s.synchronize();
@@ -693,6 +708,7 @@ pub fn check(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytype
     var times: [times_visit]u64 = undefined;
     try cuda.memory.download(d, f.times.ptr + @as(u64, v) * times_visit * 8, std.mem.sliceAsBytes(&times));
     // compare
+    f.at = "compare";
     const step = f.steps[v];
     f.steps[v] += 1;
     var diff_total: usize = 0;
