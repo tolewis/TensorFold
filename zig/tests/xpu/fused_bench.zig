@@ -7,11 +7,20 @@ const xpu = @import("xpu");
 const ze = @import("ze");
 
 const reps = 5;
-// The spin cap in tm0 ticks: 50 ms at the rate fb_tsc measures at the start (brief section 6 rule 1, a faulted
-// launch ends in 100 ms or less). Block 2 had a cap of 20,000 polls, and M-f took 121 ms at G 32 and 119 ms at G 64
-// with 10,000 (an uncached poll costs more as G grows).
+// The spin cap in tm0 ticks (brief section 6 rule 1, a faulted launch ends in 100 ms or less). tm0 counts at the GT
+// clock, and the clock moves (review C1: fb_tsc read 1,946.7 and 2,794.9 ticks a us in two runs of block 4). So the
+// cap is 90,000 us at the lowest clock of the card (sysfs rpn_freq), and less at every faster clock. Block 4 had
+// 50,000 us at the fb_tsc rate, 349 ms at 400 MHz. Block 2 had a cap of 20,000 polls (M-f 121 ms at G 32).
 var spin_cap: u32 = 0;
-const cap_us: f64 = 50_000;
+// The cap of one wait at the lowest clock of the card (rpn). Block fix1 (2026-11-27 20:22Z) showed a forced launch
+// that ends up to 5.1 ms after its first cap at 2,800 MHz (M-f G 1,024: 17.98 ms against a 12.86 ms cap). A launch
+// at rpn takes up to 7 times as long, so a cap of 50 ms at rpn keeps the whole forced launch under 100 ms at rpn.
+const cap_low_us: f64 = 50_000;
+/// The GT clock range of the opened card in MHz (sysfs tile0/gt0/freq0 of its PCI address).
+const Freq = struct { rpn: u32 = 0, rp0: u32 = 0, min: u32 = 0, max: u32 = 0 };
+var card_freq: Freq = .{};
+var freq_dir_buf: [128]u8 = undefined;
+var freq_dir: []const u8 = "";
 const gib: usize = 1 << 30;
 
 const Shape = struct { g: u32, s: u32, grf: u32 };
@@ -28,6 +37,49 @@ const mech_names = [_][]const u8{ "none", "a", "b", "c", "e", "f" };
 
 fn nowNs(io: std.Io) i96 {
     return std.Io.Clock.awake.now(io).toNanoseconds();
+}
+
+fn readMhz(io: std.Io, name: []const u8) u32 {
+    var pbuf: [192]u8 = undefined;
+    const path = std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ freq_dir, name }) catch return 0;
+    const txt = std.Io.Dir.cwd().readFileAlloc(io, path, std.heap.page_allocator, .limited(4096)) catch return 0;
+    defer std.heap.page_allocator.free(txt);
+    return std.fmt.parseInt(u32, std.mem.trim(u8, txt, " \n"), 10) catch 0;
+}
+
+const PciGet = *const fn (ze.H, *PciProps) callconv(.c) u32;
+const PciProps = extern struct {
+    stype: u32 = 0x10008,
+    pNext: ?*anyopaque = null,
+    domain: u32 = 0,
+    bus: u32 = 0,
+    device: u32 = 0,
+    function: u32 = 0,
+    gen: i32 = -1,
+    width: i32 = -1,
+    bandwidth: i64 = -1,
+};
+
+/// Finds the sysfs clock folder of the opened card by its PCI address and reads the clock range (review C1).
+fn readFreq(io: std.Io, ctx: *xpu.Context) !void {
+    const get = @constCast(ctx.d).lib.lookup(PciGet, "zeDevicePciGetPropertiesExt") orelse return error.NoPciAddress;
+    var pci: PciProps = .{};
+    if (get(ctx.gpu.device, &pci) != 0) return error.NoPciAddress;
+    freq_dir = try std.fmt.bufPrint(&freq_dir_buf, "/sys/bus/pci/devices/{x:0>4}:{x:0>2}:{x:0>2}.{x}/tile0/gt0/freq0", .{ pci.domain, pci.bus, pci.device, pci.function });
+    card_freq = .{ .rpn = readMhz(io, "rpn_freq"), .rp0 = readMhz(io, "rp0_freq"), .min = readMhz(io, "min_freq"), .max = readMhz(io, "max_freq") };
+}
+
+/// Sets every argument of the tuple in order, as xpu.launch.dispatch does.
+fn setAll(k: xpu.Kernel, args: anytype) !void {
+    inline for (args, 0..) |v, i| {
+        const idx: u32 = i;
+        switch (comptime xpu.launch.argKind(@TypeOf(v))) {
+            .buffer => try k.setPtr(idx, v.ptr),
+            .pointer => try k.setPtr(idx, v),
+            .float => try k.setF32(idx, v),
+            .integer => try k.setU32(idx, @intCast(v)),
+        }
+    }
 }
 
 fn median(v: *[reps]i96) i96 {
@@ -748,7 +800,9 @@ fn benchNv(b: *B) !void {
 
 /// Rule 1 of brief section 6: a forced fault (the last group stops its arrivals at round 3) on fb_phase, 2,000 rounds.
 /// The small shape G 32 S 16 runs first, each mechanism once; any launch over 100 ms ends the bench with an error
-/// before any other spin run. Then the other shapes, each mechanism once.
+/// before any other spin run. Then the other shapes, each mechanism once. Review C1: each launch prints its host time,
+/// its device time (kernel timestamp event), the fault record with the tm0 ticks of the first capped group, and the
+/// tick rate in the spin (those ticks over the device time: rounds 1 and 2 take microseconds).
 fn benchForce(b: *B) !void {
     const Run = struct { g: u32, s: u32, mech: u32 };
     const first = [_]Run{ .{ .g = 32, .s = 16, .mech = 1 }, .{ .g = 32, .s = 16, .mech = 2 }, .{ .g = 32, .s = 16, .mech = 3 }, .{ .g = 32, .s = 16, .mech = 5 }, .{ .g = 32, .s = 1, .mech = 4 } };
@@ -760,7 +814,9 @@ fn benchForce(b: *B) !void {
         .{ .g = 64, .s = 16, .mech = 5 }, .{ .g = 128, .s = 8, .mech = 5 },
         .{ .g = 1024, .s = 1, .mech = 1 }, .{ .g = 1024, .s = 1, .mech = 2 }, .{ .g = 1024, .s = 1, .mech = 4 }, .{ .g = 1024, .s = 1, .mech = 5 },
     };
+    var timer = try Timer.init(b.ctx);
     const data = try b.big.at(0);
+    var worst: f64 = 0;
     for ([_][]const Run{ &first, &rest }, 0..) |list, li| {
         for (list) |run| {
             var k = try b.m256.kernel("fb_phase", .{ run.s * 16, 1, 1 });
@@ -772,16 +828,26 @@ fn benchForce(b: *B) !void {
             }
             try b.checkTime();
             try b.reset();
+            try setAll(k, .{ b.sync, b.stamp, b.fault, data, b.sink, @as(u32, 2000), spin_cap, run.mech | 0x100, @as(u32, 0) });
+            const mhz0 = readMhz(b.io, "act_freq");
             const t0 = nowNs(b.io);
-            try xpu.launch.dispatchCooperative(k, b.s, .{ run.g, 1, 1 }, .{ b.sync, b.stamp, b.fault, data, b.sink, @as(u32, 2000), spin_cap, run.mech | 0x100, @as(u32, 0) });
-            try b.s.synchronize();
+            const dev_us = try timer.run(b, k, .{ run.g, 1, 1 }, true);
             const ms = usOf(nowNs(b.io) - t0) / 1000.0;
+            const mhz1 = readMhz(b.io, "act_freq");
+            // The launch time at rpn: the device time at the clock of the launch, scaled to the lowest clock.
+            const mhz = if (@max(mhz0, mhz1) == 0) card_freq.rp0 else @max(mhz0, mhz1);
+            const at_rpn = dev_us / 1000.0 * @as(f64, @floatFromInt(mhz)) / @as(f64, @floatFromInt(card_freq.rpn));
+            worst = @max(worst, at_rpn);
             const f = try b.faultWords();
+            var fw: [36]u8 = undefined;
+            try b.fault.download(b.s, 0, &fw);
+            const ticks = (@as(u64, std.mem.readInt(u32, fw[32..36], .little)) << 32) | std.mem.readInt(u32, fw[28..32], .little);
             var cw: [8]u8 = undefined;
             try b.sync.download(b.s, 0, cw[0..4]);
             try b.sync.download(b.s, 64, cw[4..8]);
-            std.debug.print("BENCH force G {d} S {d} mech {s}: launch {d:.3} ms, fault word {d}, fault round {d}, counter {d}, generation {d}\n", .{
-                run.g, run.s, mech_names[run.mech], ms, f[0], f[2], std.mem.readInt(u32, cw[0..4], .little), std.mem.readInt(u32, cw[4..8], .little),
+            std.debug.print("BENCH force G {d} S {d} mech {s}: launch {d:.3} ms host, {d:.3} ms device at act_freq {d} to {d} MHz, {d:.3} ms at rpn, fault word {d}, fault round {d}, counter {d}, generation {d}, tick rate in the spin {d:.1} ticks a us\n", .{
+                run.g,                                  run.s,                                  mech_names[run.mech], ms, dev_us / 1000.0, mhz0, mhz1, at_rpn, f[0], f[2],
+                std.mem.readInt(u32, cw[0..4], .little), std.mem.readInt(u32, cw[4..8], .little), @as(f64, @floatFromInt(ticks)) / dev_us,
             });
             if (f[0] == 0 or ms > 100.0) {
                 std.debug.print("BENCH force FAILED at G {d} S {d} mech {s}: {s}\n", .{ run.g, run.s, mech_names[run.mech], if (f[0] == 0) "no fault" else "over 100 ms" });
@@ -790,6 +856,49 @@ fn benchForce(b: *B) !void {
         }
         if (li == 0) std.debug.print("BENCH force small shape passed\n", .{});
     }
+    std.debug.print("BENCH force passed: longest forced launch {d:.3} ms at rpn\n", .{worst});
+}
+
+/// Review C1: the tm0 rate in three states, each 3 times, with the card clock (sysfs act_freq) read before and after.
+/// (1) fb_tsc alone, (2) fb_tsc queued right after a 40 MB read over the full grid, (3) fb_tsc_grid, the rate inside a
+/// full grid that reads 1 GiB 4 times.
+fn benchTsc(b: *B) !void {
+    var timer = try Timer.init(b.ctx);
+    var kt = try b.m256.kernel("fb_tsc", .{ 16, 1, 1 });
+    defer kt.deinit();
+    var kg = try b.m256.kernel("fb_tsc_grid", .{ 512, 1, 1 });
+    defer kg.deinit();
+    const groups = xpu.launch.suggestCooperative(kg) catch 0;
+    if (groups == 0) return error.AboveCooperativeCount;
+    const data = try b.big.at(0);
+    const sink = try b.sink.at(0);
+    const ticks: u32 = 1 << 20;
+    for ([_][]const u8{ "alone", "after a 40 MB read", "beside a full grid" }, 0..) |name, mode| {
+        for (0..3) |_| {
+            try b.checkTime();
+            const f0 = readMhz(b.io, "act_freq");
+            var us: f64 = 0;
+            if (mode == 2) {
+                const per: u32 = @intCast(gib / 16 / groups); // uint4 a group
+                try setAll(kg, .{ data, sink, @as(u32, 4), per });
+                us = try timer.run(b, kg, .{ groups, 1, 1 }, false);
+            } else {
+                if (mode == 1) {
+                    const per: u32 = @intCast(40_000_000 / 16 / groups);
+                    try xpu.launch.dispatch(kg, b.s, .{ groups, 1, 1 }, .{ data, sink, @as(u32, 1), per });
+                }
+                try setAll(kt, .{ sink, ticks });
+                us = try timer.run(b, kt, .{ 1, 1, 1 }, false);
+            }
+            const f1 = readMhz(b.io, "act_freq");
+            var w: [8]u8 = undefined;
+            try b.sink.download(b.s, 0, &w);
+            const delta = std.mem.readInt(u64, w[0..8], .little);
+            std.debug.print("BENCH tsc {s}: {d} ticks in {d:.3} us device time, {d:.1} ticks a us, act_freq {d} MHz before, {d} MHz after\n", .{ name, delta, us, @as(f64, @floatFromInt(delta)) / us, f0, f1 });
+        }
+    }
+}
+
 }
 
 pub fn main(init: std.process.Init) !u8 {
@@ -897,9 +1006,20 @@ pub fn main(init: std.process.Init) !u8 {
             std.debug.print("BENCH tsc: rate {d:.3} ticks a us is too low for a time cap, no spin run\n", .{best});
             return 3;
         }
-        const cap = @min(best * cap_us, 4.0e9);
+        readFreq(init.io, &ctx) catch |e| {
+            std.debug.print("BENCH clock: {s}, no spin run\n", .{@errorName(e)});
+            return 3;
+        };
+        if (card_freq.rpn == 0 or card_freq.rp0 < card_freq.rpn) {
+            std.debug.print("BENCH clock: no rpn_freq or rp0_freq in {s}, no spin run\n", .{freq_dir});
+            return 3;
+        }
+        const cap = @as(f64, @floatFromInt(card_freq.rpn)) * cap_low_us;
         spin_cap = @intFromFloat(cap);
-        std.debug.print("BENCH tsc: {d:.3} ticks a us (best of 3 at 2^20 ticks), spin cap {d} ticks = {d:.0} us\n", .{ best, spin_cap, cap_us });
+        std.debug.print("BENCH tsc: {d:.3} ticks a us (best of 3 at 2^20 ticks, not used for the cap)\n", .{best});
+        std.debug.print("BENCH cap: {s}: rpn {d} MHz, rp0 {d} MHz, min_freq {d}, max_freq {d}; spin cap {d} ticks = {d:.0} us at rpn, {d:.0} us at rp0\n", .{
+            freq_dir, card_freq.rpn, card_freq.rp0, card_freq.min, card_freq.max, spin_cap, cap_low_us, cap / @as(f64, @floatFromInt(card_freq.rp0)),
+        });
     }
     var it = std.mem.splitScalar(u8, benches, ',');
     while (it.next()) |name| runOne(&b, &ctx, init, a, name, dir) catch |e| {
@@ -915,6 +1035,7 @@ fn runOne(b: *B, ctx: *xpu.Context, init: std.process.Init, a: std.mem.Allocator
     std.debug.print("BENCH start {s}\n", .{name});
     if (std.mem.eql(u8, name, "props")) try benchProps(b)
     else if (std.mem.eql(u8, name, "force")) try benchForce(b)
+    else if (std.mem.eql(u8, name, "tsc")) try benchTsc(b)
     else if (std.mem.eql(u8, name, "phase")) try benchPhase(b, 0)
     else if (std.mem.eql(u8, name, "work")) try benchPhase(b, 4096)
     else if (std.mem.eql(u8, name, "wgbar")) try benchWgbar(b)

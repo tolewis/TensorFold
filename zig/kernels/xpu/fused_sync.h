@@ -21,8 +21,10 @@
 // IGC built-in: a plain LSC load with cache control. cacheOpt 1 is L1 uncached, L3 uncached; the vISA is
 // `lsc_load.ugm.uc.uc` (checked with IGC_ShaderDumpEnable on inference1 ocloc, 2026-11-27).
 uint __builtin_IB_lsc_load_global_uint(global uint *base, int immElemOff, int cacheOpt);
-// IGC built-in: the thread timestamp register tm0 (ISA `mov ... tm0.0`; __builtin_IB_get_timestamp gave an undefined value). The bench measures its ticks a us (fb_tsc) and passes the
-// spin cap in ticks, so a cap is a time for every mechanism and every G (brief section 6 rule 1).
+// IGC built-in: the thread timestamp register tm0 (ISA `mov (2) ... tm0.0`, both dwords in one move;
+// __builtin_IB_get_timestamp gave an undefined value). tm0 counts at the GT clock, so its rate moves with the clock
+// (review C1). The host passes the cap in ticks for the lowest clock of the card (sysfs rpn_freq), so a cap ends a
+// wait in that time or less at every clock (brief section 6 rule 1).
 ulong __builtin_IB_read_cycle_counter(void);
 
 typedef global atomic_uint fb_au;

@@ -332,3 +332,23 @@ FB_SGA kernel void fb_tsc(global ulong *o, uint ticks) {
   o[0] = t - t0;
   o[1] = n;
 }
+
+// Review C1: the tm0 rate beside a full grid. Every work-item of every group reads its group's window of `work_u4`
+// uint4 `passes` times. Lane 0 of group 0 stores its tm0 ticks from its start to its end; the host divides by the
+// event time of the launch (all groups do the same reads, so group 0 runs about as long as the launch).
+FB_SGA kernel void fb_tsc_grid(global const uint4 *data, global ulong *o, uint passes, uint work_u4) {
+  const ulong t0 = __builtin_IB_read_cycle_counter();
+  const uint g = get_group_id(0), lid = get_local_id(0), L = get_local_size(0);
+  const ulong base = (ulong)g * work_u4;
+  uint acc = 0u;
+  for (uint p = 0u; p < passes; ++p) {
+    __attribute__((opencl_unroll_hint(8))) for (uint i = lid; i < work_u4; i += L) {
+      const uint4 v = data[base + i];
+      acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    acc += p;
+  }
+  work_group_barrier(CLK_LOCAL_MEM_FENCE);
+  if (g == 0u && lid == 0u) o[0] = __builtin_IB_read_cycle_counter() - t0;
+  if (acc == 0x9e3779b9u) o[2 + g] = acc;
+}
