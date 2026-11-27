@@ -628,6 +628,7 @@ pub fn main(init: std.process.Init) !void {
             defer _ = std.c.fclose(f);
             if (std.c.fwrite(@ptrCast(probe_buf.ptr), 2, probe_buf.len, f) != probe_buf.len) return error.DumpWrite;
             std.debug.print("PROBE {d} positions x {d} visits x {d} bf16 to {s}\n", .{ probe_pos.items.len, schedule.n_visits, probe_width, probe_out.? });
+            for (schedule.visits[0..schedule.n_visits], 0..) |v, vi| std.debug.print("PROBE visit {d} layer {d} pass {d} kind {s}\n", .{ vi, v.layer, v.pass, @tagName(schedule.at(v.layer).kind) });
         }
         try rowSpread(gpa, row_max);
         for (diffs.items) |d| std.debug.print("  diff at {d}: reference token {d}, ours {d}, reference margin {d:.4}, our logit gap {d:.4}\n", .{ d.pos, d.ref_id, d.our_id, d.margin, d.our_gap });
