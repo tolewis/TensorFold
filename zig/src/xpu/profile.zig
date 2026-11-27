@@ -125,7 +125,13 @@ pub const Profile = struct {
     /// The sum of the "gap us/c" column: start of a launch minus end of the launch before it, 0 when they overlap.
     device_gap_ns: u64 = 0,
     tokens: u64 = 0,
+    /// Host clock (`nowNs`) of the parts of one forward: its start, the end of its uploads, its first and last launch
+    /// append, and the end of its wait. The forward sets them; a tool reads them before the next forward.
+    started_at: u64 = 0,
+    uploaded_at: u64 = 0,
+    first_append_at: u64 = 0,
     enqueued_at: u64 = 0,
+    waited_at: u64 = 0,
 
     const gpa = std.heap.c_allocator;
 
@@ -169,6 +175,30 @@ pub const Profile = struct {
     /// Called when the host has queued the last launch of a pass and is about to wait.
     pub fn enqueued(p: *Profile) void {
         p.enqueued_at = nowNs();
+    }
+
+    /// Called at the start of a forward, before its uploads.
+    pub fn started(p: *Profile) void {
+        p.started_at = nowNs();
+        p.uploaded_at = p.started_at;
+        p.first_append_at = 0;
+        p.enqueued_at = 0;
+        p.waited_at = 0;
+    }
+
+    /// Called when the forward's uploads are queued.
+    pub fn uploaded(p: *Profile) void {
+        p.uploaded_at = nowNs();
+    }
+
+    /// Called when the wait of the forward on its stream has returned.
+    pub fn waited(p: *Profile) void {
+        p.waited_at = nowNs();
+    }
+
+    /// The host clock of the first launch append of a forward (the launch path calls it before each append).
+    pub fn appending(p: *Profile, t: u64) void {
+        if (p.first_append_at == 0) p.first_append_at = t;
     }
 
     fn row(p: *Profile, handle: ze.H, lab: []const u8) !*Row {

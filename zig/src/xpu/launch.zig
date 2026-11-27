@@ -71,6 +71,7 @@ pub fn dispatch(k: Kernel, s: Stream, groups: [3]u32, args: anytype) Error!void 
 
 fn dispatchProfiled(p: *profile.Profile, k: Kernel, s: Stream, groups: [3]u32, args: anytype) Error!void {
     const t0 = profile.nowNs();
+    p.appending(t0);
     inline for (args, 0..) |v, i| {
         const idx: u32 = i;
         switch (comptime argKind(@TypeOf(v))) {

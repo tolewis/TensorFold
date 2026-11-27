@@ -933,10 +933,12 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     // The host arrays below stay valid until the stream has finished, which this function waits for before it returns.
     const stream = m.r.stream(ctx);
     errdefer stream.synchronize() catch {};
+    if (xpu.profile.active) |prof| prof.started();
     try m.r.upload(s.ids, std.mem.sliceAsBytes(ids));
     try m.r.upload(s.pos, std.mem.sliceAsBytes(pos[0..rows]));
     try m.r.upload(s.seg_of, std.mem.sliceAsBytes(seg_of[0..rows]));
     try m.r.upload(s.segs, std.mem.sliceAsBytes(segs[0..segments.len]));
+    if (xpu.profile.active) |prof| prof.uploaded();
     var wrote: [state.visit_slots]u8 = @splat(0);
     const g = Run{ .m = m, .p = p, .s = stream, .sc = s, .wrote = if (fuse.roleConv() and rows == 1) &wrote else null };
     if (m.options.place.rank == 0) if (group.live) |gp| {
@@ -1042,6 +1044,7 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     if (xpu.profile.active) |prof| prof.enqueued();
     xpu.profile.reportAppend(m.options.place.rank);
     try stream.synchronize();
+    if (xpu.profile.active) |prof| prof.waited();
     if (group.live) |gp| gp.releaseEvents();
 }
 

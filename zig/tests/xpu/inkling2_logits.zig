@@ -797,31 +797,78 @@ fn profileDecode(ctx: *xpu.Context, io: std.Io, m: *const ink.model.Model, scrat
         var wall: i96 = 0;
         var enqueue: i96 = 0;
         var draw: i96 = 0;
-        for (0..steps) |_| {
+        // The parts of a step on the host clock of the profile (V9): call to forward, uploads, first append to last append,
+        // the wait after the last append, the return, the logit download (or the device candidates), the draw.
+        const part_names = [_][]const u8{ "call", "upload", "queue", "wait", "return", "download", "draw" };
+        var parts: [part_names.len]u64 = @splat(0);
+        var step_ns: u64 = 0;
+        for (0..steps) |si| {
             const f0 = nowNs(io);
             const e0 = xpu.profile.nowNs();
             try ink.forward.run(m, scratch, cache, &.{token}, .{});
+            const e1 = xpu.profile.nowNs();
             wall += nowNs(io) - f0;
             enqueue += @as(i96, prof.enqueued_at) - e0;
             cache.len += 1;
+            var dl: u64 = 0;
+            var dr: u64 = 0;
             if (smp == null) {
                 try prof.collect();
                 const d0 = nowNs(io);
-                token = argmax(try lastLogits(r, cache, logits));
+                const h0 = xpu.profile.nowNs();
+                const row_l = try lastLogits(r, cache, logits);
+                const h1 = xpu.profile.nowNs();
+                token = argmax(row_l);
+                const h2 = xpu.profile.nowNs();
                 draw += nowNs(io) - d0;
+                dl = h1 - h0;
+                dr = h2 - h1;
             } else {
                 const d0 = nowNs(io);
+                const h0 = xpu.profile.nowNs();
                 const row = ink.sampler.Row.of(rule);
                 const set = try smp.?.select(cache.logits.ptr, @intCast(vocab), &.{row});
                 var buf: [ink.sampler.top_max]lanes.gpu_rule.Cand = undefined;
                 const top = set.list(0, row.n, &buf);
                 const whole: ?[]const f32 = if (lanes.gpu_full.needsRow(rule)) try lastLogits(r, cache, logits) else null;
+                const h1 = xpu.profile.nowNs();
                 token = lanes.gpu_full.drawTop(whole, top, rule, @intCast(cache.len));
+                const h2 = xpu.profile.nowNs();
                 draw += nowNs(io) - d0;
+                dl = h1 - h0;
+                dr = h2 - h1;
                 try prof.collect();
             }
+            const first_append = if (prof.first_append_at != 0) prof.first_append_at else prof.uploaded_at;
+            const one = [part_names.len]u64{
+                prof.started_at -| e0,
+                prof.uploaded_at -| prof.started_at,
+                prof.enqueued_at -| first_append,
+                prof.waited_at -| prof.enqueued_at,
+                e1 -| prof.waited_at,
+                dl,
+                dr,
+            };
+            var line: [256]u8 = undefined;
+            var w: usize = 0;
+            var sum: u64 = 0;
+            for (one, part_names, 0..) |v, name, k| {
+                parts[k] += v;
+                sum += v;
+                w += if (std.fmt.bufPrint(line[w..], " {s} {d:.1}", .{ name, @as(f64, @floatFromInt(v)) / 1e3 })) |o| o.len else |_| 0;
+            }
+            // the uploads end and the first append start: host work between them (the first launch's argument set) is in "upload to append"
+            const gap_first = first_append -| prof.uploaded_at;
+            step_ns += sum + gap_first;
+            std.debug.print("STEP {s} {d}: us{s} upload-to-append {d:.1} sum {d:.1}\n", .{ if (device) "events" else "host", si, line[0..w], @as(f64, @floatFromInt(gap_first)) / 1e3, @as(f64, @floatFromInt(sum + gap_first)) / 1e3 });
         }
         const n: f64 = @floatFromInt(steps);
+        {
+            var line: [256]u8 = undefined;
+            var w: usize = 0;
+            for (parts, part_names) |v, name| w += if (std.fmt.bufPrint(line[w..], " {s} {d:.3}", .{ name, @as(f64, @floatFromInt(v)) / 1e6 / n })) |o| o.len else |_| 0;
+            std.debug.print("\nsteps ({s}): ms a token{s}; sum {d:.3}\n", .{ if (device) "with a timestamp event on every launch" else "host timing only", line[0..w], @as(f64, @floatFromInt(step_ns)) / 1e6 / n });
+        }
         std.debug.print("\nprofile ({s}), {s}: {d} decode steps, {d:.0} launches a token, forward {d:.3} ms a token, of it queueing on the host {d:.3} ms, waiting {d:.3} ms; draw {d:.3} ms a token (needsRow {})\n", .{ if (smp == null) "greedy, host argmax" else "sampled T 0.8 top_k 20 top_p 0.95, device candidates", if (device) "with a timestamp event on every launch" else "host timing only", steps, @as(f64, @floatFromInt(prof.launches)) / n, 1000 * secs(wall) / n, 1000 * secs(enqueue) / n, 1000 * secs(wall - enqueue) / n, 1000 * secs(draw) / n, lanes.gpu_full.needsRow(rule) });
         prof.print();
     }
