@@ -228,6 +228,10 @@ pub const State = struct {
     f: cuda.Function,
     grid: u32,
     dyn: u32,
+    grid2: u32, // two blocks a multiprocessor (0: the card does not hold two)
+    dyn2: u32,
+    lg: u32, // the grid and dynamic shared bytes of the next launch (one or two blocks a multiprocessor)
+    ldyn: u32,
     sw: Switch,
     table: cuda.DeviceBuffer, // Visit [visits]
     args: cuda.DeviceBuffer, // [visits][arg_bytes]
@@ -267,12 +271,21 @@ pub const State = struct {
         try d.check(d.api.cuOccupancyMaxActiveBlocksPerMultiprocessor(&per, f.handle, threads, dyn), "cuOccupancyMaxActiveBlocksPerMultiprocessor");
         if (per < 1) return error.FusedOccupancy;
         const grid: u32 = @intCast(sms); // one block a multiprocessor (DESIGN section 10)
+        // review A10: two blocks a multiprocessor when every phase fits in one K and V tile of tf_ink2_attn8
+        // (34,816 B; the sliding attention then runs today's tile with no prefetch, db 0)
+        const dyn2: u32 = @max(@max(@as(u32, 34816), cuda.qmmf.sharedBytes(.mxfp8, 16)), @max(cuda.qmmf.sharedBytes(.fp8, 16), 4 * 5760));
+        var per2: c_int = 0;
+        try d.check(d.api.cuOccupancyMaxActiveBlocksPerMultiprocessor(&per2, f.handle, threads, dyn2), "cuOccupancyMaxActiveBlocksPerMultiprocessor");
         var s: State = .{
             .d = d,
             .mod = mod,
             .f = f,
             .grid = grid,
             .dyn = dyn,
+            .grid2 = if (per2 >= 2) 2 * grid else 0,
+            .dyn2 = dyn2,
+            .lg = grid,
+            .ldyn = dyn,
             .sw = sw,
             .table = try cuda.DeviceBuffer.alloc(d, visits_max * @sizeOf(Visit)),
             .args = try cuda.DeviceBuffer.alloc(d, visits_max * arg_bytes),
@@ -282,7 +295,7 @@ pub const State = struct {
             .part1 = try cuda.DeviceBuffer.alloc(d, part1_sources * part1_warps * part1_stride * 4),
             .part2 = try cuda.DeviceBuffer.alloc(d, 4 * 16 * 4),
             .times = try cuda.DeviceBuffer.alloc(d, visits_max * times_visit * 8),
-            .probe = try cuda.DeviceBuffer.alloc(d, (3 * @as(usize, @intCast(sms)) + probe_stamps) * 8),
+            .probe = try cuda.DeviceBuffer.alloc(d, (3 * 2 * @as(usize, @intCast(sms)) + probe_stamps) * 8),
             .qpart = try cuda.DeviceBuffer.alloc(d, 4 * qpart_sk * qpart_n * 4),
             .ref = try cuda.DeviceBuffer.alloc(d, @as(usize, if (sw.mode == .check) ref_bytes else 0)),
             .save = try cuda.DeviceBuffer.alloc(d, @as(usize, if (sw.mode == .check) 1 << 20 else 0)),
@@ -327,7 +340,7 @@ pub const State = struct {
         a.add(@as(i32, @intCast(first)));
         a.add(@as(i32, @intCast(count)));
         a.add(f.statePtrs());
-        try cuda.launch.launch(f.f, .{ .grid = .{ .x = f.grid, .y = 1, .z = 1 }, .block = .{ .x = threads, .y = 1, .z = 1 }, .shared = f.dyn, .cooperative = true }, s, &a);
+        try cuda.launch.launch(f.f, .{ .grid = .{ .x = f.lg, .y = 1, .z = 1 }, .block = .{ .x = threads, .y = 1, .z = 1 }, .shared = f.ldyn, .cooperative = true }, s, &a);
     }
 };
 
@@ -502,7 +515,7 @@ pub fn fill(f: *const State, m: *Model, r: anytype, v: u32, hin: u64, hout: u64,
         .slots_rh = @intCast(stride),
         .subs = 1,
         .scale = 1.0 / @sqrt(@as(f32, attn.head_dim)),
-        .db = @intFromBool(db),
+        .db = @intFromBool(db and f.lg == f.grid),
     };
     if (l.window == 0) {
         if (!attn.split(rows, stride, m.s.entries)) return error.FusedSplit;
@@ -792,10 +805,19 @@ fn probeFor(v: u32, step: usize) i32 {
 }
 
 /// TF_INKLING2_FUSED_FIX: the review corrections on (fused_visit.cuh fz_fix: 1 A9, 2 A11, 4 A12, 8 A18, 32 A1, 64 X1, 128 X2; 16 A17, the
-/// host clears its own visits only); default all. TF_INKLING2_FUSED_FIX_AB=1: steps s with (s / every) even run none,
+/// host clears its own visits only; 256 A10, two blocks a multiprocessor); default all. TF_INKLING2_FUSED_FIX_AB=1: steps s with (s / every) even run none,
 /// so one run holds the phase times before and after.
-const fix_all: i32 = 255;
+const fix_all: i32 = 511;
 const fix_own_clear: i32 = 16;
+const fix_two: i32 = 256; // review A10: two blocks a multiprocessor (host: the grid, the shared bytes, S6 db 0)
+const fix_host: i32 = fix_own_clear | fix_two;
+
+/// The launch shape of a step's fix set.
+fn shapeFor(f: *State, fix: i32) void {
+    const two = (fix & fix_two) != 0 and f.grid2 != 0;
+    f.lg = if (two) f.grid2 else f.grid;
+    f.ldyn = if (two) f.dyn2 else f.dyn;
+}
 fn fixFor(step: usize) i32 {
     const S = struct {
         var mask: ?i32 = null;
@@ -878,7 +900,7 @@ fn reportBounds() void {
         .{ .name = "head N 200064 (3126 tiles)", .nq = 0, .nb = 0, .n = 200064 },
     };
     for (cases) |c| {
-        if (bounds(c.nq, c.nb, c.n, 4, c.n)) |_| {
+        if (bounds(c.nq, c.nb, c.n, 4, c.n)) {
             std.debug.print("[fused-bounds] {s}: fits\n", .{c.name});
         } else |e| std.debug.print("[fused-bounds] {s}: refused ({s})\n", .{ c.name, @errorName(e) });
     }
@@ -895,7 +917,7 @@ pub fn reportLoad(m: *const Model, k: *const Kernels) !void {
     const f = &m.fused.?;
     var per_f: c_int = 0;
     try d.check(d.api.cuOccupancyMaxActiveBlocksPerMultiprocessor(&per_f, f.f.handle, threads, f.dyn), "cuOccupancyMaxActiveBlocksPerMultiprocessor");
-    std.debug.print("[fused-load] occupancy at 128 threads, blocks a multiprocessor: tf_ink2_attn8 {d}, tf_ink2_attn8_db {d} ({d} B dynamic), tf_ink2_fused_visit {d} ({d} B dynamic), grid {d}\n", .{ per, per_db, attn.db8_shared, per_f, f.dyn, f.grid });
+    std.debug.print("[fused-load] occupancy at 128 threads, blocks a multiprocessor: tf_ink2_attn8 {d}, tf_ink2_attn8_db {d} ({d} B dynamic), tf_ink2_fused_visit {d} ({d} B dynamic), grid {d}; two a multiprocessor: grid {d} ({d} B dynamic)\n", .{ per, per_db, attn.db8_shared, per_f, f.dyn, f.grid, f.grid2, f.dyn2 });
 }
 
 /// The fault word as text: (code << 16) | (block + 1), code = ((group + 1) << 3) | sub (fused_visit.cuh fz_sync).
@@ -964,6 +986,7 @@ fn checkPair(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytype
     const d = f.d;
     const gpa = std.heap.page_allocator;
     const w = v + 1;
+    shapeFor(f, fixFor(f.steps[v]));
     f.at = "pair-fill";
     var host_v: [arg_bytes]u8 = undefined;
     var host_w: [arg_bytes]u8 = undefined;
@@ -974,8 +997,8 @@ fn checkPair(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytype
     };
     const step = f.steps[v];
     const fix = fixFor(step);
-    vis_v.fix = fix & ~fix_own_clear;
-    vis_w.fix = fix & ~fix_own_clear;
+    vis_v.fix = fix & ~fix_host;
+    vis_w.fix = fix & ~fix_host;
     try s.synchronize();
     try f.args.upload(@as(usize, v) * arg_bytes, &host_v);
     try f.args.upload(@as(usize, w) * arg_bytes, &host_w);
@@ -1109,22 +1132,22 @@ pub fn check(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytype
 
 fn printProbe(f: *State, v: u32, step: usize, pos: u32, ph: i32, ms_fused: f32, fix: i32) !void {
     const gpa = std.heap.page_allocator;
-    const n = 3 * @as(usize, f.grid) + probe_stamps;
+    const n = 3 * @as(usize, f.lg) + probe_stamps;
     const p = try gpa.alloc(u64, n);
     defer gpa.free(p);
     try cuda.memory.download(f.d, f.probe.ptr, std.mem.sliceAsBytes(p));
     var t0: u64 = std.math.maxInt(u64);
-    for (p[0..f.grid]) |x| if (x != 0) {
+    for (p[0..f.lg]) |x| if (x != 0) {
         t0 = @min(t0, x);
     };
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
-    try out.print(gpa, "[fused-probe] visit {d} step {d} pos {d} phase {d} fused_us {d:.2} fix {d} grid {d} ns from the first start:", .{ v, step, pos, ph, ms_fused * 1000, fix, f.grid });
+    try out.print(gpa, "[fused-probe] visit {d} step {d} pos {d} phase {d} fused_us {d:.2} fix {d} grid {d} ns from the first start:", .{ v, step, pos, ph, ms_fused * 1000, fix, f.lg });
     const names = [_][]const u8{ " start", " arrive", " exit", " stamps" };
     for (0..4) |part| {
         try out.appendSlice(gpa, names[part]);
-        const lo = part * f.grid;
-        const hi = if (part == 3) n else lo + f.grid;
+        const lo = part * f.lg;
+        const hi = if (part == 3) n else lo + f.lg;
         for (p[lo..hi]) |x| {
             if (x == 0 or t0 == std.math.maxInt(u64)) try out.appendSlice(gpa, " -") else try out.print(gpa, " {d}", .{@as(i64, @intCast(x)) - @as(i64, @intCast(t0))});
         }
@@ -1136,6 +1159,7 @@ fn printProbe(f: *State, v: u32, step: usize, pos: u32, ph: i32, ms_fused: f32, 
 fn checkSteps(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytype, v: u32, hin: u64, hout: u64, today: anytype) !void {
     const d = f.d;
     const gpa = std.heap.page_allocator; // not the model's allocator: the check's buffers live for one visit
+    shapeFor(f, fixFor(f.steps[v]));
     f.at = "fill";
     var host: [arg_bytes]u8 = undefined;
     var vis = fill(f, m, r, v, hin, hout, &host) catch |e| {
@@ -1161,7 +1185,7 @@ fn checkSteps(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytyp
     const probe = probeFor(v, step);
     vis.probe = probe + 1;
     const fix = fixFor(step);
-    vis.fix = fix & ~fix_own_clear;
+    vis.fix = fix & ~fix_host;
     f.at = "upload";
     try s.synchronize();
     try f.args.upload(@as(usize, v) * arg_bytes, &host);

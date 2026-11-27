@@ -36,3 +36,7 @@ extern "C" __device__ void fz_nvfp4_down(const __nv_bfloat16* __restrict__ X, in
                                          skip, 0.f);
     __syncthreads();
 }
+
+// review A10: with two blocks a multiprocessor the dynamic shared memory is one K and V tile of tf_ink2_attn8
+static_assert(sizeof(tf_nvfp4_experts::Ring<2, 4, uint2>) <= 34816 && sizeof(tf_nvfp4_experts::Ring<1, 4, uint2>) <= 34816,
+              "fused.zig dyn2");
