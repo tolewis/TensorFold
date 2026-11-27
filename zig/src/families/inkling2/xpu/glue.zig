@@ -26,6 +26,8 @@ pub const Pipelines = struct {
     logits: xpu.Kernel,
     expert_pick: xpu.Kernel,
     expert_combine: xpu.Kernel,
+    /// The K and the V dynamic convolution of a visit in one launch (the production image only).
+    conv_dynamic_kv: ?xpu.Kernel = null,
 
     /// The kernels of a loaded image. A contract control's image holds the same kernels under `tf_ctl_inkling2_*`.
     pub fn load(module: xpu.Module, control: bool) !Pipelines {
@@ -48,11 +50,16 @@ pub const Pipelines = struct {
             .logits = made[@backingInt(plan.Kind.logits)],
             .expert_pick = made[@backingInt(plan.Kind.expert_pick)],
             .expert_combine = made[@backingInt(plan.Kind.expert_combine)],
+            .conv_dynamic_kv = if (control) null else try module.kernel("tf_inkling2_conv_dynamic_kv", group),
         };
     }
 
     pub fn deinit(p: *Pipelines) void {
-        inline for (@typeInfo(Pipelines).@"struct".field_names) |name| @field(p, name).deinit();
+        inline for (@typeInfo(Pipelines).@"struct".field_names) |name| {
+            if (@TypeOf(@field(p, name)) == ?xpu.Kernel) {
+                if (@field(p, name)) |*k| k.deinit();
+            } else @field(p, name).deinit();
+        }
     }
 };
 
@@ -84,6 +91,13 @@ pub fn convStatic(p: *const Pipelines, s: xpu.Stream, history: Ref, current: Ref
 pub fn convDynamic(p: *const Pipelines, s: xpu.Stream, history: Ref, current: Ref, taps: Ref, input: Ref, static_w: Ref, projection: Ref, out: Ref, rows: u32, channels: u32) !void {
     std.debug.assert(rows > 0 and channels > 0 and channels <= 1024);
     try xpu.launch.dispatch(p.conv_dynamic, s, .{ rows, 1, 1 }, .{ history, current, taps, input, static_w, projection, out, rows, channels });
+}
+
+/// The K and the V dynamic convolution of a visit, one launch of (rows, 2) work-groups. Each work-group runs the code
+/// of `convDynamic` for its role.
+pub fn convDynamicKv(p: *const Pipelines, s: xpu.Stream, k: [7]Ref, v: [7]Ref, rows: u32, channels: u32) !void {
+    std.debug.assert(rows > 0 and channels > 0 and channels <= 1024);
+    try xpu.launch.dispatch(p.conv_dynamic_kv.?, s, .{ rows, 2, 1 }, .{ k[0], k[1], k[2], k[3], k[4], k[5], k[6], v[0], v[1], v[2], v[3], v[4], v[5], v[6], rows, channels });
 }
 
 /// Router IDs and weights are sorted by ascending expert index for the deterministic expert sum.

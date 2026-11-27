@@ -335,6 +335,27 @@ const Run = struct {
         }
     }
 
+    /// The arguments of `glue.convDynamic` for the K (key) or the V convolution of a visit with a dynamic convolution:
+    /// history, current, taps, input, static weight, projection, out.
+    fn dynamicConvArgs(g: Run, cache: *state.Cache, v: *const layer_plan.Visit, base: usize, key: bool) [7]Ptr {
+        const s = g.sc;
+        const lp = g.m.weight_plan.at(v.layer);
+        const w = &g.m.weights.layers[v.layer];
+        const kv_stride = g.m.options.place.kvWidth() * 2;
+        const normalized = if (key) s.k_norm else if (v.hasMessages() or lp.kind == .global) s.v_norm else s.q_norm;
+        const conv_state: usize = if (key) 0 else 1;
+        const d = switch (if (key) w.attn.k_conv else w.attn.v_conv) {
+            .dynamic => |d| d,
+            .static => unreachable,
+        };
+        return .{
+            cache.history(v.cache_slot, conv_state).ptr(),     at(if (key) s.k_raw else s.v_raw, base * kv_stride),
+            cache.staged(v.cache_slot, conv_state, 0).ptr(),   at(normalized, base * state.hidden * 2),
+            tensor(d.static_w),                                tensor(d.projection),
+            at(if (key) s.k_conv else s.v_conv, base * kv_stride),
+        };
+    }
+
     fn attendSegments(g: Run, v: *const layer_plan.Visit, segments: []const Segment) !void {
         const s = g.sc;
         const m = g.m;
@@ -384,6 +405,8 @@ const Run = struct {
                     mask[v.cache_slot] = mask[v.cache_slot] | 0x3;
                 };
                 try fuse.convKv(&g.p.fuse, g.s, cache.history(v.cache_slot, 0).ptr(), at(s.k_raw, base * channels * 2), cache.staged(v.cache_slot, 0, 0).ptr(), tensor(wk), at(s.k_conv, base * channels * 2), cache.history(v.cache_slot, 1).ptr(), at(s.v_raw, base * channels * 2), cache.staged(v.cache_slot, 1, 0).ptr(), tensor(wv), at(s.v_conv, base * channels * 2), @intCast(rows), channels, commit1);
+            } else if (g.p.glue.conv_dynamic_kv != null and w.attn.k_conv == .dynamic and w.attn.v_conv == .dynamic) {
+                try glue.convDynamicKv(&g.p.glue, g.s, g.dynamicConvArgs(cache, v, base, true), g.dynamicConvArgs(cache, v, base, false), @intCast(rows), g.m.options.place.kvWidth());
             } else {
                 try g.convInputForAttention(cache, v, base, rows, true);
                 try g.convInputForAttention(cache, v, base, rows, false);
