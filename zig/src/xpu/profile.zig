@@ -122,6 +122,8 @@ pub const Profile = struct {
     launches: u64 = 0,
     device_busy_ns: u64 = 0,
     device_span_ns: u64 = 0,
+    /// The sum of the "gap us/c" column: start of a launch minus end of the launch before it, 0 when they overlap.
+    device_gap_ns: u64 = 0,
     tokens: u64 = 0,
     enqueued_at: u64 = 0,
 
@@ -230,8 +232,13 @@ pub const Profile = struct {
                     } else |_| {}
                 };
                 if (i == 0) first = ts.global_start else {
-                    const gap: u64 = @intFromFloat(@as(f64, @floatFromInt((ts.global_start -% prev_end) & mask)) * res);
+                    // A launch can start before the launch before it ends (the two overlap on the clock). Its gap is 0, not
+                    // the wrapped difference.
+                    const diff = (ts.global_start -% prev_end) & mask;
+                    const gap: u64 = if (diff > mask / 2) 0 else @intFromFloat(@as(f64, @floatFromInt(diff)) * res);
                     gap_ns += gap;
+                    // the idle time before this launch belongs to the launch before it, in this pass
+                    if (prev_row) |pr| pr.gap_ns += gap;
                     const name = std.mem.sliceTo(&r.name, 0);
                     if (std.mem.startsWith(u8, name, "tp_")) {
                         reduce_gap_ns += gap;
@@ -249,10 +256,7 @@ pub const Profile = struct {
                         @memcpy(big[slot].name[0..@min(name.len, 23)], name[0..@min(name.len, 23)]);
                     }
                 }
-                prev_end = ts.global_end;
                 last_end = ts.global_end;
-                // the idle time before this launch belongs to the launch before it, in this pass
-                if (prev_row) |pr| pr.gap_ns += @intFromFloat(@as(f64, @floatFromInt((ts.global_start -% prev_end) & mask)) * res);
                 prev_row = r;
                 prev_end = ts.global_end;
                 try d.check(d.api.zeEventHostReset(p.events[i]), "zeEventHostReset");
@@ -263,6 +267,7 @@ pub const Profile = struct {
             for (big) |b| if (b.ns > 0) std.log.info("inkling2: gap {d:.1} us before {s}", .{ @as(f64, @floatFromInt(b.ns)) / 1e3, std.mem.sliceTo(&b.name, 0) });
         }
         if (p.device_time and p.used > 0) {
+            p.device_gap_ns += gap_ns;
             p.device_busy_ns += @intFromFloat(busy);
             p.device_span_ns += @intFromFloat(@as(f64, @floatFromInt((last_end -% first) & mask)) * res);
         }
@@ -279,6 +284,7 @@ pub const Profile = struct {
         p.launches = 0;
         p.device_busy_ns = 0;
         p.device_span_ns = 0;
+        p.device_gap_ns = 0;
         p.tokens = 0;
         p.used = 0;
     }
@@ -309,6 +315,6 @@ pub const Profile = struct {
             args += r.args;
         }
         std.debug.print("{s:<40} {d:>7.1} {d:>10.3} {s:>9} {d:>10.3} {d:>10.3} {d:>6.1}\n", .{ "all (a pass)", @as(f64, @floatFromInt(calls)) / n, @as(f64, @floatFromInt(dev)) / 1e6 / n, "", @as(f64, @floatFromInt(set)) / 1e6 / n, @as(f64, @floatFromInt(app)) / 1e6 / n, @as(f64, @floatFromInt(args)) / n });
-        if (p.device_time) std.debug.print("device busy {d:.3} ms, first start to last end {d:.3} ms, idle between kernels {d:.3} ms (a pass); {d} launches not timed\n", .{ @as(f64, @floatFromInt(p.device_busy_ns)) / 1e6 / n, @as(f64, @floatFromInt(p.device_span_ns)) / 1e6 / n, @as(f64, @floatFromInt(p.device_span_ns -| p.device_busy_ns)) / 1e6 / n, p.dropped });
+        if (p.device_time) std.debug.print("device busy {d:.3} ms, first start to last end {d:.3} ms, idle between kernels {d:.3} ms (span minus busy, a pass); sum of the gap column {d:.3} ms (a pass); {d} launches not timed\n", .{ @as(f64, @floatFromInt(p.device_busy_ns)) / 1e6 / n, @as(f64, @floatFromInt(p.device_span_ns)) / 1e6 / n, @as(f64, @floatFromInt(p.device_span_ns -| p.device_busy_ns)) / 1e6 / n, @as(f64, @floatFromInt(p.device_gap_ns)) / 1e6 / n, p.dropped });
     }
 };
