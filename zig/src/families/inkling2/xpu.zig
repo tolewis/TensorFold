@@ -34,4 +34,5 @@ test {
     _ = @import("xpu/dspark_state.zig");
     _ = @import("xpu/dspark_weights.zig");
     _ = model;
+    _ = group;
 }

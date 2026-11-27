@@ -124,6 +124,8 @@ pub const Options = struct {
     all: bool = false,
     /// Where the DSpark taps go ([row][tap][H] bf16), or none.
     taps: ?Ptr = null,
+    /// A verify forward: the leader opens a cache transaction on every segment, so rank 1 must open one too.
+    txn: bool = false,
 };
 
 pub const FinalPlan = struct { work_rows: usize, logits_rows: usize, logits_row: usize, capture_rows: usize };
@@ -721,15 +723,19 @@ fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) 
         base = 0;
         // The down epilogue re-does the expert combine from s.down, which on a split rank holds only that rank's
         // experts. It would overwrite the reduced mlp_out with a rank-local half sum, so a split rank keeps the plain
-        // branch, which reads the reduced mlp_out.
-        if (fuse.downEpi() and segments.len == 1 and !g.m.options.place.split()) {
-            const seg = segments[0];
+        // branch, which reads the reduced mlp_out. An unsplit rank runs the epilogue a segment, at the segment's row
+        // offset and with its own history, so every stream combines the way it does alone (B16: C1).
+        if (fuse.downEpi() and !g.m.options.place.split()) {
             const channels: u32 = @intCast(state.convWidth(3));
             const commit1: u32 = if (fuse.roleConv() and rows == 1) 1 else 0;
             if (commit1 == 1) if (g.wrote) |mask| {
                 mask[v.cache_slot] = mask[v.cache_slot] | 0x8;
             };
-            try fuse.downEpilogue(&g.p.fuse, g.s, at(s.down, 0), at(s.route_ids, 0), at(s.route_weights, 0), seg.cache.history(v.cache_slot, 3).ptr(), seg.cache.staged(v.cache_slot, 3, 0).ptr(), tensor(w.mlp_conv), at(s.mlp_out, 0), at(s.mlp_conv, 0), at(s.partial, 0), at(s.p, 0), state.hidden, 8, channels, @intCast(rows), commit1);
+            var b: usize = 0;
+            for (segments) |seg| {
+                try fuse.downEpilogue(&g.p.fuse, g.s, at(s.down, b * state.row_down), at(s.route_ids, b * state.row_route_ids), at(s.route_weights, b * state.row_route_weights), seg.cache.history(v.cache_slot, 3).ptr(), seg.cache.staged(v.cache_slot, 3, 0).ptr(), tensor(w.mlp_conv), at(s.mlp_out, b * state.row_mlp_out), at(s.mlp_conv, b * state.row_mlp_conv), at(s.partial, b * state.row_partial), at(s.p, b * state.row_p), state.hidden, 8, channels, @intCast(seg.rows), commit1);
+                b += seg.rows;
+            }
         } else if (fuse.convFold() and segments.len == 1) {
             const seg = segments[0];
             const channels: u32 = @intCast(state.convWidth(3));
@@ -933,7 +939,12 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     try m.r.upload(s.segs, std.mem.sliceAsBytes(segs[0..segments.len]));
     var wrote: [state.visit_slots]u8 = @splat(0);
     const g = Run{ .m = m, .p = p, .s = stream, .sc = s, .wrote = if (fuse.roleConv() and rows == 1) &wrote else null };
-    if (m.options.place.rank == 0) if (group.live) |gp| try gp.note(.forward, ids, if (options.all) 1 else 0, @intCast(segments[0].cache.len));
+    if (m.options.place.rank == 0) if (group.live) |gp| {
+        // Each stream's rows name their own slot, base and capacity: rank 1 runs a stream's state in a cache of its own.
+        var table: [state.max_segments]group.Seg = undefined;
+        for (segments, 0..) |seg, si| table[si] = .{ .slot = seg.cache.slot, .rows = @intCast(seg.rows), .base = @intCast(seg.cache.len), .capacity = @intCast(seg.cache.capacity), .accepted = 0 };
+        try gp.note(.forward, ids, (if (options.all) @as(u32, 1) else 0) | (if (options.txn) @as(u32, 8) else 0), table[0..segments.len], 0);
+    };
     try glue.embedNorm(&p.glue, stream, at(s.ids, 0), tensor(m.weights.embed), tensor(m.weights.embed_norm), at(s.p, 0), @intCast(rows));
     const vdump = std.c.getenv("TF_TP_VDUMP") != null and rows <= state.batch_rows;
     const seq = vdump_seq;

@@ -425,46 +425,35 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
         return false;
     };
     defer scratch.deinit();
-    var cache = st.Cache.init(&rt, cap, &model.weight_plan, .bf16) catch |e| {
-        problem.* = try std.fmt.allocPrint(a, "inkling2_loop: cache ({s})", .{@errorName(e)});
-        return false;
+    // One cache a stream slot, made on that slot's first record and freed on its release. The leader gives each stream a
+    // slot of its own, so a stream's K/V, convolution history and transactions stay apart (B16: S1).
+    var caches: [st.max_segments + 1]?*st.Cache = @splat(null);
+    defer for (&caches) |*c| if (c.*) |cache| {
+        cache.deinit();
+        gpa.destroy(cache);
     };
-    defer cache.deinit();
+    // The leader's prompt cache snapshots, saved from this rank's own half of a slot's cache under the same id.
+    var snaps: std.AutoHashMapUnmanaged(u32, *ink.snapshot.Snap) = .empty;
+    defer {
+        var it = snaps.valueIterator();
+        while (it.next()) |s| {
+            s.*.free();
+            gpa.destroy(s.*);
+        }
+        snaps.deinit(gpa);
+    }
+    var acts: [st.max_segments * 4 + 8]ink.group.Action = undefined;
     std.log.info("inkling2_loop: TP rank 1 following", .{});
-    // The leader commits an accepted prefix of a verify window. This rank replays the window, whose forward advances
-    // the convolution history to the window's last row. Without the leader's commit the rejected rows stay in this
-    // rank's history, so its partial differs and the reduce drifts (2026-11-26: a drafted round diverged from plain).
-    var pending_rows: usize = 0;
-    var pending_base: usize = 0;
     while (true) {
         const rec = gp.wait() catch |e| {
             std.log.err("inkling2_loop: rank 1 stopped ({s})", .{@errorName(e)});
             return false;
         };
-        if (rec.op == .close) return true;
-        if (pending_rows != 0) {
-            const end = pending_base + pending_rows;
-            if (rec.base >= pending_base and rec.base <= end) {
-                cache.commit(rec.base - pending_base) catch |e| {
-                    std.log.err("inkling2_loop: rank 1 commit ({s})", .{@errorName(e)});
-                    return false;
-                };
-            } else cache.rollback() catch |e| {
-                std.log.err("inkling2_loop: rank 1 rollback ({s})", .{@errorName(e)});
-                return false;
-            };
-            pending_rows = 0;
-        }
-        std.log.info("inkling2: follow base {d} n {d}", .{ rec.base, rec.n });
-        cache.len = rec.base;
-        // A request at position 0 must not read the previous request's convolution history (as `feed` clears it).
-        if (rec.base == 0 and rec.flags & 4 != 0) {
-            st.zero(&rt, cache.conv, st.conv_bytes) catch |e| {
-                std.log.err("inkling2_loop: rank 1 conv zero ({s})", .{@errorName(e)});
-                return false;
-            };
-            rt.sync() catch {};
-        }
+        const list = ink.group.plan(rec, &acts) catch |e| {
+            std.log.err("inkling2_loop: rank 1 record ({s})", .{@errorName(e)});
+            return false;
+        };
+        std.log.info("inkling2: follow seq {d} op {d} n {d} segs {d}", .{ rec.seq, @intFromEnum(rec.op), rec.n, rec.nseg });
         const profile_one = std.c.getenv("TF_TP_PROFILE") != null and xpu.profile.active == null;
         var prof: xpu.profile.Profile = undefined;
         if (profile_one) {
@@ -475,32 +464,168 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
             xpu.profile.active = &prof;
             xpu.rt.Runtime.resetSyncLog();
         }
-        // Bit 2 marks a prompt chunk. A verify window is a forward, even when it has more than one row.
-        if (rec.flags & 4 != 0) {
-            ink.prefill.run(model, &scratch, &cache, rec.ids[0..rec.n], .{ .defer_head = rec.flags & 2 != 0, .all = rec.flags & 1 != 0 }) catch |e| {
-                std.log.err("inkling2_loop: rank 1 prefill ({s})", .{@errorName(e)});
-                return false;
-            };
-            if (rec.flags & 2 != 0) ink.prefill.headRows(model, &scratch, 0, rec.n) catch |e| {
-                std.log.err("inkling2_loop: rank 1 head ({s})", .{@errorName(e)});
-                return false;
-            };
-        } else {
-            // A window of more than one row is a drafted verify window: the leader opened a cache transaction, so this
-            // rank must too. A plain decode row writes its history itself, and the leader opened none.
-            if (rec.n > 1) {
-                cache.begin(rec.n) catch |e| {
-                    std.log.err("inkling2_loop: rank 1 begin ({s})", .{@errorName(e)});
+        for (list) |act| switch (act) {
+            .close => return true,
+            .ensure => |e| {
+                const want: usize = e.capacity;
+                if (caches[e.slot]) |c| {
+                    if (c.capacity < want) {
+                        c.deinit();
+                        gpa.destroy(c);
+                        caches[e.slot] = null;
+                    }
+                }
+                if (caches[e.slot] == null) {
+                    const c = gpa.create(st.Cache) catch |err| {
+                        std.log.err("inkling2_loop: rank 1 cache slot {d} ({s})", .{ e.slot, @errorName(err) });
+                        return false;
+                    };
+                    c.* = st.Cache.init(&rt, want, &model.weight_plan, .bf16) catch |err| {
+                        std.log.err("inkling2_loop: rank 1 cache slot {d} ({s})", .{ e.slot, @errorName(err) });
+                        gpa.destroy(c);
+                        return false;
+                    };
+                    // The follower's taps are packed at the rank width; a cache at the full width commits the wrong rows (S3).
+                    c.kv_channels = place.kvWidth();
+                    caches[e.slot] = c;
+                }
+            },
+            .seek => |e| {
+                const c = caches[e.slot] orelse {
+                    std.log.err("inkling2_loop: rank 1 seek on a slot with no cache", .{});
                     return false;
                 };
-                pending_rows = rec.n;
-                pending_base = rec.base;
-            }
-            ink.forward.run(model, &scratch, &cache, rec.ids[0..rec.n], .{ .all = rec.flags != 0 }) catch |e| {
-                std.log.err("inkling2_loop: rank 1 forward ({s})", .{@errorName(e)});
-                return false;
-            };
-        }
+                c.len = e.base;
+            },
+            .zero_conv => |e| {
+                const c = caches[e.slot] orelse {
+                    std.log.err("inkling2_loop: rank 1 conv zero on a slot with no cache", .{});
+                    return false;
+                };
+                st.zero(&rt, c.conv, st.conv_bytes) catch |err| {
+                    std.log.err("inkling2_loop: rank 1 conv zero ({s})", .{@errorName(err)});
+                    return false;
+                };
+                rt.sync() catch {};
+            },
+            .begin => |e| {
+                const c = caches[e.slot] orelse {
+                    std.log.err("inkling2_loop: rank 1 begin on a slot with no cache", .{});
+                    return false;
+                };
+                c.begin(e.rows) catch |err| {
+                    std.log.err("inkling2_loop: rank 1 begin ({s})", .{@errorName(err)});
+                    return false;
+                };
+            },
+            .run_prefill => {
+                const seg = rec.segs[0];
+                const c = caches[seg.slot] orelse {
+                    std.log.err("inkling2_loop: rank 1 prefill on a slot with no cache", .{});
+                    return false;
+                };
+                // Bit 2 marks a prompt chunk. A verify window is a forward, even when it has more than one row.
+                ink.prefill.run(model, &scratch, c, rec.ids[0..rec.n], .{ .defer_head = rec.flags & 2 != 0, .all = rec.flags & 1 != 0 }) catch |e| {
+                    std.log.err("inkling2_loop: rank 1 prefill ({s})", .{@errorName(e)});
+                    return false;
+                };
+                if (rec.flags & 2 != 0) ink.prefill.headRows(model, &scratch, 0, rec.n) catch |e| {
+                    std.log.err("inkling2_loop: rank 1 head ({s})", .{@errorName(e)});
+                    return false;
+                };
+            },
+            .run_forward => {
+                var segs: [st.max_segments]ink.forward.Segment = undefined;
+                var rows: usize = 0;
+                for (rec.segs[0..rec.nseg], 0..) |seg, si| {
+                    const c = caches[seg.slot] orelse {
+                        std.log.err("inkling2_loop: rank 1 forward on a slot with no cache", .{});
+                        return false;
+                    };
+                    segs[si] = .{ .cache = c, .rows = seg.rows };
+                    rows += seg.rows;
+                }
+                if (rows != rec.n) {
+                    std.log.err("inkling2_loop: rank 1 forward rows {d} n {d}", .{ rows, rec.n });
+                    return false;
+                }
+                ink.forward.runShared(model, &scratch, segs[0..rec.nseg], rec.ids[0..rec.n], .{ .all = rec.flags & 1 != 0 }) catch |e| {
+                    std.log.err("inkling2_loop: rank 1 forward ({s})", .{@errorName(e)});
+                    return false;
+                };
+            },
+            .keep => |e| {
+                const c = caches[e.slot] orelse {
+                    std.log.err("inkling2_loop: rank 1 keep on a slot with no cache", .{});
+                    return false;
+                };
+                c.commit(e.accepted) catch |err| {
+                    std.log.err("inkling2_loop: rank 1 commit ({s})", .{@errorName(err)});
+                    return false;
+                };
+            },
+            .release => |e| {
+                if (caches[e.slot]) |c| {
+                    // A slot can end while a verify window is open: roll the transaction back before the cache goes.
+                    if (c.pending != null) c.rollback() catch |err| std.log.err("inkling2_loop: rank 1 rollback at release ({s})", .{@errorName(err)});
+                    c.deinit();
+                    gpa.destroy(c);
+                    caches[e.slot] = null;
+                }
+            },
+            .save => |e| {
+                const c = caches[e.slot] orelse {
+                    std.log.err("inkling2_loop: rank 1 save on a slot with no cache", .{});
+                    return false;
+                };
+                const snap = gpa.create(ink.snapshot.Snap) catch |err| {
+                    std.log.err("inkling2_loop: rank 1 save ({s})", .{@errorName(err)});
+                    return false;
+                };
+                // The follower's own length stops at the last chunk base: the leader's `at` covers the rows it ran past it.
+                c.saveAt(e.at) catch |err| {
+                    std.log.err("inkling2_loop: rank 1 save position ({s})", .{@errorName(err)});
+                    gpa.destroy(snap);
+                    return false;
+                };
+                snap.* = ink.snapshot.save(&rt, c) catch |err| {
+                    std.log.err("inkling2_loop: rank 1 save ({s})", .{@errorName(err)});
+                    gpa.destroy(snap);
+                    return false;
+                };
+                snap.id = e.snap;
+                if (snaps.fetchRemove(e.snap)) |old| {
+                    old.value.free();
+                    gpa.destroy(old.value);
+                }
+                snaps.put(gpa, e.snap, snap) catch |err| {
+                    std.log.err("inkling2_loop: rank 1 save ({s})", .{@errorName(err)});
+                    snap.free();
+                    gpa.destroy(snap);
+                    return false;
+                };
+            },
+            .restore => |e| {
+                const c = caches[e.slot] orelse {
+                    std.log.err("inkling2_loop: rank 1 restore on a slot with no cache", .{});
+                    return false;
+                };
+                const snap = snaps.get(e.snap) orelse {
+                    std.log.err("inkling2_loop: rank 1 restore of snapshot {d} it does not hold", .{e.snap});
+                    return false;
+                };
+                ink.snapshot.restore(c, snap) catch |err| {
+                    std.log.err("inkling2_loop: rank 1 restore ({s})", .{@errorName(err)});
+                    return false;
+                };
+            },
+            .drop => |e| {
+                if (snaps.fetchRemove(e.snap)) |old| {
+                    old.value.free();
+                    gpa.destroy(old.value);
+                }
+            },
+        };
         if (profile_one) {
             prof.collect() catch {};
             std.log.info("inkling2: rank 1 one token, {d} launches", .{prof.launches});
@@ -509,5 +634,7 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
             xpu.profile.active = null;
             prof.deinit();
         }
+        // The ring holds eight records: the leader waits for this word before it overwrites one.
+        gp.markDone(rec.seq);
     }
 }

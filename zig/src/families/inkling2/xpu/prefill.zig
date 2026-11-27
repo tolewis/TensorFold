@@ -568,7 +568,7 @@ pub fn run(m: *const Model, s: *state.Scratch, cache: *state.Cache, ids: []const
     if (m.options.place.rank == 0) {
         if (group.live) |gp| {
             const flags: u32 = (if (options.all) @as(u32, 1) else 0) | (if (options.defer_head) @as(u32, 2) else 0) | 4;
-            try gp.note(.forward, ids, flags, @intCast(cache.len));
+            try gp.note(.forward, ids, flags, &[_]group.Seg{.{ .slot = cache.slot, .rows = @intCast(rows), .base = @intCast(cache.len), .capacity = @intCast(cache.capacity), .accepted = 0 }}, 0);
         }
     }
     const g = Run{ .m = m, .p = p, .s = stream, .sc = s, .rows = rows, .old_experts = options.old_experts, .old_dense = options.old_dense, .old_loop = options.old_loop, .old_sliding = options.old_sliding, .gl_slice = gl_slice, .sl_slice = sl_slice, .sl_seg0 = gl_n };
