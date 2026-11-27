@@ -68,7 +68,7 @@ struct FzTaps {          // the k and v taps of a global visit: dense_rows_scale
 
 struct FusedVisit {
     int global, gated, nq_attn, n_proj;   // n_proj: 1 (all) or 3 (qx, wk, wv)
-    int copy_bytes, pad0, pad1, pad2;      // the boundary copy (0: none)
+    int copy_bytes, drop, pad1, pad2;      // the boundary copy (0: none); drop: a test's skipped arrival (fused.zig)
     void* copy_dst;
     const void* copy_src;
     const void* mix_attn;   // ops MixArgs (plain) or loop LoopMixArgs (gated)

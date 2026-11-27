@@ -57,9 +57,9 @@ extern "C" __device__ void fz_dense_scaled_warp(const __nv_bfloat16* x, const __
                                                 float* out, int n, int k, int col);
 extern "C" __device__ void fz_plan(const int* picks, int P, int E, int T, int* members, int* items, int* counts);
 extern "C" __device__ void fz_mix_s(const fz_mix::MixArgs& a, float* part1, float* part2, unsigned* cnt,
-                                    unsigned* fault, unsigned char* stg);
+                                    unsigned* fault, unsigned char* stg, int drop);
 extern "C" __device__ void fz_loop_s(const fz_mix::LoopMixArgs& a, float* part1, float* part2, unsigned* cnt,
-                                     unsigned* fault, unsigned char* stg);
+                                     unsigned* fault, unsigned char* stg, int drop);
 
 namespace {
 
@@ -85,7 +85,11 @@ struct Ctx {
     unsigned long long* times;
     int ci;   // the next counter group (block-uniform)
     int ph;   // the phase number in the visit
+    int drop; // a test's skipped arrival: ((group + 1) << 3) | sub, 0 none (fused.zig TF_INKLING2_FUSED_DROP)
 };
+
+// The counter of this group that the test skips (-1: none).
+__device__ __forceinline__ int drop_sub(const Ctx& c) { return (c.drop >> 3) == c.ci + 1 ? (c.drop & 7) : -1; }
 
 // The all-of wait (M4, P = G). Returns false when this block or another block set the fault word.
 __device__ bool all_wait(Ctx& c) {
@@ -93,7 +97,7 @@ __device__ bool all_wait(Ctx& c) {
     __syncthreads();
     if (threadIdx.x == 0) {
         unsigned* cnt = c.st.cnt + 8 * c.ci;
-        red_rel_add(cnt, 1u);
+        if (!(blockIdx.x == 0 && drop_sub(c) == 0)) red_rel_add(cnt, 1u);
         const unsigned long long t0 = now();
         bool ok = true;
         while (ld_acq(cnt) < gridDim.x) {
@@ -174,9 +178,9 @@ __device__ bool gates_phase(const void* ga, int gates, Ctx& c, unsigned char* dy
 __device__ bool mix_phase(const void* a, bool gated, Ctx& c, unsigned char* dyn) {
     unsigned* cnt = c.st.cnt + 8 * c.ci;
     if (gated)
-        fz_loop_s(*static_cast<const fz_mix::LoopMixArgs*>(a), c.st.part1, c.st.part2, cnt, c.fault, dyn);
+        fz_loop_s(*static_cast<const fz_mix::LoopMixArgs*>(a), c.st.part1, c.st.part2, cnt, c.fault, dyn, drop_sub(c));
     else
-        fz_mix_s(*static_cast<const fz_mix::MixArgs*>(a), c.st.part1, c.st.part2, cnt, c.fault, dyn);
+        fz_mix_s(*static_cast<const fz_mix::MixArgs*>(a), c.st.part1, c.st.part2, cnt, c.fault, dyn, drop_sub(c));
     c.ci++;
     c.ph++;
     if (threadIdx.x == 0 && blockIdx.x == 0 && c.ph < 64) c.times[c.ph] = now();
@@ -271,12 +275,13 @@ __device__ bool visit(const FusedVisit& V, Ctx& c, unsigned char* dyn) {
 extern "C" __global__ void __launch_bounds__(128) tf_ink2_fused_visit(const FusedVisit* __restrict__ table, int first,
                                                                      int count, FusedState st) {
     extern __shared__ __align__(128) unsigned char dyn[];
-    Ctx c{st, nullptr, nullptr, 0, 0};
+    Ctx c{st, nullptr, nullptr, 0, 0, 0};
     for (int v = first; v < first + count; ++v) {
         c.fault = st.fault + v;
         c.st.tk = st.tk + 1024 * v;  // 4 qmmf calls a visit, 256 tiles a call
         c.times = st.times + 64 * v;
         c.ph = 0;
+        c.drop = table[v].drop;
         if (!visit(table[v], c, dyn)) return;
     }
 }

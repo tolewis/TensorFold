@@ -90,6 +90,7 @@ struct SArgs {
   unsigned* fault;
   unsigned* sink;
   int reps;
+  int drop;         // a test's skipped arrival: counter 0 (unit 0), 1 + q (unit w 0 of q), 7 (block 0); -1 none
 };
 
 __device__ __forceinline__ void cpa16(void* s, const void* g) { __pipeline_memcpy_async(s, g, 16); }
@@ -108,14 +109,14 @@ __device__ __forceinline__ void warp_wait(unsigned* c, unsigned target, unsigned
     if (!spin_ge<false>(c, target)) set_fault(fault, ph);
   __syncwarp();
 }
-__device__ __forceinline__ void warp_arrive(unsigned* c) {
+__device__ __forceinline__ void warp_arrive(unsigned* c, bool skip = false) {
   __syncwarp();
-  if ((threadIdx.x & 31) == 0) { __threadfence(); red_rel_add(c, 1u); }
+  if ((threadIdx.x & 31) == 0 && !skip) { __threadfence(); red_rel_add(c, 1u); }
 }
-__device__ __forceinline__ void block_all(unsigned* c, unsigned* fault, unsigned ph) {
+__device__ __forceinline__ void block_all(unsigned* c, unsigned* fault, unsigned ph, bool skip = false) {
   __syncthreads();
   if (threadIdx.x == 0) {
-    red_rel_add(c, 1u);
+    if (!skip) red_rel_add(c, 1u);
     if (!spin_ge<false>(c, gridDim.x)) set_fault(fault, ph);
   }
   __syncthreads();
@@ -164,7 +165,7 @@ __device__ void mixS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigned
     for (int i = 0; i < 4; ++i) v[i] = warpSum(v[i]);
     if (lane == 0)
       for (int i = 0; i < 1 + nq; ++i) A.part1[(j * MIXW + w) * 4 + i] = v[i];
-    warp_arrive(cnt + 0);
+    warp_arrive(cnt + 0, A.drop == 0 && slot == 0);
   } else if (slot < P1 + P2) {
     // ---- pass 2 unit (q, w)
     const int u = slot - P1, w = u % MIXW, q = u / MIXW, t = w * 32 + lane;
@@ -209,7 +210,7 @@ __device__ void mixS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigned
     }
     s = warpSum(s);
     if (lane == 0) A.part2[q * MIXW + w] = s;
-    warp_arrive(cnt + 1 + q);
+    warp_arrive(cnt + 1 + q, A.drop == 1 + q && w == 0);
     warp_wait(cnt + 1 + q, MIXW, A.fault, 2);
     const float tot = sum_level2(A.part2 + q * MIXW, MIXW, 1);
     const float rq = rsqrtf(tot / C + a.eps);
@@ -223,7 +224,7 @@ __device__ void mixS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigned
     }
     acc ^= __float_as_uint(hv[0]);
   }
-  block_all(cnt + 7, A.fault, 3);
+  block_all(cnt + 7, A.fault, 3, A.drop == 7 && blockIdx.x == 0);
 }
 
 __device__ void loopS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigned& acc) {
@@ -261,7 +262,7 @@ __device__ void loopS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigne
       A.part1[(s * LOOPW + w) * 4 + 0] = an;
       for (int q = 0; q < nq; ++q) A.part1[(s * LOOPW + w) * 4 + 1 + q] = aq[q];
     }
-    warp_arrive(cnt + 0);
+    warp_arrive(cnt + 0, A.drop == 0 && slot == 0);
   } else if (slot < P1 + P2) {
     const int u = slot - P1, w = u % LOOPW, q = u / LOOPW;
     warp_wait(cnt + 0, P1, A.fault, 1);
@@ -307,15 +308,16 @@ __device__ void loopS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigne
       acc ^= __float_as_uint(uu);
     }
   }
-  block_all(cnt + 7, A.fault, 3);
+  block_all(cnt + 7, A.fault, 3, A.drop == 7 && blockIdx.x == 0);
 }
 }  // namespace fz_mix
 
 // One mix phase (mixS of B9). cnt: 8 zeroed counters. part1 [9][16][4], part2 [4][16] fp32. stg: 4 x 5,760 B shared.
 extern "C" __device__ void fz_mix_s(const fz_mix::MixArgs& a, float* part1, float* part2, unsigned* cnt,
-                                    unsigned* fault, unsigned char* stg) {
+                                    unsigned* fault, unsigned char* stg, int drop) {
     fz_mix::SArgs A;
     A.mix = a;
+    A.drop = drop;
     A.part1 = part1;
     A.part2 = part2;
     A.fault = fault;
@@ -325,9 +327,10 @@ extern "C" __device__ void fz_mix_s(const fz_mix::MixArgs& a, float* part1, floa
 
 // One loop mix phase (loopS of B9).
 extern "C" __device__ void fz_loop_s(const fz_mix::LoopMixArgs& a, float* part1, float* part2, unsigned* cnt,
-                                     unsigned* fault, unsigned char* stg) {
+                                     unsigned* fault, unsigned char* stg, int drop) {
     fz_mix::SArgs A;
     A.loop = a;
+    A.drop = drop;
     A.part1 = part1;
     A.part2 = part2;
     A.fault = fault;

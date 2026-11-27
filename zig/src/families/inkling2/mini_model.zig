@@ -263,7 +263,10 @@ pub const Model = struct {
         errdefer m.deinit();
         try m.build(s, k);
         try s.synchronize();
-        if (fused_.read().mode != .off and m.attn8 != null) m.fused = try fused_.State.init(d);
+        if (fused_.read().mode != .off and m.attn8 != null) {
+            m.fused = try fused_.State.init(d);
+            if (fused_.checking()) try fused_.reportLoad(&m, k);
+        }
         return m;
     }
 

@@ -155,7 +155,7 @@ pub const Visit = extern struct {
     nq_attn: i32,
     n_proj: i32,
     copy_bytes: i32 = 0,
-    pad0: i32 = 0,
+    drop: i32 = 0, // review A2, A3: a skipped arrival, ((group + 1) << 3) | sub (0: none)
     pad1: i32 = 0,
     pad2: i32 = 0,
     copy_dst: u64 = 0,
@@ -225,6 +225,7 @@ pub const State = struct {
     at: []const u8 = "",
     steps: [visits_max]usize = @splat(0),
     bad: [visits_max]usize = @splat(0),
+    drop_at: [visits_max]usize = @splat(0),
 
     pub fn init(d: *const cuda.Driver) !State {
         const sw = read();
@@ -647,6 +648,109 @@ fn every() usize {
     return @max(S.v.?, 1);
 }
 
+/// TF_INKLING2_FUSED_POISON (default 1): every compared buffer except the conv states is filled with 0xFF bytes
+/// before today's kernels and again before the fused launch (review A20). 0: the old method (no fill).
+fn poisonOn() bool {
+    const S = struct {
+        var v: ?bool = null;
+    };
+    if (S.v == null) S.v = if (std.c.getenv("TF_INKLING2_FUSED_POISON")) |e| e[0] != '0' else true;
+    return S.v.?;
+}
+
+/// TF_INKLING2_FUSED_CONTROL=1: at step 1 of each visit, compare once with no fused launch by the old method (no
+/// fill) and once by the fill method, then run the check as usual (review A20).
+fn controlOn() bool {
+    const S = struct {
+        var v: ?bool = null;
+    };
+    if (S.v == null) S.v = if (std.c.getenv("TF_INKLING2_FUSED_CONTROL")) |e| e[0] == '1' else false;
+    return S.v.?;
+}
+
+/// TF_INKLING2_FUSED_DROP=<visit>:<group>:<sub>,...: on the steps with a position below TF_INKLING2_FUSED_DROP_POS
+/// (default 4096), the next entry of the visit makes block 0 (or unit 0 of a mix counter) skip its arrival on counter
+/// `sub` of counter group `group` (review A2, A3). The visit table carries it in `drop`: ((group + 1) << 3) | sub.
+const Drop = struct { v: u32, code: i32 };
+const drops_max = 16;
+fn drops() []const Drop {
+    const S = struct {
+        var list: [drops_max]Drop = undefined;
+        var n: usize = 0;
+        var done = false;
+    };
+    if (!S.done) {
+        S.done = true;
+        if (std.c.getenv("TF_INKLING2_FUSED_DROP")) |e| {
+            var it = std.mem.tokenizeScalar(u8, std.mem.span(e), ',');
+            while (it.next()) |x| if (S.n < drops_max) {
+                var f = std.mem.tokenizeScalar(u8, x, ':');
+                const v = std.fmt.parseInt(u32, f.next() orelse continue, 10) catch continue;
+                const g = std.fmt.parseInt(i32, f.next() orelse continue, 10) catch continue;
+                const sub = std.fmt.parseInt(i32, f.next() orelse continue, 10) catch continue;
+                S.list[S.n] = .{ .v = v, .code = ((g + 1) << 3) | (sub & 7) };
+                S.n += 1;
+            };
+        }
+    }
+    return S.list[0..S.n];
+}
+
+fn dropPos() u32 {
+    const S = struct {
+        var v: ?u32 = null;
+    };
+    if (S.v == null) S.v = if (std.c.getenv("TF_INKLING2_FUSED_DROP_POS")) |e| std.fmt.parseInt(u32, std.mem.span(e), 10) catch 4096 else 4096;
+    return S.v.?;
+}
+
+/// At load in check mode: the query pointers of each layer (review A7) and the resident blocks a multiprocessor of
+/// today's fp8 attention kernels at 128 threads against the fused kernel (review A10).
+pub fn reportLoad(m: *const Model, k: *const Kernels) !void {
+    const d = m.d;
+    for (m.w.layers, 0..) |L, i| std.debug.print("[fused-load] layer {d} attn_query 0x{x} mlp_query 0x{x}\n", .{ i, L.attn_query, L.mlp_query });
+    var per: c_int = 0;
+    try d.check(d.api.cuOccupancyMaxActiveBlocksPerMultiprocessor(&per, k.attn.attn8.handle, threads, 0), "cuOccupancyMaxActiveBlocksPerMultiprocessor");
+    var per_db: c_int = 0;
+    try d.check(d.api.cuOccupancyMaxActiveBlocksPerMultiprocessor(&per_db, k.attn.attn8_db.handle, threads, attn.db8_shared), "cuOccupancyMaxActiveBlocksPerMultiprocessor");
+    const f = &m.fused.?;
+    var per_f: c_int = 0;
+    try d.check(d.api.cuOccupancyMaxActiveBlocksPerMultiprocessor(&per_f, f.f.handle, threads, f.dyn), "cuOccupancyMaxActiveBlocksPerMultiprocessor");
+    std.debug.print("[fused-load] occupancy at 128 threads, blocks a multiprocessor: tf_ink2_attn8 {d}, tf_ink2_attn8_db {d} ({d} B dynamic), tf_ink2_fused_visit {d} ({d} B dynamic), grid {d}\n", .{ per, per_db, attn.db8_shared, per_f, f.dyn, f.grid });
+}
+
+/// Fill every compared buffer except the conv states (the visit's inputs) with 0xFF bytes.
+fn poison(d: *const cuda.Driver, s: cuda.Stream, list: []const Buf) !void {
+    for (list) |b| if (!std.mem.startsWith(u8, b.name, "conv_")) try d.check(d.api.cuMemsetD8Async(b.ptr, 0xff, b.len, s.handle), "cuMemsetD8Async");
+}
+
+/// Compare each listed buffer with its bytes in `ref`; one line a buffer into `lines`. Returns the differing bytes.
+fn compare(f: *State, list: []const Buf, v: u32, step: usize, pos: u32, lines: ?*std.ArrayList(u8)) !usize {
+    const d = f.d;
+    const gpa = std.heap.page_allocator;
+    var diff_total: usize = 0;
+    var at: usize = 0;
+    for (list) |b| {
+        const want = try gpa.alloc(u8, b.len);
+        defer gpa.free(want);
+        const got = try gpa.alloc(u8, b.len);
+        defer gpa.free(got);
+        try cuda.memory.download(d, f.ref.ptr + at, want);
+        try cuda.memory.download(d, b.ptr, got);
+        var bytes: usize = 0;
+        for (want, got) |x, y| bytes += @intFromBool(x != y);
+        var big: f64 = 0;
+        if (bytes != 0) {
+            const w = width(b.kind);
+            for (0..b.len / w) |e| big = @max(big, @abs(value(b.kind, want, e) - value(b.kind, got, e)));
+        }
+        diff_total += bytes;
+        if (lines) |l| try l.print(gpa, "[fused-check] visit {d} step {d} pos {d} {s} bytes {d} differing {d} largest {e}\n", .{ v, step, pos, b.name, b.len, bytes, big });
+        at += b.len;
+    }
+    return diff_total;
+}
+
 /// Visit `v` by today's kernels (`today`), then by the fused kernel from the same state; compare; keep today's bytes.
 pub fn check(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytype, v: u32, hin: u64, hout: u64, today: anytype) !void {
     checkSteps(f, m, k, s, r, v, hin, hout, today) catch |e| {
@@ -660,23 +764,40 @@ fn checkSteps(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytyp
     const gpa = std.heap.page_allocator; // not the model's allocator: the check's buffers live for one visit
     f.at = "fill";
     var host: [arg_bytes]u8 = undefined;
-    const vis = fill(f, m, r, v, hin, hout, &host) catch |e| {
+    var vis = fill(f, m, r, v, hin, hout, &host) catch |e| {
         if (f.steps[v] == 0) std.debug.print("[fused-check] visit {d}: not a Part 2 visit ({s}), today's kernels\n", .{ v, @errorName(e) });
         f.steps[v] += 1;
         return today.run(m, k, s, r, v, hin, hout);
     };
+    // the drop entry of this step (review A2, A3): the table entry carries it
+    const step = f.steps[v];
+    var drop: i32 = 0;
+    if (r.last_pos < dropPos()) {
+        var k_: usize = 0;
+        for (drops()) |e| if (e.v == v) {
+            if (k_ == f.drop_at[v]) {
+                drop = e.code;
+                break;
+            }
+            k_ += 1;
+        };
+        if (drop != 0) f.drop_at[v] += 1;
+    }
+    vis.drop = drop;
     f.at = "upload";
     try s.synchronize();
     try f.args.upload(@as(usize, v) * arg_bytes, &host);
     try f.table.upload(@as(usize, v) * @sizeOf(Visit), std.mem.asBytes(&vis));
     var list: [list_max]Buf = undefined;
     const nbuf = buffers(m, r, v, hout, &vis, &list);
+    const fill_on = poisonOn();
     // the conv states before the visit
     var saved: usize = 0;
     for (list[0..nbuf]) |b| if (std.mem.startsWith(u8, b.name, "conv_")) {
         try m.copy(s, f.save.ptr + saved, b.ptr, b.len);
         saved += b.len;
     };
+    if (fill_on) try poison(d, s, list[0..nbuf]);
     f.at = "today";
     try s.synchronize();
     try d.check(d.api.cuEventRecord(f.ev[0], s.handle), "cuEventRecord");
@@ -694,6 +815,16 @@ fn checkSteps(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytyp
         try m.copy(s, b.ptr, f.save.ptr + saved, b.len);
         saved += b.len;
     };
+    // the control (review A20): no fused launch, compared by the old method, then by the fill method
+    if (controlOn() and step == 1) {
+        try s.synchronize();
+        const old_n = try compare(f, list[0..nbuf], v, step, r.last_pos, null);
+        try poison(d, s, list[0..nbuf]);
+        try s.synchronize();
+        const new_n = try compare(f, list[0..nbuf], v, step, r.last_pos, null);
+        std.debug.print("[fused-control] visit {d} step {d} pos {d} no fused launch: differing bytes {d} by the old method, {d} by the fill method, buffers {d}\n", .{ v, step, r.last_pos, old_n, new_n, nbuf });
+    }
+    if (fill_on) try poison(d, s, list[0..nbuf]);
     try d.check(d.api.cuEventRecord(f.ev[2], s.handle), "cuEventRecord");
     f.at = "fused";
     try f.launch(s, v, 1);
@@ -709,30 +840,10 @@ fn checkSteps(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytyp
     try cuda.memory.download(d, f.times.ptr + @as(u64, v) * times_visit * 8, std.mem.sliceAsBytes(&times));
     // compare
     f.at = "compare";
-    const step = f.steps[v];
     f.steps[v] += 1;
-    var diff_total: usize = 0;
     var lines: std.ArrayList(u8) = .empty;
     defer lines.deinit(gpa);
-    at = 0;
-    for (list[0..nbuf]) |b| {
-        const want = try gpa.alloc(u8, b.len);
-        defer gpa.free(want);
-        const got = try gpa.alloc(u8, b.len);
-        defer gpa.free(got);
-        try cuda.memory.download(d, f.ref.ptr + at, want);
-        try cuda.memory.download(d, b.ptr, got);
-        var bytes: usize = 0;
-        for (want, got) |x, y| bytes += @intFromBool(x != y);
-        var big: f64 = 0;
-        if (bytes != 0) {
-            const w = width(b.kind);
-            for (0..b.len / w) |e| big = @max(big, @abs(value(b.kind, want, e) - value(b.kind, got, e)));
-        }
-        diff_total += bytes;
-        try lines.print(gpa, "[fused-check] visit {d} step {d} pos {d} {s} bytes {d} differing {d} largest {e}\n", .{ v, step, r.last_pos, b.name, b.len, bytes, big });
-        at += b.len;
-    }
+    const diff_total = try compare(f, list[0..nbuf], v, step, r.last_pos, &lines);
     // today's bytes back (the reply stays today's)
     at = 0;
     for (list[0..nbuf]) |b| {
@@ -740,14 +851,16 @@ fn checkSteps(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytyp
         at += b.len;
     }
     try s.synchronize();
-    if (diff_total != 0 or fault != 0) f.bad[v] += 1;
-    if (diff_total != 0 or fault != 0 or step % every() == 0) {
+    if (drop != 0) {
+        std.debug.print("[fused-drop] visit {d} step {d} pos {d} group {d} sub {d} fused_us {d:.2} fault 0x{x} differing {d}\n", .{ v, step, r.last_pos, (drop >> 3) - 1, drop & 7, ms_fused * 1000, fault, diff_total });
+    } else if (diff_total != 0 or fault != 0) f.bad[v] += 1;
+    if (drop == 0 and (diff_total != 0 or fault != 0 or step % every() == 0)) {
         std.debug.print("{s}", .{lines.items});
         var tl: std.ArrayList(u8) = .empty;
         defer tl.deinit(gpa);
         var ph: usize = 1;
         while (ph < times_visit and times[ph] != 0 and times[ph] >= times[ph - 1]) : (ph += 1) try tl.print(gpa, " {d}", .{times[ph] - times[ph - 1]});
-        std.debug.print("[fused-time] visit {d} step {d} pos {d} today_us {d:.2} fused_us {d:.2} fault 0x{x} phases_ns{s}\n", .{ v, step, r.last_pos, ms_today * 1000, ms_fused * 1000, fault, tl.items });
+        std.debug.print("[fused-time] visit {d} step {d} pos {d} today_us {d:.2} fused_us {d:.2} fault 0x{x} fill {d} phases_ns{s}\n", .{ v, step, r.last_pos, ms_today * 1000, ms_fused * 1000, fault, @intFromBool(fill_on), tl.items });
         std.debug.print("[fused-sum] visit {d} steps {d} bad {d} buffers {d} differing {d}\n", .{ v, step + 1, f.bad[v], nbuf, diff_total });
     }
     try d.check(d.api.cuMemsetD8Async(f.times.ptr + @as(u64, v) * times_visit * 8, 0, times_visit * 8, s.handle), "cuMemsetD8Async");
