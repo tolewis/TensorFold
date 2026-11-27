@@ -587,6 +587,8 @@ static inline float4 rx4u(local const ushort *n, uint i) {
 }
 
 // The dense norm, then the wide router GEMV. Group 0 stores the bf16 row. The GEMV reads that row from local.
+// Each lane loads its 18 weight pieces before the norm, so the weight reads run under the norm (the 8 groups of the
+// launch each compute the norm). The dot order is the one of tf_ink2_router_gemv.
 KERNEL(256) void tf_ink2_router_norm_gemv(
     global const float *x, global const ushort *nw, global const ushort *weight, global ushort *normed_out,
     global float *scores, uint rows) {
@@ -594,6 +596,10 @@ KERNEL(256) void tf_ink2_router_norm_gemv(
   if (row >= rows) return;
   local float red[16];
   local ushort normed[H];
+  const uint expert = get_group_id(0) * 16 + sg;
+  global const uint4 *w = (global const uint4 *)(weight + (size_t)(expert < 128 ? expert : 127) * H);
+  uint4 a[18];
+  for (uint k = 0; k < 18; ++k) a[k] = w[k * 16 + lane];
   global const float *xr = x + (size_t)row * H;
   float sum = 0.0f;
   for (uint d = t; d < H; d += 256) sum = fma(xr[d], xr[d], sum);
@@ -608,23 +614,21 @@ KERNEL(256) void tf_ink2_router_norm_gemv(
   if (get_group_id(0) == 0) {
     for (uint d = t; d < H; d += 256) normed_out[(size_t)row * H + d] = normed[d];
   }
-  const uint expert = get_group_id(0) * 16 + sg;
   if (expert >= 128) return;
-  global const uint4 *w = (global const uint4 *)(weight + (size_t)expert * H);
   float dot = 0.0f;
   for (uint part = 0; part < 2; ++part) {
     for (uint u = 0; u < 9; ++u) {
       const uint at = (part * 9 + u) * 16 + lane;
-      const uint4 a = w[(part * 9 + u) * 16 + lane];
+      const uint4 wa = a[part * 9 + u];
       const float4 b0 = rx4u(normed, 2 * at), b1 = rx4u(normed, 2 * at + 1);
-      dot += as_float(a.x << 16) * b0.x;
-      dot += as_float(a.x & 0xffff0000u) * b0.y;
-      dot += as_float(a.y << 16) * b0.z;
-      dot += as_float(a.y & 0xffff0000u) * b0.w;
-      dot += as_float(a.z << 16) * b1.x;
-      dot += as_float(a.z & 0xffff0000u) * b1.y;
-      dot += as_float(a.w << 16) * b1.z;
-      dot += as_float(a.w & 0xffff0000u) * b1.w;
+      dot += as_float(wa.x << 16) * b0.x;
+      dot += as_float(wa.x & 0xffff0000u) * b0.y;
+      dot += as_float(wa.y << 16) * b0.z;
+      dot += as_float(wa.y & 0xffff0000u) * b0.w;
+      dot += as_float(wa.z << 16) * b1.x;
+      dot += as_float(wa.z & 0xffff0000u) * b1.y;
+      dot += as_float(wa.w << 16) * b1.z;
+      dot += as_float(wa.w & 0xffff0000u) * b1.w;
     }
   }
   dot = sub_group_reduce_add(dot);
