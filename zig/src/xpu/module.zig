@@ -52,6 +52,12 @@ pub const Module = struct {
     pub fn kernel(self: Module, name: [:0]const u8, local: [3]u32) Error!Kernel {
         const k = try self.kernelAt(name);
         try self.ctx.d.check(self.ctx.d.api.zeKernelSetGroupSize(k.handle, local[0], local[1], local[2]), "zeKernelSetGroupSize");
+        if (std.c.getenv("TF_XPU_KPROPS") != null) {
+            // TF_XPU_KPROPS: one line a kernel with the driver's register and memory sizes (spill check of a kernel change).
+            var kp: ze.KernelProperties = .{};
+            if (self.ctx.d.api.zeKernelGetProperties(k.handle, &kp) == 0)
+                std.debug.print("KPROPS {s} spill {d} private {d} local {d} args {d}\n", .{ name, kp.spillMemSize, kp.privateMemSize, kp.localMemSize, kp.numKernelArgs });
+        }
         return k;
     }
 

@@ -161,6 +161,8 @@ pub const Pipelines = struct {
     conv_kv: xpu.Kernel,
     down_epi: xpu.Kernel,
     router_norm: xpu.Kernel,
+    /// Empty kernels at 64, 128 and 256 work-items, for the launch-cost probe.
+    empty: [3]xpu.Kernel,
 
     pub fn load(module: xpu.Module) !Pipelines {
         var pre = try module.kernel("tf_ink2_fuse_pre", .{ 256, 1, 1 });
@@ -190,10 +192,16 @@ pub const Pipelines = struct {
         var down_epi_k = try module.kernel("tf_ink2_down_epilogue", .{ 256, 1, 1 });
         errdefer down_epi_k.deinit();
         const router_norm = try module.kernel("tf_ink2_router_norm_gemv", .{ 256, 1, 1 });
-        return .{ .pre = pre, .zeta = zeta, .gates = gates, .norms = norms, .router_gemv = router_gemv, .router_pick = router_pick, .conv_attn = conv_attn, .conv_mlp = conv_mlp, .zeta_wide = zeta_wide_k, .zeta_split_k = zeta_split_k, .gates_norms_k = gates_norms_k, .pre_q_k = pre_q_k, .pre_zeta_k = pre_zeta_k, .conv_kv = conv_kv, .down_epi = down_epi_k, .router_norm = router_norm };
+        const empty: [3]xpu.Kernel = .{
+            try module.kernel("tf_ink2_empty64", .{ 64, 1, 1 }),
+            try module.kernel("tf_ink2_empty128", .{ 128, 1, 1 }),
+            try module.kernel("tf_ink2_empty256", .{ 256, 1, 1 }),
+        };
+        return .{ .empty = empty, .pre = pre, .zeta = zeta, .gates = gates, .norms = norms, .router_gemv = router_gemv, .router_pick = router_pick, .conv_attn = conv_attn, .conv_mlp = conv_mlp, .zeta_wide = zeta_wide_k, .zeta_split_k = zeta_split_k, .gates_norms_k = gates_norms_k, .pre_q_k = pre_q_k, .pre_zeta_k = pre_zeta_k, .conv_kv = conv_kv, .down_epi = down_epi_k, .router_norm = router_norm };
     }
 
     pub fn deinit(p: *Pipelines) void {
+        for (&p.empty) |*k| k.deinit();
         p.router_norm.deinit();
         p.down_epi.deinit();
         p.conv_kv.deinit();
@@ -212,6 +220,34 @@ pub const Pipelines = struct {
         p.pre.deinit();
     }
 };
+
+/// The launch-cost probe: `INK2_EMPTY_PROBE=1` adds one empty launch a (work-group size, grid) pair at the end of a
+/// one-row forward, each under its own profile label. The grids are those of the decode kernels' sheet.
+pub fn emptyProbe() bool {
+    if (std.c.getenv("INK2_EMPTY_PROBE")) |p| {
+        const s = std.mem.span(p);
+        return s.len > 0 and s[0] == '1';
+    }
+    return false;
+}
+
+const probe_grids = [_]u32{ 1, 3, 4, 8, 9, 12, 16, 36, 48, 108 };
+const probe_labels = [3][probe_grids.len][]const u8{
+    .{ "w64g1", "w64g3", "w64g4", "w64g8", "w64g9", "w64g12", "w64g16", "w64g36", "w64g48", "w64g108" },
+    .{ "w128g1", "w128g3", "w128g4", "w128g8", "w128g9", "w128g12", "w128g16", "w128g36", "w128g48", "w128g108" },
+    .{ "w256g1", "w256g3", "w256g4", "w256g8", "w256g9", "w256g12", "w256g16", "w256g36", "w256g48", "w256g108" },
+};
+
+pub fn emptyLaunches(p: *const Pipelines, s: xpu.Stream) !void {
+    const saved = xpu.profile.label;
+    defer xpu.profile.label = saved;
+    for (0..3) |ki| {
+        for (probe_grids, 0..) |n, gi| {
+            xpu.profile.label = probe_labels[ki][gi];
+            try xpu.launch.dispatch(p.empty[ki], s, .{ n, 1, 1 }, .{@as(u32, 0)});
+        }
+    }
+}
 
 pub const PhaseA = struct {
     p: Ref,

@@ -781,3 +781,8 @@ KERNEL(256) void tf_ink2_down_epilogue(
   if (commit1 && rows == 1 && c < n && c < channels) commit3(history, current, c, channels);
 }
 
+// Empty bodies at the three work-group sizes of the decode kernels: the fixed cost of a launch at a grid
+// (INK2_EMPTY_PROBE=1, forward.zig). Nothing reads or writes memory.
+KERNEL(64) void tf_ink2_empty64(uint unused) {}
+KERNEL(128) void tf_ink2_empty128(uint unused) {}
+KERNEL(256) void tf_ink2_empty256(uint unused) {}

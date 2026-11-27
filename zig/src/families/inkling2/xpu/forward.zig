@@ -1041,6 +1041,7 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
         }
     }
     try g.commitFullHistories(segments);
+    if (rows == 1 and fuse.emptyProbe()) try fuse.emptyLaunches(&p.fuse, stream);
     if (xpu.profile.active) |prof| prof.enqueued();
     xpu.profile.reportAppend(m.options.place.rank);
     try stream.synchronize();
