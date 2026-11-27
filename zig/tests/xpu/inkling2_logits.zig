@@ -16,6 +16,7 @@
 //! `--digest` prints SHA-256 digests of the bits of every logit row computed (prompt rows, then decode steps), to compare
 //! two builds for bit identity. `--profile` adds eight profiled decode steps: launches by kernel, host and device time.
 //! `--bench-context C` times N decode steps (default 32) at context C with no prompt: K/V is zeroed, only the cost is real.
+//! `--capacity N` makes the cache hold at least N positions (else the tool sizes it from the longest prompt or context).
 //!
 //! A reference file holds the token ids of a prompt and, for every position, the reference's top 16 token ids and
 //! logits, its log-sum-exp and its top-1 margin (flat little-endian layout of ref_to_bin.py: "IKRF", u32 version 1,
@@ -249,6 +250,7 @@ pub fn main(init: std.process.Init) !void {
     var route_union = false;
     var bench_context: ?usize = null;
     var bench_prefill: usize = 0;
+    var capacity_min: usize = 0;
     var options: ink.model.Options = .{ .embed_host = false };
     var tp: u32 = 1;
     var rank: u32 = 0;
@@ -379,6 +381,10 @@ pub fn main(init: std.process.Init) !void {
             // the first --ref prompt, repeated to N rows, prefilled in --chunk row chunks with the last row's logits only; cold first token
             i += 1;
             bench_prefill = try std.fmt.parseInt(usize, argv[i], 10);
+        } else if (std.mem.eql(u8, a, "--capacity")) {
+            // the cache capacity at least N positions, apart from the bench context (the server's INK_CONTEXT is 131,072)
+            i += 1;
+            capacity_min = try std.fmt.parseInt(usize, argv[i], 10);
         } else if (std.mem.eql(u8, a, "--bench-context")) {
             i += 1;
             bench_context = try std.fmt.parseInt(usize, argv[i], 10);
@@ -439,7 +445,9 @@ pub fn main(init: std.process.Init) !void {
         loaded_refs.items[0].rows = bench_prefill;
         longest = @max(longest, bench_prefill + decode_steps + 4 * profile_steps + 8);
     }
+    longest = @max(longest, capacity_min);
     const capacity = std.mem.alignForward(usize, longest, 64);
+    std.debug.print("capacity {d}\n", .{capacity});
 
     xpu.stop.install();
     var drv = xpu.Driver.open() catch {
