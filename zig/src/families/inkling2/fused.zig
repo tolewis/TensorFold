@@ -959,6 +959,21 @@ fn compareAt(f: *State, list: []const Buf, base: usize, v: u32, step: usize, pos
         }
         diff_total += bytes;
         if (lines) |l| try l.print(gpa, "[fused-check] visit {d} step {d} pos {d} {s} bytes {d} differing {d} largest {e}\n", .{ v, step, pos, b.name, b.len, bytes, big });
+        if (bytes != 0) { // the first and last differing 4-byte words, today then fused (0xffffffff: the fill)
+            var lo: usize = b.len;
+            var hi: usize = 0;
+            for (want, got, 0..) |x, y, i| if (x != y) {
+                lo = @min(lo, i);
+                hi = i;
+            };
+            const word = struct {
+                fn at(xs: []const u8, i: usize) u32 {
+                    const j = i & ~@as(usize, 3);
+                    return if (j + 4 <= xs.len) std.mem.readInt(u32, xs[j..][0..4], .little) else xs[i];
+                }
+            }.at;
+            std.debug.print("[fused-diffword] visit {d} step {d} pos {d} {s} first byte {d} today 0x{x} fused 0x{x}, last byte {d} today 0x{x} fused 0x{x}\n", .{ v, step, pos, b.name, lo, word(want, lo), word(got, lo), hi, word(want, hi), word(got, hi) });
+        }
         at += b.len;
     }
     return diff_total;
