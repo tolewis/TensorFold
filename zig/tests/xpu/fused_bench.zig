@@ -22,7 +22,7 @@ const shapes = [_]Shape{
 };
 /// One sub-group a group, the B0 grid counts, for M-e and the M-a control.
 const s1_counts = [_]u32{ 32, 64, 128, 256, 512, 1024 };
-const mech_names = [_][]const u8{ "none", "a", "b", "c", "e" };
+const mech_names = [_][]const u8{ "none", "a", "b", "c", "e", "f" };
 
 fn nowNs(io: std.Io) i96 {
     return std.Io.Clock.awake.now(io).toNanoseconds();
@@ -160,13 +160,13 @@ fn benchPhase(b: *B, work_u4: u32) !void {
     var runs: std.ArrayList(Run) = .empty;
     defer runs.deinit(std.heap.page_allocator);
     for (shapes) |sh| {
-        for ([_]u32{ 1, 2, 3 }) |mech| {
+        for ([_]u32{ 1, 5, 2, 3 }) |mech| {
             if (mech == 3 and sh.g > 64) continue;
             try runs.append(std.heap.page_allocator, .{ .g = sh.g, .s = sh.s, .grf = sh.grf, .mech = mech });
         }
     }
     for (s1_counts) |g| {
-        for ([_]u32{ 4, 1 }) |mech| try runs.append(std.heap.page_allocator, .{ .g = g, .s = 1, .grf = 256, .mech = mech });
+        for ([_]u32{ 4, 1, 5 }) |mech| try runs.append(std.heap.page_allocator, .{ .g = g, .s = 1, .grf = 256, .mech = mech });
     }
     for (runs.items) |run| {
         b.cfg_fault = false;
@@ -312,7 +312,7 @@ fn benchQ8(b: *B) !void {
             const nwin: u32 = @intCast(gib / stride);
             const bytes = @as(f64, @floatFromInt(n)) * 2448.0;
             const big_r: u32 = @intFromFloat(@max(4.0, @min(100.0, 2e9 / bytes)));
-            for ([_]u32{ 1, 0 }) |mech| {
+            for ([_]u32{ 1, 5, 0 }) |mech| {
                 b.cfg_fault = false;
                 const t1 = try timeCoop(b, k, sh.g, .{ b.big, x, y, b.sync, b.fault, n, @as(u32, 1), nwin, stride, spin_cap, mech });
                 const tr = try timeCoop(b, k, sh.g, .{ b.big, x, y, b.sync, b.fault, n, big_r, nwin, stride, spin_cap, mech });
@@ -340,7 +340,7 @@ fn benchStream(b: *B) !void {
             continue;
         }
         const t_sg = sh.g * sh.s;
-        for ([_]u32{ 0, 1, 3 }) |mech| {
+        for ([_]u32{ 0, 1, 5, 3 }) |mech| {
           for (pf_mbs) |pf| {
             if (mech == 0 and pf != 0) continue;
             if (mech == 3 and sh.g > 64) continue;
@@ -749,13 +749,14 @@ fn benchNv(b: *B) !void {
 /// before any other spin run. Then the other shapes, each mechanism once.
 fn benchForce(b: *B) !void {
     const Run = struct { g: u32, s: u32, mech: u32 };
-    const first = [_]Run{ .{ .g = 32, .s = 16, .mech = 1 }, .{ .g = 32, .s = 16, .mech = 2 }, .{ .g = 32, .s = 16, .mech = 3 }, .{ .g = 32, .s = 1, .mech = 4 } };
+    const first = [_]Run{ .{ .g = 32, .s = 16, .mech = 1 }, .{ .g = 32, .s = 16, .mech = 2 }, .{ .g = 32, .s = 16, .mech = 3 }, .{ .g = 32, .s = 16, .mech = 5 }, .{ .g = 32, .s = 1, .mech = 4 } };
     const rest = [_]Run{
         .{ .g = 16, .s = 32, .mech = 1 }, .{ .g = 16, .s = 32, .mech = 2 }, .{ .g = 16, .s = 32, .mech = 3 },
         .{ .g = 32, .s = 32, .mech = 1 }, .{ .g = 32, .s = 32, .mech = 2 }, .{ .g = 32, .s = 32, .mech = 3 },
         .{ .g = 64, .s = 16, .mech = 1 }, .{ .g = 64, .s = 16, .mech = 2 }, .{ .g = 64, .s = 16, .mech = 3 },
         .{ .g = 128, .s = 8, .mech = 1 }, .{ .g = 128, .s = 8, .mech = 2 },
-        .{ .g = 1024, .s = 1, .mech = 1 }, .{ .g = 1024, .s = 1, .mech = 2 }, .{ .g = 1024, .s = 1, .mech = 4 },
+        .{ .g = 64, .s = 16, .mech = 5 }, .{ .g = 128, .s = 8, .mech = 5 },
+        .{ .g = 1024, .s = 1, .mech = 1 }, .{ .g = 1024, .s = 1, .mech = 2 }, .{ .g = 1024, .s = 1, .mech = 4 }, .{ .g = 1024, .s = 1, .mech = 5 },
     };
     const data = try b.big.at(0);
     for ([_][]const Run{ &first, &rest }, 0..) |list, li| {

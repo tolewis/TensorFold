@@ -16,6 +16,11 @@
 #define FB_B 2u
 #define FB_C 3u
 #define FB_E 4u
+#define FB_F 5u // M-f (CL 15:56Z): M-a with a lane-0 poll by a plain load, L1 and L3 uncached, no RMW
+
+// IGC built-in: a plain LSC load with cache control. cacheOpt 1 is L1 uncached, L3 uncached; the vISA is
+// `lsc_load.ugm.uc.uc` (checked with IGC_ShaderDumpEnable on inference1 ocloc, 2026-11-27).
+uint __builtin_IB_lsc_load_global_uint(global uint *base, int immElemOff, int cacheOpt);
 
 typedef global atomic_uint fb_au;
 
@@ -31,6 +36,12 @@ static inline uint fb_poll1(global uint *p) {
   if (get_sub_group_local_id() == 0u) v = fb_ld(p);
   return sub_group_broadcast(v, 0);
 #endif
+}
+// The M-f poll: lane 0 loads with no RMW, the sub-group gets its value.
+static inline uint fb_poll_plain(global uint *p) {
+  uint v = 0u;
+  if (get_sub_group_local_id() == 0u) v = __builtin_IB_lsc_load_global_uint(p, 0, 1);
+  return sub_group_broadcast(v, 0);
 }
 static inline void fb_rel(void) { atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_release, memory_scope_device); }
 static inline void fb_acq(void) { atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_acquire, memory_scope_device); }
@@ -53,7 +64,7 @@ static inline void fb_arrive(uint mech_arg, global uint *sync, uint round) {
   fb_rel();
   work_group_barrier(CLK_LOCAL_MEM_FENCE);
   if (get_local_id(0) == 0u && !skip) {
-    if (mech == FB_A)
+    if (mech == FB_A || mech == FB_F)
       atomic_fetch_add_explicit((global fb_au *)(sync + FB_CNT), 1u, memory_order_relaxed, memory_scope_device);
     else
       atomic_store_explicit((global fb_au *)(sync + FB_FLAGS + get_group_id(0) * FB_LINE), round, memory_order_relaxed,
@@ -82,6 +93,9 @@ static inline uint fb_wait(uint mech_arg, global uint *sync, global uint *fault,
     if (mech == FB_A || mech == FB_E) {
       const uint target = round * G;
       while (fb_poll1(sync + FB_CNT) < target) { FB_SPIN_CHECK }
+    } else if (mech == FB_F) {
+      const uint target = round * G;
+      while (fb_poll_plain(sync + FB_CNT) < target) { FB_SPIN_CHECK }
     } else if (mech == FB_C || g == 0u) {
       for (;;) {
         uint ok = 1u;
