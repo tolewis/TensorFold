@@ -43,6 +43,8 @@ const Entry = struct { name: [:0]const u8, threads: u32 };
 const names = struct {
     const prep: Entry = .{ .name = "tf_ink2_prep", .threads = 16 };
     const prep8: Entry = .{ .name = "tf_ink2_prep8", .threads = 16 };
+    const prep8q: Entry = .{ .name = "tf_ink2_prep8q", .threads = 16 };
+    const dequant8: Entry = .{ .name = "tf_ink2_kv_dequant8", .threads = 16 };
     const rel_table: Entry = .{ .name = "tf_ink2_rel_table", .threads = 256 };
     const decode: Entry = .{ .name = "tf_ink2_attn_decode", .threads = planning.decode_threads };
     const decode8: Entry = .{ .name = "tf_ink2_attn_decode8", .threads = planning.decode_threads };
@@ -57,6 +59,8 @@ const names = struct {
 pub const Kernels = struct {
     prep: xpu.Kernel,
     prep8: xpu.Kernel,
+    prep8q: xpu.Kernel,
+    dequant8: xpu.Kernel,
     rel_table: xpu.Kernel,
     decode: xpu.Kernel,
     decode8: xpu.Kernel,
@@ -71,6 +75,10 @@ pub const Kernels = struct {
         errdefer k.prep.deinit();
         k.prep8 = try attention.kernel(names.prep8.name, .{ names.prep8.threads, 1, 1 });
         errdefer k.prep8.deinit();
+        k.prep8q = try attention.kernel(names.prep8q.name, .{ names.prep8q.threads, 1, 1 });
+        errdefer k.prep8q.deinit();
+        k.dequant8 = try attention.kernel(names.dequant8.name, .{ names.dequant8.threads, 1, 1 });
+        errdefer k.dequant8.deinit();
         k.rel_table = try attention.kernel(names.rel_table.name, .{ names.rel_table.threads, 1, 1 });
         errdefer k.rel_table.deinit();
         k.decode = try attention.kernel(names.decode.name, .{ names.decode.threads, 1, 1 });
@@ -94,11 +102,35 @@ pub const Kernels = struct {
         k.decode8.deinit();
         k.decode.deinit();
         k.rel_table.deinit();
+        k.dequant8.deinit();
+        k.prep8q.deinit();
         k.prep8.deinit();
         k.prep.deinit();
         k.* = undefined;
     }
 };
+
+/// The prompt path's sliding stage of an int8 cache: tf_ink2_prep8's codes and scales, written as bf16(code * scale) to the
+/// bf16 staging ring `stage` (`l.ring` is its length). The queries and the relative taps go out as in `prep`.
+pub fn prepStage8(k: *const Kernels, s: xpu.Stream, r: planning.Rows, l: planning.Layer, c: planning.Prep, meta: RowMeta, raw: [4]Ref, scales: [2]Ref, q: Ref, rel: Ref, stage: Cache) xpu.Error!void {
+    std.debug.assert(!stage.int8);
+    try xpu.launch.dispatch(k.prep8q, s, .{ r.rows, r.heads + 2 * r.kv_heads, 1 }, .{
+        raw[0].at(),     raw[1].at(),  raw[2].at(), raw[3].at(),
+        scales[0].at(),  scales[1].at(), meta.pos.at(), meta.seg_of.at(),
+        meta.segs.at(),  q.at(),       rel.at(),    stage.k.at(),
+        stage.v.at(),    r.heads,      r.kv_heads,  l.ring,
+        @intFromBool(l.tau), c.qk_clip, c.rel_clip, c.floor,
+        c.alpha,         c.eps,
+    });
+}
+
+/// Positions `from` .. `from + n - 1` of the int8 ring `src` (`src_ring` positions) to the bf16 ring `dst` (`dst_ring`
+/// positions), one bf16(code * scale) a value: the value `prepStage8` writes for the same position.
+pub fn dequant8(k: *const Kernels, s: xpu.Stream, src: Cache, dst: Cache, from: u32, src_ring: u32, dst_ring: u32, n: u32, kv_heads: u32) xpu.Error!void {
+    std.debug.assert(src.int8 and !dst.int8);
+    if (n == 0) return;
+    try xpu.launch.dispatch(k.dequant8, s, .{ n, kv_heads, 1 }, .{ src.k.at(), src.kscale.at(), src.v.at(), src.vscale.at(), dst.k.at(), dst.v.at(), from, src_ring, dst_ring, n, kv_heads });
+}
 
 /// raw holds independent q/k/v rows followed by q-side relative rows; gated sliding visits never infer K or V from Q.
 pub fn prep(k: *const Kernels, s: xpu.Stream, r: planning.Rows, l: planning.Layer, c: planning.Prep, meta: RowMeta, raw: [4]Ref, scales: [2]Ref, q: Ref, rel: Ref, kv: Cache) xpu.Error!void {

@@ -76,8 +76,8 @@ fn probeAttention(g: Run, cache: *const state.Cache, v: *const layer_plan.Visit)
 }
 
 /// The sliding layers of this chunk attend in 64-row slices over the cache ring.
-fn slicedSliding(options: Options, cache: *const state.Cache) bool {
-    return options.old_sliding or cache.kv == .int8;
+fn slicedSliding(options: Options) bool {
+    return options.old_sliding;
 }
 
 fn sref(r: state.Ref) attention.Ref {
@@ -272,8 +272,7 @@ const Run = struct {
         const prep = ap.Prep{ .qk_clip = m.config.text.qk_clip, .rel_clip = m.config.text.rel_clip, .floor = @floatFromInt(m.config.text.log_floor), .alpha = m.config.text.log_alpha, .eps = m.config.text.eps };
         const layer = cache.attentionLayer(&m.weight_plan, v.cache_slot, state.max_rows);
         const sliding = layer.window != 0;
-        // the staging ring and the window kernel hold bf16 rows only: an int8 cache's sliding layers attend over the cache ring
-        if (sliding and (g.old_sliding or kv.int8)) return g.attendOld(cache, v);
+        if (sliding and g.old_sliding) return g.attendOld(cache, v);
         const start: u32 = @intCast(cache.len);
         const rows: u32 = @intCast(g.rows);
         const stage: u32 = @intCast(state.stageRows(g.rows));
@@ -287,10 +286,21 @@ const Run = struct {
             into = .{ .k = aref(s.kstage, 0), .v = aref(s.vstage, 0) };
             prep_layer.ring = stage;
             const history = @min(start, layer.window - 1);
-            try pk.kvCopy(&g.p.prefill, g.s, kv.k.at(), into.k.at(), start - history, layer.ring, stage, history, kh);
-            try pk.kvCopy(&g.p.prefill, g.s, kv.v.at(), into.v.at(), start - history, layer.ring, stage, history, kh);
+            // the staging ring holds bf16 rows: an int8 cache's window enters it as bf16(code * scale), and so does the chunk
+            if (kv.int8) {
+                try attention.dequant8(k, g.s, kv, into, start - history, layer.ring, stage, history, kh);
+            } else {
+                try pk.kvCopy(&g.p.prefill, g.s, kv.k.at(), into.k.at(), start - history, layer.ring, stage, history, kh);
+                try pk.kvCopy(&g.p.prefill, g.s, kv.v.at(), into.v.at(), start - history, layer.ring, stage, history, kh);
+            }
         }
-        try attention.prep(k, g.s, all, prep_layer, prep, meta_all, .{ aref(s.q_raw, 0), aref(s.k_conv, 0), aref(s.v_conv, 0), aref(s.rel_raw, 0) }, .{ aref(w.attn.q_scale.buf, 0), aref(w.attn.rel_scale.buf, 0) }, aref(s.q_prep, 0), aref(s.rel_prep, 0), into);
+        const raw = [4]attention.Ref{ aref(s.q_raw, 0), aref(s.k_conv, 0), aref(s.v_conv, 0), aref(s.rel_raw, 0) };
+        const scales = [2]attention.Ref{ aref(w.attn.q_scale.buf, 0), aref(w.attn.rel_scale.buf, 0) };
+        if (sliding and kv.int8) {
+            try attention.prepStage8(k, g.s, all, prep_layer, prep, meta_all, raw, scales, aref(s.q_prep, 0), aref(s.rel_prep, 0), into);
+        } else {
+            try attention.prep(k, g.s, all, prep_layer, prep, meta_all, raw, scales, aref(s.q_prep, 0), aref(s.rel_prep, 0), into);
+        }
         try pk.relTable(&g.p.prefill, g.s, all.rows * all.heads, aref(s.rel_prep, 0).at(), aref(w.attn.rel_projection.buf, 0).at(), aref(s.rel_tab, 0).at());
         const step: usize = if (sliding) g.sl_slice else g.gl_slice;
         var base: usize = 0;
@@ -318,8 +328,18 @@ const Run = struct {
         }
         if (sliding) {
             const n: u32 = @min(rows, layer.ring);
-            try pk.kvCopy(&g.p.prefill, g.s, into.k.at(), kv.k.at(), start + rows - n, stage, layer.ring, n, kh);
-            try pk.kvCopy(&g.p.prefill, g.s, into.v.at(), kv.v.at(), start + rows - n, stage, layer.ring, n, kh);
+            if (kv.int8) {
+                // the last `n` rows' codes and scales go to the cache ring from tf_ink2_prep8 itself (K/V units only)
+                const r0: usize = rows - n;
+                const tail = ap.Rows{ .rows = n, .heads = 0, .kv_heads = kh, .last_pos = start + rows - 1, .streams = 1 };
+                const meta_tail = attention.RowMeta{ .pos = aref(s.pos, r0 * 4), .seg_of = aref(s.seg_of, r0 * 4), .segs = aref(s.segs, 0) };
+                const kv_at = r0 * m.options.place.kvWidth() * 2;
+                const raw_tail = [4]attention.Ref{ aref(s.q_raw, 0), aref(s.k_conv, kv_at), aref(s.v_conv, kv_at), aref(s.rel_raw, 0) };
+                try attention.prep(k, g.s, tail, layer, prep, meta_tail, raw_tail, scales, aref(s.q_prep, 0), aref(s.rel_prep, 0), kv);
+            } else {
+                try pk.kvCopy(&g.p.prefill, g.s, into.k.at(), kv.k.at(), start + rows - n, stage, layer.ring, n, kh);
+                try pk.kvCopy(&g.p.prefill, g.s, into.v.at(), kv.v.at(), start + rows - n, stage, layer.ring, n, kh);
+            }
         }
         try probeAttention(g, cache, v);
     }
@@ -527,9 +547,9 @@ pub fn run(m: *const Model, s: *state.Scratch, cache: *state.Cache, ids: []const
     try m.r.upload(s.ids, std.mem.sliceAsBytes(ids));
     try m.r.upload(s.pos, std.mem.sliceAsBytes(pos_buf[0..rows]));
     try m.r.upload(s.seg_of, std.mem.sliceAsBytes(zero_buf[0..rows]));
-    // the 64-row sliding slices (`old_sliding`, and every int8 cache) read the slots from 0 on and take only `off` from them,
+    // the 64-row sliding slices (`old_sliding`) read the slots from 0 on and take only `off` from them,
     // so a slot past the slices holds a zero segment too
-    const seg_slots = if (slicedSliding(options, cache)) state.prefill_segments else slices;
+    const seg_slots = if (slicedSliding(options)) state.prefill_segments else slices;
     for (slices..seg_slots) |j| segs[j] = .{ .row0 = 0, .n = 0, .p0 = 0, .off = 0 };
     try m.r.upload(s.segs, std.mem.sliceAsBytes(segs[0..seg_slots]));
     if (m.options.place.rank == 0) {

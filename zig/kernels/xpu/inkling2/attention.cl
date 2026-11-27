@@ -166,6 +166,89 @@ KERNEL(16) void tf_ink2_prep8(global const ushort *q_raw, global const ushort *k
   }
 }
 
+// The sliding stage of an int8 cache on the prompt path: the codes and the scales of tf_ink2_prep8, written as one
+// bf16(code * scale) a value to the bf16 staging ring of tf_ink2_pf_attn_window. The arguments and the query units are
+// those of tf_ink2_prep. The value is the one tf_ink2_kv_dequant8 makes from the codes in the cache ring, so a key has
+// one value in the stage whatever chunk wrote it.
+KERNEL(16) void tf_ink2_prep8q(global const ushort *q_raw, global const ushort *k_raw, global const ushort *v_raw, global const ushort *rel_raw,
+                               global const ushort *q_scale, global const ushort *rel_scale, global const int *rpos, global const int *rseg,
+                               global const InkSeg *segs, global ushort *q_out, global ushort *rel_out, global ushort *kc, global ushort *vc,
+                               uint heads, uint kv_heads, uint ring, uint is_global, float qk_clip, float rel_clip, float floor_pos,
+                               float alpha, float eps) {
+  const uint row = get_group_id(0), unit = get_group_id(1), lane = get_sub_group_local_id(), pos = (uint)rpos[row];
+#if INK2_CTL == 2
+  const float tau = 1.0f;
+#else
+  const float tau = is_global ? 1.0f + alpha * log(fmax((float)(pos + 1) / floor_pos, 1.0f)) : 1.0f;
+#endif
+  if (unit < heads) {
+    const size_t rh = (size_t)row * heads + unit;
+    const float8 x = bf2f8(vload8(0, q_raw + rh * D + lane * 8)) * bf2f8(vload8(0, q_scale + unit * D + lane * 8));
+    const float f = clip_factor(sub_group_reduce_add(sum8(x)), qk_clip);
+    ushort8 o;
+    o.s0 = f2bf(x.s0 * f); o.s1 = f2bf(x.s1 * f); o.s2 = f2bf(x.s2 * f); o.s3 = f2bf(x.s3 * f);
+    o.s4 = f2bf(x.s4 * f); o.s5 = f2bf(x.s5 * f); o.s6 = f2bf(x.s6 * f); o.s7 = f2bf(x.s7 * f);
+    if (is_global) {
+      const float8 t = bf2f8(o) * tau;
+      o.s0 = f2bf(t.s0); o.s1 = f2bf(t.s1); o.s2 = f2bf(t.s2); o.s3 = f2bf(t.s3);
+      o.s4 = f2bf(t.s4); o.s5 = f2bf(t.s5); o.s6 = f2bf(t.s6); o.s7 = f2bf(t.s7);
+    }
+    vstore8(o, 0, q_out + rh * D + lane * 8);
+    const float r = bf2f(rel_raw[rh * REL + lane]) * bf2f(rel_scale[unit * REL + lane]);
+    const float rf = clip_factor(sub_group_reduce_add(r * r), rel_clip);
+    const ushort once = f2bf(r * rf);
+    rel_out[rh * REL + lane] = is_global ? f2bf(bf2f(once) * tau) : once;
+    return;
+  }
+  const bool key = unit < heads + kv_heads;
+  const uint h = key ? unit - heads : unit - heads - kv_heads;
+#if INK2_CTL == 1
+  global const ushort *src = (key ? v_raw : k_raw) + ((size_t)row * kv_heads + h) * D;
+#else
+  global const ushort *src = (key ? k_raw : v_raw) + ((size_t)row * kv_heads + h) * D;
+#endif
+  const float8 x = bf2f8(vload8(0, src + lane * 8));
+  const float ss = sub_group_reduce_add(sum8(x));
+  const float scale = key ? clip_factor(ss, qk_clip) : rsqrt(ss / (float)D + eps);
+  const InkSeg s = segs[rseg[row]];
+  const float8 y = x * scale;
+  ushort8 o;
+  o.s0 = f2bf(y.s0); o.s1 = f2bf(y.s1); o.s2 = f2bf(y.s2); o.s3 = f2bf(y.s3);
+  o.s4 = f2bf(y.s4); o.s5 = f2bf(y.s5); o.s6 = f2bf(y.s6); o.s7 = f2bf(y.s7);
+  // the value the bf16 cache would hold: its largest magnitude over the row, then one scale and one code a value
+  const float8 v = bf2f8(o);
+  const float amax = sub_group_reduce_max(max8abs(v));
+  const float qs = amax > 0.0f ? amax / 127.0f : 0.0f;
+  const char8 c = (char8)(q8(v.s0, qs), q8(v.s1, qs), q8(v.s2, qs), q8(v.s3, qs),
+                          q8(v.s4, qs), q8(v.s5, qs), q8(v.s6, qs), q8(v.s7, qs));
+  global ushort *dst = (key ? kc : vc) + s.off + ((size_t)h * ring + pos % ring) * D;
+  ushort8 w;
+  w.s0 = f2bf((float)c.s0 * qs); w.s1 = f2bf((float)c.s1 * qs); w.s2 = f2bf((float)c.s2 * qs); w.s3 = f2bf((float)c.s3 * qs);
+  w.s4 = f2bf((float)c.s4 * qs); w.s5 = f2bf((float)c.s5 * qs); w.s6 = f2bf((float)c.s6 * qs); w.s7 = f2bf((float)c.s7 * qs);
+  vstore8(w, 0, dst + lane * 8);
+}
+
+// Positions from .. from + n - 1 of an int8 ring (the K tiles, V rows and scales of tf_ink2_prep8) to a bf16 ring of
+// the tf_ink2_pf_kv_copy layout, one bf16(code * scale) a value. One sub-group a (position, K/V head), 8 dims a lane.
+KERNEL(16) void tf_ink2_kv_dequant8(global const char *kc, global const float *ksc, global const char *vc, global const float *vsc,
+                                    global ushort *kd, global ushort *vd, uint from, uint src_ring, uint dst_ring, uint n, uint kv_heads) {
+  const uint i = get_group_id(0), h = get_group_id(1), lane = get_sub_group_local_id();
+  if (i >= n || h >= kv_heads) return;
+  const uint p = from + i, at = p % src_ring;
+  const float ks = ksc[(size_t)h * src_ring + at], vs = vsc[(size_t)h * src_ring + at];
+  global const char *kt = kc + (size_t)h * src_ring * D + (size_t)(at / 16) * 2048 + (size_t)lane * 128 + (size_t)(at % 16) * 4;
+  const char4 k0 = vload4(0, kt), k1 = vload4(0, kt + 64);
+  const char8 v = vload8(0, vc + ((size_t)h * src_ring + at) * D + lane * 8);
+  const size_t o = ((size_t)h * dst_ring + p % dst_ring) * D + lane * 8;
+  ushort8 a, b;
+  a.s0 = f2bf((float)k0.s0 * ks); a.s1 = f2bf((float)k0.s1 * ks); a.s2 = f2bf((float)k0.s2 * ks); a.s3 = f2bf((float)k0.s3 * ks);
+  a.s4 = f2bf((float)k1.s0 * ks); a.s5 = f2bf((float)k1.s1 * ks); a.s6 = f2bf((float)k1.s2 * ks); a.s7 = f2bf((float)k1.s3 * ks);
+  b.s0 = f2bf((float)v.s0 * vs); b.s1 = f2bf((float)v.s1 * vs); b.s2 = f2bf((float)v.s2 * vs); b.s3 = f2bf((float)v.s3 * vs);
+  b.s4 = f2bf((float)v.s4 * vs); b.s5 = f2bf((float)v.s5 * vs); b.s6 = f2bf((float)v.s6 * vs); b.s7 = f2bf((float)v.s7 * vs);
+  vstore8(a, 0, kd + o);
+  vstore8(b, 0, vd + o);
+}
+
 // The bf16 relative-bias table: one fp32 accumulation in projection tap order.
 KERNEL(256) void tf_ink2_rel_table(global const ushort *rel, global const ushort *proj, global ushort *tab) {
   const uint rh = get_group_id(0), t = get_local_id(0);
