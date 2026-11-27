@@ -5,6 +5,11 @@
 #include <stdint.h>
 
 #include "experts.cuh"
+// The load of the plan (counts, items, members) in half_body. The fused visit writes the plan in the same launch and
+// reads it with a coherent load (inkling2/fused_experts.cu, review A1).
+#ifndef TF_PLAN_LD
+#define TF_PLAN_LD(p) __ldg(p)
+#endif
 #include "common/fp_pairs.cuh"
 #include "mma4.cuh"
 #include "nvfp4q.cuh"
@@ -333,16 +338,16 @@ __device__ __forceinline__ void half_body(const __nv_bfloat16* __restrict__ X, i
                                           void* __restrict__ out, int N, float limit, int skip, float limit2) {
   TF_RING(ring, Ring<M, WARPS, uint2>);
   const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3, wi = threadIdx.x >> 5;
-  const int units = __ldg(counts) * NB * 2;
+  const int units = TF_PLAN_LD(counts) * NB * 2;
   for (int unit = blockIdx.x * WARPS + wi; unit < units; unit += gridDim.x * WARPS) {
     const int it = unit / (NB * 2), rest = unit - it * NB * 2, cb = rest >> 1, jh = rest & 1;
-    const int e = __ldg(items + 3 * it), first = __ldg(items + 3 * it + 1), cnt = __ldg(items + 3 * it + 2);
+    const int e = TF_PLAN_LD(items + 3 * it), first = TF_PLAN_LD(items + 3 * it + 1), cnt = TF_PLAN_LD(items + 3 * it + 2);
     if (e == skip) continue;
     const uint4* blk = W + ((size_t)e * NB + cb) * (size_t)KG * (M * BLOCK4);
     for (int r0 = 0; r0 < cnt; r0 += 16) {
       const bool v0 = r0 + gq < cnt, v1 = r0 + gq + 8 < cnt;
-      const int pr0 = v0 ? __ldg(members + first + r0 + gq) : 0;
-      const int pr1 = v1 ? __ldg(members + first + r0 + gq + 8) : 0;
+      const int pr0 = v0 ? TF_PLAN_LD(members + first + r0 + gq) : 0;
+      const int pr1 = v1 ? TF_PLAN_LD(members + first + r0 + gq + 8) : 0;
       const int x0r = slots ? pr0 / slots : pr0, x1r = slots ? pr1 / slots : pr1;
       const __nv_bfloat16* x0 = X + (size_t)x0r * x_stride;
       const __nv_bfloat16* x1 = X + (size_t)x1r * x_stride;

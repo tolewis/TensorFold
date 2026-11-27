@@ -4,6 +4,7 @@
 // The decode rings in the dynamic shared memory of the fused kernel (offset 0, free during the expert phases): two
 // static rings would add 59 KB of static shared memory beside the attention ring of 68,608 B.
 extern __shared__ __align__(128) unsigned char fz_dyn_experts[];
+#define TF_PLAN_LD(p) __ldcg(p)  // the plan is written in this launch (review A1)
 #define TF_RING(name, ...) __VA_ARGS__& name = *reinterpret_cast<__VA_ARGS__*>(fz_dyn_experts)
 #include "nvfp4_experts.cu"
 
