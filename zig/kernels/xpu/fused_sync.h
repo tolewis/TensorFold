@@ -94,6 +94,9 @@ static inline uint fb_wait(uint mech_arg, global uint *sync, global uint *fault,
       const uint target = round * G;
       while (fb_poll1(sync + FB_CNT) < target) { FB_SPIN_CHECK }
     } else if (mech == FB_F) {
+      // An uncached plain-load poll took about 6 us in the block 2 force run (20,000 polls, 121 ms), so M-f spins to
+      // half the cap: a faulted launch ends inside 100 ms (brief section 6 rule 1).
+      spin_cap /= 2u;
       const uint target = round * G;
       while (fb_poll_plain(sync + FB_CNT) < target) { FB_SPIN_CHECK }
     } else if (mech == FB_C || g == 0u) {
