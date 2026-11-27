@@ -57,6 +57,29 @@ fn tensor(t: Tensor) Ptr {
 fn aref(b: rt.Buffer, off: usize) attention.Ref {
     return .{ .ptr = b.ptr, .off = off };
 }
+/// A check tool's probe: after each visit's attention, the output row (bf16, `qWidth` values) of each position in `pos`
+/// that the chunk holds goes to `out[(i * n_visits + visit) * qWidth ..]`. Each copy waits for the stream, so a served
+/// forward never sets it.
+pub const AttProbe = struct { pos: []const usize, out: []u16, width: usize, n_visits: usize };
+pub var att_probe: ?*AttProbe = null;
+
+fn probeAttention(g: Run, cache: *const state.Cache, v: *const layer_plan.Visit) !void {
+    const pr = att_probe orelse return;
+    const start = cache.len;
+    for (pr.pos, 0..) |p, i| {
+        if (p < start or p >= start + g.rows) continue;
+        const dst = pr.out[(i * pr.n_visits + v.cache_slot) * pr.width ..][0..pr.width];
+        const src = rt.Buffer{ .rt = g.m.r, .ptr = at(g.sc.att, (p - start) * pr.width * 2), .len = pr.width * 2 };
+        try g.m.r.download(std.mem.sliceAsBytes(dst), src);
+        try g.m.r.sync();
+    }
+}
+
+/// The sliding layers of this chunk attend in 64-row slices over the cache ring.
+fn slicedSliding(options: Options, cache: *const state.Cache) bool {
+    return options.old_sliding or cache.kv == .int8;
+}
+
 fn sref(r: state.Ref) attention.Ref {
     return .{ .ptr = r.buf.ptr, .off = r.off };
 }
@@ -244,12 +267,13 @@ const Run = struct {
         const w = &m.weights.layers[v.layer];
         try g.convInputForAttention(cache, v, true);
         try g.convInputForAttention(cache, v, false);
-        const kv = attention.Cache{ .k = sref(cache.keys(v.cache_slot)), .v = sref(cache.values(v.cache_slot)) };
+        const kv = cacheRefs(cache, v.cache_slot);
         const k = &g.p.attention;
         const prep = ap.Prep{ .qk_clip = m.config.text.qk_clip, .rel_clip = m.config.text.rel_clip, .floor = @floatFromInt(m.config.text.log_floor), .alpha = m.config.text.log_alpha, .eps = m.config.text.eps };
         const layer = cache.attentionLayer(&m.weight_plan, v.cache_slot, state.max_rows);
         const sliding = layer.window != 0;
-        if (sliding and g.old_sliding) return g.attendOld(cache, v);
+        // the staging ring and the window kernel hold bf16 rows only: an int8 cache's sliding layers attend over the cache ring
+        if (sliding and (g.old_sliding or kv.int8)) return g.attendOld(cache, v);
         const start: u32 = @intCast(cache.len);
         const rows: u32 = @intCast(g.rows);
         const stage: u32 = @intCast(state.stageRows(g.rows));
@@ -297,13 +321,24 @@ const Run = struct {
             try pk.kvCopy(&g.p.prefill, g.s, into.k.at(), kv.k.at(), start + rows - n, stage, layer.ring, n, kh);
             try pk.kvCopy(&g.p.prefill, g.s, into.v.at(), kv.v.at(), start + rows - n, stage, layer.ring, n, kh);
         }
+        try probeAttention(g, cache, v);
+    }
+
+    fn cacheRefs(cache: *state.Cache, slot: usize) attention.Cache {
+        return .{
+            .k = sref(cache.keys(slot)),
+            .v = sref(cache.values(slot)),
+            .int8 = cache.kv == .int8,
+            .kscale = sref(cache.keyScales(slot)),
+            .vscale = sref(cache.valueScales(slot)),
+        };
     }
 
     fn attendOld(g: Run, cache: *state.Cache, v: *const layer_plan.Visit) !void {
         const s = g.sc;
         const m = g.m;
         const w = &m.weights.layers[v.layer];
-        const kv = attention.Cache{ .k = sref(cache.keys(v.cache_slot)), .v = sref(cache.values(v.cache_slot)) };
+        const kv = cacheRefs(cache, v.cache_slot);
         const k = &g.p.attention;
         const prep = ap.Prep{ .qk_clip = m.config.text.qk_clip, .rel_clip = m.config.text.rel_clip, .floor = @floatFromInt(m.config.text.log_floor), .alpha = m.config.text.log_alpha, .eps = m.config.text.eps };
         var base: usize = 0;
@@ -323,6 +358,7 @@ const Run = struct {
             try attention.attend(k, g.s, rr, layer, s.stride, meta, aref(s.q_prep, q_at), kv, aref(s.rel_tab, tab_at), aref(s.part_o, 0), aref(s.part_ml, 0), aref(s.sink, base * @as(usize, qh) * 2), aref(s.gate, q_at), aref(s.att, q_at));
             base += rows;
         }
+        try probeAttention(g, cache, v);
     }
 
     fn routedExperts(g: Run, layer: usize) !void {
@@ -464,7 +500,6 @@ pub fn run(m: *const Model, s: *state.Scratch, cache: *state.Cache, ids: []const
     const rows = ids.len;
     if (rows == 0 or rows > s.rows or rows > state.max_prefill_rows) return error.Inkling2RowsExceeded;
     if (options.all and rows > state.max_rows) return error.Inkling2RowsExceeded;
-    if (cache.kv != .bf16) return error.Inkling2KvDtype;
     if (cache.capacity > s.capacity) return error.Inkling2ScratchCapacity;
     if (cache.len + rows > cache.capacity) return error.Inkling2ContextFull;
     if (cache.pending != null) return error.Inkling2CacheTransaction;
@@ -492,7 +527,11 @@ pub fn run(m: *const Model, s: *state.Scratch, cache: *state.Cache, ids: []const
     try m.r.upload(s.ids, std.mem.sliceAsBytes(ids));
     try m.r.upload(s.pos, std.mem.sliceAsBytes(pos_buf[0..rows]));
     try m.r.upload(s.seg_of, std.mem.sliceAsBytes(zero_buf[0..rows]));
-    try m.r.upload(s.segs, std.mem.sliceAsBytes(segs[0..slices]));
+    // the 64-row sliding slices (`old_sliding`, and every int8 cache) read the slots from 0 on and take only `off` from them,
+    // so a slot past the slices holds a zero segment too
+    const seg_slots = if (slicedSliding(options, cache)) state.prefill_segments else slices;
+    for (slices..seg_slots) |j| segs[j] = .{ .row0 = 0, .n = 0, .p0 = 0, .off = 0 };
+    try m.r.upload(s.segs, std.mem.sliceAsBytes(segs[0..seg_slots]));
     if (m.options.place.rank == 0) {
         if (group.live) |gp| {
             const flags: u32 = (if (options.all) @as(u32, 1) else 0) | (if (options.defer_head) @as(u32, 2) else 0) | 4;
