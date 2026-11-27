@@ -808,6 +808,8 @@ fn probeFor(v: u32, step: usize) i32 {
 /// host clears its own visits only; 256 A10, two blocks a multiprocessor); default all. TF_INKLING2_FUSED_FIX_AB=1: steps s with (s / every) even run none,
 /// so one run holds the phase times before and after.
 const fix_all: i32 = 1023;
+// the default: every fix but 4 (A12, the loop mix's single read: fx4 Q1 +1.3 us, Q13 +1.9 us, visit 19 +7.4 us)
+const fix_default: i32 = fix_all & ~@as(i32, 4);
 const fix_own_clear: i32 = 16;
 const fix_two: i32 = 256; // review A10: two blocks a multiprocessor (host: the grid, the shared bytes, S6 db 0)
 const fix_host: i32 = fix_own_clear | fix_two;
@@ -832,7 +834,7 @@ fn fixFor(step: usize) i32 {
         var ab = false;
     };
     if (S.mask == null) {
-        S.mask = if (std.c.getenv("TF_INKLING2_FUSED_FIX")) |e| std.fmt.parseInt(i32, std.mem.span(e), 0) catch fix_all else fix_all;
+        S.mask = if (std.c.getenv("TF_INKLING2_FUSED_FIX")) |e| std.fmt.parseInt(i32, std.mem.span(e), 0) catch fix_default else fix_default;
         // TF_INKLING2_FUSED_FIX_BASE: the fix set of the "before" steps of _AB (default 0); FIX minus one bit measures
         // that one fix
         S.base = if (std.c.getenv("TF_INKLING2_FUSED_FIX_BASE")) |e| std.fmt.parseInt(i32, std.mem.span(e), 0) catch 0 else 0;
