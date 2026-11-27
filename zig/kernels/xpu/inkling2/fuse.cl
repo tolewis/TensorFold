@@ -225,7 +225,8 @@ KERNEL(256) void tf_ink2_zeta_wide(
 }
 
 // Grid (16, roles, rows). The prologue's AR for the group's source row, then the message gate projection over four
-// sub-groups a rank. The AR is the code of tf_ink2_fuse_pre_q, run by every group, so the bits do not move.
+// sub-groups a rank. The AR is the code of tf_ink2_fuse_pre_q, run by every group, so the bits do not move. Only group
+// 0 stores it.
 KERNEL(256) void tf_ink2_pre_zeta(
     global const ushort *p, global float *partial, global const ushort *blocks, global const float *queries, global float *ar,
     global const float *messages, global const ushort *down0, global const ushort *down1, global const ushort *down2,
@@ -238,16 +239,23 @@ KERNEL(256) void tf_ink2_pre_zeta(
   local float red[160];
   local float parts[16];
   local ushort normalized[2 * H];
+  // The down row of this rank part, loaded before the residual: the residual and the norms run under the reads.
+  global const ushort *down = role == 0 ? down0 : role == 1 ? down1 : down2;
+  global const ushort *dr = down + (size_t)r * (2 * H);
+  ushort8 dw[2 * H / 512];
+  for (uint k = 0; k < 2 * H / 512; ++k) dw[k] = vload8(0, dr + 8 * lane + 128 * part + 512 * k);
   global const ushort *pb = p + (size_t)row * H;
   global float *part_row = partial + (size_t)row * H;
-  for (uint d = t; d < H; d += 256) part_row[d] = bf2f(pb[d]);
+  // Every group computes the same residual. Group 0 of role 0 stores partial, group 0 of each source role stores ar.
+  if (g == 0 && role == 0)
+    for (uint d = t; d < H; d += 256) part_row[d] = bf2f(pb[d]);
   for (uint i = t; i < 160; i += 256) red[i] = 0.0f;
   barrier(CLK_LOCAL_MEM_FENCE);
   global const ushort *blk = blocks + (size_t)row * blocks_stride;
   float v[5][H / 256];
   for (uint s = 0; s < 5; ++s)
     for (uint i = 0; i < H / 256; ++i)
-      v[s][i] = s < sources ? (s + 1 == sources ? part_row[t + 256 * i] : bf2f(blk[(size_t)s * H + t + 256 * i])) : 0.0f;
+      v[s][i] = s < sources ? (s + 1 == sources ? bf2f(pb[t + 256 * i]) : bf2f(blk[(size_t)s * H + t + 256 * i])) : 0.0f;
   float means[5];
   for (uint s = 0; s < 5; ++s) {
     float ss = 0.0f;
@@ -286,12 +294,13 @@ KERNEL(256) void tf_ink2_pre_zeta(
   }
   for (uint s = 0; s < 5; ++s) weights[s] = weights[s] / den;
   float hv[H / 256];
+  const bool store_ar = g == 0 && role == src;
   for (uint i = 0; i < H / 256; ++i) {
     float acc = 0.0f;
     for (uint s = 0; s < 5; ++s)
       if (s < sources) acc += weights[s] * (v[s][i] * means[s]);
     hv[i] = FUSE_PRE(acc);
-    ar[((size_t)src * rows + row) * H + t + 256 * i] = hv[i];
+    if (store_ar) ar[((size_t)src * rows + row) * H + t + 256 * i] = hv[i];
   }
   barrier(CLK_GLOBAL_MEM_FENCE);
   global const float *m = messages + ((size_t)row * msg_entries + core * 4 + role) * H;
@@ -309,12 +318,10 @@ KERNEL(256) void tf_ink2_pre_zeta(
     normalized[H + t + 256 * i] = f2bf(mv[i] * inv1);
   }
   barrier(CLK_LOCAL_MEM_FENCE);
-  global const ushort *down = role == 0 ? down0 : role == 1 ? down1 : down2;
-  global const ushort *dr = down + (size_t)r * (2 * H);
   float dot = 0.0f;
-  for (uint d = 8 * lane + 128 * part; d < 2 * H; d += 512) {
-    const ushort8 w0 = vload8(0, dr + d);
-    const ushort8 x0 = vload8(0, normalized + d);
+  for (uint k = 0; k < 2 * H / 512; ++k) {
+    const ushort8 w0 = dw[k];
+    const ushort8 x0 = vload8(0, normalized + 8 * lane + 128 * part + 512 * k);
     for (int j = 0; j < 8; ++j) dot += bf2f(w0[j]) * bf2f(x0[j]);
   }
   dot = sub_group_reduce_add(dot);
