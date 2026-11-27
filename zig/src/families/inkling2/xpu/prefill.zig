@@ -287,6 +287,7 @@ const Run = struct {
             prep_layer.ring = stage;
             const history = @min(start, layer.window - 1);
             // the staging ring holds bf16 rows: an int8 cache's window enters it as bf16(code * scale), and so does the chunk
+            xpu.profile.label = "hist"; // the profile names the three pieces of a sliding visit: hist, stage, ring
             if (kv.int8) {
                 try attention.dequant8(k, g.s, kv, into, start - history, layer.ring, stage, history, kh);
             } else {
@@ -296,11 +297,13 @@ const Run = struct {
         }
         const raw = [4]attention.Ref{ aref(s.q_raw, 0), aref(s.k_conv, 0), aref(s.v_conv, 0), aref(s.rel_raw, 0) };
         const scales = [2]attention.Ref{ aref(w.attn.q_scale.buf, 0), aref(w.attn.rel_scale.buf, 0) };
+        if (sliding) xpu.profile.label = "stage";
         if (sliding and kv.int8) {
             try attention.prepStage8(k, g.s, all, prep_layer, prep, meta_all, raw, scales, aref(s.q_prep, 0), aref(s.rel_prep, 0), into);
         } else {
             try attention.prep(k, g.s, all, prep_layer, prep, meta_all, raw, scales, aref(s.q_prep, 0), aref(s.rel_prep, 0), into);
         }
+        xpu.profile.label = "";
         try pk.relTable(&g.p.prefill, g.s, all.rows * all.heads, aref(s.rel_prep, 0).at(), aref(w.attn.rel_projection.buf, 0).at(), aref(s.rel_tab, 0).at());
         const step: usize = if (sliding) g.sl_slice else g.gl_slice;
         var base: usize = 0;
@@ -328,6 +331,8 @@ const Run = struct {
         }
         if (sliding) {
             const n: u32 = @min(rows, layer.ring);
+            xpu.profile.label = "ring";
+            defer xpu.profile.label = "";
             if (kv.int8) {
                 // the last `n` rows' codes and scales go to the cache ring from tf_ink2_prep8 itself (K/V units only)
                 const r0: usize = rows - n;
