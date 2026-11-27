@@ -182,8 +182,10 @@ const KlStats = struct {
     sum: f64 = 0,
     max: f64 = 0,
     max_row: usize = 0,
+    /// The token position of the row with the largest KL (`max_row` counts from the first compared row).
+    max_pos: usize = 0,
 
-    fn add(k: *KlStats, p: []const f32, q: []const f32) void {
+    fn add(k: *KlStats, p: []const f32, q: []const f32, pos: usize) void {
         const tp = top2(p);
         const tq = top2(q);
         var zp: f64 = 0;
@@ -203,16 +205,17 @@ const KlStats = struct {
         if (d > k.max) {
             k.max = d;
             k.max_row = k.rows;
+            k.max_pos = pos;
         }
         if (std.c.getenv("TF_TP_ROWKL") != null) {
-            std.debug.print("row {d} kl {e:.4} top1 {d} dump {d} ours {d} pdump {d:.4} pours {d:.4}\n", .{ k.rows, d, @intFromBool(tp.id == tq.id), tp.id, tq.id, @exp(@as(f64, tp.first) - lp), @exp(@as(f64, tq.first) - lq) });
+            std.debug.print("row {d} kl {e:.4} top1 {d} dump {d} ours {d} pdump {d:.4} pours {d:.4} pos {d}\n", .{ k.rows, d, @intFromBool(tp.id == tq.id), tp.id, tq.id, @exp(@as(f64, tp.first) - lp), @exp(@as(f64, tq.first) - lq), pos });
         }
         k.rows += 1;
         if (tp.id == tq.id) k.agree += 1;
     }
 
     fn print(k: KlStats, name: []const u8) void {
-        std.debug.print("  vs dump of {s}: KL(dump || ours) mean {e:.4}, max {e:.4} (row {d}); top-1 agreement with the dump {d}/{d} ({d:.3} %)\n", .{ name, k.sum / @as(f64, @floatFromInt(@max(k.rows, 1))), k.max, k.max_row, k.agree, k.rows, 100.0 * @as(f64, @floatFromInt(k.agree)) / @as(f64, @floatFromInt(@max(k.rows, 1))) });
+        std.debug.print("  vs dump of {s}: KL(dump || ours) mean {e:.4}, max {e:.4} (row {d}, position {d}); top-1 agreement with the dump {d}/{d} ({d:.3} %)\n", .{ name, k.sum / @as(f64, @floatFromInt(@max(k.rows, 1))), k.max, k.max_row, k.max_pos, k.agree, k.rows, 100.0 * @as(f64, @floatFromInt(k.agree)) / @as(f64, @floatFromInt(@max(k.rows, 1))) });
     }
 };
 
@@ -566,7 +569,7 @@ pub fn main(init: std.process.Init) !void {
                 };
                 if (compare_file) |f| if (p >= dump_from) {
                     if (std.c.fread(@ptrCast(other.ptr), 4, vocab, f) != vocab) return error.DumpRead;
-                    kl.add(other, row);
+                    kl.add(other, row, p);
                 };
                 const ref_top = ref.top_ids[p * top_n ..][0..top_n];
                 const ref_logit = ref.top_logits[p * top_n ..][0..top_n];
