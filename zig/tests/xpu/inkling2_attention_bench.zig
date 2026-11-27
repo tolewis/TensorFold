@@ -6,6 +6,12 @@
 //! scale exactly, then requires `tf_ink2_attn_decode8` to give the partials and the output of `tf_ink2_attn_decode` bit
 //! for bit, at the layer chunk and at 128 splits, and `tf_ink2_attn_prompt8` those of `tf_ink2_attn_prompt` (a code times
 //! a power-of-two scale rounds to itself in bf16, so the prompt read's V rounding changes nothing). Exit 1 on a difference.
+//! `--check-real` uses the prep rule's own scales (`amax / 127`, rows of very different size) and a host reference for
+//! each of the five int8 kernels: `tf_ink2_prep8` (codes and scales), `tf_ink2_prep8q` (the bf16 stage) and
+//! `tf_ink2_kv_dequant8` must equal the bf16 prep followed by the host quantize rule bit for bit, and the prep8q stage
+//! must equal dequant8 of the prep8 ring. `tf_ink2_attn_decode8` and `tf_ink2_attn_prompt8` go against an fp64 host
+//! partial (top, weight sum, weighted mean of V) on the exact values `code * scale`, beside the bf16 kernels on
+//! `bf16(code * scale)`. Exit 1 on a difference or an error above the bounds of `real_bounds`.
 const std = @import("std");
 const xpu = @import("xpu");
 const rig_ = @import("contract_rig.zig");
@@ -31,6 +37,18 @@ fn bf2f(h: u16) f32 {
     return @bitCast(@as(u32, h) << 16);
 }
 
+/// fp32 to bf16, round to nearest even (the device `intel_convert_bfloat16_as_ushort`, finite values).
+fn f2bf(f: f32) u16 {
+    const u: u32 = @bitCast(f);
+    return @truncate((u + 0x7fff + ((u >> 16) & 1)) >> 16);
+}
+
+/// Round to nearest, ties to even (the device `rint`).
+fn rintEven(t: f32) f32 {
+    if (@abs(t - @trunc(t)) == 0.5) return 2.0 * @round(t / 2.0);
+    return @round(t);
+}
+
 /// One (position, head) row quantized as `tf_ink2_prep8` does: the largest magnitude of the bf16 value, one fp32 scale
 /// (`amax / 127`), then one code a value. Returns the scale.
 fn quantize(row: []const u16, codes: []u8) f32 {
@@ -38,7 +56,7 @@ fn quantize(row: []const u16, codes: []u8) f32 {
     for (row) |h| amax = @max(amax, @abs(bf2f(h)));
     const scale: f32 = if (amax > 0) amax / 127.0 else 0;
     for (row, codes) |h, *c| {
-        const t = if (scale > 0) @round(bf2f(h) / scale) else 0;
+        const t = if (scale > 0) rintEven(bf2f(h) / scale) else 0;
         c.* = @intCast(@as(i8, @intFromFloat(std.math.clamp(t, -127.0, 127.0))));
     }
     return scale;
@@ -170,12 +188,325 @@ fn check(a: std.mem.Allocator, dev: *rig_.Dev, k: *const attn.Kernels, rng: std.
     return failed;
 }
 
+/// The bounds of `--check-real` for the int8 reads against the fp64 partial: the top score (log2 units), the relative
+/// weight sum and the weighted mean of V over the RMS of V. A wrong scale moves a key by a factor of up to 64 here.
+const real_bounds = struct {
+    const top: f64 = 1e-3;
+    const sum: f64 = 1e-2;
+    const mean: f64 = 2e-2;
+};
+
+const RealErr = struct {
+    top: f64 = 0,
+    sum: f64 = 0,
+    mean: f64 = 0,
+    fn ok(e: RealErr) bool {
+        return e.top <= real_bounds.top and e.sum <= real_bounds.sum and e.mean <= real_bounds.mean;
+    }
+};
+
+/// The partials of one launch against the fp64 reference on `kref`/`vref` (`[head][ring][D]`, exact `code * scale`).
+fn realErrors(cs: Case, layer: plan.Layer, chunk: u32, stride: usize, q: []const u16, tab: []const u16, pos: []const i32, kref: []const f64, vref: []const f64, vrms: f64, po: []const f32, pml: []const [2]f32) RealErr {
+    var e: RealErr = .{};
+    const ring: usize = layer.ring;
+    const scale: f64 = 1.0 / @sqrt(@as(f64, D));
+    const log2e: f64 = 1.4426950408889634;
+    var x = std.heap.page_allocator.alloc(f64, chunk) catch unreachable;
+    defer std.heap.page_allocator.free(x);
+    for (0..cs.rows) |row| {
+        const p: usize = @intCast(pos[row]);
+        const lo: usize = if (layer.window > 0 and p + 1 > layer.window) p + 1 - layer.window else 0;
+        const first: usize = if (layer.window > 0) lo / chunk else 0;
+        for (0..H) |h| {
+            const kvh = h / 3;
+            const rh = row * H + h;
+            for (0..stride) |j| {
+                const c = first + j;
+                const from = @max(lo, c * chunk);
+                const to = @min(p + 1, (c + 1) * chunk);
+                if (from >= to) continue;
+                var top: f64 = -std.math.inf(f64);
+                for (from..to) |kp| {
+                    var dot: f64 = 0;
+                    const kr = kref[(kvh * ring + kp % ring) * D ..][0..D];
+                    for (0..D) |d| dot += @as(f64, bf2f(q[rh * D + d])) * kr[d];
+                    const dist = p - kp;
+                    const bias: f64 = if (dist < EXTENT) bf2f(tab[rh * EXTENT + dist]) else 0;
+                    x[kp - from] = (dot * scale + bias) * log2e;
+                    top = @max(top, x[kp - from]);
+                }
+                var sum: f64 = 0;
+                var mean: [D]f64 = @splat(0);
+                for (from..to) |kp| {
+                    const w = std.math.pow(f64, 2, x[kp - from] - top);
+                    sum += w;
+                    const vr = vref[(kvh * ring + kp % ring) * D ..][0..D];
+                    for (0..D) |d| mean[d] += w * vr[d];
+                }
+                const slot = rh * stride + j;
+                const ml = pml[slot];
+                e.top = @max(e.top, @abs(@as(f64, ml[0]) - top));
+                e.sum = @max(e.sum, @abs(@as(f64, ml[1]) / sum - 1));
+                for (0..D) |d| e.mean = @max(e.mean, @abs(@as(f64, po[slot * D + d]) / @as(f64, ml[1]) - mean[d] / sum) / vrms);
+            }
+        }
+    }
+    return e;
+}
+
+fn checkReal(a: std.mem.Allocator, dev: *rig_.Dev, k: *const attn.Kernels, rng: std.Random) !usize {
+    var failed: usize = 0;
+    var cases_run: usize = 0;
+    // 1. the three prep kernels against the bf16 prep and the host quantize rule
+    for ([_]plan.Layer{ plan.Layer.sliding(1024, 64), plan.Layer.global(4096) }) |layer| {
+        var rig: rig_.Rig = .{ .a = a, .dev = dev };
+        defer rig.deinit();
+        const rows: u32 = 64;
+        const ring: usize = layer.ring;
+        const stage_ring: u32 = 1104;
+        const p0: u32 = if (layer.window > 0) 3000 else 4000;
+        const raw_q = try a.alloc(u16, rows * H * D);
+        defer a.free(raw_q);
+        const raw_k = try a.alloc(u16, rows * KV * D);
+        defer a.free(raw_k);
+        const raw_v = try a.alloc(u16, rows * KV * D);
+        defer a.free(raw_v);
+        const raw_rel = try a.alloc(u16, rows * H * 16);
+        defer a.free(raw_rel);
+        const q_scale = try a.alloc(u16, H * D);
+        defer a.free(q_scale);
+        const rel_scale = try a.alloc(u16, H * 16);
+        defer a.free(rel_scale);
+        fillBf16(rng, raw_q, 4);
+        fillBf16(rng, raw_rel, 4);
+        for (q_scale) |*v| v.* = f2bf(0.5 + rng.float(f32));
+        for (rel_scale) |*v| v.* = f2bf(0.5 + rng.float(f32));
+        // rows of very different size, so that the scales of two positions differ
+        for (0..rows * KV) |r| {
+            const f = std.math.pow(f32, 2, rng.float(f32) * 12 - 6);
+            for (0..D) |d| {
+                raw_k[r * D + d] = f2bf((rng.float(f32) - 0.5) * f);
+                raw_v[r * D + d] = f2bf((rng.float(f32) - 0.5) * f);
+            }
+        }
+        const pos = try a.alloc(i32, rows);
+        defer a.free(pos);
+        for (pos, 0..) |*v, i| v.* = @intCast(p0 + i);
+        const seg_of = try a.alloc(i32, rows);
+        defer a.free(seg_of);
+        @memset(seg_of, 0);
+        const seg = [1]plan.Seg{.{ .row0 = 0, .n = @intCast(rows), .p0 = @intCast(p0), .off = 0 }};
+        const meta: attn.RowMeta = .{
+            .pos = .{ .ptr = try rig.input(std.mem.sliceAsBytes(pos)) },
+            .seg_of = .{ .ptr = try rig.input(std.mem.sliceAsBytes(seg_of)) },
+            .segs = .{ .ptr = try rig.input(std.mem.sliceAsBytes(&seg)) },
+        };
+        const raw = [4]attn.Ref{
+            .{ .ptr = try rig.input(std.mem.sliceAsBytes(raw_q)) },  .{ .ptr = try rig.input(std.mem.sliceAsBytes(raw_k)) },
+            .{ .ptr = try rig.input(std.mem.sliceAsBytes(raw_v)) },  .{ .ptr = try rig.input(std.mem.sliceAsBytes(raw_rel)) },
+        };
+        const scales = [2]attn.Ref{ .{ .ptr = try rig.input(std.mem.sliceAsBytes(q_scale)) }, .{ .ptr = try rig.input(std.mem.sliceAsBytes(rel_scale)) } };
+        const qn = rows * H * D * 2;
+        const reln = rows * H * 16 * 2;
+        const bfn = KV * ring * D * 2;
+        const stn = KV * @as(usize, stage_ring) * D * 2;
+        const q_out = [3]attn.Ref{ .{ .ptr = try rig.output(qn) }, .{ .ptr = try rig.output(qn) }, .{ .ptr = try rig.output(qn) } };
+        const rel_out = [3]attn.Ref{ .{ .ptr = try rig.output(reln) }, .{ .ptr = try rig.output(reln) }, .{ .ptr = try rig.output(reln) } };
+        const bfc: attn.Cache = .{ .k = .{ .ptr = try rig.output(bfn) }, .v = .{ .ptr = try rig.output(bfn) } };
+        const i8c: attn.Cache = .{ .k = .{ .ptr = try rig.output(KV * ring * D) }, .v = .{ .ptr = try rig.output(KV * ring * D) }, .int8 = true, .kscale = .{ .ptr = try rig.output(KV * ring * 4) }, .vscale = .{ .ptr = try rig.output(KV * ring * 4) } };
+        const stq: attn.Cache = .{ .k = .{ .ptr = try rig.output(stn) }, .v = .{ .ptr = try rig.output(stn) } };
+        const std8: attn.Cache = .{ .k = .{ .ptr = try rig.output(stn) }, .v = .{ .ptr = try rig.output(stn) } };
+        const r: plan.Rows = .{ .rows = rows, .last_pos = p0 + rows - 1 };
+        const c: plan.Prep = .{};
+        var stage_layer = layer;
+        stage_layer.ring = stage_ring;
+        try attn.prep(k, dev.s, r, layer, c, meta, raw, scales, q_out[0], rel_out[0], bfc);
+        try attn.prep(k, dev.s, r, layer, c, meta, raw, scales, q_out[1], rel_out[1], i8c);
+        try attn.prepStage8(k, dev.s, r, stage_layer, c, meta, raw, scales, q_out[2], rel_out[2], stq);
+        try attn.dequant8(k, dev.s, i8c, std8, p0, @intCast(ring), stage_ring, rows, KV);
+        var qx: [3][]u8 = undefined;
+        for (0..3) |w| qx[w] = try a.dupe(u8, try rig.bytes(q_out[w].ptr, qn));
+        defer for (qx) |b| a.free(b);
+        var rx: [3][]u8 = undefined;
+        for (0..3) |w| rx[w] = try a.dupe(u8, try rig.bytes(rel_out[w].ptr, reln));
+        defer for (rx) |b| a.free(b);
+        var bfk: [2][]u16 = undefined; // the bf16 prep's K and V
+        for (0..2) |w| bfk[w] = try a.dupe(u16, @alignCast(std.mem.bytesAsSlice(u16, try rig.bytes(if (w == 0) bfc.k.ptr else bfc.v.ptr, bfn))));
+        defer for (bfk) |b| a.free(b);
+        var codes: [2][]u8 = undefined;
+        for (0..2) |w| codes[w] = try a.dupe(u8, try rig.bytes(if (w == 0) i8c.k.ptr else i8c.v.ptr, KV * ring * D));
+        defer for (codes) |b| a.free(b);
+        var scl: [2][]f32 = undefined;
+        for (0..2) |w| scl[w] = try a.dupe(f32, @alignCast(std.mem.bytesAsSlice(f32, try rig.bytes(if (w == 0) i8c.kscale.ptr else i8c.vscale.ptr, KV * ring * 4))));
+        defer for (scl) |b| a.free(b);
+        var stg: [4][]u16 = undefined; // prep8q K, V, then dequant8 K, V
+        for (0..4) |w| stg[w] = try a.dupe(u16, @alignCast(std.mem.bytesAsSlice(u16, try rig.bytes(switch (w) {
+            0 => stq.k.ptr,
+            1 => stq.v.ptr,
+            2 => std8.k.ptr,
+            else => std8.v.ptr,
+        }, stn))));
+        defer for (stg) |b| a.free(b);
+        var bad: [6]usize = @splat(0); // codes, scales, prep8q stage, dequant8, stage against dequant8, q and rel
+        var want_codes: [D]u8 = undefined;
+        for (0..2) |w| for (0..KV) |h| for (0..rows) |i| {
+            const p = p0 + i;
+            const at = p % ring;
+            const st = (h * stage_ring + p % stage_ring) * D;
+            const sc = quantize(bfk[w][(h * ring + at) * D ..][0..D], &want_codes);
+            bad[1] += @intFromBool(@as(u32, @bitCast(sc)) != @as(u32, @bitCast(scl[w][h * ring + at])));
+            for (0..D) |d| {
+                const got = codes[w][if (w == 0) plan.kCodeOffset(h, at, d, ring) else plan.vCodeOffset(h, at, d, ring)];
+                bad[0] += @intFromBool(got != want_codes[d]);
+                const want = f2bf(@as(f32, @floatFromInt(@as(i8, @bitCast(want_codes[d])))) * sc);
+                bad[2] += @intFromBool(stg[w][st + d] != want);
+                bad[3] += @intFromBool(stg[2 + w][st + d] != want);
+                bad[4] += @intFromBool(stg[w][st + d] != stg[2 + w][st + d]);
+            }
+        };
+        for (1..3) |w| {
+            bad[5] += @intFromBool(!std.mem.eql(u8, qx[0], qx[w]));
+            bad[5] += @intFromBool(!std.mem.eql(u8, rx[0], rx[w]));
+        }
+        const n = 2 * KV * rows * D;
+        std.debug.print("CHECK-REAL prep {s} ring {d}, {d} rows from {d}: prep8 codes {d} of {d} differ, scales {d} of {d}; prep8q stage {d} of {d}; dequant8 {d} of {d}; prep8q stage against dequant8 of the prep8 ring {d} of {d}; q and rel outputs of prep8 and prep8q against prep: {d} of 4 differ\n", .{ if (layer.window > 0) "sliding" else "global", ring, rows, p0, bad[0], n, bad[1], 2 * KV * rows, bad[2], n, bad[3], n, bad[4], n, bad[5] });
+        var sum: usize = 0;
+        for (bad) |b| sum += b;
+        if (sum != 0) failed += 1;
+        cases_run += 1;
+    }
+    // 2. the two attention reads against the fp64 partial
+    const cases = [_]Case{
+        .{ .name = "global 1 row, 3,000 keys", .rows = 1, .k = 3000, .window = 0 },
+        .{ .name = "global 8 rows, 3,000 keys", .rows = 8, .k = 3000, .window = 0 },
+        .{ .name = "global 1 row, 40,000 keys", .rows = 1, .k = 40000, .window = 0 },
+        .{ .name = "sliding 1 row, 2,050 keys, window 1,024", .rows = 1, .k = 2050, .window = 1024 },
+        .{ .name = "global prompt 100 rows, 3,000 keys", .rows = 100, .k = 3000, .window = 0, .prompt = true },
+        .{ .name = "global prompt 256 rows, 2,056 keys", .rows = 256, .k = 2056, .window = 0, .prompt = true },
+    };
+    for ([_]u32{ 0, 128 }) |splits| {
+        plan.flash_splits = splits;
+        plan.flash_user_set = splits != 0;
+        for (cases) |cs| {
+            var rig: rig_.Rig = .{ .a = a, .dev = dev };
+            defer rig.deinit();
+            const layer: plan.Layer = if (cs.window > 0) plan.Layer.sliding(cs.window, cs.rows) else plan.Layer.global(cs.k);
+            const rows = cs.rows;
+            const ring: usize = layer.ring;
+            const stride = @max(plan.slotsFor(layer, cs.k), plan.chunks(cs.k - 1, plan.prompt_chunk));
+            const cache_n = @as(usize, KV) * ring * D;
+            const kb = try a.alloc(u16, cache_n);
+            defer a.free(kb);
+            const vb = try a.alloc(u16, cache_n);
+            defer a.free(vb);
+            const kc = try a.alloc(u8, cache_n);
+            defer a.free(kc);
+            const vc = try a.alloc(u8, cache_n);
+            defer a.free(vc);
+            const ks = try a.alloc(f32, KV * ring);
+            defer a.free(ks);
+            const vs = try a.alloc(f32, KV * ring);
+            defer a.free(vs);
+            const kref = try a.alloc(f64, cache_n);
+            defer a.free(kref);
+            const vref = try a.alloc(f64, cache_n);
+            defer a.free(vref);
+            var row: [D]u16 = undefined;
+            var cd: [D]u8 = undefined;
+            var vsq: f64 = 0;
+            for (0..KV) |h| for (0..ring) |p| for (0..2) |w| {
+                // a row's size varies by up to 64 times between positions, so each position has its own real scale
+                const f = std.math.pow(f32, 2, rng.float(f32) * 6 - 3);
+                for (&row) |*x| x.* = f2bf((rng.float(f32) - 0.5) * f);
+                const sc = quantize(&row, &cd);
+                (if (w == 0) ks else vs)[h * ring + p] = sc;
+                for (0..D) |d| {
+                    const code: i8 = @bitCast(cd[d]);
+                    const exact = @as(f64, @floatFromInt(code)) * @as(f64, sc);
+                    const at = (h * ring + p) * D + d;
+                    if (w == 0) {
+                        kc[plan.kCodeOffset(h, p, d, ring)] = cd[d];
+                        kb[at] = f2bf(@as(f32, @floatFromInt(code)) * sc);
+                        kref[at] = exact;
+                    } else {
+                        vc[plan.vCodeOffset(h, p, d, ring)] = cd[d];
+                        vb[at] = f2bf(@as(f32, @floatFromInt(code)) * sc);
+                        vref[at] = exact;
+                        vsq += exact * exact;
+                    }
+                }
+            };
+            const vrms = @sqrt(vsq / @as(f64, @floatFromInt(cache_n)));
+            const bf: attn.Cache = .{ .k = .{ .ptr = try rig.input(std.mem.sliceAsBytes(kb)) }, .v = .{ .ptr = try rig.input(std.mem.sliceAsBytes(vb)) } };
+            const i8c: attn.Cache = .{
+                .k = .{ .ptr = try rig.input(kc) },
+                .v = .{ .ptr = try rig.input(vc) },
+                .int8 = true,
+                .kscale = .{ .ptr = try rig.input(std.mem.sliceAsBytes(ks)) },
+                .vscale = .{ .ptr = try rig.input(std.mem.sliceAsBytes(vs)) },
+            };
+            const q = try a.alloc(u16, rows * H * D);
+            defer a.free(q);
+            fillBf16(rng, q, 0.6);
+            const tab = try a.alloc(u16, rows * H * EXTENT);
+            defer a.free(tab);
+            fillBf16(rng, tab, 0.5);
+            const sink = try a.alloc(u16, rows * H);
+            defer a.free(sink);
+            @memset(sink, 0x4040);
+            const gate = try a.alloc(u16, rows * H * D);
+            defer a.free(gate);
+            fillBf16(rng, gate, 2);
+            const pos = try a.alloc(i32, rows);
+            defer a.free(pos);
+            for (pos, 0..) |*v, i| v.* = @intCast(cs.k - rows + i);
+            const seg_of = try a.alloc(i32, rows);
+            defer a.free(seg_of);
+            @memset(seg_of, 0);
+            const seg = [1]plan.Seg{.{ .row0 = 0, .n = @intCast(rows), .p0 = @intCast(cs.k - rows), .off = 0 }};
+            const meta: attn.RowMeta = .{
+                .pos = .{ .ptr = try rig.input(std.mem.sliceAsBytes(pos)) },
+                .seg_of = .{ .ptr = try rig.input(std.mem.sliceAsBytes(seg_of)) },
+                .segs = .{ .ptr = try rig.input(std.mem.sliceAsBytes(&seg)) },
+            };
+            const qd: attn.Ref = .{ .ptr = try rig.input(std.mem.sliceAsBytes(q)) };
+            const tabd: attn.Ref = .{ .ptr = try rig.input(std.mem.sliceAsBytes(tab)) };
+            const sinkd: attn.Ref = .{ .ptr = try rig.input(std.mem.sliceAsBytes(sink)) };
+            const gated: attn.Ref = .{ .ptr = try rig.input(std.mem.sliceAsBytes(gate)) };
+            const po_n = @as(usize, rows) * H * stride * (D * 4);
+            const pml_n = @as(usize, rows) * H * stride * 8;
+            const po: attn.Ref = .{ .ptr = try rig.scratch(po_n) };
+            const pml: attn.Ref = .{ .ptr = try rig.scratch(pml_n) };
+            const out: attn.Ref = .{ .ptr = try rig.output(@as(usize, rows) * H * D * 2) };
+            const r: plan.Rows = .{ .rows = rows, .last_pos = cs.k - 1 };
+            const path: plan.Path = if (cs.prompt) .prompt else .decode;
+            const launch = try plan.attendAs(r, layer, stride, path);
+            var errs: [2]RealErr = undefined;
+            for ([_]attn.Cache{ bf, i8c }, 0..) |c, w| {
+                try attn.attendAs(k, dev.s, path, r, layer, stride, meta, qd, c, tabd, po, pml, sinkd, gated, out);
+                const pob = try a.dupe(u8, try rig.bytes(po.ptr, po_n));
+                defer a.free(pob);
+                const pmlb = try a.dupe(u8, try rig.bytes(pml.ptr, pml_n));
+                defer a.free(pmlb);
+                errs[w] = realErrors(cs, layer, launch.chunk, stride, q, tab, pos, kref, vref, vrms, @alignCast(std.mem.bytesAsSlice(f32, pob)), @alignCast(std.mem.bytesAsSlice([2]f32, pmlb)));
+            }
+            const ok = errs[1].ok();
+            std.debug.print("CHECK-REAL splits {d} chunk {d}, {s}, {s}: against fp64, top / sum / mean error: int8 {e:.2} / {e:.2} / {e:.2}, bf16 cache of bf16(code * scale) {e:.2} / {e:.2} / {e:.2}{s}\n", .{ splits, launch.chunk, cs.name, if (cs.prompt) "tf_ink2_attn_prompt8" else "tf_ink2_attn_decode8", errs[1].top, errs[1].sum, errs[1].mean, errs[0].top, errs[0].sum, errs[0].mean, if (ok) "" else ", ABOVE BOUND" });
+            if (!ok) failed += 1;
+            cases_run += 1;
+        }
+    }
+    std.debug.print("CHECK-REAL {s}: {d} of {d} cases fail (bounds: top {e:.1}, sum {e:.1}, mean {e:.1})\n", .{ if (failed == 0) "PASS" else "FAIL", failed, cases_run, real_bounds.top, real_bounds.sum, real_bounds.mean });
+    return failed;
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const a = init.gpa;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     var kv_int8 = false;
     var splits: u32 = 0;
     var do_check = false;
+    var do_check_real = false;
     var ai: usize = 1;
     while (ai < args.len) : (ai += 1) {
         const arg = args[ai];
@@ -191,6 +522,8 @@ pub fn main(init: std.process.Init) !u8 {
             splits = try std.fmt.parseInt(u32, args[ai], 10);
         } else if (std.mem.eql(u8, arg, "--check")) {
             do_check = true;
+        } else if (std.mem.eql(u8, arg, "--check-real")) {
+            do_check_real = true;
         } else return error.BadArgument;
     }
     plan.flash_splits = splits;
@@ -224,6 +557,7 @@ pub fn main(init: std.process.Init) !u8 {
     var prng = std.Random.DefaultPrng.init(7);
     const rng = prng.random();
     if (do_check) return if (try check(a, &dev, &k, rng) == 0) 0 else 1;
+    if (do_check_real) return if (try checkReal(a, &dev, &k, rng) == 0) 0 else 1;
     std.debug.print("BENCH inkling2 attention on {s}, kv {s}, splits {d}, roof {d:.1} GB/s read\n", .{ "bmg-g31", if (kv_int8) "int8" else "bf16", splits, roof_gbs });
     for (cases) |cs| {
         var rig: rig_.Rig = .{ .a = a, .dev = &dev };
