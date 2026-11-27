@@ -245,6 +245,7 @@ pub fn main(init: std.process.Init) !void {
     var fuse_check = false;
     var router_check = false;
     var verify_bench = false;
+    var two_slot: ?[2]usize = null;
     var route_union = false;
     var bench_context: ?usize = null;
     var bench_prefill: usize = 0;
@@ -317,6 +318,11 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--profile-steps")) {
             i += 1;
             profile_steps = try std.fmt.parseInt(usize, argv[i], 10);
+        } else if (std.mem.eql(u8, a, "--two-slot")) {
+            // --two-slot A,B: rows A from the start and rows B from the end of the first reference, two caches, one scratch
+            i += 1;
+            var it = std.mem.splitScalar(u8, argv[i], ',');
+            two_slot = .{ try std.fmt.parseInt(usize, it.next() orelse return error.BadTwoSlot, 10), try std.fmt.parseInt(usize, it.next() orelse return error.BadTwoSlot, 10) };
         } else if (std.mem.eql(u8, a, "--verify-bench")) {
             // the first --ref prompt prefilled, then windows of 1, 2, 3, 4, 6, 8, 12 and 16 real rows run as the server's verify
             // does (every row's logits, the DSpark taps, the cache transaction), timed; then stop
@@ -475,6 +481,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     var scratch = try state.Scratch.init(&r, @max(chunk, state.max_rows), capacity);
+    if (kv_dtype == .int8) try scratch.prepareInt8Global(&r, m.options.place.kvHeads());
     defer scratch.deinit();
     var prec = ink.model.precisions();
     const schedule = try ink.plan.build(&m.config.text, &prec);
@@ -482,6 +489,10 @@ pub fn main(init: std.process.Init) !void {
     const host_logits = try gpa.alloc(f32, state.max_rows * vocab);
     defer gpa.free(host_logits);
 
+    if (two_slot) |ts| {
+        try twoSlot(gpa, m, &scratch, &r, &schedule, loaded_refs.items[0].ids, ts, chunk);
+        return;
+    }
     if (verify_bench) {
         try verifyBench(gpa, init.io, &ctx, m, &scratch, &r, &schedule, capacity, loaded_refs.items[0].ids, host_logits, profile_steps > 0, route_union);
         return;
@@ -828,6 +839,53 @@ var old_sliding = false;
 /// With `--skip-below-dump`, a block of rows wholly below `--dump-from` makes no host logits (no head on the prompt path,
 /// no download), so the per-prompt lines count only the rows from `--dump-from` on.
 var skip_below_dump = false;
+/// Two caches of two lengths on one scratch. Each prompt runs alone, then the two run again in fresh caches with their
+/// chunks in turn (A, B, A, B, ...). Every chunk's last-row logits must equal the lone run's bit for bit: a visit's
+/// scratch (the stage and, with an int8 cache, the bf16 copy of the global ring) holds nothing from the other cache.
+fn twoSlot(gpa: std.mem.Allocator, m: *const ink.model.Model, scratch: *state.Scratch, r: *xpu.rt.Runtime, schedule: *const ink.plan.Plan, src: []const u32, ts: [2]usize, chunk: usize) !void {
+    if (ts[0] == 0 or ts[1] == 0 or ts[0] > src.len or ts[1] > src.len) return error.BadTwoSlot;
+    const prompts = [2][]const u32{ src[0..ts[0]], src[src.len - ts[1] ..] };
+    var lone: [2][][]f32 = undefined;
+    for (prompts, 0..) |ids, w| {
+        const n = (ids.len + chunk - 1) / chunk;
+        lone[w] = try gpa.alloc([]f32, n);
+        var cache = try state.Cache.init(r, std.mem.alignForward(usize, ids.len + 64, 64), schedule, kv_dtype);
+        defer cache.deinit();
+        for (0..n) |c| {
+            const at = c * chunk;
+            const len = @min(chunk, ids.len - at);
+            try promptRun(m, scratch, &cache, ids[at..][0..len], .{});
+            cache.len += len;
+            lone[w][c] = try gpa.alloc(f32, vocab);
+            try cache.readLogits(lone[w][c]);
+        }
+        std.debug.print("TWO-SLOT lone {c}: {d} rows, ring {d}, {d} chunks\n", .{ @as(u8, 'A') + @as(u8, @intCast(w)), ids.len, state.globalSlots(cache.capacity), n });
+    }
+    var caches: [2]state.Cache = undefined;
+    for (prompts, 0..) |ids, w| caches[w] = try state.Cache.init(r, std.mem.alignForward(usize, ids.len + 64, 64), schedule, kv_dtype);
+    defer for (&caches) |*c| c.deinit();
+    const row = try gpa.alloc(f32, vocab);
+    defer gpa.free(row);
+    var equal = [2]usize{ 0, 0 };
+    var worst = [2]f32{ 0, 0 };
+    var c: usize = 0;
+    while (c < @max(lone[0].len, lone[1].len)) : (c += 1) {
+        for (prompts, 0..) |ids, w| {
+            if (c >= lone[w].len) continue;
+            const at = c * chunk;
+            const len = @min(chunk, ids.len - at);
+            try promptRun(m, scratch, &caches[w], ids[at..][0..len], .{});
+            caches[w].len += len;
+            try caches[w].readLogits(row);
+            if (std.mem.eql(u8, std.mem.sliceAsBytes(row), std.mem.sliceAsBytes(lone[w][c]))) equal[w] += 1;
+            for (row, lone[w][c]) |x, y| worst[w] = @max(worst[w], @abs(x - y));
+        }
+    }
+    std.debug.print("TWO-SLOT in turn, chunk {d}, kv {s}: A {d} of {d} chunks equal to the lone run bit for bit (max abs {e}), B {d} of {d} (max abs {e})\n", .{ chunk, @tagName(kv_dtype), equal[0], lone[0].len, worst[0], equal[1], lone[1].len, worst[1] });
+    if (equal[0] != lone[0].len or equal[1] != lone[1].len) return error.TwoSlotMismatch;
+    std.debug.print("TWO-SLOT PASS\n", .{});
+}
+
 fn promptRun(m: *const ink.model.Model, scratch: *state.Scratch, cache: *state.Cache, ids: []const u32, _: anytype) !void {
     if (old_forward) {
         if (ids.len > state.max_rows) return error.BadChunk;

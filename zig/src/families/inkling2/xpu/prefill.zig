@@ -307,6 +307,18 @@ const Run = struct {
         }
         xpu.profile.label = "";
         try pk.relTable(&g.p.prefill, g.s, all.rows * all.heads, aref(s.rel_prep, 0).at(), aref(w.attn.rel_projection.buf, 0).at(), aref(s.rel_tab, 0).at());
+        // An int8 cache's global visit on the prompt kernel reads a bf16 copy of the ring, bf16(code * scale): the value
+        // a sliding visit reads from its stage. tf_ink2_prep8 has written the chunk's codes, so the copy covers every key
+        // up to the last row. The copy is the scratch's, written before it is read in this visit: caches share it.
+        var gkv = kv;
+        if (!sliding and kv.int8 and g.gl_slice > state.max_rows) {
+            const kg = s.kglobal orelse return error.Inkling2GlobalScratch;
+            if (layer.ring > s.global_ring or kh > s.global_heads) return error.Inkling2GlobalScratch;
+            gkv = .{ .k = aref(kg, 0), .v = aref(s.vglobal.?, 0), .int8 = false, .kscale = kv.kscale, .vscale = kv.vscale };
+            xpu.profile.label = "gdq";
+            try attention.dequant8(k, g.s, kv, gkv, 0, layer.ring, layer.ring, start + rows, kh);
+            xpu.profile.label = "";
+        }
         const step: usize = if (sliding) g.sl_slice else g.gl_slice;
         var base: usize = 0;
         var si: usize = if (sliding) g.sl_seg0 else 0;
@@ -325,7 +337,7 @@ const Run = struct {
             } else if (g.gl_slice > state.max_rows) {
                 var lg = layer;
                 lg.chunk = ap.prompt_chunk;
-                try attention.attendAs(k, g.s, .prompt, rr, lg, ap.chunks(rr.last_pos, ap.prompt_chunk), meta, aref(s.q_prep, q_at), kv, aref(s.rel_tab, tab_at), aref(s.part_o, 0), aref(s.part_ml, 0), sink, aref(s.gate, q_at), aref(s.att, q_at));
+                try attention.attendAs(k, g.s, .prompt, rr, lg, ap.chunks(rr.last_pos, ap.prompt_chunk), meta, aref(s.q_prep, q_at), gkv, aref(s.rel_tab, tab_at), aref(s.part_o, 0), aref(s.part_ml, 0), sink, aref(s.gate, q_at), aref(s.att, q_at));
             } else {
                 try attention.attend(k, g.s, rr, layer, s.stride, meta, aref(s.q_prep, q_at), kv, aref(s.rel_tab, tab_at), aref(s.part_o, 0), aref(s.part_ml, 0), sink, aref(s.gate, q_at), aref(s.att, q_at));
             }

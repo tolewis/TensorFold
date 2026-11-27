@@ -372,6 +372,12 @@ pub fn scratchBytes(rows: usize, capacity: usize) usize {
     return out;
 }
 
+/// Bytes of the bf16 copy that an int8 cache's global visits read on the prompt path (`Scratch.prepareInt8Global`): K and
+/// V of `kv_heads` heads over the global ring of `capacity` positions, the largest ring a cache of that capacity holds.
+pub fn int8GlobalBytes(capacity: usize, heads: usize) usize {
+    return 2 * globalSlots(capacity) * heads * ap.head_dim * 2;
+}
+
 pub const Scratch = struct {
     ids: rt.Buffer,
     pos: rt.Buffer,
@@ -433,6 +439,13 @@ pub const Scratch = struct {
     vstage: rt.Buffer,
     /// Opt-in DSpark features [row][tap][H], allocated by prepare_features.
     taps: ?rt.Buffer = null,
+    /// An int8 cache's global ring as bf16(code * scale), K then V, for the prompt path (`prepareInt8Global`): each
+    /// global visit of a prompt chunk writes every position before it reads, so the copy holds nothing between visits
+    /// and any number of caches share it. `global_ring` positions of `global_heads` heads each.
+    kglobal: ?rt.Buffer = null,
+    vglobal: ?rt.Buffer = null,
+    global_ring: usize = 0,
+    global_heads: usize = 0,
     rows: usize,
     /// The largest global capacity the scratch was sized for, and the partial slots a row and head hold from it.
     capacity: usize,
@@ -451,6 +464,10 @@ pub const Scratch = struct {
             made += 1;
         }
         s.taps = null;
+        s.kglobal = null;
+        s.vglobal = null;
+        s.global_ring = 0;
+        s.global_heads = 0;
         s.rows = rows;
         s.capacity = capacity;
         s.stride = @intCast(partialStride(capacity));
@@ -460,9 +477,30 @@ pub const Scratch = struct {
         return s;
     }
 
+    /// The bf16 copy of the global ring for an int8 cache of up to `capacity` positions (the scratch capacity), `heads`
+    /// K/V heads (a rank's heads on TP 2). One a card: every cache this scratch serves reads it in turn.
+    pub fn prepareInt8Global(s: *Scratch, r: *rt.Runtime, heads: usize) !void {
+        if (s.kglobal != null) return;
+        const n = int8GlobalBytes(s.capacity, heads) / 2;
+        var k = try r.alloc(n);
+        errdefer k.free();
+        var v = try r.alloc(n);
+        errdefer v.free();
+        // the prompt kernel reads whole key tiles: keys past the last row must hold finite values, and zero is one
+        try zero(r, k, n);
+        try zero(r, v, n);
+        try r.sync();
+        s.kglobal = k;
+        s.vglobal = v;
+        s.global_ring = globalSlots(s.capacity);
+        s.global_heads = heads;
+    }
+
     pub fn deinit(s: *Scratch) void {
         inline for (fields) |f| @field(s, f).free();
         if (s.taps) |*b| b.free();
+        if (s.kglobal) |*b| b.free();
+        if (s.vglobal) |*b| b.free();
         s.* = undefined;
     }
 };

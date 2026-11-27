@@ -39,9 +39,11 @@ pub fn streamBytes(positions: usize) u64 {
     return st.cacheBytes(positions, kv_switch.get());
 }
 
-/// Device bytes the backend's scratch holds for good, for a context of `capacity` positions.
+/// Device bytes the backend's scratch holds for good, for a context of `capacity` positions. With an int8 cache that
+/// includes the bf16 copy of the global ring at all 8 K/V heads (a TP 2 rank allocates its 4: the budget counts the most).
 pub fn scratchBytes(capacity: usize) u64 {
-    return st.scratchBytes(st.prompt_rows, capacity);
+    const global: usize = if (kv_switch.get() == .int8) st.int8GlobalBytes(capacity, st.kv_heads) else 0;
+    return st.scratchBytes(st.prompt_rows, capacity) + global;
 }
 
 pub const Xpu = struct {
@@ -70,6 +72,7 @@ pub const Xpu = struct {
         errdefer gpa.destroy(out);
         var scratch = try st.Scratch.init(model.r, st.prompt_rows, options.capacity);
         errdefer scratch.deinit();
+        if (kv_switch.get() == .int8) try scratch.prepareInt8Global(model.r, model.options.place.kvHeads());
         const tokens = try gpa.alloc(u32, ring);
         errdefer gpa.free(tokens);
         const vocab_size = model.config.text.unpadded_vocab;
