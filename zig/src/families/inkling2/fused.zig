@@ -812,9 +812,16 @@ const fix_own_clear: i32 = 16;
 const fix_two: i32 = 256; // review A10: two blocks a multiprocessor (host: the grid, the shared bytes, S6 db 0)
 const fix_host: i32 = fix_own_clear | fix_two;
 
-/// The launch shape of a step's fix set.
-fn shapeFor(f: *State, fix: i32) void {
-    const two = (fix & fix_two) != 0 and f.grid2 != 0;
+fn isGlobal(m: *Model, v: u32) bool {
+    const p = &m.w.plan;
+    if (v >= p.visits.len) return false;
+    return p.at(p.visits.steps[v].layer).kind == .global;
+}
+
+/// The launch shape of a step's fix set. Two blocks a multiprocessor for a launch of global visits only: a sliding
+/// visit then loses the prefetch tile of S6 (fx4: S6 +9.3 us against S2 -7.2 and S15 -4.5, visit 1 +2.1 us).
+fn shapeFor(f: *State, fix: i32, global: bool) void {
+    const two = (fix & fix_two) != 0 and f.grid2 != 0 and global;
     f.lg = if (two) f.grid2 else f.grid;
     f.ldyn = if (two) f.dyn2 else f.dyn;
 }
@@ -1005,7 +1012,7 @@ fn checkPair(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytype
     const d = f.d;
     const gpa = std.heap.page_allocator;
     const w = v + 1;
-    shapeFor(f, fixFor(f.steps[v]));
+    shapeFor(f, fixFor(f.steps[v]), isGlobal(m, v) and isGlobal(m, w));
     f.at = "pair-fill";
     var host_v: [arg_bytes]u8 = undefined;
     var host_w: [arg_bytes]u8 = undefined;
@@ -1178,7 +1185,7 @@ fn printProbe(f: *State, v: u32, step: usize, pos: u32, ph: i32, ms_fused: f32, 
 fn checkSteps(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytype, v: u32, hin: u64, hout: u64, today: anytype) !void {
     const d = f.d;
     const gpa = std.heap.page_allocator; // not the model's allocator: the check's buffers live for one visit
-    shapeFor(f, fixFor(f.steps[v]));
+    shapeFor(f, fixFor(f.steps[v]), isGlobal(m, v));
     f.at = "fill";
     var host: [arg_bytes]u8 = undefined;
     var vis = fill(f, m, r, v, hin, hout, &host) catch |e| {
