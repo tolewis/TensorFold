@@ -13,6 +13,9 @@ pub const RowsArgs = plan.RowsArgs;
 pub const Ref = ?*anyopaque;
 
 pub const messages_symbol: [:0]const u8 = "tf_inkling2_loop_messages";
+/// The decode bank step (bank0, bank1, p restored, the two bank inverses) and the messages that read those inverses.
+pub const bank_symbol: [:0]const u8 = "tf_inkling2_loop_bank";
+pub const messages_inv_symbol: [:0]const u8 = "tf_inkling2_loop_messages_inv";
 pub const gates_symbol: [:0]const u8 = "tf_inkling2_loop_gates";
 /// The first of the two launches of a gate tuple: the D projection to zeta.
 pub const zeta_symbol: [:0]const u8 = "tf_inkling2_loop_zeta";
@@ -31,6 +34,8 @@ pub const Pipelines = struct {
     messages: xpu.Kernel,
     gates: xpu.Kernel,
     zeta: xpu.Kernel,
+    bank: xpu.Kernel,
+    messages_inv: xpu.Kernel,
 
     /// The three kernels of a loaded `loop.cl` image, each at the work-group size its record states.
     pub fn load(module: xpu.Module) !Pipelines {
@@ -38,12 +43,18 @@ pub const Pipelines = struct {
         errdefer messages.deinit();
         var zeta = try module.kernel(zeta_symbol, .{ threads, 1, 1 });
         errdefer zeta.deinit();
+        var bank = try module.kernel(bank_symbol, .{ threads, 1, 1 });
+        errdefer bank.deinit();
+        var messages_inv = try module.kernel(messages_inv_symbol, .{ threads, 1, 1 });
+        errdefer messages_inv.deinit();
         const gate_kernel = try module.kernel(gates_symbol, .{ gate_threads, 1, 1 });
-        return .{ .messages = messages, .gates = gate_kernel, .zeta = zeta };
+        return .{ .messages = messages, .gates = gate_kernel, .zeta = zeta, .bank = bank, .messages_inv = messages_inv };
     }
 
     pub fn deinit(p: *Pipelines) void {
         p.gates.deinit();
+        p.messages_inv.deinit();
+        p.bank.deinit();
         p.zeta.deinit();
         p.messages.deinit();
         p.* = undefined;
@@ -54,6 +65,15 @@ pub const Pipelines = struct {
 pub fn crossPassMessageAttention(p: *const Pipelines, s: xpu.Stream, bank0: Ref, bank1: Ref, q_mlp: Ref, kv: Ref, out: Ref, rows: u32) !void {
     std.debug.assert(rows > 0 and rows <= 64);
     try xpu.launch.dispatch(p.messages, s, .{ rows * message_entries, 1, 1 }, .{ bank0, bank1, q_mlp, kv, out, rows });
+}
+
+/// The decode bank step and the messages, two launches: bank0 = the row of block 2 of `blocks` (rows `block_stride`
+/// values apart), bank1 = p, p = prelude, the two bank norms once a row into `inv` (2 binary32 a row), then the 48
+/// messages a row from those norms.
+pub fn bankMessages(p: *const Pipelines, s: xpu.Stream, blocks: Ref, pr: Ref, prelude: Ref, bank0: Ref, bank1: Ref, inv: Ref, q_mlp: Ref, kv: Ref, out: Ref, rows: u32, block_stride: u32) !void {
+    std.debug.assert(rows > 0 and rows <= 64);
+    try xpu.launch.dispatch(p.bank, s, .{ rows, 1, 1 }, .{ blocks, pr, prelude, bank0, bank1, inv, block_stride });
+    try xpu.launch.dispatch(p.messages_inv, s, .{ rows * message_entries, 1, 1 }, .{ bank0, bank1, q_mlp, kv, inv, out, rows });
 }
 
 /// One controller tuple; h and output are [token][H] binary32 tensors, m's token rows are `m_stride` binary32 values apart

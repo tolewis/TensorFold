@@ -45,21 +45,9 @@ static float group_sum(float v, local float *red) {
 
 static inline float rms_inverse(float ss) { return 1.0f / sqrt(ss / 2304.0f + LOOP_EPS); }
 
-// One of the 48 messages of a token: work-group `row * 48 + entry`. out is [row][12 layers][q, k, v, mlp][H].
-KERNEL(256) void tf_inkling2_loop_messages(global const ushort *bank0, global const ushort *bank1,
-                                           global const float *q_mlp, global const float *kv, global float *out,
-                                           uint rows) {
-  local float red[LOOP_SGS];
-  const uint t = get_local_id(0), work = get_group_id(0);
-  const uint row = work / LOOP_MESSAGES;
-  const uint entry = work - row * LOOP_MESSAGES;
-  if (row >= rows) return;
-  const uint layer = entry / 4;
-  const uint role = entry - 4 * layer;
-  // q/mlp and k/v occupy even/odd rows respectively.
-  const global float *query = ((role == 0 || role == 3) ? q_mlp : kv) + (size_t)(2 * layer + (role >= 2 ? 1 : 0)) * LOOP_H;
-  global const ushort *b0 = bank0 + (size_t)row * LOOP_H;
-  global const ushort *b1 = bank1 + (size_t)row * LOOP_H;
+// The two bank norms of a row: each work-item adds its strided share in order, then group_sum.
+static inline float2 bank_inverses(global const ushort *b0, global const ushort *b1, local float *red) {
+  const uint t = get_local_id(0);
   float ss0 = 0.0f, ss1 = 0.0f;
   for (uint d = t; d < LOOP_H; d += 256) {
     const float x0 = bf2f(b0[d]), x1 = bf2f(b1[d]);
@@ -68,6 +56,13 @@ KERNEL(256) void tf_inkling2_loop_messages(global const ushort *bank0, global co
   }
   const float inv0 = rms_inverse(group_sum(ss0, red));
   const float inv1 = rms_inverse(group_sum(ss1, red));
+  return (float2)(inv0, inv1);
+}
+
+// The body of one message, given the two bank inverses of its row.
+static inline void loop_message(global const ushort *b0, global const ushort *b1, float inv0, float inv1,
+                                const global float *query, global float *dst, local float *red) {
+  const uint t = get_local_id(0);
   float dot0 = 0.0f, dot1 = 0.0f;
   for (uint d = t; d < LOOP_H; d += 256) {
     const float beta0 = bf2f(b0[d]) * inv0;
@@ -85,12 +80,76 @@ KERNEL(256) void tf_inkling2_loop_messages(global const ushort *bank0, global co
   den += w1;
   w0 = w0 / den;
   w1 = w1 / den;
-  global float *dst = out + ((size_t)row * LOOP_MESSAGES + entry) * LOOP_H;
   for (uint d = t; d < LOOP_H; d += 256) {
     const float beta0 = bf2f(b0[d]) * inv0;
     const float beta1 = bf2f(b1[d]) * inv1;
     dst[d] = w0 * beta0 + w1 * beta1;
   }
+}
+
+static inline const global float *message_query(global const float *q_mlp, global const float *kv, uint entry) {
+  const uint layer = entry / 4;
+  const uint role = entry - 4 * layer;
+  // q/mlp and k/v occupy even/odd rows respectively.
+  return ((role == 0 || role == 3) ? q_mlp : kv) + (size_t)(2 * layer + (role >= 2 ? 1 : 0)) * LOOP_H;
+}
+
+// One of the 48 messages of a token: work-group `row * 48 + entry`. out is [row][12 layers][q, k, v, mlp][H].
+KERNEL(256) void tf_inkling2_loop_messages(global const ushort *bank0, global const ushort *bank1,
+                                           global const float *q_mlp, global const float *kv, global float *out,
+                                           uint rows) {
+  local float red[LOOP_SGS];
+  const uint work = get_group_id(0);
+  const uint row = work / LOOP_MESSAGES;
+  const uint entry = work - row * LOOP_MESSAGES;
+  if (row >= rows) return;
+  global const ushort *b0 = bank0 + (size_t)row * LOOP_H;
+  global const ushort *b1 = bank1 + (size_t)row * LOOP_H;
+  const float2 inv = bank_inverses(b0, b1, red);
+  loop_message(b0, b1, inv.x, inv.y, message_query(q_mlp, kv, entry), out + ((size_t)row * LOOP_MESSAGES + entry) * LOOP_H, red);
+}
+
+// The decode bank step of a row, one work-group a row: bank0 = the row of block 2 (B12), bank1 = p, p = prelude, and
+// the two bank inverses to inv[2 * row]. The norms are those of tf_inkling2_loop_messages, in the same order.
+KERNEL(256) void tf_inkling2_loop_bank(global const ushort *blocks, global ushort *p, global const ushort *prelude,
+                                       global ushort *bank0, global ushort *bank1, global float *inv,
+                                       uint block_stride) {
+  local float red[LOOP_SGS];
+  const uint t = get_local_id(0), row = get_group_id(0);
+  global const ushort *src0 = blocks + (size_t)row * block_stride;
+  global ushort *pr = p + (size_t)row * LOOP_H;
+  global const ushort *pl = prelude + (size_t)row * LOOP_H;
+  global ushort *b0 = bank0 + (size_t)row * LOOP_H;
+  global ushort *b1 = bank1 + (size_t)row * LOOP_H;
+  float ss0 = 0.0f, ss1 = 0.0f;
+  for (uint d = t; d < LOOP_H; d += 256) {
+    const ushort h0 = src0[d], h1 = pr[d];
+    b0[d] = h0;
+    b1[d] = h1;
+    pr[d] = pl[d];
+    const float x0 = bf2f(h0), x1 = bf2f(h1);
+    ss0 += x0 * x0;
+    ss1 += x1 * x1;
+  }
+  const float inv0 = rms_inverse(group_sum(ss0, red));
+  const float inv1 = rms_inverse(group_sum(ss1, red));
+  if (t == 0) {
+    inv[2 * row] = inv0;
+    inv[2 * row + 1] = inv1;
+  }
+}
+
+// tf_inkling2_loop_messages with the two inverses of each row from tf_inkling2_loop_bank.
+KERNEL(256) void tf_inkling2_loop_messages_inv(global const ushort *bank0, global const ushort *bank1,
+                                               global const float *q_mlp, global const float *kv,
+                                               global const float *inv, global float *out, uint rows) {
+  local float red[LOOP_SGS];
+  const uint work = get_group_id(0);
+  const uint row = work / LOOP_MESSAGES;
+  const uint entry = work - row * LOOP_MESSAGES;
+  if (row >= rows) return;
+  loop_message(bank0 + (size_t)row * LOOP_H, bank1 + (size_t)row * LOOP_H, inv[2 * row], inv[2 * row + 1],
+               message_query(q_mlp, kv, entry), out + ((size_t)row * LOOP_MESSAGES + entry) * LOOP_H, red);
 }
 
 // One controller tuple of a token: h is [row][H] binary32, m is a row of H binary32 values every m_stride values (H for
