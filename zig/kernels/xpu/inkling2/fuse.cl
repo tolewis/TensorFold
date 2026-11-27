@@ -354,6 +354,10 @@ KERNEL(256) void tf_ink2_zeta_split(
   global const float *h = ar + ((size_t)src * rows + row) * H;
   global const float *m = messages + ((size_t)row * msg_entries + core * 4 + role) * H;
   global const ushort *down = role == 0 ? down0 : role == 1 ? down1 : down2;
+  // The down row of this rank part, loaded before the norms: the norms run under the reads.
+  global const ushort *dr = down + (size_t)r * (2 * H);
+  ushort8 dw[2 * H / 512];
+  for (uint k = 0; k < 2 * H / 512; ++k) dw[k] = vload8(0, dr + 8 * lane + 128 * part + 512 * k);
   float hv[H / 256], mv[H / 256];
   float ss0 = 0.0f, ss1 = 0.0f;
   for (uint i = 0; i < H / 256; ++i) {
@@ -369,11 +373,10 @@ KERNEL(256) void tf_ink2_zeta_split(
     normalized[H + t + 256 * i] = f2bf(mv[i] * inv1);
   }
   barrier(CLK_LOCAL_MEM_FENCE);
-  global const ushort *dr = down + (size_t)r * (2 * H);
   float dot = 0.0f;
-  for (uint d = 8 * lane + 128 * part; d < 2 * H; d += 512) {
-    const ushort8 w0 = vload8(0, dr + d);
-    const ushort8 x0 = vload8(0, normalized + d);
+  for (uint k = 0; k < 2 * H / 512; ++k) {
+    const ushort8 w0 = dw[k];
+    const ushort8 x0 = vload8(0, normalized + 8 * lane + 128 * part + 512 * k);
     for (int j = 0; j < 8; ++j) dot += bf2f(w0[j]) * bf2f(x0[j]);
   }
   dot = sub_group_reduce_add(dot);
