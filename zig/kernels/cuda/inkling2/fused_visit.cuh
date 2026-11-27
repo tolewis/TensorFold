@@ -92,3 +92,8 @@ struct FusedState {
     float* part2;
     unsigned long long* times;  // 64 a visit: globaltimer after each phase change (block 0)
 };
+
+// fused.zig asserts the same sizes
+static_assert(sizeof(FzProj) == 64 && sizeof(FzPrep) == 160 && sizeof(FzAttn) == 184, "fused.zig layout");
+static_assert(sizeof(FzMoe) == 168 && sizeof(FzTaps) == 64 && sizeof(FusedVisit) == 944, "fused.zig layout");
+static_assert(sizeof(FusedState) == 48, "fused.zig layout");

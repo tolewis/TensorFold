@@ -178,10 +178,10 @@ pub const StateArgs = extern struct { cnt: u64, tk: u64, fault: u64, part1: u64,
 comptime {
     std.debug.assert(@sizeOf(Proj) == 64);
     std.debug.assert(@sizeOf(Prep) == 160);
-    std.debug.assert(@sizeOf(Attn) == 192);
+    std.debug.assert(@sizeOf(Attn) == 184);
     std.debug.assert(@sizeOf(Moe) == 168);
     std.debug.assert(@sizeOf(Taps) == 64);
-    std.debug.assert(@sizeOf(Visit) == 952);
+    std.debug.assert(@sizeOf(Visit) == 944);
 }
 
 // a visit's argument structs in device memory: offsets in its 2 KB region
