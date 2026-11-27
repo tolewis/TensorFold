@@ -821,13 +821,17 @@ fn shapeFor(f: *State, fix: i32) void {
 fn fixFor(step: usize) i32 {
     const S = struct {
         var mask: ?i32 = null;
+        var base: i32 = 0;
         var ab = false;
     };
     if (S.mask == null) {
         S.mask = if (std.c.getenv("TF_INKLING2_FUSED_FIX")) |e| std.fmt.parseInt(i32, std.mem.span(e), 0) catch fix_all else fix_all;
+        // TF_INKLING2_FUSED_FIX_BASE: the fix set of the "before" steps of _AB (default 0); FIX minus one bit measures
+        // that one fix
+        S.base = if (std.c.getenv("TF_INKLING2_FUSED_FIX_BASE")) |e| std.fmt.parseInt(i32, std.mem.span(e), 0) catch 0 else 0;
         S.ab = if (std.c.getenv("TF_INKLING2_FUSED_FIX_AB")) |e| e[0] == '1' else false;
     }
-    if (S.ab and (step / every()) % 2 == 0) return 0;
+    if (S.ab and (step / every()) % 2 == 0) return S.base & fix_all;
     return S.mask.? & fix_all;
 }
 
