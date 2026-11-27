@@ -23,6 +23,23 @@
 #define FB_F_POLLS 9u
 #define FB_F_CAPPED 10u
 #define FB_F_LEFT 11u
+#define FB_ENTRY 32000u // the entry count (review C2): local id 0 of each group adds 1 when the group starts
+
+// The fault buffer (uint words). 0 the fault word, 1 failed visibility checks, 2 the round of the first cap, 3 the B9
+// guard count, then the record of the first group that reached the cap (review C2): 4 its group id, 5 the value of
+// its last poll (counter, generation word, or the count of flags at the round), 6 the entry count at its cap, 7 and 8
+// its tm0 ticks from the wait entry to the cap (low, high), 9 its polls. 10 the count of groups that reached the cap,
+// 11 the count of groups that left on the fault word.
+#define FB_F_ROUND 2u
+#define FB_F_GROUP 4u
+#define FB_F_SEEN 5u
+#define FB_F_ENTERED 6u
+#define FB_F_TICKS 7u
+#define FB_F_POLLS 9u
+// IGC built-in: the thread timestamp register tm0 (ISA `mov (2) ... tm0.0`, both dwords in one move;
+// __builtin_IB_get_timestamp gave an undefined value). tm0 counts at the GT clock, so its rate moves with the clock
+// (review C1). The host passes the cap in ticks for the lowest clock of the card (sysfs rpn_freq), so a cap ends a
+// wait in that time or less at every clock (brief section 6 rule 1).
 
 // Mechanism ids: 0 no wait, 1 M-a (counter, few arrivals), 2 M-b (flags and a coordinator), 3 M-c (flags, every
 // leader polls), 4 M-e (B0 at one sub-group a work-group with a relaxed spin and one acquire fence).
@@ -53,6 +70,12 @@ static inline uint fb_ld(global uint *p) { return atomic_load_explicit((global f
 static inline uint fb_poll1(global uint *p) {
 #ifdef FB_POLL16
   return fb_ld(p);
+
+// The entry count (review C2): a fault record shows how many groups had started at the cap.
+static inline void fb_enter(uint mech_arg, global uint *sync) {
+  if (FB_MECH(mech_arg) != FB_NONE && get_local_id(0) == 0u)
+    atomic_fetch_add_explicit((global fb_au *)(sync + FB_ENTRY), 1u, memory_order_relaxed, memory_scope_device);
+}
 #else
   uint v = 0u;
   if (get_sub_group_local_id() == 0u) v = fb_ld(p);
@@ -89,20 +112,22 @@ static inline void fb_arrive(uint mech_arg, global uint *sync, uint round) {
       atomic_fetch_add_explicit((global fb_au *)(sync + FB_CNT), 1u, memory_order_acq_rel, memory_scope_device);
     return;
   }
-  fb_rel();
-  work_group_barrier(CLK_LOCAL_MEM_FENCE);
+    // spin_cap is the cap in tm0 ticks. The clock and the fault word are read every 16 polls.
+    uint spins = 0u, seen = 0u;
+    ulong dt = 0ul;
   if (get_local_id(0) == 0u && !skip) {
     if (mech == FB_A || mech == FB_F)
       atomic_fetch_add_explicit((global fb_au *)(sync + FB_CNT), 1u, memory_order_relaxed, memory_scope_device);
-    else
-      atomic_store_explicit((global fb_au *)(sync + FB_FLAGS + get_group_id(0) * FB_LINE), round, memory_order_relaxed,
+    if (fb_fault_read(mech_arg, fault) != 0u) { f = 2u; break; }                        \
+    dt = __builtin_IB_read_cycle_counter() - t0;                                        \
+    if (dt > (ulong)spin_cap) { f = 1u; break; }                                        \
                             memory_scope_device);
   }
 }
-
+      while ((seen = fb_poll1(sync + FB_CNT)) < target) { FB_SPIN_CHECK }
 // The fault word fault[0] (brief section 6 rule 1). A group that reaches the spin cap sets it. Every group reads it
 // when it enters a wait and every 16 polls inside the spin, and leaves the launch when it is set.
-static inline uint fb_fault_seen(global uint *fault) { return fb_poll1(fault); }
+      while ((seen = fb_poll_plain(sync + FB_CNT)) < target) { FB_SPIN_CHECK }
 
 // The wait half. Lane 0 of sub-group 0 polls one word (M-a, M-e, M-b others), or sub-group 0 polls one flag a lane
 // (M-c, M-b coordinator), with a spin cap (R7). Returns 1 on a fault (the cap here or the fault word set by another
@@ -113,21 +138,41 @@ static inline uint fb_wait(uint mech_arg, global uint *sync, global uint *fault,
   const uint G = get_num_groups(0), g = get_group_id(0);
   uint f = 0u;
     // spin_cap is the cap in tm0 ticks. The clock and the fault word are read every 16 polls.
+      if (f == 1u) { // the record: the count of flags at this round or past it
+        uint n = 0u;
+        for (uint b = 0u; b < G; b += 16u) {
+          const uint i = b + lane;
+          if (i < G) n += (uint)(fb_ld(sync + FB_FLAGS + i * FB_LINE) >= round);
+        }
+        seen = sub_group_reduce_add(n);
+      }
     uint spins = 0u, seen = 0u;
     ulong dt = 0ul;
     // spin_cap is the cap in tm0 ticks (the host converts 50 ms). The clock and the fault word are read every 16 polls.
     uint spins = 0u;
     const ulong t0 = __builtin_IB_read_cycle_counter();
-    if (fb_fault_read(mech_arg, fault) != 0u) { f = 2u; break; }                        \
+      while ((seen = fb_poll1(sync + FB_GEN)) < round) { FB_SPIN_CHECK }
     dt = __builtin_IB_read_cycle_counter() - t0;                                        \
     if (dt > (ulong)spin_cap) { f = 1u; break; }                                        \
     if (fb_fault_seen(fault) != 0u) { f = 2u; break; }                                  \
     if (__builtin_IB_read_cycle_counter() - t0 > (ulong)spin_cap) { f = 1u; break; }       \
   }
-      while ((seen = fb_poll1(sync + FB_CNT)) < target) { FB_SPIN_CHECK }
-      const uint target = round * G;
+      atomic_fetch_add_explicit((global fb_au *)(fault + FB_F_CAPPED), 1u, memory_order_relaxed, memory_scope_device);
+      uint zero = 0u;
+      if (atomic_compare_exchange_strong_explicit((global fb_au *)fault, &zero, 1u, memory_order_relaxed, memory_order_relaxed,
+                                                  memory_scope_device)) {
+        fault[FB_F_ROUND] = round;
+        fault[FB_F_GROUP] = g;
+        fault[FB_F_SEEN] = seen;
+        fault[FB_F_ENTERED] = fb_ld(sync + FB_ENTRY);
+        fault[FB_F_TICKS] = (uint)dt;
+        fault[FB_F_TICKS + 1u] = (uint)(dt >> 32);
+        fault[FB_F_POLLS] = spins;
+      }
       while (fb_poll1(sync + FB_CNT) < target) { FB_SPIN_CHECK }
-      while ((seen = fb_poll_plain(sync + FB_CNT)) < target) { FB_SPIN_CHECK }
+    if (f == 2u && lane == 0u)
+      atomic_fetch_add_explicit((global fb_au *)(fault + FB_F_LEFT), 1u, memory_order_relaxed, memory_scope_device);
+    if ((mech_arg & (FB_NO_ACQ | FB_ACQ_ALL)) == 0u) fb_acq();
       const uint target = round * G;
       while (fb_poll_plain(sync + FB_CNT) < target) { FB_SPIN_CHECK }
     } else if (mech == FB_C || g == 0u) {

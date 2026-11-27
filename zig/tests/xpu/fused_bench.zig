@@ -30,15 +30,15 @@ const Freq = struct { rpn: u32 = 0, rp0: u32 = 0, min: u32 = 0, max: u32 = 0 };
 var card_freq: Freq = .{};
 var freq_dir_buf: [128]u8 = undefined;
 var freq_dir: []const u8 = "";
-const gib: usize = 1 << 30;
-
-const Shape = struct { g: u32, s: u32, grf: u32 };
-/// DESIGN section 8: the shapes at 256 GRF, then at 128 GRF.
-const shapes = [_]Shape{
-    .{ .g = 16, .s = 32, .grf = 256 },  .{ .g = 32, .s = 16, .grf = 256 }, .{ .g = 32, .s = 32, .grf = 256 },
-    .{ .g = 64, .s = 8, .grf = 256 },   .{ .g = 64, .s = 16, .grf = 256 }, .{ .g = 128, .s = 8, .grf = 256 },
-    .{ .g = 1024, .s = 1, .grf = 256 }, .{ .g = 16, .s = 64, .grf = 128 }, .{ .g = 32, .s = 32, .grf = 128 },
-    .{ .g = 32, .s = 64, .grf = 128 },
+// The cap of one wait at the lowest clock of the card (rpn). Block fix1 (2026-11-27 20:22Z) showed a forced launch
+// that ends up to 5.1 ms after its first cap at 2,800 MHz (M-f G 1,024: 17.98 ms against a 12.86 ms cap). A launch
+// at rpn takes up to 7 times as long, so a cap of 50 ms at rpn keeps the whole forced launch under 100 ms at rpn.
+const cap_low_us: f64 = 50_000;
+/// The GT clock range of the opened card in MHz (sysfs tile0/gt0/freq0 of its PCI address).
+const Freq = struct { rpn: u32 = 0, rp0: u32 = 0, min: u32 = 0, max: u32 = 0 };
+var card_freq: Freq = .{};
+var freq_dir_buf: [128]u8 = undefined;
+var freq_dir: []const u8 = "";
 fn readMhz(io: std.Io, name: []const u8) u32 {
     var pbuf: [192]u8 = undefined;
     const path = std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ freq_dir, name }) catch return 0;
@@ -82,15 +82,15 @@ fn setAll(k: xpu.Kernel, args: anytype) !void {
     }
 }
 
-};
-/// One sub-group a group, the B0 grid counts, for M-e and the M-a control.
-const s1_counts = [_]u32{ 32, 64, 128, 256, 512, 1024 };
-const mech_names = [_][]const u8{ "none", "a", "b", "c", "e", "f" };
+const gib: usize = 1 << 30;
 
-fn nowNs(io: std.Io) i96 {
-    return std.Io.Clock.awake.now(io).toNanoseconds();
-}
-
+const Shape = struct { g: u32, s: u32, grf: u32 };
+/// DESIGN section 8: the shapes at 256 GRF, then at 128 GRF.
+const shapes = [_]Shape{
+    .{ .g = 16, .s = 32, .grf = 256 },  .{ .g = 32, .s = 16, .grf = 256 }, .{ .g = 32, .s = 32, .grf = 256 },
+    .{ .g = 64, .s = 8, .grf = 256 },   .{ .g = 64, .s = 16, .grf = 256 }, .{ .g = 128, .s = 8, .grf = 256 },
+    .{ .g = 1024, .s = 1, .grf = 256 }, .{ .g = 16, .s = 64, .grf = 128 }, .{ .g = 32, .s = 32, .grf = 128 },
+    .{ .g = 32, .s = 64, .grf = 128 },
 fn readMhz(io: std.Io, name: []const u8) u32 {
     var pbuf: [192]u8 = undefined;
     const path = std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ freq_dir, name }) catch return 0;
@@ -156,6 +156,101 @@ fn setAll(k: xpu.Kernel, args: anytype) !void {
                 const st = std.mem.readInt(u32, sw[gi * 64 ..][0..4], .little);
                 lo = @min(lo, st);
                 hi = @max(hi, st);
+                if (st < f[2]) {
+                    if (behind < 8) std.debug.print(" {d} (stamp {d})", .{ gi, st });
+                    behind += 1;
+                }
+            }
+            std.debug.print("; {d} behind, stamps {d} to {d}\n", .{ behind, lo, hi });
+        }
+    }
+
+        switch (comptime xpu.launch.argKind(@TypeOf(v))) {
+            .buffer => try k.setPtr(idx, v.ptr),
+            .pointer => try k.setPtr(idx, v),
+            .float => try k.setF32(idx, v),
+            .integer => try k.setU32(idx, @intCast(v)),
+        }
+    }
+}
+
+};
+/// One sub-group a group, the B0 grid counts, for M-e and the M-a control.
+const s1_counts = [_]u32{ 32, 64, 128, 256, 512, 1024 };
+const mech_names = [_][]const u8{ "none", "a", "b", "c", "e", "f" };
+
+fn nowNs(io: std.Io) i96 {
+    return std.Io.Clock.awake.now(io).toNanoseconds();
+}
+
+fn readMhz(io: std.Io, name: []const u8) u32 {
+    var pbuf: [192]u8 = undefined;
+    const path = std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ freq_dir, name }) catch return 0;
+    const txt = std.Io.Dir.cwd().readFileAlloc(io, path, std.heap.page_allocator, .limited(4096)) catch return 0;
+    defer std.heap.page_allocator.free(txt);
+    return std.fmt.parseInt(u32, std.mem.trim(u8, txt, " \n"), 10) catch 0;
+}
+
+const PciGet = *const fn (ze.H, *PciProps) callconv(.c) u32;
+const PciProps = extern struct {
+    stype: u32 = 0x10008,
+    pNext: ?*anyopaque = null,
+    domain: u32 = 0,
+    bus: u32 = 0,
+    device: u32 = 0,
+    lag: bool = false, // fb_phase runs: at a fault, print the groups whose stamp is behind the fault round
+    function: u32 = 0,
+    gen: i32 = -1,
+            try b.sayFault("timeCoop", g);
+    width: i32 = -1,
+    bandwidth: i64 = -1,
+};
+
+/// Finds the sysfs clock folder of the opened card by its PCI address and reads the clock range (review C1).
+fn readFreq(io: std.Io, ctx: *xpu.Context) !void {
+    const get = @constCast(ctx.d).lib.lookup(PciGet, "zeDevicePciGetPropertiesExt") orelse return error.NoPciAddress;
+    var pci: PciProps = .{};
+    if (get(ctx.gpu.device, &pci) != 0) return error.NoPciAddress;
+    freq_dir = try std.fmt.bufPrint(&freq_dir_buf, "/sys/bus/pci/devices/{x:0>4}:{x:0>2}:{x:0>2}.{x}/tile0/gt0/freq0", .{ pci.domain, pci.bus, pci.device, pci.function });
+    card_freq = .{ .rpn = readMhz(io, "rpn_freq"), .rp0 = readMhz(io, "rp0_freq"), .min = readMhz(io, "min_freq"), .max = readMhz(io, "max_freq") };
+}
+
+/// Sets every argument of the tuple in order, as xpu.launch.dispatch does.
+fn setAll(k: xpu.Kernel, args: anytype) !void {
+    inline for (args, 0..) |v, i| {
+        const idx: u32 = i;
+    /// Review C2: the fault record of fused_sync.h and the sync words after the launch, one line.
+    fn sayFault(b: *B, tag: []const u8, g: u32) !void {
+        var w: [48]u8 = undefined;
+        try b.fault.download(b.s, 0, &w);
+        var f: [12]u32 = undefined;
+        for (&f, 0..) |*v, i| v.* = std.mem.readInt(u32, w[i * 4 ..][0..4], .little);
+        var c: [12]u8 = undefined;
+        try b.sync.download(b.s, 0, c[0..4]);
+        try b.sync.download(b.s, 64, c[4..8]);
+        try b.sync.download(b.s, 32000 * 4, c[8..12]);
+        const ticks = (@as(u64, f[8]) << 32) | f[7];
+        const tf: f64 = @floatFromInt(ticks);
+        std.debug.print("BENCH fault record {s} G {d}: round {d}, first capped group {d}, its last poll {d}, entered {d} at its cap, ticks {d} ({d:.0} us at rpn {d} MHz, {d:.0} us at rp0 {d} MHz), polls {d}, groups capped {d}, groups left on the fault word {d}; after the launch counter {d}, generation {d}, entered {d}\n", .{
+            tag,                                            g,                                        f[2], f[4], f[5], f[6], ticks,
+            tf / @as(f64, @floatFromInt(@max(card_freq.rpn, 1))), card_freq.rpn, tf / @as(f64, @floatFromInt(@max(card_freq.rp0, 1))), card_freq.rp0,
+            f[9],                                           f[10],                                    f[11],
+            std.mem.readInt(u32, c[0..4], .little),         std.mem.readInt(u32, c[4..8], .little),   std.mem.readInt(u32, c[8..12], .little),
+        });
+        if (b.lag) {
+            const sw = try std.heap.page_allocator.alloc(u8, @as(usize, g) * 64);
+            defer std.heap.page_allocator.free(sw);
+            try b.stamp.download(b.s, 0, sw);
+            var behind: u32 = 0;
+            var lo: u32 = std.math.maxInt(u32);
+            var hi: u32 = 0;
+            std.debug.print("BENCH fault stamps {s} G {d}: groups behind round {d}:", .{ tag, g, f[2] });
+            for (0..g) |gi| {
+                const st = std.mem.readInt(u32, sw[gi * 64 ..][0..4], .little);
+                lo = @min(lo, st);
+                hi = @max(hi, st);
+    b.lag = true;
+    defer b.lag = false;
                 if (st < f[2]) {
                     if (behind < 8) std.debug.print(" {d} (stamp {d})", .{ gi, st });
                     behind += 1;
@@ -414,7 +509,7 @@ fn benchLaunch(b: *B) !void {
             const t0 = nowNs(b.io);
             for (0..count) |c| {
                 const w = try b.big.at((c % nwin) * stride);
-                try xpu.launch.dispatch(d, b.s, .{ (n + 7) / 8, 1, 1 }, .{ x, w, y, nil, @as(u32, 1), n, @as(u32, 2304), n });
+const Body = struct { name: []const u8, ref: [:0]const u8, img: usize, local: u32, grid: [3]u32, args: []const Arg, runner: []const u8 = "" };
             }
             try b.s.synchronize();
             t[r] = nowNs(b.io) - t0;
@@ -431,35 +526,35 @@ fn benchLaunch(b: *B) !void {
     var sxy: f64 = 0;
     for (xs, ys) |a, c| {
         sx += a;
-        sy += c;
+    .{ .name = "fuse_pre_q", .runner = "fuse_pre_q", .ref = "tf_ink2_fuse_pre_q", .img = 0, .local = 256, .grid = .{ 3, 1, 1 }, .args = &.{
         sxx += a * a;
         sxy += a * c;
     }
-    const nf: f64 = @floatFromInt(mbs.len);
+    .{ .name = "pre_zeta", .runner = "pre_zeta", .ref = "tf_ink2_pre_zeta", .img = 0, .local = 256, .grid = .{ 16, 3, 1 }, .args = &.{
     const slope = (nf * sxy - sx * sy) / (nf * sxx - sx * sx);
     const icpt = (sy - slope * sx) / nf;
     std.debug.print("BENCH launch dense_q8_1 fit: fixed {d:.3} us a launch, marginal {d:.1} GB/s\n", .{ icpt, 1e3 / slope });
-}
+    .{ .name = "fuse_gates", .runner = "fuse_gates", .ref = "tf_ink2_fuse_gates", .img = 0, .local = 64, .grid = .{ 36, 3, 1 }, .args = &.{
 
 /// B4: GB/s of one Q8 phase inside a resident kernel, by shape and phase size, with a phase change (M-a) after each
 /// phase and with none. The slope between 1 and R phases a launch.
-fn benchQ8(b: *B) !void {
+    .{ .name = "fuse_norms", .runner = "fuse_norms", .ref = "tf_ink2_fuse_norms", .img = 0, .local = 256, .grid = .{ 3, 1, 1 }, .args = &.{
     const mbs = [_]f64{ 4, 10, 20, 40, 245 };
     const x = try b.x.at(0);
-    const y = try b.y.at(0);
+    .{ .name = "conv_dynamic", .runner = "conv_dynamic", .ref = "tf_inkling2_conv_dynamic", .img = 1, .local = 256, .grid = .{ 1, 1, 1 }, .args = &.{
     for (shapes) |sh| {
         var k = try b.module(sh.grf).kernel("fb_q8", .{ sh.s * 16, 1, 1 });
-        defer k.deinit();
+    .{ .name = "merge", .runner = "merge", .ref = "tf_ink2_merge", .img = 2, .local = 128, .grid = .{ 24, 1, 1 }, .args = &.{
         const max = xpu.launch.suggestCooperative(k) catch 0;
         if (max < sh.g) {
             std.debug.print("BENCH q8 G {d} S {d} grf {d}: refused (cooperative count {d})\n", .{ sh.g, sh.s, sh.grf, max });
-            continue;
+    .{ .name = "router_norm_gemv", .runner = "router_norm_gemv", .ref = "tf_ink2_router_norm_gemv", .img = 0, .local = 256, .grid = .{ 8, 1, 1 }, .args = &.{
         }
         for (mbs) |mb| {
-            const n: u32 = @intFromFloat(mb * 1e6 / 2448.0);
+    .{ .name = "router_pick", .runner = "router_pick", .ref = "tf_ink2_router_pick", .img = 0, .local = 128, .grid = .{ 1, 1, 1 }, .args = &.{
             const stride: u32 = @intCast(std.mem.alignForward(usize, @as(usize, n) * 2448, 4096));
             const nwin: u32 = @intCast(gib / stride);
-            const bytes = @as(f64, @floatFromInt(n)) * 2448.0;
+    .{ .name = "down_epilogue", .runner = "down_epilogue", .ref = "tf_ink2_down_epilogue", .img = 0, .local = 256, .grid = .{ 9, 1, 1 }, .args = &.{
             const big_r: u32 = @intFromFloat(@max(4.0, @min(100.0, 2e9 / bytes)));
             for ([_]u32{ 1, 5, 0 }) |mech| {
                 b.cfg_fault = false;
@@ -586,7 +681,7 @@ const bodies = [_]Body{
         bf(H), zb(H * 4), bf(4 * H), f32b(3 * H), zb(3 * H * 4), f32b(12 * H), bf(64 * 2 * H), bf(64 * 2 * H), bf(64 * 2 * H),
         zb(4 * 64 * 4), uv(1), uv(4 * H), uv(5), uv(3), uv(0), uv(1), uv(12),
     } },
-    .{ .name = "fuse_gates", .ref = "tf_ink2_fuse_gates", .img = 0, .local = 64, .grid = .{ 36, 3, 1 }, .args = &.{
+        const rlen = (try std.fmt.bufPrint(name_buf[0..63], "fbr_{s}", .{if (body.runner.len > 0) body.runner else body.name})).len;
         f32b(3 * H), f32b(12 * H), bf(H * 64), bf(H * 64), bf(H * 64), bf(H * 64), bf(H * 64), bf(H * 64), f32b(4 * 64),
         zb(3 * H * 4), uv(1), uv(3), uv(0), uv(1), uv(12),
     } },
@@ -639,7 +734,10 @@ const CoopFn = *const fn (ze.H, ze.H, *const ze.GroupCount, ze.H, u32, ?[*]ze.H)
 const Timer = struct {
     ev: ze.H,
     ns_per_tick: f64,
-    mask: u64,
+                    if (f[0] != 0) {
+                        if (faults == 0) try b.sayFault(body.name, 32);
+                        faults += 1;
+                    }
 
     fn init(ctx: *xpu.Context) !Timer {
         var pool: ze.H = null;
@@ -664,6 +762,227 @@ const Timer = struct {
         try b.s.synchronize();
         var ts: ze.KernelTimestampResult = .{};
         try b.ctx.d.check(api.zeEventQueryKernelTimestamp(t.ev, &ts), "zeEventQueryKernelTimestamp");
+
+fn uploadAll(b: *B, d: []xpu.DeviceBuffer, host: []const []u8) !void {
+    for (d, host) |*x, h| try x.upload(b.s, 0, h);
+    try b.s.synchronize();
+}
+
+fn diffBytes(b: *B, d: []xpu.DeviceBuffer, ref: []const []u8, tmp: [][]u8) !usize {
+    var n: usize = 0;
+    for (d, ref, tmp) |*x, r, t| {
+        try x.download(b.s, 0, t);
+        for (r, t) |p, q| n += @intFromBool(p != q);
+    }
+    return n;
+}
+
+fn slope3(ys: [3]f64) f64 {
+    const xs = [_]f64{ 1, 10, 100 };
+    var sx: f64 = 0;
+    var sy: f64 = 0;
+    var sxx: f64 = 0;
+    var sxy: f64 = 0;
+    for (xs, ys) |x, y| {
+        sx += x;
+        sy += y;
+        sxx += x * x;
+        sxy += x * y;
+    }
+    return (3.0 * sxy - sx * sy) / (3.0 * sxx - sx * sx);
+}
+
+/// B10 by the corrected method (review C9, C11, C10, C4). `form` is the resident image: "fix" (fused_small, each task
+/// one time, spare slots idle, equal barrier counts) or "old" (fused_small_old, the Part 1 layout). Every timed launch
+/// and every timed span starts from the uploaded inputs. Today's kernel: one launch (median of 5) and the slope over
+/// spans of 1, 10 and 100 launches. Resident: one launch of 1 repeat and the slope over 1, 10 and 100 repeats, with no
+/// wait and with M-a. The old method of Part 1 (no upload between launches) runs too, for its numbers beside the new
+/// ones. Bytes: 1 repeat with no wait and with M-a against one launch of today's kernel, and 10 repeats with M-a against
+/// 10 launches. Then the tm0 stamps of 10 repeats (C10).
+fn benchSmall2(b: *B, imgs: [5]xpu.Module, form: []const u8) !void {
+    const alloc = std.heap.page_allocator;
+    const old = std.mem.eql(u8, form, "old");
+    const rimg = if (old) imgs[4] else imgs[3];
+    var timer = try Timer.init(b.ctx);
+    var prng = std.Random.DefaultPrng.init(0x5eed_f00d);
+    const rng = prng.random();
+    const all = bodies ++ [_]Body{ merge_sliding_body, q1_body };
+    for (all, 0..) |body, bi| {
+        const is_q1 = bi == bodies.len + 1;
+        var nbuf: usize = 0;
+        for (body.args) |a| {
+            if (a == .buf) nbuf += 1;
+        }
+        const host = try alloc.alloc([]u8, nbuf);
+        const outa = try alloc.alloc([]u8, nbuf);
+        const outa10 = try alloc.alloc([]u8, nbuf);
+        const tmp = try alloc.alloc([]u8, nbuf);
+        const da = try alloc.alloc(xpu.DeviceBuffer, nbuf);
+        const db = try alloc.alloc(xpu.DeviceBuffer, nbuf);
+        {
+            var i: usize = 0;
+            for (body.args) |a| {
+                if (a != .buf) continue;
+                host[i] = try alloc.alloc(u8, a.buf.bytes);
+                outa[i] = try alloc.alloc(u8, a.buf.bytes);
+                outa10[i] = try alloc.alloc(u8, a.buf.bytes);
+                tmp[i] = try alloc.alloc(u8, a.buf.bytes);
+                fillGen(rng, a.buf.gen, host[i]);
+                da[i] = try xpu.DeviceBuffer.alloc(b.ctx, a.buf.bytes);
+                db[i] = try xpu.DeviceBuffer.alloc(b.ctx, a.buf.bytes);
+                i += 1;
+            }
+        }
+        defer for (0..nbuf) |i| {
+            da[i].free();
+            db[i].free();
+        };
+        if (is_q1 and old) {
+            std.debug.print("BENCH small2 {s} form old: not run (a slot that leaves at its range check passes fewer barriers than its neighbour; a barrier wait has no time cap)\n", .{body.name});
+            continue;
+        }
+        // today's kernel
+        var rk = try imgs[body.img].kernel(body.ref, .{ body.local, 1, 1 });
+        defer rk.deinit();
+        try setArgs(rk, body.args, da);
+        try uploadAll(b, da, host);
+        var t_old: [5]f64 = undefined;
+        t_old[0] = try timer.run(b, rk, body.grid, false);
+        for (0..nbuf) |i| try da[i].download(b.s, 0, outa[i]);
+        for (1..5) |r| t_old[r] = try timer.run(b, rk, body.grid, false);
+        var t_one: [5]f64 = undefined;
+        for (&t_one) |*t| {
+            try uploadAll(b, da, host);
+            t.* = try timer.run(b, rk, body.grid, false);
+        }
+        var ys_today: [3]f64 = undefined;
+        for ([_]u32{ 1, 10, 100 }, 0..) |c, ci| {
+            var tt: [5]f64 = undefined;
+            for (&tt) |*t| {
+                try uploadAll(b, da, host);
+                t.* = try timer.span(b, rk, body.grid, c);
+            }
+            ys_today[ci] = medianF(&tt);
+        }
+        try uploadAll(b, da, host);
+        _ = try timer.span(b, rk, body.grid, 10);
+        for (0..nbuf) |i| try da[i].download(b.s, 0, outa10[i]);
+        // the resident kernel
+        var name_buf: [64]u8 = undefined;
+        const rlen = (try std.fmt.bufPrint(name_buf[0..63], "fbr_{s}", .{body.runner})).len;
+        name_buf[rlen] = 0;
+        var k = try rimg.kernel(name_buf[0..rlen :0], .{ 512, 1, 1 });
+        defer k.deinit();
+        const max = xpu.launch.suggestCooperative(k) catch 0;
+        if (max < 32) {
+            std.debug.print("BENCH small2 {s}: refused (cooperative count {d} at 512)\n", .{ body.name, max });
+            continue;
+        }
+        const na: u32 = @intCast(body.args.len);
+        try setArgs(k, body.args, db);
+        try k.setPtr(na, b.sync.ptr);
+        try k.setPtr(na + 1, b.fault.ptr);
+        try k.setU32(na + 4, spin_cap);
+        var faults: u32 = 0;
+        const Run = struct {
+            fn one(bb: *B, tm: *Timer, kk: xpu.Kernel, n: u32, reps_: u32, mech: u32, f: *u32, name: []const u8) !f64 {
+                try bb.reset();
+                try kk.setU32(n + 2, reps_);
+                try kk.setU32(n + 3, mech);
+                const us = try tm.run(bb, kk, .{ 32, 1, 1 }, true);
+                const w = try bb.faultWords();
+                if (w[0] != 0) {
+                    if (f.* == 0) try bb.sayFault(name, 32);
+                    f.* += 1;
+                }
+                return us;
+            }
+        };
+        // bytes
+        var eq: [3]usize = undefined;
+        try uploadAll(b, db, host);
+        _ = try Run.one(b, &timer, k, na, 1, 0, &faults, body.name);
+        eq[0] = try diffBytes(b, db, outa, tmp);
+        try uploadAll(b, db, host);
+        _ = try Run.one(b, &timer, k, na, 1, 1, &faults, body.name);
+        eq[1] = try diffBytes(b, db, outa, tmp);
+        try uploadAll(b, db, host);
+        _ = try Run.one(b, &timer, k, na, 10, 1, &faults, body.name);
+        eq[2] = try diffBytes(b, db, outa10, tmp);
+        // times, corrected method: upload before each timed launch
+        var one_r: [2]f64 = undefined;
+        var slope_r: [2]f64 = undefined;
+        var slope_o: [2]f64 = undefined;
+        for ([_]u32{ 0, 1 }) |mech| {
+            var ys: [3]f64 = undefined;
+            for ([_]u32{ 1, 10, 100 }, 0..) |c, ci| {
+                var tt: [5]f64 = .{ 0, 0, 0, 0, 0 };
+                for (&tt) |*t| {
+                    if (faults != 0) break;
+                    try uploadAll(b, db, host);
+                    t.* = try Run.one(b, &timer, k, na, c, mech, &faults, body.name);
+                }
+                ys[ci] = medianF(&tt);
+            }
+            one_r[mech] = ys[0];
+            slope_r[mech] = slope3(ys);
+            // the old method: the inputs as the launch before left them
+            try uploadAll(b, db, host);
+            for ([_]u32{ 1, 10, 100 }, 0..) |c, ci| {
+                var tt: [5]f64 = .{ 0, 0, 0, 0, 0 };
+                for (&tt) |*t| {
+                    if (faults != 0) break;
+                    t.* = try Run.one(b, &timer, k, na, c, mech, &faults, body.name);
+                }
+                ys[ci] = medianF(&tt);
+            }
+            slope_o[mech] = slope3(ys);
+        }
+        const thr_today = body.grid[0] * body.grid[1] * body.grid[2] * body.local;
+        std.debug.print("BENCH small2 {s} form {s}: today {s} ({d}x{d}x{d} of {d}, {d} work-items): one launch {d:.3} us (old method {d:.3}), slope over 1, 10, 100 launches {d:.3} us ({d:.3}, {d:.3}, {d:.3}); resident 32 x 512 (16384 work-items): one launch of 1 repeat {d:.3} us no wait, {d:.3} us M-a; slope a repeat {d:.3} us no wait, {d:.3} us M-a (old method {d:.3}, {d:.3}); bytes differ: 1 repeat no wait {d}, 1 repeat M-a {d}, 10 repeats M-a against 10 launches {d}; faults {d}\n", .{
+            body.name, form,         body.ref,   body.grid[0], body.grid[1], body.grid[2], body.local, thr_today,
+            medianF(&t_one), medianF(&t_old), slope3(ys_today), ys_today[0], ys_today[1], ys_today[2],
+            one_r[0],  one_r[1],     slope_r[0], slope_r[1],   slope_o[0],   slope_o[1],   eq[0],      eq[1],
+            eq[2],     faults,
+        });
+        // C10: tm0 stamps of 10 repeats, every group
+        // C10: the stamps with no wait, with M-a, and with M-a less its acquire fence (FB_NO_ACQ)
+        if (faults == 0) for ([_]u32{ 0, 1, 1 | 0x20000 }) |mech| {
+            try uploadAll(b, db, host);
+            _ = try Run.one(b, &timer, k, na, 10, mech | 0x400, &faults, body.name);
+            var sw: [32 * 10 * 3 * 8]u8 = undefined;
+            try b.sync.download(b.s, 20000 * 4, &sw);
+            var body0: [9]f64 = undefined;
+            var wait0: [9]f64 = undefined;
+            var bmax: [9]f64 = undefined;
+            var wmin: [9]f64 = undefined;
+            var bmax_g: u32 = 0;
+            for (1..10) |r| {
+                bmax[r - 1] = 0;
+                wmin[r - 1] = 1e30;
+                for (0..32) |g| {
+                    var st: [3]u64 = undefined;
+                    for (0..3) |q| st[q] = std.mem.readInt(u64, sw[((g * 10 + r) * 3 + q) * 8 ..][0..8], .little);
+                    const bt: f64 = @floatFromInt(st[1] -% st[0]);
+                    const wt: f64 = @floatFromInt(st[2] -% st[1]);
+                    if (g == 0) {
+                        body0[r - 1] = bt;
+                        wait0[r - 1] = wt;
+                    }
+                    if (bt > bmax[r - 1]) {
+                        bmax[r - 1] = bt;
+                        bmax_g = @intCast(g);
+                    }
+                    wmin[r - 1] = @min(wmin[r - 1], wt);
+                }
+            }
+            std.debug.print("BENCH small2 stamps {s} form {s} wait {s}: tm0 ticks a repeat (median of repeats 2 to 10): group 0 tasks {d:.0}, group 0 after the tasks to the wait end {d:.0}; largest tasks time of any group {d:.0} (group {d} in the last repeat), shortest time after the tasks {d:.0}\n", .{
+                body.name, form, if (mech == 0) "none" else if (mech == 1) "a" else "a, no acquire fence", medianF(&body0), medianF(&wait0), medianF(&bmax), bmax_g, medianF(&wmin),
+            });
+        };
+    }
+}
+
         return @as(f64, @floatFromInt((ts.global_end -% ts.global_start) & t.mask)) * t.ns_per_tick / 1000.0;
     }
 };
@@ -748,7 +1067,9 @@ fn benchSmall(b: *B, imgs: [4]xpu.Module) !void {
         }
         var p: ze.KernelProperties = .{};
         try b.ctx.d.check(b.ctx.d.api.zeKernelGetProperties(k.handle, &p), "zeKernelGetProperties");
-        for (0..nbuf) |i| try db[i].upload(b.s, 0, host[i]);
+/// before any other spin run. Then the other shapes, each mechanism once. Review C1: each launch prints its host time,
+/// its device time (kernel timestamp event), the fault record with the tm0 ticks of the first capped group, and the
+/// tick rate in the spin (those ticks over the device time: rounds 1 and 2 take microseconds).
         try b.reset();
         const na: u32 = @intCast(body.args.len);
         try setArgs(k, body.args, db);
@@ -760,7 +1081,9 @@ fn benchSmall(b: *B, imgs: [4]xpu.Module) !void {
         _ = try timer.run(b, k, .{ 32, 1, 1 }, true);
         var diff_bytes: usize = 0;
         var diff_bufs: [16]u8 = undefined;
+    var timer = try Timer.init(b.ctx);
         var nd: usize = 0;
+    var worst: f64 = 0;
         for (0..nbuf) |i| {
             try db[i].download(b.s, 0, outb[i]);
             var d: usize = 0;
@@ -772,24 +1095,134 @@ fn benchSmall(b: *B, imgs: [4]xpu.Module) !void {
             diff_bytes += d;
         }
         // the slope over 1, 10 and 100 repeats, with no wait and with M-a after each repeat
+            try setAll(k, .{ b.sync, b.stamp, b.fault, data, b.sink, @as(u32, 2000), spin_cap, run.mech | 0x100, @as(u32, 0) });
+            const mhz0 = readMhz(b.io, "act_freq");
         var slope: [2]f64 = undefined;
-        var faults: u32 = 0;
-        for ([_]u32{ 0, 1 }) |mech| {
+            const dev_us = try timer.run(b, k, .{ run.g, 1, 1 }, true);
             if (faults != 0) {
+            const mhz1 = readMhz(b.io, "act_freq");
+            // The launch time at rpn: the device time at the clock of the launch, scaled to the lowest clock.
+            const mhz = if (@max(mhz0, mhz1) == 0) card_freq.rp0 else @max(mhz0, mhz1);
+            const at_rpn = dev_us / 1000.0 * @as(f64, @floatFromInt(mhz)) / @as(f64, @floatFromInt(card_freq.rpn));
+            worst = @max(worst, at_rpn);
                 slope[mech] = 0;
+            var fw: [36]u8 = undefined;
+            try b.fault.download(b.s, 0, &fw);
+            const ticks = (@as(u64, std.mem.readInt(u32, fw[32..36], .little)) << 32) | std.mem.readInt(u32, fw[28..32], .little);
                 continue;
             }
             const counts = [_]f64{ 1, 10, 100 };
-            var ys: [3]f64 = undefined;
-            for (counts, 0..) |c, ci| {
+            std.debug.print("BENCH force G {d} S {d} mech {s}: launch {d:.3} ms host, {d:.3} ms device at act_freq {d} to {d} MHz, {d:.3} ms at rpn, fault word {d}, fault round {d}, counter {d}, generation {d}, tick rate in the spin {d:.1} ticks a us\n", .{
+                run.g,                                  run.s,                                  mech_names[run.mech], ms, dev_us / 1000.0, mhz0, mhz1, at_rpn, f[0], f[2],
+                std.mem.readInt(u32, cw[0..4], .little), std.mem.readInt(u32, cw[4..8], .little), @as(f64, @floatFromInt(ticks)) / dev_us,
                 var tt: [5]f64 = undefined;
-                for (0..5) |r| {
+            try b.sayFault("force", run.g);
+            if (f[0] == 0 or ms > 100.0 or at_rpn > 100.0) {
                     try b.reset();
                     try k.setU32(na + 2, @intFromFloat(c));
                     try k.setU32(na + 3, mech);
                     tt[r] = if (faults == 0) try timer.run(b, k, .{ 32, 1, 1 }, true) else 0;
                     const f = try b.faultWords();
                     if (f[0] != 0) faults += 1;
+    std.debug.print("BENCH force passed: longest forced launch {d:.3} ms at rpn\n", .{worst});
+}
+
+/// Review C1: the tm0 rate in three states, each 3 times, with the card clock (sysfs act_freq) read before and after.
+/// (1) fb_tsc alone, (2) fb_tsc queued right after a 40 MB read over the full grid, (3) fb_tsc_grid, the rate inside a
+/// full grid that reads 1 GiB 4 times.
+fn benchTsc(b: *B) !void {
+    var timer = try Timer.init(b.ctx);
+    var kt = try b.m256.kernel("fb_tsc", .{ 16, 1, 1 });
+    defer kt.deinit();
+    var kg = try b.m256.kernel("fb_tsc_grid", .{ 512, 1, 1 });
+    defer kg.deinit();
+    const groups = xpu.launch.suggestCooperative(kg) catch 0;
+    if (groups == 0) return error.AboveCooperativeCount;
+    const data = try b.big.at(0);
+    const sink = try b.sink.at(0);
+    const ticks: u32 = 1 << 20;
+    for ([_][]const u8{ "alone", "after a 40 MB read", "beside a full grid" }, 0..) |name, mode| {
+        for (0..3) |_| {
+            try b.checkTime();
+            const f0 = readMhz(b.io, "act_freq");
+            var us: f64 = 0;
+            if (mode == 2) {
+                const per: u32 = @intCast(gib / 16 / groups); // uint4 a group
+                try setAll(kg, .{ data, sink, @as(u32, 4), per });
+                us = try timer.run(b, kg, .{ groups, 1, 1 }, false);
+            } else {
+                if (mode == 1) {
+                    const per: u32 = @intCast(40_000_000 / 16 / groups);
+                    try xpu.launch.dispatch(kg, b.s, .{ groups, 1, 1 }, .{ data, sink, @as(u32, 1), per });
+                }
+                try setAll(kt, .{ sink, ticks });
+                us = try timer.run(b, kt, .{ 1, 1, 1 }, false);
+            }
+            const f1 = readMhz(b.io, "act_freq");
+            var w: [8]u8 = undefined;
+            try b.sink.download(b.s, 0, &w);
+            const delta = std.mem.readInt(u64, w[0..8], .little);
+            std.debug.print("BENCH tsc {s}: {d} ticks in {d:.3} us device time, {d:.1} ticks a us, act_freq {d} MHz before, {d} MHz after\n", .{ name, delta, us, @as(f64, @floatFromInt(delta)) / us, f0, f1 });
+        }
+    }
+}
+
+/// Review C2: each shape and mechanism, `n` launches of B2 (2,000 changes, no work), B3 (2,000 changes over a 64 KB
+/// read) and B4 (100 Q8 phases of 4 MB). A configuration stops at its first fault (rule 2) with the fault record.
+fn benchSoak(b: *B) !void {
+    const n_launch: u32 = 50;
+    const Run = struct { g: u32, s: u32, grf: u32, mech: u32 };
+    const runs = [_]Run{
+        .{ .g = 32, .s = 16, .grf = 256, .mech = 1 },  .{ .g = 32, .s = 32, .grf = 256, .mech = 1 }, .{ .g = 16, .s = 32, .grf = 256, .mech = 1 },
+        .{ .g = 64, .s = 16, .grf = 256, .mech = 1 },  .{ .g = 128, .s = 8, .grf = 256, .mech = 1 }, .{ .g = 32, .s = 32, .grf = 128, .mech = 1 },
+        .{ .g = 32, .s = 16, .grf = 256, .mech = 2 },  .{ .g = 32, .s = 32, .grf = 256, .mech = 2 }, .{ .g = 32, .s = 16, .grf = 256, .mech = 3 },
+        .{ .g = 32, .s = 1, .grf = 256, .mech = 4 },   .{ .g = 256, .s = 1, .grf = 256, .mech = 4 }, .{ .g = 512, .s = 1, .grf = 256, .mech = 4 },
+        .{ .g = 512, .s = 1, .grf = 256, .mech = 1 },  .{ .g = 1024, .s = 1, .grf = 256, .mech = 1 }, .{ .g = 1024, .s = 1, .grf = 256, .mech = 2 },
+        .{ .g = 1024, .s = 1, .grf = 256, .mech = 4 },
+    };
+    const data = try b.big.at(0);
+    const x = try b.x.at(0);
+    const y = try b.y.at(0);
+    const q8_n: u32 = @intFromFloat(4e6 / 2448.0);
+    const q8_stride: u32 = @intCast(std.mem.alignForward(usize, @as(usize, q8_n) * 2448, 4096));
+    const q8_nwin: u32 = @intCast(gib / q8_stride);
+    for ([_][]const u8{ "B2", "B3", "B4" }, 0..) |bench, bi| {
+        for (runs) |run| {
+            var k = try b.module(run.grf).kernel(if (bi == 2) "fb_q8" else "fb_phase", .{ run.s * 16, 1, 1 });
+            defer k.deinit();
+            const max = xpu.launch.suggestCooperative(k) catch 0;
+            if (max < run.g) {
+                std.debug.print("BENCH soak {s} G {d} S {d} grf {d} mech {s}: refused (cooperative count {d})\n", .{ bench, run.g, run.s, run.grf, mech_names[run.mech], max });
+                continue;
+            }
+            b.lag = bi != 2;
+            var faults: u32 = 0;
+            var done: u32 = 0;
+            var worst: i96 = 0;
+            for (0..n_launch) |_| {
+                try b.checkTime();
+                try b.reset();
+                const t0 = nowNs(b.io);
+                if (bi == 2) {
+                    try xpu.launch.dispatchCooperative(k, b.s, .{ run.g, 1, 1 }, .{ b.big, x, y, b.sync, b.fault, q8_n, @as(u32, 100), q8_nwin, q8_stride, spin_cap, run.mech });
+                } else {
+                    try xpu.launch.dispatchCooperative(k, b.s, .{ run.g, 1, 1 }, .{ b.sync, b.stamp, b.fault, data, b.sink, @as(u32, 2000), spin_cap, run.mech, @as(u32, if (bi == 1) 4096 else 0) });
+                }
+                try b.s.synchronize();
+                worst = @max(worst, nowNs(b.io) - t0);
+                done += 1;
+                const f = try b.faultWords();
+                if (f[0] != 0) {
+                    faults += 1;
+                    var tagb: [48]u8 = undefined;
+                    try b.sayFault(try std.fmt.bufPrint(&tagb, "soak {s} launch {d}", .{ bench, done }), run.g);
+                    break;
+                }
+            }
+            b.lag = false;
+            std.debug.print("BENCH soak {s} G {d} S {d} grf {d} mech {s}: faults {d} in {d} launches, longest launch {d:.3} ms\n", .{ bench, run.g, run.s, run.grf, mech_names[run.mech], faults, done, usOf(worst) / 1000.0 });
+        }
+    }
                 }
                 ys[ci] = medianF(&tt);
             }
@@ -897,9 +1330,20 @@ fn benchNv(b: *B) !void {
             try b.y.download(b.s, 0, out[0 .. rows * 2]);
             try b.sayFault("force", run.g);
             if (f[0] == 0 or ms > 100.0 or at_rpn > 100.0) {
-            var w: [16]u8 = undefined;
+        readFreq(init.io, &ctx) catch |e| {
+            std.debug.print("BENCH clock: {s}, no spin run\n", .{@errorName(e)});
+            return 3;
+        };
+        if (card_freq.rpn == 0 or card_freq.rp0 < card_freq.rpn) {
+            std.debug.print("BENCH clock: no rpn_freq or rp0_freq in {s}, no spin run\n", .{freq_dir});
+            return 3;
+        }
+        const cap = @as(f64, @floatFromInt(card_freq.rpn)) * cap_low_us;
             try b.fault.download(b.s, 0, &w);
-            if (dec == 1) guard = std.mem.readInt(u32, w[12..16], .little);
+        std.debug.print("BENCH tsc: {d:.3} ticks a us (best of 3 at 2^20 ticks, not used for the cap)\n", .{best});
+        std.debug.print("BENCH cap: {s}: rpn {d} MHz, rp0 {d} MHz, min_freq {d}, max_freq {d}; spin cap {d} ticks = {d:.0} us at rpn, {d:.0} us at rp0\n", .{
+            freq_dir, card_freq.rpn, card_freq.rp0, card_freq.min, card_freq.max, spin_cap, cap_low_us, cap / @as(f64, @floatFromInt(card_freq.rp0)),
+        });
             us[di] = usOf(tr.ns - t1.ns) / @as(f64, @floatFromInt(big_r - 1));
             std.debug.print("BENCH nv G 32 S 32 {d:.0} MB ({d} rows) decode {s}: {d:.3} us a phase, {d:.1} GB/s, faults {d}\n", .{
                 mb, rows, if (dec == 0) "old" else "new", us[di], bytes / us[di] / 1e3, t1.faults + tr.faults,
@@ -915,6 +1359,8 @@ fn benchTsc(b: *B) !void {
     defer kt.deinit();
     var kg = try b.m256.kernel("fb_tsc_grid", .{ 512, 1, 1 });
     defer kg.deinit();
+    else if (std.mem.eql(u8, name, "tsc")) try benchTsc(b)
+    else if (std.mem.eql(u8, name, "soak")) try benchSoak(b)
     const groups = xpu.launch.suggestCooperative(kg) catch 0;
     if (groups == 0) return error.AboveCooperativeCount;
     const data = try b.big.at(0);
@@ -923,7 +1369,20 @@ fn benchTsc(b: *B) !void {
     for ([_][]const u8{ "alone", "after a 40 MB read", "beside a full grid" }, 0..) |name, mode| {
         for (0..3) |_| {
             try b.checkTime();
-            const f0 = readMhz(b.io, "act_freq");
+    else if (std.mem.eql(u8, name, "small2") or std.mem.eql(u8, name, "small2old")) {
+        const d = dir orelse return error.BadArgs;
+        var mods: [5]xpu.Module = undefined;
+        for ([_][]const u8{ "ref_fuse", "ref_glue", "ref_attention", "fused_small", "fused_small_old" }, 0..) |n, j| {
+            const path = try std.fmt.allocPrint(a, "{s}/{s}.bin", .{ d, n });
+            defer a.free(path);
+            const file = try std.Io.Dir.cwd().readFileAlloc(init.io, path, a, .limited(64 << 20));
+            defer a.free(file);
+            const bin = try a.alignedAlloc(u8, .@"8", file.len);
+            @memcpy(bin, file);
+            mods[j] = try xpu.Module.loadNative(ctx, bin);
+        }
+        try benchSmall2(b, mods, if (std.mem.eql(u8, name, "small2")) "fix" else "old");
+    } else if (std.mem.eql(u8, name, "small")) {
             var us: f64 = 0;
             if (mode == 2) {
                 const per: u32 = @intCast(gib / 16 / groups); // uint4 a group
