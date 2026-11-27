@@ -372,10 +372,16 @@ pub fn scratchBytes(rows: usize, capacity: usize) usize {
     return out;
 }
 
-/// Bytes of the bf16 copy that an int8 cache's global visits read on the prompt path (`Scratch.prepareInt8Global`): K and
-/// V of `kv_heads` heads over the global ring of `capacity` positions, the largest ring a cache of that capacity holds.
+/// Positions of the bf16 copy that an int8 cache's global visits read on the prompt path (`Scratch.prepareInt8Global`):
+/// the global ring of the largest cache a scratch of `capacity` serves, the warm-up cache (`prompt_rows + window_rows`)
+/// included.
+pub fn int8GlobalRing(capacity: usize) usize {
+    return globalSlots(@max(capacity, prompt_rows + window_rows));
+}
+
+/// Bytes of that copy: K and V of `heads` heads over `int8GlobalRing(capacity)` positions.
 pub fn int8GlobalBytes(capacity: usize, heads: usize) usize {
-    return 2 * globalSlots(capacity) * heads * ap.head_dim * 2;
+    return 2 * int8GlobalRing(capacity) * heads * ap.head_dim * 2;
 }
 
 pub const Scratch = struct {
@@ -477,7 +483,7 @@ pub const Scratch = struct {
         return s;
     }
 
-    /// The bf16 copy of the global ring for an int8 cache of up to `capacity` positions (the scratch capacity), `heads`
+    /// The bf16 copy of the global ring for an int8 cache of up to the scratch capacity or the warm-up cache, `heads`
     /// K/V heads (a rank's heads on TP 2). One a card: every cache this scratch serves reads it in turn.
     pub fn prepareInt8Global(s: *Scratch, r: *rt.Runtime, heads: usize) !void {
         if (s.kglobal != null) return;
@@ -492,7 +498,7 @@ pub const Scratch = struct {
         try r.sync();
         s.kglobal = k;
         s.vglobal = v;
-        s.global_ring = globalSlots(s.capacity);
+        s.global_ring = int8GlobalRing(s.capacity);
         s.global_heads = heads;
     }
 
