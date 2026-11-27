@@ -351,6 +351,17 @@ fn slideOn() bool {
 /// window (256 at 262,144 tokens), most of them past every row; each z block takes every gridDim.z-th slot in turn
 /// (attention.cu), so the partials are the same bits whatever the grid. Unset: about two waves of resident blocks
 /// (two a GB10 SM) over the call's (tile, key head) pairs; 0 launches a block a slot, as before; N caps at N.
+/// zBlocks for the fused visit (TF_INKLING2_FUSED): the z blocks today's split call runs.
+pub fn zBlocksOf(slots_rh: u32, pairs: u32) u32 {
+    return zBlocks(slots_rh, pairs);
+}
+
+/// Whether attnGo takes the prefetching fp8 tiles for a sliding (false) or global (true) call.
+pub fn db8For(global: bool) bool {
+    const mode = db8Mode();
+    return mode == 1 or (mode == 2 and !global) or (mode == 3 and global);
+}
+
 fn zBlocks(slots_rh: u32, pairs: u32) u32 {
     const S = struct {
         var v: ?u32 = null;
@@ -376,7 +387,7 @@ fn dbOn() bool {
 
 /// One 64-key K and V tile (2 x 17,408 bytes), then two stages of codes and scales (2 x 16,896 bytes):
 /// tf_ink2_attn8_db's dynamic shared memory (attention.cu stage8 after the tile).
-const db8_shared: u32 = 2 * tile_keys * (head_dim + 8) * 2 + 2 * (2 * tile_keys * head_dim + 2 * tile_keys * 4);
+pub const db8_shared: u32 = 2 * tile_keys * (head_dim + 8) * 2 + 2 * (2 * tile_keys * head_dim + 2 * tile_keys * 4);
 
 /// TF_INKLING2_ATTN8_DB: which fp8 attention calls prefetch their next tile's codes and scales (tf_ink2_attn8_db).
 /// Unset or 0: none, as before. 1: every call. 2: sliding calls only. 3: global calls only.

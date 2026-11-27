@@ -33,7 +33,7 @@ extern "C" __device__ void fz_rel_table(int rh, const uint16_t* rel, const uint1
 extern "C" __device__ void fz_attn8(uint3 b, int zn_grid, const uint16_t* q, const uint16_t* kc, const uint16_t* vc,
                                     const uint16_t* tab, const ink2::Seg* segs, const int2* tiles, float* part_o,
                                     float2* part_ml, int heads, int kv_heads, int ring, int window, int chunk, int c0,
-                                    int chunks, float scale, int split, const float* ksc, const float* vsc,
+                                    int chunks, float scale, int split, const float* ksc, const float* vsc, int db,
                                     unsigned char* dyn);
 extern "C" __device__ void fz_merge(int rh, const float* part_o, const float2* part_ml, const uint16_t* sink,
                                     const uint16_t* gate, const int* rpos, uint16_t* out, int heads, int window,
@@ -219,7 +219,7 @@ __device__ bool visit(const FusedVisit& V, Ctx& c, unsigned char* dyn) {
     for (int u = blockIdx.x; u < a.kv_heads * a.zgrid; u += gridDim.x)
         fz_attn8(make_uint3(0, u / a.zgrid, u % a.zgrid), a.zgrid, a.q, a.kc, a.vc, a.tab,
                  static_cast<const ink2::Seg*>(a.segs), a.tiles, a.part_o, a.part_ml, a.heads, a.kv_heads, a.ring,
-                 a.window, a.chunk, 0, a.chunks, a.scale, a.split, a.ksc, a.vsc, dyn);
+                 a.window, a.chunk, 0, a.chunks, a.scale, a.split, a.ksc, a.vsc, a.db, dyn);
     if (!all_wait(c)) return false;
     for (int rh = blockIdx.x; rh < a.heads; rh += gridDim.x)
         fz_merge(rh, a.part_o, a.part_ml, a.sink, a.gate, a.rpos, a.att, a.heads, a.window, a.chunk, 0, a.slots_rh,
@@ -273,6 +273,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_ink2_fused_visit(const Fuse
     Ctx c{st, nullptr, nullptr, 0, 0};
     for (int v = first; v < first + count; ++v) {
         c.fault = st.fault + v;
+        c.st.tk = st.tk + 1024 * v;  // 4 qmmf calls a visit, 256 tiles a call
         c.times = st.times + 64 * v;
         c.ph = 0;
         if (!visit(table[v], c, dyn)) return;

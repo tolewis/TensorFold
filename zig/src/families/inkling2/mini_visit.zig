@@ -9,6 +9,7 @@ const ops = @import("ops.zig");
 const loop = @import("loop.zig");
 const mm = @import("mini_model.zig");
 const wts = @import("mini_weights.zig");
+const fused = @import("fused.zig");
 
 const Model = mm.Model;
 const Kernels = mm.Kernels;
@@ -21,6 +22,7 @@ pub const Rows = struct {
     prompt: bool,
     last_pos: u32,
     n_tiles: u32,
+    slot0: u32 = 0, // the first stream's slot (the fused check's K/V rows)
 
     /// Ids, positions, segments and tiles of `chains` uploaded on `s`.
     pub fn stage(m: *Model, s: cuda.Stream, chains: []const mm.Chain, rows: usize, prompt: bool) !Rows {
@@ -55,7 +57,7 @@ pub const Rows = struct {
         for (0..2) |side| try m.upload(s, m.s.segs[side], std.mem.sliceAsBytes(segs[side][0..chains.len]));
         try m.upload(s, m.s.conv_segs, std.mem.sliceAsBytes(cs[0..chains.len]));
         try m.upload(s, m.s.tiles, std.mem.sliceAsBytes(tiles[0..n_tiles]));
-        return .{ .n = rows, .streams = chains.len, .prompt = prompt, .last_pos = last, .n_tiles = @intCast(n_tiles) };
+        return .{ .n = rows, .streams = chains.len, .prompt = prompt, .last_pos = last, .n_tiles = @intCast(n_tiles), .slot0 = if (chains.len > 0) @intCast(chains[0].slot) else 0 };
     }
 };
 
@@ -74,6 +76,11 @@ pub fn run(m: *Model, k: *const Kernels, s: cuda.Stream, r: *const Rows, head0: 
     var cur: usize = 0;
     for (0..m.w.plan.visits.len) |v| {
         if (m.taps_on) if (std.mem.indexOfScalar(u32, &mm.tap_visits, @intCast(v))) |tp| try m.tap(k, s, m.s.h[cur], r.n, tp);
+        if (m.fused) |*f| if (f.sw.mode == .check and f.sw.has(@intCast(v)) and fused.takes(m, r)) {
+            try fused.check(f, m, k, s, r, @intCast(v), m.s.h[cur], m.s.h[1 - cur], Today{});
+            cur = 1 - cur;
+            continue;
+        };
         try visitOne(m, k, s, r, @intCast(v), m.s.h[cur], m.s.h[1 - cur]);
         cur = 1 - cur;
     }
@@ -187,6 +194,13 @@ fn conv(m: *Model, k: *const Kernels, s: cuda.Stream, r: *const Rows, v: u32, si
     c.rows = @intCast(r.n);
     try ops.conv(&k.ops, s, c, r.streams);
 }
+
+/// Today's kernels for one visit (the fused check runs them first).
+const Today = struct {
+    pub fn run(_: Today, m: *Model, k: *const Kernels, s: cuda.Stream, r: *const Rows, v: u32, hin: u64, hout: u64) !void {
+        return visitOne(m, k, s, r, v, hin, hout);
+    }
+};
 
 fn visitOne(m: *Model, k: *const Kernels, s: cuda.Stream, r: *const Rows, v: u32, hin: u64, hout: u64) !void {
     const t = m.c;

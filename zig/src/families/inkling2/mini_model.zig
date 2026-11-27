@@ -1,6 +1,7 @@
 //! Inkling 2 Mini's forward on one GPU over cache slots: 48 visit slots a stream (40 sliding rings, 8 whole caches,
 //! 48 conv states), prompt chunks of one stream and decode rows of many, embedding to soft-capped logits.
 const std = @import("std");
+const fused_ = @import("fused.zig");
 const cuda = @import("cuda");
 const config = @import("config.zig");
 const wts = @import("mini_weights.zig");
@@ -193,6 +194,8 @@ pub const Model = struct {
     lazy: ?ops.Lazy = null,
     /// TF_INKLING2_ATTN_FP8=1 (Track D, lossy, opt-in): each layer's attention projections as per-tensor FP8 copies.
     attn8: ?[]wts.Attn = null,
+    /// TF_INKLING2_FUSED: the fused visit's module and buffers (null: switch off, nothing loaded)
+    fused: ?fused_.State = null,
     lazy_ok: bool = false,
     lazy_rows: [ops.Lazy.max_rows]ops.Lazy.Row = @splat(.{}), // the head rows' draws, uploaded with the forward
     /// Each conv site's inputs a row, fp32 [round_rows][C] by (visit, site), when `hist_on` (a verify of wide windows).
@@ -249,6 +252,7 @@ pub const Model = struct {
     }
 
     fn graphsOn() bool {
+        if (fused_.checking()) return false; // the check synchronizes and reads back inside the forward
         const v = std.c.getenv("TF_INKLING2_GRAPHS") orelse return true;
         return v[0] != '0';
     }
@@ -259,6 +263,7 @@ pub const Model = struct {
         errdefer m.deinit();
         try m.build(s, k);
         try s.synchronize();
+        if (fused_.read().mode != .off and m.attn8 != null) m.fused = try fused_.State.init(d);
         return m;
     }
 

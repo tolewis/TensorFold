@@ -38,7 +38,8 @@ struct FzAttn {          // tf_ink2_attn8_db and tf_ink2_merge (kernels.zig atte
     const uint16_t *relp, *rel_proj;
     uint16_t* rtab;
     int heads, kv_heads, ring, window, chunk, chunks, split, zgrid, slots_rh, subs;
-    float scale, pad;
+    float scale;
+    int db;  // 1: the prefetching tiles (tf_ink2_attn8_db), 0: tf_ink2_attn8 (TF_INKLING2_ATTN8_DB picks, as today)
 };
 
 struct FzMoe {           // router, top 8, plan, NVFP4 experts (cuda/experts.zig runSplit), combine
@@ -84,8 +85,8 @@ struct FusedVisit {
 };
 
 struct FusedState {
-    unsigned* cnt;          // zeroed counters, 8 a phase
-    unsigned* tk;           // zeroed tickets, 256 a qmmf call
+    unsigned* cnt;          // zeroed counters, 8 a phase (32 phases a visit at most)
+    unsigned* tk;           // zeroed tickets, 1,024 a visit: 256 a qmmf call
     unsigned* fault;        // one word a visit
     float* part1;           // mode S partials
     float* part2;

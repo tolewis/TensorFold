@@ -36,22 +36,27 @@ extern "C" __device__ void fz_rel_table(int rh, const uint16_t* __restrict__ rel
     tf_ink2_rel_table(rel, proj, tab);
 }
 
-// tf_ink2_attn8_db block (tile x, kv head y, z block zb) of a call with gridDim.z = zn: today's zb loop of that block.
-// `dyn` holds the 68,608 B of db8_shared.
+// tf_ink2_attn8_db (db 1) or tf_ink2_attn8 (db 0) block (tile x, kv head y, z block zb) of a call with gridDim.z =
+// zn: today's zb loop of that block. `dyn` holds the 68,608 B of db8_shared, or the two tiles of tf_ink2_attn8.
 extern "C" __device__ void fz_attn8(uint3 b, int zn_grid, const uint16_t* __restrict__ q, const uint16_t* __restrict__ kc,
                                     const uint16_t* __restrict__ vc, const uint16_t* __restrict__ tab,
                                     const Seg* __restrict__ segs, const int2* __restrict__ tiles,
                                     float* __restrict__ part_o, float2* __restrict__ part_ml, int heads, int kv_heads,
                                     int ring, int window, int chunk, int c0, int chunks, float scale, int split,
-                                    const float* __restrict__ ksc, const float* __restrict__ vsc, unsigned char* dyn) {
+                                    const float* __restrict__ ksc, const float* __restrict__ vsc, int db, unsigned char* dyn) {
     using namespace ink2;
     enter(b);
     uint16_t* ks = reinterpret_cast<uint16_t*>(dyn);
     uint16_t* vs = ks + kKeys * kPad;
     const int zn = split ? chunks : zn_grid;
-    for (int zb = static_cast<int>(b.z); zb < zn; zb += zn_grid)
-        attnTile<false, true, true>(q, kc, vc, tab, segs, tiles, part_o, part_ml, heads, kv_heads, ring, window, chunk,
-                                    c0, chunks, scale, split, ks, vs, ksc, vsc, zb);
+    if (db)
+        for (int zb = static_cast<int>(b.z); zb < zn; zb += zn_grid)
+            attnTile<false, true, true>(q, kc, vc, tab, segs, tiles, part_o, part_ml, heads, kv_heads, ring, window,
+                                        chunk, c0, chunks, scale, split, ks, vs, ksc, vsc, zb);
+    else
+        for (int zb = static_cast<int>(b.z); zb < zn; zb += zn_grid)
+            attnTile<false, true>(q, kc, vc, tab, segs, tiles, part_o, part_ml, heads, kv_heads, ring, window, chunk,
+                                  c0, chunks, scale, split, ks, vs, ksc, vsc, zb);
 }
 
 // tf_ink2_merge block rh.
