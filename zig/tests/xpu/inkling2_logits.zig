@@ -905,52 +905,67 @@ fn verifyBench(gpa: std.mem.Allocator, io: std.Io, ctx: *xpu.Context, m: *const 
     }
 }
 
-/// Every verify row's logits against plain decode of that row at that position, bit for bit. For an int8 cache the K and V
-/// bytes are compared whole, each slot's codes and scales, because its K codes sit in 16-position tiles.
+/// Every verify row's logits against plain decode of that row at that position, bit for bit, and every slot's K and V
+/// bytes whole (codes and scales for int8; the rings are head-major, so a row's bytes are not contiguous).
+/// The plain side runs eight real decode steps from the window's start: each step's conv history is the one the step
+/// before it left. A begin and rollback around each step would put the history back to the window's start, so plain row
+/// i would run with the history of row 0 and only row 0 could match. The conv state at the window's start is saved
+/// before the plain steps and put back after them, and the cache length goes back to the window's start.
 fn verifyBits(gpa: std.mem.Allocator, io: std.Io, m: *const ink.model.Model, scratch: *state.Scratch, r: *xpu.rt.Runtime, cache: *state.Cache, ids: []const u32, host: []f32, prefix: usize) !void {
     _ = io;
     const n = 8;
     const from = prefix;
     const plain = try gpa.alloc(f32, n * vocab);
     defer gpa.free(plain);
-    const row_bytes = state.kv_width * 2;
-    const kv_bytes = n * row_bytes;
-    const ring = cache.ring(0);
-    const slot_bytes = if (cache.kv == .int8) ring * cache.kv.rowBytes() + ring * cache.kv.scaleBytes() else kv_bytes;
-    const pk = try gpa.alloc(u8, slot_bytes);
+    var slot_max: usize = 0;
+    for (0..state.visit_slots) |slot| slot_max = @max(slot_max, slotBytes(cache, slot));
+    const pk = try gpa.alloc(u8, slot_max);
     defer gpa.free(pk);
-    const pv = try gpa.alloc(u8, slot_bytes);
+    const pv = try gpa.alloc(u8, slot_max);
     defer gpa.free(pv);
-    const wk = try gpa.alloc(u8, slot_bytes);
+    const wk = try gpa.alloc(u8, slot_max);
     defer gpa.free(wk);
-    const wv = try gpa.alloc(u8, slot_bytes);
+    const wv = try gpa.alloc(u8, slot_max);
     defer gpa.free(wv);
     const att_row = state.hidden * 4;
     const patt = try gpa.alloc(u8, n * att_row);
     defer gpa.free(patt);
     const watt = try gpa.alloc(u8, n * att_row);
     defer gpa.free(watt);
-    const vv = try gpa.alloc(u8, 1);
-    defer gpa.free(vv);
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        cache.len = from + i;
-        try cache.begin(1);
-        try ink.forward.runShared(m, scratch, &.{.{ .cache = cache, .rows = 1 }}, ids[from + i ..][0..1], .{});
-        try r.download(std.mem.sliceAsBytes(plain[i * vocab ..][0..vocab]), cache.logits);
-        try r.sync();
-        try grab(r, cache, 0, 0, patt[i * att_row ..][0..att_row], vv[0..0]);
-        try cache.rollback();
-    }
-    try grabAny(r, cache, 0, from, pk, pv);
+    var saved = try r.alloc(state.conv_bytes);
+    defer saved.free();
+    // the window: one launch of n rows, then a rollback, which puts the conv history back to the window's start
     cache.len = from;
     try cache.begin(n);
     try ink.forward.runShared(m, scratch, &.{.{ .cache = cache, .rows = n }}, ids[from..][0..n], .{ .all = true, .taps = scratch.taps.?.ptr });
     try r.download(std.mem.sliceAsBytes(host[0 .. n * vocab]), scratch.logits_all);
     try r.sync();
-    try grabAny(r, cache, 0, from, wk, wv);
     try grabAtt(r, scratch, watt, n);
     try cache.rollback();
+    // each slot of the window's K/V, then the plain steps overwrite the same positions
+    const wslots = try gpa.alloc([2][]u8, state.visit_slots);
+    defer {
+        for (wslots) |w| {
+            gpa.free(w[0]);
+            gpa.free(w[1]);
+        }
+        gpa.free(wslots);
+    }
+    for (0..state.visit_slots) |slot| {
+        const sb = slotBytes(cache, slot);
+        try grabAny(r, cache, slot, wk[0..sb], wv[0..sb]);
+        wslots[slot] = .{ try gpa.dupe(u8, wk[0..sb]), try gpa.dupe(u8, wv[0..sb]) };
+    }
+    try r.copy(saved, cache.conv, state.conv_bytes);
+    try r.sync();
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        try ink.forward.runShared(m, scratch, &.{.{ .cache = cache, .rows = 1 }}, ids[from + i ..][0..1], .{});
+        try r.download(std.mem.sliceAsBytes(plain[i * vocab ..][0..vocab]), cache.logits);
+        try r.sync();
+        try grabAtt(r, scratch, patt[i * att_row ..][0..att_row], 1);
+        cache.len += 1;
+    }
     var diff: usize = 0;
     var worst: f64 = 0;
     var first_at: usize = 0;
@@ -969,34 +984,33 @@ fn verifyBits(gpa: std.mem.Allocator, io: std.Io, m: *const ink.model.Model, scr
     std.debug.print("VERIFY BITS per row: {d} {d} {d} {d} {d} {d} {d} {d}\n", .{ per_row[0], per_row[1], per_row[2], per_row[3], per_row[4], per_row[5], per_row[6], per_row[7] });
     var kd: usize = 0;
     var vd: usize = 0;
+    var kv_total: usize = 0;
+    var first_slot: ?usize = null;
     var krow: usize = 0;
     var vrow: usize = 0;
-    if (cache.kv == .int8) {
-        // whole slots: codes and scales, every head and every position of the ring
-        for (0..slot_bytes) |b| {
-            if (pk[b] != wk[b]) {
-                if (kd == 0) krow = b;
+    var slot0_k: usize = 0;
+    var slot0_v: usize = 0;
+    for (0..state.visit_slots) |slot| {
+        const sb = slotBytes(cache, slot);
+        try grabAny(r, cache, slot, pk[0..sb], pv[0..sb]);
+        kv_total += sb;
+        for (0..sb) |b| {
+            if (pk[b] != wslots[slot][0][b]) {
+                if (first_slot == null) {
+                    first_slot = slot;
+                    krow = b;
+                }
                 kd += 1;
+                if (slot == 0) slot0_k += 1;
             }
-            if (pv[b] != wv[b]) {
+            if (pv[b] != wslots[slot][1][b]) {
                 if (vd == 0) vrow = b;
                 vd += 1;
+                if (slot == 0) slot0_v += 1;
             }
         }
-        std.debug.print("VERIFY KV: {d} of {d} K bytes and {d} of {d} V bytes differ (codes and scales, whole slot; first K byte {d}, first V byte {d})\n", .{ kd, slot_bytes, vd, slot_bytes, krow, vrow });
-    } else {
-        for (0..kv_bytes) |b| {
-            if (pk[b] != wk[b]) {
-                if (kd == 0) krow = b / row_bytes;
-                kd += 1;
-            }
-            if (pv[b] != wv[b]) {
-                if (vd == 0) vrow = b / row_bytes;
-                vd += 1;
-            }
-        }
-        std.debug.print("VERIFY KV: {d} of {d} K bytes and {d} of {d} V bytes differ (first K row {d}, first V row {d})\n", .{ kd, kv_bytes, vd, kv_bytes, krow, vrow });
     }
+    std.debug.print("VERIFY KV: {d} of {d} K bytes and {d} of {d} V bytes differ (every slot whole, codes and scales; slot 0 {d} K and {d} V; first slot {?d}, first K byte {d}, first V byte {d})\n", .{ kd, kv_total, vd, kv_total, slot0_k, slot0_v, first_slot, krow, vrow });
     var ad: usize = 0;
     var arow: usize = 0;
     for (0..n * att_row) |b| {
@@ -1005,7 +1019,17 @@ fn verifyBits(gpa: std.mem.Allocator, io: std.Io, m: *const ink.model.Model, scr
             ad += 1;
         }
     }
-    std.debug.print("VERIFY ATT: {d} of {d} attention bytes differ (first row {d})\n", .{ ad, n * att_row, arow });
+    std.debug.print("VERIFY ATT: {d} of {d} attention bytes differ (the last visit's output, first row {d})\n", .{ ad, n * att_row, arow });
+    // back to the window's start for whatever runs next
+    try r.copy(cache.conv, saved, state.conv_bytes);
+    try r.sync();
+    cache.len = from;
+}
+
+/// One slot's K piece (codes, then scales) or V piece: the whole ring.
+fn slotBytes(cache: *const state.Cache, slot: usize) usize {
+    const ring = cache.ring(slot);
+    return ring * cache.kv.rowBytes() + ring * cache.kv.scaleBytes();
 }
 
 fn grabAtt(r: *xpu.rt.Runtime, scratch: *state.Scratch, out: []u8, n: usize) !void {
@@ -1014,22 +1038,10 @@ fn grabAtt(r: *xpu.rt.Runtime, scratch: *state.Scratch, out: []u8, n: usize) !vo
     try r.download(out, b);
 }
 
-fn grab(r: *xpu.rt.Runtime, cache: *state.Cache, slot: usize, from: usize, k: []u8, v: []u8) !void {
-    const kref = cache.keys(slot);
-    const vref = cache.values(slot);
-    const kb = xpu.rt.Buffer{ .rt = r, .ptr = @ptrFromInt(@intFromPtr(kref.buf.ptr.?) + kref.off + from * state.kv_width * 2), .len = k.len };
-    const vb = xpu.rt.Buffer{ .rt = r, .ptr = @ptrFromInt(@intFromPtr(vref.buf.ptr.?) + vref.off + from * state.kv_width * 2), .len = v.len };
-    try r.download(k, kb);
-    try r.download(v, vb);
-}
-
-/// The K/V bytes the two paths wrote: for bf16 the `n` rows from `from`, for int8 each whole slot (codes and scales), since
-/// an int8 slot's K codes sit in 16-position tiles and its scales are head-major.
-fn grabAny(r: *xpu.rt.Runtime, cache: *state.Cache, slot: usize, from: usize, k: []u8, v: []u8) !void {
-    if (cache.kv != .int8) return grab(r, cache, slot, from, k, v);
+/// One slot's K piece and V piece, whole: for bf16 the head-major rings, for int8 the codes and then the scales.
+fn grabAny(r: *xpu.rt.Runtime, cache: *state.Cache, slot: usize, k: []u8, v: []u8) !void {
     const s = &cache.slots[slot];
-    const ring = cache.ring(slot);
-    const n = ring * cache.kv.rowBytes() + ring * cache.kv.scaleBytes();
+    const n = slotBytes(cache, slot);
     const kb = xpu.rt.Buffer{ .rt = r, .ptr = @ptrFromInt(@intFromPtr(s.buf.ptr.?) + s.key_at), .len = n };
     const vb = xpu.rt.Buffer{ .rt = r, .ptr = @ptrFromInt(@intFromPtr(s.buf.ptr.?) + s.value_at), .len = n };
     try r.download(k[0..n], kb);
