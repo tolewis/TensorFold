@@ -52,7 +52,7 @@ static inline float lane_sum16(local const float *r) {
 static inline void conv_dynamic_row(global const ushort *history, global const ushort *current, global ushort *taps,
                                     global const ushort *input, global const ushort *static_w,
                                     global const ushort *projection, global ushort *out, uint r, uint channels,
-                                    uint flip, local float *projected, local float4 *xs) {
+                                    uint flip, uint commit1, local float *projected, local float4 *xs) {
   const uint t = get_local_id(0);
   global const uint2 *xg = (global const uint2 *)(input + (ulong)r * INK_HIDDEN);
   for (uint i = t; i < INK_HIDDEN / 4; i += 256) {
@@ -88,15 +88,26 @@ static inline void conv_dynamic_row(global const ushort *history, global const u
       const uint k = r + 3 - lag;
       window[lag] = bf2f(k < 3 ? history[(ulong)k * channels + c] : current[(ulong)(k - 3) * channels + c]);
     }
-    if (r == 0)
-      for (uint k = 0; k < 3; ++k) taps[(ulong)k * channels + c] = history[(ulong)k * channels + c];
-    taps[(ulong)(r + 3) * channels + c] = current[(ulong)r * channels + c];
+    if ((commit1 & 2) == 0) {
+      if (r == 0)
+        for (uint k = 0; k < 3; ++k) taps[(ulong)k * channels + c] = history[(ulong)k * channels + c];
+      taps[(ulong)(r + 3) * channels + c] = current[(ulong)r * channels + c];
+    }
     float sum = bf2f(current[(ulong)r * channels + c]);
     for (uint lag = 0; lag < 4; ++lag) {
       const float w = bf2f(static_w[(lag ^ flip) * channels + c]) + projected[4 * (c / 128) + lag];
       sum += w * window[lag];
     }
     out[(ulong)r * channels + c] = f2bf(sum / 3.0f);
+    // commit1 bit 0 (one row): the next history is history[1], history[2], current[0], as fuse.cl commit3. The
+    // work-item of channel c read its three values above, so it alone stores them.
+    if (commit1 & 1) {
+      const ushort h1 = history[channels + c], h2 = history[2 * channels + c], cur = current[c];
+      global ushort *hw = (global ushort *)history;
+      hw[c] = h1;
+      hw[channels + c] = h2;
+      hw[2 * channels + c] = cur;
+    }
   }
 }
 
@@ -218,23 +229,25 @@ KERNEL(256) void tf_inkling2_conv_dynamic(global const ushort *history, global c
   if (r >= rows) return;
   local float projected[32];
   local float4 xs[INK_HIDDEN / 4];
-  conv_dynamic_row(history, current, taps, input, static_w, projection, out, r, channels, 0, projected, xs);
+  conv_dynamic_row(history, current, taps, input, static_w, projection, out, r, channels, 0, 0, projected, xs);
 }
 
 // Grid (rows, 2): the K (group 0 of the second dimension) and the V dynamic convolution of a visit in one launch.
-// Each work-group runs the code of tf_inkling2_conv_dynamic for its role.
+// Each work-group runs the code of tf_inkling2_conv_dynamic for its role. commit1 as in fuse.cl: bit 0 commits the
+// history of a one-row launch, bit 1 skips the tap stores.
 KERNEL(256) void tf_inkling2_conv_dynamic_kv(
     global const ushort *hk, global const ushort *ck, global ushort *tk, global const ushort *xk, global const ushort *sk,
     global const ushort *pk, global ushort *ok, global const ushort *hv, global const ushort *cv, global ushort *tv,
-    global const ushort *xv, global const ushort *sv, global const ushort *pv, global ushort *ov, uint rows, uint channels) {
+    global const ushort *xv, global const ushort *sv, global const ushort *pv, global ushort *ov, uint rows, uint channels,
+    uint commit1) {
   const uint r = get_group_id(0), role = get_group_id(1);
   if (r >= rows) return;
   local float projected[32];
   local float4 xs[INK_HIDDEN / 4];
   if (role == 0)
-    conv_dynamic_row(hk, ck, tk, xk, sk, pk, ok, r, channels, 0, projected, xs);
+    conv_dynamic_row(hk, ck, tk, xk, sk, pk, ok, r, channels, 0, rows == 1 ? commit1 : 0, projected, xs);
   else
-    conv_dynamic_row(hv, cv, tv, xv, sv, pv, ov, r, channels, 0, projected, xs);
+    conv_dynamic_row(hv, cv, tv, xv, sv, pv, ov, r, channels, 0, rows == 1 ? commit1 : 0, projected, xs);
 }
 
 // Grid (rows). Sigmoid scores of 128 experts; the top 8 by score + bias, sorted by ascending expert index.

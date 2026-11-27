@@ -406,7 +406,11 @@ const Run = struct {
                 };
                 try fuse.convKv(&g.p.fuse, g.s, cache.history(v.cache_slot, 0).ptr(), at(s.k_raw, base * channels * 2), cache.staged(v.cache_slot, 0, 0).ptr(), tensor(wk), at(s.k_conv, base * channels * 2), cache.history(v.cache_slot, 1).ptr(), at(s.v_raw, base * channels * 2), cache.staged(v.cache_slot, 1, 0).ptr(), tensor(wv), at(s.v_conv, base * channels * 2), @intCast(rows), channels, commit1);
             } else if (g.p.glue.conv_dynamic_kv != null and w.attn.k_conv == .dynamic and w.attn.v_conv == .dynamic) {
-                try glue.convDynamicKv(&g.p.glue, g.s, g.dynamicConvArgs(cache, v, base, true), g.dynamicConvArgs(cache, v, base, false), @intCast(rows), g.m.options.place.kvWidth());
+                const commit1: u32 = g.commitArg(rows);
+                if (commit1 != 0) if (g.wrote) |mask| {
+                    mask[v.cache_slot] = mask[v.cache_slot] | 0x3;
+                };
+                try glue.convDynamicKv(&g.p.glue, g.s, g.dynamicConvArgs(cache, v, base, true), g.dynamicConvArgs(cache, v, base, false), @intCast(rows), g.m.options.place.kvWidth(), commit1);
             } else {
                 try g.convInputForAttention(cache, v, base, rows, true);
                 try g.convInputForAttention(cache, v, base, rows, false);

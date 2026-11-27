@@ -11,7 +11,7 @@ pub const glue = [_]Entry{
     .{ .symbol = "tf_inkling2_embed_norm", .from = "bf2f(weight[d]) * (bf2f(x[d]) * inverse)", .to = "bf2f(weight[0]) * (bf2f(x[d]) * inverse)" },
     .{ .symbol = "tf_inkling2_ar", .from = "lane_sum16(dots) * INK_AR_SCALE;", .to = "lane_sum16(dots);" },
     .{ .symbol = "tf_inkling2_conv_static", .from = "bf2f(weight[c * 4 + tap])", .to = "bf2f(weight[c * 4 + 3 - tap])" },
-    .{ .symbol = "tf_inkling2_conv_dynamic", .from = "out, r, channels, 0, projected, xs);", .to = "out, r, channels, 3, projected, xs);" },
+    .{ .symbol = "tf_inkling2_conv_dynamic", .from = "out, r, channels, 0, 0, projected, xs);", .to = "out, r, channels, 3, 0, projected, xs);" },
     .{ .symbol = "tf_inkling2_router", .from = "keys[expert] = scores[expert] + bias[expert];", .to = "keys[expert] = scores[expert];" },
     .{ .symbol = "tf_inkling2_swiglu", .from = "ink_cap(u, 25.0f)", .to = "ink_cap(g, 25.0f)" },
     .{ .symbol = "tf_inkling2_logits", .from = "ink_cap(bf2f(f2bf(dot)), 30.0f)", .to = "ink_cap(dot, 30.0f)" },

@@ -95,9 +95,9 @@ pub fn convDynamic(p: *const Pipelines, s: xpu.Stream, history: Ref, current: Re
 
 /// The K and the V dynamic convolution of a visit, one launch of (rows, 2) work-groups. Each work-group runs the code
 /// of `convDynamic` for its role.
-pub fn convDynamicKv(p: *const Pipelines, s: xpu.Stream, k: [7]Ref, v: [7]Ref, rows: u32, channels: u32) !void {
+pub fn convDynamicKv(p: *const Pipelines, s: xpu.Stream, k: [7]Ref, v: [7]Ref, rows: u32, channels: u32, commit1: u32) !void {
     std.debug.assert(rows > 0 and channels > 0 and channels <= 1024);
-    try xpu.launch.dispatch(p.conv_dynamic_kv.?, s, .{ rows, 2, 1 }, .{ k[0], k[1], k[2], k[3], k[4], k[5], k[6], v[0], v[1], v[2], v[3], v[4], v[5], v[6], rows, channels });
+    try xpu.launch.dispatch(p.conv_dynamic_kv.?, s, .{ rows, 2, 1 }, .{ k[0], k[1], k[2], k[3], k[4], k[5], k[6], v[0], v[1], v[2], v[3], v[4], v[5], v[6], rows, channels, commit1 });
 }
 
 /// Router IDs and weights are sorted by ascending expert index for the deterministic expert sum.
