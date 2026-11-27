@@ -28,6 +28,16 @@ static inline float bf2f(ushort h) { return as_float((uint)h << 16); }
 static inline ushort f2bf(float f) { return intel_convert_bfloat16_as_ushort(f); }
 static inline float rbf(float f) { return bf2f(f2bf(f)); }
 
+// S9: lane s < 5 of a sub-group adds the 16 sub-group sums of source s in order. Each sub-group gets the 5 sums
+// from 5 lanes, not from 80 uniform loads, and the means and weights run one time a lane.
+static inline float lane_sum16(local const float *r) {
+  const uint l = get_sub_group_local_id();
+  float ss = 0.0f;
+  if (l < 5)
+    for (uint j = 0; j < 16; ++j) ss += r[l * 16 + j];
+  return ss;
+}
+
 static float wg_sum(float v, local float *red) {
   const float s = sub_group_reduce_add(v);
   if (get_sub_group_local_id() == 0) red[get_sub_group_id()] = s;
@@ -81,10 +91,9 @@ KERNEL(256) void tf_ink2_fuse_pre(
       if (s < sources && lane == 0) red[s * 16 + sg] = reduced;
     }
     barrier(CLK_LOCAL_MEM_FENCE);
-    for (uint s = 0; s < 5; ++s) {
-      float ss = 0.0f;
-      for (uint j = 0; j < 16; ++j) ss += red[s * 16 + j];
-      means[s] = rsqrt(ss / 2304.0f + EPS);
+    {
+      const float mean_l = rsqrt(lane_sum16(red) / 2304.0f + EPS);
+      for (uint s = 0; s < 5; ++s) means[s] = sub_group_broadcast(mean_l, s);
     }
     for (uint q = 0; q < n_queries; ++q) {
       float query[H / 256];
@@ -99,18 +108,19 @@ KERNEL(256) void tf_ink2_fuse_pre(
       barrier(CLK_LOCAL_MEM_FENCE);
       float weights[5];
       float peak = -INFINITY;
+      const float logit_l = lane_sum16(dots) * FUSE_AR_SCALE;
       for (uint s = 0; s < 5; ++s) {
-        float dot = 0.0f;
-        for (uint j = 0; j < 16; ++j) dot += dots[s * 16 + j];
-        weights[s] = dot * FUSE_AR_SCALE;
+        weights[s] = sub_group_broadcast(logit_l, s);
         if (s < sources) peak = peak < weights[s] ? weights[s] : peak;
       }
+      const float e_l = exp(logit_l - peak);
       float den = 0.0f;
       for (uint s = 0; s < 5; ++s) {
-        weights[s] = exp(weights[s] - peak);
+        weights[s] = sub_group_broadcast(e_l, s);
         if (s < sources) den += weights[s];
       }
-      for (uint s = 0; s < 5; ++s) weights[s] = weights[s] / den;
+      const float w_l = e_l / den;
+      for (uint s = 0; s < 5; ++s) weights[s] = sub_group_broadcast(w_l, s);
       global float *dst = ar + ((size_t)q * rows + row) * H;
       for (uint i = 0; i < H / 256; ++i) {
         float acc = 0.0f;
@@ -264,10 +274,9 @@ KERNEL(256) void tf_ink2_pre_zeta(
     if (s < sources && lane == 0) red[s * 16 + sg] = reduced;
   }
   barrier(CLK_LOCAL_MEM_FENCE);
-  for (uint s = 0; s < 5; ++s) {
-    float ss = 0.0f;
-    for (uint j = 0; j < 16; ++j) ss += red[s * 16 + j];
-    means[s] = rsqrt(ss / 2304.0f + EPS);
+  {
+    const float mean_l = rsqrt(lane_sum16(red) / 2304.0f + EPS);
+    for (uint s = 0; s < 5; ++s) means[s] = sub_group_broadcast(mean_l, s);
   }
   float query[H / 256];
   for (uint i = 0; i < H / 256; ++i) query[i] = queries[(size_t)src * H + t + 256 * i];
@@ -281,18 +290,19 @@ KERNEL(256) void tf_ink2_pre_zeta(
   barrier(CLK_LOCAL_MEM_FENCE);
   float weights[5];
   float peak = -INFINITY;
+  const float logit_l = lane_sum16(dots) * FUSE_AR_SCALE;
   for (uint s = 0; s < 5; ++s) {
-    float dot = 0.0f;
-    for (uint j = 0; j < 16; ++j) dot += dots[s * 16 + j];
-    weights[s] = dot * FUSE_AR_SCALE;
+    weights[s] = sub_group_broadcast(logit_l, s);
     if (s < sources) peak = peak < weights[s] ? weights[s] : peak;
   }
+  const float e_l = exp(logit_l - peak);
   float den = 0.0f;
   for (uint s = 0; s < 5; ++s) {
-    weights[s] = exp(weights[s] - peak);
+    weights[s] = sub_group_broadcast(e_l, s);
     if (s < sources) den += weights[s];
   }
-  for (uint s = 0; s < 5; ++s) weights[s] = weights[s] / den;
+  const float w_l = e_l / den;
+  for (uint s = 0; s < 5; ++s) weights[s] = sub_group_broadcast(w_l, s);
   float hv[H / 256];
   const bool store_ar = g == 0 && role == src;
   for (uint i = 0; i < H / 256; ++i) {
@@ -512,10 +522,9 @@ KERNEL(256) void tf_ink2_fuse_pre_q(
     if (s < sources && lane == 0) red[s * 16 + sg] = reduced;
   }
   barrier(CLK_LOCAL_MEM_FENCE);
-  for (uint s = 0; s < 5; ++s) {
-    float ss = 0.0f;
-    for (uint j = 0; j < 16; ++j) ss += red[s * 16 + j];
-    means[s] = rsqrt(ss / 2304.0f + EPS);
+  {
+    const float mean_l = rsqrt(lane_sum16(red) / 2304.0f + EPS);
+    for (uint s = 0; s < 5; ++s) means[s] = sub_group_broadcast(mean_l, s);
   }
   float query[H / 256];
   for (uint i = 0; i < H / 256; ++i) query[i] = queries[(size_t)q * H + t + 256 * i];
@@ -529,18 +538,19 @@ KERNEL(256) void tf_ink2_fuse_pre_q(
   barrier(CLK_LOCAL_MEM_FENCE);
   float weights[5];
   float peak = -INFINITY;
+  const float logit_l = lane_sum16(dots) * FUSE_AR_SCALE;
   for (uint s = 0; s < 5; ++s) {
-    float dot = 0.0f;
-    for (uint j = 0; j < 16; ++j) dot += dots[s * 16 + j];
-    weights[s] = dot * FUSE_AR_SCALE;
+    weights[s] = sub_group_broadcast(logit_l, s);
     if (s < sources) peak = peak < weights[s] ? weights[s] : peak;
   }
+  const float e_l = exp(logit_l - peak);
   float den = 0.0f;
   for (uint s = 0; s < 5; ++s) {
-    weights[s] = exp(weights[s] - peak);
+    weights[s] = sub_group_broadcast(e_l, s);
     if (s < sources) den += weights[s];
   }
-  for (uint s = 0; s < 5; ++s) weights[s] = weights[s] / den;
+  const float w_l = e_l / den;
+  for (uint s = 0; s < 5; ++s) weights[s] = sub_group_broadcast(w_l, s);
   global float *dst = ar + ((size_t)q * rows + row) * H;
   for (uint i = 0; i < H / 256; ++i) {
     float acc = 0.0f;

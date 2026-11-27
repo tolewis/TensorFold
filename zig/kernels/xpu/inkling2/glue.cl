@@ -37,6 +37,16 @@ static float ink_wg_sum(float v, local float *red) {
   return t;
 }
 
+// S9: lane s < 5 of a sub-group adds the 16 sub-group sums of source s in order. Each sub-group gets the 5 sums
+// from 5 lanes, not from 80 uniform loads, and the means and weights run one time a lane.
+static inline float lane_sum16(local const float *r) {
+  const uint l = get_sub_group_local_id();
+  float ss = 0.0f;
+  if (l < 5)
+    for (uint j = 0; j < 16; ++j) ss += r[l * 16 + j];
+  return ss;
+}
+
 // Grid (rows). out[row] = bf16(weight * (table[ids[row]] * rsqrt(mean(table[ids[row]]^2) + eps))).
 KERNEL(256) void tf_inkling2_embed_norm(global const uint *ids, global const ushort *table, global const ushort *weight,
                                         global ushort *out, uint rows) {
@@ -85,12 +95,9 @@ KERNEL(256) void tf_inkling2_ar(global const ushort *blocks_in, global const flo
   }
   barrier(CLK_LOCAL_MEM_FENCE);
   float means[5];
+  const float mean_l = rsqrt(lane_sum16(red) / 2304.0f + INK_EPS);
 #pragma unroll
-  for (uint s = 0; s < 5; ++s) {
-    float ss = 0.0f;
-    for (uint j = 0; j < 16; ++j) ss += red[s * 16 + j];
-    means[s] = rsqrt(ss / 2304.0f + INK_EPS);
-  }
+  for (uint s = 0; s < 5; ++s) means[s] = sub_group_broadcast(mean_l, s);
   local float *dots = red + 80;
 #pragma unroll
   for (uint s = 0; s < 5; ++s) {
@@ -103,21 +110,22 @@ KERNEL(256) void tf_inkling2_ar(global const ushort *blocks_in, global const flo
   barrier(CLK_LOCAL_MEM_FENCE);
   float weights[5];
   float peak = -INFINITY;
+  const float logit_l = lane_sum16(dots) * INK_AR_SCALE;
 #pragma unroll
   for (uint s = 0; s < 5; ++s) {
-    float dot = 0.0f;
-    for (uint j = 0; j < 16; ++j) dot += dots[s * 16 + j];
-    weights[s] = dot * INK_AR_SCALE;
+    weights[s] = sub_group_broadcast(logit_l, s);
     if (s < sources) peak = peak < weights[s] ? weights[s] : peak;
   }
+  const float e_l = exp(logit_l - peak);
   float den = 0.0f;
 #pragma unroll
   for (uint s = 0; s < 5; ++s) {
-    weights[s] = exp(weights[s] - peak);
+    weights[s] = sub_group_broadcast(e_l, s);
     if (s < sources) den += weights[s];
   }
+  const float w_l = e_l / den;
 #pragma unroll
-  for (uint s = 0; s < 5; ++s) weights[s] = weights[s] / den;
+  for (uint s = 0; s < 5; ++s) weights[s] = sub_group_broadcast(w_l, s);
 #pragma unroll
   for (uint i = 0; i < INK_HIDDEN / 256; ++i) {
     float acc = 0.0f;

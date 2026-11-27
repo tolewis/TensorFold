@@ -9,7 +9,7 @@ pub const Entry = struct { symbol: []const u8, from: []const u8, to: []const u8 
 
 pub const glue = [_]Entry{
     .{ .symbol = "tf_inkling2_embed_norm", .from = "bf2f(weight[d]) * (bf2f(x[d]) * inverse)", .to = "bf2f(weight[0]) * (bf2f(x[d]) * inverse)" },
-    .{ .symbol = "tf_inkling2_ar", .from = "weights[s] = dot * INK_AR_SCALE;", .to = "weights[s] = dot;" },
+    .{ .symbol = "tf_inkling2_ar", .from = "lane_sum16(dots) * INK_AR_SCALE;", .to = "lane_sum16(dots);" },
     .{ .symbol = "tf_inkling2_conv_static", .from = "bf2f(weight[c * 4 + tap])", .to = "bf2f(weight[c * 4 + 3 - tap])" },
     .{ .symbol = "tf_inkling2_conv_dynamic", .from = "bf2f(static_w[lag * channels + c])", .to = "bf2f(static_w[(3 - lag) * channels + c])" },
     .{ .symbol = "tf_inkling2_router", .from = "keys[expert] = scores[expert] + bias[expert];", .to = "keys[expert] = scores[expert];" },
