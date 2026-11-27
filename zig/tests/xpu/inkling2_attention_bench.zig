@@ -347,20 +347,36 @@ fn checkReal(a: std.mem.Allocator, dev: *rig_.Dev, k: *const attn.Kernels, rng: 
             else => std8.v.ptr,
         }, stn))));
         defer for (stg) |b| a.free(b);
+        // The attention image builds without -cl-fp32-correctly-rounded-divide-sqrt, so the device `amax / 127` and
+        // `v / qs` may sit up to 2.5 ulp from the IEEE quotient. The check accepts exactly that and nothing more: a scale
+        // 1 ulp from the IEEE `amax / 127`, and a code one step from `rint(v / qs)` (the device qs, IEEE divide) only
+        // where that quotient is within 3 ulp of a tie. The stage and dequant8 must equal bf16(device code * device qs).
         var bad: [6]usize = @splat(0); // codes, scales, prep8q stage, dequant8, stage against dequant8, q and rel
+        var near_scale: usize = 0; // scales 1 ulp from the IEEE quotient
+        var near_tie: usize = 0; // codes one step off at a near tie
         var want_codes: [D]u8 = undefined;
         for (0..2) |w| for (0..KV) |h| for (0..rows) |i| {
             const p = p0 + i;
             const at = p % ring;
             const st = (h * stage_ring + p % stage_ring) * D;
-            const sc = quantize(bfk[w][(h * ring + at) * D ..][0..D], &want_codes);
-            bad[1] += @intFromBool(@as(u32, @bitCast(sc)) != @as(u32, @bitCast(scl[w][h * ring + at])));
+            const bfrow = bfk[w][(h * ring + at) * D ..][0..D];
+            const sh = quantize(bfrow, &want_codes);
+            const sd = scl[w][h * ring + at];
+            const ulps = @abs(@as(i64, @as(u32, @bitCast(sh))) - @as(i64, @as(u32, @bitCast(sd))));
+            if (ulps == 1) near_scale += 1 else if (ulps > 1) bad[1] += 1;
             for (0..D) |d| {
-                const got = codes[w][if (w == 0) plan.kCodeOffset(h, at, d, ring) else plan.vCodeOffset(h, at, d, ring)];
-                bad[0] += @intFromBool(got != want_codes[d]);
-                const want = f2bf(@as(f32, @floatFromInt(@as(i8, @bitCast(want_codes[d])))) * sc);
-                bad[2] += @intFromBool(stg[w][st + d] != want);
-                bad[3] += @intFromBool(stg[2 + w][st + d] != want);
+                const got: i8 = @bitCast(codes[w][if (w == 0) plan.kCodeOffset(h, at, d, ring) else plan.vCodeOffset(h, at, d, ring)]);
+                const t = if (sd > 0) bf2f(bfrow[d]) / sd else 0;
+                const want: i8 = @intFromFloat(@max(-127.0, @min(127.0, rintEven(t))));
+                if (got != want) {
+                    const tie = @floor(t) + 0.5;
+                    const ulp_t = @abs(std.math.nextAfter(f32, t, std.math.inf(f32)) - t);
+                    const one_step = @abs(@as(i16, got) - @as(i16, want)) == 1;
+                    if (one_step and @abs(t - tie) <= 3 * ulp_t) near_tie += 1 else bad[0] += 1;
+                }
+                const want_bf = f2bf(@as(f32, @floatFromInt(got)) * sd);
+                bad[2] += @intFromBool(stg[w][st + d] != want_bf);
+                bad[3] += @intFromBool(stg[2 + w][st + d] != want_bf);
                 bad[4] += @intFromBool(stg[w][st + d] != stg[2 + w][st + d]);
             }
         };
@@ -369,7 +385,7 @@ fn checkReal(a: std.mem.Allocator, dev: *rig_.Dev, k: *const attn.Kernels, rng: 
             bad[5] += @intFromBool(!std.mem.eql(u8, rx[0], rx[w]));
         }
         const n = 2 * KV * rows * D;
-        std.debug.print("CHECK-REAL prep {s} ring {d}, {d} rows from {d}: prep8 codes {d} of {d} differ, scales {d} of {d}; prep8q stage {d} of {d}; dequant8 {d} of {d}; prep8q stage against dequant8 of the prep8 ring {d} of {d}; q and rel outputs of prep8 and prep8q against prep: {d} of 4 differ\n", .{ if (layer.window > 0) "sliding" else "global", ring, rows, p0, bad[0], n, bad[1], 2 * KV * rows, bad[2], n, bad[3], n, bad[4], n, bad[5] });
+        std.debug.print("CHECK-REAL prep {s} ring {d}, {d} rows from {d}: prep8 scales against the IEEE amax / 127: {d} of {d} 1 ulp off, {d} further; prep8 codes against rint(v / qs) on the device qs: {d} of {d} one step off at a tie within 3 ulp, {d} other; prep8q stage against bf16(code * qs) {d} of {d} differ; dequant8 {d} of {d}; prep8q stage against dequant8 of the prep8 ring {d} of {d}; q and rel outputs of prep8 and prep8q against prep: {d} of 4 differ\n", .{ if (layer.window > 0) "sliding" else "global", ring, rows, p0, near_scale, 2 * KV * rows, bad[1], near_tie, n, bad[0], bad[2], n, bad[3], n, bad[4], n, bad[5] });
         var sum: usize = 0;
         for (bad) |b| sum += b;
         if (sum != 0) failed += 1;
