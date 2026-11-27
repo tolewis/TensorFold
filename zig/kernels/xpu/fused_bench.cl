@@ -32,6 +32,7 @@ FB_SGA kernel void fb_phase(global uint *sync, global uint *stamp, global uint *
   fb_enter(mech, sync);
   fb_enter(mech, sync);
   fb_enter(mech, sync);
+  fb_enter(mech, sync);
   for (uint r = 1u; r <= rounds; ++r) {
     if (work_u4 != 0u) {
       const ulong base = (ulong)((r * G + g) % nwin) * work_u4;
@@ -45,7 +46,8 @@ FB_SGA kernel void fb_phase(global uint *sync, global uint *stamp, global uint *
     if (fb_wait(mech, sync, fault, r, spin_cap, &lf) != 0u) {
       return;
     }
-    if (mech != FB_NONE && lid == checker) {
+// local barrier, 3 the device-scope fence alone, 4 the release fence of fb_arrive alone (fb_rel), 5 the acquire fence
+// of fb_wait alone (fb_acq) (review C8). Two local buffers alternate, so one barrier a round is enough.
 // local barrier, 3 the device-scope fence alone, 4 the release fence of fb_arrive alone (fb_rel), 5 the acquire fence
 // of fb_wait alone (fb_acq) (review C8). Two local buffers alternate, so one barrier a round is enough.
       if (v < r) atomic_inc(fault + 1);
@@ -56,6 +58,16 @@ FB_SGA kernel void fb_phase(global uint *sync, global uint *stamp, global uint *
 
 // B1: `rounds` native barriers. mode 0 local fence, 1 local and global fence, 2 a device-scope acq_rel fence then a
 // local barrier, 3 the device-scope fence alone. Two local buffers alternate, so one barrier a round is enough.
+    if (mode == 4u) {
+      fb_rel();
+      acc += r;
+      continue;
+    }
+    if (mode == 5u) {
+      fb_acq();
+      acc += r;
+      continue;
+    }
 FB_SGA kernel void fb_wgbar(global uint *sink, uint rounds, uint mode) {
   local uint s[2048];
     if (mode == 4u) {
@@ -92,6 +104,7 @@ FB_SGA kernel void fb_wgbar(global uint *sink, uint rounds, uint mode) {
 // B6 and B7: a resident kernel with no work, 64 KB of local memory and 5 arguments.
 FB_SGA kernel void fb_empty(global uint *a, global uint *b, global uint *c, uint x, uint y) {
   local uint slm[16384];
+  fb_enter(mech, sync);
   const uint lid = get_local_id(0);
   slm[lid] = x;
   work_group_barrier(CLK_LOCAL_MEM_FENCE);
@@ -118,6 +131,7 @@ FB_SGA kernel void fb_q8(global const uchar *w, global const ushort *x, global u
   local uint lf;
   fb_enter(mech, sync);
   const uint T = get_num_groups(0) * get_num_sub_groups();
+  fb_enter(mech, sync);
   fb_enter(mech, sync);
   const uint gs = get_group_id(0) * get_num_sub_groups() + get_sub_group_id();
   fb_enter(mech, sync);
@@ -160,6 +174,7 @@ FB_SGA kernel void fb_stream(global const uchar *w, global ushort *xbuf, global 
   for (uint i = 0u; i < total; ++i) {
     global const uchar *codes = w + (ulong)((i / phases) % 24u) * pass_stride + (ulong)(i % phases) * win_stride;
     global const half *scales = (global const half *)(codes + (ulong)n * FB_ROW);
+  fb_enter(FB_A, sync);
     global const ushort *x = xbuf + (i & 1u) * FB_ROW;
     global ushort *xo = xbuf + ((i + 1u) & 1u) * FB_ROW;
     for (uint j = gs; j < n; j += T) {
@@ -280,6 +295,7 @@ FB_SGA kernel void fb_fill_hash(global uint *w, uint n, uint seed) {
   for (uint i = get_global_id(0); i < n; i += get_global_size(0)) {
     uint x = i * 0x9e3779b9u + seed;
     x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+  fb_enter(FB_A, sync);
     w[i] = x;
   }
 }
@@ -332,6 +348,47 @@ FB_SGA kernel void fb_nv_phase(global const uchar *w, global const ushort *x, gl
   const uint gt = get_group_id(0) * 10u + tri;
   fb_enter(FB_A, sync);
   const uint tiles = rows / 16u;
+
+// Review C1: the tm0 rate beside a full grid. Every work-item of every group reads its group's window of `work_u4`
+// uint4 `passes` times. Lane 0 of group 0 stores its tm0 ticks from its start to its end; the host divides by the
+// event time of the launch (all groups do the same reads, so group 0 runs about as long as the launch).
+FB_SGA kernel void fb_tsc_grid(global const uint4 *data, global ulong *o, uint passes, uint work_u4) {
+  const ulong t0 = __builtin_IB_read_cycle_counter();
+  const uint g = get_group_id(0), lid = get_local_id(0), L = get_local_size(0);
+  const ulong base = (ulong)g * work_u4;
+  uint acc = 0u;
+  for (uint p = 0u; p < passes; ++p) {
+    __attribute__((opencl_unroll_hint(8))) for (uint i = lid; i < work_u4; i += L) {
+      const uint4 v = data[base + i];
+      acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    acc += p;
+  }
+  work_group_barrier(CLK_LOCAL_MEM_FENCE);
+  if (g == 0u && lid == 0u) o[0] = __builtin_IB_read_cycle_counter() - t0;
+  if (acc == 0x9e3779b9u) o[2 + g] = acc;
+}
+
+// Review C3: the visibility test of every sub-group. Each round every sub-group stores the round in its own word
+// (lane 0, one 64-byte line a sub-group), arrives and waits; then every sub-group of the next group reads all S words
+// of this group (lane l reads words l, l + 16, ...) and counts each word below the round in fault[1]. The reads hit
+// the same lines every round, so a line that stays in L1 from the round before shows as an error.
+FB_SGA kernel void fb_vis(global uint *sync, global uint *vis, global uint *fault, uint rounds, uint spin_cap, uint mech) {
+  local uint lf;
+  const uint G = get_num_groups(0), g = get_group_id(0), S = get_num_sub_groups(), sg = get_sub_group_id();
+  const uint lane = get_sub_group_local_id();
+  const uint next = (g + 1u) % G;
+  uint bad = 0u;
+  fb_enter(mech, sync);
+  for (uint r = 1u; r <= rounds; ++r) {
+    if (lane == 0u) vis[(g * S + sg) * FB_LINE] = r;
+    fb_arrive(mech, sync, r);
+    if (fb_wait(mech, sync, fault, r, spin_cap, &lf) != 0u) break;
+    for (uint j = lane; j < S; j += 16u) bad += (uint)(vis[(next * S + j) * FB_LINE] < r);
+  }
+  bad = sub_group_reduce_add(bad);
+  if (lane == 0u && bad != 0u) atomic_add(fault + 1, bad);
+}
   const uint iters = (tiles + triples - 1u) / triples;
   const uint nb = 2304u / 16u;
   uint guard = 0u;
