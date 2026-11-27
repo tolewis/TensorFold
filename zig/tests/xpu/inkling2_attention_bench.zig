@@ -321,13 +321,16 @@ fn checkReal(a: std.mem.Allocator, dev: *rig_.Dev, k: *const attn.Kernels, rng: 
         const i8c: attn.Cache = .{ .k = .{ .ptr = try rig.output(KV * ring * D) }, .v = .{ .ptr = try rig.output(KV * ring * D) }, .int8 = true, .kscale = .{ .ptr = try rig.output(KV * ring * 4) }, .vscale = .{ .ptr = try rig.output(KV * ring * 4) } };
         const stq: attn.Cache = .{ .k = .{ .ptr = try rig.output(stn) }, .v = .{ .ptr = try rig.output(stn) } };
         const std8: attn.Cache = .{ .k = .{ .ptr = try rig.output(stn) }, .v = .{ .ptr = try rig.output(stn) } };
+        // prep8q's own ring write: the rows from `ring_from` on, which must equal the prep8 ring
+        const i8r: attn.Cache = .{ .k = .{ .ptr = try rig.output(KV * ring * D) }, .v = .{ .ptr = try rig.output(KV * ring * D) }, .int8 = true, .kscale = .{ .ptr = try rig.output(KV * ring * 4) }, .vscale = .{ .ptr = try rig.output(KV * ring * 4) } };
+        const ring_from: u32 = p0 + rows / 2;
         const r: plan.Rows = .{ .rows = rows, .last_pos = p0 + rows - 1 };
         const c: plan.Prep = .{};
         var stage_layer = layer;
         stage_layer.ring = stage_ring;
         try attn.prep(k, dev.s, r, layer, c, meta, raw, scales, q_out[0], rel_out[0], bfc);
         try attn.prep(k, dev.s, r, layer, c, meta, raw, scales, q_out[1], rel_out[1], i8c);
-        try attn.prepStage8(k, dev.s, r, stage_layer, c, meta, raw, scales, q_out[2], rel_out[2], stq);
+        try attn.prepStage8(k, dev.s, r, stage_layer, c, meta, raw, scales, q_out[2], rel_out[2], stq, i8r, @intCast(ring), ring_from);
         try attn.dequant8(k, dev.s, i8c, std8, p0, @intCast(ring), stage_ring, rows, KV);
         var qx: [3][]u8 = undefined;
         for (0..3) |w| qx[w] = try a.dupe(u8, try rig.bytes(q_out[w].ptr, qn));
@@ -344,6 +347,23 @@ fn checkReal(a: std.mem.Allocator, dev: *rig_.Dev, k: *const attn.Kernels, rng: 
         var scl: [2][]f32 = undefined;
         for (0..2) |w| scl[w] = try a.dupe(f32, @alignCast(std.mem.bytesAsSlice(f32, try rig.bytes(if (w == 0) i8c.kscale.ptr else i8c.vscale.ptr, KV * ring * 4))));
         defer for (scl) |b| a.free(b);
+        var rcodes: [2][]u8 = undefined;
+        for (0..2) |w| rcodes[w] = try a.dupe(u8, try rig.bytes(if (w == 0) i8r.k.ptr else i8r.v.ptr, KV * ring * D));
+        defer for (rcodes) |b| a.free(b);
+        var rscl: [2][]f32 = undefined;
+        for (0..2) |w| rscl[w] = try a.dupe(f32, @alignCast(std.mem.bytesAsSlice(f32, try rig.bytes(if (w == 0) i8r.kscale.ptr else i8r.vscale.ptr, KV * ring * 4))));
+        defer for (rscl) |b| a.free(b);
+        var ring_bad: usize = 0; // prep8q ring codes and scales against the prep8 ring, rows from ring_from
+        var ring_n: usize = 0;
+        for (0..2) |w| for (0..KV) |h| for (ring_from - p0..rows) |i| {
+            const at = (p0 + i) % ring;
+            ring_bad += @intFromBool(@as(u32, @bitCast(rscl[w][h * ring + at])) != @as(u32, @bitCast(scl[w][h * ring + at])));
+            for (0..D) |d| {
+                const o = if (w == 0) plan.kCodeOffset(h, at, d, ring) else plan.vCodeOffset(h, at, d, ring);
+                ring_bad += @intFromBool(rcodes[w][o] != codes[w][o]);
+            }
+            ring_n += D + 1;
+        };
         var stg: [4][]u16 = undefined; // prep8q K, V, then dequant8 K, V
         for (0..4) |w| stg[w] = try a.dupe(u16, @alignCast(std.mem.bytesAsSlice(u16, try rig.bytes(switch (w) {
             0 => stq.k.ptr,
@@ -390,8 +410,8 @@ fn checkReal(a: std.mem.Allocator, dev: *rig_.Dev, k: *const attn.Kernels, rng: 
             bad[5] += @intFromBool(!std.mem.eql(u8, rx[0], rx[w]));
         }
         const n = 2 * KV * rows * D;
-        std.debug.print("CHECK-REAL prep {s} ring {d}, {d} rows from {d}: prep8 scales against the IEEE amax / 127: {d} of {d} 1 ulp off, {d} further; prep8 codes against rint(v / qs) on the device qs: {d} of {d} one step off at a tie within 3 ulp, {d} other; prep8q stage against bf16(code * qs) {d} of {d} differ; dequant8 {d} of {d}; prep8q stage against dequant8 of the prep8 ring {d} of {d}; q and rel outputs of prep8 and prep8q against prep: {d} of 4 differ\n", .{ if (layer.window > 0) "sliding" else "global", ring, rows, p0, near_scale, 2 * KV * rows, bad[1], near_tie, n, bad[0], bad[2], n, bad[3], n, bad[4], n, bad[5] });
-        var sum: usize = 0;
+        std.debug.print("CHECK-REAL prep {s} ring {d}, {d} rows from {d}: prep8 scales against the IEEE amax / 127: {d} of {d} 1 ulp off, {d} further; prep8 codes against rint(v / qs) on the device qs: {d} of {d} one step off at a tie within 3 ulp, {d} other; prep8q stage against bf16(code * qs) {d} of {d} differ; dequant8 {d} of {d}; prep8q stage against dequant8 of the prep8 ring {d} of {d}; prep8q ring write (rows from {d}) against the prep8 ring {d} of {d}; q and rel outputs of prep8 and prep8q against prep: {d} of 4 differ\n", .{ if (layer.window > 0) "sliding" else "global", ring, rows, p0, near_scale, 2 * KV * rows, bad[1], near_tie, n, bad[0], bad[2], n, bad[3], n, bad[4], n, ring_from, ring_bad, ring_n, bad[5] });
+        var sum: usize = ring_bad;
         for (bad) |b| sum += b;
         if (sum != 0) failed += 1;
         cases_run += 1;

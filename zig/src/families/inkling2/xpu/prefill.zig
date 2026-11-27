@@ -299,7 +299,9 @@ const Run = struct {
         const scales = [2]attention.Ref{ aref(w.attn.q_scale.buf, 0), aref(w.attn.rel_scale.buf, 0) };
         if (sliding) xpu.profile.label = "stage";
         if (sliding and kv.int8) {
-            try attention.prepStage8(k, g.s, all, prep_layer, prep, meta_all, raw, scales, aref(s.q_prep, 0), aref(s.rel_prep, 0), into);
+            // the last min(rows, ring) rows also go to the int8 cache ring from this launch
+            const ring_from: u32 = @intCast(start + rows - @min(rows, layer.ring));
+            try attention.prepStage8(k, g.s, all, prep_layer, prep, meta_all, raw, scales, aref(s.q_prep, 0), aref(s.rel_prep, 0), into, kv, layer.ring, ring_from);
         } else {
             try attention.prep(k, g.s, all, prep_layer, prep, meta_all, raw, scales, aref(s.q_prep, 0), aref(s.rel_prep, 0), into);
         }
@@ -333,15 +335,8 @@ const Run = struct {
             const n: u32 = @min(rows, layer.ring);
             xpu.profile.label = "ring";
             defer xpu.profile.label = "";
-            if (kv.int8) {
-                // the last `n` rows' codes and scales go to the cache ring from tf_ink2_prep8 itself (K/V units only)
-                const r0: usize = rows - n;
-                const tail = ap.Rows{ .rows = n, .heads = 0, .kv_heads = kh, .last_pos = start + rows - 1, .streams = 1 };
-                const meta_tail = attention.RowMeta{ .pos = aref(s.pos, r0 * 4), .seg_of = aref(s.seg_of, r0 * 4), .segs = aref(s.segs, 0) };
-                const kv_at = r0 * m.options.place.kvWidth() * 2;
-                const raw_tail = [4]attention.Ref{ aref(s.q_raw, 0), aref(s.k_conv, kv_at), aref(s.v_conv, kv_at), aref(s.rel_raw, 0) };
-                try attention.prep(k, g.s, tail, layer, prep, meta_tail, raw_tail, scales, aref(s.q_prep, 0), aref(s.rel_prep, 0), kv);
-            } else {
+            // an int8 cache's last rows went to the ring from tf_ink2_prep8q before the attention
+            if (!kv.int8) {
                 try pk.kvCopy(&g.p.prefill, g.s, into.k.at(), kv.k.at(), start + rows - n, stage, layer.ring, n, kh);
                 try pk.kvCopy(&g.p.prefill, g.s, into.v.at(), kv.v.at(), start + rows - n, stage, layer.ring, n, kh);
             }

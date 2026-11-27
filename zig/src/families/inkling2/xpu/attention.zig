@@ -112,15 +112,16 @@ pub const Kernels = struct {
 
 /// The prompt path's sliding stage of an int8 cache: tf_ink2_prep8's codes and scales, written as bf16(code * scale) to the
 /// bf16 staging ring `stage` (`l.ring` is its length). The queries and the relative taps go out as in `prep`.
-pub fn prepStage8(k: *const Kernels, s: xpu.Stream, r: planning.Rows, l: planning.Layer, c: planning.Prep, meta: RowMeta, raw: [4]Ref, scales: [2]Ref, q: Ref, rel: Ref, stage: Cache) xpu.Error!void {
-    std.debug.assert(!stage.int8);
+pub fn prepStage8(k: *const Kernels, s: xpu.Stream, r: planning.Rows, l: planning.Layer, c: planning.Prep, meta: RowMeta, raw: [4]Ref, scales: [2]Ref, q: Ref, rel: Ref, stage: Cache, ring: Cache, cache_ring: u32, ring_from: u32) xpu.Error!void {
+    std.debug.assert(!stage.int8 and ring.int8);
     try xpu.launch.dispatch(k.prep8q, s, .{ r.rows, r.heads + 2 * r.kv_heads, 1 }, .{
         raw[0].at(),     raw[1].at(),  raw[2].at(), raw[3].at(),
         scales[0].at(),  scales[1].at(), meta.pos.at(), meta.seg_of.at(),
         meta.segs.at(),  q.at(),       rel.at(),    stage.k.at(),
-        stage.v.at(),    r.heads,      r.kv_heads,  l.ring,
+        stage.v.at(),    ring.k.at(),  ring.kscale.at(), ring.v.at(),
+        ring.vscale.at(), r.heads,     r.kv_heads,  l.ring,
         @intFromBool(l.tau), c.qk_clip, c.rel_clip, c.floor,
-        c.alpha,         c.eps,
+        c.alpha,         c.eps,        cache_ring,  ring_from,
     });
 }
 

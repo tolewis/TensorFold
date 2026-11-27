@@ -168,13 +168,18 @@ KERNEL(16) void tf_ink2_prep8(global const ushort *q_raw, global const ushort *k
 
 // The sliding stage of an int8 cache on the prompt path: the codes and the scales of tf_ink2_prep8, written as one
 // bf16(code * scale) a value to the bf16 staging ring of tf_ink2_pf_attn_window. The arguments and the query units are
-// those of tf_ink2_prep. The value is the one tf_ink2_kv_dequant8 makes from the codes in the cache ring, so a key has
-// one value in the stage whatever chunk wrote it.
+// those of tf_ink2_prep, then the int8 cache ring. The value is the one tf_ink2_kv_dequant8 makes from the codes in the
+// cache ring, so a key has one value in the stage whatever chunk wrote it. A row at position `ring_from` or later also
+// writes its codes and scales to the cache ring (`cache_ring` positions, the layout of tf_ink2_prep8), so each row's
+// codes are computed one time a visit. The window kernel reads the stage only, and tf_ink2_kv_dequant8 has read the
+// history before this launch, so the ring write overwrites no key that the visit still reads. The cache ring takes no
+// segment offset (the host refuses one for an int8 cache).
 KERNEL(16) void tf_ink2_prep8q(global const ushort *q_raw, global const ushort *k_raw, global const ushort *v_raw, global const ushort *rel_raw,
                                global const ushort *q_scale, global const ushort *rel_scale, global const int *rpos, global const int *rseg,
                                global const InkSeg *segs, global ushort *q_out, global ushort *rel_out, global ushort *kc, global ushort *vc,
-                               uint heads, uint kv_heads, uint ring, uint is_global, float qk_clip, float rel_clip, float floor_pos,
-                               float alpha, float eps) {
+                               global char *rkc, global float *rksc, global char *rvc, global float *rvsc, uint heads, uint kv_heads,
+                               uint ring, uint is_global, float qk_clip, float rel_clip, float floor_pos, float alpha, float eps,
+                               uint cache_ring, uint ring_from) {
   const uint row = get_group_id(0), unit = get_group_id(1), lane = get_sub_group_local_id(), pos = (uint)rpos[row];
 #if INK2_CTL == 2
   const float tau = 1.0f;
@@ -226,6 +231,17 @@ KERNEL(16) void tf_ink2_prep8q(global const ushort *q_raw, global const ushort *
   w.s0 = f2bf((float)c.s0 * qs); w.s1 = f2bf((float)c.s1 * qs); w.s2 = f2bf((float)c.s2 * qs); w.s3 = f2bf((float)c.s3 * qs);
   w.s4 = f2bf((float)c.s4 * qs); w.s5 = f2bf((float)c.s5 * qs); w.s6 = f2bf((float)c.s6 * qs); w.s7 = f2bf((float)c.s7 * qs);
   vstore8(w, 0, dst + lane * 8);
+  if (pos < ring_from) return;
+  const uint at = pos % cache_ring;
+  if (key) {
+    global char *kt = rkc + (size_t)h * cache_ring * D + (size_t)(at / 16) * 2048;
+    vstore4((char4)(c.s0, c.s1, c.s2, c.s3), 0, kt + (size_t)lane * 128 + (size_t)(at % 16) * 4);
+    vstore4((char4)(c.s4, c.s5, c.s6, c.s7), 0, kt + (size_t)lane * 128 + 64 + (size_t)(at % 16) * 4);
+    if (lane == 0) rksc[(size_t)h * cache_ring + at] = qs;
+  } else {
+    vstore8(c, 0, rvc + ((size_t)h * cache_ring + at) * D + lane * 8);
+    if (lane == 0) rvsc[(size_t)h * cache_ring + at] = qs;
+  }
 }
 
 // Positions from .. from + n - 1 of an int8 ring (the K tiles, V rows and scales of tf_ink2_prep8) to a bf16 ring of
