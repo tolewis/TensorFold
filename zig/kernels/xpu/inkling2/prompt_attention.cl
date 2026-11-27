@@ -147,9 +147,11 @@ kernel void tf_ink2_attn_prompt(global const ushort *q, global const ushort *kc,
 // of tf_ink2_prep8 (K codes in 16-position tiles [dim / 4][16 positions][4 codes], V codes row-major, one fp32 scale a
 // position and K/V head, head-major). K: the sub-group reads a tile's codes a key a lane, writes them to local memory as a
 // row-major bf16 tile (a code from -127 to 127 is exact in bf16) and gives the DPAS the codes, then each key's score takes
-// its K scale: S = (q . code) * kscale * scale. V: a 2D read gives each lane one dim of the tile's 16 keys, and each value
-// enters the P.V DPAS as bf16(code * vscale), one bf16 rounding more than the decode read. A key past the chunk enters S as
-// -inf and V as an exact zero by a select: a position never written can hold any bits, also an inf or a NaN scale.
+// its K scale: S = (q . code) * kscale * scale. V: block reads give each lane 4 dims of 2 keys, and the sub-group writes the
+// tile to a second local tile as bf16(code * vscale) in the B layout of the P.V DPAS (a word holds keys 2i and 2i + 1 of
+// one dim), one bf16 rounding more than the decode read. Both tiles fill at the tile start in loops that do not unroll:
+// the same staging after the softmax, or unrolled, spills 3 to 8 KB a thread at 256 GRF. A key past the chunk enters S as -inf and V as an exact zero by a
+// select: a position never written can hold any bits, also an inf or a NaN scale.
 #define KROW 132 // ushorts a key row of the local K tile: 128 dims and a pad that spreads the writes over the banks
 __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(16, 1, 1)))
 kernel void tf_ink2_attn_prompt8(global const ushort *q, global const char *kc, global const float *ksc, global const char *vc,
@@ -157,7 +159,11 @@ kernel void tf_ink2_attn_prompt8(global const ushort *q, global const char *kc, 
                                  global float2 *part_ml, uint heads, uint kv_heads, uint ring, uint chunk, uint c0, uint chunks,
                                  float scale) {
   local ushort pl[PAIRS * KEYS]; // P as A tiles: pair a lane, then (pair, key) for the matrix units
-  local ushort kl[KEYS * KROW];  // the tile's K codes as bf16, a key a row
+  // the tile's K codes as bf16, a key a row. A uint array seen as ushorts: declared as a ushort array, the kernel spills
+  // 128 bytes a thread
+  local uint kw[KEYS * KROW / 2];
+  local ushort *kl = (local ushort *)kw;
+  local uint vv[KEYS / 2 * D];   // the tile's V as bf16(code * vscale): word (i, d) holds keys 2i and 2i + 1 of dim d
   const InkSeg s = segs[0];
   const uint total = (uint)s.n * GROUP, m0 = get_group_id(0) * PAIRS, kvh = get_group_id(1), lane = get_sub_group_local_id();
   const uint c = c0 + get_group_id(2), b_lo = c * chunk;
@@ -185,7 +191,7 @@ kernel void tf_ink2_attn_prompt8(global const ushort *q, global const char *kc, 
     global const char *kt_k = khead + (size_t)at0 * D;  // tile at0 / 16 of 2,048 bytes
     global const char *kt_v = vhead + (size_t)at0 * D;
     // lane l: key l's codes. Word i of slab j sits at byte 64 (8j + i) + 4l: dims 4 (8j + i) .. 4 (8j + i) + 3.
-    UNROLL
+    __attribute__((opencl_unroll_hint(1)))
     for (uint j = 0; j < 4; ++j) {
       const uint8 x = intel_sub_group_block_read_ui8((global const uint *)(kt_k + (size_t)j * 512));
       UNROLL
@@ -197,6 +203,22 @@ kernel void tf_ink2_attn_prompt8(global const ushort *q, global const char *kc, 
     }
     const float kown = ks[at0 + lane]; // key l's scales; the tile lies inside the ring, so every lane reads in bounds
     const float vown = vs[at0 + lane];
+    // Block p2 of 256 bytes holds keys 2 p2 and 2 p2 + 1. Word i of lane l: key 2 p2 + i / 2, dims 64 (i % 2) + 4l .. + 3.
+    __attribute__((opencl_unroll_hint(1)))
+    for (uint p2 = 0; p2 < 8; ++p2) {
+      const uint4 x = intel_sub_group_block_read_ui4((global const uint *)(kt_v + (size_t)p2 * 256));
+      const uint k0 = 2 * p2;
+      const float s0 = sub_group_broadcast(vown, k0), s1 = sub_group_broadcast(vown, k0 + 1);
+      const bool l0 = (int)k0 < nv, l1 = (int)k0 + 1 < nv;
+      UNROLL
+      for (uint h = 0; h < 2; ++h) {
+        const float4 f0 = convert_float4(as_char4(x[h])), f1 = convert_float4(as_char4(x[2 + h]));
+        uint4 w;
+        UNROLL
+        for (uint t = 0; t < 4; ++t) w[t] = (uint)(l0 ? f2bf(f0[t] * s0) : (ushort)0) | ((uint)(l1 ? f2bf(f1[t] * s1) : (ushort)0) << 16);
+        vstore4(w, 0, vv + p2 * D + 64 * h + 4 * lane);
+      }
+    }
     barrier(CLK_LOCAL_MEM_FENCE);
     float8 sc[KEYS / 8];
     UNROLL
@@ -254,27 +276,13 @@ kernel void tf_ink2_attn_prompt8(global const ushort *q, global const char *kc, 
     }
     UNROLL
     for (uint j = 0; j < D / 16; ++j) {
-      // lane l: dim 16j + l of the tile's keys, word w holds keys 4w .. 4w + 3; rows past nv read as zero codes
-      uint w8[8];
-      intel_sub_group_2d_block_read_transform_8b_32r16x1c((global void *)kt_v, D, nv, D, (int2)(j * 16, 0), w8);
       uint8 vw;
       UNROLL
-      for (uint w = 0; w < 4; ++w) {
-        const float4 f = convert_float4(as_char4(w8[w]));
-        ushort e[4];
-        UNROLL
-        for (uint t = 0; t < 4; ++t) {
-          const uint key = 4 * w + t;
-          const float vscale = sub_group_broadcast(vown, key);
-          e[t] = (int)key < nv ? f2bf(f[t] * vscale) : (ushort)0;
-        }
-        vw[2 * w] = (uint)e[0] | ((uint)e[1] << 16);
-        vw[2 * w + 1] = (uint)e[2] | ((uint)e[3] << 16);
-      }
+      for (uint i = 0; i < 8; ++i) vw[i] = vv[i * D + j * 16 + lane];
       o[0][j] = intel_sub_group_bf16_bf16_matrix_mad_k16(a0, as_int8(vw), o[0][j]);
       o[1][j] = intel_sub_group_bf16_bf16_matrix_mad_k16(a1, as_int8(vw), o[1][j]);
     }
-    barrier(CLK_LOCAL_MEM_FENCE); // the next tile rewrites pl and kl
+    barrier(CLK_LOCAL_MEM_FENCE); // the next tile rewrites pl, kl and vv
   }
   const uint slot = get_group_id(2);
   UNROLL
