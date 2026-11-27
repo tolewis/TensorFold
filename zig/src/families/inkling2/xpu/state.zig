@@ -185,6 +185,8 @@ pub const Cache = struct {
     tap: Tap = .{},
     last_tap: ?rt.Buffer = null,
     capacity: usize,
+    /// The leader's stream slot this cache serves: 0 to `--parallel` - 1, and `--parallel` for the warm-up cache.
+    slot: u32 = 0,
     len: usize = 0,
     pending: ?usize = null,
     r: *rt.Runtime,

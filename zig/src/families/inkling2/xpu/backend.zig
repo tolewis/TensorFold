@@ -9,6 +9,7 @@ const fwd = @import("forward.zig");
 const prefill = @import("prefill.zig");
 const Model = @import("model.zig").Model;
 const snapshot = @import("snapshot.zig");
+const group = @import("group.zig");
 const sampler = @import("sampler.zig");
 const cfg = @import("../config.zig");
 const be = lanes.backend;
@@ -64,6 +65,10 @@ pub const Xpu = struct {
     prepared: bool = false,
     sink: ?be.FeatureSink = null,
     tap_gen: u64 = 0,
+    /// One bit a stream slot the leader has given out: slot 0 to `options.streams` - 1.
+    slot_used: u32 = 0,
+    /// The next prompt cache snapshot id, so the follower names the same snapshots.
+    snap_next: u32 = 0,
 
     pub fn init(gpa: std.mem.Allocator, model: *Model, options: Options) !*Xpu {
         const out = try gpa.create(Xpu);
@@ -210,6 +215,29 @@ pub const Xpu = struct {
         return h;
     }
 
+    /// The lowest free stream slot. Rank 1 keys its caches by it, so a stream's state stays apart.
+    fn takeSlot(self: *Xpu) !u32 {
+        var s: u32 = 0;
+        while (s < @min(self.options.streams, 32)) : (s += 1) {
+            const bit = @as(u32, 1) << @intCast(s);
+            if (self.slot_used & bit == 0) {
+                self.slot_used |= bit;
+                return s;
+            }
+        }
+        return error.InklingStateFull;
+    }
+
+    fn freeSlot(self: *Xpu, slot: u32) void {
+        if (slot < 32) self.slot_used &= ~(@as(u32, 1) << @intCast(slot));
+    }
+
+    /// One record to rank 1 for a cache control (a keep, a release, a save, a restore or a drop); rank 0 only.
+    fn tell(self: *Xpu, op: group.Op, snap: u32, segs: []const group.Seg) !void {
+        if (self.model.options.place.rank != 0) return;
+        if (group.live) |gp| try gp.note(op, &.{}, 0, segs, snap);
+    }
+
     fn put(self: *Xpu, token: u32) u64 {
         const h = self.take();
         self.tokens[h % ring] = token;
@@ -282,7 +310,10 @@ pub const Xpu = struct {
         self.held += need;
         errdefer self.held -= need;
         if (self.room) |r| r.fit(r.ctx, self.options.budget - self.held, stream.reuse.saved, ids);
+        const slot = try self.takeSlot();
+        errdefer self.freeSlot(slot);
         const cache = try self.createCache(ids.len + stream.max_new);
+        cache.slot = slot;
         errdefer self.gpa.destroy(cache);
         errdefer cache.deinit();
         try self.caches.put(self.gpa, stream, cache);
@@ -291,7 +322,12 @@ pub const Xpu = struct {
         if (stream.reuse.saved) |saved| {
             const snap: *const snapshot.Snap = @ptrCast(@alignCast(saved));
             if (snap.at < ids.len) {
-                if (snapshot.restore(cache, snap)) stream.cached = @intCast(snap.at) else |_| stream.reuse_failed = true;
+                if (snapshot.restore(cache, snap)) {
+                    stream.cached = @intCast(snap.at);
+                    // Rank 1 keeps its own copy of a snapshot: this record restores that copy into the slot's cache
+                    // before the first prompt chunk, so the follower attends to the same K/V and history.
+                    try self.tell(.restore, snap.id, &[_]group.Seg{.{ .slot = slot, .rows = 0, .base = 0, .capacity = @intCast(cache.capacity), .accepted = 0 }});
+                } else |_| stream.reuse_failed = true;
             } else stream.reuse_failed = true;
         }
         try self.feed(cache, ids[cache.len..], stream);
@@ -301,7 +337,12 @@ pub const Xpu = struct {
     pub fn warm(self: *Xpu) !void {
         var cache = try st.Cache.init(self.model.r, st.prompt_rows + st.window_rows, &self.model.weight_plan, kv);
         cache.kv_channels = self.model.options.place.kvWidth();
-        defer cache.deinit();
+        // The warm-up cache uses the slot after the streams and frees it at the end, so the follower drops that cache too.
+        cache.slot = self.options.streams;
+        defer {
+            self.tell(.release, 0, &[_]group.Seg{.{ .slot = cache.slot, .rows = 0, .base = @intCast(cache.len), .capacity = @intCast(cache.capacity), .accepted = 0 }}) catch |err| std.log.err("inkling2_loop warm release: {s}", .{@errorName(err)});
+            cache.deinit();
+        }
         var ids: [st.prompt_rows]u32 = undefined;
         for (&ids, 0..) |*t, i| t.* = @intCast(1000 + i * 37 % 20000);
         try self.feed(&cache, &ids, null);
@@ -477,7 +518,10 @@ pub const Xpu = struct {
             const cache = try self.cacheOf(w.stream);
             for (path, 0..) |r, i| if (r != i) return error.UnsupportedInklingTree;
             if (path.len == 0 or path.len > w.rows() or cache.pending == null or cache.pending.? != w.rows()) return error.UnsupportedInklingWindow;
+            const base = cache.len;
             try cache.commit(path.len);
+            // The follower commits from this record, not from the next base: the rows it accepts belong to this slot.
+            try self.tell(.keep, 0, &[_]group.Seg{.{ .slot = cache.slot, .rows = @intCast(w.rows()), .base = @intCast(base), .capacity = @intCast(cache.capacity), .accepted = @intCast(path.len) }});
         }
     }
 
@@ -494,6 +538,9 @@ pub const Xpu = struct {
         const self = cast(ptr);
         if (self.caches.fetchRemove(stream)) |entry| {
             const cache = entry.value;
+            // The follower frees the slot's cache when it hears this, so the slot can serve the next stream.
+            self.tell(.release, 0, &[_]group.Seg{.{ .slot = cache.slot, .rows = 0, .base = @intCast(cache.len), .capacity = @intCast(cache.capacity), .accepted = 0 }}) catch |err| std.log.err("inkling2_loop release record: {s}", .{@errorName(err)});
+            self.freeSlot(cache.slot);
             if (cache.pending != null) cache.rollback() catch |err| std.log.err("inkling2_loop rollback at release: {s}", .{@errorName(err)});
             self.held -= streamBytes(cache.capacity);
             cache.deinit();
@@ -514,6 +561,12 @@ pub const Xpu = struct {
         const snap = try self.gpa.create(snapshot.Snap);
         errdefer self.gpa.destroy(snap);
         snap.* = try snapshot.save(self.model.r, cache);
+        errdefer snap.free();
+        snap.id = self.snap_next;
+        self.snap_next +%= 1;
+        // The follower saves its own half of the cache under the same id, so a restore on either rank rebuilds that rank's
+        // half of the K/V and the convolution states.
+        try self.tell(.save, snap.id, &[_]group.Seg{.{ .slot = cache.slot, .rows = 0, .base = at, .capacity = @intCast(cache.capacity), .accepted = 0 }});
         return snap;
     }
 
@@ -523,6 +576,8 @@ pub const Xpu = struct {
 
     pub fn snapDrop(ptr: *anyopaque, saved: *anyopaque) void {
         const snap: *snapshot.Snap = @ptrCast(@alignCast(saved));
+        // The follower frees its copy of the same snapshot.
+        cast(ptr).tell(.drop, snap.id, &.{}) catch |err| std.log.err("inkling2_loop drop record: {s}", .{@errorName(err)});
         snap.free();
         cast(ptr).gpa.destroy(snap);
     }

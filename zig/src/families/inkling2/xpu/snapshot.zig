@@ -17,6 +17,8 @@ pub const Snap = struct {
     at: usize,
     bytes: u64,
     kv: state.KvDtype,
+    /// The leader's snapshot id, so the follower saves, restores and drops the same snapshot on its own half.
+    id: u32 = 0,
     freed: bool = false,
 
     pub fn free(s: *Snap) void {

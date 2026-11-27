@@ -920,7 +920,12 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     try m.r.upload(s.segs, std.mem.sliceAsBytes(segs[0..segments.len]));
     var wrote: [state.visit_slots]u8 = @splat(0);
     const g = Run{ .m = m, .p = p, .s = stream, .sc = s, .wrote = if (fuse.roleConv() and rows == 1) &wrote else null };
-    if (m.options.place.rank == 0) if (group.live) |gp| try gp.note(.forward, ids, if (options.all) 1 else 0, @intCast(segments[0].cache.len));
+    if (m.options.place.rank == 0) if (group.live) |gp| {
+        // Each stream's rows name their own slot, base and capacity: rank 1 runs a stream's state in a cache of its own.
+        var table: [state.max_segments]group.Seg = undefined;
+        for (segments, 0..) |seg, si| table[si] = .{ .slot = seg.cache.slot, .rows = @intCast(seg.rows), .base = @intCast(seg.cache.len), .capacity = @intCast(seg.cache.capacity), .accepted = 0 };
+        try gp.note(.forward, ids, if (options.all) 1 else 0, table[0..segments.len], 0);
+    };
     try glue.embedNorm(&p.glue, stream, at(s.ids, 0), tensor(m.weights.embed), tensor(m.weights.embed_norm), at(s.p, 0), @intCast(rows));
     const vdump = std.c.getenv("TF_TP_VDUMP") != null and rows <= state.batch_rows;
     const seq = vdump_seq;
