@@ -209,6 +209,21 @@ pub const Xpu = struct {
         return if (t.temperature > 0) t else null;
     }
 
+    /// True when every window of the round samples with the seed, temperature and filters of the first one, so that
+    /// `raceRows` can take those settings from `windows[0]` for every row. A window with other settings must run
+    /// `select`, which reads each row's own picks (B16: C3).
+    pub fn oneSampling(windows: []const be.Window) bool {
+        if (windows.len == 0) return false;
+        const first = windows[0].stream.sampling orelse return false;
+        if (sampled(first) == null) return false;
+        for (windows[1..]) |w| {
+            const t = w.stream.sampling orelse return false;
+            if (sampled(t) == null) return false;
+            if (t.seed != first.seed or t.temperature != first.temperature or t.top_k != first.top_k or t.top_p != first.top_p or t.min_p != first.min_p) return false;
+        }
+        return true;
+    }
+
     fn take(self: *Xpu) u64 {
         const h = self.next;
         self.next += 1;
@@ -446,7 +461,7 @@ pub const Xpu = struct {
             at += w.rows();
         }
         var raced: ?[]const u32 = null;
-        if (any and !whole and total > 0) {
+        if (any and !whole and total > 0 and oneSampling(windows)) {
             const t0 = sampled(windows[0].stream.sampling).?;
             if (t0.top_k == 0 and t0.top_p >= 1.0 and t0.min_p == 0.0) {
                 var pos: [st.batch_rows]u32 = undefined;
@@ -614,6 +629,29 @@ fn logprobRow(l: []const f32, pick: u32, count: u8) lanes.LogprobRow {
     }
     r.count = @min(count, top);
     return r;
+}
+
+test "the sampler race runs only when every window shares the first one's sampling" {
+    const t = std.testing;
+    var a: lanes.Stream = undefined;
+    var b: lanes.Stream = undefined;
+    a.sampling = .{ .seed = 11, .temperature = 0.8, .top_k = 0, .top_p = 1.0 };
+    b.sampling = .{ .seed = 11, .temperature = 0.8, .top_k = 0, .top_p = 1.0 };
+    var windows = [_]be.Window{
+        .{ .stream = &a, .pending = 1, .held = 0, .tokens = &.{}, .parents = null, .positions = &.{ 1, 2 } },
+        .{ .stream = &b, .pending = 3, .held = 0, .tokens = &.{}, .parents = null, .positions = &.{ 5, 6 } },
+    };
+    try t.expect(Xpu.oneSampling(&windows));
+    // Another seed samples differently: the round must read each row's own picks.
+    windows[1].stream.sampling.?.seed = 99;
+    try t.expect(!Xpu.oneSampling(&windows));
+    windows[1].stream.sampling.?.seed = 11;
+    // Another temperature samples differently too.
+    windows[1].stream.sampling.?.temperature = 0.3;
+    try t.expect(!Xpu.oneSampling(&windows));
+    // A greedy window is drawn on the host, so it never races.
+    windows[1].stream.sampling.?.temperature = 0;
+    try t.expect(!Xpu.oneSampling(&windows));
 }
 
 test "sampled first-token logprob uses the last written handle, not argmax" {

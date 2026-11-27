@@ -708,15 +708,19 @@ fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) 
         base = 0;
         // The down epilogue re-does the expert combine from s.down, which on a split rank holds only that rank's
         // experts. It would overwrite the reduced mlp_out with a rank-local half sum, so a split rank keeps the plain
-        // branch, which reads the reduced mlp_out.
-        if (fuse.downEpi() and segments.len == 1 and !g.m.options.place.split()) {
-            const seg = segments[0];
+        // branch, which reads the reduced mlp_out. An unsplit rank runs the epilogue a segment, at the segment's row
+        // offset and with its own history, so every stream combines the way it does alone (B16: C1).
+        if (fuse.downEpi() and !g.m.options.place.split()) {
             const channels: u32 = @intCast(state.convWidth(3));
             const commit1: u32 = if (fuse.roleConv() and rows == 1) 1 else 0;
             if (commit1 == 1) if (g.wrote) |mask| {
                 mask[v.cache_slot] = mask[v.cache_slot] | 0x8;
             };
-            try fuse.downEpilogue(&g.p.fuse, g.s, at(s.down, 0), at(s.route_ids, 0), at(s.route_weights, 0), seg.cache.history(v.cache_slot, 3).ptr(), seg.cache.staged(v.cache_slot, 3, 0).ptr(), tensor(w.mlp_conv), at(s.mlp_out, 0), at(s.mlp_conv, 0), at(s.partial, 0), at(s.p, 0), state.hidden, 8, channels, @intCast(rows), commit1);
+            var b: usize = 0;
+            for (segments) |seg| {
+                try fuse.downEpilogue(&g.p.fuse, g.s, at(s.down, b * state.row_down), at(s.route_ids, b * state.row_route_ids), at(s.route_weights, b * state.row_route_weights), seg.cache.history(v.cache_slot, 3).ptr(), seg.cache.staged(v.cache_slot, 3, 0).ptr(), tensor(w.mlp_conv), at(s.mlp_out, b * state.row_mlp_out), at(s.mlp_conv, b * state.row_mlp_conv), at(s.partial, b * state.row_partial), at(s.p, b * state.row_p), state.hidden, 8, channels, @intCast(seg.rows), commit1);
+                b += seg.rows;
+            }
         } else if (fuse.convFold() and segments.len == 1) {
             const seg = segments[0];
             const channels: u32 = @intCast(state.convWidth(3));

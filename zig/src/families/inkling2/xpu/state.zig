@@ -97,6 +97,30 @@ pub fn cacheBytes(capacity: usize, kv: KvDtype) usize {
     return kvBytes(capacity, kv) + conv_bytes + taps_bytes + conv_bytes + vocabulary * 4;
 }
 
+/// Bytes one row takes in the scratch buffers the down epilogue reads a segment at. They are the `sizes` entries that grow
+/// one row at a time, so a segment's rows start at its own offset.
+pub const row_p = hidden * 2;
+pub const row_partial = hidden * 4;
+pub const row_route_ids = experts_per_token * 4;
+pub const row_route_weights = experts_per_token * 4;
+pub const row_down = experts_per_token * hidden * 2;
+pub const row_mlp_out = hidden * 2;
+pub const row_mlp_conv = hidden * 2;
+
+// The row bytes are the `sizes` entries at one row, checked by the host test below.
+test "the down epilogue's row bytes are the scratch's row bytes at one row" {
+    const t = std.testing;
+    var one = sizes(1, 1);
+    _ = &one;
+    try t.expectEqual(row_p, one[4]);
+    try t.expectEqual(row_partial, one[10]);
+    try t.expectEqual(row_route_ids, one[35]);
+    try t.expectEqual(row_route_weights, one[36]);
+    try t.expectEqual(row_down, one[38]);
+    try t.expectEqual(row_mlp_out, one[39]);
+    try t.expectEqual(row_mlp_conv, one[40]);
+}
+
 /// The largest global capacity (at most `max_capacity`) whose cache fits `budget` bytes; zero when none does.
 pub fn largestCapacity(budget: u64, kv: KvDtype) usize {
     if (cacheBytes(1, kv) > budget) return 0;
@@ -124,6 +148,12 @@ pub fn convBase(state: usize, tap_rows: usize) usize {
 pub fn convByteOffset(slot: usize, state: usize, rows_before: usize, tap_rows: usize) usize {
     std.debug.assert(slot < visit_slots and rows_before <= tap_rows);
     return (slot * tap_rows * conv_row_values + convBase(state, tap_rows) + rows_before * convWidth(state)) * 2;
+}
+
+/// Where a partial accept's KV taps start in the staging ring: `accepted` rows at the tap width `channels`. The taps are
+/// packed at the rank width (512 on a split rank), so this is `accepted * channels * 2` bytes into the slot's ring.
+pub fn commitFrom(slot: usize, cs: usize, accepted: usize, channels: usize) usize {
+    return convByteOffset(slot, cs, 0, 3 + max_rows) + accepted * channels * 2;
 }
 
 /// A byte offset into a device buffer; the buffer value is borrowed, never freed through a Ref.
@@ -277,7 +307,7 @@ pub const Cache = struct {
                 const kv = cs < 2;
                 const channels: usize = if (kv) c.kv_channels else convWidth(cs);
                 const bytes = 3 * channels * 2;
-                const from = if (kv) convByteOffset(slot, cs, 0, 3 + max_rows) + accepted * channels * 2 else convByteOffset(slot, cs, accepted, 3 + max_rows);
+                const from = if (kv) commitFrom(slot, cs, accepted, channels) else convByteOffset(slot, cs, accepted, 3 + max_rows);
                 const to = convByteOffset(slot, cs, 0, 3);
                 try c.r.copy(view(c.conv, to, bytes), view(c.taps, from, bytes), bytes);
             };
@@ -476,4 +506,17 @@ test "capacity math: bytes a context costs and the largest one a budget holds" {
 
 test "conv offsets tile one slot exactly" {
     try std.testing.expectEqual(conv_bytes, convByteOffset(visit_slots - 1, conv_states - 1, 3, 3) + 0 + 0);
+}
+
+test "a rank-width commit reads the accepted rows' taps at that width" {
+    const t = std.testing;
+    // a split rank holds 4 of the 8 K/V heads: 4 * 128 channels
+    const rank_width = 4 * ap.head_dim;
+    const slot: usize = 5;
+    const base = convByteOffset(slot, 0, 0, 3 + max_rows);
+    try t.expectEqual(base + rank_width * 2, commitFrom(slot, 0, 1, rank_width));
+    try t.expectEqual(base + 3 * rank_width * 2, commitFrom(slot, 0, 3, rank_width));
+    // the full width would read twice as far into the ring
+    try t.expectEqual(base + kv_width * 2, commitFrom(slot, 0, 1, kv_width));
+    try t.expect(commitFrom(slot, 0, 1, kv_width) - base == 2 * (commitFrom(slot, 0, 1, rank_width) - base));
 }
