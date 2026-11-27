@@ -4,7 +4,8 @@
 //! default. `--splits N` sets the decode chunk the server uses (`flash_splits`, 64 live), zero keeps the layer chunk.
 //! `--check` times nothing: it fills int8 codes with power-of-two scales and a bf16 cache that holds each code times its
 //! scale exactly, then requires `tf_ink2_attn_decode8` to give the partials and the output of `tf_ink2_attn_decode` bit
-//! for bit, at the layer chunk and at 128 splits. Exit 1 on a difference.
+//! for bit, at the layer chunk and at 128 splits, and `tf_ink2_attn_prompt8` those of `tf_ink2_attn_prompt` (a code times
+//! a power-of-two scale rounds to itself in bf16, so the prompt read's V rounding changes nothing). Exit 1 on a difference.
 const std = @import("std");
 const xpu = @import("xpu");
 const rig_ = @import("contract_rig.zig");
@@ -54,6 +55,8 @@ fn check(a: std.mem.Allocator, dev: *rig_.Dev, k: *const attn.Kernels, rng: std.
         .{ .name = "global 8 rows, 3,000 keys", .rows = 8, .k = 3000, .window = 0 },
         .{ .name = "global 1 row, 40,000 keys", .rows = 1, .k = 40000, .window = 0 },
         .{ .name = "sliding 1 row, 2,048 keys, window start 1,024", .rows = 1, .k = 2048, .window = 1024 },
+        .{ .name = "global prompt 100 rows, 3,000 keys", .rows = 100, .k = 3000, .window = 0, .prompt = true },
+        .{ .name = "global prompt 256 rows, 2,056 keys", .rows = 256, .k = 2056, .window = 0, .prompt = true },
     };
     var failed: usize = 0;
     for ([_]u32{ 0, 128 }) |splits| {
@@ -65,7 +68,7 @@ fn check(a: std.mem.Allocator, dev: *rig_.Dev, k: *const attn.Kernels, rng: std.
             const layer: plan.Layer = if (cs.window > 0) plan.Layer.sliding(cs.window, cs.rows) else plan.Layer.global(cs.k);
             const rows = cs.rows;
             const ring: usize = layer.ring;
-            const stride = plan.slotsFor(layer, cs.k);
+            const stride = @max(plan.slotsFor(layer, cs.k), plan.chunks(cs.k - 1, plan.prompt_chunk));
             const cache_n = @as(usize, KV) * ring * D;
             const kb = try a.alloc(u16, cache_n);
             defer a.free(kb);
@@ -137,9 +140,16 @@ fn check(a: std.mem.Allocator, dev: *rig_.Dev, k: *const attn.Kernels, rng: std.
             const pml: attn.Ref = .{ .ptr = try rig.scratch(pml_n) };
             const out: attn.Ref = .{ .ptr = try rig.output(out_n) };
             const r: plan.Rows = .{ .rows = rows, .last_pos = cs.k - 1 };
+            const path: plan.Path = if (cs.prompt) .prompt else .decode;
+            const zeros = try a.alloc(u8, po_n);
+            defer a.free(zeros);
+            @memset(zeros, 0);
             var got: [2][3][]u8 = undefined;
             for ([_]attn.Cache{ bf, i8c }, 0..) |c, w| {
-                try attn.attendAs(k, dev.s, .decode, r, layer, stride, meta, qd, c, tabd, po, pml, sinkd, gated, out);
+                // a slot no chunk writes keeps its bytes from the first kernel: clear both before each
+                try rig.put(po.ptr, zeros);
+                try rig.put(pml.ptr, zeros[0..pml_n]);
+                try attn.attendAs(k, dev.s, path, r, layer, stride, meta, qd, c, tabd, po, pml, sinkd, gated, out);
                 got[w][0] = try a.dupe(u8, try rig.bytes(po.ptr, po_n));
                 got[w][1] = try a.dupe(u8, try rig.bytes(pml.ptr, pml_n));
                 got[w][2] = try a.dupe(u8, try rig.bytes(out.ptr, out_n));
@@ -151,7 +161,7 @@ fn check(a: std.mem.Allocator, dev: *rig_.Dev, k: *const attn.Kernels, rng: std.
                 const y = std.mem.bytesAsSlice(u32, got[1][j][0 .. got[1][j].len / 4 * 4]);
                 for (x, y) |u, v| diff[j] += @intFromBool(u != v);
             }
-            const launch = try plan.attendAs(r, layer, stride, .decode);
+            const launch = try plan.attendAs(r, layer, stride, path);
             std.debug.print("CHECK splits {d} chunk {d}, {s}: int8 against bf16 on equal values, words that differ: partials {d} of {d}, max and sum {d} of {d}, output {d} of {d}\n", .{ splits, launch.chunk, cs.name, diff[0], po_n / 4, diff[1], pml_n / 4, diff[2], out_n / 4 });
             if (diff[0] + diff[1] + diff[2] != 0) failed += 1;
         }
@@ -195,6 +205,10 @@ pub fn main(init: std.process.Init) !u8 {
         const d8 = try dev.properties(k.decode8);
         std.debug.print("BENCH kernel properties: tf_ink2_prep8 {d} spill bytes, {d} private bytes; tf_ink2_attn_decode8 {d} spill bytes, {d} private bytes\n", .{ p8.spillMemSize, p8.privateMemSize, d8.spillMemSize, d8.privateMemSize });
     }
+    for ([_]struct { []const u8, xpu.Kernel }{ .{ "tf_ink2_attn_prompt", k.prompt }, .{ "tf_ink2_attn_prompt8", k.prompt8 } }) |e| {
+        const p = try dev.properties(e[1]);
+        std.debug.print("BENCH kernel properties: {s} {d} spill bytes, {d} private bytes, {d} local bytes, {d} arguments\n", .{ e[0], p.spillMemSize, p.privateMemSize, p.localMemSize, p.numKernelArgs });
+    }
     const cases = [_]Case{
         .{ .name = "sliding decode 1 row, 1,024 keys", .rows = 1, .k = 2049, .window = 1024 },
         .{ .name = "sliding verify 8 rows, 1,024 keys", .rows = 8, .k = 2056, .window = 1024 },
@@ -204,14 +218,14 @@ pub fn main(init: std.process.Init) !u8 {
         .{ .name = "global decode 1 row, 100,000 keys", .rows = 1, .k = 100000, .window = 0 },
         .{ .name = "global decode 1 row, 125,000 keys", .rows = 1, .k = 125000, .window = 0 },
         .{ .name = "global prompt 256 rows over 8,192 keys", .rows = 256, .k = 8192, .window = 0, .prompt = true },
+        .{ .name = "global prompt 256 rows over 40,000 keys", .rows = 256, .k = 40000, .window = 0, .prompt = true },
+        .{ .name = "global prompt 2,048 rows over 40,000 keys", .rows = 2048, .k = 40000, .window = 0, .prompt = true },
     };
     var prng = std.Random.DefaultPrng.init(7);
     const rng = prng.random();
     if (do_check) return if (try check(a, &dev, &k, rng) == 0) 0 else 1;
     std.debug.print("BENCH inkling2 attention on {s}, kv {s}, splits {d}, roof {d:.1} GB/s read\n", .{ "bmg-g31", if (kv_int8) "int8" else "bf16", splits, roof_gbs });
     for (cases) |cs| {
-        // the prompt kernel reads bf16 rows only, so an int8 run keeps the decode cases
-        if (kv_int8 and cs.prompt) continue;
         var rig: rig_.Rig = .{ .a = a, .dev = &dev };
         defer rig.deinit();
         const layer: plan.Layer = if (cs.window > 0) plan.Layer.sliding(cs.window, cs.rows) else plan.Layer.global(cs.k);
@@ -325,6 +339,13 @@ pub fn main(init: std.process.Init) !u8 {
                         } else {
                             try xpu.launch.dispatch(k.decode, dev.s, launch.grid, .{ qd.at(), c.k.at(), c.v.at(), tabd.at(), meta.segs.at(), po.at(), pml.at(), meta.pos.at(), meta.seg_of.at(), @as(u32, H), @as(u32, KV), layer.ring, layer.window, launch.chunk, @as(u32, 0), launch.partials_rh, sc });
                         }
+                    } else if (which == 0 and kv_int8) {
+                        try xpu.launch.dispatch(k.prompt8, dev.s, launch.grid, .{
+                            qd.at(),          c.k.at(),      c.kscale.at(), c.v.at(),         c.vscale.at(),
+                            tabd.at(),        meta.segs.at(), po.at(),       pml.at(),        @as(u32, H),
+                            @as(u32, KV),     layer.ring,    launch.chunk,  @as(u32, 0),     launch.partials_rh,
+                            sc,
+                        });
                     } else if (which == 0) {
                         try xpu.launch.dispatch(k.prompt, dev.s, launch.grid, .{ qd.at(), c.k.at(), c.v.at(), tabd.at(), meta.segs.at(), po.at(), pml.at(), @as(u32, H), @as(u32, KV), layer.ring, launch.chunk, @as(u32, 0), launch.partials_rh, sc });
                     } else {

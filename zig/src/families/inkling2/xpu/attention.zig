@@ -49,9 +49,11 @@ const names = struct {
     const merge: Entry = .{ .name = "tf_ink2_merge", .threads = planning.merge_threads };
     const merge_split: Entry = .{ .name = "tf_ink2_merge_split", .threads = planning.merge_threads };
     const prompt: Entry = .{ .name = "tf_ink2_attn_prompt", .threads = planning.prompt_threads };
+    const prompt8: Entry = .{ .name = "tf_ink2_attn_prompt8", .threads = planning.prompt_threads };
 };
 
-/// The five kernels of two loaded images: `attention` holds prep, relative table, decode and merge; `prompt` the prompt kernel.
+/// The kernels of two loaded images: `attention` holds prep, relative table, decode and merge (bf16 and int8 entries);
+/// `prompt` the prompt kernel and its int8 read.
 pub const Kernels = struct {
     prep: xpu.Kernel,
     prep8: xpu.Kernel,
@@ -61,6 +63,7 @@ pub const Kernels = struct {
     merge: xpu.Kernel,
     merge_split: xpu.Kernel,
     prompt: xpu.Kernel,
+    prompt8: xpu.Kernel,
 
     pub fn init(attention: xpu.Module, prompt: xpu.Module) xpu.Error!Kernels {
         var k: Kernels = undefined;
@@ -79,9 +82,12 @@ pub const Kernels = struct {
         k.merge_split = try attention.kernel(names.merge_split.name, .{ names.merge_split.threads, 1, 1 });
         errdefer k.merge_split.deinit();
         k.prompt = try prompt.kernel(names.prompt.name, .{ names.prompt.threads, 1, 1 });
+        errdefer k.prompt.deinit();
+        k.prompt8 = try prompt.kernel(names.prompt8.name, .{ names.prompt8.threads, 1, 1 });
         return k;
     }
     pub fn deinit(k: *Kernels) void {
+        k.prompt8.deinit();
         k.prompt.deinit();
         k.merge_split.deinit();
         k.merge.deinit();
@@ -131,8 +137,7 @@ var attn_logged = false;
 
 /// `attend` on a path the caller names (the contract runs the prompt kernel at a few rows too).
 pub fn attendAs(k: *const Kernels, s: xpu.Stream, path: planning.Path, r: planning.Rows, l: planning.Layer, stride: u32, meta: RowMeta, q: Ref, kv: Cache, tab: Ref, part_o: Ref, part_ml: Ref, sink: Ref, gate: Ref, out: Ref) Error!void {
-    // An int8 cache has no prompt kernel in this lane: the prompt path of prefill refuses int8, so the decode kernel serves.
-    const launch = try planning.attendAs(r, l, stride, if (kv.int8) .decode else path);
+    const launch = try planning.attendAs(r, l, stride, path);
     if (!attn_logged) {
         attn_logged = true;
         std.log.info("inkling2: attn {s} heads {d} kv {d} splits {d} grid {d},{d}", .{ @tagName(launch.path), r.heads, r.kv_heads, planning.flash_splits, launch.grid[0], launch.grid[1] });
@@ -152,6 +157,13 @@ pub fn attendAs(k: *const Kernels, s: xpu.Stream, path: planning.Path, r: planni
                 r.heads,         r.kv_heads,      l.ring,            l.window,      launch.chunk,   @as(u32, 0), launch.partials_rh, scale,
             });
         }
+    } else if (kv.int8) {
+        try xpu.launch.dispatch(k.prompt8, s, launch.grid, .{
+            q.at(),       kv.k.at(),   kv.kscale.at(),    kv.v.at(),    kv.vscale.at(),
+            tab.at(),     meta.segs.at(), part_o.at(),    part_ml.at(), r.heads,
+            r.kv_heads,   l.ring,      launch.chunk,      @as(u32, 0),  launch.partials_rh,
+            scale,
+        });
     } else {
         try xpu.launch.dispatch(k.prompt, s, launch.grid, .{
             q.at(),     kv.k.at(),   kv.v.at(),       tab.at(),     meta.segs.at(),
