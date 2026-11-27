@@ -15,6 +15,7 @@
 const std = @import("std");
 const xpu = @import("xpu");
 const rig_ = @import("contract_rig.zig");
+const ze = @import("ze");
 const attn = @import("inkling2_xpu_attention");
 
 const plan = attn.planning;
@@ -257,6 +258,19 @@ fn realErrors(cs: Case, layer: plan.Layer, chunk: u32, stride: usize, q: []const
         }
     }
     return e;
+}
+
+/// B6: the groups of one kernel that the device holds at one time (`zeKernelSuggestMaxCooperativeGroupCount` at the
+/// kernel's group size of 16 x 1 x 1), and that count over the Xe cores of the device properties.
+fn occupancy(dev: *rig_.Dev, kern: xpu.Kernel) struct { groups: u32, cores: u32, rc: u32 } {
+    var lib = std.DynLib.open("libze_loader.so.1") catch return .{ .groups = 0, .cores = 0, .rc = 1 };
+    defer lib.close();
+    const f = lib.lookup(*const fn (ze.H, *u32) callconv(.c) u32, "zeKernelSuggestMaxCooperativeGroupCount") orelse return .{ .groups = 0, .cores = 0, .rc = 2 };
+    _ = dev.ctx.d.api.zeKernelSetGroupSize(kern.handle, 16, 1, 1);
+    var n: u32 = 0;
+    const rc = f(kern.handle, &n);
+    const pr = dev.ctx.gpu.props;
+    return .{ .groups = n, .cores = pr.numSlices * pr.numSubslicesPerSlice, .rc = rc };
 }
 
 fn checkReal(a: std.mem.Allocator, dev: *rig_.Dev, k: *const attn.Kernels, rng: std.Random) !usize {
@@ -584,6 +598,8 @@ pub fn main(init: std.process.Init) !u8 {
     for ([_]struct { []const u8, xpu.Kernel }{ .{ "tf_ink2_attn_prompt", k.prompt }, .{ "tf_ink2_attn_prompt8", k.prompt8 } }) |e| {
         const p = try dev.properties(e[1]);
         std.debug.print("BENCH kernel properties: {s} {d} spill bytes, {d} private bytes, {d} local bytes, {d} arguments\n", .{ e[0], p.spillMemSize, p.privateMemSize, p.localMemSize, p.numKernelArgs });
+        const occ = occupancy(&dev, e[1]);
+        std.debug.print("BENCH occupancy: {s} {d} groups of 16 lanes resident on the device ({d} Xe cores: {d} a core), zeKernelSuggestMaxCooperativeGroupCount result {d}\n", .{ e[0], occ.groups, occ.cores, if (occ.cores > 0) occ.groups / occ.cores else 0, occ.rc });
     }
     const cases = [_]Case{
         .{ .name = "sliding decode 1 row, 1,024 keys", .rows = 1, .k = 2049, .window = 1024 },
