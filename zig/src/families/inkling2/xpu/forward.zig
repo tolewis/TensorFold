@@ -897,6 +897,78 @@ pub fn checkRouter(m: *const Model, s: *state.Scratch, r: *xpu.rt.Runtime) !usiz
     return bad;
 }
 
+/// The host rule of tf_ink2_router_pick: key = score + bias, a NaN key ranks below every number (as -inf), a larger key
+/// wins, an equal key keeps the lower index. The top 8 in ascending index order, weight = score / (1e-20 + the 8 scores
+/// in that order) * 8.
+fn pickRef(scores: *const [128]f32, bias: *const [128]f32, ids: *[8]u32, weights: *[8]f32) void {
+    var key: [128]f32 = undefined;
+    for (&key, scores, bias) |*k, sc, b| {
+        const v = sc + b;
+        k.* = if (std.math.isNan(v)) -std.math.inf(f32) else v;
+    }
+    var n: usize = 0;
+    for (0..128) |t| {
+        var rank: usize = 0;
+        for (0..128) |j| {
+            if (key[j] > key[t] or (key[j] == key[t] and j < t)) rank += 1;
+        }
+        if (rank < 8) {
+            ids[n] = @intCast(t);
+            n += 1;
+        }
+    }
+    var den: f32 = 1e-20;
+    for (ids) |id| den += scores[id];
+    for (ids, weights) |id, *w| w.* = scores[id] / den * 8.0;
+}
+
+/// tf_ink2_router_pick, one launch of one row, against `pickRef` on three score rows: finite (with ties), one NaN score,
+/// and two NaN scores with one NaN bias. The ids and the weight bits must equal the host rule's.
+pub fn checkPick(m: *const Model, s: *state.Scratch, r: *xpu.rt.Runtime) !usize {
+    if (m.pipelines == null or m.ctx == null) return error.Inkling2NoKernels;
+    const pipes = &m.pipelines.?;
+    const stream = m.r.stream(m.ctx.?);
+    var bad: usize = 0;
+    for (0..3) |case| {
+        var in: [256]f32 = undefined; // scores, then bias
+        for (0..128) |t| {
+            const x: f32 = @floatFromInt((t * 37 + 11) % 101);
+            in[t] = 1.0 / (1.0 + @exp(-(x - 50.0) / 17.0));
+            in[128 + t] = 0.001 * @as(f32, @floatFromInt((t * 7) % 13));
+        }
+        in[40] = in[41]; // a tie
+        in[128 + 40] = in[128 + 41];
+        if (case >= 1) in[5] = std.math.nan(f32);
+        if (case == 2) {
+            in[77] = std.math.nan(f32);
+            in[128 + 100] = std.math.nan(f32);
+        }
+        try r.upload(s.logits_all, std.mem.sliceAsBytes(&in));
+        try xpu.launch.dispatch(pipes.fuse.router_pick, stream, .{ 1, 1, 1 }, .{ at(s.logits_all, 0), at(s.logits_all, 128 * 4), at(s.route_ids, 0), at(s.route_weights, 0), @as(u32, 1) });
+        try stream.synchronize();
+        var ids: [8]u32 = undefined;
+        var w: [8]f32 = undefined;
+        try r.download(std.mem.sliceAsBytes(&ids), s.route_ids);
+        try r.download(std.mem.sliceAsBytes(&w), s.route_weights);
+        try r.sync();
+        var ref_ids: [8]u32 = undefined;
+        var ref_w: [8]f32 = undefined;
+        pickRef(in[0..128], in[128..256], &ref_ids, &ref_w);
+        var case_bad: usize = 0;
+        for (ids, ref_ids, w, ref_w) |a, b, x, y| {
+            if (a != b) case_bad += 1;
+            if (@as(u32, @bitCast(x)) != @as(u32, @bitCast(y))) case_bad += 1;
+        }
+        std.debug.print("PICK-CHECK case {d} ({s}): ids {any} host {any}; weights {any} host {any}; mismatches {d}\n", .{ case, switch (case) {
+            0 => "finite",
+            1 => "score 5 NaN",
+            else => "scores 5 and 77 NaN, bias 100 NaN",
+        }, ids, ref_ids, w, ref_w, case_bad });
+        bad += case_bad;
+    }
+    return bad;
+}
+
 pub fn run(m: *const Model, s: *state.Scratch, cache: *state.Cache, ids: []const u32, options: Options) !void {
     return runShared(m, s, &.{.{ .cache = cache, .rows = ids.len }}, ids, options);
 }

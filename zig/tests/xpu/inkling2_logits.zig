@@ -244,6 +244,7 @@ pub fn main(init: std.process.Init) !void {
     var profile_all = false;
     var fuse_check = false;
     var router_check = false;
+    var pick_check = false;
     var verify_bench = false;
     var two_slot: ?[2]usize = null;
     var route_union = false;
@@ -344,6 +345,8 @@ pub fn main(init: std.process.Init) !void {
             fuse_check = true;
         } else if (std.mem.eql(u8, a, "--router-check")) {
             router_check = true;
+        } else if (std.mem.eql(u8, a, "--pick-check")) {
+            pick_check = true;
         } else if (std.mem.eql(u8, a, "--router-wide")) {
             ink.fuse.router_wide = true;
         } else if (std.mem.eql(u8, a, "--conv-fold")) {
@@ -414,7 +417,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     };
     if (chunk == 0 or chunk > state.max_prefill_rows) return error.BadChunk;
-    if (refs.items.len == 0 and ids_path == null and bench_context == null) return error.NothingToDo;
+    if (refs.items.len == 0 and ids_path == null and bench_context == null and !pick_check) return error.NothingToDo;
 
     // inputs first, so a bad file fails before the model loads
     var loaded_refs: std.ArrayList(Ref) = .empty;
@@ -471,6 +474,14 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("FUSE-A-CHECK mismatches {d}\n", .{bad});
         if (bad != 0) return error.FuseMismatch;
         if (!router_check) return;
+    }
+    if (pick_check) {
+        var scratch_p = try state.Scratch.init(&r, state.max_rows, 64);
+        defer scratch_p.deinit();
+        const bad_p = try ink.forward.checkPick(m, &scratch_p, &r);
+        std.debug.print("PICK-CHECK {s}: mismatches {d}\n", .{ if (bad_p == 0) "PASS" else "FAIL", bad_p });
+        if (bad_p != 0) return error.FuseMismatch;
+        return;
     }
     if (router_check) {
         var scratch_r = try state.Scratch.init(&r, state.max_rows, 64);
