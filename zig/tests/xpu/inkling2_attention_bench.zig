@@ -11,7 +11,8 @@
 //! `tf_ink2_kv_dequant8` must equal the bf16 prep followed by the host quantize rule bit for bit, and the prep8q stage
 //! must equal dequant8 of the prep8 ring. `tf_ink2_attn_decode8` and the int8 prompt read go against an fp64 host
 //! partial (top, weight sum, weighted mean of V) on the exact values `code * scale`, beside the bf16 kernels on
-//! `bf16(code * scale)`. Exit 1 on a difference or an error above the bounds of `real_bounds`.
+//! `bf16(code * scale)`. The int8 prompt read must give the bits of the bf16 kernel on `bf16(code * scale)` (its design).
+//! Exit 1 on a difference or a decode8 error above the bounds of `real_bounds`.
 const std = @import("std");
 const xpu = @import("xpu");
 const rig_ = @import("contract_rig.zig");
@@ -538,6 +539,7 @@ fn checkReal(a: std.mem.Allocator, dev: *rig_.Dev, k: *const attn.Kernels, rng: 
             const path: plan.Path = if (cs.prompt) .prompt else .decode;
             const launch = try plan.attendAs(r, layer, stride, path);
             var errs: [2]RealErr = undefined;
+            var words: [2][]u8 = undefined;
             const copy = try promptCopy(&rig, ring);
             for ([_]attn.Cache{ bf, i8c }, 0..) |c, w| {
                 try attn.attendAs(k, dev.s, path, r, layer, stride, meta, qd, try readAs(k, dev, c, copy, cs, layer), tabd, po, pml, sinkd, gated, out);
@@ -546,9 +548,16 @@ fn checkReal(a: std.mem.Allocator, dev: *rig_.Dev, k: *const attn.Kernels, rng: 
                 const pmlb = try a.dupe(u8, try rig.bytes(pml.ptr, pml_n));
                 defer a.free(pmlb);
                 errs[w] = realErrors(cs, layer, launch.chunk, stride, q, tab, pos, kref, vref, vrms, @alignCast(std.mem.bytesAsSlice(f32, pob)), @alignCast(std.mem.bytesAsSlice([2]f32, pmlb)));
+                words[w] = try std.mem.concat(a, u8, &.{ pob, pmlb });
             }
-            const ok = errs[1].ok();
-            std.debug.print("CHECK-REAL splits {d} chunk {d}, {s}, {s}: against fp64, top / sum / mean error: int8 {e:.2} / {e:.2} / {e:.2}, bf16 cache of bf16(code * scale) {e:.2} / {e:.2} / {e:.2}{s}\n", .{ splits, launch.chunk, cs.name, if (cs.prompt) "tf_ink2_kv_dequant8 then tf_ink2_attn_prompt" else "tf_ink2_attn_decode8", errs[1].top, errs[1].sum, errs[1].mean, errs[0].top, errs[0].sum, errs[0].mean, if (ok) "" else ", ABOVE BOUND" });
+            defer for (words) |x| a.free(x);
+            // The int8 prompt read is bf16(code * scale) by design (the bf16 copy): it must give the bf16 kernel's bits on
+            // the bf16 cache of those values. The fp64 bounds hold for the reads of code * scale (decode8) only.
+            var differ: usize = 0;
+            for (std.mem.bytesAsSlice(u32, words[0]), std.mem.bytesAsSlice(u32, words[1])) |x, y| differ += @intFromBool(x != y);
+            const ok = if (cs.prompt) differ == 0 else errs[1].ok();
+            if (cs.prompt) std.debug.print("CHECK-REAL splits {d} chunk {d}, {s}: the int8 prompt read against the bf16 kernel on bf16(code * scale), partial words that differ {d} of {d}\n", .{ splits, launch.chunk, cs.name, differ, words[0].len / 4 });
+            std.debug.print("CHECK-REAL splits {d} chunk {d}, {s}, {s}: against fp64, top / sum / mean error: int8 {e:.2} / {e:.2} / {e:.2}, bf16 cache of bf16(code * scale) {e:.2} / {e:.2} / {e:.2}{s}\n", .{ splits, launch.chunk, cs.name, if (cs.prompt) "tf_ink2_kv_dequant8 then tf_ink2_attn_prompt" else "tf_ink2_attn_decode8", errs[1].top, errs[1].sum, errs[1].mean, errs[0].top, errs[0].sum, errs[0].mean, if (ok) "" else if (cs.prompt) ", DIFFERS" else ", ABOVE BOUND" });
             if (!ok) failed += 1;
             cases_run += 1;
         }
