@@ -624,7 +624,9 @@ pub fn main(init: std.process.Init) !void {
         if (compare_file != null) kl.print(std.fs.path.basename(ref_path));
         if (ink.prefill.att_probe != null) {
             ink.prefill.att_probe = null;
-            const f = std.c.fopen((try gpa.dupeZ(u8, probe_out.?)).ptr, "wb") orelse return error.DumpOpen;
+            const name = try std.fmt.allocPrintSentinel(gpa, "{s}", .{probe_out.?}, 0);
+            defer gpa.free(name);
+            const f = std.c.fopen(name, "wb") orelse return error.DumpOpen;
             defer _ = std.c.fclose(f);
             if (std.c.fwrite(@ptrCast(probe_buf.ptr), 2, probe_buf.len, f) != probe_buf.len) return error.DumpWrite;
             std.debug.print("PROBE {d} positions x {d} visits x {d} bf16 to {s}\n", .{ probe_pos.items.len, schedule.n_visits, probe_width, probe_out.? });
