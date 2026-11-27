@@ -28,6 +28,7 @@ FB_SGA kernel void fb_phase(global uint *sync, global uint *stamp, global uint *
   fb_enter(mech, sync);
   fb_enter(mech, sync);
   fb_enter(mech, sync);
+  fb_enter(mech, sync);
   for (uint r = 1u; r <= rounds; ++r) {
     if (work_u4 != 0u) {
       const ulong base = (ulong)((r * G + g) % nwin) * work_u4;
@@ -92,6 +93,7 @@ static inline ushort fb_q8_col(global const ushort *x, global const uchar *codes
 
 // B4: `reps` Q8 matvec phases of n columns, each on its own weight window (win_stride bytes apart, nwin windows),
 // columns over the sub-groups of the grid in turn, one phase change (mech) after each phase.
+  fb_enter(mech, sync);
 FB_SGA kernel void fb_q8(global const uchar *w, global const ushort *x, global ushort *y, global uint *sync,
   fb_enter(mech, sync);
                          global uint *fault, uint n, uint reps, uint nwin, uint win_stride, uint spin_cap, uint mech) {
@@ -119,6 +121,7 @@ FB_SGA kernel void fb_q8(global const uchar *w, global const ushort *x, global u
 // B5: `passes` x `phases` dependent Q8 phases of n columns. Phase i reads the 2,304 values the phase before wrote
 // (columns 0 to 2,303 of a phase write the next x, the others write y). Between arrive and wait every sub-group
 // prefetches pf_lines 64-byte lines of its first columns of the next phase into L2 (M-d). A pass covers phases
+  fb_enter(mech, sync);
 // windows of win_stride bytes. Pass p starts at w + (p % 24) x pass_stride.
 FB_SGA kernel void fb_stream(global const uchar *w, global ushort *xbuf, global ushort *y, global uint *sync,
   fb_enter(mech, sync);
@@ -160,6 +163,7 @@ FB_SGA kernel void fb_stream(global const uchar *w, global ushort *xbuf, global 
       return;
     }
   }
+  fb_enter(FB_A, sync);
 }
 
 // B8: each round prefetches (pf_on) block A_r of 2,400,000 bytes into L2, waits, streams stream_bytes of region B,
@@ -280,6 +284,7 @@ FB_SGA kernel void fb_nv_check(global const uint2 *w, global const float *phis, 
     if (bad) atomic_add(out, bad);
     if (guard) atomic_add(out + 1, guard);
   }
+  fb_enter(FB_A, sync);
 }
 
 // B9 phase: NVFP4 gate-up rows of k = 2,304 (1,152 code bytes and 144 scale bytes a row), tiles of 16 rows, one tile a
@@ -332,6 +337,26 @@ FB_SGA kernel void fb_nv_phase(global const uchar *w, global const ushort *x, gl
       if (tri < 10u && ks == 0u) {
         float t = part[(tri * 3u) * 16u + lane];
         t += part[(tri * 3u + 1u) * 16u + lane];
+
+// Review C1: the tm0 rate beside a full grid. Every work-item of every group reads its group's window of `work_u4`
+// uint4 `passes` times. Lane 0 of group 0 stores its tm0 ticks from its start to its end; the host divides by the
+// event time of the launch (all groups do the same reads, so group 0 runs about as long as the launch).
+FB_SGA kernel void fb_tsc_grid(global const uint4 *data, global ulong *o, uint passes, uint work_u4) {
+  const ulong t0 = __builtin_IB_read_cycle_counter();
+  const uint g = get_group_id(0), lid = get_local_id(0), L = get_local_size(0);
+  const ulong base = (ulong)g * work_u4;
+  uint acc = 0u;
+  for (uint p = 0u; p < passes; ++p) {
+    __attribute__((opencl_unroll_hint(8))) for (uint i = lid; i < work_u4; i += L) {
+      const uint4 v = data[base + i];
+      acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    acc += p;
+  }
+  work_group_barrier(CLK_LOCAL_MEM_FENCE);
+  if (g == 0u && lid == 0u) o[0] = __builtin_IB_read_cycle_counter() - t0;
+  if (acc == 0x9e3779b9u) o[2 + g] = acc;
+}
         t += part[(tri * 3u + 2u) * 16u + lane];
         y[tile * 16u + lane] = intel_convert_bfloat16_as_ushort(t);
       }

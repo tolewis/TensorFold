@@ -255,6 +255,7 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         .{ "fused_bench", "zig/kernels/xpu/fused_bench.cl", "-cl-std=CL3.0 -cl-intel-256-GRF-per-thread -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2 -I zig/kernels/xpu" },
         .{ "fused_bench128", "zig/kernels/xpu/fused_bench.cl", "-cl-std=CL3.0 -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2 -I zig/kernels/xpu" },
         .{ "fused_small", "zig/kernels/xpu/fused_small.cl", prod ++ " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu" },
+        .{ "fused_small_old", "zig/kernels/xpu/fused_small_old.cl", prod ++ " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu" },
         .{ "ref_fuse", "zig/kernels/xpu/inkling2/fuse.cl", prod ++ " -cl-fp32-correctly-rounded-divide-sqrt" },
         .{ "ref_glue", "zig/kernels/xpu/inkling2/glue.cl", prod ++ " -cl-fp32-correctly-rounded-divide-sqrt" },
         .{ "ref_attention", "zig/kernels/xpu/inkling2/attention.cl", prod },
