@@ -103,7 +103,8 @@ constexpr int kLoopRead = 4; // A12: a loop mix pass 2 unit reads each partial o
 constexpr int kLastWait = 8; // A18: no wait after the last phase of a launch
 constexpr int kMixBatch = 64; // X1: a mode S mix pass 2 issues its partial loads before its warp sums
 constexpr int kGateUnroll = 128; // X2: gate down's rank row loop unrolled by 4 (each lane's sum order kept)
-constexpr int kPlanCg = 32;  // A1: the expert units read the plan with __ldcg (16 is the host's own-visit clear, A17)
+constexpr int kPlanCg = 32;
+constexpr int kLocal = 512;  // X3: a block barrier where no reader of another block needs the wait  // A1: the expert units read the plan with __ldcg (16 is the host's own-visit clear, A17)
 }
 
 // Unit stamps of a probed phase (FusedState probe + 3 G), globaltimer ns

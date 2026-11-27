@@ -96,8 +96,9 @@ __device__ __forceinline__ void probe_start(const Ctx& c, int next_ph) {
 // The counter of this group that the test skips (-1: none).
 __device__ __forceinline__ int drop_sub(const Ctx& c) { return (c.drop >> 3) == c.ci + 1 ? (c.drop & 7) : -1; }
 
-// The all-of wait (M4, P = G). Returns false when this block or another block set the fault word.
-__device__ bool all_wait(Ctx& c) {
+// The all-of wait (M4, P = G). Returns false when this block or another block set the fault word. wait false: the
+// block arrives and goes on (X3: no reader in this block needs the other blocks' stores).
+__device__ bool all_wait(Ctx& c, bool wait = true) {
     __shared__ int bad;
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -105,7 +106,7 @@ __device__ bool all_wait(Ctx& c) {
         const bool pr = c.probe == c.ph + 1;
         if (pr) c.st.probe[gridDim.x + blockIdx.x] = now();
         if (!(blockIdx.x == 0 && drop_sub(c) == 0)) red_rel_add(cnt, 1u);
-        const bool ok = fz_sync::wait_ge(cnt, gridDim.x, c.fault, fz_sync::code(c.ci, 0));
+        const bool ok = !wait || fz_sync::wait_ge(cnt, gridDim.x, c.fault, fz_sync::code(c.ci, 0));
         if (pr) c.st.probe[2 * gridDim.x + blockIdx.x] = now();
         probe_start(c, c.ph + 1);
         bad = !ok;
@@ -115,6 +116,21 @@ __device__ bool all_wait(Ctx& c) {
     c.ci++;
     c.ph++;
     return !bad;
+}
+
+// X3: the end of a phase whose next phase reads only stores of the same block (prep8 unit y and rel table unit y; the
+// combine and the MLP conv of columns 128 b to 128 b + 127): a block barrier, the phase stamps kept.
+__device__ bool local_wait(Ctx& c) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        if (c.probe == c.ph + 1) c.st.probe[gridDim.x + blockIdx.x] = c.st.probe[2 * gridDim.x + blockIdx.x] = now();
+        probe_start(c, c.ph + 1);
+        if (blockIdx.x == 0 && c.ph < 63) c.times[c.ph + 1] = now();
+    }
+    __syncthreads();
+    c.ci++;
+    c.ph++;
+    return true;
 }
 
 __device__ __forceinline__ bool fault_set(const Ctx& c) {
@@ -234,8 +250,11 @@ __device__ bool visit(const FusedVisit& V, Ctx& c, unsigned char* dyn, bool last
         fz_prep8(y, p.q_raw, p.k_raw, p.v_raw, p.rel_raw, p.q_scale, p.rel_scale, p.rpos, p.rseg,
                  static_cast<const ink2::Seg*>(p.segs), p.q_out, p.rel_out, p.kc, p.vc, p.heads, p.kv_heads, p.ring,
                  p.global, p.qk_clip, p.rel_clip, p.floor_pos, p.alpha, p.eps, p.ksc, p.vsc);
-    if (!all_wait(c)) return false;
+    // rel table unit rh reads the rel row of prep8 unit rh (row 0), on the same block (X3)
     const FzAttn& a = V.attn;
+    if (!((c.fix & fz_fix::kLocal) && a.heads == p.heads && p.heads <= static_cast<int>(gridDim.x) ? local_wait(c)
+                                                                                                   : all_wait(c)))
+        return false;
     for (int rh = blockIdx.x; rh < a.heads; rh += gridDim.x) fz_rel_table(rh, a.relp, a.rel_proj, a.rtab);
     if (!all_wait(c)) return false;
     // attention: today's grid (1 tile, kv heads, zgrid) as virtual blocks
@@ -263,7 +282,8 @@ __device__ bool visit(const FusedVisit& V, Ctx& c, unsigned char* dyn, bool last
         const int w = blockIdx.x * 4 + (threadIdx.x >> 5), W = gridDim.x * 4;
         for (int j = w; j < m.E; j += W) fz_rowdot_warp(j, m.xm, m.router, m.scores, m.E, m.H, 0, 1);
     }
-    if (!all_wait(c)) return false;
+    // top 8 runs on block 0 alone: the other blocks arrive and go on to the plan's wait (X3)
+    if (!all_wait(c, !(c.fix & fz_fix::kLocal) || blockIdx.x == 0)) return false;
     if (blockIdx.x == 0) {
         unsigned long long* px = probe_x(c);
         if (px && threadIdx.x == 0) px[fz_probe::kTop] = now();
@@ -285,7 +305,9 @@ __device__ bool visit(const FusedVisit& V, Ctx& c, unsigned char* dyn, bool last
     if (!all_wait(c)) return false;
     for (int d = blockIdx.x * blockDim.x + threadIdx.x; d < m.H; d += gridDim.x * blockDim.x)
         fz_combine(m.y, m.rw, m.moe, m.K, m.H, d);
-    if (!all_wait(c)) return false;
+    // the MLP conv of columns 128 b to 128 b + 127 reads the combine of the same block when H fits the grid (X3)
+    if (!((c.fix & fz_fix::kLocal) && m.H <= static_cast<int>(gridDim.x * blockDim.x) ? local_wait(c) : all_wait(c)))
+        return false;
     conv_phase(V.conv[3], conv_c(V.conv[3]), 0);
     if (last && (c.fix & fz_fix::kLastWait)) {  // no reader after the launch's last phase (review A18)
         __syncthreads();
