@@ -184,7 +184,7 @@ pub fn mix(k: *const Kernels, s: cuda.Stream, m: MixArgs) !void {
     // split-block mix: the same sums in the same order, the 16 warps of a row spread over B blocks
     if (m.rows <= 8 and m.query != 0) {
         if (std.c.getenv("TF_INKLING2_MIX_SPLIT")) |v| {
-            const b = std.fmt.parseInt(i32, v, 10) catch 0;
+            const b = std.fmt.parseInt(i32, std.mem.span(v), 10) catch 0;
             if (b == 2 or b == 4 or b == 8 or b == 16) {
                 const grid: cuda.Dim3 = .{ .x = @intCast(m.rows), .y = @intCast(b) };
                 const threads: u32 = @intCast(512 / b);
