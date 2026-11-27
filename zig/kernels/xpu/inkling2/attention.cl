@@ -595,8 +595,43 @@ KERNEL(128) void tf_ink2_merge(global const float *part_o, global const float2 *
                                uint subs) {
   const uint rh = get_group_id(0), d = get_local_id(0), row = rh / heads, pos = (uint)rpos[row];
   const uint lo = window && pos + 1 > window ? pos + 1 - window : 0;
+  local float xs[128], ys[128], fin[2]; // the fold factors of the subs == 1 path (OpenCL wants them at kernel scope)
   float mm = -INFINITY, ll = 0.0f, o = 0.0f;
-  for (uint c = lo / chunk; c <= pos / chunk; ++c) {
+  if (subs == 1) {
+    // p3-review R15: sub-group 0 makes the fold factors of each chunk once, x = exp2(m_before - m) and y = exp2(cm - m)
+    // with the running maximum m, a chunk a lane, and the denominator ll in chunk order. Every channel then folds its own
+    // partial in chunk order with those factors: the values and the order of the serial fold of every thread before.
+    const uint sg = get_sub_group_id(), lane = get_sub_group_local_id();
+    const uint last = pos / chunk, slot0 = window ? lo / chunk : c0;
+    const size_t at0 = (size_t)rh * chunks;
+    for (uint tile = lo / chunk; tile <= last; tile += 128) {
+      const uint n = min(128u, last + 1 - tile);
+      if (sg == 0) {
+        for (uint u = 0; u < n; u += 16) {
+          const uint k = u + lane;
+          const bool live = k < n;
+          const float2 ml = live ? part_ml[at0 + tile + k - slot0] : (float2)(-INFINITY, 0.0f);
+          const float mn = fmax(mm, sub_group_scan_inclusive_max(ml.x));
+          const float before = intel_sub_group_shuffle(mn, lane == 0 ? 0 : lane - 1);
+          const float mb = lane == 0 ? mm : before;
+          const float x = exp2(mb - mn), y = exp2(ml.x - mn);
+          const float t = ml.y * y;
+          if (live) { xs[k] = x; ys[k] = y; }
+          const uint m = min(16u, n - u);
+          for (uint j = 0; j < m; ++j) ll = ll * sub_group_broadcast(x, j) + sub_group_broadcast(t, j);
+          mm = sub_group_broadcast(mn, m - 1);
+        }
+      }
+      barrier(CLK_LOCAL_MEM_FENCE);
+      __attribute__((opencl_unroll_hint(8)))
+      for (uint k = 0; k < n; ++k) o = o * xs[k] + part_o[(at0 + tile + k - slot0) * D + d] * ys[k];
+      barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (d == 0) { fin[0] = mm; fin[1] = ll; }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    mm = fin[0];
+    ll = fin[1];
+  } else for (uint c = lo / chunk; c <= pos / chunk; ++c) {
     float cm, cl, co;
     if (subs > 1) {
       float sm = -INFINITY, sl = 0.0f, so = 0.0f;
