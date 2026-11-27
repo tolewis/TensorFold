@@ -205,7 +205,7 @@ const KlStats = struct {
             k.max_row = k.rows;
         }
         if (std.c.getenv("TF_TP_ROWKL") != null) {
-            std.debug.print("row {d} kl {e:.4} top1 {d} dump {d} ours {d}\n", .{ k.rows, d, @intFromBool(tp.id == tq.id), tp.id, tq.id });
+            std.debug.print("row {d} kl {e:.4} top1 {d} dump {d} ours {d} pdump {d:.4} pours {d:.4}\n", .{ k.rows, d, @intFromBool(tp.id == tq.id), tp.id, tq.id, @exp(@as(f64, tp.first) - lp), @exp(@as(f64, tq.first) - lq) });
         }
         k.rows += 1;
         if (tp.id == tq.id) k.agree += 1;
@@ -253,6 +253,8 @@ pub fn main(init: std.process.Init) !void {
     var compare_prefix: ?[]const u8 = null;
     // Only the rows at or past this one are dumped and compared: a 125k dump of every row is 100 GB.
     var dump_from: usize = 0;
+    var probe_pos: std.ArrayList(usize) = .empty;
+    var probe_out: ?[]const u8 = null;
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
@@ -380,6 +382,14 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--dump-from")) {
             i += 1;
             dump_from = try std.fmt.parseInt(usize, argv[i], 10);
+        } else if (std.mem.eql(u8, a, "--probe-att")) {
+            // positions, comma-separated: each visit's attention output row of each goes to --probe-out
+            i += 1;
+            var it = std.mem.splitScalar(u8, argv[i], ',');
+            while (it.next()) |t| try probe_pos.append(gpa, try std.fmt.parseInt(usize, t, 10));
+        } else if (std.mem.eql(u8, a, "--probe-out")) {
+            i += 1;
+            probe_out = argv[i];
         } else if (std.mem.eql(u8, a, "--device")) {
             i += 1;
             device = try std.fmt.parseInt(u32, argv[i], 10);
@@ -494,6 +504,16 @@ pub fn main(init: std.process.Init) !void {
     var overall_diffs: usize = 0;
     var prefill_digest = std.crypto.hash.sha2.Sha256.init(.{});
     var decode_digest = std.crypto.hash.sha2.Sha256.init(.{});
+    // the probe: [position][visit][qWidth] bf16 of the attention output, written after the first prompt
+    const probe_width: usize = m.options.place.qWidth();
+    const probe_buf = try gpa.alloc(u16, probe_pos.items.len * schedule.n_visits * probe_width);
+    defer gpa.free(probe_buf);
+    @memset(probe_buf, 0);
+    var probe: ink.prefill.AttProbe = .{ .pos = probe_pos.items, .out = probe_buf, .width = probe_width, .n_visits = schedule.n_visits };
+    if (probe_pos.items.len > 0) {
+        if (probe_out == null or old_forward) return error.ProbeNeedsOutAndPromptPath;
+        ink.prefill.att_probe = &probe;
+    }
     for (loaded_refs.items, refs.items) |ref, ref_path| {
         var cache = try state.Cache.init(&r, capacity, &schedule, kv_dtype);
         defer cache.deinit();
@@ -602,6 +622,13 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("  log-sum-exp difference: mean {d:.4}, max {d:.4}\n", .{ st.lse_sum / @as(f64, @floatFromInt(st.rows)), st.lse_max });
         std.debug.print("  next-token loss over {d} rows with the token in the reference top 16: ours {d:.4}, reference {d:.4}\n", .{ st.nll_n, st.nll_ours / @as(f64, @floatFromInt(@max(st.nll_n, 1))), st.nll_ref / @as(f64, @floatFromInt(@max(st.nll_n, 1))) });
         if (compare_file != null) kl.print(std.fs.path.basename(ref_path));
+        if (ink.prefill.att_probe != null) {
+            ink.prefill.att_probe = null;
+            const f = std.c.fopen((try gpa.dupeZ(u8, probe_out.?)).ptr, "wb") orelse return error.DumpOpen;
+            defer _ = std.c.fclose(f);
+            if (std.c.fwrite(@ptrCast(probe_buf.ptr), 2, probe_buf.len, f) != probe_buf.len) return error.DumpWrite;
+            std.debug.print("PROBE {d} positions x {d} visits x {d} bf16 to {s}\n", .{ probe_pos.items.len, schedule.n_visits, probe_width, probe_out.? });
+        }
         try rowSpread(gpa, row_max);
         for (diffs.items) |d| std.debug.print("  diff at {d}: reference token {d}, ours {d}, reference margin {d:.4}, our logit gap {d:.4}\n", .{ d.pos, d.ref_id, d.our_id, d.margin, d.our_gap });
         if (diffs.items.len > 0) std.debug.print("  largest reference margin among the differences: {d:.4}\n", .{st.max_diff_margin});
