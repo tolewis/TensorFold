@@ -315,6 +315,9 @@ KERNEL(16) void tf_ink2_attn_decode(global const ushort *q, global const ushort 
     UNROLL
     for (uint j = 0; j < D / 16; ++j) acc[g][j] = 0.0f;
   }
+  // the block's first ring slot: one modulo a chunk, then add and wrap by a compare (p3-review R8). `from` is not a multiple
+  // of 16 in a window's first chunk, so a block can cross the ring end: every slot wraps by its own compare.
+  uint b0 = from % ring;
   for (uint kp0 = from; kp0 < to; kp0 += BLOCK) {
     const uint n = min((uint)BLOCK, to - kp0);
     const bool live = lane < n;
@@ -323,8 +326,16 @@ KERNEL(16) void tf_ink2_attn_decode(global const ushort *q, global const ushort 
     // key's row and enter as zero
     ushort8 vr[BLOCK];
     UNROLL
-    for (uint k = 0; k < BLOCK; ++k) vr[k] = intel_sub_group_block_read_us8(vh + (size_t)((kp0 + min(k, n - 1)) % ring) * D);
-    global const ushort *krow = kh + (size_t)(kp % ring) * D;
+    for (uint k = 0; k < BLOCK; ++k) {
+      uint at = b0 + min(k, n - 1);
+      at = at >= ring ? at - ring : at;
+      vr[k] = intel_sub_group_block_read_us8(vh + (size_t)at * D);
+    }
+    uint own = b0 + (live ? lane : 0);
+    own = own >= ring ? own - ring : own;
+    global const ushort *krow = kh + (size_t)own * D;
+    b0 += BLOCK;
+    b0 = b0 >= ring ? b0 - ring : b0;
     float dot[GROUP];
     UNROLL
     for (uint g = 0; g < GROUP; ++g) dot[g] = 0.0f;
@@ -415,17 +426,22 @@ KERNEL(16) void tf_ink2_attn_decode8(global const ushort *q, global const char *
     UNROLL
     for (uint j = 0; j < D / 16; ++j) acc[g][j] = 0.0f;
   }
+  // the tile's first ring slot: one modulo a chunk, then add and wrap by a compare. `ring` is a multiple of 16 and kp0 is
+  // too, so a tile never crosses the ring end and slot `t0 + k` is `(kp0 + k) % ring` (p3-review R8)
+  uint t0 = (from & ~15u) % ring;
   for (uint kp0 = from & ~15u; kp0 < to; kp0 += 16) {
     const uint kp = kp0 + lane;
     const bool live = kp >= from && kp < to;
-    const uint at = kp % ring;
+    const uint at = t0 + lane;
     // every row of the tile is requested before any is used, so the latencies overlap; a row past the end enters as zero
     uchar8 vr[16];
     UNROLL
-    for (uint k = 0; k < 16; ++k) vr[k] = intel_sub_group_block_read_uc8(vh + (size_t)((kp0 + k) % ring) * D);
+    for (uint k = 0; k < 16; ++k) vr[k] = intel_sub_group_block_read_uc8(vh + (size_t)(t0 + k) * D);
     // the tile's K codes: four 32-dim slabs, one block read a slab, all issued before the dot. Lane `l` gets dims
     // 32j .. 32j + 31 of its own key: word i of the read sits at byte 64i + 4l, which is dim group 8j + i at position l.
-    global const char *kt = kh + (size_t)((kp0 % ring) / 16) * 2048;
+    global const char *kt = kh + (size_t)(t0 / 16) * 2048;
+    t0 += 16;
+    if (t0 == ring) t0 = 0;
     uint kr[4][8];
     UNROLL
     for (uint j = 0; j < 4; ++j) {
