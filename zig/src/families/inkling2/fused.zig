@@ -791,10 +791,10 @@ fn probeFor(v: u32, step: usize) i32 {
     return -1;
 }
 
-/// TF_INKLING2_FUSED_FIX: the review corrections on (fused_visit.cuh fz_fix: 1 A9, 2 A11, 4 A12, 8 A18, 32 A1; 16 A17, the
+/// TF_INKLING2_FUSED_FIX: the review corrections on (fused_visit.cuh fz_fix: 1 A9, 2 A11, 4 A12, 8 A18, 32 A1, 64 X1, 128 X2; 16 A17, the
 /// host clears its own visits only); default all. TF_INKLING2_FUSED_FIX_AB=1: steps s with (s / every) even run none,
 /// so one run holds the phase times before and after.
-const fix_all: i32 = 63;
+const fix_all: i32 = 255;
 const fix_own_clear: i32 = 16;
 fn fixFor(step: usize) i32 {
     const S = struct {

@@ -154,6 +154,26 @@ __device__ void mixS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigned
     if (!warp_wait(cnt + 0, P1, A.fault, fz_sync::code(A.group, 0))) break;
     mstamp(A, u == 0, 1);
     float rr[NB + 1], wq[NB + 1];
+    if (A.fix & fz_fix::kMixBatch) {
+      // X1: the 2 n partial loads first (one each a lane, as sum_level2), then the same warp sums: n dependent L2
+      // round trips become one
+      float p0[NB + 1], pq[NB + 1];
+#pragma unroll
+      for (int j = 0; j < NB + 1; ++j) {
+        const bool on = j < n && lane < MIXW;
+        p0[j] = on ? __ldcg(A.part1 + (j * MIXW + lane) * 4 + 0) : 0.0f;
+        pq[j] = on ? __ldcg(A.part1 + (j * MIXW + lane) * 4 + 1 + q) : 0.0f;
+      }
+#pragma unroll
+      for (int j = 0; j < NB + 1; ++j) {
+        if (j >= n) break;
+        const float v0 = __shfl_sync(0xffffffffu, warpSum(p0[j]), 0);
+        const float vq = __shfl_sync(0xffffffffu, warpSum(pq[j]), 0);
+        const float r = rsqrtf(v0 / C + 1e-6f);
+        rr[j] = r;
+        wq[j] = vq * r * rsqrtf(static_cast<float>(C));
+      }
+    } else {
 #pragma unroll
     for (int j = 0; j < NB + 1; ++j) {
       if (j >= n) break;
@@ -162,6 +182,7 @@ __device__ void mixS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigned
       const float r = rsqrtf(v0 / C + 1e-6f);
       rr[j] = r;
       wq[j] = vq * r * rsqrtf(static_cast<float>(C));
+    }
     }
     {  // the softmax of thread q
       float m = -INFINITY, tt = 0.0f;
@@ -333,9 +354,10 @@ __device__ void loopS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigne
 
 // One mix phase (mixS of B9). cnt: 8 zeroed counters. part1 [9][16][4], part2 [4][16] fp32. stg: 4 x 5,760 B shared.
 extern "C" __device__ void fz_mix_s(const fz_mix::MixArgs& a, float* part1, float* part2, unsigned* cnt,
-                                    unsigned* fault, unsigned char* stg, int drop, int group, unsigned long long* pr) {
+                                    unsigned* fault, unsigned char* stg, int drop, int group, unsigned long long* pr,
+                                    int fix) {
     fz_mix::SArgs A;
-    A.fix = 0;
+    A.fix = fix;
     A.mix = a;
     A.drop = drop;
     A.group = group;

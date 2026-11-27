@@ -45,7 +45,7 @@ extern "C" __device__ void fz_qmmf_unit(const __nv_bfloat16* x, const unsigned c
 extern "C" __device__ void fz_qmmf_tile_sum(const float* part, __nv_bfloat16* out, int N, int SK, float scale,
                                             int tile);
 extern "C" __device__ void fz_gate_down(const LoopGateArgs& a, int g, int z, float* xs, float* sh,
-                                        unsigned long long* px, int half);
+                                        unsigned long long* px, int half, bool unroll);
 extern "C" __device__ void fz_gate_lin(const LoopGateArgs& a, int g, int z, float* dn);
 extern "C" __device__ void fz_gate_mix(const LoopGateArgs& a, int g, float* sh);
 extern "C" __device__ void fz_nvfp4_up(const __nv_bfloat16* X, int x_stride, int slots, const uint4* W,
@@ -59,7 +59,8 @@ extern "C" __device__ void fz_dense_scaled_warp(const __nv_bfloat16* x, const __
                                                 float* out, int n, int k, int col);
 extern "C" __device__ void fz_plan(const int* picks, int P, int E, int T, int* members, int* items, int* counts);
 extern "C" __device__ void fz_mix_s(const fz_mix::MixArgs& a, float* part1, float* part2, unsigned* cnt,
-                                    unsigned* fault, unsigned char* stg, int drop, int group, unsigned long long* pr);
+                                    unsigned* fault, unsigned char* stg, int drop, int group, unsigned long long* pr,
+                                    int fix);
 extern "C" __device__ void fz_loop_s(const fz_mix::LoopMixArgs& a, float* part1, float* part2, unsigned* cnt,
                                      unsigned* fault, unsigned char* stg, int drop, int group, unsigned long long* pr,
                                      int fix);
@@ -178,10 +179,10 @@ __device__ bool gates_phase(const void* ga, int gates, Ctx& c, unsigned char* dy
     unsigned long long* px = probe_x(c);
     if (c.fix & fz_fix::kGateHalf)  // a unit a (gate, z, half): one rank row a warp (review A11)
         for (int u = blockIdx.x; u < gates * 16; u += gridDim.x)
-            fz_gate_down(g, u / 16, (u / 2) % 8, buf, sh, u == 0 ? px : nullptr, u % 2);
+            fz_gate_down(g, u / 16, (u / 2) % 8, buf, sh, u == 0 ? px : nullptr, u % 2, (c.fix & fz_fix::kGateUnroll) != 0);
     else
         for (int u = blockIdx.x; u < gates * 8; u += gridDim.x)
-            fz_gate_down(g, u / 8, u % 8, buf, sh, u == 0 ? px : nullptr, -1);
+            fz_gate_down(g, u / 8, u % 8, buf, sh, u == 0 ? px : nullptr, -1, (c.fix & fz_fix::kGateUnroll) != 0);
     if (!all_wait(c)) return false;
     for (int u = blockIdx.x; u < gates * 18; u += gridDim.x) fz_gate_lin(g, u / 18, u % 18, buf);
     if (!all_wait(c)) return false;
@@ -195,7 +196,7 @@ __device__ bool mix_phase(const void* a, bool gated, Ctx& c, unsigned char* dyn)
     if (gated)
         fz_loop_s(*static_cast<const fz_mix::LoopMixArgs*>(a), c.st.part1, c.st.part2, cnt, c.fault, dyn, drop_sub(c), c.ci, pr, c.fix);
     else
-        fz_mix_s(*static_cast<const fz_mix::MixArgs*>(a), c.st.part1, c.st.part2, cnt, c.fault, dyn, drop_sub(c), c.ci, pr);
+        fz_mix_s(*static_cast<const fz_mix::MixArgs*>(a), c.st.part1, c.st.part2, cnt, c.fault, dyn, drop_sub(c), c.ci, pr, c.fix);
     if (threadIdx.x == 0) probe_start(c, c.ph + 1);
     c.ci++;
     c.ph++;

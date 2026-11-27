@@ -42,7 +42,7 @@ __device__ __forceinline__ float blockSum2(const float (&v)[2], float* sh) {
 // `xs` is 2 H floats of the caller's shared memory, `sh` 8 floats. half 0 or 1: only virtual warps w + 4 half (one
 // rank row a warp, review A11); -1: both, in series.
 extern "C" __device__ void fz_gate_down(const LoopGateArgs& a, int g, int z, float* xs, float* sh,
-                                        unsigned long long* px, int half) {
+                                        unsigned long long* px, int half, bool unroll) {
     const size_t row = 0;
     if (px && threadIdx.x == 0) px[8] = stamp();
     const int H = a.H;
@@ -69,7 +69,18 @@ extern "C" __device__ void fz_gate_down(const LoopGateArgs& a, int g, int z, flo
         if (r >= a.rank) continue;
         const uint16_t* wr = a.down_w[g] + static_cast<size_t>(r) * 2 * H;
         float acc = 0.0f;
-        for (int i = lane; i < 2 * H; i += 32) acc = fmaf(bf(wr[i]), xs[i], acc);
+        if (unroll) {  // X2: the loads of 4 steps ahead of their fmaf chain, the chain in today's order
+            int i = lane;
+            for (; i + 96 < 2 * H; i += 128) {
+                const uint16_t w0 = wr[i], w1 = wr[i + 32], w2 = wr[i + 64], w3 = wr[i + 96];
+                acc = fmaf(bf(w0), xs[i], acc);
+                acc = fmaf(bf(w1), xs[i + 32], acc);
+                acc = fmaf(bf(w2), xs[i + 64], acc);
+                acc = fmaf(bf(w3), xs[i + 96], acc);
+            }
+            for (; i < 2 * H; i += 32) acc = fmaf(bf(wr[i]), xs[i], acc);
+        } else
+            for (int i = lane; i < 2 * H; i += 32) acc = fmaf(bf(wr[i]), xs[i], acc);
         acc = warpSum(acc);
         if (lane == 0) a.down[(static_cast<size_t>(g) * a.rows + row) * a.rank + r] = tobf(acc);
     }
