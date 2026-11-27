@@ -28,6 +28,7 @@ test {
     _ = @import("xpu/dflash2_state.zig");
     _ = @import("xpu/dflash2_weights.zig");
     _ = sampler;
+    _ = @import("xpu/kv_switch.zig");
     _ = @import("xpu/dspark_fold.zig");
     _ = @import("xpu/dspark_kernels.zig");
     _ = @import("xpu/dspark_state.zig");

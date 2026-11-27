@@ -6,6 +6,7 @@ const xpu = @import("xpu");
 const ze = xpu.ze;
 const images = @import("inkling2_xpu_images");
 const place = @import("place.zig");
+const kv_switch = @import("kv_switch.zig");
 const rt = xpu.rt;
 const qg = @import("qwen_group");
 
@@ -346,6 +347,11 @@ pub const Group = struct {
         try sendByte(g.conn, mode);
         try recvByte(g.conn, &peer_mode);
         if (mode == 5 and peer_mode == 5) g.ex = 3;
+        var peer_kv: []const u8 = "";
+        kv_switch.agree(g.conn, kv_switch.get(), &peer_kv) catch |e| {
+            if (e == error.Inkling2KvMismatch) std.log.err("inkling2: kv {s} on rank {d}, {s} on its peer: both ranks need the same XPU_KV_INT8; refusing to start", .{ @tagName(kv_switch.get()), g.rank, peer_kv });
+            return e;
+        };
     }
 
     fn rangeOff(g: *Group, ptr: *anyopaque) u64 {
