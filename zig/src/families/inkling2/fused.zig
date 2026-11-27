@@ -791,10 +791,10 @@ fn probeFor(v: u32, step: usize) i32 {
     return -1;
 }
 
-/// TF_INKLING2_FUSED_FIX: the review corrections on (fused_visit.cuh fz_fix: 1 A9, 2 A11, 4 A12, 8 A18; 16 A17, the
+/// TF_INKLING2_FUSED_FIX: the review corrections on (fused_visit.cuh fz_fix: 1 A9, 2 A11, 4 A12, 8 A18, 32 A1; 16 A17, the
 /// host clears its own visits only); default all. TF_INKLING2_FUSED_FIX_AB=1: steps s with (s / every) even run none,
 /// so one run holds the phase times before and after.
-const fix_all: i32 = 31;
+const fix_all: i32 = 63;
 const fix_own_clear: i32 = 16;
 fn fixFor(step: usize) i32 {
     const S = struct {
@@ -912,10 +912,15 @@ fn poison(d: *const cuda.Driver, s: cuda.Stream, list: []const Buf) !void {
 
 /// Compare each listed buffer with its bytes in `ref`; one line a buffer into `lines`. Returns the differing bytes.
 fn compare(f: *State, list: []const Buf, v: u32, step: usize, pos: u32, lines: ?*std.ArrayList(u8)) !usize {
+    return compareAt(f, list, 0, v, step, pos, lines);
+}
+
+/// `compare` against the bytes of `ref` from offset `base`.
+fn compareAt(f: *State, list: []const Buf, base: usize, v: u32, step: usize, pos: u32, lines: ?*std.ArrayList(u8)) !usize {
     const d = f.d;
     const gpa = std.heap.page_allocator;
     var diff_total: usize = 0;
-    var at: usize = 0;
+    var at: usize = base;
     for (list) |b| {
         const want = try gpa.alloc(u8, b.len);
         defer gpa.free(want);
@@ -937,8 +942,165 @@ fn compare(f: *State, list: []const Buf, v: u32, step: usize, pos: u32, lines: ?
     return diff_total;
 }
 
+/// TF_INKLING2_FUSED_PAIR=<v>: the check of visit v launches visits v and v + 1 in one launch (count 2, reviews A1,
+/// A5, A8). 0 or unset: none.
+fn pairVisit() u32 {
+    const S = struct {
+        var v: ?u32 = null;
+    };
+    if (S.v == null) S.v = if (std.c.getenv("TF_INKLING2_FUSED_PAIR")) |e| std.fmt.parseInt(u32, std.mem.span(e), 10) catch 0 else 0;
+    return S.v.?;
+}
+
+fn overlaps(b: Buf, list: []const Buf) bool {
+    for (list) |o| if (b.ptr < o.ptr + o.len and o.ptr < b.ptr + b.len) return true;
+    return false;
+}
+
+/// Visits v and v + 1 by today's kernels, then by one fused launch of count 2 from the same state (every compared
+/// buffer filled first); compare every buffer of v + 1 and the buffers of v that v + 1 does not write again. Then the
+/// state of v + 1 goes back to its state before the pair: the forward runs visit v + 1 next as usual.
+fn checkPair(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytype, v: u32, hin: u64, hout: u64, today: anytype) !bool {
+    const d = f.d;
+    const gpa = std.heap.page_allocator;
+    const w = v + 1;
+    f.at = "pair-fill";
+    var host_v: [arg_bytes]u8 = undefined;
+    var host_w: [arg_bytes]u8 = undefined;
+    var vis_v = fill(f, m, r, v, hin, hout, &host_v) catch return false;
+    var vis_w = fill(f, m, r, w, hout, hin, &host_w) catch |e| {
+        if (f.steps[v] == 0) std.debug.print("[fused-pair] visit {d}: not a Part 2 visit ({s}), single checks\n", .{ w, @errorName(e) });
+        return false;
+    };
+    const step = f.steps[v];
+    const fix = fixFor(step);
+    vis_v.fix = fix & ~fix_own_clear;
+    vis_w.fix = fix & ~fix_own_clear;
+    try s.synchronize();
+    try f.args.upload(@as(usize, v) * arg_bytes, &host_v);
+    try f.args.upload(@as(usize, w) * arg_bytes, &host_w);
+    try f.table.upload(@as(usize, v) * @sizeOf(Visit), std.mem.asBytes(&vis_v));
+    try f.table.upload(@as(usize, w) * @sizeOf(Visit), std.mem.asBytes(&vis_w));
+    var la: [list_max]Buf = undefined;
+    var lb: [list_max]Buf = undefined;
+    const na = buffers(m, r, v, hout, &vis_v, &la);
+    const nb = buffers(m, r, w, hin, &vis_w, &lb);
+    // the state before the pair: the conv states of both visits, and hin (visit w's output buffer)
+    var saved: usize = 0;
+    for ([2][]const Buf{ la[0..na], lb[0..nb] }) |l| for (l) |b| if (std.mem.startsWith(u8, b.name, "conv_")) {
+        try m.copy(s, f.save.ptr + saved, b.ptr, b.len);
+        saved += b.len;
+    };
+    const h_bytes: usize = m.c.hidden * 2;
+    const hin_at = saved;
+    try m.copy(s, f.save.ptr + hin_at, hin, h_bytes);
+    f.at = "pair-today";
+    try today.run(m, k, s, r, v, hin, hout);
+    var at: usize = 0;
+    for (la[0..na]) |b| {
+        try m.copy(s, f.ref.ptr + at, b.ptr, b.len);
+        at += b.len;
+    }
+    const base_b = at;
+    try today.run(m, k, s, r, w, hout, hin);
+    for (lb[0..nb]) |b| {
+        if (at + b.len > f.ref.len) return error.FusedRefFull;
+        try m.copy(s, f.ref.ptr + at, b.ptr, b.len);
+        at += b.len;
+    }
+    // fill, then the inputs back: conv states and hin
+    for ([2][]const Buf{ la[0..na], lb[0..nb] }) |l| try poison(d, s, l);
+    saved = 0;
+    for ([2][]const Buf{ la[0..na], lb[0..nb] }) |l| for (l) |b| if (std.mem.startsWith(u8, b.name, "conv_")) {
+        try m.copy(s, b.ptr, f.save.ptr + saved, b.len);
+        saved += b.len;
+    };
+    try m.copy(s, hin, f.save.ptr + hin_at, h_bytes);
+    f.at = "pair-fused";
+    try s.synchronize();
+    try d.check(d.api.cuEventRecord(f.ev[2], s.handle), "cuEventRecord");
+    try f.launchFix(s, v, 2, null, false, (fix & fix_own_clear) != 0);
+    try d.check(d.api.cuEventRecord(f.ev[3], s.handle), "cuEventRecord");
+    try s.synchronize();
+    var ms: f32 = 0;
+    try d.check(d.api.cuEventElapsedTime(&ms, f.ev[2], f.ev[3]), "cuEventElapsedTime");
+    var faults: [2]u32 = undefined;
+    try cuda.memory.download(d, f.fault.ptr + @as(u64, v) * 4, std.mem.sliceAsBytes(&faults));
+    // compare: visit w fully, visit v where w does not write again
+    var nka: usize = 0;
+    var skipped: usize = 0;
+    var lines: std.ArrayList(u8) = .empty;
+    defer lines.deinit(gpa);
+    var diff_v: usize = 0;
+    at = 0;
+    for (la[0..na]) |b| {
+        if (!overlaps(b, lb[0..nb])) {
+            nka += 1;
+            diff_v += try compareAt(f, &.{b}, at, v, step, r.last_pos, &lines);
+        } else skipped += 1;
+        at += b.len;
+    }
+    const diff_w = try compareAt(f, lb[0..nb], base_b, w, step, r.last_pos, &lines);
+    // whether the two visits' picks differ (review A1: the plan is written again by visit w)
+    var picks_differ = false;
+    {
+        var pa: usize = 0;
+        var pb: usize = base_b;
+        var ia: ?usize = null;
+        var ib: ?usize = null;
+        var len: usize = 0;
+        for (la[0..na]) |b| {
+            if (std.mem.eql(u8, b.name, "pick")) {
+                ia = pa;
+                len = b.len;
+            }
+            pa += b.len;
+        }
+        for (lb[0..nb]) |b| {
+            if (std.mem.eql(u8, b.name, "pick")) ib = pb;
+            pb += b.len;
+        }
+        if (ia != null and ib != null and len <= 64) {
+            var x: [64]u8 = undefined;
+            var y: [64]u8 = undefined;
+            try cuda.memory.download(d, f.ref.ptr + ia.?, x[0..len]);
+            try cuda.memory.download(d, f.ref.ptr + ib.?, y[0..len]);
+            picks_differ = !std.mem.eql(u8, x[0..len], y[0..len]);
+        }
+    }
+    // today's bytes back (v, then w: a buffer both write ends with w's bytes), then visit w's conv states before the
+    // pair (the forward runs w next)
+    at = 0;
+    for ([2][]const Buf{ la[0..na], lb[0..nb] }) |l| for (l) |b| {
+        try m.copy(s, b.ptr, f.ref.ptr + at, b.len);
+        at += b.len;
+    };
+    saved = 0;
+    for (la[0..na]) |b| if (std.mem.startsWith(u8, b.name, "conv_")) {
+        saved += b.len;
+    };
+    for (lb[0..nb]) |b| if (std.mem.startsWith(u8, b.name, "conv_")) {
+        try m.copy(s, b.ptr, f.save.ptr + saved, b.len);
+        saved += b.len;
+    };
+    try s.synchronize();
+    f.steps[v] += 1;
+    const bad = diff_v != 0 or diff_w != 0 or faults[0] != 0 or faults[1] != 0;
+    if (bad) f.bad[v] += 1;
+    if (bad or step % every() == 0) std.debug.print("{s}", .{lines.items});
+    std.debug.print("[fused-pair] visits {d} {d} step {d} pos {d} fused_us {d:.2} fix {d} faults 0x{x} 0x{x} differing {d} (visit {d}, {d} buffers, {d} not compared: visit {d} writes them again) {d} (visit {d}, {d} buffers) picks differ {d}\n", .{ v, w, step, r.last_pos, ms * 1000, fix, faults[0], faults[1], diff_v, v, nka, skipped, w, diff_w, w, nb, @intFromBool(picks_differ) });
+    return true;
+}
+
 /// Visit `v` by today's kernels (`today`), then by the fused kernel from the same state; compare; keep today's bytes.
 pub fn check(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytype, v: u32, hin: u64, hout: u64, today: anytype) !void {
+    if (pairVisit() == v and v + 1 < visits_max) {
+        const done = checkPair(f, m, k, s, r, v, hin, hout, today) catch |e| {
+            std.debug.print("[fused-pair] visit {d} pos {d}: {s} at step {s}\n", .{ v, r.last_pos, @errorName(e), f.at });
+            return e;
+        };
+        if (done) return;
+    }
     checkSteps(f, m, k, s, r, v, hin, hout, today) catch |e| {
         std.debug.print("[fused-check] visit {d} pos {d}: {s} at step {s}\n", .{ v, r.last_pos, @errorName(e), f.at });
         return e;

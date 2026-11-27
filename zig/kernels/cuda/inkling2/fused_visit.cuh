@@ -101,6 +101,7 @@ constexpr int kBusy = 1;     // A9: the global attention deals its busy units on
 constexpr int kGateHalf = 2; // A11: gate down as half units, one rank row a warp
 constexpr int kLoopRead = 4; // A12: a loop mix pass 2 unit reads each partial once
 constexpr int kLastWait = 8; // A18: no wait after the last phase of a launch
+constexpr int kPlanCg = 32;  // A1: the expert units read the plan with __ldcg (16 is the host's own-visit clear, A17)
 }
 
 // Unit stamps of a probed phase (FusedState probe + 3 G), globaltimer ns

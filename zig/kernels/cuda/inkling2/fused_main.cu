@@ -50,10 +50,10 @@ extern "C" __device__ void fz_gate_lin(const LoopGateArgs& a, int g, int z, floa
 extern "C" __device__ void fz_gate_mix(const LoopGateArgs& a, int g, float* sh);
 extern "C" __device__ void fz_nvfp4_up(const __nv_bfloat16* X, int x_stride, int slots, const uint4* W,
                                        const float* scale, int KG, int NB, const int* items, const int* counts,
-                                       const int* members, void* out, int N, float gate_cap, float up_cap, int skip);
+                                       const int* members, void* out, int N, float gate_cap, float up_cap, int skip, int cg);
 extern "C" __device__ void fz_nvfp4_down(const __nv_bfloat16* X, int x_stride, int slots, const uint4* W,
                                          const float* scale, int KG, int NB, const int* items, const int* counts,
-                                         const int* members, void* out, int N, float limit, int skip);
+                                         const int* members, void* out, int N, float limit, int skip, int cg);
 extern "C" __device__ void fz_combine(const float* y, const float* w, uint16_t* out, int slots, int dims, int d);
 extern "C" __device__ void fz_dense_scaled_warp(const __nv_bfloat16* x, const __nv_bfloat16* w, const float* scale,
                                                 float* out, int n, int k, int col);
@@ -276,10 +276,11 @@ __device__ bool visit(const FusedVisit& V, Ctx& c, unsigned char* dyn, bool last
     }
     if (!all_wait(c)) return false;
     fz_nvfp4_up(reinterpret_cast<const __nv_bfloat16*>(m.xm), m.H, m.K, m.up, m.up_scale, m.H / 32, m.width / 32,
-                m.items, m.counts, m.members, m.act, m.width, m.gate_cap, m.up_cap, -1);
+                m.items, m.counts, m.members, m.act, m.width, m.gate_cap, m.up_cap, -1,
+                (c.fix & fz_fix::kPlanCg) != 0);
     if (!all_wait(c)) return false;
     fz_nvfp4_down(reinterpret_cast<const __nv_bfloat16*>(m.act), m.width, 0, m.down, m.down_scale, m.width / 32,
-                  m.H / 32, m.items, m.counts, m.members, m.y, m.H, 0.0f, -1);
+                  m.H / 32, m.items, m.counts, m.members, m.y, m.H, 0.0f, -1, (c.fix & fz_fix::kPlanCg) != 0);
     if (!all_wait(c)) return false;
     for (int d = blockIdx.x * blockDim.x + threadIdx.x; d < m.H; d += gridDim.x * blockDim.x)
         fz_combine(m.y, m.rw, m.moe, m.K, m.H, d);
