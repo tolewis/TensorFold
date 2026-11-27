@@ -2,6 +2,9 @@
 //! Each case rotates through enough layers' caches that the K/V it reads is not in the card's cache from the last call.
 //! `--kv int8` fills an int8 cache from the same random bf16 data with the prep kernel's scale rule; `--kv bf16` is the
 //! default. `--splits N` sets the decode chunk the server uses (`flash_splits`, 64 live), zero keeps the layer chunk.
+//! `--check` times nothing: it fills int8 codes with power-of-two scales and a bf16 cache that holds each code times its
+//! scale exactly, then requires `tf_ink2_attn_decode8` to give the partials and the output of `tf_ink2_attn_decode` bit
+//! for bit, at the layer chunk and at 128 splits. Exit 1 on a difference.
 const std = @import("std");
 const xpu = @import("xpu");
 const rig_ = @import("contract_rig.zig");
@@ -42,11 +45,127 @@ fn quantize(row: []const u16, codes: []u8) f32 {
 
 const Case = struct { name: []const u8, rows: u32, k: u32, window: u32, prompt: bool = false };
 
+/// The int8 read against the bf16 read on the same values. A code times a power-of-two scale is exact in bf16, and a
+/// power-of-two factor commutes with every fp32 rounding, so the two kernels must agree bit for bit wherever their key
+/// blocks start at the same key: global layers, and a sliding row whose window start is a multiple of 16.
+fn check(a: std.mem.Allocator, dev: *rig_.Dev, k: *const attn.Kernels, rng: std.Random) !usize {
+    const cases = [_]Case{
+        .{ .name = "global 1 row, 3,000 keys", .rows = 1, .k = 3000, .window = 0 },
+        .{ .name = "global 8 rows, 3,000 keys", .rows = 8, .k = 3000, .window = 0 },
+        .{ .name = "global 1 row, 40,000 keys", .rows = 1, .k = 40000, .window = 0 },
+        .{ .name = "sliding 1 row, 2,048 keys, window start 1,024", .rows = 1, .k = 2048, .window = 1024 },
+    };
+    var failed: usize = 0;
+    for ([_]u32{ 0, 128 }) |splits| {
+        plan.flash_splits = splits;
+        plan.flash_user_set = splits != 0;
+        for (cases) |cs| {
+            var rig: rig_.Rig = .{ .a = a, .dev = dev };
+            defer rig.deinit();
+            const layer: plan.Layer = if (cs.window > 0) plan.Layer.sliding(cs.window, cs.rows) else plan.Layer.global(cs.k);
+            const rows = cs.rows;
+            const ring: usize = layer.ring;
+            const stride = plan.slotsFor(layer, cs.k);
+            const cache_n = @as(usize, KV) * ring * D;
+            const kb = try a.alloc(u16, cache_n);
+            defer a.free(kb);
+            const vb = try a.alloc(u16, cache_n);
+            defer a.free(vb);
+            const kc = try a.alloc(u8, cache_n);
+            defer a.free(kc);
+            const vc = try a.alloc(u8, cache_n);
+            defer a.free(vc);
+            const ks = try a.alloc(f32, KV * ring);
+            defer a.free(ks);
+            const vs = try a.alloc(f32, KV * ring);
+            defer a.free(vs);
+            for (0..KV) |h| for (0..ring) |p| {
+                const ksc = std.math.ldexp(@as(f32, 1), -6 - @as(i32, rng.intRangeAtMost(i32, 0, 2)));
+                const vsc = std.math.ldexp(@as(f32, 1), -5 - @as(i32, rng.intRangeAtMost(i32, 0, 2)));
+                ks[h * ring + p] = ksc;
+                vs[h * ring + p] = vsc;
+                for (0..D) |d| {
+                    const ck = rng.intRangeAtMost(i8, -127, 127);
+                    const cv = rng.intRangeAtMost(i8, -127, 127);
+                    kc[plan.kCodeOffset(h, p, d, ring)] = @bitCast(ck);
+                    vc[plan.vCodeOffset(h, p, d, ring)] = @bitCast(cv);
+                    const at = (h * ring + p) * D + d;
+                    kb[at] = @truncate(@as(u32, @bitCast(@as(f32, @floatFromInt(ck)) * ksc)) >> 16);
+                    vb[at] = @truncate(@as(u32, @bitCast(@as(f32, @floatFromInt(cv)) * vsc)) >> 16);
+                }
+            };
+            const bf: attn.Cache = .{ .k = .{ .ptr = try rig.input(std.mem.sliceAsBytes(kb)) }, .v = .{ .ptr = try rig.input(std.mem.sliceAsBytes(vb)) } };
+            const i8c: attn.Cache = .{
+                .k = .{ .ptr = try rig.input(kc) },
+                .v = .{ .ptr = try rig.input(vc) },
+                .int8 = true,
+                .kscale = .{ .ptr = try rig.input(std.mem.sliceAsBytes(ks)) },
+                .vscale = .{ .ptr = try rig.input(std.mem.sliceAsBytes(vs)) },
+            };
+            const q = try a.alloc(u16, rows * H * D);
+            defer a.free(q);
+            fillBf16(rng, q, 0.6);
+            const tab = try a.alloc(u16, rows * H * EXTENT);
+            defer a.free(tab);
+            fillBf16(rng, tab, 0.5);
+            const sink = try a.alloc(u16, rows * H);
+            defer a.free(sink);
+            @memset(sink, 0x4040);
+            const gate = try a.alloc(u16, rows * H * D);
+            defer a.free(gate);
+            fillBf16(rng, gate, 2);
+            const pos = try a.alloc(i32, rows);
+            defer a.free(pos);
+            for (pos, 0..) |*v, i| v.* = @intCast(cs.k - rows + i);
+            const seg_of = try a.alloc(i32, rows);
+            defer a.free(seg_of);
+            @memset(seg_of, 0);
+            const seg = [1]plan.Seg{.{ .row0 = 0, .n = @intCast(rows), .p0 = @intCast(cs.k - rows), .off = 0 }};
+            const meta: attn.RowMeta = .{
+                .pos = .{ .ptr = try rig.input(std.mem.sliceAsBytes(pos)) },
+                .seg_of = .{ .ptr = try rig.input(std.mem.sliceAsBytes(seg_of)) },
+                .segs = .{ .ptr = try rig.input(std.mem.sliceAsBytes(&seg)) },
+            };
+            const qd: attn.Ref = .{ .ptr = try rig.input(std.mem.sliceAsBytes(q)) };
+            const tabd: attn.Ref = .{ .ptr = try rig.input(std.mem.sliceAsBytes(tab)) };
+            const sinkd: attn.Ref = .{ .ptr = try rig.input(std.mem.sliceAsBytes(sink)) };
+            const gated: attn.Ref = .{ .ptr = try rig.input(std.mem.sliceAsBytes(gate)) };
+            const po_n = @as(usize, rows) * H * stride * (D * 4);
+            const pml_n = @as(usize, rows) * H * stride * 8;
+            const out_n = @as(usize, rows) * H * D * 2;
+            const po: attn.Ref = .{ .ptr = try rig.scratch(po_n) };
+            const pml: attn.Ref = .{ .ptr = try rig.scratch(pml_n) };
+            const out: attn.Ref = .{ .ptr = try rig.output(out_n) };
+            const r: plan.Rows = .{ .rows = rows, .last_pos = cs.k - 1 };
+            var got: [2][3][]u8 = undefined;
+            for ([_]attn.Cache{ bf, i8c }, 0..) |c, w| {
+                try attn.attendAs(k, dev.s, .decode, r, layer, stride, meta, qd, c, tabd, po, pml, sinkd, gated, out);
+                got[w][0] = try a.dupe(u8, try rig.bytes(po.ptr, po_n));
+                got[w][1] = try a.dupe(u8, try rig.bytes(pml.ptr, pml_n));
+                got[w][2] = try a.dupe(u8, try rig.bytes(out.ptr, out_n));
+            }
+            defer for (got) |g| for (g) |b| a.free(b);
+            var diff: [3]usize = .{ 0, 0, 0 };
+            for (0..3) |j| {
+                const x = std.mem.bytesAsSlice(u32, got[0][j][0 .. got[0][j].len / 4 * 4]);
+                const y = std.mem.bytesAsSlice(u32, got[1][j][0 .. got[1][j].len / 4 * 4]);
+                for (x, y) |u, v| diff[j] += @intFromBool(u != v);
+            }
+            const launch = try plan.attendAs(r, layer, stride, .decode);
+            std.debug.print("CHECK splits {d} chunk {d}, {s}: int8 against bf16 on equal values, words that differ: partials {d} of {d}, max and sum {d} of {d}, output {d} of {d}\n", .{ splits, launch.chunk, cs.name, diff[0], po_n / 4, diff[1], pml_n / 4, diff[2], out_n / 4 });
+            if (diff[0] + diff[1] + diff[2] != 0) failed += 1;
+        }
+    }
+    std.debug.print("CHECK {s}: {d} of {d} cases differ\n", .{ if (failed == 0) "PASS" else "FAIL", failed, 2 * cases.len });
+    return failed;
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const a = init.gpa;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     var kv_int8 = false;
     var splits: u32 = 0;
+    var do_check = false;
     var ai: usize = 1;
     while (ai < args.len) : (ai += 1) {
         const arg = args[ai];
@@ -60,6 +179,8 @@ pub fn main(init: std.process.Init) !u8 {
         } else if (std.mem.eql(u8, arg, "--splits")) {
             ai += 1;
             splits = try std.fmt.parseInt(u32, args[ai], 10);
+        } else if (std.mem.eql(u8, arg, "--check")) {
+            do_check = true;
         } else return error.BadArgument;
     }
     plan.flash_splits = splits;
@@ -86,6 +207,7 @@ pub fn main(init: std.process.Init) !u8 {
     };
     var prng = std.Random.DefaultPrng.init(7);
     const rng = prng.random();
+    if (do_check) return if (try check(a, &dev, &k, rng) == 0) 0 else 1;
     std.debug.print("BENCH inkling2 attention on {s}, kv {s}, splits {d}, roof {d:.1} GB/s read\n", .{ "bmg-g31", if (kv_int8) "int8" else "bf16", splits, roof_gbs });
     for (cases) |cs| {
         // the prompt kernel reads bf16 rows only, so an int8 run keeps the decode cases
