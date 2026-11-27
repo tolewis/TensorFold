@@ -860,3 +860,17 @@ test "finding 3: a slot a failed prompt left rows in restores the next stream" {
     try h.feed(recOf(.restore, 0, 1, &.{.{ .slot = 0, .rows = 0, .base = 0, .capacity = 8192 }}));
     try t.expectEqual(@as(usize, 2048), h.cache[0].len);
 }
+
+test "finding 4: rank 1 reads the shm magic and stops on a different one" {
+    const t = std.testing;
+    var map: [256]u8 align(8) = @splat(0);
+    // A map rank 0 made carries this binary's magic.
+    std.mem.writeInt(u64, map[magic_at..][0..8], magic, .little);
+    try checkMagic(&map);
+    // An 0001 binary maps the ring at other offsets: every record it reads is garbage.
+    std.mem.writeInt(u64, map[magic_at..][0..8], 0x494E_4B32_5450_0001, .little);
+    try t.expectError(error.Inkling2TpMagic, checkMagic(&map));
+    // A map with no magic is not this binary's either.
+    @memset(&map, 0);
+    try t.expectError(error.Inkling2TpMagic, checkMagic(&map));
+}
