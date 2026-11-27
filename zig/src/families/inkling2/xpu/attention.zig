@@ -130,24 +130,38 @@ pub fn dequant8(k: *const Kernels, s: xpu.Stream, src: Cache, dst: Cache, from: 
 
 /// raw holds independent q/k/v rows followed by q-side relative rows; gated sliding visits never infer K or V from Q.
 pub fn prep(k: *const Kernels, s: xpu.Stream, r: planning.Rows, l: planning.Layer, c: planning.Prep, meta: RowMeta, raw: [4]Ref, scales: [2]Ref, q: Ref, rel: Ref, kv: Cache) xpu.Error!void {
+    return prepTable(k, s, r, l, c, meta, raw, scales, q, rel, kv, null);
+}
+
+/// Relative-table units a prep launch adds when it makes the table: 16 distances each, a distance a lane.
+pub const table_units: u32 = planning.extent / 16;
+
+/// `prep`, and with `table` (the projection weight, the table out) also the relative table that `relTable` makes, in the
+/// same launch: the bits of `prep` then `relTable` (p3-review R16 and V4).
+pub fn prepTable(k: *const Kernels, s: xpu.Stream, r: planning.Rows, l: planning.Layer, c: planning.Prep, meta: RowMeta, raw: [4]Ref, scales: [2]Ref, q: Ref, rel: Ref, kv: Cache, table: ?[2]Ref) xpu.Error!void {
+    const units: u32 = if (table != null) table_units else 0;
+    const proj: ?*anyopaque = if (table) |t| t[0].at() else null;
+    const tab: ?*anyopaque = if (table) |t| t[1].at() else null;
     if (kv.int8) {
-        try xpu.launch.dispatch(k.prep8, s, .{ r.rows, r.heads + 2 * r.kv_heads, 1 }, .{
+        try xpu.launch.dispatch(k.prep8, s, .{ r.rows, r.heads + 2 * r.kv_heads + units, 1 }, .{
             raw[0].at(),     raw[1].at(),     raw[2].at(), raw[3].at(),
             scales[0].at(),  scales[1].at(),  meta.pos.at(), meta.seg_of.at(),
             meta.segs.at(),  q.at(),          rel.at(),    kv.k.at(),
             kv.kscale.at(),  kv.v.at(),       kv.vscale.at(), r.heads,
             r.kv_heads,      l.ring,          @intFromBool(l.tau), c.qk_clip,
             c.rel_clip,      c.floor,         c.alpha,     c.eps,
+            proj,            tab,             units,
         });
         return;
     }
-    try xpu.launch.dispatch(k.prep, s, .{ r.rows, r.heads + 2 * r.kv_heads, 1 }, .{
+    try xpu.launch.dispatch(k.prep, s, .{ r.rows, r.heads + 2 * r.kv_heads + units, 1 }, .{
         raw[0].at(),     raw[1].at(),  raw[2].at(), raw[3].at(),
         scales[0].at(),  scales[1].at(), meta.pos.at(), meta.seg_of.at(),
         meta.segs.at(),  q.at(),       rel.at(),    kv.k.at(),
         kv.v.at(),       r.heads,      r.kv_heads,  l.ring,
         @intFromBool(l.tau), c.qk_clip, c.rel_clip, c.floor,
-        c.alpha,         c.eps,
+        c.alpha,         c.eps,        proj,        tab,
+        units,
     });
 }
 
