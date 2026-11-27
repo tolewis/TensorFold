@@ -60,6 +60,7 @@ struct SArgs {
   int reps;
   int drop;         // a test's skipped arrival: counter 0 (unit 0), 1 + q (unit w 0 of q), 7 (block 0); -1 none
   int group;        // the counter group of the phase (the fault codes, fz_sync)
+  unsigned long long* pr;  // probed: start [G], arrival [G], exit [G], stamps (fz_probe::kMix); null: not probed
 };
 
 __device__ __forceinline__ void cpa16(void* s, const void* g) { __pipeline_memcpy_async(s, g, 16); }
@@ -83,13 +84,20 @@ __device__ __forceinline__ void warp_arrive(unsigned* c, bool skip = false) {
   if ((threadIdx.x & 31) == 0 && !skip) { __threadfence(); red_rel_add(c, 1u); }
 }
 // The last wait of a mix. The caller reads the fault word after it (mix_phase, fault_set).
-__device__ __forceinline__ void block_all(unsigned* c, unsigned* fault, unsigned code, bool skip = false) {
+__device__ __forceinline__ void block_all(unsigned* c, unsigned* fault, unsigned code, bool skip,
+                                          unsigned long long* pr) {
   __syncthreads();
   if (threadIdx.x == 0) {
+    if (pr) pr[gridDim.x + blockIdx.x] = fz_sync::now();
     if (!skip) red_rel_add(c, 1u);
     fz_sync::wait_ge(c, gridDim.x, fault, code);
+    if (pr) pr[2 * gridDim.x + blockIdx.x] = fz_sync::now();
   }
   __syncthreads();
+}
+// A unit stamp of a probed mix (lane 0 of the stamping unit).
+__device__ __forceinline__ void mstamp(const SArgs& A, bool on, int k) {
+  if (A.pr && on && (threadIdx.x & 31) == 0) A.pr[3 * gridDim.x + k] = fz_sync::now();
 }
 
 // Today's blockSums second level for one value: lanes below nw hold the warp partials, the rest 0, warpSum, lane 0.
@@ -121,6 +129,7 @@ __device__ void mixS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigned
   __pipeline_commit();
   __pipeline_wait_prior(0);
   __syncwarp();
+  mstamp(A, slot == P1, 0);
   if (slot < P1) {
     // ---- pass 1 unit (j, w)
     const int j = slot / MIXW, w = slot % MIXW, t = w * 32 + lane;
@@ -135,12 +144,14 @@ __device__ void mixS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigned
     for (int i = 0; i < 4; ++i) v[i] = warpSum(v[i]);
     if (lane == 0)
       for (int i = 0; i < 1 + nq; ++i) A.part1[(j * MIXW + w) * 4 + i] = v[i];
+    mstamp(A, slot == 0, 5);
     warp_arrive(cnt + 0, A.drop == 0 && slot == 0);
   } else if (slot < P1 + P2) {
     // ---- pass 2 unit (q, w)
     const int u = slot - P1, w = u % MIXW, q = u / MIXW, t = w * 32 + lane;
     do {  // a failed wait leaves the unit before any store (review A2)
     if (!warp_wait(cnt + 0, P1, A.fault, fz_sync::code(A.group, 0))) break;
+    mstamp(A, u == 0, 1);
     float rr[NB + 1], wq[NB + 1];
 #pragma unroll
     for (int j = 0; j < NB + 1; ++j) {
@@ -160,6 +171,7 @@ __device__ void mixS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigned
 #pragma unroll
       for (int j = 0; j < NB + 1; ++j) if (j < n) wq[j] = expf(wq[j] - m) / tt;
     }
+    mstamp(A, u == 0, 2);
     float hv[MIXRUNS];
     float s = 0.0f;
 #pragma unroll
@@ -183,6 +195,7 @@ __device__ void mixS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigned
     if (lane == 0) A.part2[q * MIXW + w] = s;
     warp_arrive(cnt + 1 + q, A.drop == 1 + q && w == 0);
     if (!warp_wait(cnt + 1 + q, MIXW, A.fault, fz_sync::code(A.group, 1 + q))) break;
+    mstamp(A, u == 0, 3);
     const float tot = sum_level2(A.part2 + q * MIXW, MIXW, 1);
     const float rq = rsqrtf(tot / C + a.eps);
     uint16_t* o = a.out + (size_t)q * a.rows * C;
@@ -194,9 +207,10 @@ __device__ void mixS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigned
       o[c] = tobf(nv * (hv[r] * rq));
     }
     acc ^= __float_as_uint(hv[0]);
+    mstamp(A, u == 0, 4);
     } while (false);
   }
-  block_all(cnt + 7, A.fault, fz_sync::code(A.group, 7), A.drop == 7 && blockIdx.x == 0);
+  block_all(cnt + 7, A.fault, fz_sync::code(A.group, 7), A.drop == 7 && blockIdx.x == 0, A.pr);
 }
 
 __device__ void loopS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigned& acc) {
@@ -218,6 +232,7 @@ __device__ void loopS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigne
   __pipeline_commit();
   __pipeline_wait_prior(0);
   __syncwarp();
+  mstamp(A, slot == P1, 0);
   if (slot < P1) {
     const int s = slot / LOOPW, w = slot % LOOPW;
     float an = 0.0f, aq[MAXQ_LOOP] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -234,11 +249,13 @@ __device__ void loopS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigne
       A.part1[(s * LOOPW + w) * 4 + 0] = an;
       for (int q = 0; q < nq; ++q) A.part1[(s * LOOPW + w) * 4 + 1 + q] = aq[q];
     }
+    mstamp(A, slot == 0, 5);
     warp_arrive(cnt + 0, A.drop == 0 && slot == 0);
   } else if (slot < P1 + P2) {
     const int u = slot - P1, w = u % LOOPW, q = u / LOOPW;
     do {  // a failed wait leaves the unit before any store (review A2)
     if (!warp_wait(cnt + 0, P1, A.fault, fz_sync::code(A.group, 0))) break;
+    mstamp(A, u == 0, 1);
     // today's blockSum: warp partials added in warp order by every thread
     float inv[NB + 1], score[NB + 1];
 #pragma unroll
@@ -265,6 +282,7 @@ __device__ void loopS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigne
     }
 #pragma unroll
     for (int s = 0; s < NB + 1; ++s) if (s < S) coef[s] = (score[s] / l) * inv[s];
+    mstamp(A, u == 0, 2);
     float* dst = a.out + q * a.out_stride;
     for (int k = 0; k < LOOPRUNS; ++k) {
       float uu = 0.0f;
@@ -280,19 +298,21 @@ __device__ void loopS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigne
       dst[w * 32 + lane + 256 * k] = uu;
       acc ^= __float_as_uint(uu);
     }
+    mstamp(A, u == 0, 4);
     } while (false);
   }
-  block_all(cnt + 7, A.fault, fz_sync::code(A.group, 7), A.drop == 7 && blockIdx.x == 0);
+  block_all(cnt + 7, A.fault, fz_sync::code(A.group, 7), A.drop == 7 && blockIdx.x == 0, A.pr);
 }
 }  // namespace fz_mix
 
 // One mix phase (mixS of B9). cnt: 8 zeroed counters. part1 [9][16][4], part2 [4][16] fp32. stg: 4 x 5,760 B shared.
 extern "C" __device__ void fz_mix_s(const fz_mix::MixArgs& a, float* part1, float* part2, unsigned* cnt,
-                                    unsigned* fault, unsigned char* stg, int drop, int group) {
+                                    unsigned* fault, unsigned char* stg, int drop, int group, unsigned long long* pr) {
     fz_mix::SArgs A;
     A.mix = a;
     A.drop = drop;
     A.group = group;
+    A.pr = pr;
     A.part1 = part1;
     A.part2 = part2;
     A.fault = fault;
@@ -302,11 +322,12 @@ extern "C" __device__ void fz_mix_s(const fz_mix::MixArgs& a, float* part1, floa
 
 // One loop mix phase (loopS of B9).
 extern "C" __device__ void fz_loop_s(const fz_mix::LoopMixArgs& a, float* part1, float* part2, unsigned* cnt,
-                                     unsigned* fault, unsigned char* stg, int drop, int group) {
+                                     unsigned* fault, unsigned char* stg, int drop, int group, unsigned long long* pr) {
     fz_mix::SArgs A;
     A.loop = a;
     A.drop = drop;
     A.group = group;
+    A.pr = pr;
     A.part1 = part1;
     A.part2 = part2;
     A.fault = fault;

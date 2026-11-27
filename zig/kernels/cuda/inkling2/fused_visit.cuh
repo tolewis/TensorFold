@@ -68,7 +68,8 @@ struct FzTaps {          // the k and v taps of a global visit: dense_rows_scale
 
 struct FusedVisit {
     int global, gated, nq_attn, n_proj;   // n_proj: 1 (all) or 3 (qx, wk, wv)
-    int copy_bytes, drop, pad1, pad2;      // the boundary copy (0: none); drop: a test's skipped arrival (fused.zig)
+    int copy_bytes, drop, probe, pad2;     // the boundary copy (0: none); drop: a test's skipped arrival, probe: the
+                                           // probed phase + 1 (0: none), fused.zig
     void* copy_dst;
     const void* copy_src;
     const void* mix_attn;   // ops MixArgs (plain) or loop LoopMixArgs (gated)
@@ -91,7 +92,17 @@ struct FusedState {
     float* part1;           // mode S partials
     float* part2;
     unsigned long long* times;  // 64 a visit: globaltimer after each phase change (block 0)
+    unsigned long long* probe;  // the probed phase: start [G], arrival [G], wait exit [G] a block, then 32 unit stamps
 };
+
+// Unit stamps of a probed phase (FusedState probe + 3 G), globaltimer ns
+namespace fz_probe {
+constexpr int kMix = 0;    // mix: 0 pass 2 unit 0 staged, 1 after its first wait, 2 coefficients, 3 after its second
+                           // wait, 4 unit end, 5 pass 1 unit 0 arrival
+constexpr int kGate = 8;   // gate down unit 0: 8 start, 9 norms and xs, 10 rank rows done
+constexpr int kTop = 12;   // block 0: 12 start, 13 top 8 done, 14 plan done
+constexpr int kProj = 16;  // block 0, unit j < 4: 16 + 4 j start, + 1 body done, + 2 ticket, + 3 tile sum done
+}
 
 // The waits of the fused visit (review A2, A3). Every wait spins on one counter with the same 200 ms limit (R8) and
 // reads the visit's fault word in each spin. A wait that reaches the limit sets the fault word once:
@@ -130,4 +141,4 @@ __device__ __forceinline__ bool wait_ge(const unsigned* p, unsigned target, unsi
 // fused.zig asserts the same sizes
 static_assert(sizeof(FzProj) == 64 && sizeof(FzPrep) == 160 && sizeof(FzAttn) == 184, "fused.zig layout");
 static_assert(sizeof(FzMoe) == 168 && sizeof(FzTaps) == 64 && sizeof(FusedVisit) == 944, "fused.zig layout");
-static_assert(sizeof(FusedState) == 48, "fused.zig layout");
+static_assert(sizeof(FusedState) == 56, "fused.zig layout");

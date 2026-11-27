@@ -16,6 +16,11 @@
 
 namespace {
 constexpr int kR = 128;  // real threads a block
+__device__ __forceinline__ unsigned long long stamp() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
 
 // Today's blockSum of a 256-thread block, the virtual warp partials of v[0] (virtual threads t) and v[1] (t + 128).
 __device__ __forceinline__ float blockSum2(const float (&v)[2], float* sh) {
@@ -35,8 +40,10 @@ __device__ __forceinline__ float blockSum2(const float (&v)[2], float* sh) {
 
 // tf_ink2_loop_gate_down block (row 0, gate g, z): rank rows 8 z to 8 z + 7, two a real warp (virtual warps w, w + 4).
 // `xs` is 2 H floats of the caller's shared memory, `sh` 8 floats.
-extern "C" __device__ void fz_gate_down(const LoopGateArgs& a, int g, int z, float* xs, float* sh) {
+extern "C" __device__ void fz_gate_down(const LoopGateArgs& a, int g, int z, float* xs, float* sh,
+                                        unsigned long long* px) {
     const size_t row = 0;
+    if (px && threadIdx.x == 0) px[8] = stamp();
     const int H = a.H;
     const float* h = a.h[g] + row * H;
     const float* m = a.msg + a.slot[g] * a.msg_stride + row * H;
@@ -53,6 +60,7 @@ extern "C" __device__ void fz_gate_down(const LoopGateArgs& a, int g, int z, flo
         xs[H + i] = bf(tobf(m[i] * im));
     }
     __syncthreads();
+    if (px && threadIdx.x == 0) px[9] = stamp();
     const int lane = threadIdx.x & 31;
     for (int k = 0; k < 2; ++k) {
         const int w = (threadIdx.x >> 5) + 4 * k;
@@ -65,6 +73,7 @@ extern "C" __device__ void fz_gate_down(const LoopGateArgs& a, int g, int z, flo
         if (lane == 0) a.down[(static_cast<size_t>(g) * a.rows + row) * a.rank + r] = tobf(acc);
     }
     __syncthreads();
+    if (px && threadIdx.x == 0) px[10] = stamp();
 }
 
 // tf_ink2_loop_gate_lin_rows block (row tile 0, gate g, z) for one row, rank 64. `dn` is 64 floats of shared memory.

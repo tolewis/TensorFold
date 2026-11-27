@@ -156,7 +156,7 @@ pub const Visit = extern struct {
     n_proj: i32,
     copy_bytes: i32 = 0,
     drop: i32 = 0, // review A2, A3: a skipped arrival, ((group + 1) << 3) | sub (0: none)
-    pad1: i32 = 0,
+    probe: i32 = 0, // the probed phase + 1 (0: none), TF_INKLING2_FUSED_PROBE
     pad2: i32 = 0,
     copy_dst: u64 = 0,
     copy_src: u64 = 0,
@@ -173,7 +173,7 @@ pub const Visit = extern struct {
     moe: Moe,
 };
 
-pub const StateArgs = extern struct { cnt: u64, tk: u64, fault: u64, part1: u64, part2: u64, times: u64 };
+pub const StateArgs = extern struct { cnt: u64, tk: u64, fault: u64, part1: u64, part2: u64, times: u64, probe: u64 };
 
 comptime {
     std.debug.assert(@sizeOf(Proj) == 64);
@@ -182,6 +182,7 @@ comptime {
     std.debug.assert(@sizeOf(Moe) == 168);
     std.debug.assert(@sizeOf(Taps) == 64);
     std.debug.assert(@sizeOf(Visit) == 944);
+    std.debug.assert(@sizeOf(StateArgs) == 56);
 }
 
 // a visit's argument structs in device memory: offsets in its 2 KB region
@@ -202,6 +203,7 @@ const times_visit = 64;
 const visits_max = config.max_visits;
 const threads = 128;
 const ref_bytes = 32 << 20;
+const probe_stamps = 32;
 
 pub const State = struct {
     d: *const cuda.Driver,
@@ -218,10 +220,12 @@ pub const State = struct {
     part1: cuda.DeviceBuffer,
     part2: cuda.DeviceBuffer,
     times: cuda.DeviceBuffer,
+    probe: cuda.DeviceBuffer, // the probed phase of a launch: start, arrival, exit [G] each, 32 unit stamps
     qpart: cuda.DeviceBuffer, // fp32 [4 calls][8][8600] qmmf slice partials
     ref: cuda.DeviceBuffer, // check: today's bytes of each compared buffer
     save: cuda.DeviceBuffer, // check: the conv states before the visit
-    ev: [4]cuda.abi.Event = @splat(null),
+    ev: [8]cuda.abi.Event = @splat(null),
+    graph_ok: bool = true, // the fused launch captures into a graph (review A22); false after a refused capture
     at: []const u8 = "",
     steps: [visits_max]usize = @splat(0),
     bad: [visits_max]usize = @splat(0),
@@ -257,6 +261,7 @@ pub const State = struct {
             .part1 = try cuda.DeviceBuffer.alloc(d, 9 * 16 * 4 * 4),
             .part2 = try cuda.DeviceBuffer.alloc(d, 4 * 16 * 4),
             .times = try cuda.DeviceBuffer.alloc(d, visits_max * times_visit * 8),
+            .probe = try cuda.DeviceBuffer.alloc(d, (3 * @as(usize, @intCast(sms)) + probe_stamps) * 8),
             .qpart = try cuda.DeviceBuffer.alloc(d, 4 * 8 * 8704 * 4),
             .ref = try cuda.DeviceBuffer.alloc(d, @as(usize, if (sw.mode == .check) ref_bytes else 0)),
             .save = try cuda.DeviceBuffer.alloc(d, @as(usize, if (sw.mode == .check) 1 << 20 else 0)),
@@ -267,15 +272,21 @@ pub const State = struct {
     }
 
     fn statePtrs(f: *const State) StateArgs {
-        return .{ .cnt = f.cnt.ptr, .tk = f.tk.ptr, .fault = f.fault.ptr, .part1 = f.part1.ptr, .part2 = f.part2.ptr, .times = f.times.ptr };
+        return .{ .cnt = f.cnt.ptr, .tk = f.tk.ptr, .fault = f.fault.ptr, .part1 = f.part1.ptr, .part2 = f.part2.ptr, .times = f.times.ptr, .probe = f.probe.ptr };
     }
 
     /// Visits [first, first + count): counters, tickets and fault words cleared, one cooperative launch.
     pub fn launch(f: *const State, s: cuda.Stream, first: u32, count: u32) !void {
+        return f.launchMarked(s, first, count, null, false);
+    }
+
+    /// `launch` with event `mid` recorded after the memsets (review A17); `external` when the stream captures.
+    pub fn launchMarked(f: *const State, s: cuda.Stream, first: u32, count: u32, mid: cuda.abi.Event, external: bool) !void {
         const d = f.d;
         try d.check(d.api.cuMemsetD8Async(f.cnt.ptr, 0, f.cnt.len, s.handle), "cuMemsetD8Async");
         try d.check(d.api.cuMemsetD8Async(f.tk.ptr, 0, f.tk.len, s.handle), "cuMemsetD8Async");
         try d.check(d.api.cuMemsetD8Async(f.fault.ptr, 0, f.fault.len, s.handle), "cuMemsetD8Async");
+        if (mid != null) try d.check(d.api.cuEventRecordWithFlags(mid, s.handle, if (external) 1 else 0), "cuEventRecordWithFlags");
         var a: cuda.Args = .{};
         a.add(f.table.ptr);
         a.add(@as(i32, @intCast(first)));
@@ -704,6 +715,103 @@ fn dropPos() u32 {
     return S.v.?;
 }
 
+/// TF_INKLING2_FUSED_PROBE=<visit>:<phase>,...: on the steps that print no [fused-time] line, step s of a visit
+/// probes entry s % n of its n entries: each block stores the globaltimer at the phase start, at its arrival at the
+/// phase's last wait and at the wait's exit, and named units store stamps (fused_visit.cuh fz_probe).
+const Probe = struct { v: u32, ph: i32 };
+fn probes() []const Probe {
+    const S = struct {
+        var list: [64]Probe = undefined;
+        var n: usize = 0;
+        var done = false;
+    };
+    if (!S.done) {
+        S.done = true;
+        if (std.c.getenv("TF_INKLING2_FUSED_PROBE")) |e| {
+            var it = std.mem.tokenizeScalar(u8, std.mem.span(e), ',');
+            while (it.next()) |x| if (S.n < S.list.len) {
+                var f = std.mem.tokenizeScalar(u8, x, ':');
+                const v = std.fmt.parseInt(u32, f.next() orelse continue, 10) catch continue;
+                const ph = std.fmt.parseInt(i32, f.next() orelse continue, 10) catch continue;
+                S.list[S.n] = .{ .v = v, .ph = ph };
+                S.n += 1;
+            };
+        }
+    }
+    return S.list[0..S.n];
+}
+
+fn probeFor(v: u32, step: usize) i32 {
+    if (step % every() == 0) return -1;
+    var n: usize = 0;
+    for (probes()) |p| n += @intFromBool(p.v == v);
+    if (n == 0) return -1;
+    var k: usize = step % n;
+    for (probes()) |p| if (p.v == v) {
+        if (k == 0) return p.ph;
+        k -= 1;
+    };
+    return -1;
+}
+
+/// TF_INKLING2_FUSED_GRAPH (default 1): today's visit also runs as a captured graph (the live launch method), and
+/// the fused launch runs from a captured graph on even steps (review A22). 0: the old method only.
+fn graphOn() bool {
+    const S = struct {
+        var v: ?bool = null;
+    };
+    if (S.v == null) S.v = if (std.c.getenv("TF_INKLING2_FUSED_GRAPH")) |e| e[0] != '0' else true;
+    return S.v.?;
+}
+
+/// Today's visit captured into a graph, instantiated and uploaded; the stream is idle at return.
+fn todayGraph(m: *Model, k: *const Kernels, s: cuda.Stream, r: anytype, v: u32, hin: u64, hout: u64, today: anytype) !cuda.graph.Exec {
+    try s.synchronize();
+    try cuda.graph.beginCapture(s, .thread_local);
+    today.run(m, k, s, r, v, hin, hout) catch |e| {
+        if (cuda.graph.endCapture(s)) |g| {
+            var gg = g;
+            gg.deinit();
+        } else |_| {}
+        return e;
+    };
+    var g = try cuda.graph.endCapture(s);
+    defer g.deinit();
+    var ex = try g.instantiate();
+    errdefer ex.deinit();
+    try ex.upload(s);
+    try s.synchronize();
+    return ex;
+}
+
+/// The fused launch of visit v captured into a graph (memsets, event `mid`, the cooperative launch); null when the
+/// driver refuses the capture.
+fn fusedGraph(f: *State, s: cuda.Stream, v: u32) !?cuda.graph.Exec {
+    try s.synchronize();
+    try cuda.graph.beginCapture(s, .thread_local);
+    f.launchMarked(s, v, 1, f.ev[6], true) catch |e| {
+        if (cuda.graph.endCapture(s)) |g| {
+            var gg = g;
+            gg.deinit();
+        } else |_| {}
+        std.debug.print("[fused] the fused launch does not capture ({s}): stream launches only\n", .{@errorName(e)});
+        return null;
+    };
+    var g = cuda.graph.endCapture(s) catch |e| {
+        std.debug.print("[fused] the fused capture ends with {s}: stream launches only\n", .{@errorName(e)});
+        return null;
+    };
+    defer g.deinit();
+    var ex = g.instantiate() catch |e| {
+        std.debug.print("[fused] the fused graph does not instantiate ({s}): stream launches only\n", .{@errorName(e)});
+        return null;
+    };
+    errdefer ex.deinit();
+    try ex.upload(s);
+    try s.synchronize();
+    return ex;
+}
+
 /// At load in check mode: the query pointers of each layer (review A7) and the resident blocks a multiprocessor of
 /// today's fp8 attention kernels at 128 threads against the fused kernel (review A10).
 pub fn reportLoad(m: *const Model, k: *const Kernels) !void {
@@ -766,6 +874,32 @@ pub fn check(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytype
     };
 }
 
+fn printProbe(f: *State, v: u32, step: usize, pos: u32, ph: i32, ms_fused: f32) !void {
+    const gpa = std.heap.page_allocator;
+    const n = 3 * @as(usize, f.grid) + probe_stamps;
+    const p = try gpa.alloc(u64, n);
+    defer gpa.free(p);
+    try cuda.memory.download(f.d, f.probe.ptr, std.mem.sliceAsBytes(p));
+    var t0: u64 = std.math.maxInt(u64);
+    for (p[0..f.grid]) |x| if (x != 0) {
+        t0 = @min(t0, x);
+    };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try out.print(gpa, "[fused-probe] visit {d} step {d} pos {d} phase {d} fused_us {d:.2} grid {d} ns from the first start:", .{ v, step, pos, ph, ms_fused * 1000, f.grid });
+    const names = [_][]const u8{ " start", " arrive", " exit", " stamps" };
+    for (0..4) |part| {
+        try out.appendSlice(gpa, names[part]);
+        const lo = part * f.grid;
+        const hi = if (part == 3) n else lo + f.grid;
+        for (p[lo..hi]) |x| {
+            if (x == 0 or t0 == std.math.maxInt(u64)) try out.appendSlice(gpa, " -") else try out.print(gpa, " {d}", .{@as(i64, @intCast(x)) - @as(i64, @intCast(t0))});
+        }
+    }
+    try out.append(gpa, '\n');
+    std.debug.print("{s}", .{out.items});
+}
+
 fn checkSteps(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytype, v: u32, hin: u64, hout: u64, today: anytype) !void {
     const d = f.d;
     const gpa = std.heap.page_allocator; // not the model's allocator: the check's buffers live for one visit
@@ -791,6 +925,8 @@ fn checkSteps(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytyp
         if (drop != 0) f.drop_at[v] += 1;
     }
     vis.drop = drop;
+    const probe = probeFor(v, step);
+    vis.probe = probe + 1;
     f.at = "upload";
     try s.synchronize();
     try f.args.upload(@as(usize, v) * arg_bytes, &host);
@@ -805,12 +941,32 @@ fn checkSteps(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytyp
         saved += b.len;
     };
     if (fill_on) try poison(d, s, list[0..nbuf]);
+    if (probe >= 0) try d.check(d.api.cuMemsetD8Async(f.probe.ptr, 0, f.probe.len, s.handle), "cuMemsetD8Async");
+    // today's kernels: one by one from an idle stream (the method of deb490d58), then as a captured graph (the live
+    // launch method, review A22) from the same state. The graph's bytes are the reference.
     f.at = "today";
     try s.synchronize();
     try d.check(d.api.cuEventRecord(f.ev[0], s.handle), "cuEventRecord");
     try today.run(m, k, s, r, v, hin, hout);
-    f.at = "ref";
     try d.check(d.api.cuEventRecord(f.ev[1], s.handle), "cuEventRecord");
+    var ms_graph: f32 = -1;
+    if (graphOn()) {
+        saved = 0;
+        for (list[0..nbuf]) |b| if (std.mem.startsWith(u8, b.name, "conv_")) {
+            try m.copy(s, b.ptr, f.save.ptr + saved, b.len);
+            saved += b.len;
+        };
+        if (fill_on) try poison(d, s, list[0..nbuf]);
+        f.at = "today-graph";
+        var ex = try todayGraph(m, k, s, r, v, hin, hout, today);
+        defer ex.deinit();
+        try d.check(d.api.cuEventRecord(f.ev[4], s.handle), "cuEventRecord");
+        try ex.launchOn(s);
+        try d.check(d.api.cuEventRecord(f.ev[5], s.handle), "cuEventRecord");
+        try s.synchronize();
+        try d.check(d.api.cuEventElapsedTime(&ms_graph, f.ev[4], f.ev[5]), "cuEventElapsedTime");
+    }
+    f.at = "ref";
     var at: usize = 0;
     for (list[0..nbuf]) |b| {
         if (at + b.len > f.ref.len) return error.FusedRefFull;
@@ -832,15 +988,37 @@ fn checkSteps(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytyp
         std.debug.print("[fused-control] visit {d} step {d} pos {d} no fused launch: differing bytes {d} by the old method, {d} by the fill method, buffers {d}\n", .{ v, step, r.last_pos, old_n, new_n, nbuf });
     }
     if (fill_on) try poison(d, s, list[0..nbuf]);
-    try d.check(d.api.cuEventRecord(f.ev[2], s.handle), "cuEventRecord");
+    // the fused launch: on even steps from a captured graph after an idle stream (review A22); on odd steps as a stream
+    // launch behind the queued copies (the method of deb490d58), with an event after the memsets (review A17)
     f.at = "fused";
-    try f.launch(s, v, 1);
-    try d.check(d.api.cuEventRecord(f.ev[3], s.handle), "cuEventRecord");
+    var method: []const u8 = "stream-queued";
+    var ms_memset: f32 = -1;
+    var fx: ?cuda.graph.Exec = null;
+    defer if (fx) |*e| e.deinit();
+    if (graphOn() and f.graph_ok and step % 2 == 0) {
+        fx = try fusedGraph(f, s, v);
+        if (fx == null) f.graph_ok = false;
+    }
+    if (fx) |e| {
+        method = "graph";
+        try d.check(d.api.cuEventRecord(f.ev[2], s.handle), "cuEventRecord");
+        try e.launchOn(s);
+        try d.check(d.api.cuEventRecord(f.ev[3], s.handle), "cuEventRecord");
+    } else {
+        try d.check(d.api.cuEventRecord(f.ev[2], s.handle), "cuEventRecord");
+        try f.launchMarked(s, v, 1, f.ev[7], false);
+        try d.check(d.api.cuEventRecord(f.ev[3], s.handle), "cuEventRecord");
+    }
     try s.synchronize();
     var ms_today: f32 = 0;
     var ms_fused: f32 = 0;
     try d.check(d.api.cuEventElapsedTime(&ms_today, f.ev[0], f.ev[1]), "cuEventElapsedTime");
     try d.check(d.api.cuEventElapsedTime(&ms_fused, f.ev[2], f.ev[3]), "cuEventElapsedTime");
+    if (fx != null) {
+        d.check(d.api.cuEventElapsedTime(&ms_memset, f.ev[2], f.ev[6]), "cuEventElapsedTime") catch {
+            ms_memset = -1;
+        };
+    } else try d.check(d.api.cuEventElapsedTime(&ms_memset, f.ev[2], f.ev[7]), "cuEventElapsedTime");
     var fault: u32 = 0;
     try cuda.memory.download(d, f.fault.ptr + @as(u64, v) * 4, std.mem.asBytes(&fault));
     var times: [times_visit]u64 = undefined;
@@ -862,13 +1040,14 @@ fn checkSteps(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytyp
     if (drop != 0) {
         std.debug.print("[fused-drop] visit {d} step {d} pos {d} group {d} sub {d} fused_us {d:.2} fault 0x{x} ({s}) differing {d}\n", .{ v, step, r.last_pos, (drop >> 3) - 1, drop & 7, ms_fused * 1000, fault, faultText(&fbuf, fault), diff_total });
     } else if (diff_total != 0 or fault != 0) f.bad[v] += 1;
+    if (probe >= 0) try printProbe(f, v, step, r.last_pos, probe, ms_fused);
     if (drop == 0 and (diff_total != 0 or fault != 0 or step % every() == 0)) {
         std.debug.print("{s}", .{lines.items});
         var tl: std.ArrayList(u8) = .empty;
         defer tl.deinit(gpa);
         var ph: usize = 1;
         while (ph < times_visit and times[ph] != 0 and times[ph] >= times[ph - 1]) : (ph += 1) try tl.print(gpa, " {d}", .{times[ph] - times[ph - 1]});
-        std.debug.print("[fused-time] visit {d} step {d} pos {d} today_us {d:.2} fused_us {d:.2} fault 0x{x} fill {d} phases_ns{s}\n", .{ v, step, r.last_pos, ms_today * 1000, ms_fused * 1000, fault, @intFromBool(fill_on), tl.items });
+        std.debug.print("[fused-time] visit {d} step {d} pos {d} today_us {d:.2} fused_us {d:.2} fault 0x{x} fill {d} today_graph_us {d:.2} memset_us {d:.2} method {s} phases_ns{s}\n", .{ v, step, r.last_pos, ms_today * 1000, ms_fused * 1000, fault, @intFromBool(fill_on), ms_graph * 1000, ms_memset * 1000, method, tl.items });
         if (fault != 0) std.debug.print("[fused-fault] visit {d} step {d} {s}\n", .{ v, step, faultText(&fbuf, fault) });
         std.debug.print("[fused-sum] visit {d} steps {d} bad {d} buffers {d} differing {d}\n", .{ v, step + 1, f.bad[v], nbuf, diff_total });
     }
