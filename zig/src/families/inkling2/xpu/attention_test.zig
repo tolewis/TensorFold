@@ -3,6 +3,13 @@ const std = @import("std");
 const p = @import("attention_plan.zig");
 const t = std.testing;
 
+test "inkling2 xpu int8 cache refuses a segment offset" {
+    const segs = [_]p.Seg{ .{ .row0 = 0, .n = 4, .p0 = 0, .off = 0 }, .{ .row0 = 0, .n = 4, .p0 = 4, .off = 128 } };
+    try p.checkSegs(segs[0..1], true);
+    try p.checkSegs(&segs, false);
+    try t.expectError(error.Inkling2Int8SegmentOffset, p.checkSegs(&segs, true));
+}
+
 test "inkling2 xpu ring and window boundaries" {
     try t.expectEqual(@as(usize, 24), @sizeOf(p.Seg));
     try t.expectEqual(@as(u32, 1024), p.ringFor(1024, 1));

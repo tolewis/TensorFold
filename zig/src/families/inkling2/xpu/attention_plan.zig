@@ -69,6 +69,13 @@ comptime {
     if (@sizeOf(Seg) != 24) @compileError("Inkling attention segment ABI drift");
 }
 
+/// The int8 kernels add `off` to the code pointers only (bytes in prep8, decode8 and prompt8, bf16 values in prep8q) and
+/// not to the scale pointers, and dequant8 reads no segment. So an int8 cache takes no segment offset: refuse one.
+pub fn checkSegs(segs: []const Seg, int8: bool) error{Inkling2Int8SegmentOffset}!void {
+    if (!int8) return;
+    for (segs) |s| if (s.off != 0) return error.Inkling2Int8SegmentOffset;
+}
+
 /// What `tf_ink2_prep` takes after its buffers, in order; the kernel takes each as its own scalar argument.
 pub const PrepArgs = struct { heads: u32, kv_heads: u32, ring: u32, global: u32, qk_clip: f32, rel_clip: f32, floor_pos: f32, alpha: f32, eps: f32 };
 pub const AttnArgs = struct { heads: u32, kv_heads: u32, ring: u32, window: u32, chunk: u32, c0: u32, chunks: u32, scale: f32 };

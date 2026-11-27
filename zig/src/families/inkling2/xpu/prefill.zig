@@ -551,6 +551,7 @@ pub fn run(m: *const Model, s: *state.Scratch, cache: *state.Cache, ids: []const
     // so a slot past the slices holds a zero segment too
     const seg_slots = if (slicedSliding(options)) state.prefill_segments else slices;
     for (slices..seg_slots) |j| segs[j] = .{ .row0 = 0, .n = 0, .p0 = 0, .off = 0 };
+    try ap.checkSegs(segs[0..seg_slots], cache.kv == .int8);
     try m.r.upload(s.segs, std.mem.sliceAsBytes(segs[0..seg_slots]));
     if (m.options.place.rank == 0) {
         if (group.live) |gp| {

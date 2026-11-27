@@ -922,6 +922,7 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
         base += seg.rows;
     }
     if (total != rows) return error.Inkling2Segments;
+    try ap.checkSegs(segs[0..segments.len], segments[0].cache.kv == .int8);
     for (ids) |id| if (id >= m.config.text.vocab) return error.Inkling2Token;
     // The host arrays below stay valid until the stream has finished, which this function waits for before it returns.
     const stream = m.r.stream(ctx);
