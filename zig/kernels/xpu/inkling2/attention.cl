@@ -37,6 +37,11 @@ static inline float sum8(float8 x) {
 
 static inline float8 bf2f8(ushort8 h) { return as_float8(convert_uint8(h) << 16); }
 
+// A query value of the decode kernels: lane `l` holds dims 16j + l of each of the GROUP heads in private registers, and the
+// dot takes dim d from lane d % 16 by a broadcast at a fixed lane (p3-review R9: no local memory, no barrier). The int8
+// kernel keeps its local copy: its compiled tile loop has no local load (the compiler holds the values in registers).
+#define QV(qr, g, d) sub_group_broadcast((qr)[g][(d) / 16], (d) % 16)
+
 static inline float max8abs(float8 x) {
   return fmax(fmax(fmax(fabs(x.s0), fabs(x.s1)), fmax(fabs(x.s2), fabs(x.s3))),
               fmax(fmax(fabs(x.s4), fabs(x.s5)), fmax(fabs(x.s6), fabs(x.s7))));
@@ -301,12 +306,11 @@ KERNEL(16) void tf_ink2_attn_decode(global const ushort *q, global const ushort 
   global const ushort *kh = kc + s.off + (size_t)kvh * ring * D;
   global const ushort *vh = vc + s.off + (size_t)kvh * ring * D;
   const size_t rh0 = (size_t)row * heads + kvh * GROUP;
-  local float qs[GROUP][D];
+  float qr[GROUP][D / 16];
   UNROLL
   for (uint g = 0; g < GROUP; ++g)
     UNROLL
-    for (uint j = 0; j < D / 16; ++j) qs[g][j * 16 + lane] = bf2f(q[(rh0 + g) * D + j * 16 + lane]);
-  sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint j = 0; j < D / 16; ++j) qr[g][j] = bf2f(q[(rh0 + g) * D + j * 16 + lane]);
   float top[GROUP], total[GROUP], acc[GROUP][D / 16];
   UNROLL
   for (uint g = 0; g < GROUP; ++g) {
@@ -344,10 +348,9 @@ KERNEL(16) void tf_ink2_attn_decode(global const ushort *q, global const ushort 
       const float8 k = bf2f8(vload8(0, krow + i * 8));
       UNROLL
       for (uint g = 0; g < GROUP; ++g) {
-        const float8 w = vload8(0, &qs[g][i * 8]);
         float a = dot[g];
-        a += k.s0 * w.s0; a += k.s1 * w.s1; a += k.s2 * w.s2; a += k.s3 * w.s3;
-        a += k.s4 * w.s4; a += k.s5 * w.s5; a += k.s6 * w.s6; a += k.s7 * w.s7;
+        a += k.s0 * QV(qr, g, i * 8 + 0); a += k.s1 * QV(qr, g, i * 8 + 1); a += k.s2 * QV(qr, g, i * 8 + 2); a += k.s3 * QV(qr, g, i * 8 + 3);
+        a += k.s4 * QV(qr, g, i * 8 + 4); a += k.s5 * QV(qr, g, i * 8 + 5); a += k.s6 * QV(qr, g, i * 8 + 6); a += k.s7 * QV(qr, g, i * 8 + 7);
         dot[g] = a;
       }
     }
