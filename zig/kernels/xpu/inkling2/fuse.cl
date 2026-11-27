@@ -632,7 +632,8 @@ KERNEL(256) void tf_ink2_router_norm_gemv(
   if (lane == 0) scores[(size_t)row * 128 + expert] = rsig(dot);
 }
 
-// Grid (rows). Same tie rule as tf_inkling2_router: a larger key wins, an equal key keeps the lower index.
+// Grid (rows). Same tie rule as tf_inkling2_router: a larger key wins, an equal key keeps the lower index. A NaN key
+// ranks as -inf, below every number, so the ranks are a permutation and exactly 8 work-items store.
 __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(128, 1, 1))) kernel void tf_ink2_router_pick(
     global const float *scores_in, global const float *bias, global uint *ids, global float *weights, uint rows) {
   const uint row = get_group_id(0), t = get_local_id(0);
@@ -641,7 +642,8 @@ __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_si
   local uint flag[128], picked[8];
   const float sc = scores_in[(size_t)row * 128 + t];
   scores[t] = sc;
-  keys[t] = sc + bias[t];
+  const float key = sc + bias[t];
+  keys[t] = isnan(key) ? -INFINITY : key;
   barrier(CLK_LOCAL_MEM_FENCE);
   const float ke = keys[t];
   uint rank = 0;
@@ -654,8 +656,10 @@ __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_si
   if (flag[t]) {
     uint at = 0;
     for (uint j = 0; j < t; ++j) at += flag[j];
-    picked[at] = t;
-    chosen[at] = scores[t];
+    if (at < 8) {
+      picked[at] = t;
+      chosen[at] = scores[t];
+    }
   }
   barrier(CLK_LOCAL_MEM_FENCE);
   if (t == 0) {
