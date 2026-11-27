@@ -10,7 +10,12 @@ pub const Kernel = struct {
     min_sm: u32 = 0,
     /// has a TF_NATIVE_FP_DECODE path (common/fp_pairs.cuh), built by -Dnative-fp-decode
     native_fp: bool = false,
+    /// a relocatable module: each unit compiled with -rdc=true -dc and its own flags, then one device link (-dlink)
+    units: ?[]const Unit = null,
 };
+
+/// One source of a relocatable module: its .cu under zig/kernels/cuda and the flags of the module whose code it holds.
+pub const Unit = struct { src: []const u8, flags: []const []const u8, native_fp: bool = false };
 
 /// One `-Dsm` entry: the SM number and any suffix given with it ("120", "121a").
 pub const Target = struct {
@@ -43,6 +48,11 @@ pub fn nativeFp(gpa: std.mem.Allocator, k: Kernel, on: bool) Kernel {
     var out = k;
     out.arch_specific = true;
     out.flags = std.mem.concat(gpa, []const u8, &.{ k.flags, &.{"-DTF_NATIVE_FP_DECODE"} }) catch @panic("OOM");
+    if (k.units) |units| {
+        const all = gpa.alloc(Unit, units.len) catch @panic("OOM");
+        for (units, all) |u, *o| o.* = if (u.native_fp) .{ .src = u.src, .flags = std.mem.concat(gpa, []const u8, &.{ u.flags, &.{"-DTF_NATIVE_FP_DECODE"} }) catch @panic("OOM"), .native_fp = true } else u;
+        out.units = all;
+    }
     return out;
 }
 
@@ -167,6 +177,18 @@ pub const kernels = [_]Kernel{
     .{ .name = "inkling2_loop", .src = "inkling2/loop", .flags = glue }, // Inkling 2 Mini: loop messages, gates
     .{ .name = "inkling2_mtp", .src = "inkling2/mtp", .flags = glue }, // Inkling 2 Mini: DSpark drafter, taps, conv backups
     .{ .name = "inkling2_dflash", .src = "inkling2/dflash", .flags = glue }, // Inkling 2 Mini: DFlash2 drafter
+    // Inkling 2 Mini: one cooperative kernel a range of decode visits (TF_INKLING2_FUSED). Each unit includes one of
+    // today's modules and keeps that module's flags, so every phase runs today's code with today's float rules.
+    .{ .name = "inkling2_fused", .flags = glue, .arch_specific = true, .min_sm = 120, .native_fp = true, .units = &.{
+        .{ .src = "inkling2/fused_main", .flags = glue },
+        .{ .src = "inkling2/fused_mix", .flags = glue },
+        .{ .src = "inkling2/fused_ops", .flags = glue },
+        .{ .src = "inkling2/fused_loop", .flags = glue },
+        .{ .src = "inkling2/fused_attn", .flags = &.{"-O3"} },
+        .{ .src = "inkling2/fused_qmmf", .flags = &.{"-O3"}, .native_fp = true },
+        .{ .src = "inkling2/fused_experts", .flags = &.{"-O3"} },
+        .{ .src = "inkling2/fused_glue", .flags = &.{"-O3"} },
+    } },
     .{ .name = "glm_quant", .flags = torch_ops }, // ours: GLM's draft-only weight quantizers, torch at load in the Python family
     .{ .name = "exl3_linear", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/linear.cu's device code, tensorfold_exl3_linear_v5
     .{ .name = "exl3_experts", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/experts.cu's device code, tensorfold_exl3_experts
@@ -227,8 +249,8 @@ test "profile: arch-specific kernels take sm_<n>a from sm_120 on, others plain, 
     try std.testing.expectEqual(@as(?Profile, null), profile(plain, Target.parse("75")));
 }
 
-test "native_fp units: exactly fp8_experts, qmmf and prompt16 (without the flag native-fp only skips)" {
-    const want = [_][]const u8{ "fp8_experts", "qmmf", "prompt16" };
+test "native_fp units: exactly fp8_experts, qmmf, prompt16 and inkling2_fused (without the flag native-fp only skips)" {
+    const want = [_][]const u8{ "fp8_experts", "qmmf", "prompt16", "inkling2_fused" };
     var seen: usize = 0;
     for (kernels) |k| {
         if (!k.native_fp) continue;

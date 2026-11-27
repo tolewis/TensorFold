@@ -116,6 +116,7 @@ pub const inkling2_ops: []const u8 = if (available) &Blob("fatbin_inkling2_ops")
 pub const inkling2_rows: []const u8 = if (available) &Blob("fatbin_inkling2_rows").bytes else &.{};
 pub const inkling2_loop: []const u8 = if (available) &Blob("fatbin_inkling2_loop").bytes else &.{};
 pub const inkling2_mtp: []const u8 = if (available) &Blob("fatbin_inkling2_mtp").bytes else &.{};
+pub const inkling2_fused: []const u8 = if (available) &Blob("fatbin_inkling2_fused").bytes else &.{};
 pub const inkling2_dflash: []const u8 = if (available) &Blob("fatbin_inkling2_dflash").bytes else &.{};
 pub const glm_quant: []const u8 = if (available) &Blob("fatbin_glm_quant").bytes else &.{};
 pub const glm_vision: []const u8 = if (available) &Blob("fatbin_glm_vision").bytes else &.{};

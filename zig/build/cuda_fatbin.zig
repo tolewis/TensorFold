@@ -16,6 +16,7 @@ pub fn fatbin(b: *std.Build, nvcc: []const u8, version: std.Build.LazyPath, k: K
         any = any or Target.parse(sm).number >= k.min_sm;
     }
     if (!any) return b.addWriteFiles().add(b.fmt("unsupported-{s}.fatbin", .{k.name}), "");
+    if (k.units) |units| return relocatable(b, nvcc, version, k, units, sms);
     const run = b.addSystemCommand(&.{ nvcc, "-fatbin" });
     run.addFileInput(version);
     run.addArgs(&torch_flags);
@@ -24,14 +25,7 @@ pub fn fatbin(b: *std.Build, nvcc: []const u8, version: std.Build.LazyPath, k: K
     run.addArgs(k.flags);
     // Generated CUDA sources resolve the same maintained headers as checked-in units.
     run.addDirectoryArg2(b.path("zig/kernels/cuda"), .{ .prefix = "-I" });
-    var it = std.mem.tokenizeScalar(u8, sms, ',');
-    while (it.next()) |sm| {
-        const target = Target.parse(sm);
-        const p = profile(k, target) orelse continue;
-        // arch-specific features (the block-scaled FP4 mma) from sm_120 on; older targets build the trapping fallback
-        const a = if (p.arch_specific and target.suffix.len == 0) "a" else "";
-        run.addArg(b.fmt("-gencode=arch=compute_{s}{s},code=sm_{s}{s}", .{ sm, a, sm, a }));
-    }
+    gencodes(b, run, k, sms);
     run.addArgs(&.{ "-MD", "-MF" });
     _ = run.addDepFileOutputArg2(b.fmt("{s}.d", .{k.name}), .{});
     run.addArg("-o");
@@ -45,5 +39,40 @@ pub fn fatbin(b: *std.Build, nvcc: []const u8, version: std.Build.LazyPath, k: K
         const controlled = @import("../src/families/qwen4/ple_control_source.zig").cuda(b.allocator, text) catch @panic("Qwen4 PLE controls changed");
         run.addFileArg(b.addWriteFiles().add("qwen4_ple.cu", controlled));
     } else run.addFileArg(b.path(b.fmt("zig/kernels/cuda/{s}.cu", .{k.src orelse k.name})));
+    return out;
+}
+
+fn gencodes(b: *std.Build, run: *std.Build.Step.Run, k: Kernel, sms: []const u8) void {
+    var it = std.mem.tokenizeScalar(u8, sms, ',');
+    while (it.next()) |sm| {
+        const target = Target.parse(sm);
+        const p = profile(k, target) orelse continue;
+        // arch-specific features (the block-scaled FP4 mma) from sm_120 on; older targets build the trapping fallback
+        const a = if (p.arch_specific and target.suffix.len == 0) "a" else "";
+        run.addArg(b.fmt("-gencode=arch=compute_{s}{s},code=sm_{s}{s}", .{ sm, a, sm, a }));
+    }
+}
+
+/// A relocatable module: each unit to an object with its own flags (-rdc=true -dc), then one device link to a fatbin.
+fn relocatable(b: *std.Build, nvcc: []const u8, version: std.Build.LazyPath, k: Kernel, units: []const catalog.Unit, sms: []const u8) std.Build.LazyPath {
+    const link = b.addSystemCommand(&.{ nvcc, "-dlink", "-fatbin" });
+    link.addFileInput(version);
+    gencodes(b, link, k, sms);
+    link.addArg("-o");
+    const out = link.addOutputFileArg(b.fmt("{s}.fatbin", .{k.name}));
+    for (units, 0..) |u, i| {
+        const run = b.addSystemCommand(&.{ nvcc, "-rdc=true", "-dc" });
+        run.addFileInput(version);
+        run.addArgs(&torch_flags);
+        if (b.graph.host.result.os.tag == .windows) run.addArgs(&.{ "-Xcompiler=/Zc:preprocessor", "-D_USE_MATH_DEFINES" });
+        run.addArgs(u.flags);
+        run.addDirectoryArg2(b.path("zig/kernels/cuda"), .{ .prefix = "-I" });
+        gencodes(b, run, k, sms);
+        run.addArgs(&.{ "-MD", "-MF" });
+        _ = run.addDepFileOutputArg2(b.fmt("{s}_{d}.d", .{ k.name, i }), .{});
+        run.addArg("-o");
+        link.addFileArg(run.addOutputFileArg(b.fmt("{s}_{d}.o", .{ k.name, i })));
+        run.addFileArg(b.path(b.fmt("zig/kernels/cuda/{s}.cu", .{u.src})));
+    }
     return out;
 }

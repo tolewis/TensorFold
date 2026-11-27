@@ -164,6 +164,11 @@ struct Ring {
 };
 #endif
 
+// A unit's ring: shared storage of its own, or (TF_RING set first, the fused visit) a reference into the caller's.
+#ifndef TF_RING
+#define TF_RING(name, ...) TF_RING_STORAGE __VA_ARGS__ name
+#endif
+
 // One unit of the decode form: a warp's 32 columns of item `unit / NB` over all K, then the epilogue.
 template <int M, int EPI, int WARPS>
 __device__ __forceinline__ void unit_full(int unit, int lane, int gq, int t, int wi,
@@ -172,7 +177,7 @@ __device__ __forceinline__ void unit_full(int unit, int lane, int gq, int t, int
                                           const int* __restrict__ items, const int* __restrict__ members,
                                           void* __restrict__ out, int N, float limit, int skip,
                                           float limit2 = 0.f) {
-  TF_RING_STORAGE Ring<M, WARPS, uint4> ring;
+  TF_RING(ring, Ring<M, WARPS, uint4>);
   const int it = unit / NB, cb = unit - it * NB;
   const int e = __ldg(items + 3 * it), first = __ldg(items + 3 * it + 1), cnt = __ldg(items + 3 * it + 2);
   if (e == skip) return;
@@ -326,7 +331,7 @@ __device__ __forceinline__ void half_body(const __nv_bfloat16* __restrict__ X, i
                                           const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
                                           const int* __restrict__ counts, const int* __restrict__ members,
                                           void* __restrict__ out, int N, float limit, int skip, float limit2) {
-  TF_RING_STORAGE Ring<M, WARPS, uint2> ring;
+  TF_RING(ring, Ring<M, WARPS, uint2>);
   const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3, wi = threadIdx.x >> 5;
   const int units = __ldg(counts) * NB * 2;
   for (int unit = blockIdx.x * WARPS + wi; unit < units; unit += gridDim.x * WARPS) {
