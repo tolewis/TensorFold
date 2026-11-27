@@ -35,6 +35,7 @@ extern "C" __device__ void fz_attn8(uint3 b, int zn_grid, const uint16_t* q, con
                                     float2* part_ml, int heads, int kv_heads, int ring, int window, int chunk, int c0,
                                     int chunks, float scale, int split, const float* ksc, const float* vsc, int db,
                                     unsigned char* dyn);
+extern "C" __device__ void fz_attn8_phase(const FzAttn& a, int fix, unsigned char* dyn);
 extern "C" __device__ void fz_merge(int rh, const float* part_o, const float2* part_ml, const uint16_t* sink,
                                     const uint16_t* gate, const int* rpos, uint16_t* out, int heads, int window,
                                     int chunk, int c0, int chunks, int subs);
@@ -44,7 +45,7 @@ extern "C" __device__ void fz_qmmf_unit(const __nv_bfloat16* x, const unsigned c
 extern "C" __device__ void fz_qmmf_tile_sum(const float* part, __nv_bfloat16* out, int N, int SK, float scale,
                                             int tile);
 extern "C" __device__ void fz_gate_down(const LoopGateArgs& a, int g, int z, float* xs, float* sh,
-                                        unsigned long long* px);
+                                        unsigned long long* px, int half);
 extern "C" __device__ void fz_gate_lin(const LoopGateArgs& a, int g, int z, float* dn);
 extern "C" __device__ void fz_gate_mix(const LoopGateArgs& a, int g, float* sh);
 extern "C" __device__ void fz_nvfp4_up(const __nv_bfloat16* X, int x_stride, int slots, const uint4* W,
@@ -60,7 +61,8 @@ extern "C" __device__ void fz_plan(const int* picks, int P, int E, int T, int* m
 extern "C" __device__ void fz_mix_s(const fz_mix::MixArgs& a, float* part1, float* part2, unsigned* cnt,
                                     unsigned* fault, unsigned char* stg, int drop, int group, unsigned long long* pr);
 extern "C" __device__ void fz_loop_s(const fz_mix::LoopMixArgs& a, float* part1, float* part2, unsigned* cnt,
-                                     unsigned* fault, unsigned char* stg, int drop, int group, unsigned long long* pr);
+                                     unsigned* fault, unsigned char* stg, int drop, int group, unsigned long long* pr,
+                                     int fix);
 
 namespace {
 
@@ -78,6 +80,7 @@ struct Ctx {
     int ph;   // the phase number in the visit
     int drop; // a test's skipped arrival: ((group + 1) << 3) | sub, 0 none (fused.zig TF_INKLING2_FUSED_DROP)
     int probe; // the probed phase + 1, 0 none (fused.zig TF_INKLING2_FUSED_PROBE)
+    int fix;   // the review corrections on (fz_fix)
 };
 
 // The unit stamps of the probed phase, when the current phase (c.ph) is probed (else null).
@@ -173,7 +176,12 @@ __device__ bool gates_phase(const void* ga, int gates, Ctx& c, unsigned char* dy
     float* sh = reinterpret_cast<float*>(dyn);
     float* buf = sh + 32;
     unsigned long long* px = probe_x(c);
-    for (int u = blockIdx.x; u < gates * 8; u += gridDim.x) fz_gate_down(g, u / 8, u % 8, buf, sh, u == 0 ? px : nullptr);
+    if (c.fix & fz_fix::kGateHalf)  // a unit a (gate, z, half): one rank row a warp (review A11)
+        for (int u = blockIdx.x; u < gates * 16; u += gridDim.x)
+            fz_gate_down(g, u / 16, (u / 2) % 8, buf, sh, u == 0 ? px : nullptr, u % 2);
+    else
+        for (int u = blockIdx.x; u < gates * 8; u += gridDim.x)
+            fz_gate_down(g, u / 8, u % 8, buf, sh, u == 0 ? px : nullptr, -1);
     if (!all_wait(c)) return false;
     for (int u = blockIdx.x; u < gates * 18; u += gridDim.x) fz_gate_lin(g, u / 18, u % 18, buf);
     if (!all_wait(c)) return false;
@@ -185,7 +193,7 @@ __device__ bool mix_phase(const void* a, bool gated, Ctx& c, unsigned char* dyn)
     unsigned* cnt = c.st.cnt + 8 * c.ci;
     unsigned long long* pr = c.probe == c.ph + 1 ? c.st.probe : nullptr;  // start, arrival, exit, then the stamps
     if (gated)
-        fz_loop_s(*static_cast<const fz_mix::LoopMixArgs*>(a), c.st.part1, c.st.part2, cnt, c.fault, dyn, drop_sub(c), c.ci, pr);
+        fz_loop_s(*static_cast<const fz_mix::LoopMixArgs*>(a), c.st.part1, c.st.part2, cnt, c.fault, dyn, drop_sub(c), c.ci, pr, c.fix);
     else
         fz_mix_s(*static_cast<const fz_mix::MixArgs*>(a), c.st.part1, c.st.part2, cnt, c.fault, dyn, drop_sub(c), c.ci, pr);
     if (threadIdx.x == 0) probe_start(c, c.ph + 1);
@@ -195,7 +203,7 @@ __device__ bool mix_phase(const void* a, bool gated, Ctx& c, unsigned char* dyn)
     return !fault_set(c);
 }
 
-__device__ bool visit(const FusedVisit& V, Ctx& c, unsigned char* dyn) {
+__device__ bool visit(const FusedVisit& V, Ctx& c, unsigned char* dyn, bool last) {
     if (threadIdx.x == 0 && blockIdx.x == 0) c.times[0] = now();
     if (threadIdx.x == 0) probe_start(c, 0);
     // the attention input: the mix, or the loop mix and the 3 gates
@@ -230,10 +238,7 @@ __device__ bool visit(const FusedVisit& V, Ctx& c, unsigned char* dyn) {
     for (int rh = blockIdx.x; rh < a.heads; rh += gridDim.x) fz_rel_table(rh, a.relp, a.rel_proj, a.rtab);
     if (!all_wait(c)) return false;
     // attention: today's grid (1 tile, kv heads, zgrid) as virtual blocks
-    for (int u = blockIdx.x; u < a.kv_heads * a.zgrid; u += gridDim.x)
-        fz_attn8(make_uint3(0, u / a.zgrid, u % a.zgrid), a.zgrid, a.q, a.kc, a.vc, a.tab,
-                 static_cast<const ink2::Seg*>(a.segs), a.tiles, a.part_o, a.part_ml, a.heads, a.kv_heads, a.ring,
-                 a.window, a.chunk, 0, a.chunks, a.scale, a.split, a.ksc, a.vsc, a.db, dyn);
+    fz_attn8_phase(a, c.fix, dyn);
     if (!all_wait(c)) return false;
     for (int rh = blockIdx.x; rh < a.heads; rh += gridDim.x)
         fz_merge(rh, a.part_o, a.part_ml, a.sink, a.gate, a.rpos, a.att, a.heads, a.window, a.chunk, 0, a.slots_rh,
@@ -280,6 +285,13 @@ __device__ bool visit(const FusedVisit& V, Ctx& c, unsigned char* dyn) {
         fz_combine(m.y, m.rw, m.moe, m.K, m.H, d);
     if (!all_wait(c)) return false;
     conv_phase(V.conv[3], conv_c(V.conv[3]), 0);
+    if (last && (c.fix & fz_fix::kLastWait)) {  // no reader after the launch's last phase (review A18)
+        __syncthreads();
+        if (threadIdx.x == 0 && blockIdx.x == 0 && c.ph < 63) c.times[c.ph + 1] = now();
+        c.ci++;
+        c.ph++;
+        return true;
+    }
     return all_wait(c);
 }
 
@@ -289,7 +301,7 @@ __device__ bool visit(const FusedVisit& V, Ctx& c, unsigned char* dyn) {
 extern "C" __global__ void __launch_bounds__(128) tf_ink2_fused_visit(const FusedVisit* __restrict__ table, int first,
                                                                      int count, FusedState st) {
     extern __shared__ __align__(128) unsigned char dyn[];
-    Ctx c{st, nullptr, nullptr, 0, 0, 0, 0};
+    Ctx c{st, nullptr, nullptr, 0, 0, 0, 0, 0};
     for (int v = first; v < first + count; ++v) {
         c.fault = st.fault + v;
         c.st.tk = st.tk + 1024 * v;  // 4 qmmf calls a visit, 256 tiles a call
@@ -297,6 +309,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_ink2_fused_visit(const Fuse
         c.ph = 0;
         c.drop = table[v].drop;
         c.probe = table[v].probe;
-        if (!visit(table[v], c, dyn)) return;
+        c.fix = table[v].fix;
+        if (!visit(table[v], c, dyn, v == first + count - 1)) return;
     }
 }

@@ -15,6 +15,8 @@ __shared__ uint3 fz_bi_attn;
 #pragma pop_macro("__global__")
 #undef blockIdx
 
+#include "inkling2/fused_visit.cuh"
+
 namespace {
 __device__ __forceinline__ void enter(uint3 b) {
     __syncthreads();
@@ -66,4 +68,22 @@ extern "C" __device__ void fz_merge(int rh, const float* __restrict__ part_o, co
                                     int chunk, int c0, int chunks, int subs) {
     enter(make_uint3(rh, 0, 0));
     tf_ink2_merge(part_o, part_ml, sink, gate, rpos, out, heads, window, chunk, c0, chunks, subs);
+}
+
+// The attention phase: today's grid (1 tile, kv heads, zgrid) as units over the blocks. With fz_fix::kBusy a split
+// (global) call deals only its busy units, z blocks whose first key is at or below the tile's last position (the
+// early return of attnTile), round robin: no block holds more than ceil(busy / G) of them (review A9).
+extern "C" __device__ void fz_attn8_phase(const FzAttn& a, int fix, unsigned char* dyn) {
+    using namespace ink2;
+    int nz = a.zgrid;
+    if ((fix & fz_fix::kBusy) && a.split) {
+        const Seg s = static_cast<const Seg*>(a.segs)[a.tiles[0].x];
+        const int group = a.heads / a.kv_heads, total = s.n * group;
+        const int tile_hi = s.p0 + min(a.tiles[0].y + 63, total - 1) / group;
+        nz = min(a.zgrid, tile_hi / kSub + 1);
+    }
+    for (int u = blockIdx.x; u < a.kv_heads * nz; u += gridDim.x)
+        fz_attn8(make_uint3(0, u / nz, u % nz), a.zgrid, a.q, a.kc, a.vc, a.tab, static_cast<const Seg*>(a.segs), a.tiles,
+                 a.part_o, a.part_ml, a.heads, a.kv_heads, a.ring, a.window, a.chunk, 0, a.chunks, a.scale, a.split, a.ksc,
+                 a.vsc, a.db, dyn);
 }

@@ -39,9 +39,10 @@ __device__ __forceinline__ float blockSum2(const float (&v)[2], float* sh) {
 }  // namespace
 
 // tf_ink2_loop_gate_down block (row 0, gate g, z): rank rows 8 z to 8 z + 7, two a real warp (virtual warps w, w + 4).
-// `xs` is 2 H floats of the caller's shared memory, `sh` 8 floats.
+// `xs` is 2 H floats of the caller's shared memory, `sh` 8 floats. half 0 or 1: only virtual warps w + 4 half (one
+// rank row a warp, review A11); -1: both, in series.
 extern "C" __device__ void fz_gate_down(const LoopGateArgs& a, int g, int z, float* xs, float* sh,
-                                        unsigned long long* px) {
+                                        unsigned long long* px, int half) {
     const size_t row = 0;
     if (px && threadIdx.x == 0) px[8] = stamp();
     const int H = a.H;
@@ -62,7 +63,7 @@ extern "C" __device__ void fz_gate_down(const LoopGateArgs& a, int g, int z, flo
     __syncthreads();
     if (px && threadIdx.x == 0) px[9] = stamp();
     const int lane = threadIdx.x & 31;
-    for (int k = 0; k < 2; ++k) {
+    for (int k = half < 0 ? 0 : half; k < (half < 0 ? 2 : half + 1); ++k) {
         const int w = (threadIdx.x >> 5) + 4 * k;
         const int r = z * kWarps + w;
         if (r >= a.rank) continue;

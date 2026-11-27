@@ -157,7 +157,7 @@ pub const Visit = extern struct {
     copy_bytes: i32 = 0,
     drop: i32 = 0, // review A2, A3: a skipped arrival, ((group + 1) << 3) | sub (0: none)
     probe: i32 = 0, // the probed phase + 1 (0: none), TF_INKLING2_FUSED_PROBE
-    pad2: i32 = 0,
+    fix: i32 = 0, // the review corrections the kernel runs (fused_visit.cuh fz_fix), TF_INKLING2_FUSED_FIX
     copy_dst: u64 = 0,
     copy_src: u64 = 0,
     mix_attn: u64,
@@ -198,6 +198,23 @@ comptime {
 }
 
 const phases_max = 32;
+// the table sizes and the bound of each sender (review A6); fused_visit.cuh and fused_mix.cu use the same numbers
+const part1_sources = 9; // n_blocks + 1, n_blocks at most mix_blocks
+const part1_warps = 16; // MIXW (LOOPW is 8)
+const part1_stride = 4; // floats a warp: the norm and up to 3 query partials
+const mix_blocks = 8; // fused_mix.cu NB
+const tiles_call = 256; // tickets a qmmf call
+const qpart_sk = 8;
+const qpart_n = 8704;
+
+/// Whether a sender fits the fused tables; the host refuses the visit before the launch otherwise (review A6).
+pub fn bounds(nq: usize, n_blocks: usize, n: usize, sk: usize, npad: usize) !void {
+    if (nq + 1 > part1_stride) return error.FusedQueries;
+    if (n_blocks > mix_blocks or n_blocks + 1 > part1_sources) return error.FusedBlocks;
+    if ((n + 63) / 64 > tiles_call) return error.FusedTickets;
+    if (sk > qpart_sk or @max(n, npad) > qpart_n) return error.FusedQpart;
+}
+
 const tickets_visit = 1024;
 const times_visit = 64;
 const visits_max = config.max_visits;
@@ -233,6 +250,10 @@ pub const State = struct {
 
     pub fn init(d: *const cuda.Driver) !State {
         const sw = read();
+        if (sw.mode == .on) { // review A8: no serve path runs the fused kernel yet
+            std.debug.print("[fused] TF_INKLING2_FUSED=1: the fused kernel serves no visit yet (check:<visits> checks it); refused at start\n", .{});
+            return error.FusedOnNotBuilt;
+        }
         var mod = try cuda.Module.load(d, cuda.kernels.inkling2_fused);
         errdefer mod.unload();
         const f = try mod.function("tf_ink2_fused_visit");
@@ -258,11 +279,11 @@ pub const State = struct {
             .cnt = try cuda.DeviceBuffer.alloc(d, visits_max * phases_max * 8 * 4),
             .tk = try cuda.DeviceBuffer.alloc(d, visits_max * tickets_visit * 4),
             .fault = try cuda.DeviceBuffer.alloc(d, visits_max * 4),
-            .part1 = try cuda.DeviceBuffer.alloc(d, 9 * 16 * 4 * 4),
+            .part1 = try cuda.DeviceBuffer.alloc(d, part1_sources * part1_warps * part1_stride * 4),
             .part2 = try cuda.DeviceBuffer.alloc(d, 4 * 16 * 4),
             .times = try cuda.DeviceBuffer.alloc(d, visits_max * times_visit * 8),
             .probe = try cuda.DeviceBuffer.alloc(d, (3 * @as(usize, @intCast(sms)) + probe_stamps) * 8),
-            .qpart = try cuda.DeviceBuffer.alloc(d, 4 * 8 * 8704 * 4),
+            .qpart = try cuda.DeviceBuffer.alloc(d, 4 * qpart_sk * qpart_n * 4),
             .ref = try cuda.DeviceBuffer.alloc(d, @as(usize, if (sw.mode == .check) ref_bytes else 0)),
             .save = try cuda.DeviceBuffer.alloc(d, @as(usize, if (sw.mode == .check) 1 << 20 else 0)),
         };
@@ -282,10 +303,24 @@ pub const State = struct {
 
     /// `launch` with event `mid` recorded after the memsets (review A17); `external` when the stream captures.
     pub fn launchMarked(f: *const State, s: cuda.Stream, first: u32, count: u32, mid: cuda.abi.Event, external: bool) !void {
+        return f.launchFix(s, first, count, mid, external, true);
+    }
+
+    /// `own`: clear the counter groups of `count` visits (the kernel counts groups from 0 in a launch), and the
+    /// tickets and fault words of visits [first, first + count) only (review A8, A17). Else every visit's.
+    pub fn launchFix(f: *const State, s: cuda.Stream, first: u32, count: u32, mid: cuda.abi.Event, external: bool, own: bool) !void {
         const d = f.d;
-        try d.check(d.api.cuMemsetD8Async(f.cnt.ptr, 0, f.cnt.len, s.handle), "cuMemsetD8Async");
-        try d.check(d.api.cuMemsetD8Async(f.tk.ptr, 0, f.tk.len, s.handle), "cuMemsetD8Async");
-        try d.check(d.api.cuMemsetD8Async(f.fault.ptr, 0, f.fault.len, s.handle), "cuMemsetD8Async");
+        if (first + count > visits_max) return error.FusedVisitRange;
+        if (own) {
+            const cv: usize = phases_max * 8 * 4;
+            try d.check(d.api.cuMemsetD8Async(f.cnt.ptr, 0, @as(usize, count) * cv, s.handle), "cuMemsetD8Async");
+            try d.check(d.api.cuMemsetD8Async(f.tk.ptr + @as(u64, first) * tickets_visit * 4, 0, @as(usize, count) * tickets_visit * 4, s.handle), "cuMemsetD8Async");
+            try d.check(d.api.cuMemsetD8Async(f.fault.ptr + @as(u64, first) * 4, 0, @as(usize, count) * 4, s.handle), "cuMemsetD8Async");
+        } else {
+            try d.check(d.api.cuMemsetD8Async(f.cnt.ptr, 0, f.cnt.len, s.handle), "cuMemsetD8Async");
+            try d.check(d.api.cuMemsetD8Async(f.tk.ptr, 0, f.tk.len, s.handle), "cuMemsetD8Async");
+            try d.check(d.api.cuMemsetD8Async(f.fault.ptr, 0, f.fault.len, s.handle), "cuMemsetD8Async");
+        }
         if (mid != null) try d.check(d.api.cuEventRecordWithFlags(mid, s.handle, if (external) 1 else 0), "cuEventRecordWithFlags");
         var a: cuda.Args = .{};
         a.add(f.table.ptr);
@@ -305,6 +340,7 @@ fn proj1(m: *const Model, w: cuda.qmmf.Weight, x: u64, out: u64, part: u64) !Pro
     if (w.mode != .mxfp8 and w.mode != .fp8) return error.FusedWeightMode;
     const p = cuda.qmmf.planFor(1, w, true);
     if (p.fused or p.bm != 16) return error.FusedPlan;
+    try bounds(0, 0, w.n, p.sk, w.npad);
     _ = m;
     return .{ .x = x, .codes = w.codes, .scales = w.scales, .out = out, .part = part, .scale = w.scale, .n = @intCast(w.n), .k = @intCast(w.k), .sk = @intCast(p.sk), .npad = @intCast(w.npad), .mode = @intCast(@backingInt(w.mode)) };
 }
@@ -326,6 +362,7 @@ pub fn fill(f: *const State, m: *Model, r: anytype, v: u32, hin: u64, hout: u64,
     const global = spec.kind == .global;
     const msgs = p.messages(v);
     if (p.restarts(v) or i == 0) return error.FusedVisitKind; // Part 3: restarts and layer 0
+    try bounds(spec.attn_queries, spec.blocks_in, 0, 0, 0);
     const base = f.args.ptr + @as(u64, v) * arg_bytes;
     @memset(args_host, 0);
     const put = struct {
@@ -754,6 +791,24 @@ fn probeFor(v: u32, step: usize) i32 {
     return -1;
 }
 
+/// TF_INKLING2_FUSED_FIX: the review corrections on (fused_visit.cuh fz_fix: 1 A9, 2 A11, 4 A12, 8 A18; 16 A17, the
+/// host clears its own visits only); default all. TF_INKLING2_FUSED_FIX_AB=1: steps s with (s / every) even run none,
+/// so one run holds the phase times before and after.
+const fix_all: i32 = 31;
+const fix_own_clear: i32 = 16;
+fn fixFor(step: usize) i32 {
+    const S = struct {
+        var mask: ?i32 = null;
+        var ab = false;
+    };
+    if (S.mask == null) {
+        S.mask = if (std.c.getenv("TF_INKLING2_FUSED_FIX")) |e| std.fmt.parseInt(i32, std.mem.span(e), 0) catch fix_all else fix_all;
+        S.ab = if (std.c.getenv("TF_INKLING2_FUSED_FIX_AB")) |e| e[0] == '1' else false;
+    }
+    if (S.ab and (step / every()) % 2 == 0) return 0;
+    return S.mask.? & fix_all;
+}
+
 /// TF_INKLING2_FUSED_GRAPH (default 1): today's visit also runs as a captured graph (the live launch method), and
 /// the fused launch runs from a captured graph on even steps (review A22). 0: the old method only.
 fn graphOn() bool {
@@ -786,10 +841,10 @@ fn todayGraph(m: *Model, k: *const Kernels, s: cuda.Stream, r: anytype, v: u32, 
 
 /// The fused launch of visit v captured into a graph (memsets, event `mid`, the cooperative launch); null when the
 /// driver refuses the capture.
-fn fusedGraph(f: *State, s: cuda.Stream, v: u32) !?cuda.graph.Exec {
+fn fusedGraph(f: *State, s: cuda.Stream, v: u32, own: bool) !?cuda.graph.Exec {
     try s.synchronize();
     try cuda.graph.beginCapture(s, .thread_local);
-    f.launchMarked(s, v, 1, f.ev[6], true) catch |e| {
+    f.launchFix(s, v, 1, f.ev[6], true, own) catch |e| {
         if (cuda.graph.endCapture(s)) |g| {
             var gg = g;
             gg.deinit();
@@ -814,8 +869,24 @@ fn fusedGraph(f: *State, s: cuda.Stream, v: u32) !?cuda.graph.Exec {
 
 /// At load in check mode: the query pointers of each layer (review A7) and the resident blocks a multiprocessor of
 /// today's fp8 attention kernels at 128 threads against the fused kernel (review A10).
+/// At load in check mode: the bounds of review A6 against the senders the review names.
+fn reportBounds() void {
+    const cases = [_]struct { name: []const u8, nq: usize, nb: usize, n: usize }{
+        .{ .name = "loop mix nq 3 (live)", .nq = 3, .nb = 8, .n = 0 },
+        .{ .name = "restart message mix nq 4", .nq = 4, .nb = 8, .n = 0 },
+        .{ .name = "qmmf all N 8600 (live)", .nq = 0, .nb = 0, .n = 8600 },
+        .{ .name = "head N 200064 (3126 tiles)", .nq = 0, .nb = 0, .n = 200064 },
+    };
+    for (cases) |c| {
+        if (bounds(c.nq, c.nb, c.n, 4, c.n)) |_| {
+            std.debug.print("[fused-bounds] {s}: fits\n", .{c.name});
+        } else |e| std.debug.print("[fused-bounds] {s}: refused ({s})\n", .{ c.name, @errorName(e) });
+    }
+}
+
 pub fn reportLoad(m: *const Model, k: *const Kernels) !void {
     const d = m.d;
+    reportBounds();
     for (m.w.layers, 0..) |L, i| std.debug.print("[fused-load] layer {d} attn_query 0x{x} mlp_query 0x{x}\n", .{ i, L.attn_query, L.mlp_query });
     var per: c_int = 0;
     try d.check(d.api.cuOccupancyMaxActiveBlocksPerMultiprocessor(&per, k.attn.attn8.handle, threads, 0), "cuOccupancyMaxActiveBlocksPerMultiprocessor");
@@ -874,7 +945,7 @@ pub fn check(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytype
     };
 }
 
-fn printProbe(f: *State, v: u32, step: usize, pos: u32, ph: i32, ms_fused: f32) !void {
+fn printProbe(f: *State, v: u32, step: usize, pos: u32, ph: i32, ms_fused: f32, fix: i32) !void {
     const gpa = std.heap.page_allocator;
     const n = 3 * @as(usize, f.grid) + probe_stamps;
     const p = try gpa.alloc(u64, n);
@@ -886,7 +957,7 @@ fn printProbe(f: *State, v: u32, step: usize, pos: u32, ph: i32, ms_fused: f32) 
     };
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
-    try out.print(gpa, "[fused-probe] visit {d} step {d} pos {d} phase {d} fused_us {d:.2} grid {d} ns from the first start:", .{ v, step, pos, ph, ms_fused * 1000, f.grid });
+    try out.print(gpa, "[fused-probe] visit {d} step {d} pos {d} phase {d} fused_us {d:.2} fix {d} grid {d} ns from the first start:", .{ v, step, pos, ph, ms_fused * 1000, fix, f.grid });
     const names = [_][]const u8{ " start", " arrive", " exit", " stamps" };
     for (0..4) |part| {
         try out.appendSlice(gpa, names[part]);
@@ -927,6 +998,8 @@ fn checkSteps(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytyp
     vis.drop = drop;
     const probe = probeFor(v, step);
     vis.probe = probe + 1;
+    const fix = fixFor(step);
+    vis.fix = fix & ~fix_own_clear;
     f.at = "upload";
     try s.synchronize();
     try f.args.upload(@as(usize, v) * arg_bytes, &host);
@@ -996,7 +1069,7 @@ fn checkSteps(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytyp
     var fx: ?cuda.graph.Exec = null;
     defer if (fx) |*e| e.deinit();
     if (graphOn() and f.graph_ok and step % 2 == 0) {
-        fx = try fusedGraph(f, s, v);
+        fx = try fusedGraph(f, s, v, (fix & fix_own_clear) != 0);
         if (fx == null) f.graph_ok = false;
     }
     if (fx) |e| {
@@ -1006,7 +1079,7 @@ fn checkSteps(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytyp
         try d.check(d.api.cuEventRecord(f.ev[3], s.handle), "cuEventRecord");
     } else {
         try d.check(d.api.cuEventRecord(f.ev[2], s.handle), "cuEventRecord");
-        try f.launchMarked(s, v, 1, f.ev[7], false);
+        try f.launchFix(s, v, 1, f.ev[7], false, (fix & fix_own_clear) != 0);
         try d.check(d.api.cuEventRecord(f.ev[3], s.handle), "cuEventRecord");
     }
     try s.synchronize();
@@ -1040,14 +1113,14 @@ fn checkSteps(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytyp
     if (drop != 0) {
         std.debug.print("[fused-drop] visit {d} step {d} pos {d} group {d} sub {d} fused_us {d:.2} fault 0x{x} ({s}) differing {d}\n", .{ v, step, r.last_pos, (drop >> 3) - 1, drop & 7, ms_fused * 1000, fault, faultText(&fbuf, fault), diff_total });
     } else if (diff_total != 0 or fault != 0) f.bad[v] += 1;
-    if (probe >= 0) try printProbe(f, v, step, r.last_pos, probe, ms_fused);
+    if (probe >= 0) try printProbe(f, v, step, r.last_pos, probe, ms_fused, fix);
     if (drop == 0 and (diff_total != 0 or fault != 0 or step % every() == 0)) {
         std.debug.print("{s}", .{lines.items});
         var tl: std.ArrayList(u8) = .empty;
         defer tl.deinit(gpa);
         var ph: usize = 1;
         while (ph < times_visit and times[ph] != 0 and times[ph] >= times[ph - 1]) : (ph += 1) try tl.print(gpa, " {d}", .{times[ph] - times[ph - 1]});
-        std.debug.print("[fused-time] visit {d} step {d} pos {d} today_us {d:.2} fused_us {d:.2} fault 0x{x} fill {d} today_graph_us {d:.2} memset_us {d:.2} method {s} phases_ns{s}\n", .{ v, step, r.last_pos, ms_today * 1000, ms_fused * 1000, fault, @intFromBool(fill_on), ms_graph * 1000, ms_memset * 1000, method, tl.items });
+        std.debug.print("[fused-time] visit {d} step {d} pos {d} today_us {d:.2} fused_us {d:.2} fault 0x{x} fill {d} today_graph_us {d:.2} memset_us {d:.2} method {s} fix {d} phases_ns{s}\n", .{ v, step, r.last_pos, ms_today * 1000, ms_fused * 1000, fault, @intFromBool(fill_on), ms_graph * 1000, ms_memset * 1000, method, fix, tl.items });
         if (fault != 0) std.debug.print("[fused-fault] visit {d} step {d} {s}\n", .{ v, step, faultText(&fbuf, fault) });
         std.debug.print("[fused-sum] visit {d} steps {d} bad {d} buffers {d} differing {d}\n", .{ v, step + 1, f.bad[v], nbuf, diff_total });
     }

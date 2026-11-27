@@ -61,6 +61,7 @@ struct SArgs {
   int drop;         // a test's skipped arrival: counter 0 (unit 0), 1 + q (unit w 0 of q), 7 (block 0); -1 none
   int group;        // the counter group of the phase (the fault codes, fz_sync)
   unsigned long long* pr;  // probed: start [G], arrival [G], exit [G], stamps (fz_probe::kMix); null: not probed
+  int fix;          // the review corrections on (fz_fix)
 };
 
 __device__ __forceinline__ void cpa16(void* s, const void* g) { __pipeline_memcpy_async(s, g, 16); }
@@ -258,6 +259,30 @@ __device__ void loopS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigne
     mstamp(A, u == 0, 1);
     // today's blockSum: warp partials added in warp order by every thread
     float inv[NB + 1], score[NB + 1];
+    if (A.fix & fz_fix::kLoopRead) {
+      // review A12: lane l loads partials l, l + 32, l + 64 once; each source's 8 partials come back by shuffle and
+      // are added in warp order, as today's blockSum
+      constexpr int R = ((NB + 1) * LOOPW + 31) / 32;
+      float pn[R], pq[R];
+#pragma unroll
+      for (int r = 0; r < R; ++r) {
+        const int i = r * 32 + lane;
+        pn[r] = i < S * LOOPW ? __ldcg(A.part1 + i * 4 + 0) : 0.0f;
+        pq[r] = i < S * LOOPW ? __ldcg(A.part1 + i * 4 + 1 + q) : 0.0f;
+      }
+#pragma unroll
+      for (int s = 0; s < NB + 1; ++s) {
+        if (s >= S) break;
+        float t = 0.0f, u = 0.0f;
+#pragma unroll
+        for (int i = 0; i < LOOPW; ++i) {
+          t += __shfl_sync(0xffffffffu, pn[s * LOOPW / 32], (s * LOOPW) % 32 + i);
+          u += __shfl_sync(0xffffffffu, pq[s * LOOPW / 32], (s * LOOPW) % 32 + i);
+        }
+        inv[s] = rsqrtf(t / static_cast<float>(Hh) + a.eps);
+        score[s] = u * inv[s] * a.scale;
+      }
+    } else {
 #pragma unroll
     for (int s = 0; s < NB + 1; ++s) {
       if (s >= S) break;
@@ -271,6 +296,7 @@ __device__ void loopS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigne
       float t = 0.0f;
       for (int i = 0; i < LOOPW; ++i) t += __ldcg(A.part1 + (s * LOOPW + i) * 4 + 1 + q);
       score[s] = t * inv[s] * a.scale;
+    }
     }
     float m = -INFINITY, l = 0.0f, coef[NB + 1];
 #pragma unroll
@@ -309,6 +335,7 @@ __device__ void loopS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigne
 extern "C" __device__ void fz_mix_s(const fz_mix::MixArgs& a, float* part1, float* part2, unsigned* cnt,
                                     unsigned* fault, unsigned char* stg, int drop, int group, unsigned long long* pr) {
     fz_mix::SArgs A;
+    A.fix = 0;
     A.mix = a;
     A.drop = drop;
     A.group = group;
@@ -322,8 +349,10 @@ extern "C" __device__ void fz_mix_s(const fz_mix::MixArgs& a, float* part1, floa
 
 // One loop mix phase (loopS of B9).
 extern "C" __device__ void fz_loop_s(const fz_mix::LoopMixArgs& a, float* part1, float* part2, unsigned* cnt,
-                                     unsigned* fault, unsigned char* stg, int drop, int group, unsigned long long* pr) {
+                                     unsigned* fault, unsigned char* stg, int drop, int group, unsigned long long* pr,
+                                     int fix) {
     fz_mix::SArgs A;
+    A.fix = fix;
     A.loop = a;
     A.drop = drop;
     A.group = group;

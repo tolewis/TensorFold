@@ -68,8 +68,8 @@ struct FzTaps {          // the k and v taps of a global visit: dense_rows_scale
 
 struct FusedVisit {
     int global, gated, nq_attn, n_proj;   // n_proj: 1 (all) or 3 (qx, wk, wv)
-    int copy_bytes, drop, probe, pad2;     // the boundary copy (0: none); drop: a test's skipped arrival, probe: the
-                                           // probed phase + 1 (0: none), fused.zig
+    int copy_bytes, drop, probe, fix;      // the boundary copy (0: none); drop: a test's skipped arrival, probe: the
+                                           // probed phase + 1 (0: none), fix: the review corrections on (fz_fix), fused.zig
     void* copy_dst;
     const void* copy_src;
     const void* mix_attn;   // ops MixArgs (plain) or loop LoopMixArgs (gated)
@@ -94,6 +94,14 @@ struct FusedState {
     unsigned long long* times;  // 64 a visit: globaltimer after each phase change (block 0)
     unsigned long long* probe;  // the probed phase: start [G], arrival [G], wait exit [G] a block, then 32 unit stamps
 };
+
+// The review corrections a launch runs (FusedVisit fix), so that one run times a phase with and without each.
+namespace fz_fix {
+constexpr int kBusy = 1;     // A9: the global attention deals its busy units only
+constexpr int kGateHalf = 2; // A11: gate down as half units, one rank row a warp
+constexpr int kLoopRead = 4; // A12: a loop mix pass 2 unit reads each partial once
+constexpr int kLastWait = 8; // A18: no wait after the last phase of a launch
+}
 
 // Unit stamps of a probed phase (FusedState probe + 3 G), globaltimer ns
 namespace fz_probe {
