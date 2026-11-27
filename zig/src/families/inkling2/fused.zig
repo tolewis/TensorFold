@@ -971,11 +971,11 @@ fn compareAt(f: *State, list: []const Buf, base: usize, v: u32, step: usize, pos
                 hi = i;
             };
             const word = struct {
-                fn at(xs: []const u8, i: usize) u32 {
+                fn of(xs: []const u8, i: usize) u32 {
                     const j = i & ~@as(usize, 3);
                     return if (j + 4 <= xs.len) std.mem.readInt(u32, xs[j..][0..4], .little) else xs[i];
                 }
-            }.at;
+            }.of;
             std.debug.print("[fused-diffword] visit {d} step {d} pos {d} {s} first byte {d} today 0x{x} fused 0x{x}, last byte {d} today 0x{x} fused 0x{x}\n", .{ v, step, pos, b.name, lo, word(want, lo), word(got, lo), hi, word(want, hi), word(got, hi) });
         }
         at += b.len;
