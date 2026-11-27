@@ -4,9 +4,10 @@
 //!
 //! A matrix [n][k] with k a multiple of 256 is one buffer: the code plane (n * k bytes), then the scale plane (n * k / 32
 //! fp16 values, row major). Within a row the codes are laid out in 256-byte planes of eight blocks, the order the decode
-//! kernel's sub-group reads them: plane p holds blocks 8p to 8p + 7, and in it lane l (0 to 15) owns bytes 16 l to 16 l + 15,
-//! which are, for each of the eight blocks in turn, the values 2 l and 2 l + 1 of the block. So one 16-byte load a lane
-//! covers a plane in 256 contiguous bytes, and a lane's two values of a block sit side by side.
+//! kernel's sub-group reads them: plane p holds blocks 8p to 8p + 7, in four 64-byte words of 16 lanes. Word i (blocks 2i
+//! and 2i + 1) gives lane l (0 to 15) the four bytes at 64 i + 4 l: the values 2 l and 2 l + 1 of block 2i, then of block
+//! 2i + 1. So one sub-group block read of 4 words (intel_sub_group_block_read4) covers a plane in 256 contiguous bytes, the
+//! lane's word i is its two blocks 2i and 2i + 1, and a lane's two values of a block sit side by side (p3-review R6).
 //!
 //! Encoding of a block: amax = max |v|, scale d = fp16(amax / 127) rounded to nearest even, code = clamp(round_to_nearest_even(v / d),
 //! -127, 127); a block of zeros (or one whose scale underflows fp16) has d = 0 and all codes 0. A value decodes as code * d.
@@ -66,7 +67,7 @@ fn bf16(v: u16) f32 {
 pub fn codeOffset(b: usize, e: usize) usize {
     const p = b / plane_blocks;
     const q = b % plane_blocks;
-    return p * plane_bytes + (e / 2) * 16 + q * 2 + (e % 2);
+    return p * plane_bytes + (q / 2) * 64 + (e / 2) * 4 + (q % 2) * 2 + (e % 2);
 }
 
 /// The fp16 scale of a block whose largest magnitude is `amax`, as bits; 0 when it underflows.
@@ -116,7 +117,9 @@ test "layout: a lane's bytes in a plane are its two values of each of eight bloc
     try std.testing.expectEqual(@as(usize, 0), codeOffset(0, 0));
     try std.testing.expectEqual(@as(usize, 1), codeOffset(0, 1));
     try std.testing.expectEqual(@as(usize, 2), codeOffset(1, 0));
-    try std.testing.expectEqual(@as(usize, 16), codeOffset(0, 2));
+    try std.testing.expectEqual(@as(usize, 4), codeOffset(0, 2));
+    try std.testing.expectEqual(@as(usize, 64), codeOffset(2, 0));
+    try std.testing.expectEqual(@as(usize, 64 + 4 * 15 + 2 + 1), codeOffset(3, 31));
     try std.testing.expectEqual(@as(usize, 255), codeOffset(7, 31));
     try std.testing.expectEqual(@as(usize, 256), codeOffset(8, 0));
     // a bijection on a row of two planes
