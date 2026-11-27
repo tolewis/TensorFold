@@ -634,41 +634,49 @@ KERNEL(256) void tf_ink2_router_norm_gemv(
 
 // Grid (rows). Same tie rule as tf_inkling2_router: a larger key wins, an equal key keeps the lower index. A NaN key
 // ranks as -inf, below every number, so the ranks are a permutation and exactly 8 work-items store.
+// Two barriers: the keys, then one 16-bit flag mask a sub-group. A picked work-item finds its place and the sum of the 8
+// picked scores (ascending index, the order of the old work-item 0 loop) from the masks, and stores its own id and weight.
 __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(128, 1, 1))) kernel void tf_ink2_router_pick(
     global const float *scores_in, global const float *bias, global uint *ids, global float *weights, uint rows) {
-  const uint row = get_group_id(0), t = get_local_id(0);
+  const uint row = get_group_id(0), t = get_local_id(0), lane = get_sub_group_local_id(), sg = get_sub_group_id();
   if (row >= rows) return;
-  local float keys[128], scores[128], chosen[8];
-  local uint flag[128], picked[8];
+  local float4 keys4[32];
+  local float scores[128];
+  local uint masks[8];
+  local float *keys = (local float *)keys4;
   const float sc = scores_in[(size_t)row * 128 + t];
   scores[t] = sc;
   const float key = sc + bias[t];
-  keys[t] = isnan(key) ? -INFINITY : key;
+  const float ke = isnan(key) ? -INFINITY : key;
+  keys[t] = ke;
   barrier(CLK_LOCAL_MEM_FENCE);
-  const float ke = keys[t];
   uint rank = 0;
-  for (uint j = 0; j < 128; ++j) {
-    const float kj = keys[j];
-    rank += (kj > ke || (kj == ke && j < t)) ? 1u : 0u;
+  for (uint q = 0; q < 32; ++q) {
+    const float4 k4 = keys4[q];
+    const uint j = 4 * q;
+    rank += (k4.x > ke || (k4.x == ke && j < t)) ? 1u : 0u;
+    rank += (k4.y > ke || (k4.y == ke && j + 1 < t)) ? 1u : 0u;
+    rank += (k4.z > ke || (k4.z == ke && j + 2 < t)) ? 1u : 0u;
+    rank += (k4.w > ke || (k4.w == ke && j + 3 < t)) ? 1u : 0u;
   }
-  flag[t] = rank < 8 ? 1u : 0u;
+  const uint flag = rank < 8 ? 1u : 0u;
+  const uint mask = sub_group_reduce_add(flag << lane); // the bits are disjoint, so the sum is the mask
+  if (lane == 0) masks[sg] = mask;
   barrier(CLK_LOCAL_MEM_FENCE);
-  if (flag[t]) {
-    uint at = 0;
-    for (uint j = 0; j < t; ++j) at += flag[j];
-    if (at < 8) {
-      picked[at] = t;
-      chosen[at] = scores[t];
+  if (!flag) return;
+  uint at = popcount(mask & ((1u << lane) - 1u));
+  for (uint g = 0; g < sg; ++g) at += popcount(masks[g]);
+  float den = 1e-20f;
+  for (uint g = 0; g < 8; ++g) {
+    uint m = masks[g];
+    while (m != 0u) {
+      den += scores[16 * g + ctz(m)];
+      m &= m - 1u;
     }
   }
-  barrier(CLK_LOCAL_MEM_FENCE);
-  if (t == 0) {
-    float den = 1e-20f;
-    for (uint j = 0; j < 8; ++j) den += chosen[j];
-    for (uint j = 0; j < 8; ++j) {
-      ids[(size_t)row * 8 + j] = picked[j];
-      weights[(size_t)row * 8 + j] = chosen[j] / den * 8.0f;
-    }
+  if (at < 8) {
+    ids[(size_t)row * 8 + at] = t;
+    weights[(size_t)row * 8 + at] = sc / den * 8.0f;
   }
 }
 
