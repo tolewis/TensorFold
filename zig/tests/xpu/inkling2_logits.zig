@@ -387,6 +387,9 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             var it = std.mem.splitScalar(u8, argv[i], ',');
             while (it.next()) |t| try probe_pos.append(gpa, try std.fmt.parseInt(usize, t, 10));
+        } else if (std.mem.eql(u8, a, "--skip-below-dump")) {
+            // rows below --dump-from make no logits on the host: the KL runs at long context skip their download
+            skip_below_dump = true;
         } else if (std.mem.eql(u8, a, "--probe-out")) {
             i += 1;
             probe_out = argv[i];
@@ -521,6 +524,7 @@ pub fn main(init: std.process.Init) !void {
         // the largest |ours - reference| over each row's reference top 16, to see where the error sits
         const row_max = try gpa.alloc(f32, ref.rows);
         defer gpa.free(row_max);
+        @memset(row_max, 0); // rows that --skip-below-dump leaves out read as 0
         var diffs: std.ArrayList(Diff) = .empty;
         defer diffs.deinit(gpa);
         var dump_file: ?*std.c.FILE = null;
@@ -547,6 +551,7 @@ pub fn main(init: std.process.Init) !void {
             var sub: usize = 0;
             while (sub < n) : (sub += state.max_rows) {
             const sn: usize = @min(state.max_rows, n - sub);
+            if (skip_below_dump and pos + sub + sn <= dump_from) continue;
             if (!old_forward and n != 1) try ink.prefill.headRows(m, &scratch, sub, sn);
             try r.download(std.mem.sliceAsBytes(host_logits[0 .. sn * vocab]), scratch.logits_all);
             try r.sync();
@@ -817,6 +822,9 @@ var old_dense = false;
 var old_loop = false;
 var old_global = false;
 var old_sliding = false;
+/// With `--skip-below-dump`, a block of rows wholly below `--dump-from` makes no host logits (no head on the prompt path,
+/// no download), so the per-prompt lines count only the rows from `--dump-from` on.
+var skip_below_dump = false;
 fn promptRun(m: *const ink.model.Model, scratch: *state.Scratch, cache: *state.Cache, ids: []const u32, _: anytype) !void {
     if (old_forward) {
         if (ids.len > state.max_rows) return error.BadChunk;
