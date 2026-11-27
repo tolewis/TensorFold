@@ -320,3 +320,15 @@ FB_SGA kernel void fb_nv_phase(global const uchar *w, global const ushort *x, gl
   guard = sub_group_reduce_add(guard);
   if (lane == 0u && guard != 0u) atomic_add(fault + 3, guard);
 }
+
+// The tm0 rate: one work-item spins on its own clock (no memory) until `ticks` have passed. The host divides by the
+// event time of the launch.
+FB_SGA kernel void fb_tsc(global ulong *o, uint ticks) {
+  if (get_global_id(0) != 0u) return;
+  const ulong t0 = __builtin_IB_read_cycle_counter();
+  ulong t = t0;
+  uint n = 0u; // a bound in reads, so a clock that does not move cannot hang the launch
+  while (t - t0 < (ulong)ticks && n < (1u << 24)) { t = __builtin_IB_read_cycle_counter(); ++n; }
+  o[0] = t - t0;
+  o[1] = n;
+}

@@ -7,9 +7,11 @@ const xpu = @import("xpu");
 const ze = @import("ze");
 
 const reps = 5;
-// Polls before a fault. Run 1 used 1,000,000 and a faulted launch took seconds. Brief section 6 rule 1: a faulted
-// launch ends in 100 ms or less (the force bench shows it), every group leaves when it sees the fault word.
-const spin_cap: u32 = 20_000;
+// The spin cap in tm0 ticks: 50 ms at the rate fb_tsc measures at the start (brief section 6 rule 1, a faulted
+// launch ends in 100 ms or less). Block 2 had a cap of 20,000 polls, and M-f took 121 ms at G 32 and 119 ms at G 64
+// with 10,000 (an uncached poll costs more as G grows).
+var spin_cap: u32 = 0;
+const cap_us: f64 = 50_000;
 const gib: usize = 1 << 30;
 
 const Shape = struct { g: u32, s: u32, grf: u32 };
@@ -873,6 +875,32 @@ pub fn main(init: std.process.Init) !u8 {
     try b.x.upload(s, 0, std.mem.sliceAsBytes(&xh));
     try s.synchronize();
 
+    {
+        var timer = try Timer.init(&ctx);
+        var kt = try m256.kernel("fb_tsc", .{ 16, 1, 1 });
+        defer kt.deinit();
+        const ticks: u32 = 1 << 20;
+        try kt.setPtr(0, b.sink.ptr);
+        try kt.setU32(1, ticks);
+        var best: f64 = 0;
+        for (0..3) |_| {
+            const us = try timer.run(&b, kt, .{ 1, 1, 1 }, false);
+            var w: [16]u8 = undefined;
+            try b.sink.download(b.s, 0, &w);
+            const delta = std.mem.readInt(u64, w[0..8], .little);
+            const reads = std.mem.readInt(u64, w[8..16], .little);
+            const rate = @as(f64, @floatFromInt(delta)) / us;
+            std.debug.print("BENCH tsc run: {d} ticks in {d:.3} us device time, {d} reads\n", .{ delta, us, reads });
+            if (rate > best) best = rate;
+        }
+        if (best < 1.0) {
+            std.debug.print("BENCH tsc: rate {d:.3} ticks a us is too low for a time cap, no spin run\n", .{best});
+            return 3;
+        }
+        const cap = @min(best * cap_us, 4.0e9);
+        spin_cap = @intFromFloat(cap);
+        std.debug.print("BENCH tsc: {d:.3} ticks a us (best of 3 at 2^20 ticks), spin cap {d} ticks = {d:.0} us\n", .{ best, spin_cap, cap_us });
+    }
     var it = std.mem.splitScalar(u8, benches, ',');
     while (it.next()) |name| runOne(&b, &ctx, init, a, name, dir) catch |e| {
         std.debug.print("BENCH stopped: {s}\n", .{@errorName(e)});

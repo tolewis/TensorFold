@@ -21,6 +21,9 @@
 // IGC built-in: a plain LSC load with cache control. cacheOpt 1 is L1 uncached, L3 uncached; the vISA is
 // `lsc_load.ugm.uc.uc` (checked with IGC_ShaderDumpEnable on inference1 ocloc, 2026-11-27).
 uint __builtin_IB_lsc_load_global_uint(global uint *base, int immElemOff, int cacheOpt);
+// IGC built-in: the thread timestamp register tm0 (ISA `mov ... tm0.0`; __builtin_IB_get_timestamp gave an undefined value). The bench measures its ticks a us (fb_tsc) and passes the
+// spin cap in ticks, so a cap is a time for every mechanism and every G (brief section 6 rule 1).
+ulong __builtin_IB_read_cycle_counter(void);
 
 typedef global atomic_uint fb_au;
 
@@ -86,17 +89,18 @@ static inline uint fb_wait(uint mech_arg, global uint *sync, global uint *fault,
   uint f = 0u;
   if (get_sub_group_id() == 0u) {
     const uint lane = get_sub_group_local_id();
+    // spin_cap is the cap in tm0 ticks (the host converts 50 ms). The clock and the fault word are read every 16 polls.
     uint spins = 0u;
-#define FB_SPIN_CHECK                                                    \
-  if ((spins & 15u) == 0u && fb_fault_seen(fault) != 0u) { f = 2u; break; } \
-  if (++spins > spin_cap) { f = 1u; break; }
+    const ulong t0 = __builtin_IB_read_cycle_counter();
+#define FB_SPIN_CHECK                                                                   \
+  if ((++spins & 15u) == 0u) {                                                          \
+    if (fb_fault_seen(fault) != 0u) { f = 2u; break; }                                  \
+    if (__builtin_IB_read_cycle_counter() - t0 > (ulong)spin_cap) { f = 1u; break; }       \
+  }
     if (mech == FB_A || mech == FB_E) {
       const uint target = round * G;
       while (fb_poll1(sync + FB_CNT) < target) { FB_SPIN_CHECK }
     } else if (mech == FB_F) {
-      // An uncached plain-load poll took about 6 us in the block 2 force run (20,000 polls, 121 ms), so M-f spins to
-      // half the cap: a faulted launch ends inside 100 ms (brief section 6 rule 1).
-      spin_cap /= 2u;
       const uint target = round * G;
       while (fb_poll_plain(sync + FB_CNT) < target) { FB_SPIN_CHECK }
     } else if (mech == FB_C || g == 0u) {
@@ -118,6 +122,7 @@ static inline uint fb_wait(uint mech_arg, global uint *sync, global uint *fault,
     }
 #undef FB_SPIN_CHECK
     if (f == 0u && fb_fault_seen(fault) != 0u) f = 2u; // a fault set while this group was in its phase
+    (void)spins;
     if (f == 1u && lane == 0u) {
       atomic_store_explicit((global fb_au *)(fault + 2), round, memory_order_relaxed, memory_scope_device);
       atomic_store_explicit((global fb_au *)fault, 1u, memory_order_relaxed, memory_scope_device);
