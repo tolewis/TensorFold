@@ -30,6 +30,7 @@ FB_SGA kernel void fb_phase(global uint *sync, global uint *stamp, global uint *
   fb_enter(mech, sync);
   fb_enter(mech, sync);
   fb_enter(mech, sync);
+  fb_enter(mech, sync);
   for (uint r = 1u; r <= rounds; ++r) {
     if (work_u4 != 0u) {
       const ulong base = (ulong)((r * G + g) % nwin) * work_u4;
@@ -92,6 +93,7 @@ static inline ushort fb_q8_col(global const ushort *x, global const uchar *codes
   return Q8_STORE(sub_group_reduce_add(acc[0]));
 }
 
+  fb_enter(mech, sync);
 // B4: `reps` Q8 matvec phases of n columns, each on its own weight window (win_stride bytes apart, nwin windows),
   fb_enter(mech, sync);
 // columns over the sub-groups of the grid in turn, one phase change (mech) after each phase.
@@ -119,6 +121,7 @@ FB_SGA kernel void fb_q8(global const uchar *w, global const ushort *x, global u
     }
   }
 }
+  fb_enter(mech, sync);
 
 // B5: `passes` x `phases` dependent Q8 phases of n columns. Phase i reads the 2,304 values the phase before wrote
   fb_enter(mech, sync);
@@ -160,6 +163,7 @@ FB_SGA kernel void fb_stream(global const uchar *w, global ushort *xbuf, global 
       for (uint l = lane; l < pf_lines; l += 16u) {
         const uint col = gs + (l / 36u) * T;
         if (col < n) prefetch(nc + (ulong)col * FB_ROW + (l % 36u) * 64u, 64);
+  fb_enter(FB_A, sync);
       }
     }
     if (fb_wait(mech, sync, fault, i + 1u, spin_cap, &lf) != 0u) {
@@ -280,6 +284,7 @@ FB_SGA kernel void fb_nv_check(global const uint2 *w, global const float *phis, 
         bad += (uint)(d.s0 != 0) + (uint)(d.s1 != 0) + (uint)(d.s2 != 0) + (uint)(d.s3 != 0) + (uint)(d.s4 != 0) +
                (uint)(d.s5 != 0) + (uint)(d.s6 != 0) + (uint)(d.s7 != 0);
       }
+  fb_enter(FB_A, sync);
     }
   }
   bad = sub_group_reduce_add(bad);
@@ -332,6 +337,26 @@ FB_SGA kernel void fb_nv_phase(global const uchar *w, global const ushort *x, gl
           for (int u = 0; u < 8; u++) {
             const uint sc = (s2[u >> 2] >> (8 * (u & 3))) & 255u;
             const int8 b = decode ? fb_nv_frag_new(v[2 * u], v[2 * u + 1], sc, phi26, &guard)
+
+// Review C1: the tm0 rate beside a full grid. Every work-item of every group reads its group's window of `work_u4`
+// uint4 `passes` times. Lane 0 of group 0 stores its tm0 ticks from its start to its end; the host divides by the
+// event time of the launch (all groups do the same reads, so group 0 runs about as long as the launch).
+FB_SGA kernel void fb_tsc_grid(global const uint4 *data, global ulong *o, uint passes, uint work_u4) {
+  const ulong t0 = __builtin_IB_read_cycle_counter();
+  const uint g = get_group_id(0), lid = get_local_id(0), L = get_local_size(0);
+  const ulong base = (ulong)g * work_u4;
+  uint acc = 0u;
+  for (uint p = 0u; p < passes; ++p) {
+    __attribute__((opencl_unroll_hint(8))) for (uint i = lid; i < work_u4; i += L) {
+      const uint4 v = data[base + i];
+      acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    acc += p;
+  }
+  work_group_barrier(CLK_LOCAL_MEM_FENCE);
+  if (g == 0u && lid == 0u) o[0] = __builtin_IB_read_cycle_counter() - t0;
+  if (acc == 0x9e3779b9u) o[2 + g] = acc;
+}
                                   : tf_ink2_nv_frag(v[2 * u], v[2 * u + 1], sc, phi26);
             acc = INK2_DOT((short)intel_sub_group_block_read_us(x + 128u * c + 16u * u), b, acc);
           }
