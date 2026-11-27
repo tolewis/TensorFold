@@ -375,9 +375,8 @@ KERNEL(16) void tf_ink2_attn_decode8(global const ushort *q, global const char *
     UNROLL
     for (uint k = 0; k < 16; ++k) {
       const float vk = sub_group_broadcast(vown, k);
-      const uchar8 cd = vr[k];
-      const float8 v8 = (float8)((float)cd.s0, (float)cd.s1, (float)cd.s2, (float)cd.s3,
-                                 (float)cd.s4, (float)cd.s5, (float)cd.s6, (float)cd.s7) * vk;
+      // the block read returns unsigned bytes: the codes are signed, so they are converted as char, not as uchar
+      const float8 v8 = convert_float8(as_char8(vr[k])) * vk;
       const bool kl = kp0 + k >= from && kp0 + k < to;
       const float8 v = kl ? v8 : (float8)(0.0f);
       UNROLL
