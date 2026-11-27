@@ -11,86 +11,7 @@
 
 #include "dense_q8.cl" // Q8_DOT and today's tf_ink2_dense_q8_1, the same source and options as the dense_q8 image
 
-#define FB_SGA __attribute__((intel_reqd_sub_group_size(16)))
-#define FB_LINE 16u
-#define FB_CNT 0u
-#define FB_GEN 16u
-#define FB_FLAGS 32u
-#define FB_ROW 2304u // Q8 codes a column of k = 2,304
-
-// Mechanism ids: 0 no wait, 1 M-a (counter, few arrivals), 2 M-b (flags and a coordinator), 3 M-c (flags, every
-// leader polls), 4 M-e (B0 at one sub-group a work-group with a relaxed spin and one acquire fence).
-#define FB_NONE 0u
-#define FB_A 1u
-#define FB_B 2u
-#define FB_C 3u
-#define FB_E 4u
-
-typedef global atomic_uint fb_au;
-
-static inline uint fb_ld(global uint *p) { return atomic_load_explicit((global fb_au *)p, memory_order_relaxed, memory_scope_device); }
-static inline void fb_rel(void) { atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_release, memory_scope_device); }
-static inline void fb_acq(void) { atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_acquire, memory_scope_device); }
-
-// The arrive half of a phase change. Every work-item of the group calls it after its last store of the phase.
-static inline void fb_arrive(uint mech, global uint *sync, uint round) {
-  if (mech == FB_NONE) return;
-  if (mech == FB_E) {
-    if (get_local_id(0) == 0u)
-      atomic_fetch_add_explicit((global fb_au *)(sync + FB_CNT), 1u, memory_order_acq_rel, memory_scope_device);
-    return;
-  }
-  fb_rel();
-  work_group_barrier(CLK_LOCAL_MEM_FENCE);
-  if (get_local_id(0) == 0u) {
-    if (mech == FB_A)
-      atomic_fetch_add_explicit((global fb_au *)(sync + FB_CNT), 1u, memory_order_relaxed, memory_scope_device);
-    else
-      atomic_store_explicit((global fb_au *)(sync + FB_FLAGS + get_group_id(0) * FB_LINE), round, memory_order_relaxed,
-                            memory_scope_device);
-  }
-}
-
-// The wait half. Sub-group 0 of the group spins (all 16 lanes, one address or one flag a lane), with a spin cap (R7).
-// Returns 1 when the cap was reached. M-e returns without a native barrier (it runs at one sub-group a group).
-static inline uint fb_wait(uint mech, global uint *sync, uint round, uint spin_cap, local uint *lf) {
-  if (mech == FB_NONE) return 0u;
-  const uint G = get_num_groups(0), g = get_group_id(0);
-  uint f = 0u;
-  if (get_sub_group_id() == 0u) {
-    const uint lane = get_sub_group_local_id();
-    uint spins = 0u;
-    if (mech == FB_A || mech == FB_E) {
-      const uint target = round * G;
-      while (fb_ld(sync + FB_CNT) < target) {
-        if (++spins > spin_cap) { f = 1u; break; }
-      }
-    } else if (mech == FB_C || g == 0u) {
-      for (;;) {
-        uint ok = 1u;
-        for (uint b = 0u; b < G; b += 16u) {
-          const uint i = b + lane;
-          if (i < G) ok &= (uint)(fb_ld(sync + FB_FLAGS + i * FB_LINE) >= round);
-        }
-        if (sub_group_all(ok)) break;
-        if (++spins > spin_cap) { f = 1u; break; }
-      }
-      if (mech == FB_B && f == 0u) {
-        fb_acq();
-        if (lane == 0u) atomic_store_explicit((global fb_au *)(sync + FB_GEN), round, memory_order_release, memory_scope_device);
-      }
-    } else {
-      while (fb_ld(sync + FB_GEN) < round) {
-        if (++spins > spin_cap) { f = 1u; break; }
-      }
-    }
-    fb_acq();
-    if (mech != FB_E && lane == 0u) *lf = f;
-  }
-  if (mech == FB_E) return f;
-  work_group_barrier(CLK_LOCAL_MEM_FENCE);
-  return *lf;
-}
+#include "fused_sync.h"
 
 // B2 and B3: `rounds` phase changes. With work_u4 > 0 each group first reads work_u4 uint4 (64 KB at 4,096) of its
 // own window, a new window each round. The visibility check: the last work-item of the group (lane 0 at one sub-group)
@@ -112,8 +33,7 @@ FB_SGA kernel void fb_phase(global uint *sync, global uint *stamp, global uint *
     }
     if (mech != FB_NONE && lid == checker) stamp[g * FB_LINE] = r;
     fb_arrive(mech, sync, r);
-    if (fb_wait(mech, sync, r, spin_cap, &lf) != 0u) {
-      if (lid == 0u) { fault[0] = 1u; fault[2] = r; }
+    if (fb_wait(mech, sync, fault, r, spin_cap, &lf) != 0u) {
       return;
     }
     if (mech != FB_NONE && lid == checker) {
@@ -180,8 +100,7 @@ FB_SGA kernel void fb_q8(global const uchar *w, global const ushort *x, global u
       if (get_sub_group_local_id() == 0u) y[j] = v;
     }
     fb_arrive(mech, sync, r + 1u);
-    if (fb_wait(mech, sync, r + 1u, spin_cap, &lf) != 0u) {
-      if (get_local_id(0) == 0u) { fault[0] = 1u; fault[2] = r + 1u; }
+    if (fb_wait(mech, sync, fault, r + 1u, spin_cap, &lf) != 0u) {
       return;
     }
   }
@@ -222,8 +141,7 @@ FB_SGA kernel void fb_stream(global const uchar *w, global ushort *xbuf, global 
         if (col < n) prefetch(nc + (ulong)col * FB_ROW + (l % 36u) * 64u, 64);
       }
     }
-    if (fb_wait(mech, sync, i + 1u, spin_cap, &lf) != 0u) {
-      if (get_local_id(0) == 0u) { fault[0] = 1u; fault[2] = i + 1u; }
+    if (fb_wait(mech, sync, fault, i + 1u, spin_cap, &lf) != 0u) {
       return;
     }
   }
@@ -248,13 +166,13 @@ FB_SGA kernel void fb_l2keep(global const uchar *w, global uint *sink, global ui
     if (pf_on != 0u)
       for (uint l = gs * 16u + lane; l < FB_PF_BLOCK / 64u; l += T * 16u) prefetch(a + (ulong)l * 64u, 64);
     fb_arrive(FB_A, sync, 3u * r + 1u);
-    if (fb_wait(FB_A, sync, 3u * r + 1u, spin_cap, &lf) != 0u) { if (get_local_id(0) == 0u) fault[0] = 1u; return; }
+    if (fb_wait(FB_A, sync, fault, 3u * r + 1u, spin_cap, &lf) != 0u) return;
     __attribute__((opencl_unroll_hint(8))) for (uint i = gs * 16u + lane; i < stream_bytes / 16u; i += T * 16u) {
       const uint4 v = bq[i];
       acc ^= v.x ^ v.y ^ v.z ^ v.w;
     }
     fb_arrive(FB_A, sync, 3u * r + 2u);
-    if (fb_wait(FB_A, sync, 3u * r + 2u, spin_cap, &lf) != 0u) { if (get_local_id(0) == 0u) fault[0] = 1u; return; }
+    if (fb_wait(FB_A, sync, fault, 3u * r + 2u, spin_cap, &lf) != 0u) return;
     if (read_on != 0u) {
       global const uint4 *aq = (global const uint4 *)a;
       __attribute__((opencl_unroll_hint(8))) for (uint i = gs * 16u + lane; i < FB_PF_BLOCK / 16u; i += T * 16u) {
@@ -263,7 +181,142 @@ FB_SGA kernel void fb_l2keep(global const uchar *w, global uint *sink, global ui
       }
     }
     fb_arrive(FB_A, sync, 3u * r + 3u);
-    if (fb_wait(FB_A, sync, 3u * r + 3u, spin_cap, &lf) != 0u) { if (get_local_id(0) == 0u) fault[0] = 1u; return; }
+    if (fb_wait(FB_A, sync, fault, 3u * r + 3u, spin_cap, &lf) != 0u) return;
   }
   if (acc == 0x9e3779b9u) sink[gs] = acc;
+}
+
+// ---------------------------------------------------------------- B9: the NVFP4 decode, today's against the new one
+// The new decode (DESIGN section 4d, briefs/e1-nvfp4-expert-rate.md): a block computes A = bf16((t(1.0) * k1) * phi26)
+// and B = bf16((t(1.5) * k1) * phi26) the reference way, then a value is bits(A or B) plus (e << 7), the nibble's sign
+// on top. A block whose A or B exponent field lies outside 3 to 252 takes today's nv_frag (the guard).
+#define INK2_ONLY 0 // the helpers alone, no expert kernel
+#include "experts.cl"
+
+#define FB_NV_T(c) as_float((uint)(c) << 22) // the e2m1 magnitude code under the FP32 2^-126 offset, as INK2_NIBBLE_T
+
+static inline uint fb_nv_val(uint nib, uint a, uint b) {
+  const uint m = nib & 7u;
+  const uint base = ((m & 1u) != 0u && m != 1u) ? b : a;
+  const uint mag = m == 0u ? (a & 0x8000u) : base + ((m >> 1) << 7) - 128u;
+  return (mag ^ ((nib & 8u) << 12)) & 0xffffu;
+}
+
+static inline uint fb_nv_pair(uint w, uint i, uint a, uint b) {
+  return fb_nv_val(w >> (4u * i), a, b) | (fb_nv_val(w >> (4u * i + 4u), a, b) << 16);
+}
+
+// The new decode of one 16-column block; *guard counts the blocks that took today's nv_frag.
+static inline int8 fb_nv_frag_new(uint w0, uint w1, uint scale, float phi26, uint *guard) {
+  const float k1 = tf_ink2_e4m3(scale) * 0x1p100f;
+  const ushort2 ab = intel_convert_bfloat162_as_ushort2((float2)((FB_NV_T(2u) * k1) * phi26, (FB_NV_T(3u) * k1) * phi26));
+  const uint a = ab.x, b = ab.y;
+  const uint ea = (a >> 7) & 0xffu, eb = (b >> 7) & 0xffu;
+  if (ea < 3u || ea > 252u || eb < 3u || eb > 252u) {
+    *guard += 1u;
+    return tf_ink2_nv_frag(w0, w1, scale, phi26);
+  }
+  int8 r;
+  r.s0 = (int)fb_nv_pair(w0, 0u, a, b);
+  r.s1 = (int)fb_nv_pair(w0, 2u, a, b);
+  r.s2 = (int)fb_nv_pair(w0, 4u, a, b);
+  r.s3 = (int)fb_nv_pair(w0, 6u, a, b);
+  r.s4 = (int)fb_nv_pair(w1, 0u, a, b);
+  r.s5 = (int)fb_nv_pair(w1, 2u, a, b);
+  r.s6 = (int)fb_nv_pair(w1, 4u, a, b);
+  r.s7 = (int)fb_nv_pair(w1, 6u, a, b);
+  return r;
+}
+
+// Fills `n` uints with a hash of their index (the B9 weights and scales).
+FB_SGA kernel void fb_fill_hash(global uint *w, uint n, uint seed) {
+  for (uint i = get_global_id(0); i < n; i += get_global_size(0)) {
+    uint x = i * 0x9e3779b9u + seed;
+    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+    w[i] = x;
+  }
+}
+
+// Decode check: every block of `blocks` (8 code bytes each from w) against every scale code and each phi26 of `phis`.
+// out[0] counts dwords that differ, out[1] blocks that took the guard.
+FB_SGA kernel void fb_nv_check(global const uint2 *w, global const float *phis, uint nphi, uint blocks, global uint *out) {
+  uint bad = 0u, guard = 0u;
+  for (uint i = get_global_id(0); i < blocks; i += get_global_size(0)) {
+    const uint2 v = w[i];
+    for (uint s = 0u; s < 256u; s += 17u) {
+      const uint scale = (s + i) & 255u;
+      for (uint p = 0u; p < nphi; ++p) {
+        const int8 o = tf_ink2_nv_frag(v.x, v.y, scale, phis[p]);
+        const int8 n = fb_nv_frag_new(v.x, v.y, scale, phis[p], &guard);
+        const int8 d = o ^ n;
+        bad += (uint)(d.s0 != 0) + (uint)(d.s1 != 0) + (uint)(d.s2 != 0) + (uint)(d.s3 != 0) + (uint)(d.s4 != 0) +
+               (uint)(d.s5 != 0) + (uint)(d.s6 != 0) + (uint)(d.s7 != 0);
+      }
+    }
+  }
+  bad = sub_group_reduce_add(bad);
+  guard = sub_group_reduce_add(guard);
+  if (get_sub_group_local_id() == 0u) {
+    if (bad) atomic_add(out, bad);
+    if (guard) atomic_add(out + 1, guard);
+  }
+}
+
+// B9 phase: NVFP4 gate-up rows of k = 2,304 (1,152 code bytes and 144 scale bytes a row), tiles of 16 rows, one tile a
+// triple of sub-groups over three slices of k (today's INK2_KS_NV_GU 3, today's nv_pass chunk loop at live 1), the three
+// partial sums added in sub-group order and stored as bf16. 10 triples a group of 32 sub-groups, the last 2 sub-groups
+// idle. Every triple runs ceil(tiles / triples) tiles (the last tile again past the end), so the group barriers match.
+// `reps` phases over windows of win_stride bytes (codes, then scales at codes + rows * 1,152), M-a after each.
+FB_SGA kernel void fb_nv_phase(global const uchar *w, global const ushort *x, global ushort *y, global uint *sync,
+                               global uint *fault, uint rows, uint reps, uint nwin, uint win_stride, uint spin_cap,
+                               uint decode, float phi26) {
+  local float part[10 * 3 * 16];
+  local uint lf;
+  const uint sg = get_sub_group_id(), lane = get_sub_group_local_id();
+  const uint tri = sg / 3u, ks = sg % 3u;
+  const uint triples = get_num_groups(0) * 10u;
+  const uint gt = get_group_id(0) * 10u + tri;
+  const uint tiles = rows / 16u;
+  const uint iters = (tiles + triples - 1u) / triples;
+  const uint nb = 2304u / 16u;
+  uint guard = 0u;
+  for (uint r = 0u; r < reps; ++r) {
+    global const uchar *codes = w + (ulong)(r % nwin) * win_stride;
+    global const uchar *scales = codes + (ulong)rows * 1152u;
+    for (uint it = 0u; it < iters; ++it) {
+      const uint tile = min(gt + it * triples, tiles - 1u);
+      float acc = 0.0f;
+      if (tri < 10u) {
+        const uint row = tile * 16u + lane;
+        global const uchar *wr = codes + (ulong)row * 1152u;
+        global const uchar *sr = scales + (ulong)row * nb;
+        for (uint c = ks; c < nb / 8u; c += 3u) {
+          const uint16 v = vload16(0, (global const uint *)(wr + 64u * c));
+          const uint2 s2 = vload2(0, (global const uint *)(sr + 8u * c));
+#pragma unroll
+          for (int u = 0; u < 8; u++) {
+            const uint sc = (s2[u >> 2] >> (8 * (u & 3))) & 255u;
+            const int8 b = decode ? fb_nv_frag_new(v[2 * u], v[2 * u + 1], sc, phi26, &guard)
+                                  : tf_ink2_nv_frag(v[2 * u], v[2 * u + 1], sc, phi26);
+            acc = INK2_DOT((short)intel_sub_group_block_read_us(x + 128u * c + 16u * u), b, acc);
+          }
+        }
+        part[(tri * 3u + ks) * 16u + lane] = acc;
+      }
+      work_group_barrier(CLK_LOCAL_MEM_FENCE);
+      if (tri < 10u && ks == 0u) {
+        float t = part[(tri * 3u) * 16u + lane];
+        t += part[(tri * 3u + 1u) * 16u + lane];
+        t += part[(tri * 3u + 2u) * 16u + lane];
+        y[tile * 16u + lane] = intel_convert_bfloat16_as_ushort(t);
+      }
+      work_group_barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    fb_arrive(FB_A, sync, r + 1u);
+    if (fb_wait(FB_A, sync, fault, r + 1u, spin_cap, &lf) != 0u) {
+      return;
+    }
+  }
+  guard = sub_group_reduce_add(guard);
+  if (lane == 0u && guard != 0u) atomic_add(fault + 3, guard);
 }

@@ -248,12 +248,23 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     barrier_step.dependOn(&barrier_install.step);
     // The fused-visit benches (lane fused-visit Part 1): one source, built at 256 GRF and at the default 128 GRF.
     const fused_step = b.step("tf-xpu-fused-bench", "Build the fused-visit resident-kernel benches");
-    for ([_][2][]const u8{ .{ "fused_bench", " -cl-intel-256-GRF-per-thread" }, .{ "fused_bench128", "" } }) |img| {
+    // B10 adds fused_small (today's small-phase bodies in a resident kernel) and the three production sources it copies,
+    // built with the production options (xpu_inkling2.zig: the common options, then each image's extra).
+    const prod = "-cl-std=CL3.0 -cl-intel-256-GRF-per-thread -cl-fp32-correctly-rounded-divide-sqrt";
+    for ([_][3][]const u8{
+        .{ "fused_bench", "zig/kernels/xpu/fused_bench.cl", "-cl-std=CL3.0 -cl-intel-256-GRF-per-thread -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2 -I zig/kernels/xpu" },
+        .{ "fused_bench128", "zig/kernels/xpu/fused_bench.cl", "-cl-std=CL3.0 -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2 -I zig/kernels/xpu" },
+        .{ "fused_small", "zig/kernels/xpu/fused_small.cl", prod ++ " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu" },
+        .{ "ref_fuse", "zig/kernels/xpu/inkling2/fuse.cl", prod ++ " -cl-fp32-correctly-rounded-divide-sqrt" },
+        .{ "ref_glue", "zig/kernels/xpu/inkling2/glue.cl", prod ++ " -cl-fp32-correctly-rounded-divide-sqrt" },
+        .{ "ref_attention", "zig/kernels/xpu/inkling2/attention.cl", prod },
+    }) |img| {
         const obj = b.addSystemCommand(&.{ ocloc, "compile", "-q", "-file" });
-        obj.addFileArg(b.path("zig/kernels/xpu/fused_bench.cl"));
-        obj.addArgs(&.{ "-device", device, "-options", b.fmt("-cl-std=CL3.0{s} -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2", .{img[1]}), "-output_no_suffix", "-output", img[0], "-out_dir" });
+        obj.addFileArg(b.path(img[1]));
+        obj.addArgs(&.{ "-device", device, "-options", img[2], "-output_no_suffix", "-output", img[0], "-out_dir" });
         obj.setCwd(b.path("."));
         obj.addFileInput(b.path("zig/kernels/xpu/inkling2/dense_q8.cl"));
+        obj.addFileInput(b.path("zig/kernels/xpu/fused_sync.h"));
         const dir = obj.addOutputDirectoryArg(b.fmt("ocloc-{s}", .{img[0]}));
         fused_step.dependOn(&b.addInstallFile(dir.path(b, b.fmt("{s}.bin", .{img[0]})), b.fmt("xpu-bench/{s}.bin", .{img[0]})).step);
     }
@@ -371,21 +382,21 @@ const contract_images = [_]Source{
 /// Inkling 2 Mini's DSpark kernels and their planted controls (the controls file includes the kernels).
 const inkling2_images = [_]Source{
     // The prompt chunk's grouped expert GEMMs (plan, gather, four GEMMs, combine) and their planted twins (the controls file includes the source).
-    .{ .name = "inkling2_prefill_experts", .path = "zig/kernels/xpu/inkling2/prefill_experts.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2" },
+    .{ .name = "inkling2_prefill_experts", .path = "zig/kernels/xpu/inkling2/prefill_experts.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2 -I zig/kernels/xpu" },
     .{
         .name = "contract_inkling2_prefill_experts_controls",
         .path = "zig/kernels/xpu/inkling2/contract_prefill_experts_controls.cl",
         .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2",
         .inputs = &.{"zig/kernels/xpu/inkling2/prefill_experts.cl"},
     },
-    .{ .name = "inkling2_dspark", .path = "zig/kernels/xpu/inkling2/dspark.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2" },
+    .{ .name = "inkling2_dspark", .path = "zig/kernels/xpu/inkling2/dspark.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2 -I zig/kernels/xpu" },
     .{
         .name = "contract_inkling2_dspark_controls",
         .path = "zig/kernels/xpu/inkling2/contract_dspark_controls.cl",
         .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2",
         .inputs = &.{"zig/kernels/xpu/inkling2/dspark.cl"},
     },
-    .{ .name = "inkling2_dflash2", .path = "zig/kernels/xpu/inkling2/dflash2.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2" },
+    .{ .name = "inkling2_dflash2", .path = "zig/kernels/xpu/inkling2/dflash2.cl", .extra = " -cl-fp32-correctly-rounded-divide-sqrt -I zig/kernels/xpu/inkling2 -I zig/kernels/xpu" },
     .{
         .name = "contract_inkling2_dflash2_controls",
         .path = "zig/kernels/xpu/inkling2/contract_dflash2_controls.cl",
