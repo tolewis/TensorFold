@@ -1045,6 +1045,15 @@ fn checkPair(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytype
     const h_bytes: usize = m.c.hidden * 2;
     const hin_at = saved;
     try m.copy(s, f.save.ptr + hin_at, hin, h_bytes);
+    // X4: today's two visits also start from filled buffers (A20); else a slot no visit writes at this position holds
+    // an earlier step's bytes in the reference only (fx3, fx4: part_o slot 4 at pos 125951)
+    for ([2][]const Buf{ la[0..na], lb[0..nb] }) |l| try poison(d, s, l);
+    saved = 0;
+    for ([2][]const Buf{ la[0..na], lb[0..nb] }) |l| for (l) |b| if (std.mem.startsWith(u8, b.name, "conv_")) {
+        try m.copy(s, b.ptr, f.save.ptr + saved, b.len);
+        saved += b.len;
+    };
+    try m.copy(s, hin, f.save.ptr + hin_at, h_bytes);
     f.at = "pair-today";
     try today.run(m, k, s, r, v, hin, hout);
     var at: usize = 0;
