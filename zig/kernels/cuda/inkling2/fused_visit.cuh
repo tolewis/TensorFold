@@ -93,6 +93,40 @@ struct FusedState {
     unsigned long long* times;  // 64 a visit: globaltimer after each phase change (block 0)
 };
 
+// The waits of the fused visit (review A2, A3). Every wait spins on one counter with the same 200 ms limit (R8) and
+// reads the visit's fault word in each spin. A wait that reaches the limit sets the fault word once:
+// (code << 16) | (block + 1), code = ((group + 1) << 3) | sub. `group` is the counter group (8 counters) of the wait,
+// unique in a launch. `sub` is the counter in the group: 0 for an all-of wait and for the first wait of a mix, 1 + q
+// for the second wait of mix query q, 7 for the last wait of a mix. So no two waits of a launch have one code.
+namespace fz_sync {
+constexpr unsigned long long kLimitNs = 200000000ull;  // 200 ms a wait (R8)
+
+__device__ __forceinline__ unsigned ld_acq(const unsigned* p) {
+    unsigned v;
+    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+__device__ __forceinline__ unsigned long long now() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+__device__ __forceinline__ unsigned code(int group, int sub) {
+    return (static_cast<unsigned>(group + 1) << 3) | static_cast<unsigned>(sub);
+}
+// Spin until *p >= target. False when the fault word is set, or at the limit (this wait's code goes in first).
+__device__ __forceinline__ bool wait_ge(const unsigned* p, unsigned target, unsigned* fault, unsigned c) {
+    const unsigned long long t0 = now();
+    while (ld_acq(p) < target) {
+        if (now() - t0 > kLimitNs || ld_acq(fault) != 0) {
+            atomicCAS(fault, 0u, (c << 16) | (blockIdx.x + 1u));
+            return false;
+        }
+    }
+    return true;
+}
+}  // namespace fz_sync
+
 // fused.zig asserts the same sizes
 static_assert(sizeof(FzProj) == 64 && sizeof(FzPrep) == 160 && sizeof(FzAttn) == 184, "fused.zig layout");
 static_assert(sizeof(FzMoe) == 168 && sizeof(FzTaps) == 64 && sizeof(FusedVisit) == 944, "fused.zig layout");

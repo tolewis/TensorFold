@@ -719,6 +719,13 @@ pub fn reportLoad(m: *const Model, k: *const Kernels) !void {
     std.debug.print("[fused-load] occupancy at 128 threads, blocks a multiprocessor: tf_ink2_attn8 {d}, tf_ink2_attn8_db {d} ({d} B dynamic), tf_ink2_fused_visit {d} ({d} B dynamic), grid {d}\n", .{ per, per_db, attn.db8_shared, per_f, f.dyn, f.grid });
 }
 
+/// The fault word as text: (code << 16) | (block + 1), code = ((group + 1) << 3) | sub (fused_visit.cuh fz_sync).
+fn faultText(buf: []u8, w: u32) []const u8 {
+    if (w == 0) return "none";
+    const code = w >> 16;
+    return std.fmt.bufPrint(buf, "group {d} sub {d} block {d}", .{ @as(i64, code >> 3) - 1, code & 7, @as(i64, w & 0xffff) - 1 }) catch "?";
+}
+
 /// Fill every compared buffer except the conv states (the visit's inputs) with 0xFF bytes.
 fn poison(d: *const cuda.Driver, s: cuda.Stream, list: []const Buf) !void {
     for (list) |b| if (!std.mem.startsWith(u8, b.name, "conv_")) try d.check(d.api.cuMemsetD8Async(b.ptr, 0xff, b.len, s.handle), "cuMemsetD8Async");
@@ -851,8 +858,9 @@ fn checkSteps(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytyp
         at += b.len;
     }
     try s.synchronize();
+    var fbuf: [64]u8 = undefined;
     if (drop != 0) {
-        std.debug.print("[fused-drop] visit {d} step {d} pos {d} group {d} sub {d} fused_us {d:.2} fault 0x{x} differing {d}\n", .{ v, step, r.last_pos, (drop >> 3) - 1, drop & 7, ms_fused * 1000, fault, diff_total });
+        std.debug.print("[fused-drop] visit {d} step {d} pos {d} group {d} sub {d} fused_us {d:.2} fault 0x{x} ({s}) differing {d}\n", .{ v, step, r.last_pos, (drop >> 3) - 1, drop & 7, ms_fused * 1000, fault, faultText(&fbuf, fault), diff_total });
     } else if (diff_total != 0 or fault != 0) f.bad[v] += 1;
     if (drop == 0 and (diff_total != 0 or fault != 0 or step % every() == 0)) {
         std.debug.print("{s}", .{lines.items});
@@ -861,6 +869,7 @@ fn checkSteps(f: *State, m: *Model, k: *const Kernels, s: cuda.Stream, r: anytyp
         var ph: usize = 1;
         while (ph < times_visit and times[ph] != 0 and times[ph] >= times[ph - 1]) : (ph += 1) try tl.print(gpa, " {d}", .{times[ph] - times[ph - 1]});
         std.debug.print("[fused-time] visit {d} step {d} pos {d} today_us {d:.2} fused_us {d:.2} fault 0x{x} fill {d} phases_ns{s}\n", .{ v, step, r.last_pos, ms_today * 1000, ms_fused * 1000, fault, @intFromBool(fill_on), tl.items });
+        if (fault != 0) std.debug.print("[fused-fault] visit {d} step {d} {s}\n", .{ v, step, faultText(&fbuf, fault) });
         std.debug.print("[fused-sum] visit {d} steps {d} bad {d} buffers {d} differing {d}\n", .{ v, step + 1, f.bad[v], nbuf, diff_total });
     }
     try d.check(d.api.cuMemsetD8Async(f.times.ptr + @as(u64, v) * times_visit * 8, 0, times_visit * 8, s.handle), "cuMemsetD8Async");

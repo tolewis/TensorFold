@@ -1,7 +1,7 @@
 // tf_ink2_fused_visit: one cooperative kernel runs every phase of a range of decode visits (fused-cuda DESIGN sections
 // 5, 10 and 11). The glue flags. Each phase calls the unit of today's kernel in its own unit file. Between two phases
 // every block waits (M4 counter, P = G). Each wait has a time limit: at the limit the block sets the visit's fault
-// word, (phase << 16) | (block + 1), and leaves (R8). Block 0 stores the global timer after each phase change.
+// word, (code << 16) | (block + 1) with the wait's own code (fz_sync in fused_visit.cuh), and leaves (R8). Block 0 stores the global timer after each phase change.
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -57,26 +57,16 @@ extern "C" __device__ void fz_dense_scaled_warp(const __nv_bfloat16* x, const __
                                                 float* out, int n, int k, int col);
 extern "C" __device__ void fz_plan(const int* picks, int P, int E, int T, int* members, int* items, int* counts);
 extern "C" __device__ void fz_mix_s(const fz_mix::MixArgs& a, float* part1, float* part2, unsigned* cnt,
-                                    unsigned* fault, unsigned char* stg, int drop);
+                                    unsigned* fault, unsigned char* stg, int drop, int group);
 extern "C" __device__ void fz_loop_s(const fz_mix::LoopMixArgs& a, float* part1, float* part2, unsigned* cnt,
-                                     unsigned* fault, unsigned char* stg, int drop);
+                                     unsigned* fault, unsigned char* stg, int drop, int group);
 
 namespace {
 
-constexpr unsigned long long kLimitNs = 200000000ull;  // 200 ms a wait (R8)
-
-__device__ __forceinline__ unsigned ld_acq(const unsigned* p) {
-    unsigned v;
-    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
-    return v;
-}
+using fz_sync::ld_acq;
+using fz_sync::now;
 __device__ __forceinline__ void red_rel_add(unsigned* p, unsigned v) {
     asm volatile("red.release.gpu.global.add.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
-}
-__device__ __forceinline__ unsigned long long now() {
-    unsigned long long t;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-    return t;
 }
 
 struct Ctx {
@@ -98,15 +88,7 @@ __device__ bool all_wait(Ctx& c) {
     if (threadIdx.x == 0) {
         unsigned* cnt = c.st.cnt + 8 * c.ci;
         if (!(blockIdx.x == 0 && drop_sub(c) == 0)) red_rel_add(cnt, 1u);
-        const unsigned long long t0 = now();
-        bool ok = true;
-        while (ld_acq(cnt) < gridDim.x) {
-            if (now() - t0 > kLimitNs || ld_acq(c.fault) != 0) {
-                ok = false;
-                break;
-            }
-        }
-        if (!ok) atomicCAS(c.fault, 0u, (static_cast<unsigned>(c.ph + 1) << 16) | (blockIdx.x + 1u));
+        const bool ok = fz_sync::wait_ge(cnt, gridDim.x, c.fault, fz_sync::code(c.ci, 0));
         bad = !ok;
         if (ok && blockIdx.x == 0 && c.ph < 63) c.times[c.ph + 1] = now();
     }
@@ -178,9 +160,9 @@ __device__ bool gates_phase(const void* ga, int gates, Ctx& c, unsigned char* dy
 __device__ bool mix_phase(const void* a, bool gated, Ctx& c, unsigned char* dyn) {
     unsigned* cnt = c.st.cnt + 8 * c.ci;
     if (gated)
-        fz_loop_s(*static_cast<const fz_mix::LoopMixArgs*>(a), c.st.part1, c.st.part2, cnt, c.fault, dyn, drop_sub(c));
+        fz_loop_s(*static_cast<const fz_mix::LoopMixArgs*>(a), c.st.part1, c.st.part2, cnt, c.fault, dyn, drop_sub(c), c.ci);
     else
-        fz_mix_s(*static_cast<const fz_mix::MixArgs*>(a), c.st.part1, c.st.part2, cnt, c.fault, dyn, drop_sub(c));
+        fz_mix_s(*static_cast<const fz_mix::MixArgs*>(a), c.st.part1, c.st.part2, cnt, c.fault, dyn, drop_sub(c), c.ci);
     c.ci++;
     c.ph++;
     if (threadIdx.x == 0 && blockIdx.x == 0 && c.ph < 64) c.times[c.ph] = now();

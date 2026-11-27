@@ -8,6 +8,8 @@
 #include <cuda_pipeline.h>
 #include <cuda_runtime.h>
 
+#include "inkling2/fused_visit.cuh"
+
 namespace fz_mix {
 constexpr int NB = 8, MAXQ_MIX = 3, MAXQ_LOOP = 4;
 __device__ __forceinline__ float bf(uint16_t u) { return __uint_as_float(static_cast<uint32_t>(u) << 16); }
@@ -37,44 +39,10 @@ struct LoopMixArgs {
   float eps, scale;
 };
 
-#ifndef SPIN_CAP
-#define SPIN_CAP 100000000u  // DESIGN section 3, from briefs/b0c-cuda-barrier.md
-#endif
-
-__device__ __forceinline__ unsigned ld_acq(const unsigned* p) {
-  unsigned v;
-  asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
-  return v;
-}
-__device__ __forceinline__ void st_rel(unsigned* p, unsigned v) {
-  asm volatile("st.release.gpu.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
-}
 __device__ __forceinline__ void red_rel_add(unsigned* p, unsigned v) {
   asm volatile("red.release.gpu.global.add.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
 }
 
-// Spin until *p >= target (or != old when NE). Returns false at the iteration limit.
-template <bool SLEEP>
-__device__ __forceinline__ bool spin_ge(const unsigned* p, unsigned target) {
-  for (unsigned it = 0; it < SPIN_CAP; it++) {
-    if (ld_acq(p) >= target) return true;
-    if (SLEEP) __nanosleep(32);
-  }
-  return false;
-}
-template <bool SLEEP>
-__device__ __forceinline__ bool spin_ne(const unsigned* p, unsigned old) {
-  for (unsigned it = 0; it < SPIN_CAP; it++) {
-    if (ld_acq(p) != old) return true;
-    if (SLEEP) __nanosleep(32);
-  }
-  return false;
-}
-
-// Set the fault word once: (phase << 16) | (block + 1).
-__device__ __forceinline__ void set_fault(unsigned* fault, unsigned phase) {
-  atomicCAS(fault, 0u, (phase << 16) | (blockIdx.x + 1u));
-}
 // ---------------------------------------------------------------- mode S
 constexpr int MIXW = 16, LOOPW = 8;   // virtual warps of today's block
 constexpr int MIXRUNS = 5;            // column runs of 32 a virtual warp: ceil(2304 / 512)
@@ -91,6 +59,7 @@ struct SArgs {
   unsigned* sink;
   int reps;
   int drop;         // a test's skipped arrival: counter 0 (unit 0), 1 + q (unit w 0 of q), 7 (block 0); -1 none
+  int group;        // the counter group of the phase (the fault codes, fz_sync)
 };
 
 __device__ __forceinline__ void cpa16(void* s, const void* g) { __pipeline_memcpy_async(s, g, 16); }
@@ -103,21 +72,22 @@ __device__ __forceinline__ void stage_runs(unsigned char* s, const void* g, int 
   }
 }
 
-// Thread 0 of the warp spins; the warp then syncs.
-__device__ __forceinline__ void warp_wait(unsigned* c, unsigned target, unsigned* fault, unsigned ph) {
-  if ((threadIdx.x & 31) == 0)
-    if (!spin_ge<false>(c, target)) set_fault(fault, ph);
-  __syncwarp();
+// Lane 0 of the warp spins; the warp then syncs. False (on every lane) when the wait failed.
+__device__ __forceinline__ bool warp_wait(unsigned* c, unsigned target, unsigned* fault, unsigned code) {
+  bool ok = true;
+  if ((threadIdx.x & 31) == 0) ok = fz_sync::wait_ge(c, target, fault, code);
+  return __shfl_sync(0xffffffffu, ok ? 1 : 0, 0) != 0;
 }
 __device__ __forceinline__ void warp_arrive(unsigned* c, bool skip = false) {
   __syncwarp();
   if ((threadIdx.x & 31) == 0 && !skip) { __threadfence(); red_rel_add(c, 1u); }
 }
-__device__ __forceinline__ void block_all(unsigned* c, unsigned* fault, unsigned ph, bool skip = false) {
+// The last wait of a mix. The caller reads the fault word after it (mix_phase, fault_set).
+__device__ __forceinline__ void block_all(unsigned* c, unsigned* fault, unsigned code, bool skip = false) {
   __syncthreads();
   if (threadIdx.x == 0) {
     if (!skip) red_rel_add(c, 1u);
-    if (!spin_ge<false>(c, gridDim.x)) set_fault(fault, ph);
+    fz_sync::wait_ge(c, gridDim.x, fault, code);
   }
   __syncthreads();
 }
@@ -169,7 +139,8 @@ __device__ void mixS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigned
   } else if (slot < P1 + P2) {
     // ---- pass 2 unit (q, w)
     const int u = slot - P1, w = u % MIXW, q = u / MIXW, t = w * 32 + lane;
-    warp_wait(cnt + 0, P1, A.fault, 1);
+    do {  // a failed wait leaves the unit before any store (review A2)
+    if (!warp_wait(cnt + 0, P1, A.fault, fz_sync::code(A.group, 0))) break;
     float rr[NB + 1], wq[NB + 1];
 #pragma unroll
     for (int j = 0; j < NB + 1; ++j) {
@@ -211,7 +182,7 @@ __device__ void mixS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigned
     s = warpSum(s);
     if (lane == 0) A.part2[q * MIXW + w] = s;
     warp_arrive(cnt + 1 + q, A.drop == 1 + q && w == 0);
-    warp_wait(cnt + 1 + q, MIXW, A.fault, 2);
+    if (!warp_wait(cnt + 1 + q, MIXW, A.fault, fz_sync::code(A.group, 1 + q))) break;
     const float tot = sum_level2(A.part2 + q * MIXW, MIXW, 1);
     const float rq = rsqrtf(tot / C + a.eps);
     uint16_t* o = a.out + (size_t)q * a.rows * C;
@@ -223,8 +194,9 @@ __device__ void mixS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigned
       o[c] = tobf(nv * (hv[r] * rq));
     }
     acc ^= __float_as_uint(hv[0]);
+    } while (false);
   }
-  block_all(cnt + 7, A.fault, 3, A.drop == 7 && blockIdx.x == 0);
+  block_all(cnt + 7, A.fault, fz_sync::code(A.group, 7), A.drop == 7 && blockIdx.x == 0);
 }
 
 __device__ void loopS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigned& acc) {
@@ -265,7 +237,8 @@ __device__ void loopS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigne
     warp_arrive(cnt + 0, A.drop == 0 && slot == 0);
   } else if (slot < P1 + P2) {
     const int u = slot - P1, w = u % LOOPW, q = u / LOOPW;
-    warp_wait(cnt + 0, P1, A.fault, 1);
+    do {  // a failed wait leaves the unit before any store (review A2)
+    if (!warp_wait(cnt + 0, P1, A.fault, fz_sync::code(A.group, 0))) break;
     // today's blockSum: warp partials added in warp order by every thread
     float inv[NB + 1], score[NB + 1];
 #pragma unroll
@@ -307,17 +280,19 @@ __device__ void loopS(const SArgs& A, unsigned char* stg, unsigned* cnt, unsigne
       dst[w * 32 + lane + 256 * k] = uu;
       acc ^= __float_as_uint(uu);
     }
+    } while (false);
   }
-  block_all(cnt + 7, A.fault, 3, A.drop == 7 && blockIdx.x == 0);
+  block_all(cnt + 7, A.fault, fz_sync::code(A.group, 7), A.drop == 7 && blockIdx.x == 0);
 }
 }  // namespace fz_mix
 
 // One mix phase (mixS of B9). cnt: 8 zeroed counters. part1 [9][16][4], part2 [4][16] fp32. stg: 4 x 5,760 B shared.
 extern "C" __device__ void fz_mix_s(const fz_mix::MixArgs& a, float* part1, float* part2, unsigned* cnt,
-                                    unsigned* fault, unsigned char* stg, int drop) {
+                                    unsigned* fault, unsigned char* stg, int drop, int group) {
     fz_mix::SArgs A;
     A.mix = a;
     A.drop = drop;
+    A.group = group;
     A.part1 = part1;
     A.part2 = part2;
     A.fault = fault;
@@ -327,10 +302,11 @@ extern "C" __device__ void fz_mix_s(const fz_mix::MixArgs& a, float* part1, floa
 
 // One loop mix phase (loopS of B9).
 extern "C" __device__ void fz_loop_s(const fz_mix::LoopMixArgs& a, float* part1, float* part2, unsigned* cnt,
-                                     unsigned* fault, unsigned char* stg, int drop) {
+                                     unsigned* fault, unsigned char* stg, int drop, int group) {
     fz_mix::SArgs A;
     A.loop = a;
     A.drop = drop;
+    A.group = group;
     A.part1 = part1;
     A.part2 = part2;
     A.fault = fault;
