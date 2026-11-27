@@ -429,6 +429,7 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
         problem.* = try std.fmt.allocPrint(a, "inkling2_loop: cache ({s})", .{@errorName(e)});
         return false;
     };
+    cache.kv_channels = place.kvWidth();
     defer cache.deinit();
     std.log.info("inkling2_loop: TP rank 1 following", .{});
     // The leader commits an accepted prefix of a verify window. This rank replays the window, whose forward advances
