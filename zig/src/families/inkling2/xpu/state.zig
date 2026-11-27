@@ -295,6 +295,13 @@ pub const Cache = struct {
         c.pending = rows;
     }
 
+    /// The follower's save position: the leader's `at`. The follower's own length stops at the last chunk base, because
+    /// its prefill does not add rows as the leader's `feed` does, so a snapshot taken at that base is short.
+    pub fn saveAt(c: *Cache, at: usize) !void {
+        if (c.pending != null) return error.Inkling2CacheTransaction;
+        if (at > c.capacity or at < c.len) return error.Inkling2SnapshotGeometry;
+    }
+
     /// Commit accepted rows: staged taps select the new state; rejected KV positions are overwritten on replay.
     pub fn commit(c: *Cache, accepted: usize) !void {
         const rows = c.pending orelse return error.Inkling2NoTransaction;

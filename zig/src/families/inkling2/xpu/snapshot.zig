@@ -79,9 +79,14 @@ pub fn save(r: *rt.Runtime, cache: *const state.Cache) !Snap {
     return .{ .buf = buf, .at = cache.len, .bytes = size, .kv = cache.kv };
 }
 
+/// The geometry a restore needs, and the follower's own rows it drops first.
+pub fn accept(cache: *state.Cache, snap: *const Snap) !void {
+    if (snap.freed or cache.len != 0 or cache.pending != null or snap.at > cache.capacity or snap.kv != cache.kv or snap.bytes < bytes(snap.at, snap.kv)) return error.Inkling2SnapshotGeometry;
+}
+
 /// Restore into an empty, large-enough cache; global capacity may grow while sliding positions stay unchanged.
 pub fn restore(cache: *state.Cache, snap: *const Snap) !void {
-    if (snap.freed or cache.len != 0 or cache.pending != null or snap.at > cache.capacity or snap.kv != cache.kv or snap.bytes < bytes(snap.at, snap.kv)) return error.Inkling2SnapshotGeometry;
+    try accept(cache, snap);
     try encode(cache, snap.buf, snap.at, .restore);
     cache.len = snap.at;
 }

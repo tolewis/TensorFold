@@ -8,6 +8,8 @@ const images = @import("inkling2_xpu_images");
 const place = @import("place.zig");
 const rt = xpu.rt;
 const qg = @import("qwen_group");
+const st = @import("state.zig");
+const snapshot = @import("snapshot.zig");
 
 const D = place.hidden;
 const rows_max: u32 = 64;
@@ -18,6 +20,14 @@ const blk_bytes = blk_flag + 64;
 const head_bytes = 100029 * 4;
 const shm_default = "/dev/shm/tf-tp-inkling2";
 const magic: u64 = 0x494E_4B32_5450_0002; // INK2TP, not the Qwen magic; 0002 carries the segment table
+/// The magic's byte in the map: the first 128 bytes hold the done word and nothing else.
+const magic_at: usize = 8;
+
+/// Rank 1 checks the map's magic when it attaches: a rank 0 of another binary maps the ring at other offsets, so every
+/// record it reads is garbage. A mismatch stops the follower at start with a clear line.
+pub fn checkMagic(map: []const u8) !void {
+    _ = map;
+}
 
 const IpcHandle = extern struct { data: [64]u8 };
 const ZexWriteDesc = extern struct { writeScope: u32 = 2 };
@@ -96,10 +106,12 @@ pub fn plan(rec: Rec, out: []Action) ![]Action {
             return out[0 .. n + 1];
         },
         .forward => {
-            if (rec.nseg == 0 or rec.n > 2048) return error.Inkling2RecordShape;
+            if (rec.nseg == 0 or rec.n > st.max_prefill_rows) return error.Inkling2RecordShape;
+            // A prompt chunk carries the whole chunk; a verify window carries one window's rows a segment.
+            const rows_cap: u32 = if (rec.flags & 4 != 0) st.max_prefill_rows else rows_max;
             var rows: u64 = 0;
             for (segs) |s| {
-                if (s.slot > max_segs or s.rows == 0 or s.rows > rows_max or s.capacity == 0) return error.Inkling2RecordShape;
+                if (s.slot > max_segs or s.rows == 0 or s.rows > rows_cap or s.capacity == 0) return error.Inkling2RecordShape;
                 if (@as(u64, s.base) + s.rows > s.capacity) return error.Inkling2RecordShape;
                 rows += s.rows;
                 try put(out, n, .{ .ensure = .{ .slot = s.slot, .rows = 0, .base = 0, .capacity = s.capacity, .accepted = 0 } });
@@ -111,8 +123,9 @@ pub fn plan(rec: Rec, out: []Action) ![]Action {
                 }
                 try put(out, n, .{ .seek = .{ .slot = s.slot, .base = s.base } });
                 n += 1;
-                // The leader opens a transaction on every segment of a verify window, so this rank must too.
-                if (rec.flags & 1 != 0 and s.rows > 1) {
+                // Bit 3 marks a verify window: the leader opens a transaction on every segment, a one-row window too.
+                // Bit 1 alone is a warm-up or plain forward, which opens none.
+                if (rec.flags & 8 != 0) {
                     try put(out, n, .{ .begin = .{ .slot = s.slot, .rows = s.rows } });
                     n += 1;
                 }
@@ -215,10 +228,16 @@ pub const Group = struct {
         // "wait saw seq 2, wanted 3", a drafted run started after production left /dev/shm/tf-tp-inkling2-prod).
         if (p.rank == 0) {
             g.map = try mapShm(name, p.rank);
+            std.mem.writeInt(u64, g.map[magic_at..][0..8], magic, .little);
             try g.handshake(name);
         } else {
             try g.handshake(name);
             g.map = try mapShm(name, p.rank);
+            // A rank 0 of another binary maps the ring at other offsets, so every record this rank reads is garbage.
+            checkMagic(g.map) catch |err| {
+                std.log.err("inkling2: TP rank 1: the shm magic is {x}, this binary wants {x}; rank 0 runs another binary, so stop", .{ std.mem.readInt(u64, g.map[magic_at..][0..8], .little), magic });
+                return err;
+            };
         }
         qg.q.setRank(p.rank);
         _ = setenv("TF_TP_SHM", "/dev/shm/tf-tp-inkling2-qwen", 1);
@@ -667,7 +686,7 @@ test "the follower's plan: a cache a segment, a keep, a release, a save and a re
         .{ .slot = 2, .rows = 2, .base = 4, .capacity = 64 },
         .{ .slot = 3, .rows = 2, .base = 11, .capacity = 64 },
     };
-    const shared = try plan(recOf(.forward, 1, 8, four[0..]), &out);
+    const shared = try plan(recOf(.forward, 1 | 8, 8, four[0..]), &out);
     try t.expectEqual(@as(usize, 13), shared.len);
     for (four, 0..) |seg, i| {
         try t.expectEqual(seg.slot, shared[i * 3].ensure.slot);
@@ -675,6 +694,10 @@ test "the follower's plan: a cache a segment, a keep, a release, a save and a re
         try t.expectEqual(seg.base, shared[i * 3 + 1].seek.base);
         try t.expectEqual(seg.rows, shared[i * 3 + 2].begin.rows);
     }
+    // Bit 1 without bit 3 is the warm-up forward: it opens no transaction, so its plan is a cache, a seek and the run.
+    const warm = try plan(recOf(.forward, 1, 8, four[0..]), &out);
+    try t.expectEqual(@as(usize, 9), warm.len);
+    for (warm, 0..) |a, i| try t.expect(i % 3 != 2 or a != .begin);
     try t.expect(shared[12] == .run_forward);
     // A prompt chunk at position 0 zeroes that stream's convolution states before it runs.
     const chunk = try plan(recOf(.forward, 4, 8, &.{.{ .slot = 5, .rows = 8, .base = 0, .capacity = 64 }}), &out);
@@ -710,4 +733,95 @@ test "the follower's plan: a cache a segment, a keep, a release, a save and a re
     // A forward whose table does not name every row is refused.
     try t.expectError(error.Inkling2RecordShape, plan(recOf(.forward, 1, 9, four[0..]), &out));
     try t.expectError(error.Inkling2RecordShape, plan(recOf(.forward, 1, 0, &.{}), &out));
+}
+
+/// A host follower: the plan's cache actions applied to real `state.Cache` values. Only the fields the length and
+/// transaction rules use are set, so the test needs no device. Device work (a copy, a kernel) is the mark it leaves.
+const Host = struct {
+    cache: [4]st.Cache = undefined,
+    made: [4]bool = .{ false, false, false, false },
+    snap: [4]snapshot.Snap = undefined,
+    held: [4]bool = .{ false, false, false, false },
+
+    fn at(self: *Host, slot: u32) !*st.Cache {
+        if (slot > 3 or !self.made[slot]) return error.NoCache;
+        return &self.cache[slot];
+    }
+
+    /// One record through the follower: plan it, then each action on the host caches.
+    fn feed(self: *Host, rec: Rec) !void {
+        var acts: [40]Action = undefined;
+        for (try plan(rec, &acts)) |a| switch (a) {
+            .close => {},
+            .ensure => |e| {
+                if (e.slot > 3) return error.NoCache;
+                if (!self.made[e.slot]) {
+                    self.cache[e.slot] = .{ .slots = undefined, .conv = undefined, .taps = undefined, .backup = undefined, .logits = undefined, .kv = .bf16, .capacity = e.capacity, .slot = e.slot, .r = undefined };
+                    self.made[e.slot] = true;
+                }
+            },
+            .seek => |e| (try self.at(e.slot)).len = e.base,
+            .zero_conv => {},
+            // `begin` copies the convolution states on the device; on the host the transaction is its mark.
+            .begin => |e| (try self.at(e.slot)).pending = e.rows,
+            .run_forward, .run_prefill => {},
+            .keep => |e| try (try self.at(e.slot)).commit(e.accepted),
+            .release => |e| if (self.made[e.slot]) {
+                self.cache[e.slot].pending = null;
+                self.made[e.slot] = false;
+            },
+            .save => |e| {
+                const c = try self.at(e.slot);
+                try c.saveAt(e.at);
+                self.snap[e.snap % 4] = .{ .buf = undefined, .at = c.len, .bytes = snapshot.bytes(c.len, c.kv), .kv = c.kv, .id = e.snap };
+                self.held[e.snap % 4] = true;
+            },
+            .restore => |e| {
+                const c = try self.at(e.slot);
+                if (!self.held[e.snap % 4]) return error.NoSnap;
+                try snapshot.accept(c, &self.snap[e.snap % 4]);
+                c.len = self.snap[e.snap % 4].at;
+            },
+            .drop => |e| self.held[e.snap % 4] = false,
+        };
+    }
+};
+
+test "finding 1: the follower opens a transaction on a verify window of one row" {
+    const t = std.testing;
+    var h: Host = .{};
+    // Rank 0's verify opens a transaction on every segment, a one-row window too, then keeps the accepted row.
+    try h.feed(recOf(.forward, 1 | 8, 1, &.{.{ .slot = 0, .rows = 1, .base = 0, .capacity = 64 }}));
+    try t.expectEqual(@as(usize, 1), h.cache[0].pending orelse 0);
+    try h.feed(recOf(.keep, 0, 0, &.{.{ .slot = 0, .rows = 1, .base = 0, .capacity = 64, .accepted = 1 }}));
+    try t.expectEqual(@as(usize, 1), h.cache[0].len);
+}
+
+test "finding 1: a round of two segments begins each one, the one-row segment included" {
+    const t = std.testing;
+    var h: Host = .{};
+    const segs = [_]Seg{
+        .{ .slot = 0, .rows = 1, .base = 0, .capacity = 64 },
+        .{ .slot = 1, .rows = 2, .base = 0, .capacity = 64 },
+    };
+    try h.feed(recOf(.forward, 1 | 8, 3, segs[0..]));
+    try t.expectEqual(@as(usize, 1), h.cache[0].pending orelse 0);
+    try t.expectEqual(@as(usize, 2), h.cache[1].pending orelse 0);
+    try h.feed(recOf(.keep, 0, 0, &.{
+        .{ .slot = 0, .rows = 1, .base = 0, .capacity = 64, .accepted = 1 },
+        .{ .slot = 1, .rows = 2, .base = 0, .capacity = 64, .accepted = 2 },
+    }));
+    try t.expectEqual(@as(usize, 1), h.cache[0].len);
+    try t.expectEqual(@as(usize, 2), h.cache[1].len);
+}
+
+test "finding 1: the production shape, a lone round with no drafts at TP 2" {
+    const t = std.testing;
+    var h: Host = .{};
+    // A prompt fills the slot, then a lone round verifies its one pending token and keeps it.
+    try h.feed(recOf(.forward, 4, 8, &.{.{ .slot = 0, .rows = 8, .base = 0, .capacity = 4096 }}));
+    try h.feed(recOf(.forward, 4, 2048, &.{.{ .slot = 0, .rows = 2048, .base = 8, .capacity = 4096 }}));
+    try h.feed(recOf(.forward, 1 | 8, 1, &.{.{ .slot = 0, .rows = 1, .base = 2056, .capacity = 4096 }}));
+    try h.feed(recOf(.keep, 0, 0, &.{.{ .slot = 0, .rows = 1, .base = 2056, .capacity = 4096, .accepted = 1 }}));
+    try t.expectEqual(@as(usize, 2057), h.cache[0].len);
 }

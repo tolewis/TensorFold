@@ -438,7 +438,7 @@ pub const Xpu = struct {
         }
         const generation = if (self.prepared) self.nextTapGeneration() else 0;
         const t_fwd = verifyNow();
-        try fwd.runShared(self.model, &self.scratch, segments[0..windows.len], ids[0..total], .{ .all = true, .taps = self.tapPtr() });
+        try fwd.runShared(self.model, &self.scratch, segments[0..windows.len], ids[0..total], .{ .all = true, .taps = self.tapPtr(), .txn = true });
         const t_sel = verifyNow();
         const v = self.vocab();
         const all = self.window[0 .. total * v];

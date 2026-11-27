@@ -123,6 +123,8 @@ pub const Options = struct {
     all: bool = false,
     /// Where the DSpark taps go ([row][tap][H] bf16), or none.
     taps: ?Ptr = null,
+    /// A verify forward: the leader opens a cache transaction on every segment, so rank 1 must open one too.
+    txn: bool = false,
 };
 
 pub const FinalPlan = struct { work_rows: usize, logits_rows: usize, logits_row: usize, capture_rows: usize };
@@ -928,7 +930,7 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
         // Each stream's rows name their own slot, base and capacity: rank 1 runs a stream's state in a cache of its own.
         var table: [state.max_segments]group.Seg = undefined;
         for (segments, 0..) |seg, si| table[si] = .{ .slot = seg.cache.slot, .rows = @intCast(seg.rows), .base = @intCast(seg.cache.len), .capacity = @intCast(seg.cache.capacity), .accepted = 0 };
-        try gp.note(.forward, ids, if (options.all) 1 else 0, table[0..segments.len], 0);
+        try gp.note(.forward, ids, (if (options.all) @as(u32, 1) else 0) | (if (options.txn) @as(u32, 8) else 0), table[0..segments.len], 0);
     };
     try glue.embedNorm(&p.glue, stream, at(s.ids, 0), tensor(m.weights.embed), tensor(m.weights.embed_norm), at(s.p, 0), @intCast(rows));
     const vdump = std.c.getenv("TF_TP_VDUMP") != null and rows <= state.batch_rows;
