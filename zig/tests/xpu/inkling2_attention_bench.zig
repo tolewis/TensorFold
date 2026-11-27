@@ -23,6 +23,11 @@ const H = 24;
 const KV = 8;
 const EXTENT = plan.extent;
 const reps = 40;
+/// `--sync-each`: one launch and one wait a repeat. Without it the repeats queue on one stream with one wait at the end.
+var sync_each = false;
+fn method() []const u8 {
+    return if (sync_each) "method: one launch and one wait, mean of 40" else "method: 40 queued launches, one wait, total over 40";
+}
 const roof_gbs = 605.7;
 
 fn ms(io: std.Io) i96 {
@@ -538,6 +543,8 @@ pub fn main(init: std.process.Init) !u8 {
             splits = try std.fmt.parseInt(u32, args[ai], 10);
         } else if (std.mem.eql(u8, arg, "--check")) {
             do_check = true;
+        } else if (std.mem.eql(u8, arg, "--sync-each")) {
+            sync_each = true;
         } else if (std.mem.eql(u8, arg, "--check-real")) {
             do_check_real = true;
         } else return error.BadArgument;
@@ -661,7 +668,10 @@ pub fn main(init: std.process.Init) !u8 {
         var t_enqueue: i96 = 0;
         for (0..2) |pass| {
             const t0 = ms(init.io);
-            for (0..reps) |i| try attn.attendAs(&k, dev.s, path, r, layer, stride, meta, qd, kv[i % sets], tabd, po, pml, sinkd, gated, out);
+            for (0..reps) |i| {
+                try attn.attendAs(&k, dev.s, path, r, layer, stride, meta, qd, kv[i % sets], tabd, po, pml, sinkd, gated, out);
+                if (sync_each) try dev.s.synchronize();
+            }
             const t1 = ms(init.io);
             try dev.s.synchronize();
             if (pass == 1) {
@@ -701,6 +711,7 @@ pub fn main(init: std.process.Init) !u8 {
                     } else {
                         try xpu.launch.dispatch(k.merge, dev.s, launch.merge_grid, .{ po.at(), pml.at(), sinkd.at(), gated.at(), meta.pos.at(), out.at(), @as(u32, H), layer.window, launch.chunk, @as(u32, 0), launch.partials_rh, @as(u32, 1) });
                     }
+                    if (sync_each) try dev.s.synchronize();
                 }
                 try dev.s.synchronize();
                 if (pass == 1) t_part[which] = ms(init.io) - t0;
@@ -708,7 +719,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
         const per_ns = @as(f64, @floatFromInt(t_decode)) / reps;
         const att_ns = @as(f64, @floatFromInt(t_part[0])) / reps;
-        std.debug.print("BENCH   parts: attention kernel {d:.1} us, merge {d:.1} us\n", .{ att_ns / 1000, @as(f64, @floatFromInt(t_part[1])) / reps / 1000 });
+        std.debug.print("BENCH   parts: attention kernel {d:.1} us, merge {d:.1} us ({s})\n", .{ att_ns / 1000, @as(f64, @floatFromInt(t_part[1])) / reps / 1000, method() });
         const lo: usize = if (cs.window > 0) cs.k - rows + 1 -| cs.window else 0;
         const keys: usize = cs.k - lo;
         // the bytes the attention kernel reads: bf16 values of K and V, or int8 codes and their scales
@@ -721,10 +732,10 @@ pub fn main(init: std.process.Init) !u8 {
             // rows share every K/V byte, so the rate that matters is the matrix work: 4 * D flops a (row, head, key)
             const pairs = @as(f64, @floatFromInt(rows)) * H;
             const flops = pairs * (@as(f64, @floatFromInt(keys)) - @as(f64, @floatFromInt(rows)) / 2) * 4 * D;
-            std.debug.print("BENCH {s}: {d:.1} us a call (attention kernel and merge), {d:.2} TFLOP/s\n", .{ cs.name, per_ns / 1000, flops / per_ns / 1000 });
+            std.debug.print("BENCH {s}: {d:.1} us a call (attention kernel and merge), {d:.2} TFLOP/s ({s})\n", .{ cs.name, per_ns / 1000, flops / per_ns / 1000, method() });
             continue;
         }
-        std.debug.print("BENCH {s}: attention kernel {d:.1} us, merge {d:.1} us, both {d:.1} us a call (host enqueue {d:.1} us), {d:.1} MB of K and V, {d:.1} GB/s = {d:.2} of {d:.1}\n", .{ cs.name, att_ns / 1000, @as(f64, @floatFromInt(t_part[1])) / reps / 1000, per_ns / 1000, @as(f64, @floatFromInt(t_enqueue)) / reps / 1000, bytes / 1e6, gbs, gbs / roof_gbs, roof_gbs });
+        std.debug.print("BENCH {s}: attention kernel {d:.1} us, merge {d:.1} us, both {d:.1} us a call (host enqueue {d:.1} us), {d:.1} MB of K and V, {d:.1} GB/s = {d:.2} of {d:.1} ({s})\n", .{ cs.name, att_ns / 1000, @as(f64, @floatFromInt(t_part[1])) / reps / 1000, per_ns / 1000, @as(f64, @floatFromInt(t_enqueue)) / reps / 1000, bytes / 1e6, gbs, gbs / roof_gbs, roof_gbs, method() });
     }
     return 0;
 }
