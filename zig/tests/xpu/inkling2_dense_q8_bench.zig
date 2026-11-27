@@ -105,7 +105,7 @@ fn deviceTime(b: *Bench, head: bool, ws: []const host.Ref, x: host.Ref, y: host.
     const events = try gpu.events(count);
     const d = b.dev.ctx.d;
     const kern = if (head) b.k.head_dpas else b.k.dense[host.variantOf(rows)];
-    const groups: ze.GroupCount = if (head) .{ .x = (n + 15) / 16, .y = 1, .z = 1 } else .{ .x = (n + b.k.columns - 1) / b.k.columns, .y = 1, .z = 1 };
+    const groups: ze.GroupCount = if (head) .{ .x = (n + 15) / 16, .y = 1, .z = 1 } else .{ .x = (n + host.groupColumns(&b.k, rows) - 1) / host.groupColumns(&b.k, rows), .y = 1, .z = 1 };
     var qc: host.Ref = null;
     var qs: host.Ref = null;
     if (head) {

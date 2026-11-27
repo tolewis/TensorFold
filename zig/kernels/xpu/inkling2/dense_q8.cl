@@ -132,6 +132,54 @@ static inline float q8_cap(float x, float c) { return c * tanh(x / c); }
     for (; p < planes;) Q8_GROUP(ROWS, 1, p)                                                                       \
   }
 
+// p3-review R5: the one-row kernels (dense_q8_1, head_q8_1, dense_q8_seg1) give a sub-group Q8_COLS1 output columns,
+// j0 to j0 + Q8_COLS1 - 1, and use each activation block read for all of them. Each column's sum is the same chain as
+// Q8_DOT's (the lane's blocks in order, then the sub-group tree), so the bits do not change. dense_q8.zig
+// one_row_columns must equal Q8_COLS1.
+#ifndef Q8_COLS1
+#define Q8_COLS1 2
+#endif
+#define Q8_GROUPC(U, p)                                                                                            \
+  {                                                                                                                \
+    uint4 wv[Q8_COLS1][U], sc[Q8_COLS1][U];                                                                        \
+    _Pragma("unroll") for (uint qc = 0; qc < Q8_COLS1; ++qc)                                                         \
+      _Pragma("unroll") for (uint u = 0; u < (U); ++u) {                                                           \
+        wv[qc][u] = intel_sub_group_block_read4((global const uint *)(wr[qc] + ((p) + u) * 16));                    \
+        sc[qc][u] = sr[qc][(p) + u];                                                                                \
+      }                                                                                                            \
+    _Pragma("unroll") for (uint u = 0; u < (U); ++u) {                                                             \
+      const uint4 xa = intel_sub_group_block_read4(xw + ((p) + u) * 128);                                          \
+      const uint4 xb = intel_sub_group_block_read4(xw + ((p) + u) * 128 + 64);                                     \
+      _Pragma("unroll") for (uint qc = 0; qc < Q8_COLS1; ++qc) {                                                     \
+        Q8_SCALES(s, sc[qc][u])                                                                                    \
+        Q8_PLANE_ROW(accc[qc], wv[qc][u], s, xa, xb)                                                                \
+      }                                                                                                            \
+    }                                                                                                              \
+    (p) += (U);                                                                                                    \
+  }
+
+// accc[c] = the lane's sum of column min(j0 + c, n - 1) over one row of x (k values, a multiple of 256).
+#define Q8_DOTC(x, codes, scales, j0, n, k)                                                                        \
+  {                                                                                                                \
+    const uint planes = (k) / 256;                                                                                 \
+    global const uint4 *wr[Q8_COLS1];                                                                              \
+    global const uint4 *sr[Q8_COLS1];                                                                              \
+    _Pragma("unroll") for (uint c = 0; c < Q8_COLS1; ++c) {                                                        \
+      const uint jc = min((j0) + c, (n) - 1);                                                                      \
+      wr[c] = (global const uint4 *)((codes) + (ulong)jc * (k));                                                   \
+      sr[c] = (global const uint4 *)((scales) + (ulong)jc * ((k) / 32));                                           \
+      accc[c] = 0.0f;                                                                                              \
+    }                                                                                                              \
+    global const uint *xw = (global const uint *)(x);                                                              \
+    uint p = 0;                                                                                                    \
+    for (; p + Q8_UNROLL <= planes;) Q8_GROUPC(Q8_UNROLL, p)                                                       \
+    for (; p + Q8_TAIL <= planes;) Q8_GROUPC(Q8_TAIL, p)                                                           \
+    for (; p < planes;) Q8_GROUPC(1, p)                                                                            \
+  }
+
+// The first of the sub-group's Q8_COLS1 columns in a one-row kernel.
+#define Q8_J0(g) (((g) * (Q8_WG / 16) + get_sub_group_id()) * Q8_COLS1)
+
 // y[r][j] for r < rows, rows <= ROWS; x holds ROWS rows of k values (k a multiple of 256); w is the codes then the scales.
 #define Q8_MATVEC(ROWS)                                                                                            \
   Q8_KERNEL(Q8_WG) void Q8_NAME(dense_q8_##ROWS)(global const ushort *x, global const uchar *w, global ushort *y,   \
@@ -167,7 +215,23 @@ static inline float q8_cap(float x, float c) { return c * tanh(x / c); }
     }                                                                                                              \
   }
 
-Q8_MATVEC(1)
+// The one-row matvec: Q8_COLS1 columns a sub-group (R5), the same dot and store as Q8_MATVEC's.
+Q8_KERNEL(Q8_WG) void Q8_NAME(dense_q8_1)(global const ushort *x, global const uchar *w, global ushort *y, global float *wide,
+                                         uint rows, uint n, uint k, uint ldy) {
+  const uint j0 = Q8_J0(get_group_id(0));
+  if (j0 >= n) return;
+  global const uchar *codes = w;
+  global const half *scales = (global const half *)(w + (ulong)n * k);
+  float accc[Q8_COLS1];
+  Q8_DOTC(x, codes, scales, j0, n, k)
+  _Pragma("unroll") for (uint c = 0; c < Q8_COLS1; ++c) {
+    const float s = sub_group_reduce_add(accc[c]);
+    if (get_sub_group_local_id() == 0 && rows > 0 && j0 + c < n) {
+      y[j0 + c] = Q8_STORE(s);
+      if (wide) wide[j0 + c] = s;
+    }
+  }
+}
 
 // One launch, five projections, one row of x each. Grid (ceil(max_n / (Q8_WG/16)), 5). A group whose column is past its n returns.
 // The dot is Q8_DOT, the same lane order as dense_q8_1.
@@ -219,7 +283,7 @@ Q8_KERNEL(Q8_WG) void Q8_NAME(dense_q8_seg1)(
     global const uchar *sink_w, global ushort *sink_y, uint sink_n, uint sink_on) {
   // p3-review R4: a flat grid of the segments' column groups in order, ceil(n_s / (Q8_WG / 16)) a segment, so every
   // work-group has a column. Group g of segment s takes the columns it took at (g, s) in the 2-D grid before.
-  const uint cpg = Q8_WG / 16;
+  const uint cpg = (Q8_WG / 16) * Q8_COLS1; // columns a work-group (R5)
   uint g = get_group_id(0), seg = 0;
   uint n = n0;
   global const ushort *x = x0;
@@ -230,15 +294,19 @@ Q8_KERNEL(Q8_WG) void Q8_NAME(dense_q8_seg1)(
     if (g >= g1) { g -= g1; seg = 2; n = n2; x = x2; w = w2; y = y2;
       if (g >= g2) { g -= g2; seg = 3; n = n3; x = x3; w = w3; y = y3;
         if (g >= g3) { g -= g3; seg = 4; n = n4; x = x4; w = w4; y = y4; } } } }
-  const uint j = g * cpg + get_sub_group_id();
-  if (j >= n) return;
+  const uint j0 = Q8_J0(g);
+  if (j0 >= n) return;
   global const uchar *codes = w;
   global const half *scales = (global const half *)(w + (ulong)n * k);
-  float acc[1];
-  Q8_DOT(1, x, codes, scales, j, n, k)
-  const float s = sub_group_reduce_add(acc[0]);
-  if (get_sub_group_local_id() == 0) y[j] = Q8_STORE(s);
-  if (sink_on && seg == 0 && j < sink_n) q8_sink_bf16(x0, (global const ushort *)sink_w, sink_y, j, k);
+  float accc[Q8_COLS1];
+  Q8_DOTC(x, codes, scales, j0, n, k)
+  _Pragma("unroll") for (uint c = 0; c < Q8_COLS1; ++c) {
+    const float s = sub_group_reduce_add(accc[c]);
+    if (get_sub_group_local_id() == 0 && j0 + c < n) y[j0 + c] = Q8_STORE(s);
+  }
+  if (sink_on && seg == 0)
+    _Pragma("unroll") for (uint c = 0; c < Q8_COLS1; ++c)
+      if (j0 + c < n && j0 + c < sink_n) q8_sink_bf16(x0, (global const ushort *)sink_w, sink_y, j0 + c, k);
 }
 
 // The same five projections for a window: one launch, five segments, four rows of x each (a verify window's rows).
@@ -321,7 +389,19 @@ Q8_MATVEC(8)
 Q8_MATVEC(16)
 Q8_MATVEC(32)
 
-Q8_HEAD(1)
+// The one-row head: Q8_COLS1 columns a sub-group (R5), the same dot and epilogue as Q8_HEAD's.
+Q8_KERNEL(Q8_WG) void Q8_NAME(head_q8_1)(global const ushort *h, global const uchar *w, global float *out, uint rows, uint vocab) {
+  const uint j0 = Q8_J0(get_group_id(0));
+  if (j0 >= vocab) return;
+  global const uchar *codes = w;
+  global const half *scales = (global const half *)(w + (ulong)vocab * Q8_HIDDEN);
+  float accc[Q8_COLS1];
+  Q8_DOTC(h, codes, scales, j0, vocab, Q8_HIDDEN)
+  _Pragma("unroll") for (uint c = 0; c < Q8_COLS1; ++c) {
+    const float s = sub_group_reduce_add(accc[c]);
+    if (get_sub_group_local_id() == 0 && rows > 0 && j0 + c < vocab) out[j0 + c] = q8_cap(Q8_CAP_ROUND(s), 30.0f);
+  }
+}
 Q8_HEAD(2)
 Q8_HEAD(4)
 Q8_HEAD(8)
