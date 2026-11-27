@@ -81,7 +81,9 @@ pub fn save(r: *rt.Runtime, cache: *const state.Cache) !Snap {
 
 /// The geometry a restore needs, and the follower's own rows it drops first.
 pub fn accept(cache: *state.Cache, snap: *const Snap) !void {
-    if (snap.freed or cache.len != 0 or cache.pending != null or snap.at > cache.capacity or snap.kv != cache.kv or snap.bytes < bytes(snap.at, snap.kv)) return error.Inkling2SnapshotGeometry;
+    if (snap.freed or cache.pending != null or snap.at > cache.capacity or snap.kv != cache.kv or snap.bytes < bytes(snap.at, snap.kv)) return error.Inkling2SnapshotGeometry;
+    // A slot reused after a failed prompt keeps rows the snapshot does not cover: the snapshot rewrites [0, at).
+    cache.len = 0;
 }
 
 /// Restore into an empty, large-enough cache; global capacity may grow while sliding positions stay unchanged.

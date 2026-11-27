@@ -845,3 +845,18 @@ test "finding 2: a follower's save covers the rows past its last chunk base" {
     try h.feed(recOf(.restore, 0, 7, &.{.{ .slot = 2, .rows = 0, .base = 0, .capacity = 8192 }}));
     try t.expectEqual(@as(usize, 3946), h.cache[2].len);
 }
+
+test "finding 3: a slot a failed prompt left rows in restores the next stream" {
+    const t = std.testing;
+    var h: Host = .{};
+    // A prompt on slot 0 fills 2048 rows and saves them, then its stream ends and the follower frees the slot.
+    try h.feed(recOf(.forward, 4, 2048, &.{.{ .slot = 0, .rows = 2048, .base = 0, .capacity = 8192 }}));
+    try h.feed(recOf(.save, 0, 1, &.{.{ .slot = 0, .rows = 0, .base = 2048, .capacity = 8192 }}));
+    try h.feed(recOf(.release, 0, 0, &.{.{ .slot = 0, .capacity = 8192 }}));
+    // Stream A hits the cache on slot 0, then its prompt fails: rank 0 sends no release and the rows stay.
+    try h.feed(recOf(.restore, 0, 1, &.{.{ .slot = 0, .rows = 0, .base = 0, .capacity = 8192 }}));
+    try t.expectEqual(@as(usize, 2048), h.cache[0].len);
+    // Stream B hits the same cache on the same slot: the follower must drop its own rows, not stop.
+    try h.feed(recOf(.restore, 0, 1, &.{.{ .slot = 0, .rows = 0, .base = 0, .capacity = 8192 }}));
+    try t.expectEqual(@as(usize, 2048), h.cache[0].len);
+}
