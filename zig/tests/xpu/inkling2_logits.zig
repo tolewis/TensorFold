@@ -1046,6 +1046,8 @@ fn grabAny(r: *xpu.rt.Runtime, cache: *state.Cache, slot: usize, k: []u8, v: []u
     const vb = xpu.rt.Buffer{ .rt = r, .ptr = @ptrFromInt(@intFromPtr(s.buf.ptr.?) + s.value_at), .len = n };
     try r.download(k[0..n], kb);
     try r.download(v[0..n], vb);
+    // a download is only queued: the host bytes are there after the sync
+    try r.sync();
 }
 
 /// The distinct experts a window of n real rows reads in a visit, averaged over the visits of the same precision and over
