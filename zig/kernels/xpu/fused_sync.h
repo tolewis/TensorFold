@@ -97,6 +97,7 @@ static inline void fb_enter(uint mech_arg, global uint *sync) {
 #define FB_F_ENTERED 6u
 #define FB_F_TICKS 7u
 #define FB_F_POLLS 9u
+#define FB_ACQ_ALL 0x200u
 #define FB_STAMP 0x400u
 #define FB_FRD_PLAIN 0x800u
 #define FB_NO_FRD 0x10000u
@@ -104,11 +105,11 @@ static inline void fb_enter(uint mech_arg, global uint *sync) {
 // The entry count (review C2): a fault record shows how many groups had started at the cap.
 static inline void fb_enter(uint mech_arg, global uint *sync) {
   if (FB_MECH(mech_arg) != FB_NONE && get_local_id(0) == 0u)
-    atomic_fetch_add_explicit((global fb_au *)(sync + FB_ENTRY), 1u, memory_order_relaxed, memory_scope_device);
 static inline uint fb_fault_read(uint mech_arg, global uint *fault) {
   if ((mech_arg & FB_NO_FRD) != 0u) return 0u;
   return (mech_arg & FB_FRD_PLAIN) != 0u ? fb_poll_plain(fault) : fb_poll1(fault);
 }
+    atomic_fetch_add_explicit((global fb_au *)(sync + FB_ENTRY), 1u, memory_order_relaxed, memory_scope_device);
 }
 // IGC built-in: the thread timestamp register tm0 (ISA `mov (2) ... tm0.0`, both dwords in one move;
 // __builtin_IB_get_timestamp gave an undefined value). tm0 counts at the GT clock, so its rate moves with the clock
@@ -119,19 +120,71 @@ static inline uint fb_fault_read(uint mech_arg, global uint *fault) {
 // The fault buffer (uint words). 0 the fault word, 1 failed visibility checks, 2 the round of the first cap, 3 the B9
 // guard count, then the record of the first group that reached the cap (review C2): 4 its group id, 5 the value of
 // its last poll (counter, generation word, or the count of flags at the round), 6 the entry count at its cap, 7 and 8
-// its tm0 ticks from the wait entry to the cap (low, high), 9 its polls. 10 the count of groups that reached the cap,
     // spin_cap is the cap in tm0 ticks. The clock and the fault word are read every 16 polls.
     uint spins = 0u, seen = 0u;
     ulong dt = 0ul;
+#define FB_F_ROUND 2u
 #define FB_F_GROUP 4u
 #define FB_F_SEEN 5u
-#define FB_F_ENTERED 6u
     if (fb_fault_read(mech_arg, fault) != 0u) { f = 2u; break; }                        \
     dt = __builtin_IB_read_cycle_counter() - t0;                                        \
+    if (dt > (ulong)spin_cap) { f = 1u; break; }                                        \
+#define FB_F_POLLS 9u
+#define FB_STAMP 0x400u
+#define FB_FRD_PLAIN 0x800u
+      while ((seen = fb_poll1(sync + FB_CNT)) < target) { FB_SPIN_CHECK }
+
+// The entry count (review C2): a fault record shows how many groups had started at the cap.
+      while ((seen = fb_poll_plain(sync + FB_CNT)) < target) { FB_SPIN_CHECK }
+  if (FB_MECH(mech_arg) != FB_NONE && get_local_id(0) == 0u)
+    atomic_fetch_add_explicit((global fb_au *)(sync + FB_ENTRY), 1u, memory_order_relaxed, memory_scope_device);
+static inline uint fb_fault_read(uint mech_arg, global uint *fault) {
+  if ((mech_arg & FB_NO_FRD) != 0u) return 0u;
+  return (mech_arg & FB_FRD_PLAIN) != 0u ? fb_poll_plain(fault) : fb_poll1(fault);
+}
+}
+// IGC built-in: the thread timestamp register tm0 (ISA `mov (2) ... tm0.0`, both dwords in one move;
+// __builtin_IB_get_timestamp gave an undefined value). tm0 counts at the GT clock, so its rate moves with the clock
+// (review C1). The host passes the cap in ticks for the lowest clock of the card (sysfs rpn_freq), so a cap ends a
+      if (f == 1u) { // the record: the count of flags at this round or past it
+        uint n = 0u;
+        for (uint b = 0u; b < G; b += 16u) {
+          const uint i = b + lane;
+          if (i < G) n += (uint)(fb_ld(sync + FB_FLAGS + i * FB_LINE) >= round);
+        }
+        seen = sub_group_reduce_add(n);
+      }
+// wait in that time or less at every clock (brief section 6 rule 1).
+#define FB_ENTRY 32000u // the entry count (review C2): local id 0 of each group adds 1 when the group starts
+
+// The fault buffer (uint words). 0 the fault word, 1 failed visibility checks, 2 the round of the first cap, 3 the B9
+// guard count, then the record of the first group that reached the cap (review C2): 4 its group id, 5 the value of
+      while ((seen = fb_poll1(sync + FB_GEN)) < round) { FB_SPIN_CHECK }
+// its tm0 ticks from the wait entry to the cap (low, high), 9 its polls. 10 the count of groups that reached the cap,
+    // spin_cap is the cap in tm0 ticks. The clock and the fault word are read every 16 polls.
+    if (f == 0u && fb_fault_read(mech_arg, fault) != 0u) f = 2u; // a fault set while this group was in its phase
+#define FB_F_GROUP 4u
+      atomic_fetch_add_explicit((global fb_au *)(fault + FB_F_CAPPED), 1u, memory_order_relaxed, memory_scope_device);
+      uint zero = 0u;
+      if (atomic_compare_exchange_strong_explicit((global fb_au *)fault, &zero, 1u, memory_order_relaxed, memory_order_relaxed,
+                                                  memory_scope_device)) {
+        fault[FB_F_ROUND] = round;
+        fault[FB_F_GROUP] = g;
+        fault[FB_F_SEEN] = seen;
+        fault[FB_F_ENTERED] = fb_ld(sync + FB_ENTRY);
+        fault[FB_F_TICKS] = (uint)dt;
+        fault[FB_F_TICKS + 1u] = (uint)(dt >> 32);
+        fault[FB_F_POLLS] = spins;
+      }
+    if (fb_fault_read(mech_arg, fault) != 0u) { f = 2u; break; }                        \
+    if (f == 2u && lane == 0u)
+      atomic_fetch_add_explicit((global fb_au *)(fault + FB_F_LEFT), 1u, memory_order_relaxed, memory_scope_device);
+    if ((mech_arg & (FB_NO_ACQ | FB_ACQ_ALL)) == 0u) fb_acq();
     if (dt > (ulong)spin_cap) { f = 1u; break; }                                        \
 #define FB_STAMP 0x400u
 #define FB_FRD_PLAIN 0x800u
 #define FB_NO_FRD 0x10000u
+  if ((mech_arg & FB_ACQ_ALL) != 0u) fb_acq(); // review C3: every work-item that reads data of another group
       while ((seen = fb_poll1(sync + FB_CNT)) < target) { FB_SPIN_CHECK }
 // The entry count (review C2): a fault record shows how many groups had started at the cap.
 static inline void fb_enter(uint mech_arg, global uint *sync) {
