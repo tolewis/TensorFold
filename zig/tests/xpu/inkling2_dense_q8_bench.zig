@@ -128,10 +128,11 @@ fn deviceTime(b: *Bench, head: bool, ws: []const host.Ref, x: host.Ref, y: host.
             try kern.setPtr(0, x);
             try kern.setPtr(1, ws[i % ws.len]);
             try kern.setPtr(2, y);
-            try kern.setU32(3, rows);
-            try kern.setU32(4, n);
-            try kern.setU32(5, k);
-            try kern.setU32(6, n);
+            try kern.setPtr(3, null); // wide: no second output (the kernel's arguments as dense_q8.matvec sends them)
+            try kern.setU32(4, rows);
+            try kern.setU32(5, n);
+            try kern.setU32(6, k);
+            try kern.setU32(7, n);
         }
         try d.check(d.api.zeCommandListAppendLaunchKernel(b.dev.s.list, kern.handle, &groups, if (timed) events[i - ws.len] else null, 0, null), "launch");
     }
