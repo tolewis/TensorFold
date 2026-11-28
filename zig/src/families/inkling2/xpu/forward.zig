@@ -954,6 +954,21 @@ fn pickRef(scores: *const [128]f32, bias: *const [128]f32, ids: *[8]u32, weights
 
 /// tf_ink2_router_pick, one launch of one row, against `pickRef` on three score rows: finite (with ties), one NaN score,
 /// and two NaN scores with one NaN bias. The ids and the weight bits must equal the host rule's.
+/// Y-args: a launch with one argument short must fail before its append. tf_ink2_empty64 takes one u32 and reads
+/// nothing, so a build without the check runs the short launch with no effect. True when the short launch fails with
+/// error.ArgCount and the full launch runs.
+pub fn checkArgCount(m: *const Model) !bool {
+    if (m.pipelines == null or m.ctx == null) return error.Inkling2NoKernels;
+    const k = m.pipelines.?.fuse.empty[0];
+    const stream = m.r.stream(m.ctx.?);
+    const short = xpu.launch.dispatch(k, stream, .{ 1, 1, 1 }, .{});
+    try stream.synchronize();
+    try xpu.launch.dispatch(k, stream, .{ 1, 1, 1 }, .{@as(u32, 0)});
+    try stream.synchronize();
+    std.debug.print("arg check: a launch of {s} with 0 of its arguments: {s}, with 1: ran\n", .{ k.name, if (short) |_| "appended" else |e| @errorName(e) });
+    return if (short) |_| false else |e| e == error.ArgCount;
+}
+
 pub fn checkPick(m: *const Model, s: *state.Scratch, r: *xpu.rt.Runtime) !usize {
     if (m.pipelines == null or m.ctx == null) return error.Inkling2NoKernels;
     const pipes = &m.pipelines.?;
