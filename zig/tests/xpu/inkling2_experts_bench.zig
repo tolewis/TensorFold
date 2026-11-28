@@ -22,6 +22,17 @@ const Case = struct { fmt: host.Format, gu: bool, rows: u32 };
 
 pub fn main(init: std.process.Init) !u8 {
     const a = init.gpa;
+    // --down-n <n>: the down calls write n rows (default the hidden size). An n that is not a multiple of 16 leaves the
+    // last tile part empty (p3-review R3).
+    var down_n: u32 = HID;
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    var ai: usize = 1;
+    while (ai < argv.len) : (ai += 1) {
+        if (std.mem.eql(u8, argv[ai], "--down-n") and ai + 1 < argv.len) {
+            ai += 1;
+            down_n = try std.fmt.parseInt(u32, argv[ai], 10);
+        } else return error.UnknownArgument;
+    }
     var drv = try xpu.Driver.open();
     defer drv.close();
     var ctx = try xpu.Context.init(&drv, null);
@@ -39,7 +50,7 @@ pub fn main(init: std.process.Init) !u8 {
     var best: f64 = 0;
     for ([_]host.Format{ .nvfp4, .mxfp8 }) |fmt| for ([_]bool{ true, false }) |gu| {
         const k: u32 = if (gu) HID else FF;
-        const n: u32 = if (gu) FF else HID;
+        const n: u32 = if (gu) FF else down_n;
         const rpe: usize = if (gu) 2 * @as(usize, n) else n;
         const code_bytes: usize = if (fmt == .nvfp4) k / 2 else k;
         const block: usize = if (fmt == .nvfp4) 16 else 32;
@@ -74,6 +85,7 @@ pub fn main(init: std.process.Init) !u8 {
         try amax.upload(s, 0, std.mem.sliceAsBytes(ones));
         try den.upload(s, 0, std.mem.sliceAsBytes(ones[0..1]));
         for ([_]u32{ 1, 4, 16 }) |rows| {
+            if (!gu and down_n != HID and rows != 1) continue; // the one-row path only: the rows path assumes whole tiles
             const routes = rows * TOPK;
             const ids = try a.alloc(i32, @as(usize, routes) * 64); // 64 distinct id sets, each calls reads its own
             defer a.free(ids);
