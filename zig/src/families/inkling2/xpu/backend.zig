@@ -391,9 +391,13 @@ pub const Xpu = struct {
         };
         if (token >= self.vocab()) return error.InvalidInklingToken;
         const generation = if (self.prepared) self.nextTapGeneration() else 0;
-        try fwd.run(self.model, &self.scratch, cache, &.{token}, .{ .taps = self.tapPtr() });
+        // A greedy token is drawn on the device and comes back with the forward's one wait (V7).
+        var pick: u32 = std.math.maxInt(u32);
+        const greedy = sampled(stream.sampling) == null and @import("fuse.zig").greedyDevice();
+        try fwd.run(self.model, &self.scratch, cache, &.{token}, .{ .taps = self.tapPtr(), .pick = if (greedy) &pick else null });
         if (self.prepared) cache.tap = .{ .buf = self.scratch.taps, .start = @intCast(cache.len), .rows = 1, .gen = generation };
         cache.len += 1;
+        if (greedy and pick < self.vocab()) return self.put(pick);
         return self.put(try self.drawLast(cache, stream.sampling, position, &.{}));
     }
 

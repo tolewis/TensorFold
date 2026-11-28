@@ -822,3 +822,57 @@ KERNEL(256) void tf_ink2_down_epilogue(
 KERNEL(64) void tf_ink2_empty64(uint unused) {}
 KERNEL(128) void tf_ink2_empty128(uint unused) {}
 KERNEL(256) void tf_ink2_empty256(uint unused) {}
+
+// V7: the greedy token on the device. Grid (parts): group g takes the values [g * chunk, (g + 1) * chunk) of one row
+// and writes its largest value and the lowest id that holds it. A NaN ranks as -inf. Equal values keep the lowest
+// id, as the host scan does (a strict > in ascending id order).
+static inline void argmax_pair(float *v, uint *id, local float *lv, local uint *li) {
+  const uint lane = get_sub_group_local_id(), sg = get_sub_group_id(), n_sg = get_num_sub_groups();
+  float m = sub_group_reduce_max(*v);
+  uint at = sub_group_reduce_min(*v == m ? *id : 0xffffffffu);
+  if (lane == 0) {
+    lv[sg] = m;
+    li[sg] = at;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  m = lane < n_sg ? lv[lane] : -INFINITY;
+  at = lane < n_sg ? li[lane] : 0xffffffffu;
+  const float mm = sub_group_reduce_max(m);
+  *id = sub_group_reduce_min(m == mm ? at : 0xffffffffu);
+  *v = mm;
+}
+
+KERNEL(256) void tf_ink2_argmax_part(global const float *logits, global float *part_v, global uint *part_id, uint n,
+                                     uint chunk) {
+  local float lv[16];
+  local uint li[16];
+  const uint g = get_group_id(0), t = get_local_id(0);
+  const uint lo = g * chunk, hi = min(n, lo + chunk);
+  float best = -INFINITY;
+  uint at = 0xffffffffu;
+  for (uint i = lo + t; i < hi; i += 256) {
+    float x = logits[i];
+    if (isnan(x)) x = -INFINITY;
+    if (x > best || (x == best && i < at)) {
+      best = x;
+      at = i;
+    }
+  }
+  argmax_pair(&best, &at, lv, li);
+  if (t == 0) {
+    part_v[g] = best;
+    part_id[g] = at;
+  }
+}
+
+// One group: the parts of tf_ink2_argmax_part to one id.
+KERNEL(256) void tf_ink2_argmax_final(global const float *part_v, global const uint *part_id, global uint *out,
+                                      uint parts) {
+  local float lv[16];
+  local uint li[16];
+  const uint t = get_local_id(0);
+  float best = t < parts ? part_v[t] : -INFINITY;
+  uint at = t < parts ? part_id[t] : 0xffffffffu;
+  argmax_pair(&best, &at, lv, li);
+  if (t == 0) out[0] = at;
+}

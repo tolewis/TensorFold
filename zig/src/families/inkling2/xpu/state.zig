@@ -492,6 +492,9 @@ pub const Scratch = struct {
     vglobal: ?rt.Buffer = null,
     global_ring: usize = 0,
     global_heads: usize = 0,
+    /// Pinned host memory for the greedy token of the device pick (V7), made on the first pick. A copy into pageable
+    /// memory waits at its append, so the token comes here and the host reads it after the forward's one wait.
+    pick: ?rt.Buffer = null,
     rows: usize,
     /// The largest global capacity the scratch was sized for, and the partial slots a row and head hold from it.
     capacity: usize,
@@ -510,6 +513,7 @@ pub const Scratch = struct {
             made += 1;
         }
         s.taps = null;
+        s.pick = null;
         s.kglobal = null;
         s.vglobal = null;
         s.global_ring = 0;
@@ -545,6 +549,7 @@ pub const Scratch = struct {
     pub fn deinit(s: *Scratch) void {
         inline for (fields) |f| @field(s, f).free();
         if (s.taps) |*b| b.free();
+        if (s.pick) |*b| b.free();
         if (s.kglobal) |*b| b.free();
         if (s.vglobal) |*b| b.free();
         s.* = undefined;

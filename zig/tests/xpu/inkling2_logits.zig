@@ -89,6 +89,29 @@ fn loadIds(gpa: std.mem.Allocator, path: []const u8) ![]u32 {
     return out.toOwnedSlice(gpa);
 }
 
+/// V7: steps where the device pick and the host argmax differ (XPU_PICK_CHECK=1), and steps checked.
+var pick_diff: usize = 0;
+var pick_checked: usize = 0;
+
+/// One greedy decode step: the forward draws the token on the device (one wait), unless XPU_GREEDY_HOST=1. With
+/// XPU_PICK_CHECK=1 the row also comes back and the host argmax is compared.
+fn greedyStep(m: *const ink.model.Model, scratch: *state.Scratch, cache: *state.Cache, r: *xpu.rt.Runtime, logits: []f32, token: u32) !u32 {
+    if (!ink.fuse.greedyDevice()) {
+        try ink.forward.run(m, scratch, cache, &.{token}, .{});
+        cache.len += 1;
+        return argmax(try lastLogits(r, cache, logits));
+    }
+    var pick: u32 = std.math.maxInt(u32);
+    try ink.forward.run(m, scratch, cache, &.{token}, .{ .pick = &pick });
+    cache.len += 1;
+    if (std.c.getenv("XPU_PICK_CHECK") != null) {
+        const host = argmax(try lastLogits(r, cache, logits));
+        pick_checked += 1;
+        if (host != pick) pick_diff += 1;
+    }
+    return if (pick < logits.len) pick else argmax(try lastLogits(r, cache, logits));
+}
+
 fn argmax(row: []const f32) u32 {
     var best: usize = 0;
     for (row, 0..) |v, i| if (v > row[best]) {
@@ -773,18 +796,11 @@ pub fn main(init: std.process.Init) !void {
         try r.sync();
         cache.len = context;
         var token: u32 = 1;
-        for (0..4) |_| {
-            try ink.forward.run(m, &scratch, &cache, &.{token}, .{});
-            cache.len += 1;
-            token = argmax(try lastLogits(&r, &cache, host_logits[0..vocab]));
-        }
+        for (0..4) |_| token = try greedyStep(m, &scratch, &cache, &r, host_logits[0..vocab], token);
         const t1 = nowNs(init.io);
-        for (0..decode_steps) |_| {
-            try ink.forward.run(m, &scratch, &cache, &.{token}, .{});
-            cache.len += 1;
-            token = argmax(try lastLogits(&r, &cache, host_logits[0..vocab]));
-        }
+        for (0..decode_steps) |_| token = try greedyStep(m, &scratch, &cache, &r, host_logits[0..vocab], token);
         const total = secs(nowNs(init.io) - t1);
+        if (pick_checked > 0) std.debug.print("PICK-STEPS {d} of {d} device picks differ from the host argmax\n", .{ pick_diff, pick_checked });
         std.debug.print("\nbench: {d} decode steps at context {d} (no prompt): {d:.2} tok/s, {d:.2} ms a token\n", .{ decode_steps, context, @as(f64, @floatFromInt(decode_steps)) / total, 1000 * total / @as(f64, @floatFromInt(decode_steps)) });
         if (profile_steps > 0) try profileDecode(&ctx, init.io, m, &scratch, &cache, &r, host_logits[0..vocab], token, profile_steps, null);
         if (profile_steps > 0) {
@@ -825,7 +841,9 @@ fn profileDecode(ctx: *xpu.Context, io: std.Io, m: *const ink.model.Model, scrat
         for (0..steps) |si| {
             const f0 = nowNs(io);
             const e0 = xpu.profile.nowNs();
-            try ink.forward.run(m, scratch, cache, &.{token}, .{});
+            var pick: u32 = std.math.maxInt(u32);
+            const dev_pick = smp == null and ink.fuse.greedyDevice();
+            try ink.forward.run(m, scratch, cache, &.{token}, .{ .pick = if (dev_pick) &pick else null });
             const e1 = xpu.profile.nowNs();
             wall += nowNs(io) - f0;
             enqueue += @as(i96, prof.enqueued_at) - e0;
@@ -836,9 +854,9 @@ fn profileDecode(ctx: *xpu.Context, io: std.Io, m: *const ink.model.Model, scrat
                 try prof.collect();
                 const d0 = nowNs(io);
                 const h0 = xpu.profile.nowNs();
-                const row_l = try lastLogits(r, cache, logits);
+                const row_l: ?[]f32 = if (dev_pick and pick < logits.len) null else try lastLogits(r, cache, logits);
                 const h1 = xpu.profile.nowNs();
-                token = argmax(row_l);
+                token = if (row_l) |l| argmax(l) else pick;
                 const h2 = xpu.profile.nowNs();
                 draw += nowNs(io) - d0;
                 dl = h1 - h0;

@@ -126,6 +126,9 @@ pub const Options = struct {
     taps: ?Ptr = null,
     /// A verify forward: the leader opens a cache transaction on every segment, so rank 1 must open one too.
     txn: bool = false,
+    /// The greedy token of the last row, drawn on the device after the head and copied here before the one wait of
+    /// the forward. Left as is when the forward cannot draw it (split head, all rows). The caller sets a sentinel.
+    pick: ?*u32 = null,
 };
 
 pub const FinalPlan = struct { work_rows: usize, logits_rows: usize, logits_row: usize, capture_rows: usize };
@@ -1106,6 +1109,7 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     }
     if (std.c.getenv("TF_TP_DUMP") != null) dump_fwd += 1;
     try g.widen(at(s.p, 0), at(s.partial, 0), rows);
+    var picked = false;
     const final = finalPlan(rows, options.all, options.taps != null);
     if (final.work_rows == rows) {
         try glue.arRows(&p.glue, stream, at(s.blocks, 0), at(s.partial, 0), tensor(m.weights.output_query), at(s.mlp_ar, 0), m.weight_plan.final_sources, 1, @intCast(rows), state.block_slots * state.hidden);
@@ -1122,6 +1126,14 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
         if (m.weights.unembed_q8) |head| {
             try dense_q8_kernels.head(&p.dense_q8, stream, tensor(head), head_input, logits, @intCast(final.logits_rows), vocab_n);
         } else try glue.logits(&p.glue, stream, head_input, tensor(m.weights.unembed), logits, @intCast(final.logits_rows), vocab_n);
+        if (options.pick != null and !options.all and final.logits_rows == 1) {
+            // logits_all held the router scores of the last visit, which the stream has used by now.
+            const out = at(s.logits_all, 2 * fuse.argmax_parts * 4);
+            try fuse.argmax(&p.fuse, stream, logits, at(s.logits_all, 0), out, vocab_n);
+            if (s.pick == null) s.pick = try m.r.allocHost(64);
+            try m.r.copy(s.pick.?, .{ .rt = s.logits_all.rt, .ptr = out, .len = 4 }, 4);
+            picked = true;
+        }
     } else if (group.live) |gp| {
         // The head kernel stores [row][slice]. The logit buffer is [row][full vocab]. Write the slice aside, pull the
         // other rank's slice, then place both at the full stride. The kernel itself is unchanged.
@@ -1174,6 +1186,7 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     xpu.profile.reportAppend(m.options.place.rank);
     try stream.synchronize();
     if (xpu.profile.active) |prof| prof.waited();
+    if (picked) options.pick.?.* = @as(*const u32, @ptrCast(@alignCast(s.pick.?.ptr.?))).*;
     if (group.live) |gp| gp.releaseEvents();
 }
 

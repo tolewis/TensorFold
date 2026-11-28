@@ -163,6 +163,9 @@ pub const Pipelines = struct {
     router_norm: xpu.Kernel,
     /// Empty kernels at 64, 128 and 256 work-items, for the launch-cost probe.
     empty: [3]xpu.Kernel,
+    /// The greedy token on the device: the part maxima, then one group.
+    argmax_part: xpu.Kernel,
+    argmax_final: xpu.Kernel,
 
     pub fn load(module: xpu.Module) !Pipelines {
         var pre = try module.kernel("tf_ink2_fuse_pre", .{ 256, 1, 1 });
@@ -197,10 +200,14 @@ pub const Pipelines = struct {
             try module.kernel("tf_ink2_empty128", .{ 128, 1, 1 }),
             try module.kernel("tf_ink2_empty256", .{ 256, 1, 1 }),
         };
-        return .{ .empty = empty, .pre = pre, .zeta = zeta, .gates = gates, .norms = norms, .router_gemv = router_gemv, .router_pick = router_pick, .conv_attn = conv_attn, .conv_mlp = conv_mlp, .zeta_wide = zeta_wide_k, .zeta_split_k = zeta_split_k, .gates_norms_k = gates_norms_k, .pre_q_k = pre_q_k, .pre_zeta_k = pre_zeta_k, .conv_kv = conv_kv, .down_epi = down_epi_k, .router_norm = router_norm };
+        const argmax_part = try module.kernel("tf_ink2_argmax_part", .{ 256, 1, 1 });
+        const argmax_final = try module.kernel("tf_ink2_argmax_final", .{ 256, 1, 1 });
+        return .{ .argmax_part = argmax_part, .argmax_final = argmax_final, .empty = empty, .pre = pre, .zeta = zeta, .gates = gates, .norms = norms, .router_gemv = router_gemv, .router_pick = router_pick, .conv_attn = conv_attn, .conv_mlp = conv_mlp, .zeta_wide = zeta_wide_k, .zeta_split_k = zeta_split_k, .gates_norms_k = gates_norms_k, .pre_q_k = pre_q_k, .pre_zeta_k = pre_zeta_k, .conv_kv = conv_kv, .down_epi = down_epi_k, .router_norm = router_norm };
     }
 
     pub fn deinit(p: *Pipelines) void {
+        p.argmax_final.deinit();
+        p.argmax_part.deinit();
         for (&p.empty) |*k| k.deinit();
         p.router_norm.deinit();
         p.down_epi.deinit();
@@ -220,6 +227,27 @@ pub const Pipelines = struct {
         p.pre.deinit();
     }
 };
+
+/// Parts of the device argmax: 108 groups (the decode kernels' widest grid) of a 200058-wide row.
+pub const argmax_parts: u32 = 108;
+
+/// The greedy token of a row of `n` binary32 logits to `out` (one u32 on the device). `scratch` holds 2 * 108 words.
+/// The largest value wins, equal values keep the lowest id, a NaN ranks as -inf.
+pub fn argmax(p: *const Pipelines, s: xpu.Stream, logits: Ref, scratch: Ref, out: Ref, n: u32) !void {
+    const chunk = (n + argmax_parts - 1) / argmax_parts;
+    const ids: Ref = @ptrFromInt(@intFromPtr(scratch.?) + argmax_parts * 4);
+    try xpu.launch.dispatch(p.argmax_part, s, .{ argmax_parts, 1, 1 }, .{ logits, scratch, ids, n, chunk });
+    try xpu.launch.dispatch(p.argmax_final, s, .{ 1, 1, 1 }, .{ scratch, ids, out, argmax_parts });
+}
+
+/// `XPU_GREEDY_HOST=1` keeps the greedy draw on the host (the 800 KB logit download and a second wait).
+pub fn greedyDevice() bool {
+    if (std.c.getenv("XPU_GREEDY_HOST")) |p| {
+        const v = std.mem.span(p);
+        return !(v.len > 0 and v[0] == '1');
+    }
+    return true;
+}
 
 /// The launch-cost probe: `INK2_EMPTY_PROBE=1` adds one empty launch a (work-group size, grid) pair at the end of a
 /// one-row forward, each under its own profile label. The grids are those of the decode kernels' sheet.
