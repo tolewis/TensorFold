@@ -371,6 +371,88 @@ static inline void P(finish_one)(const uint ks, float acc, local float *part, __
   }
 }
 
+#if defined(P3RF_P1) || defined(P3RF_P2) || defined(P3RF_P3) || defined(P3RF_LOADS)
+// p3-read-fix section 13 (lever 3): access-pattern variants of the whole-line one-row loop, build switches, off by
+// default. The decode, the dot and the order of every sum are the base ones; only the order, the width and the count
+// of the loads change.
+//  P3RF_P1=1|2  load ahead: the weight (and scale) loads of chunk c + ks (P1=1) or c + 2 ks (P1=2) are sent before
+//               the decode of chunk c; a load past the last chunk of the sub-group is not sent.
+//  P3RF_P2      x in one block read a chunk (intel_sub_group_block_read_us8: element u of lane l is x[128 c + 16 u + l],
+//               the value of the eight single reads).
+//  P3RF_P3      the scales of all chunks of the lane in one span before the loop (8 * sg to the end of its last
+//               chunk), in the fewest loads: 128 bytes (4 loads, d32x8) for 6 chunks a sub-group, 56 bytes (3 loads)
+//               for 3; the chunk loop is unrolled for those counts. A SIMT load holds at most 32 bytes a lane.
+//  P3RF_LOADS   time split only (wrong bits): the loads alone, folded so they stay live (as P3RF_NODOT of block 4).
+#ifndef P3RF_P1
+#define P3RF_P1 0
+#endif
+#ifdef P3RF_P2
+#define INK2_P_X(c) const ushort8 x8_ = intel_sub_group_block_read_us8(xr + 128u * (c));
+#define INK2_P_A(c, u) ((short)x8_[u])
+#else
+#define INK2_P_X(c)
+#define INK2_P_A(c, u) ((short)intel_sub_group_block_read_us(xr + 128u * (c) + 16u * (u)))
+#endif
+#ifdef P3RF_LOADS
+#define INK2_P_STEP(v, sc, a) acc = as_float(as_uint(acc) ^ (v)[2 * u_] ^ (v)[2 * u_ + 1] ^ (sc) ^ (uint)(ushort)(a) ^ as_uint(phi26))
+#else
+#define INK2_P_STEP(v, sc, a) do { const int8 b_ = P(nv_frag)((v)[2 * u_], (v)[2 * u_ + 1], (sc), phi26); acc = INK2_DOT((a), b_, acc); } while (0)
+#endif
+// One chunk: the eight blocks in the base order.
+#define INK2_P_CHUNK(v, s2, c) do { \
+    INK2_P_X(c) \
+    _Pragma("unroll") for (int u_ = 0; u_ < 8; u_++) { \
+      const uint sc_ = ((s2)[u_ >> 2] >> (8 * (u_ & 3))) & 255u; \
+      const short a_ = INK2_P_A(c, u_); \
+      INK2_P_STEP(v, sc_, a_); \
+    } } while (0)
+#define INK2_P_W(c) vload16(0, (__global const uint *)(wr + 64u * (c)))
+#define INK2_P_S(c) vload2(0, (__global const uint *)(sr + 8u * (c)))
+// The rolled loop (P1 and P2 without P3).
+#if P3RF_P1 == 0
+#define INK2_P_LOOP() \
+    for (uint c = sg; c < chunks; c += ks) { \
+      const uint16 v = INK2_P_W(c); \
+      const uint2 s2 = INK2_P_S(c); \
+      INK2_P_CHUNK(v, s2, c); \
+    }
+#elif P3RF_P1 == 1
+#define INK2_P_LOOP() \
+    { uint16 vn = (uint16)0; uint2 sn = (uint2)0; \
+      if (sg < chunks) { vn = INK2_P_W(sg); sn = INK2_P_S(sg); } \
+      for (uint c = sg; c < chunks; c += ks) { \
+        const uint16 v = vn; const uint2 s2 = sn; \
+        if (c + ks < chunks) { vn = INK2_P_W(c + ks); sn = INK2_P_S(c + ks); } \
+        INK2_P_CHUNK(v, s2, c); \
+      } }
+#else
+#define INK2_P_LOOP() \
+    { uint16 vn = (uint16)0, vm = (uint16)0; uint2 sn = (uint2)0, sm = (uint2)0; \
+      if (sg < chunks) { vn = INK2_P_W(sg); sn = INK2_P_S(sg); } \
+      if (sg + ks < chunks) { vm = INK2_P_W(sg + ks); sm = INK2_P_S(sg + ks); } \
+      for (uint c = sg; c < chunks; c += ks) { \
+        const uint16 v = vn; const uint2 s2 = sn; \
+        vn = vm; sn = sm; \
+        if (c + 2u * ks < chunks) { vm = INK2_P_W(c + 2u * ks); sm = INK2_P_S(c + 2u * ks); } \
+        INK2_P_CHUNK(v, s2, c); \
+      } }
+#endif
+// The unrolled row of J chunks a sub-group (P3, ks 3): the scale span first, then the weights. The weights of chunks
+// 0 to P3RF_P1 load before the first decode; before the decode of chunk j the weights of chunk j + P3RF_P1 load.
+#define INK2_P_SPAN6(sp, s0) do { vstore16(vload16(0, s0), 0, sp); vstore16(vload16(1, s0), 1, sp); } while (0)
+#define INK2_P_SPAN3(sp, s0) do { vstore8(vload8(0, s0), 0, sp); vstore4(vload4(2, s0), 2, sp); vstore2(vload2(6, s0), 6, sp); } while (0)
+#define INK2_P_ROW(J) { \
+    uint sp_[2 * ((J) - 1) * 3 + 2]; \
+    INK2_P_SPAN##J(sp_, (__global const uint *)(sr + 8u * sg)); \
+    uint16 w_[J]; \
+    _Pragma("unroll") for (int j_ = 0; j_ <= P3RF_P1 && j_ < (J); j_++) w_[j_] = INK2_P_W(sg + (uint)j_ * 3u); \
+    _Pragma("unroll") for (int j_ = 0; j_ < (J); j_++) { \
+      if (j_ > 0 && j_ + P3RF_P1 < (J)) w_[j_ + P3RF_P1] = INK2_P_W(sg + (uint)(j_ + P3RF_P1) * 3u); \
+      const uint2 s2_ = (uint2)(sp_[6 * j_], sp_[6 * j_ + 1]); \
+      INK2_P_CHUNK(w_[j_], s2_, sg + (uint)j_ * 3u); \
+    } }
+#endif
+
 static inline void P(nv_decode_one)(const uint ks, __global const ushort *X, __global const uchar *W, __global const uchar *S,
                                 __global const float *amax, __global const float *den, __global const int *ids,
                                 __global ushort *Y, uint k, uint n, uint topk, uint experts, bool gu, local float *part) {
@@ -399,6 +481,17 @@ static inline void P(nv_decode_one)(const uint ks, __global const ushort *X, __g
   __global const ushort *xr = X + (ulong)(gu ? route / topk : route) * k;
   const float phi26 = P(phi)(amax, den, e) * 0x1p26f;
   float acc = 0.0f;
+#if defined(P3RF_P1) || defined(P3RF_P2) || defined(P3RF_P3) || defined(P3RF_LOADS)
+  if ((nb & 7u) == 0) { // whole 64-byte lines a row: eight blocks, one line a lane
+    const uint chunks = nb / 8u;
+#ifdef P3RF_P3
+    if (ks == 3u && chunks == 18u) INK2_P_ROW(6)
+    else if (ks == 3u && chunks == 9u) INK2_P_ROW(3)
+    else
+#endif
+    INK2_P_LOOP()
+  } else {
+#else
   if ((nb & 7u) == 0) { // whole 64-byte lines a row: eight blocks, one line a lane
     const uint chunks = nb / 8u;
     for (uint c = sg; c < chunks; c += ks) {
@@ -413,6 +506,7 @@ static inline void P(nv_decode_one)(const uint ks, __global const ushort *X, __g
       }
     }
   } else {
+#endif
     for (uint blk = sg; blk < nb; blk += ks) {
       const uint2 v = vload2(0, (__global const uint *)(wr + 8u * blk));
       const int8 b = P(nv_frag)(v.x, v.y, (uint)sr[blk], phi26);
