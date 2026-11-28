@@ -94,11 +94,15 @@ pub const Sampler = struct {
             want_z = want_z or row.norm;
         }
         try s.r.upload(s.cfg, std.mem.sliceAsBytes(s.host_cfg[0 .. rows.len * 2]));
+        try xpu.launch.tokStamp(s.r.stream(s.ctx), .sstart);
         try xpu.launch.dispatch(s.kernel, s.r.stream(s.ctx), .{ @intCast(rows.len), 1, 1 }, .{ logits, s.cfg.ptr, s.out.ptr, s.zbuf.ptr, vocab, stride });
+        try xpu.launch.tokStamp(s.r.stream(s.ctx), .send);
         const words = rows.len * stride * 2;
         try s.r.download(std.mem.sliceAsBytes(s.host_out[0..words]), s.out);
         if (want_z) try s.r.download(std.mem.sliceAsBytes(s.host_z[0..rows.len]), s.zbuf);
+        xpu.profile.tokMark(.sel_app);
         try s.r.sync();
+        xpu.profile.tokMark(.sel_sync);
         return .{ .words = s.host_out[0..words], .stride = stride, .z = s.host_z[0..rows.len] };
     }
 

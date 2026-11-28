@@ -50,6 +50,7 @@ pub fn checkArgCount(k: Kernel, have: usize) Error!void {
 /// Sets the arguments, then launches with the group count in device memory. Y is this rank's route count.
 pub fn dispatchIndirect(k: Kernel, s: Stream, groups: *anyopaque, args: anytype) Error!void {
     try checkArgCount(k, args.len);
+    if (profile.tok_live) profile.tokLaunch();
     inline for (args, 0..) |v, i| {
         const idx: u32 = i;
         switch (comptime argKind(@TypeOf(v))) {
@@ -66,6 +67,7 @@ pub fn dispatchIndirect(k: Kernel, s: Stream, groups: *anyopaque, args: anytype)
 /// Sets every argument of the tuple in order (buffer, device pointer, f32 or u32) and queues the kernel.
 pub fn dispatch(k: Kernel, s: Stream, groups: [3]u32, args: anytype) Error!void {
     try checkArgCount(k, args.len);
+    if (profile.tok_live) profile.tokLaunch();
     if (profile.active) |p| return dispatchProfiled(p, k, s, groups, args);
     inline for (args, 0..) |v, i| {
         const idx: u32 = i;
@@ -134,4 +136,15 @@ test "argument kinds follow the Zig type" {
     try std.testing.expectEqual(ArgKind.integer, argKind(u32));
     try std.testing.expectEqual(ArgKind.integer, argKind(comptime_int));
     try std.testing.expectEqual(ArgKind.integer, argKind(usize));
+}
+
+const WriteTs = *const fn (ze.H, *u64, ze.H, u32, ?[*]ze.H) callconv(.c) u32;
+var write_ts: ?WriteTs = null;
+
+/// V11 (TF_TOKLOG): queues a write of the device clock into the current token's slot `d`, in order on `s`.
+pub fn tokStamp(s: Stream, d: profile.TokDev) Error!void {
+    const slot = profile.tokSlot(d) orelse return;
+    if (write_ts == null) write_ts = @constCast(s.ctx.d).lib.lookup(WriteTs, "zeCommandListAppendWriteGlobalTimestamp");
+    const f = write_ts orelse return;
+    try s.ctx.d.check(f(s.list, slot, null, 0, null), "zeCommandListAppendWriteGlobalTimestamp");
 }

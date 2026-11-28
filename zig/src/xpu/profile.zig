@@ -348,3 +348,227 @@ pub const Profile = struct {
         if (p.device_time) std.debug.print("device busy {d:.3} ms, first start to last end {d:.3} ms, idle between kernels {d:.3} ms (span minus busy, a pass); sum of the gap column {d:.3} ms (a pass); {d} launches not timed\n", .{ @as(f64, @floatFromInt(p.device_busy_ns)) / 1e6 / n, @as(f64, @floatFromInt(p.device_span_ns)) / 1e6 / n, @as(f64, @floatFromInt(p.device_span_ns -| p.device_busy_ns)) / 1e6 / n, @as(f64, @floatFromInt(p.device_gap_ns)) / 1e6 / n, p.dropped });
     }
 };
+
+// V11: the time of a decode token that is not device time. `TF_TOKLOG=<file>` (off by default) writes one line a
+// one-row decode token: host clock marks of the feed, the forward and the draw, and three device stamps (the forward's
+// first kernel, its end, the sampler kernel) from zeCommandListAppendWriteGlobalTimestamp. A line is written in the
+// device-busy part of a later token (at that forward's last append), so the write is not in the gap it measures.
+
+/// The host marks of one token, in the order the code reaches them.
+pub const Tok = enum(u8) { entry, fstart, uploaded, first, enqueued, waited, fret, sel_app, sel_sync, dl, draw, ret };
+const tok_marks = @as(usize, @intFromEnum(Tok.ret)) + 1;
+/// Device stamp slots of a token: the forward's first kernel, the forward's end, the sampler kernel start and end.
+pub const TokDev = enum(u8) { fstart, fend, sstart, send, estart, eend };
+const tok_slots = 8;
+const tok_ring = 4;
+
+const TokRec = struct {
+    t: [tok_marks]u64 = @splat(0),
+    path: u8 = 0,
+    /// The host clock (midpoint of the call) and the device clock of one zeDeviceGetGlobalTimestamps.
+    cal_host: u64 = 0,
+    cal_dev: u64 = 0,
+    cal_ns: u64 = 0,
+    stamped: [6]bool = @splat(false),
+    gen: u64 = 0,
+    /// Kernel launches of the token (forward and draw).
+    launches: u32 = 0,
+    /// TF_TOKLOG_EV=1: the forward's launches with a timestamp event each, device busy, first start to last end, idle.
+    ev_launches: u64 = 0,
+    ev_busy: u64 = 0,
+    ev_span: u64 = 0,
+    ev_gap: u64 = 0,
+    /// TF_TOKLOG_EMPTY=<n>: n empty launches after the forward's end stamp.
+    empties: u32 = 0,
+};
+
+pub var tok_on: bool = false;
+var tok_read: bool = false;
+var tok_fd: c_int = -1;
+var tok_recs: [tok_ring]TokRec = @splat(.{});
+var tok_k: u64 = 0;
+var tok_gen: u64 = 0;
+
+/// A prefill starts: the next token does not follow the one before (no line spans two requests).
+pub fn tokBreak() void {
+    tok_gen += 1;
+}
+/// Pinned host memory of `tok_ring * 4` u64 device stamps (set by the forward on the first token).
+pub var tok_dev: ?[*]u64 = null;
+/// True while a one-row decode forward or its draw runs: launch marks and device stamps go to the current token.
+pub var tok_live: bool = false;
+
+/// Reads TF_TOKLOG one time a process.
+pub fn tokInit() void {
+    if (tok_read) return;
+    tok_read = true;
+    const path = std.c.getenv("TF_TOKLOG") orelse return;
+    tok_fd = platform.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(c_uint, 0o644));
+    tok_on = tok_fd >= 0;
+    if (tok_on) tokWrite("TOKLOG v11: us from the device end of the token's forward (fend). path 1 queue, 2 verify, 3 tool\n");
+}
+
+fn tokWrite(s: []const u8) void {
+    if (tok_fd >= 0) _ = std.c.write(tok_fd, s.ptr, s.len);
+}
+
+/// A feed starts: a new token record. `path` 1 queueFn, 2 verifyFn, 3 the logits tool.
+pub fn tokEntry(path: u8) void {
+    tokInit();
+    if (!tok_on) return;
+    tok_k += 1;
+    const r = &tok_recs[tok_k % tok_ring];
+    r.* = .{ .path = path, .gen = tok_gen };
+    r.t[@intFromEnum(Tok.entry)] = nowNs();
+    tok_live = true;
+}
+
+/// Sets mark `m` of the current token, the first time only.
+pub fn tokMark(m: Tok) void {
+    if (!tok_on or !tok_live) return;
+    const r = &tok_recs[tok_k % tok_ring];
+    if (r.t[@intFromEnum(m)] == 0) r.t[@intFromEnum(m)] = nowNs();
+}
+
+/// The current token's slot for device stamp `d`, or null when the log is off.
+pub fn tokSlot(d: TokDev) ?*u64 {
+    if (!tok_on or !tok_live) return null;
+    const p = tok_dev orelse return null;
+    tok_recs[tok_k % tok_ring].stamped[@intFromEnum(d)] = true;
+    return &p[(tok_k % tok_ring) * tok_slots + @intFromEnum(d)];
+}
+
+/// A kernel launch of the current token: the first sets the `first` mark.
+pub fn tokLaunch() void {
+    const r = &tok_recs[tok_k % tok_ring];
+    if (r.t[@intFromEnum(Tok.first)] == 0) r.t[@intFromEnum(Tok.first)] = nowNs();
+    r.launches += 1;
+}
+
+var tok_ev_read = false;
+var tok_ev_on = false;
+var tok_empty_n: u32 = 0;
+var tok_prof: ?Profile = null;
+
+fn tokEvRead() void {
+    if (tok_ev_read) return;
+    tok_ev_read = true;
+    if (std.c.getenv("TF_TOKLOG_EV")) |p| tok_ev_on = p[0] == '1';
+    if (std.c.getenv("TF_TOKLOG_EMPTY")) |p| tok_empty_n = std.fmt.parseInt(u32, std.mem.span(p), 10) catch 0;
+}
+
+/// TF_TOKLOG_EMPTY: the count of empty launches a token, 0 when off.
+pub fn tokEmpties() u32 {
+    if (!tok_on or !tok_live) return 0;
+    tokEvRead();
+    return tok_empty_n;
+}
+
+/// TF_TOKLOG_EV=1: a profile with a timestamp event on every launch of this token's forward (installed if none is).
+pub fn tokEvBegin(ctx: *const Context) Error!bool {
+    if (!tok_on or !tok_live) return false;
+    tokEvRead();
+    if (!tok_ev_on or active != null) return false;
+    if (tok_prof == null) tok_prof = try Profile.init(ctx, 4096, true);
+    active = &tok_prof.?;
+    return true;
+}
+
+/// After the forward's wait: the event totals of the token into its record, then the profile is removed.
+pub fn tokEvEnd() Error!void {
+    const p = &(tok_prof orelse return);
+    active = null;
+    try p.collect();
+    const r = &tok_recs[tok_k % tok_ring];
+    r.ev_launches = p.launches;
+    r.ev_busy = p.device_busy_ns;
+    r.ev_span = p.device_span_ns;
+    r.ev_gap = p.device_gap_ns;
+    p.reset();
+}
+
+pub fn tokSetEmpties(n: u32) void {
+    tok_recs[tok_k % tok_ring].empties = n;
+}
+
+/// Empty launches go uncounted and without events.
+pub fn tokQuiet(on: bool) void {
+    tok_live = !on;
+}
+
+/// The feed has returned its token.
+pub fn tokRet() void {
+    tokMark(.ret);
+    tok_live = false;
+}
+
+const GlobalTs = *const fn (ze.H, *u64, *u64) callconv(.c) u32;
+var tok_gts: ?GlobalTs = null;
+
+/// At the forward's last append of token k: the clock pair of token k, then the line of token k - 2 (all its stamps
+/// and those of token k - 1 have landed: token k - 1's wait has returned).
+pub fn tokEmit(ctx: *const Context) void {
+    if (!tok_on or !tok_live) return;
+    const r = &tok_recs[tok_k % tok_ring];
+    if (tok_gts == null) tok_gts = @constCast(ctx.d).lib.lookup(GlobalTs, "zeDeviceGetGlobalTimestamps");
+    if (tok_gts) |f| {
+        var h: u64 = 0;
+        var d: u64 = 0;
+        const a = nowNs();
+        if (f(ctx.gpu.device, &h, &d) == 0) {
+            const b = nowNs();
+            r.cal_host = a + (b - a) / 2;
+            r.cal_dev = d;
+            r.cal_ns = b - a;
+        }
+    }
+    if (tok_k < 3) return;
+    const p = tok_dev orelse return;
+    const o = &tok_recs[(tok_k - 2) % tok_ring];
+    const n = &tok_recs[(tok_k - 1) % tok_ring];
+    if (o.gen != n.gen or o.cal_ns == 0 or !o.stamped[1] or !n.stamped[0]) return;
+    const bits = ctx.gpu.props.timestampValidBits;
+    const mask: u64 = if (bits >= 64 or bits == 0) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(bits)) - 1;
+    const tick_ns = 1e9 / @as(f64, @floatFromInt(ctx.gpu.props.timerResolution));
+    const half = (mask >> 1) + 1;
+    const devHost = struct {
+        fn f(cal: *const TokRec, v: u64, m: u64, hf: u64, ns: f64) f64 {
+            const diff = (v -% cal.cal_dev) & m;
+            const signed: f64 = if (diff >= hf) -@as(f64, @floatFromInt((m - diff) + 1)) else @as(f64, @floatFromInt(diff));
+            return @as(f64, @floatFromInt(cal.cal_host)) + signed * ns;
+        }
+    }.f;
+    const ob = ((tok_k - 2) % tok_ring) * tok_slots;
+    const nb = ((tok_k - 1) % tok_ring) * tok_slots;
+    const e = devHost(o, p[ob + 1], mask, half, tick_ns);
+    const us = struct {
+        fn f(t: u64, base: f64) f64 {
+            return if (t == 0) -1 else (@as(f64, @floatFromInt(t)) - base) / 1e3;
+        }
+    }.f;
+    var buf: [900]u8 = undefined;
+    const empty_us: f64 = if (o.stamped[4] and o.stamped[5] and o.empties > 0) @as(f64, @floatFromInt((p[ob + 5] -% p[ob + 4]) & mask)) * tick_ns / 1e3 else -1;
+    const fwd_us = @as(f64, @floatFromInt((p[ob + 1] -% p[ob]) & mask)) * tick_ns / 1e3;
+    const sel_s: f64 = if (o.stamped[2]) (devHost(o, p[ob + 2], mask, half, tick_ns) - e) / 1e3 else -1;
+    const sel_e: f64 = if (o.stamped[3]) (devHost(o, p[ob + 3], mask, half, tick_ns) - e) / 1e3 else -1;
+    const next_dev = (devHost(o, p[nb], mask, half, tick_ns) - e) / 1e3;
+    const T = struct {
+        fn at(rec: *const TokRec, m: Tok) u64 {
+            return rec.t[@intFromEnum(m)];
+        }
+    };
+    const line = std.fmt.bufPrint(&buf, "TOK {d} gen {d} path {d} fwd_dev {d:.1} launches {d} ev_launches {d} ev_busy {d:.1} ev_span {d:.1} ev_gap {d:.1} empties {d} empty_us {d:.2} | waited {d:.1} fret {d:.1} sel_app {d:.1} sel_dev_start {d:.1} sel_dev_end {d:.1} sel_sync {d:.1} dl {d:.1} draw {d:.1} ret {d:.1} | next entry {d:.1} fstart {d:.1} uploaded {d:.1} first {d:.1} dev_start {d:.1} | own fstart {d:.1} uploaded {d:.1} first {d:.1} enqueued {d:.1} | cal {d} ns\n", .{
+        tok_k - 2,                     o.gen,                         o.path,                        fwd_us,
+        o.launches,                    o.ev_launches,                 @as(f64, @floatFromInt(o.ev_busy)) / 1e3,
+        @as(f64, @floatFromInt(o.ev_span)) / 1e3, @as(f64, @floatFromInt(o.ev_gap)) / 1e3, o.empties,
+        empty_us,
+        us(T.at(o, .waited), e),       us(T.at(o, .fret), e),         us(T.at(o, .sel_app), e),
+        sel_s,                         sel_e,                         us(T.at(o, .sel_sync), e),
+        us(T.at(o, .dl), e),           us(T.at(o, .draw), e),         us(T.at(o, .ret), e),
+        us(T.at(n, .entry), e),        us(T.at(n, .fstart), e),       us(T.at(n, .uploaded), e),
+        us(T.at(n, .first), e),        next_dev,                      us(T.at(o, .fstart), e),
+        us(T.at(o, .uploaded), e),     us(T.at(o, .first), e),        us(T.at(o, .enqueued), e),
+        o.cal_ns,
+    }) catch return;
+    tokWrite(line);
+}

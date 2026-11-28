@@ -1064,12 +1064,24 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     // The host arrays below stay valid until the stream has finished, which this function waits for before it returns.
     const stream = m.r.stream(ctx);
     errdefer stream.synchronize() catch {};
+    const tok_ev = rows == 1 and try xpu.profile.tokEvBegin(stream.ctx);
+    errdefer if (tok_ev) xpu.profile.tokEvEnd() catch {};
     if (xpu.profile.active) |prof| prof.started();
+    if (rows == 1) xpu.profile.tokMark(.fstart);
     try m.r.upload(s.ids, std.mem.sliceAsBytes(ids));
     try m.r.upload(s.pos, std.mem.sliceAsBytes(pos[0..rows]));
     try m.r.upload(s.seg_of, std.mem.sliceAsBytes(seg_of[0..rows]));
     try m.r.upload(s.segs, std.mem.sliceAsBytes(segs[0..segments.len]));
     if (xpu.profile.active) |prof| prof.uploaded();
+    if (rows == 1 and xpu.profile.tok_live) {
+        // V11 (TF_TOKLOG): the pinned device stamps of the token log, made on the first logged token
+        if (xpu.profile.tok_dev == null) {
+            const b = try m.r.allocHost(4 * 8 * 8);
+            xpu.profile.tok_dev = @ptrCast(@alignCast(b.ptr.?));
+        }
+        xpu.profile.tokMark(.uploaded);
+        try xpu.launch.tokStamp(stream, .fstart);
+    }
     var wrote: [state.visit_slots]u8 = @splat(0);
     const g = Run{ .m = m, .p = p, .s = stream, .sc = s, .wrote = if (fuse.roleConv() and rows == 1) &wrote else null, .keep_taps = options.txn or anyPending(segments) };
     if (m.options.place.rank == 0) if (group.live) |gp| {
@@ -1182,10 +1194,30 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     }
     try g.commitFullHistories(segments);
     if (rows == 1 and fuse.emptyProbe()) try fuse.emptyLaunches(&p.fuse, stream);
+    if (rows == 1 and xpu.profile.tok_live) {
+        try xpu.launch.tokStamp(stream, .fend);
+        const n_empty = xpu.profile.tokEmpties();
+        if (n_empty > 0) {
+            // the fixed device time of a launch: n launches of an empty kernel between two device stamps
+            try xpu.launch.tokStamp(stream, .estart);
+            const saved = xpu.profile.active;
+            xpu.profile.active = null;
+            xpu.profile.tokQuiet(true);
+            for (0..n_empty) |_| try xpu.launch.dispatch(p.fuse.empty[0], stream, .{ 1, 1, 1 }, .{@as(u32, 0)});
+            xpu.profile.tokQuiet(false);
+            xpu.profile.active = saved;
+            try xpu.launch.tokStamp(stream, .eend);
+            xpu.profile.tokSetEmpties(n_empty);
+        }
+        xpu.profile.tokMark(.enqueued);
+        xpu.profile.tokEmit(stream.ctx);
+    }
     if (xpu.profile.active) |prof| prof.enqueued();
     xpu.profile.reportAppend(m.options.place.rank);
     try stream.synchronize();
+    if (rows == 1) xpu.profile.tokMark(.waited);
     if (xpu.profile.active) |prof| prof.waited();
+    if (tok_ev) try xpu.profile.tokEvEnd();
     if (picked) options.pick.?.* = @as(*const u32, @ptrCast(@alignCast(s.pick.?.ptr.?))).*;
     if (group.live) |gp| gp.releaseEvents();
 }

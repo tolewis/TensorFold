@@ -708,7 +708,10 @@ pub fn main(init: std.process.Init) !void {
                 const f0 = nowNs(init.io);
                 if (!digest) {
                     // the draw of the serve path: the device pick (V7) unless XPU_GREEDY_HOST=1
+                    xpu.profile.tokEntry(3);
                     token = try greedyStep(m, &scratch, &cache, &r, host_logits[0..vocab], token);
+                    xpu.profile.tokMark(.draw);
+                    xpu.profile.tokRet();
                     fwd_ns += nowNs(init.io) - f0;
                     continue;
                 }
@@ -1283,5 +1286,6 @@ fn routeUnion(gpa: std.mem.Allocator, m: *const ink.model.Model, scratch: *state
 fn lastLogits(r: *xpu.rt.Runtime, cache: *state.Cache, out: []f32) ![]f32 {
     _ = r;
     try cache.readLogits(out);
+    xpu.profile.tokMark(.dl);
     return out;
 }

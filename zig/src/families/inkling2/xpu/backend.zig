@@ -173,6 +173,7 @@ pub const Xpu = struct {
     /// The last row the forward wrote for `cache`, read back to the host.
     fn logits(self: *Xpu, cache: *st.Cache) ![]const f32 {
         try cache.readLogits(self.row);
+        xpu.profile.tokMark(.dl);
         return self.row;
     }
 
@@ -195,6 +196,7 @@ pub const Xpu = struct {
     /// The next token of `cache`'s last row. A sampled row's candidates are selected on the device and only they come back,
     /// with the whole row too where the draw sums every token (top_k off); greedy and masked rows are drawn from the row.
     fn drawLast(self: *Xpu, cache: *st.Cache, sampling: ?lanes.Sampling, position: u64, mask: []const u32) !u32 {
+        defer xpu.profile.tokMark(.draw);
         const t = sampled(sampling) orelse return self.draw(try self.logits(cache), sampling, position, mask);
         if (mask.len > 0 or !sampler.Row.supported(t)) return self.draw(try self.logits(cache), sampling, position, mask);
         const row = sampler.Row.of(t);
@@ -317,6 +319,7 @@ pub const Xpu = struct {
 
     fn prefillFn(ptr: *anyopaque, stream: *lanes.Stream) !void {
         const self = cast(ptr);
+        xpu.profile.tokBreak();
         const ids = stream.prompt();
         if (ids.len == 0 or ids.len + stream.max_new > self.options.capacity or self.caches.contains(stream)) return error.InvalidInklingPrompt;
         if (stream.images.len > 0) return error.InklingHasNoImageTower;
@@ -383,6 +386,8 @@ pub const Xpu = struct {
 
     fn queueFn(ptr: *anyopaque, stream: *lanes.Stream, what: be.Feed, position: u64) !u64 {
         const self = cast(ptr);
+        xpu.profile.tokEntry(1);
+        defer xpu.profile.tokRet();
         const cache = try self.cacheOf(stream);
         if (position != cache.len + 1 or cache.pending != null) return error.InvalidInklingPosition;
         const token = switch (what) {
@@ -395,6 +400,7 @@ pub const Xpu = struct {
         var pick: u32 = std.math.maxInt(u32);
         const greedy = sampled(stream.sampling) == null and @import("fuse.zig").greedyDevice();
         try fwd.run(self.model, &self.scratch, cache, &.{token}, .{ .taps = self.tapPtr(), .pick = if (greedy) &pick else null });
+        xpu.profile.tokMark(.fret);
         if (self.prepared) cache.tap = .{ .buf = self.scratch.taps, .start = @intCast(cache.len), .rows = 1, .gen = generation };
         cache.len += 1;
         if (greedy and pick < self.vocab()) return self.put(pick);
