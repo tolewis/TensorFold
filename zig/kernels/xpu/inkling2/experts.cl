@@ -371,7 +371,7 @@ static inline void P(finish_one)(const uint ks, float acc, local float *part, __
   }
 }
 
-#if defined(P3RF_P1) || defined(P3RF_P2) || defined(P3RF_P3) || defined(P3RF_LOADS)
+#if defined(P3RF_P1) || defined(P3RF_P2) || defined(P3RF_P3) || defined(P3RF_LOADS) || defined(P3RF_ARITH)
 // p3-read-fix section 13 (lever 3): access-pattern variants of the whole-line one-row loop, build switches, off by
 // default. The decode, the dot and the order of every sum are the base ones; only the order, the width and the count
 // of the loads change.
@@ -383,10 +383,16 @@ static inline void P(finish_one)(const uint ks, float acc, local float *part, __
 //               chunk), in the fewest loads: 128 bytes (4 loads, d32x8) for 6 chunks a sub-group, 56 bytes (3 loads)
 //               for 3; the chunk loop is unrolled for those counts. A SIMT load holds at most 32 bytes a lane.
 //  P3RF_LOADS   time split only (wrong bits): the loads alone, folded so they stay live (as P3RF_NODOT of block 4).
+//  P3RF_ARITH=1|2  time split only (wrong bits, section 14): no weight or scale load in the loop. The words of the
+//               sub-group's first chunk load one time before the loop; chunk c uses them xor c, so the decode cannot
+//               leave the loop. ARITH=1 keeps the eight x reads a chunk; ARITH=2 also reads x one time (xor c).
 #ifndef P3RF_P1
 #define P3RF_P1 0
 #endif
-#ifdef P3RF_P2
+#if defined(P3RF_ARITH) && P3RF_ARITH == 2
+#define INK2_P_X(c) const ushort8 x8_ = x0_ ^ (ushort8)(ushort)(c);
+#define INK2_P_A(c, u) ((short)x8_[u])
+#elif defined(P3RF_P2)
 #define INK2_P_X(c) const ushort8 x8_ = intel_sub_group_block_read_us8(xr + 128u * (c));
 #define INK2_P_A(c, u) ((short)x8_[u])
 #else
@@ -409,7 +415,21 @@ static inline void P(finish_one)(const uint ks, float acc, local float *part, __
 #define INK2_P_W(c) vload16(0, (__global const uint *)(wr + 64u * (c)))
 #define INK2_P_S(c) vload2(0, (__global const uint *)(sr + 8u * (c)))
 // The rolled loop (P1 and P2 without P3).
-#if P3RF_P1 == 0
+#if defined(P3RF_ARITH)
+#if P3RF_ARITH == 2
+#define INK2_P_X0() const ushort8 x0_ = intel_sub_group_block_read_us8(xr + 128u * (sg < chunks ? sg : 0u));
+#else
+#define INK2_P_X0()
+#endif
+#define INK2_P_LOOP() \
+    { const uint16 v0_ = INK2_P_W(sg < chunks ? sg : 0u); const uint2 s0_ = INK2_P_S(sg < chunks ? sg : 0u); \
+      INK2_P_X0() \
+      for (uint c = sg; c < chunks; c += ks) { \
+        const uint16 v = v0_ ^ (uint16)c; \
+        const uint2 s2 = s0_ ^ (uint2)c; \
+        INK2_P_CHUNK(v, s2, c); \
+      } }
+#elif P3RF_P1 == 0
 #define INK2_P_LOOP() \
     for (uint c = sg; c < chunks; c += ks) { \
       const uint16 v = INK2_P_W(c); \
@@ -481,7 +501,7 @@ static inline void P(nv_decode_one)(const uint ks, __global const ushort *X, __g
   __global const ushort *xr = X + (ulong)(gu ? route / topk : route) * k;
   const float phi26 = P(phi)(amax, den, e) * 0x1p26f;
   float acc = 0.0f;
-#if defined(P3RF_P1) || defined(P3RF_P2) || defined(P3RF_P3) || defined(P3RF_LOADS)
+#if defined(P3RF_P1) || defined(P3RF_P2) || defined(P3RF_P3) || defined(P3RF_LOADS) || defined(P3RF_ARITH)
   if ((nb & 7u) == 0) { // whole 64-byte lines a row: eight blocks, one line a lane
     const uint chunks = nb / 8u;
 #ifdef P3RF_P3
