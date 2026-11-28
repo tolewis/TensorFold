@@ -13,6 +13,11 @@
 //! partial (top, weight sum, weighted mean of V) on the exact values `code * scale`, beside the bf16 kernels on
 //! `bf16(code * scale)`. The int8 prompt read must give the bits of the bf16 kernel on `bf16(code * scale)` (its design).
 //! Exit 1 on a difference or a decode8 error above the bounds of `real_bounds`.
+//! kv8-fix Part 6 switches: `--image <file>` takes `tf_ink2_attn_decode8` and the other attention entries from an image
+//! built from attention.cl with other build switches (INK2_ATT_*). `--only <words>` runs the cases whose name holds the
+//! words (more than one allowed). `--device-time` times each attention kernel launch alone (one launch, one wait) by its
+//! kernel timestamp and prints the median, the least and the most of the 40 launches. `--digest` zeroes the partials,
+//! runs one attention kernel launch on the first cache set and prints the sha256 of the partials (`part_o`, `part_ml`).
 const std = @import("std");
 const xpu = @import("xpu");
 const rig_ = @import("contract_rig.zig");
@@ -586,6 +591,11 @@ pub fn main(init: std.process.Init) !u8 {
     var splits: u32 = 0;
     var do_check = false;
     var do_check_real = false;
+    var image: ?[]const u8 = null;
+    var only: [8][]const u8 = undefined;
+    var only_n: usize = 0;
+    var device_time = false;
+    var digest = false;
     var ai: usize = 1;
     while (ai < args.len) : (ai += 1) {
         const arg = args[ai];
@@ -605,6 +615,18 @@ pub fn main(init: std.process.Init) !u8 {
             sync_each = true;
         } else if (std.mem.eql(u8, arg, "--check-real")) {
             do_check_real = true;
+        } else if (std.mem.eql(u8, arg, "--image")) {
+            ai += 1;
+            image = args[ai];
+        } else if (std.mem.eql(u8, arg, "--only")) {
+            ai += 1;
+            if (only_n == only.len) return error.BadArgument;
+            only[only_n] = args[ai];
+            only_n += 1;
+        } else if (std.mem.eql(u8, arg, "--device-time")) {
+            device_time = true;
+        } else if (std.mem.eql(u8, arg, "--digest")) {
+            digest = true;
         } else return error.BadArgument;
     }
     plan.flash_splits = splits;
@@ -612,8 +634,20 @@ pub fn main(init: std.process.Init) !u8 {
     var dev: rig_.Dev = undefined;
     try dev.init(null);
     defer dev.deinit();
-    var k = try attn.Kernels.init(dev.ink2_attention, dev.ink2_prompt);
+    var image_bin: []u8 = &.{};
+    defer if (image_bin.len > 0) a.free(image_bin);
+    if (image) |path| {
+        image_bin = try std.Io.Dir.cwd().readFileAlloc(init.io, path, a, .limited(64 << 20));
+        try dev.addImage("attention-variant", image_bin);
+        var h: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(image_bin, &h, .{});
+        std.debug.print("BENCH image {s}, {d} bytes, sha256 {x}\n", .{ path, image_bin.len, h[0..8] });
+    }
+    var k = try attn.Kernels.init(if (image != null) dev.named("attention-variant").?.* else dev.ink2_attention, dev.ink2_prompt);
     defer k.deinit();
+    var prof: ?xpu.profile.Profile = null;
+    if (device_time) prof = try xpu.profile.Profile.init(&dev.ctx, 16, true);
+    defer if (prof) |*pp| pp.deinit();
     if (kv_int8) {
         const p8 = try dev.properties(k.prep8);
         const d8 = try dev.properties(k.decode8);
@@ -643,6 +677,11 @@ pub fn main(init: std.process.Init) !u8 {
     if (do_check_real) return if (try checkReal(a, &dev, &k, rng) == 0) 0 else 1;
     std.debug.print("BENCH inkling2 attention on {s}, kv {s}, splits {d}, roof {d:.1} GB/s read\n", .{ "bmg-g31", if (kv_int8) "int8" else "bf16", splits, roof_gbs });
     for (cases) |cs| {
+        if (only_n > 0) {
+            var hit = false;
+            for (only[0..only_n]) |w| hit = hit or std.mem.indexOf(u8, cs.name, w) != null;
+            if (!hit) continue;
+        }
         var rig: rig_.Rig = .{ .a = a, .dev = &dev };
         defer rig.deinit();
         const layer: plan.Layer = if (cs.window > 0) plan.Layer.sliding(cs.window, cs.rows) else plan.Layer.global(cs.k);
@@ -771,6 +810,43 @@ pub fn main(init: std.process.Init) !u8 {
                 }
                 try dev.s.synchronize();
                 if (pass == 1) t_part[which] = ms(init.io) - t0;
+            }
+        }
+        if (!cs.prompt and kv_int8 and (device_time or digest)) {
+            if (prof) |*pp| {
+                var dns: [reps]u64 = undefined;
+                xpu.profile.active = pp;
+                for (0..2) |pass| {
+                    for (0..reps) |i| {
+                        pp.reset();
+                        try xpu.launch.dispatch(k.decode8, dev.s, launch.grid, .{ qd.at(), kv[i % sets].k.at(), kv[i % sets].kscale.at(), kv[i % sets].v.at(), kv[i % sets].vscale.at(), tabd.at(), meta.segs.at(), po.at(), pml.at(), meta.pos.at(), meta.seg_of.at(), @as(u32, H), @as(u32, KV), layer.ring, layer.window, launch.chunk, @as(u32, 0), launch.partials_rh, sc });
+                        try dev.s.synchronize();
+                        try pp.collect();
+                        if (pass == 1) dns[i] = pp.device_busy_ns;
+                    }
+                }
+                xpu.profile.active = null;
+                std.mem.sort(u64, &dns, {}, std.sort.asc(u64));
+                const med = @as(f64, @floatFromInt(dns[reps / 2 - 1] + dns[reps / 2])) / 2;
+                const lo_: usize = if (cs.window > 0) cs.k - rows + 1 -| cs.window else 0;
+                const by = @as(f64, @floatFromInt(cs.k - lo_)) * KV * (D + 4) * 2;
+                std.debug.print("DEVICE {s}: attention kernel device time {d:.2} us a launch, median of {d} (least {d:.2}, most {d:.2}), one launch a wait, {d:.1} MB of K and V, {d:.1} GB/s at the median\n", .{ cs.name, med / 1000, reps, @as(f64, @floatFromInt(dns[0])) / 1000, @as(f64, @floatFromInt(dns[reps - 1])) / 1000, by / 1e6, by / med });
+            }
+            if (digest) {
+                const po_n = @as(usize, rows) * H * stride * (D * 4);
+                const pml_n = @as(usize, rows) * H * stride * 8;
+                const zeros = try a.alloc(u8, po_n);
+                defer a.free(zeros);
+                @memset(zeros, 0);
+                try rig.put(po.ptr, zeros);
+                try rig.put(pml.ptr, zeros[0..pml_n]);
+                try xpu.launch.dispatch(k.decode8, dev.s, launch.grid, .{ qd.at(), kv[0].k.at(), kv[0].kscale.at(), kv[0].v.at(), kv[0].vscale.at(), tabd.at(), meta.segs.at(), po.at(), pml.at(), meta.pos.at(), meta.seg_of.at(), @as(u32, H), @as(u32, KV), layer.ring, layer.window, launch.chunk, @as(u32, 0), launch.partials_rh, sc });
+                try dev.s.synchronize();
+                var ho: [32]u8 = undefined;
+                var hm: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(try rig.bytes(po.ptr, po_n), &ho, .{});
+                std.crypto.hash.sha2.Sha256.hash(try rig.bytes(pml.ptr, pml_n), &hm, .{});
+                std.debug.print("DIGEST {s}: part_o {x} part_ml {x}\n", .{ cs.name, ho[0..16], hm[0..16] });
             }
         }
         const per_ns = @as(f64, @floatFromInt(t_decode)) / reps;
