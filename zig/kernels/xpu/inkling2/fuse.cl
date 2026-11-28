@@ -601,6 +601,11 @@ KERNEL(256) void tf_ink2_router_gemv(global const ushort *x, global const ushort
   if (lane == 0) scores[(size_t)row * 128 + expert] = rsig(dot);
 }
 
+static inline float4 rx4u(local const ushort *n, uint i) {
+  const uint b = i * 4;
+  return (float4)(bf2f(n[b]), bf2f(n[b + 1]), bf2f(n[b + 2]), bf2f(n[b + 3]));
+}
+
 // The dense norm, then the wide router GEMV. Group 0 stores the bf16 row. The GEMV reads that row from local.
 // Each lane loads its 18 weight pieces before the norm, so the weight reads run under the norm (the 8 groups of the
 // launch each compute the norm). The dot order is the one of tf_ink2_router_gemv.
@@ -610,8 +615,7 @@ KERNEL(256) void tf_ink2_router_norm_gemv(
   const uint row = get_group_id(1), lane = get_sub_group_local_id(), sg = get_sub_group_id(), t = get_local_id(0);
   if (row >= rows) return;
   local float red[16];
-  local uint4 normed4[H / 8];
-  local ushort *normed = (local ushort *)normed4;
+  local ushort normed[H];
   const uint expert = get_group_id(0) * 16 + sg;
   global const uint4 *w = (global const uint4 *)(weight + (size_t)(expert < 128 ? expert : 127) * H);
   uint4 a[18];
@@ -636,16 +640,15 @@ KERNEL(256) void tf_ink2_router_norm_gemv(
     for (uint u = 0; u < 9; ++u) {
       const uint at = (part * 9 + u) * 16 + lane;
       const uint4 wa = a[part * 9 + u];
-      // the 8 row values of this piece in one 16 B local load: value 8 * at + i is half i of the four words
-      const uint4 xv = normed4[at];
-      dot += as_float(wa.x << 16) * as_float(xv.x << 16);
-      dot += as_float(wa.x & 0xffff0000u) * as_float(xv.x & 0xffff0000u);
-      dot += as_float(wa.y << 16) * as_float(xv.y << 16);
-      dot += as_float(wa.y & 0xffff0000u) * as_float(xv.y & 0xffff0000u);
-      dot += as_float(wa.z << 16) * as_float(xv.z << 16);
-      dot += as_float(wa.z & 0xffff0000u) * as_float(xv.z & 0xffff0000u);
-      dot += as_float(wa.w << 16) * as_float(xv.w << 16);
-      dot += as_float(wa.w & 0xffff0000u) * as_float(xv.w & 0xffff0000u);
+      const float4 b0 = rx4u(normed, 2 * at), b1 = rx4u(normed, 2 * at + 1);
+      dot += as_float(wa.x << 16) * b0.x;
+      dot += as_float(wa.x & 0xffff0000u) * b0.y;
+      dot += as_float(wa.y << 16) * b0.z;
+      dot += as_float(wa.y & 0xffff0000u) * b0.w;
+      dot += as_float(wa.z << 16) * b1.x;
+      dot += as_float(wa.z & 0xffff0000u) * b1.y;
+      dot += as_float(wa.w << 16) * b1.z;
+      dot += as_float(wa.w & 0xffff0000u) * b1.w;
     }
   }
   dot = sub_group_reduce_add(dot);
