@@ -706,11 +706,17 @@ pub fn main(init: std.process.Init) !void {
             const t1 = nowNs(init.io);
             for (0..decode_steps) |_| {
                 const f0 = nowNs(init.io);
+                if (!digest) {
+                    // the draw of the serve path: the device pick (V7) unless XPU_GREEDY_HOST=1
+                    token = try greedyStep(m, &scratch, &cache, &r, host_logits[0..vocab], token);
+                    fwd_ns += nowNs(init.io) - f0;
+                    continue;
+                }
                 try ink.forward.run(m, &scratch, &cache, &.{token}, .{});
                 fwd_ns += nowNs(init.io) - f0;
                 cache.len += 1;
                 token = argmax(try lastLogits(&r, &cache, host_logits[0..vocab]));
-                if (digest) decode_digest.update(std.mem.sliceAsBytes(host_logits[0..vocab]));
+                decode_digest.update(std.mem.sliceAsBytes(host_logits[0..vocab]));
             }
             const total = secs(nowNs(init.io) - t1);
             std.debug.print("  decode: {d} steps at context {d}: {d:.2} tok/s ({d:.2} ms a token, {d:.2} ms of it the forward)\n", .{ decode_steps, ref.rows, @as(f64, @floatFromInt(decode_steps)) / total, 1000 * total / @as(f64, @floatFromInt(decode_steps)), 1000 * secs(fwd_ns) / @as(f64, @floatFromInt(decode_steps)) });
