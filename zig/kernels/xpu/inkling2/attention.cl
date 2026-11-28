@@ -53,42 +53,13 @@ static inline char q8(float v, float scale) {
   return (char)convert_int_sat(clamp(t, -127.0f, 127.0f));
 }
 
-// The relative-bias table inside the prep launch (p3-review R16 and V4): table unit `tu` owns distances 16 tu .. 16 tu + 15,
-// a distance a lane. It loads its 16 projection taps once, then for each query head makes the head's 16 relative values
-// as the query unit does (the same expressions, so the same bits) and sums them in tap order as tf_ink2_rel_table does.
-static inline void rel_table_unit(global const ushort *rel_raw, global const ushort *rel_scale, global const ushort *proj, global ushort *tab,
-                                  uint row, uint heads, uint tu, uint lane, uint is_global, float tau, float rel_clip) {
-  const uint d = tu * 16 + lane;
-  float pj[REL];
-  UNROLL
-  for (uint j = 0; j < REL; ++j) {
-#if INK2_CTL == 3
-    pj[j] = bf2f(proj[j * EXTENT + (d + 1) % EXTENT]);
-#else
-    pj[j] = bf2f(proj[j * EXTENT + d]);
-#endif
-  }
-  for (uint h = 0; h < heads; ++h) {
-    const size_t rh = (size_t)row * heads + h;
-    const float r = bf2f(rel_raw[rh * REL + lane]) * bf2f(rel_scale[h * REL + lane]);
-    const float rf = clip_factor(sub_group_reduce_add(r * r), rel_clip);
-    const ushort once = f2bf(r * rf);
-    const float rv = bf2f(is_global ? f2bf(bf2f(once) * tau) : once);
-    float acc = 0.0f;
-    UNROLL
-    for (uint j = 0; j < REL; ++j) acc += sub_group_broadcast(rv, j) * pj[j];
-    tab[rh * EXTENT + d] = f2bf(acc);
-  }
-}
-
 // One sub-group a (row, projection unit). Units 0 .. heads - 1 are query heads (q and the relative taps), then the K
-// heads, then the V heads, then `tab_units` units of the relative table (64, or 0 when a separate tf_ink2_rel_table launch
-// makes it). Independent q, k, v and relative rows keep their first bf16 rounding.
+// heads, then the V heads. Independent q, k, v and relative rows keep their first bf16 rounding.
 KERNEL(16) void tf_ink2_prep(global const ushort *q_raw, global const ushort *k_raw, global const ushort *v_raw, global const ushort *rel_raw,
                              global const ushort *q_scale, global const ushort *rel_scale, global const int *rpos, global const int *rseg,
                              global const InkSeg *segs, global ushort *q_out, global ushort *rel_out, global ushort *kc, global ushort *vc,
                              uint heads, uint kv_heads, uint ring, uint is_global, float qk_clip, float rel_clip, float floor_pos,
-                             float alpha, float eps, global const ushort *proj, global ushort *tab, uint tab_units) {
+                             float alpha, float eps) {
   const uint row = get_group_id(0), unit = get_group_id(1), lane = get_sub_group_local_id(), pos = (uint)rpos[row];
 #if INK2_CTL == 2
   const float tau = 1.0f;
@@ -112,10 +83,6 @@ KERNEL(16) void tf_ink2_prep(global const ushort *q_raw, global const ushort *k_
     const float rf = clip_factor(sub_group_reduce_add(r * r), rel_clip);
     const ushort once = f2bf(r * rf);
     rel_out[rh * REL + lane] = is_global ? f2bf(bf2f(once) * tau) : once;
-    return;
-  }
-  if (unit >= heads + 2 * kv_heads) {
-    rel_table_unit(rel_raw, rel_scale, proj, tab, row, heads, unit - heads - 2 * kv_heads, lane, is_global, tau, rel_clip);
     return;
   }
   const bool key = unit < heads + kv_heads;
@@ -144,8 +111,7 @@ KERNEL(16) void tf_ink2_prep8(global const ushort *q_raw, global const ushort *k
                               global const ushort *q_scale, global const ushort *rel_scale, global const int *rpos, global const int *rseg,
                               global const InkSeg *segs, global ushort *q_out, global ushort *rel_out, global char *kc, global float *ksc,
                               global char *vc, global float *vsc, uint heads, uint kv_heads, uint ring, uint is_global, float qk_clip,
-                              float rel_clip, float floor_pos, float alpha, float eps, global const ushort *proj, global ushort *tab,
-                              uint tab_units) {
+                              float rel_clip, float floor_pos, float alpha, float eps) {
   const uint row = get_group_id(0), unit = get_group_id(1), lane = get_sub_group_local_id(), pos = (uint)rpos[row];
 #if INK2_CTL == 2
   const float tau = 1.0f;
@@ -169,10 +135,6 @@ KERNEL(16) void tf_ink2_prep8(global const ushort *q_raw, global const ushort *k
     const float rf = clip_factor(sub_group_reduce_add(r * r), rel_clip);
     const ushort once = f2bf(r * rf);
     rel_out[rh * REL + lane] = is_global ? f2bf(bf2f(once) * tau) : once;
-    return;
-  }
-  if (unit >= heads + 2 * kv_heads) {
-    rel_table_unit(rel_raw, rel_scale, proj, tab, row, heads, unit - heads - 2 * kv_heads, lane, is_global, tau, rel_clip);
     return;
   }
   const bool key = unit < heads + kv_heads;
