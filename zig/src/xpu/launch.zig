@@ -56,6 +56,16 @@ fn setArg(k: Kernel, idx: u32, v: anytype) Error!void {
     }
 }
 
+/// A launch must set every argument of the kernel and no more (p3 Y-args: a tuple one short put a row count in a
+/// pointer argument and the kernel wrote through it). Checked before the first set, so a wrong tuple appends nothing.
+pub fn checkArgCount(k: Kernel, have: usize) Error!void {
+    const want = k.n_args orelse return;
+    if (have != want) {
+        std.log.err("launch of {s} with {d} arguments, the kernel takes {d}", .{ k.name, have, want });
+        return error.ArgCount;
+    }
+}
+
 /// How a launch argument is passed to the kernel parameter at its position.
 pub const ArgKind = enum { buffer, pointer, float, integer };
 
@@ -87,6 +97,7 @@ const IndirectFn = *const fn (ze.H, ze.H, *const anyopaque, ze.H, u32, ?[*]ze.H)
 
 /// Sets the arguments, then launches with the group count in device memory. Y is this rank's route count.
 pub fn dispatchIndirect(k: Kernel, s: Stream, groups: *anyopaque, args: anytype) Error!void {
+    try checkArgCount(k, args.len);
     inline for (args, 0..) |v, i| try setArg(k, i, v);
     const fnp = @constCast(k.ctx.d).lib.lookup(IndirectFn, "zeCommandListAppendLaunchKernelIndirect") orelse return error.MissingSymbol;
     try k.ctx.d.check(fnp(s.list, k.handle, groups, null, 0, null), "zeCommandListAppendLaunchKernelIndirect");
@@ -94,6 +105,7 @@ pub fn dispatchIndirect(k: Kernel, s: Stream, groups: *anyopaque, args: anytype)
 
 /// Sets every argument of the tuple in order (buffer, device pointer, f32 or u32) and queues the kernel.
 pub fn dispatch(k: Kernel, s: Stream, groups: [3]u32, args: anytype) Error!void {
+    try checkArgCount(k, args.len);
     if (profile.active) |p| return dispatchProfiled(p, k, s, groups, args);
     inline for (args, 0..) |v, i| try setArg(k, i, v);
     profile.last_kernel = k.name;

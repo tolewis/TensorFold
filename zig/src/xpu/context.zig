@@ -3,7 +3,8 @@
 const std = @import("std");
 const ze = @import("ze");
 
-pub const Error = ze.Error || error{ OutOfDeviceMemory, BuildFailed, OutOfMemory, Invalid };
+/// ArgCount: a launch with a tuple of a length other than the kernel's own argument count (launch.zig).
+pub const Error = ze.Error || error{ OutOfDeviceMemory, BuildFailed, OutOfMemory, Invalid, ArgCount };
 
 const out_of_device_memory: u32 = 0x70000002;
 

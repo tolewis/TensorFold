@@ -69,7 +69,10 @@ pub const Module = struct {
             std.log.err("kernel not in module: {s}", .{name});
             return e;
         };
-        return .{ .ctx = self.ctx, .handle = k, .name = name, .memo = Kernel.newMemo() };
+        // The kernel's own argument count, read one time a handle: each launch compares its tuple with it (launch.zig).
+        var kp: ze.KernelProperties = .{};
+        const n_args: ?u32 = if (d.api.zeKernelGetProperties(k, &kp) == 0) kp.numKernelArgs else null;
+        return .{ .ctx = self.ctx, .handle = k, .name = name, .memo = Kernel.newMemo(), .n_args = n_args };
     }
 };
 
@@ -85,6 +88,8 @@ pub const Kernel = struct {
     name: [:0]const u8 = "",
     /// Owned by the kernel, shared by its copies; freed by deinit. Null when the allocation failed (every set runs).
     memo: ?*ArgMemo = null,
+    /// The argument count of the kernel from the driver (zeKernelGetProperties), null when the driver did not give it.
+    n_args: ?u32 = null,
 
     pub fn deinit(self: *Kernel) void {
         _ = self.ctx.d.x.zeKernelDestroy(self.handle);
