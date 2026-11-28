@@ -568,11 +568,14 @@ pub fn tokEmit(ctx: *const Context) void {
             return rec.t[@intFromEnum(m)];
         }
     };
-    const line = std.fmt.bufPrint(&buf, "TOK {d} gen {d} path {d} fwd_dev {d:.1} launches {d} ev_launches {d} ev_busy {d:.1} ev_span {d:.1} ev_gap {d:.1} empties {d} empty_us {d:.2} syncs {d} dl_bytes {d} | waited {d:.1} fret {d:.1} sel_app {d:.1} sel_dev_start {d:.1} sel_dev_end {d:.1} sel_sync {d:.1} dl {d:.1} draw {d:.1} cp {d:.1} ret {d:.1} | next entry {d:.1} fstart {d:.1} uploaded {d:.1} first {d:.1} dev_start {d:.1} | own fstart {d:.1} uploaded {d:.1} first {d:.1} enqueued {d:.1} | cal {d} ns\n", .{
+    // std.fmt takes 32 arguments a call at most: the head of the line goes in a first call
+    const head = std.fmt.bufPrint(&buf, "TOK {d} gen {d} path {d} fwd_dev {d:.1} launches {d} ev_launches {d} ev_busy {d:.1} ev_span {d:.1} ev_gap {d:.1} empties {d} empty_us {d:.2} syncs {d} dl_bytes {d} | ", .{
         tok_k - 2,                     o.gen,                         o.path,                        fwd_us,
         o.launches,                    o.ev_launches,                 @as(f64, @floatFromInt(o.ev_busy)) / 1e3,
         @as(f64, @floatFromInt(o.ev_span)) / 1e3, @as(f64, @floatFromInt(o.ev_gap)) / 1e3, o.empties,
         empty_us,                      o.syncs,                       o.dl_bytes,
+    }) catch return;
+    const tail = std.fmt.bufPrint(buf[head.len..], "waited {d:.1} fret {d:.1} sel_app {d:.1} sel_dev_start {d:.1} sel_dev_end {d:.1} sel_sync {d:.1} dl {d:.1} draw {d:.1} cp {d:.1} ret {d:.1} | next entry {d:.1} fstart {d:.1} uploaded {d:.1} first {d:.1} dev_start {d:.1} | own fstart {d:.1} uploaded {d:.1} first {d:.1} enqueued {d:.1} | cal {d} ns\n", .{
         us(T.at(o, .waited), e),       us(T.at(o, .fret), e),         us(T.at(o, .sel_app), e),
         sel_s,                         sel_e,                         us(T.at(o, .sel_sync), e),
         us(T.at(o, .dl), e),           us(T.at(o, .draw), e),         us(T.at(o, .cp), e),
@@ -582,5 +585,5 @@ pub fn tokEmit(ctx: *const Context) void {
         us(T.at(o, .uploaded), e),     us(T.at(o, .first), e),        us(T.at(o, .enqueued), e),
         o.cal_ns,
     }) catch return;
-    tokWrite(line);
+    tokWrite(buf[0 .. head.len + tail.len]);
 }
