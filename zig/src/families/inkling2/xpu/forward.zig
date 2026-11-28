@@ -227,9 +227,14 @@ const Run = struct {
 
     fn bankAndReset(g: Run, rows: usize) !void {
         const s = g.sc;
-        // The second completed block of the previous pass is B12; its final p is P18. The prelude p is restored, but
-        // every visit's KV and convolution state remains live. The bank norms go to inv (a prompt-path buffer).
-        try loop.bankMessages(&g.p.loop, g.s, at(s.blocks, 2 * state.hidden * 2), at(s.p, 0), at(s.prelude, 0), at(s.bank0, 0), at(s.bank1, 0), at(s.inv, 0), tensor(g.m.weights.cross_queries), tensor(g.m.weights.cross_kv_queries), at(s.messages, 0), @intCast(rows), state.block_slots * state.hidden);
+        for (0..rows) |i| {
+            // The second completed block of the previous pass is B12; its final p is P18.
+            try g.copyBf16(at(s.blocks, (i * state.block_slots + 2) * state.hidden * 2), row(s.bank0, i, state.hidden * 2), state.hidden);
+        }
+        try g.copyBf16(at(s.p, 0), at(s.bank1, 0), rows * state.hidden);
+        try loop.crossPassMessageAttention(&g.p.loop, g.s, at(s.bank0, 0), at(s.bank1, 0), tensor(g.m.weights.cross_queries), tensor(g.m.weights.cross_kv_queries), at(s.messages, 0), @intCast(rows));
+        // The prelude p is restored, but every visit's KV and convolution state remains live.
+        try g.copyBf16(at(s.prelude, 0), at(s.p, 0), rows * state.hidden);
     }
 
     /// Widen, the attention residual, the three controller gates and the norms, in one launch.
