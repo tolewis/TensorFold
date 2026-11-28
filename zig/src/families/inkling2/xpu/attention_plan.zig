@@ -150,21 +150,7 @@ pub fn attendAs(r: Rows, l: Layer, stride: u32, path: Path) Error!Launch {
         const slots = chunks(@as(usize, r.last_pos), prompt_chunk);
         return .{ .path = .prompt, .grid = .{ blocks, r.kv_heads, slots }, .threads = prompt_threads, .merge_grid = merge_grid, .partials_rh = stride, .chunk = prompt_chunk };
     }
-    const chunk = decodeChunk(l, r.last_pos, stride);
-    return .{ .path = .decode, .grid = .{ r.rows * r.kv_heads, liveChunks(r, l, chunk), 1 }, .threads = decode_threads, .merge_grid = merge_grid, .partials_rh = stride, .chunk = chunk };
-}
-
-/// The decode grid's second dimension: the most live key chunks of one row, over the rows at positions
-/// `last_pos - rows + 1 .. last_pos` (p3-review R7). A row's chunk `c` takes work-group `c - first` (the first live chunk),
-/// so the partial slots and the merge do not change. It is at most the partial stride (`slotsFor`).
-pub fn liveChunks(r: Rows, l: Layer, chunk: u32) u32 {
-    var most: u32 = 1;
-    var p: u32 = r.last_pos + 1 - @min(r.rows, r.last_pos + 1);
-    while (p <= r.last_pos) : (p += 1) {
-        const lo: u32 = if (l.window > 0) (p + 1) -| l.window else 0;
-        most = @max(most, p / chunk + 1 - lo / chunk);
-    }
-    return most;
+    return .{ .path = .decode, .grid = .{ r.rows * r.kv_heads, stride, 1 }, .threads = decode_threads, .merge_grid = merge_grid, .partials_rh = stride, .chunk = decodeChunk(l, r.last_pos, stride) };
 }
 
 /// A chunk no smaller than 16 that yields about `flash_splits` splits, or the layer chunk when that does not fit.
