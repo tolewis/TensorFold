@@ -406,6 +406,9 @@ KERNEL(16) void tf_ink2_attn_decode(global const ushort *q, global const ushort 
 //     block read each in place of a gather.
 //   INK2_ATT_FEW=2 (A4): V codes in 4 block reads of four rows (ui8), the K read's layout: lane l holds dims 4l .. 4l + 3 and
 //     64 + 4l .. 64 + 4l + 3 of each row. Each dim keeps its own sum in key order, so only the lane that holds it changes.
+//   INK2_ATT_KAHEAD=1 (A6): only the K codes and K scale of tile t + 1 are sent before the arithmetic of tile t; the V
+//     rows of tile t are sent at the start of tile t, before its dot. One tile's K (32 GRF) more than the shipped kernel,
+//     where A1 holds one whole tile (64 GRF) more.
 //   INK2_ATT_SPLIT (time-only forms, wrong output bits): 1 the loads only (K codes, V codes, scales), folded by XOR into
 //     the partials so that no load is removed. 2 the K side only (K codes, K scale, the dot, the running top and sum, no V
 //     load). 3 every load and the K side, no V arithmetic (the V codes and scale folded by XOR).
@@ -418,9 +421,15 @@ KERNEL(16) void tf_ink2_attn_decode(global const ushort *q, global const ushort 
 #ifndef INK2_ATT_SPLIT
 #define INK2_ATT_SPLIT 0
 #endif
+#ifndef INK2_ATT_KAHEAD
+#define INK2_ATT_KAHEAD 0
+#endif
+#if INK2_ATT_KAHEAD && (INK2_ATT_AHEAD || INK2_ATT_SPLIT)
+#error INK2_ATT_KAHEAD goes with INK2_ATT_FEW only
+#endif
 #define INK2_ATT_V (INK2_ATT_SPLIT != 2)
 
-#if INK2_ATT_AHEAD || INK2_ATT_FEW || INK2_ATT_SPLIT
+#if INK2_ATT_AHEAD || INK2_ATT_FEW || INK2_ATT_SPLIT || INK2_ATT_KAHEAD
 typedef struct {
   uint kr[4][8];
 #if INK2_ATT_FEW == 2
@@ -433,9 +442,8 @@ typedef struct {
   float ksc, vsc; // this lane's key's scales
 } InkTile;
 
-// The loads of the tile at ring slot t0, in the order of the shipped kernel: V rows, then K slabs, then the scales.
-static inline void ink_tile_load(InkTile *t, global const char *kh, global const char *vh, global const float *ks,
-                                 global const float *vs, uint t0) {
+// The V rows and the V scale of the tile at ring slot t0.
+static inline void ink_tile_load_v(InkTile *t, global const char *vh, global const float *vs, uint t0) {
 #if INK2_ATT_V
 #if INK2_ATT_FEW == 2
   UNROLL
@@ -451,7 +459,16 @@ static inline void ink_tile_load(InkTile *t, global const char *kh, global const
   UNROLL
   for (uint k = 0; k < 16; ++k) t->vr[k] = intel_sub_group_block_read_uc8(vh + (size_t)(t0 + k) * D);
 #endif
+#if INK2_ATT_FEW
+  t->vsc = as_float(intel_sub_group_block_read((global const uint *)(vs + t0)));
+#else
+  t->vsc = vs[t0 + get_sub_group_local_id()];
 #endif
+#endif
+}
+
+// The K slabs and the K scale of the tile at ring slot t0.
+static inline void ink_tile_load_k(InkTile *t, global const char *kh, global const float *ks, uint t0) {
   global const char *kt = kh + (size_t)(t0 / 16) * 2048;
   UNROLL
   for (uint j = 0; j < 4; ++j) {
@@ -461,16 +478,16 @@ static inline void ink_tile_load(InkTile *t, global const char *kh, global const
   }
 #if INK2_ATT_FEW
   t->ksc = as_float(intel_sub_group_block_read((global const uint *)(ks + t0)));
-#if INK2_ATT_V
-  t->vsc = as_float(intel_sub_group_block_read((global const uint *)(vs + t0)));
-#endif
 #else
-  const uint lane = get_sub_group_local_id();
-  t->ksc = ks[t0 + lane];
-#if INK2_ATT_V
-  t->vsc = vs[t0 + lane];
+  t->ksc = ks[t0 + get_sub_group_local_id()];
 #endif
-#endif
+}
+
+// The loads of the tile at ring slot t0, in the order of the shipped kernel: V rows, then K slabs. The scales follow.
+static inline void ink_tile_load(InkTile *t, global const char *kh, global const char *vh, global const float *ks,
+                                 global const float *vs, uint t0) {
+  ink_tile_load_v(t, vh, vs, t0);
+  ink_tile_load_k(t, kh, ks, t0);
 }
 
 // Code `i` of V row `k` of the tile for this lane, as the shipped kernel reads it (a signed code), dims of acc slot i.
@@ -520,7 +537,16 @@ KERNEL(16) void tf_ink2_attn_decode8(global const ushort *q, global const char *
   // buf[0] holds the tile in work, buf[1 .. AHEAD] the next tiles, already requested. `tl` is the ring slot of the next
   // tile to request, `asked` the count requested.
   InkTile buf[INK2_ATT_AHEAD + 1];
-  uint tl = kfirst % ring, at0 = tl, asked = 0;
+  uint tl = kfirst % ring, asked = 0;
+#if INK2_ATT_KAHEAD
+  // A6: `kn` holds the K of the next tile, `tv` is the ring slot of the tile in work
+  InkTile kn;
+  uint tv = tl;
+  ink_tile_load_k(&kn, kh, ks, tl);
+  tl += 16;
+  if (tl == ring) tl = 0;
+  asked = 1;
+#endif
   UNROLL
   for (uint i = 0; i < INK2_ATT_AHEAD; ++i)
     if (asked < tiles) {
@@ -530,12 +556,29 @@ KERNEL(16) void tf_ink2_attn_decode8(global const ushort *q, global const char *
       ++asked;
     }
   for (uint ti = 0; ti < tiles; ++ti) {
+#if INK2_ATT_KAHEAD
+    ink_tile_load_v(&buf[0], vh, vs, tv);
+    tv += 16;
+    if (tv == ring) tv = 0;
+    UNROLL
+    for (uint j = 0; j < 4; ++j)
+      UNROLL
+      for (uint i = 0; i < 8; ++i) buf[0].kr[j][i] = kn.kr[j][i];
+    buf[0].ksc = kn.ksc;
+    if (asked < tiles) {
+      ink_tile_load_k(&kn, kh, ks, tl);
+      tl += 16;
+      if (tl == ring) tl = 0;
+      ++asked;
+    }
+#else
     if (asked < tiles) {
       ink_tile_load(&buf[INK2_ATT_AHEAD], kh, vh, ks, vs, tl);
       tl += 16;
       if (tl == ring) tl = 0;
       ++asked;
     }
+#endif
     const uint kp0 = kfirst + 16 * ti;
     const uint kp = kp0 + lane;
     const bool live = kp >= from && kp < to;
