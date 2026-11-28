@@ -114,6 +114,13 @@ pub fn main(init: std.process.Init) !u8 {
                 const dt = ms(init.io) - t0;
                 best_ns = @min(best_ns, dt);
             }
+            // the output of the last call (ids set 63), as sha256: a variant's bits against the base
+            const got = try a.alloc(u8, ob.len);
+            defer a.free(got);
+            try ob.download(s, 0, got);
+            var hash: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(got, &hash, .{});
+            std.debug.print("{s} {s} rows {d}: output sha256 {x}\n", .{ @tagName(fmt), if (gu) "gu  " else "down", rows, hash[0..8] });
             const bytes = @as(f64, @floatFromInt(unique)) * @as(f64, @floatFromInt(per_w + per_s)) * @as(f64, @floatFromInt(reps));
             const gbs = bytes / @as(f64, @floatFromInt(best_ns));
             if (rows == 1) {
