@@ -10,12 +10,15 @@ const profile = @import("profile.zig");
 
 /// `getenv(name)` read one time a process. The token path reads its switches through this, not `getenv` a launch.
 pub fn envOnce(comptime name: [:0]const u8) ?[*:0]const u8 {
+    // The name must be a declaration of S: a struct that does not use it is one type for every name, and all
+    // names would share the first name's value.
     const S = struct {
+        const key = name;
         var read: bool = false;
         var value: ?[*:0]const u8 = null;
     };
     if (!@atomicLoad(bool, &S.read, .acquire)) {
-        S.value = std.c.getenv(name);
+        S.value = std.c.getenv(S.key);
         @atomicStore(bool, &S.read, true, .release);
     }
     return S.value;
@@ -143,4 +146,13 @@ test "argument kinds follow the Zig type" {
     try std.testing.expectEqual(ArgKind.integer, argKind(u32));
     try std.testing.expectEqual(ArgKind.integer, argKind(comptime_int));
     try std.testing.expectEqual(ArgKind.integer, argKind(usize));
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
+test "envOnce keeps one value a name" {
+    _ = setenv("TF_ENVONCE_TEST_A", "a1", 1);
+    try std.testing.expectEqualStrings("a1", std.mem.span(envOnce("TF_ENVONCE_TEST_A").?));
+    try std.testing.expect(envOnce("TF_ENVONCE_TEST_B") == null);
+    try std.testing.expectEqualStrings("a1", std.mem.span(envOnce("TF_ENVONCE_TEST_A").?));
 }
