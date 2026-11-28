@@ -141,7 +141,7 @@ pub const Profile = struct {
 
     /// Room for `capacity` launches a pass; with `device_time` each gets a kernel-timestamp event.
     pub fn init(ctx: *const Context, capacity: usize, device_time: bool) Error!Profile {
-        var p: Profile = .{ .ctx = ctx, .recs = try gpa.alloc(Rec, capacity), .device_time = device_time };
+        var p: Profile = .{ .ctx = ctx, .recs = try gpa.alloc(Rec, capacity), .device_time = device_time, .skip_base = memo_skips };
         if (device_time) {
             const d = ctx.d;
             var device = ctx.gpu.device;
