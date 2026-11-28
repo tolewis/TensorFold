@@ -125,19 +125,10 @@ pub fn seg1(p: *const Kernels, s: xpu.Stream, x: [5]Ref, w: [5]Ref, y: [5]Ref, n
 }
 
 pub fn seg1Sink(p: *const Kernels, s: xpu.Stream, x: [5]Ref, w: [5]Ref, y: [5]Ref, n: [5]u32, k: u32, sink_w: Ref, sink_y: Ref, sink_n: u32, sink_on: u32) !void {
-    try xpu.launch.dispatch(p.seg1, s, .{ seg1Groups(groupColumns(p, 1), n), 1, 1 }, .{
+    try xpu.launch.dispatch(p.seg1, s, .{ seg1Groups(p.columns, n), 1, 1 }, .{
         x[0], x[1], x[2], x[3], x[4], w[0], w[1], w[2], w[3], w[4], y[0], y[1], y[2], y[3], y[4],
         n[0], n[1], n[2], n[3], n[4], k, sink_w, sink_y, sink_n, sink_on,
     });
-}
-
-/// Output columns a sub-group of a one-row kernel (dense_q8_1, head_q8_1, dense_q8_seg1) takes: dense_q8.cl's Q8_COLS1
-/// (p3-review R5).
-pub const one_row_columns: u32 = 2;
-
-/// Output columns a work-group of the `lead`-row dense or head kernel covers.
-pub fn groupColumns(p: *const Kernels, lead: u32) u32 {
-    return if (lead == 1) p.columns * one_row_columns else p.columns;
 }
 
 /// The flat grid of seg1: every segment's column groups in order (p3-review R4), so no work-group is past its segment's n.
@@ -176,8 +167,7 @@ pub fn seg8(p: *const Kernels, s: xpu.Stream, x: [5]Ref, w: [5]Ref, y: [5]Ref, n
 
 pub fn matvec(p: *const Kernels, s: xpu.Stream, lead: u32, weight: Ref, input: Ref, out: Ref, wide: ?*anyopaque, rows: u32, n: u32, k: u32, ldy: u32) !void {
     std.debug.assert(rows > 0 and rows <= lead and n > 0 and k > 0 and k % 256 == 0 and ldy >= n);
-    const cols = groupColumns(p, lead);
-    try xpu.launch.dispatch(p.dense[variantOf(lead)], s, .{ (n + cols - 1) / cols, 1, 1 }, .{ input, weight, out, wide, rows, n, k, ldy });
+    try xpu.launch.dispatch(p.dense[variantOf(lead)], s, .{ (n + p.columns - 1) / p.columns, 1, 1 }, .{ input, weight, out, wide, rows, n, k, ldy });
 }
 
 /// out[rows][n] = bf16(input[rows][k] . dequant(weight)[n][k]) with FP32 sums. Rows go 32, 16, 8, 4, 2, 1 at a time; each
@@ -213,8 +203,7 @@ pub fn headLaunch(p: *const Kernels, s: xpu.Stream, lead: u32, weight: Ref, h: R
     std.debug.assert(rows > 0 and vocab > 0);
     if (!tileHead()) {
         std.debug.assert(rows <= lead);
-        const cols = groupColumns(p, lead);
-        try xpu.launch.dispatch(p.head[variantOf(lead)], s, .{ (vocab + cols - 1) / cols, 1, 1 }, .{ h, weight, out, rows, vocab });
+        try xpu.launch.dispatch(p.head[variantOf(lead)], s, .{ (vocab + p.columns - 1) / p.columns, 1, 1 }, .{ h, weight, out, rows, vocab });
         return;
     }
     var base: u32 = 0;
