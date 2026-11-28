@@ -371,6 +371,10 @@ static inline void P(finish_one)(const uint ks, float acc, local float *part, __
   }
 }
 
+// p3-read-fix section 14: P2 on (x in one block read a chunk) in the engine kernel.
+#ifndef P3RF_P2
+#define P3RF_P2 1
+#endif
 #if defined(P3RF_P1) || defined(P3RF_P2) || defined(P3RF_P3) || defined(P3RF_LOADS) || defined(P3RF_ARITH)
 // p3-read-fix section 13 (lever 3): access-pattern variants of the whole-line one-row loop, build switches, off by
 // default. The decode, the dot and the order of every sum are the base ones; only the order, the width and the count
