@@ -351,6 +351,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--attn-splits-window")) {
             i += 1;
             ink.attention_plan.flash_splits_window = try std.fmt.parseInt(u32, argv[i], 10);
+            std.debug.print("attn splits window {d}\n", .{ink.attention_plan.flash_splits_window});
         } else if (std.mem.eql(u8, a, "--fuse-check")) {
             fuse_check = true;
         } else if (std.mem.eql(u8, a, "--router-check")) {
