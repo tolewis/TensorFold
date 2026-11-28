@@ -15,7 +15,10 @@
 //!
 //! `--digest` prints SHA-256 digests of the bits of every logit row computed (prompt rows, then decode steps), to compare
 //! two builds for bit identity. `--profile` adds eight profiled decode steps: launches by kernel, host and device time.
-//! `--bench-context C` times N decode steps (default 32) at context C with no prompt: K/V is zeroed, only the cost is real.
+//! `--bench-context C` times N decode steps (default 32) at context C with no prompt: K/V holds data that is not zero
+//! (`benchFill`, p3-review R13), only the cost is real. `--bench-fill zero` zeroes K/V instead (the fill before R13: the
+//! attention kernels read zero pages faster than real K/V). `--bench-fill zerocopy` writes zero bytes by a copy, not by a
+//! memory fill (it tells a fill-op effect from a zero-data effect).
 //! `--capacity N` makes the cache hold at least N positions (else the tool sizes it from the longest prompt or context).
 //!
 //! A reference file holds the token ids of a prompt and, for every position, the reference's top 16 token ids and
@@ -99,6 +102,8 @@ fn argmax(row: []const f32) u32 {
 }
 
 /// The two largest values of a row: the index of the first and the values.
+const BenchFill = enum { data, zero, zerocopy };
+
 const Top2 = struct { id: u32, first: f32, second: f32 };
 fn top2(row: []const f32) Top2 {
     var a: usize = 0;
@@ -249,6 +254,7 @@ pub fn main(init: std.process.Init) !void {
     var two_slot: ?[2]usize = null;
     var route_union = false;
     var bench_context: ?usize = null;
+    var bench_fill: BenchFill = .data;
     var bench_prefill: usize = 0;
     var capacity_min: usize = 0;
     var options: ink.model.Options = .{ .embed_host = false };
@@ -385,6 +391,9 @@ pub fn main(init: std.process.Init) !void {
             // the cache capacity at least N positions, apart from the bench context (the server's INK_CONTEXT is 131,072)
             i += 1;
             capacity_min = try std.fmt.parseInt(usize, argv[i], 10);
+        } else if (std.mem.eql(u8, a, "--bench-fill")) {
+            i += 1;
+            bench_fill = std.meta.stringToEnum(BenchFill, argv[i]) orelse return error.BadBenchFill;
         } else if (std.mem.eql(u8, a, "--bench-context")) {
             i += 1;
             bench_context = try std.fmt.parseInt(usize, argv[i], 10);
@@ -756,9 +765,11 @@ pub fn main(init: std.process.Init) !void {
     if (bench_context) |context| {
         var cache = try state.Cache.init(&r, capacity, &schedule, kv_dtype);
         defer cache.deinit();
-        // zeroed K/V: every global position reads as a valid, empty row
+        // zeroed K/V: every global position reads as a valid, empty row; then K/V data that is not zero unless --bench-fill zero
         for (&cache.slots) |*sl| try state.zero(&r, sl.buf, sl.buf.len);
         try r.sync();
+        if (bench_fill != .zero) try benchFill(&r, gpa, &cache, bench_fill == .zerocopy);
+        std.debug.print("bench fill {t}\n", .{bench_fill});
         cache.len = context;
         var token: u32 = 1;
         for (0..4) |_| {
@@ -789,6 +800,57 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("\nDIGEST prompt logits {x}\nDIGEST decode logits {x}\n", .{ &a, &b });
     }
     std.debug.print("\nDONE top-1 differences {d}\n", .{overall_diffs});
+}
+
+/// The K/V of every visit slot with data that is not zero (p3-review R13): bf16 values uniform in [-2, 2]; int8 codes
+/// uniform in [-127, 127] with fp32 scales uniform in [0.005, 0.05]. One 32 MiB random pattern a kind on the card, copied
+/// over each piece of each slot ([K values][K scales][V values][V scales]).
+/// `zeros`: the same copies of a zero pattern.
+fn benchFill(r: *xpu.rt.Runtime, gpa: std.mem.Allocator, cache: *state.Cache, zeros: bool) !void {
+    const pat_bytes: usize = 32 << 20;
+    const host = try gpa.alloc(u8, pat_bytes);
+    defer gpa.free(host);
+    var prng = std.Random.DefaultPrng.init(0x13b3);
+    const rng = prng.random();
+    var pats: [3]xpu.rt.Buffer = undefined; // bf16 values, int8 codes, fp32 scales
+    var made: usize = 0;
+    defer for (pats[0..made]) |*p| p.free();
+    for (0..3) |kind| {
+        switch (kind) {
+            0 => for (std.mem.bytesAsSlice(u16, host)) |*v| {
+                v.* = @truncate(@as(u32, @bitCast((rng.float(f32) - 0.5) * 4.0)) >> 16);
+            },
+            1 => for (host) |*c| {
+                c.* = @bitCast(@as(i8, @intCast(rng.intRangeAtMost(i32, -127, 127))));
+            },
+            else => for (std.mem.bytesAsSlice(f32, host)) |*v| {
+                v.* = 0.005 + rng.float(f32) * 0.045;
+            },
+        }
+        if (zeros) @memset(host, 0);
+        pats[kind] = try r.alloc(pat_bytes);
+        made += 1;
+        try r.upload(pats[kind], host);
+        try r.sync();
+    }
+    const int8 = cache.kv == .int8;
+    for (&cache.slots) |*sl| {
+        const val = sl.key_scale_at - sl.key_at;
+        const sc = sl.value_at - sl.key_scale_at;
+        const pieces = [_][3]usize{ .{ sl.key_at, val, 0 }, .{ sl.key_scale_at, sc, 2 }, .{ sl.value_at, val, 0 }, .{ sl.value_scale_at, sc, 2 } };
+        for (pieces) |pc| {
+            if (pc[1] == 0) continue;
+            const pat = if (pc[2] == 2) pats[2] else if (int8) pats[1] else pats[0];
+            var done: usize = 0;
+            while (done < pc[1]) {
+                const n = @min(pat_bytes, pc[1] - done);
+                const dst = xpu.rt.Buffer{ .rt = r, .ptr = @ptrFromInt(@intFromPtr(sl.buf.ptr.?) + pc[0] + done), .len = n };
+                try r.copy(dst, pat, n);
+                done += n;
+            }
+        }
+    }
+    try r.sync();
 }
 
 /// Plain decode steps again, once with launch counts and host times only and once with a device timestamp on every kernel.
