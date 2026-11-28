@@ -28,6 +28,8 @@ pub const Pipelines = struct {
     expert_combine: xpu.Kernel,
     /// The K and the V dynamic convolution of a visit in one launch (the production image only).
     conv_dynamic_kv: ?xpu.Kernel = null,
+    /// The same launch with the S7 projection (one sub-group a projected value, other bits), off by default.
+    conv_dynamic_kv_sg: ?xpu.Kernel = null,
 
     /// The kernels of a loaded image. A contract control's image holds the same kernels under `tf_ctl_inkling2_*`.
     pub fn load(module: xpu.Module, control: bool) !Pipelines {
@@ -51,6 +53,7 @@ pub const Pipelines = struct {
             .expert_pick = made[@backingInt(plan.Kind.expert_pick)],
             .expert_combine = made[@backingInt(plan.Kind.expert_combine)],
             .conv_dynamic_kv = if (control) null else try module.kernel("tf_inkling2_conv_dynamic_kv", group),
+            .conv_dynamic_kv_sg = if (control) null else try module.kernel("tf_inkling2_conv_dynamic_kv_sg", group),
         };
     }
 
@@ -94,10 +97,10 @@ pub fn convDynamic(p: *const Pipelines, s: xpu.Stream, history: Ref, current: Re
 }
 
 /// The K and the V dynamic convolution of a visit, one launch of (rows, 2) work-groups. Each work-group runs the code
-/// of `convDynamic` for its role.
-pub fn convDynamicKv(p: *const Pipelines, s: xpu.Stream, k: [7]Ref, v: [7]Ref, rows: u32, channels: u32, commit1: u32) !void {
+/// of `convDynamic` for its role. `sg`: the S7 projection (INK2_CONV_DYN_SG=1).
+pub fn convDynamicKv(p: *const Pipelines, s: xpu.Stream, k: [7]Ref, v: [7]Ref, rows: u32, channels: u32, commit1: u32, sg: bool) !void {
     std.debug.assert(rows > 0 and channels > 0 and channels <= 1024);
-    try xpu.launch.dispatch(p.conv_dynamic_kv.?, s, .{ rows, 2, 1 }, .{ k[0], k[1], k[2], k[3], k[4], k[5], k[6], v[0], v[1], v[2], v[3], v[4], v[5], v[6], rows, channels, commit1 });
+    try xpu.launch.dispatch(if (sg) p.conv_dynamic_kv_sg.? else p.conv_dynamic_kv.?, s, .{ rows, 2, 1 }, .{ k[0], k[1], k[2], k[3], k[4], k[5], k[6], v[0], v[1], v[2], v[3], v[4], v[5], v[6], rows, channels, commit1 });
 }
 
 /// Router IDs and weights are sorted by ascending expert index for the deterministic expert sum.

@@ -240,6 +240,16 @@ pub fn argmax(p: *const Pipelines, s: xpu.Stream, logits: Ref, scratch: Ref, out
     try xpu.launch.dispatch(p.argmax_final, s, .{ 1, 1, 1 }, .{ scratch, ids, out, argmax_parts });
 }
 
+/// S7 variant, off by default: `INK2_CONV_DYN_SG=1` gives each projected value of the dynamic convolution to one
+/// sub-group (other bits).
+pub fn convDynSg() bool {
+    if (std.c.getenv("INK2_CONV_DYN_SG")) |p| {
+        const v = std.mem.span(p);
+        return v.len > 0 and v[0] == '1';
+    }
+    return false;
+}
+
 /// `XPU_GREEDY_HOST=1` keeps the greedy draw on the host (the 800 KB logit download and a second wait).
 pub fn greedyDevice() bool {
     if (std.c.getenv("XPU_GREEDY_HOST")) |p| {

@@ -418,7 +418,7 @@ const Run = struct {
                 if (commit1 != 0) if (g.wrote) |mask| {
                     mask[v.cache_slot] = mask[v.cache_slot] | 0x3;
                 };
-                try glue.convDynamicKv(&g.p.glue, g.s, g.dynamicConvArgs(cache, v, base, true), g.dynamicConvArgs(cache, v, base, false), @intCast(rows), g.m.options.place.kvWidth(), commit1);
+                try glue.convDynamicKv(&g.p.glue, g.s, g.dynamicConvArgs(cache, v, base, true), g.dynamicConvArgs(cache, v, base, false), @intCast(rows), g.m.options.place.kvWidth(), commit1, fuse.convDynSg());
             } else {
                 try g.convInputForAttention(cache, v, base, rows, true);
                 try g.convInputForAttention(cache, v, base, rows, false);

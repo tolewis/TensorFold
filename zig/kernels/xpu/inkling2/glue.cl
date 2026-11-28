@@ -52,7 +52,8 @@ static inline float lane_sum16(local const float *r) {
 static inline void conv_dynamic_row(global const ushort *history, global const ushort *current, global ushort *taps,
                                     global const ushort *input, global const ushort *static_w,
                                     global const ushort *projection, global ushort *out, uint r, uint channels,
-                                    uint flip, uint commit1, local float *projected, local float4 *xs) {
+                                    uint flip, uint commit1, local float *projected, local float4 *xs,
+                                    uint sg_dot) {
   const uint t = get_local_id(0);
   global const uint2 *xg = (global const uint2 *)(input + (ulong)r * INK_HIDDEN);
   for (uint i = t; i < INK_HIDDEN / 4; i += 256) {
@@ -60,7 +61,31 @@ static inline void conv_dynamic_row(global const ushort *history, global const u
     xs[i] = (float4)(as_float(v.x << 16), as_float(v.x & 0xffff0000u), as_float(v.y << 16), as_float(v.y & 0xffff0000u));
   }
   barrier(CLK_LOCAL_MEM_FENCE);
-  if (t < 32) {
+  if (sg_dot) {
+    // S7 variant (INK2_CONV_DYN_SG=1, other bits): sub-group g owns the projected values 2g and 2g + 1. A lane adds
+    // the 144 products of its 18 pieces (piece 16k + lane), then the sub-group adds the 16 lane sums.
+    const uint lane = get_sub_group_local_id(), g = get_sub_group_id();
+    for (uint j = 0; j < 2; ++j) {
+      const uint pv = 2 * g + j;
+      global const uint4 *w = (global const uint4 *)(projection + (ulong)pv * INK_HIDDEN);
+      float dot = 0.0f;
+      for (uint k = 0; k < INK_HIDDEN / 128; ++k) {
+        const uint i = 16 * k + lane;
+        const uint4 a = w[i];
+        const float4 b0 = xs[2 * i], b1 = xs[2 * i + 1];
+        dot += as_float(a.x << 16) * b0.x;
+        dot += as_float(a.x & 0xffff0000u) * b0.y;
+        dot += as_float(a.y << 16) * b0.z;
+        dot += as_float(a.y & 0xffff0000u) * b0.w;
+        dot += as_float(a.z << 16) * b1.x;
+        dot += as_float(a.z & 0xffff0000u) * b1.y;
+        dot += as_float(a.w << 16) * b1.z;
+        dot += as_float(a.w & 0xffff0000u) * b1.w;
+      }
+      const float sum = sub_group_reduce_add(dot);
+      if (lane == 0) projected[pv] = bf2f(f2bf(sum));
+    }
+  } else if (t < 32) {
     // One work-item adds one projected value's products in order d = 0 to 2303, each product rounded, then added.
     global const uint4 *w = (global const uint4 *)(projection + (ulong)t * INK_HIDDEN);
     float dot = 0.0f;
@@ -109,6 +134,20 @@ static inline void conv_dynamic_row(global const ushort *history, global const u
       hw[2 * channels + c] = cur;
     }
   }
+}
+
+// The K and V dynamic convolution of a visit: group (r, role) runs row r of K (role 0) or V (role 1).
+static inline void conv_dynamic_kv_body(
+    global const ushort *hk, global const ushort *ck, global ushort *tk, global const ushort *xk, global const ushort *sk,
+    global const ushort *pk, global ushort *ok, global const ushort *hv, global const ushort *cv, global ushort *tv,
+    global const ushort *xv, global const ushort *sv, global const ushort *pv, global ushort *ov, uint rows, uint channels,
+    uint commit1, uint sg_dot, local float *projected, local float4 *xs) {
+  const uint r = get_group_id(0), role = get_group_id(1);
+  if (r >= rows) return;
+  if (role == 0)
+    conv_dynamic_row(hk, ck, tk, xk, sk, pk, ok, r, channels, 0, rows == 1 ? commit1 : 0, projected, xs, sg_dot);
+  else
+    conv_dynamic_row(hv, cv, tv, xv, sv, pv, ov, r, channels, 0, rows == 1 ? commit1 : 0, projected, xs, sg_dot);
 }
 
 // Grid (rows). out[row] = bf16(weight * (table[ids[row]] * rsqrt(mean(table[ids[row]]^2) + eps))).
@@ -229,7 +268,7 @@ KERNEL(256) void tf_inkling2_conv_dynamic(global const ushort *history, global c
   if (r >= rows) return;
   local float projected[32];
   local float4 xs[INK_HIDDEN / 4];
-  conv_dynamic_row(history, current, taps, input, static_w, projection, out, r, channels, 0, 0, projected, xs);
+  conv_dynamic_row(history, current, taps, input, static_w, projection, out, r, channels, 0, 0, projected, xs, 0);
 }
 
 // Grid (rows, 2): the K (group 0 of the second dimension) and the V dynamic convolution of a visit in one launch.
@@ -240,14 +279,20 @@ KERNEL(256) void tf_inkling2_conv_dynamic_kv(
     global const ushort *pk, global ushort *ok, global const ushort *hv, global const ushort *cv, global ushort *tv,
     global const ushort *xv, global const ushort *sv, global const ushort *pv, global ushort *ov, uint rows, uint channels,
     uint commit1) {
-  const uint r = get_group_id(0), role = get_group_id(1);
-  if (r >= rows) return;
   local float projected[32];
   local float4 xs[INK_HIDDEN / 4];
-  if (role == 0)
-    conv_dynamic_row(hk, ck, tk, xk, sk, pk, ok, r, channels, 0, rows == 1 ? commit1 : 0, projected, xs);
-  else
-    conv_dynamic_row(hv, cv, tv, xv, sv, pv, ov, r, channels, 0, rows == 1 ? commit1 : 0, projected, xs);
+  conv_dynamic_kv_body(hk, ck, tk, xk, sk, pk, ok, hv, cv, tv, xv, sv, pv, ov, rows, channels, commit1, 0, projected, xs);
+}
+
+// S7 variant (INK2_CONV_DYN_SG=1, other bits): the projection with one sub-group a projected value.
+KERNEL(256) void tf_inkling2_conv_dynamic_kv_sg(
+    global const ushort *hk, global const ushort *ck, global ushort *tk, global const ushort *xk, global const ushort *sk,
+    global const ushort *pk, global ushort *ok, global const ushort *hv, global const ushort *cv, global ushort *tv,
+    global const ushort *xv, global const ushort *sv, global const ushort *pv, global ushort *ov, uint rows, uint channels,
+    uint commit1) {
+  local float projected[32];
+  local float4 xs[INK_HIDDEN / 4];
+  conv_dynamic_kv_body(hk, ck, tk, xk, sk, pk, ok, hv, cv, tv, xv, sv, pv, ov, rows, channels, commit1, 1, projected, xs);
 }
 
 // Grid (rows). Sigmoid scores of 128 experts; the top 8 by score + bias, sorted by ascending expert index.
