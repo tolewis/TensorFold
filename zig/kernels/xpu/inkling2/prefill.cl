@@ -260,7 +260,7 @@ KERNEL(128) void tf_ink2_pf_q8(global const ushort *xp, global const uchar *w, g
     _Pragma("unroll") for (uint a = 0; a < PF_WA; a++)
       _Pragma("unroll") for (uint r = 0; r < 8; r++) {
         const uint wr = min(wrow0 + 8 * a + r, n - 1);
-        cv[a][r] = intel_sub_group_block_read4((global const uint *)(w + (ulong)wr * k + plane * 256)); // q8.zig word layout
+        cv[a][r] = *(global const uint4 *)(w + (ulong)wr * k + plane * 256 + lane * 16);
       }
     _Pragma("unroll") for (uint b = 0; b < 8; b++) {
       float8 sc[PF_WA];

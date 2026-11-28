@@ -8,8 +8,8 @@
 // only change against the bf16 kernel (dense.cl) is the weights' own rounding.
 //
 // Work split. A sub-group of 16 owns one output column j and reads its row once for every row of x (1, 2, 4, 8, 16 or
-// 32). A row of codes is k / 256 planes of 256 bytes (see q8.zig): one sub-group block read of a plane gives lane l 16
-// bytes, its two values of each of the eight blocks 8p to 8p + 7. The activation's matching words come from a sub-group block read, so lane l holds
+// 32). A row of codes is k / 256 planes of 256 bytes (see q8.zig): in plane p lane l loads 16 bytes, its two values of each
+// of the eight blocks 8p to 8p + 7. The activation's matching words come from a sub-group block read, so lane l holds
 // values 2l and 2l + 1 of every block, and a block's scale is the same in all lanes:
 //
 //     acc += scale[b] * (code[2l] * x[2l] + code[2l + 1] * x[2l + 1])        for each block b of the row, per lane
@@ -99,7 +99,7 @@ static inline float q8_cap(float x, float c) { return c * tanh(x / c); }
   {                                                                                                                \
     uint4 wv[U], sc[U];                                                                                            \
     _Pragma("unroll") for (uint u = 0; u < (U); ++u) {                                                             \
-      wv[u] = intel_sub_group_block_read4((global const uint *)(wr + ((p) + u) * 16));                             \
+      wv[u] = wr[((p) + u) * 16 + lane];                                                                           \
       sc[u] = sr[(p) + u];                                                                                         \
     }                                                                                                              \
     _Pragma("unroll") for (uint u = 0; u < (U); ++u) {                                                             \
