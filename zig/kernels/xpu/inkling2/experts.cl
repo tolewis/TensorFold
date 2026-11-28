@@ -380,17 +380,19 @@ static inline void P(nv_decode_one)(const uint ks, __global const ushort *X, __g
   const uint e = (uint)ids[route];
   const uint rows_total = gu ? 2u * n : n;
   const uint raw = tile * INK2_SG + lane;
-  if (raw >= rows_total) return;
   // A split rank passes a packed table. An id past that table is not this rank's expert: write zero and do not read.
+  // (The whole work-group takes this branch: one route, one id.)
   if (e >= experts) {
     if (gu) {
-      if ((lane & 1u) == 0) Y[(ulong)route * n + (raw >> 1)] = 0;
-    } else {
+      if ((lane & 1u) == 0 && raw < rows_total) Y[(ulong)route * n + (raw >> 1)] = 0;
+    } else if (raw < rows_total) {
       Y[(ulong)route * n + raw] = 0;
     }
     return;
   }
-  const uint row = raw;
+  // p3-review R3: a lane past the last row reads row 0 and goes on to the barrier of finish_one, which stores no row
+  // past rows_total (as mx_decode_one).
+  const uint row = raw < rows_total ? raw : 0u;
   const uint nb = k / 16u;
   __global const uchar *wr = W + ((ulong)e * rows_total + row) * (k / 2u);
   __global const uchar *sr = S + ((ulong)e * rows_total + row) * nb;
