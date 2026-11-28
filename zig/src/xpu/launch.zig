@@ -8,6 +8,51 @@ const Stream = @import("stream.zig").Stream;
 const Error = @import("context.zig").Error;
 const profile = @import("profile.zig");
 
+/// `getenv(name)` read one time a process. The token path reads its switches through this, not `getenv` a launch.
+pub fn envOnce(comptime name: [:0]const u8) ?[*:0]const u8 {
+    const S = struct {
+        var read: bool = false;
+        var value: ?[*:0]const u8 = null;
+    };
+    if (!@atomicLoad(bool, &S.read, .acquire)) {
+        S.value = std.c.getenv(name);
+        @atomicStore(bool, &S.read, true, .release);
+    }
+    return S.value;
+}
+
+/// `XPU_ARG_MEMO=0` sets every argument of every launch, as before the memo.
+fn memoOn() bool {
+    const p = envOnce("XPU_ARG_MEMO") orelse return true;
+    return p[0] != '0';
+}
+
+/// Sets argument `idx` unless the memo of `k` holds the same value: Level Zero keeps a kernel's arguments between
+/// appends, so an equal value need not be set again.
+fn setArg(k: Kernel, idx: u32, v: anytype) Error!void {
+    const bits: u64 = switch (comptime argKind(@TypeOf(v))) {
+        .buffer => @intFromPtr(v.ptr),
+        .pointer => @intFromPtr(v),
+        .float => @as(u32, @bitCast(@as(f32, v))),
+        .integer => @as(u32, @intCast(v)),
+    };
+    if (k.memo) |m| if (idx < m.v.len and memoOn()) {
+        const bit = @as(u32, 1) << @intCast(idx);
+        if (m.set & bit != 0 and m.v[idx] == bits) {
+            profile.memo_skips += 1;
+            return;
+        }
+        m.set |= bit;
+        m.v[idx] = bits;
+    };
+    switch (comptime argKind(@TypeOf(v))) {
+        .buffer => try k.setPtr(idx, v.ptr),
+        .pointer => try k.setPtr(idx, v),
+        .float => try k.setF32(idx, v),
+        .integer => try k.setU32(idx, @intCast(v)),
+    }
+}
+
 /// How a launch argument is passed to the kernel parameter at its position.
 pub const ArgKind = enum { buffer, pointer, float, integer };
 
@@ -39,15 +84,7 @@ const IndirectFn = *const fn (ze.H, ze.H, *const anyopaque, ze.H, u32, ?[*]ze.H)
 
 /// Sets the arguments, then launches with the group count in device memory. Y is this rank's route count.
 pub fn dispatchIndirect(k: Kernel, s: Stream, groups: *anyopaque, args: anytype) Error!void {
-    inline for (args, 0..) |v, i| {
-        const idx: u32 = i;
-        switch (comptime argKind(@TypeOf(v))) {
-            .buffer => try k.setPtr(idx, v.ptr),
-            .pointer => try k.setPtr(idx, v),
-            .float => try k.setF32(idx, v),
-            .integer => try k.setU32(idx, @intCast(v)),
-        }
-    }
+    inline for (args, 0..) |v, i| try setArg(k, i, v);
     const fnp = @constCast(k.ctx.d).lib.lookup(IndirectFn, "zeCommandListAppendLaunchKernelIndirect") orelse return error.MissingSymbol;
     try k.ctx.d.check(fnp(s.list, k.handle, groups, null, 0, null), "zeCommandListAppendLaunchKernelIndirect");
 }
@@ -55,15 +92,7 @@ pub fn dispatchIndirect(k: Kernel, s: Stream, groups: *anyopaque, args: anytype)
 /// Sets every argument of the tuple in order (buffer, device pointer, f32 or u32) and queues the kernel.
 pub fn dispatch(k: Kernel, s: Stream, groups: [3]u32, args: anytype) Error!void {
     if (profile.active) |p| return dispatchProfiled(p, k, s, groups, args);
-    inline for (args, 0..) |v, i| {
-        const idx: u32 = i;
-        switch (comptime argKind(@TypeOf(v))) {
-            .buffer => try k.setPtr(idx, v.ptr),
-            .pointer => try k.setPtr(idx, v),
-            .float => try k.setF32(idx, v),
-            .integer => try k.setU32(idx, @intCast(v)),
-        }
-    }
+    inline for (args, 0..) |v, i| try setArg(k, i, v);
     profile.last_kernel = k.name;
     try launch(k, s, groups);
     try traceLaunch(k, s, groups, args);
@@ -72,15 +101,7 @@ pub fn dispatch(k: Kernel, s: Stream, groups: [3]u32, args: anytype) Error!void 
 fn dispatchProfiled(p: *profile.Profile, k: Kernel, s: Stream, groups: [3]u32, args: anytype) Error!void {
     const t0 = profile.nowNs();
     p.appending(t0);
-    inline for (args, 0..) |v, i| {
-        const idx: u32 = i;
-        switch (comptime argKind(@TypeOf(v))) {
-            .buffer => try k.setPtr(idx, v.ptr),
-            .pointer => try k.setPtr(idx, v),
-            .float => try k.setF32(idx, v),
-            .integer => try k.setU32(idx, @intCast(v)),
-        }
-    }
+    inline for (args, 0..) |v, i| try setArg(k, i, v);
     const t1 = profile.nowNs();
     profile.last_kernel = k.name;
     try launchSignal(k, s, groups, p.nextEvent());
@@ -89,7 +110,7 @@ fn dispatchProfiled(p: *profile.Profile, k: Kernel, s: Stream, groups: [3]u32, a
 }
 
 fn traceLaunch(k: Kernel, s: Stream, groups: [3]u32, args: anytype) Error!void {
-    const path = std.c.getenv("TF_TP_LAUNCHLOG") orelse return;
+    const path = envOnce("TF_TP_LAUNCHLOG") orelse return;
     var buf: [768]u8 = undefined;
     var n: usize = 0;
     const head = std.fmt.bufPrint(buf[n..], "{s} {d},{d},{d}", .{ k.name, groups[0], groups[1], groups[2] }) catch return;

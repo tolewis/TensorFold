@@ -20,6 +20,8 @@ pub var last_kernel: []const u8 = "";
 
 /// Every kernel queued through `launch.launchSignal` since the process started (indirect launches are not counted).
 pub var launches: u64 = 0;
+/// Argument sets that `launch.setArg` skipped because the kernel already held the value, since the process started.
+pub var memo_skips: u64 = 0;
 
 /// Host time of the exchange appends, when TF_TP_APPEND=1. Sites: copy, flag write, event create, event wait, kernel launch.
 pub var host_append_ns: [5]u64 = @splat(0);
@@ -120,6 +122,8 @@ pub const Profile = struct {
     names: std.ArrayList(struct { handle: ze.H, label: []const u8, row: usize }) = .empty,
     /// Totals over every `collect`.
     launches: u64 = 0,
+    /// `memo_skips` at the last reset.
+    skip_base: u64 = 0,
     device_busy_ns: u64 = 0,
     device_span_ns: u64 = 0,
     /// The sum of the "gap us/c" column: start of a launch minus end of the launch before it, 0 when they overlap.
@@ -312,6 +316,7 @@ pub const Profile = struct {
         p.rows.clearRetainingCapacity();
         p.names.clearRetainingCapacity();
         p.launches = 0;
+        p.skip_base = memo_skips;
         p.device_busy_ns = 0;
         p.device_span_ns = 0;
         p.device_gap_ns = 0;
@@ -344,6 +349,7 @@ pub const Profile = struct {
             app += r.append_ns;
             args += r.args;
         }
+        std.debug.print("argument sets skipped by the memo {d:.1} a pass of {d:.1} (args column)\n", .{ @as(f64, @floatFromInt(memo_skips -| p.skip_base)) / n, @as(f64, @floatFromInt(args)) / n });
         std.debug.print("{s:<40} {d:>7.1} {d:>10.3} {s:>9} {d:>10.3} {d:>10.3} {d:>6.1}\n", .{ "all (a pass)", @as(f64, @floatFromInt(calls)) / n, @as(f64, @floatFromInt(dev)) / 1e6 / n, "", @as(f64, @floatFromInt(set)) / 1e6 / n, @as(f64, @floatFromInt(app)) / 1e6 / n, @as(f64, @floatFromInt(args)) / n });
         if (p.device_time) std.debug.print("device busy {d:.3} ms, first start to last end {d:.3} ms, idle between kernels {d:.3} ms (span minus busy, a pass); sum of the gap column {d:.3} ms (a pass); {d} launches not timed\n", .{ @as(f64, @floatFromInt(p.device_busy_ns)) / 1e6 / n, @as(f64, @floatFromInt(p.device_span_ns)) / 1e6 / n, @as(f64, @floatFromInt(p.device_span_ns -| p.device_busy_ns)) / 1e6 / n, @as(f64, @floatFromInt(p.device_gap_ns)) / 1e6 / n, p.dropped });
     }

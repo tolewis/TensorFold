@@ -18,7 +18,7 @@ pub var sink_seg: bool = false;
 
 pub fn sinkSeg() bool {
     if (sink_seg) return true;
-    if (std.c.getenv("INK2_SINK_SEG")) |p| {
+    if (xpu.launch.envOnce("INK2_SINK_SEG")) |p| {
         const s = std.mem.span(p);
         if (s.len > 0 and s[0] == '0') return false;
     }
@@ -26,7 +26,7 @@ pub fn sinkSeg() bool {
 }
 pub fn roleConv() bool {
     if (role_conv) return true;
-    if (std.c.getenv("INK2_ROLE")) |p| {
+    if (xpu.launch.envOnce("INK2_ROLE")) |p| {
         const s = std.mem.span(p);
         if (s.len > 0 and s[0] == '0') return false;
     }
@@ -35,7 +35,7 @@ pub fn roleConv() bool {
 
 pub fn normRouter() bool {
     if (norm_router) return true;
-    if (std.c.getenv("INK2_NORM_ROUTER")) |p| {
+    if (xpu.launch.envOnce("INK2_NORM_ROUTER")) |p| {
         const s = std.mem.span(p);
         if (s.len > 0 and s[0] == '0') return false;
     }
@@ -44,7 +44,7 @@ pub fn normRouter() bool {
 
 pub fn downEpi() bool {
     if (down_epi) return true;
-    if (std.c.getenv("INK2_DOWN_EPI")) |p| {
+    if (xpu.launch.envOnce("INK2_DOWN_EPI")) |p| {
         const s = std.mem.span(p);
         if (s.len > 0 and s[0] == '0') return false;
     }
@@ -53,7 +53,7 @@ pub fn downEpi() bool {
 
 pub fn kvConv() bool {
     if (kv_conv) return true;
-    if (std.c.getenv("INK2_KV_CONV")) |p| {
+    if (xpu.launch.envOnce("INK2_KV_CONV")) |p| {
         const s = std.mem.span(p);
         if (s.len > 0 and s[0] == '0') return false;
     }
@@ -65,7 +65,7 @@ pub var pre_q: bool = false;
 
 pub fn preQ() bool {
     if (pre_q) return true;
-    if (std.c.getenv("INK2_PRE_Q")) |p| {
+    if (xpu.launch.envOnce("INK2_PRE_Q")) |p| {
         const s = std.mem.span(p);
         if (s.len > 0 and s[0] == '0') return false;
     }
@@ -77,7 +77,7 @@ pub var pre_zeta: bool = false;
 
 pub fn preZeta() bool {
     if (pre_zeta) return true;
-    if (std.c.getenv("INK2_PRE_ZETA")) |p| {
+    if (xpu.launch.envOnce("INK2_PRE_ZETA")) |p| {
         const s = std.mem.span(p);
         if (s.len > 0 and s[0] == '0') return false;
     }
@@ -89,7 +89,7 @@ pub var gates_norms: bool = false;
 
 pub fn gatesNorms() bool {
     if (gates_norms) return true;
-    if (std.c.getenv("INK2_GATES_NORMS")) |p| {
+    if (xpu.launch.envOnce("INK2_GATES_NORMS")) |p| {
         const s = std.mem.span(p);
         return s.len > 0 and s[0] == '1';
     }
@@ -101,7 +101,7 @@ pub var zeta_split: bool = false;
 
 pub fn zetaSplit() bool {
     if (zeta_split) return true;
-    if (std.c.getenv("INK2_ZETA_SPLIT")) |p| {
+    if (xpu.launch.envOnce("INK2_ZETA_SPLIT")) |p| {
         const s = std.mem.span(p);
         if (s.len > 0 and s[0] == '0') return false;
     }
@@ -110,7 +110,7 @@ pub fn zetaSplit() bool {
 
 pub fn zetaWide() bool {
     if (zeta_wide) return true;
-    if (std.c.getenv("INK2_ZETA_WIDE")) |p| {
+    if (xpu.launch.envOnce("INK2_ZETA_WIDE")) |p| {
         const s = std.mem.span(p);
         if (s.len > 0 and s[0] == '0') return false;
     }
@@ -119,7 +119,7 @@ pub fn zetaWide() bool {
 
 pub fn convFold() bool {
     if (conv_fold) return true;
-    if (std.c.getenv("INK2_CONV_FOLD")) |p| {
+    if (xpu.launch.envOnce("INK2_CONV_FOLD")) |p| {
         const s = std.mem.span(p);
         if (s.len > 0 and s[0] == '0') return false;
     }
@@ -128,7 +128,7 @@ pub fn convFold() bool {
 
 pub fn routerWide() bool {
     if (router_wide) return true;
-    if (std.c.getenv("INK2_ROUTER_WIDE")) |p| {
+    if (xpu.launch.envOnce("INK2_ROUTER_WIDE")) |p| {
         const s = std.mem.span(p);
         if (s.len > 0 and s[0] == '0') return false;
     }
@@ -137,7 +137,7 @@ pub fn routerWide() bool {
 
 pub fn enabled() bool {
     if (force) |v| return v;
-    if (std.c.getenv("INK2_FUSE")) |p| {
+    if (xpu.launch.envOnce("INK2_FUSE")) |p| {
         const s = std.mem.span(p);
         if (s.len > 0 and s[0] == '0') return false;
     }
@@ -224,7 +224,7 @@ pub const Pipelines = struct {
 /// The launch-cost probe: `INK2_EMPTY_PROBE=1` adds one empty launch a (work-group size, grid) pair at the end of a
 /// one-row forward, each under its own profile label. The grids are those of the decode kernels' sheet.
 pub fn emptyProbe() bool {
-    if (std.c.getenv("INK2_EMPTY_PROBE")) |p| {
+    if (xpu.launch.envOnce("INK2_EMPTY_PROBE")) |p| {
         const s = std.mem.span(p);
         return s.len > 0 and s[0] == '1';
     }

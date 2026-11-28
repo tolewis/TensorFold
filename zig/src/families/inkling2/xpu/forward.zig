@@ -23,7 +23,7 @@ const group = @import("group.zig");
 var dump_fwd: u32 = 0;
 
 fn dumpWanted() bool {
-    const z = std.c.getenv("TF_TP_DUMP_FWD") orelse return dump_fwd == 0;
+    const z = xpu.launch.envOnce("TF_TP_DUMP_FWD") orelse return dump_fwd == 0;
     const want = std.fmt.parseInt(u32, std.mem.span(z), 10) catch return dump_fwd == 0;
     return dump_fwd == want;
 }
@@ -38,7 +38,7 @@ var vdump_int8_logged = false;
 
 /// TF_TP_VDUMP: the hidden state after each visit of a short call (a verify window or a decode row), for the bisect.
 pub fn dumpVisit(r: *xpu.rt.Runtime, rank: u32, seq: u32, visit: usize, src: ?*anyopaque, rows: usize, width: usize) !void {
-    const dir_z = std.c.getenv("TF_TP_VDUMP") orelse return;
+    const dir_z = xpu.launch.envOnce("TF_TP_VDUMP") orelse return;
     const ptr = src orelse return;
     const bytes: usize = rows * width * 2;
     const host = try std.heap.page_allocator.alloc(u8, bytes);
@@ -55,7 +55,7 @@ pub fn dumpVisit(r: *xpu.rt.Runtime, rank: u32, seq: u32, visit: usize, src: ?*a
 }
 
 fn dumpF32(r: *xpu.rt.Runtime, rank: u32, name: []const u8, src: ?*anyopaque, n: u32) !void {
-    const dir_z = std.c.getenv("TF_TP_DUMP") orelse return;
+    const dir_z = xpu.launch.envOnce("TF_TP_DUMP") orelse return;
     const ptr = src orelse return;
     const bytes: usize = @as(usize, n) * 4;
     const host = try std.heap.page_allocator.alloc(u8, bytes);
@@ -72,7 +72,7 @@ fn dumpF32(r: *xpu.rt.Runtime, rank: u32, name: []const u8, src: ?*anyopaque, n:
 }
 
 fn dumpNamed(g: *const Run, row_tag: []const u8, what: []const u8, src: Ptr, bytes: usize) !void {
-    const dir_z = std.c.getenv("TF_TP_DUMP") orelse return;
+    const dir_z = xpu.launch.envOnce("TF_TP_DUMP") orelse return;
     const ptr = src orelse return;
     try g.m.r.sync();
     const host = try g.m.gpa.alloc(u8, bytes);
@@ -90,7 +90,7 @@ fn dumpNamed(g: *const Run, row_tag: []const u8, what: []const u8, src: Ptr, byt
 
 fn dumpBytes(g: *const Run, visit_i: usize, tag: []const u8, src: ?*anyopaque, bytes: usize) !void {
     if (!dumpWanted()) return;
-    const dir_z = std.c.getenv("TF_TP_DUMP") orelse return;
+    const dir_z = xpu.launch.envOnce("TF_TP_DUMP") orelse return;
     const ptr = src orelse return;
     const host = try g.m.gpa.alloc(u8, bytes);
     defer g.m.gpa.free(host);
@@ -460,7 +460,7 @@ const Run = struct {
     var experts_row_old: ?bool = null;
     fn perRowExperts() bool {
         if (experts_row_old) |v| return v;
-        const v = if (std.c.getenv("INK2_EXPERTS_ROW")) |p| std.mem.eql(u8, std.mem.span(p), "1") else false;
+        const v = if (xpu.launch.envOnce("INK2_EXPERTS_ROW")) |p| std.mem.eql(u8, std.mem.span(p), "1") else false;
         experts_row_old = v;
         return v;
     }
@@ -510,7 +510,7 @@ const Run = struct {
 var seg4_on: ?bool = null;
 fn seg4() bool {
     if (seg4_on) |v| return v;
-    const v = if (std.c.getenv("INK2_SEG4")) |p| !std.mem.eql(u8, std.mem.span(p), "0") else true;
+    const v = if (xpu.launch.envOnce("INK2_SEG4")) |p| !std.mem.eql(u8, std.mem.span(p), "0") else true;
     seg4_on = v;
     return v;
 }
@@ -554,7 +554,7 @@ fn routedExperts(g: Run, layer: usize, rows: usize) !void {
                 }
             }
             try finishExperts(g, down, ids, at(s.route_weights, 0), down_call);
-            if (std.c.getenv("TF_TP_IDCHECK") != null) if (experts.faultHits()) |p| {
+            if (xpu.launch.envOnce("TF_TP_IDCHECK") != null) if (experts.faultHits()) |p| {
                 var word: i32 = 0;
                 try g.m.r.download(std.mem.asBytes(&word), .{ .rt = g.m.r, .ptr = p, .len = 4 });
                 if (word != 0) std.log.err("inkling2: expert id fault {d}", .{word});
@@ -669,7 +669,7 @@ fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) 
                 try gp.allReduce(at(s.attn_dense, 0).?, @intCast(rows));
             }
         }
-        if (std.c.getenv("TF_TP_VDUMP") != null and visit_i == 0) {
+        if (xpu.launch.envOnce("TF_TP_VDUMP") != null and visit_i == 0) {
             try dumpVisit(m.r, m.options.place.rank, vdump_cur, 90, at(s.q_norm, 0), rows, state.hidden);
             try dumpVisit(m.r, m.options.place.rank, vdump_cur, 91, at(s.attn_dense, 0), rows, state.hidden);
             try dumpVisit(m.r, m.options.place.rank, vdump_cur, 92, at(s.att, 0), rows, m.options.place.qWidth());
@@ -743,7 +743,7 @@ fn finishExperts(g: Run, down: Ptr, ids: Ptr, weights: Ptr, call: experts.Call) 
             xpu.profile.last_kernel = "tf_ink2_combine";
             const t0 = xpu.profile.nowNs();
             try gp.allReduce(at(s.mlp_out, 0).?, @intCast(rows));
-            if (std.c.getenv("TF_TP_ROUTELOG") != null and rows == 1) {
+            if (xpu.launch.envOnce("TF_TP_ROUTELOG") != null and rows == 1) {
                 try g.m.r.sync();
                 const us = (xpu.profile.nowNs() - t0) / 1000;
                 std.log.info("inkling2: route rank {d} layer {d} kept {d} reduce {d} us", .{ g.m.options.place.rank, v.layer, experts.last_kept, us });
@@ -1056,7 +1056,7 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
         try gp.note(.forward, ids, (if (options.all) @as(u32, 1) else 0) | (if (options.txn) @as(u32, 8) else 0), table[0..segments.len], 0);
     };
     try glue.embedNorm(&p.glue, stream, at(s.ids, 0), tensor(m.weights.embed), tensor(m.weights.embed_norm), at(s.p, 0), @intCast(rows));
-    const vdump = std.c.getenv("TF_TP_VDUMP") != null and rows <= state.batch_rows;
+    const vdump = xpu.launch.envOnce("TF_TP_VDUMP") != null and rows <= state.batch_rows;
     const seq = vdump_seq;
     if (vdump) vdump_seq += 1;
     for (m.weight_plan.visits[0..m.weight_plan.n_visits], 0..) |*v, vi| {
@@ -1071,7 +1071,7 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
         var meta_buf: [64]u8 = undefined;
         const meta = std.fmt.bufPrint(&meta_buf, "rows {d} base {d} rank {d}\n", .{ rows, segments[0].cache.len, m.options.place.rank }) catch "";
         if (meta.len > 0) {
-            const dir_z = std.c.getenv("TF_TP_VDUMP").?;
+            const dir_z = xpu.launch.envOnce("TF_TP_VDUMP").?;
             var path_buf: [512]u8 = undefined;
             const path = std.fmt.bufPrint(&path_buf, "{s}/c{d}.txt", .{ std.mem.span(dir_z), seq }) catch "";
             if (path.len > 0) {
@@ -1084,7 +1084,7 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
             }
         }
     }
-    if (std.c.getenv("TF_TP_DUMP") != null) dump_fwd += 1;
+    if (xpu.launch.envOnce("TF_TP_DUMP") != null) dump_fwd += 1;
     try g.widen(at(s.p, 0), at(s.partial, 0), rows);
     const final = finalPlan(rows, options.all, options.taps != null);
     if (final.work_rows == rows) {
@@ -1113,7 +1113,7 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
         var peer = try m.r.alloc(tight_bytes);
         defer peer.free();
         // TF_TP_HEAD1: one row a launch, the head shape a plain decode takes. A test switch, not a speed path.
-        const head1 = std.c.getenv("TF_TP_HEAD1") != null and n_rows > 1;
+        const head1 = xpu.launch.envOnce("TF_TP_HEAD1") != null and n_rows > 1;
         if (head1) {
             var r: u32 = 0;
             while (r < n_rows) : (r += 1) {

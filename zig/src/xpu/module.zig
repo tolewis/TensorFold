@@ -69,18 +69,33 @@ pub const Module = struct {
             std.log.err("kernel not in module: {s}", .{name});
             return e;
         };
-        return .{ .ctx = self.ctx, .handle = k, .name = name };
+        return .{ .ctx = self.ctx, .handle = k, .name = name, .memo = Kernel.newMemo() };
     }
+};
+
+/// The last value set at each of the first 32 argument positions of a kernel (launch.setArg).
+pub const ArgMemo = struct {
+    set: u32 = 0,
+    v: [32]u64 = undefined,
 };
 
 pub const Kernel = struct {
     ctx: *const Context,
     handle: ze.H,
     name: [:0]const u8 = "",
+    /// Owned by the kernel, shared by its copies; freed by deinit. Null when the allocation failed (every set runs).
+    memo: ?*ArgMemo = null,
 
     pub fn deinit(self: *Kernel) void {
         _ = self.ctx.d.x.zeKernelDestroy(self.handle);
+        if (self.memo) |m| std.heap.c_allocator.destroy(m);
         self.* = undefined;
+    }
+
+    fn newMemo() ?*ArgMemo {
+        const m = std.heap.c_allocator.create(ArgMemo) catch return null;
+        m.* = .{};
+        return m;
     }
 
     /// Argument `index` as raw bytes (a pointer, u32 or f32 as the OpenCL C parameter types it).
