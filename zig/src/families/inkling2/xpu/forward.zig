@@ -424,6 +424,9 @@ const Run = struct {
                 try g.convInputForAttention(cache, v, base, rows, false);
             }
             const k = &g.p.attention;
+            // one profile row a visit kind for prep, the relative table, decode and the merge (p3-review R14)
+            xpu.profile.label = if (layer.window > 0) "slide" else "global";
+            defer xpu.profile.label = "";
             const q_at = base * pl.qWidth() * 2;
             const tab_at = base * pl.qHeads() * ap.extent * 2;
             // A window of up to decode_rows rows runs prep, the relative table, and attention in one launch: prep and the

@@ -217,17 +217,21 @@ Q8_KERNEL(Q8_WG) void Q8_NAME(dense_q8_seg1)(
     global ushort *y0, global ushort *y1, global ushort *y2, global ushort *y3, global ushort *y4,
     uint n0, uint n1, uint n2, uint n3, uint n4, uint k,
     global const uchar *sink_w, global ushort *sink_y, uint sink_n, uint sink_on) {
-  const uint seg = get_group_id(1);
-  const uint j = get_group_id(0) * (Q8_WG / 16) + get_sub_group_id();
+  // p3-review R4: a flat grid of the segments' column groups in order, ceil(n_s / (Q8_WG / 16)) a segment, so every
+  // work-group has a column. Group g of segment s takes the columns it took at (g, s) in the 2-D grid before.
+  const uint cpg = Q8_WG / 16;
+  uint g = get_group_id(0), seg = 0;
   uint n = n0;
   global const ushort *x = x0;
   global const uchar *w = w0;
   global ushort *y = y0;
-  if (seg == 1) { n = n1; x = x1; w = w1; y = y1; }
-  else if (seg == 2) { n = n2; x = x2; w = w2; y = y2; }
-  else if (seg == 3) { n = n3; x = x3; w = w3; y = y3; }
-  else if (seg == 4) { n = n4; x = x4; w = w4; y = y4; }
-  if (seg > 4 || j >= n) return;
+  const uint g0 = (n0 + cpg - 1) / cpg, g1 = (n1 + cpg - 1) / cpg, g2 = (n2 + cpg - 1) / cpg, g3 = (n3 + cpg - 1) / cpg;
+  if (g >= g0) { g -= g0; seg = 1; n = n1; x = x1; w = w1; y = y1;
+    if (g >= g1) { g -= g1; seg = 2; n = n2; x = x2; w = w2; y = y2;
+      if (g >= g2) { g -= g2; seg = 3; n = n3; x = x3; w = w3; y = y3;
+        if (g >= g3) { g -= g3; seg = 4; n = n4; x = x4; w = w4; y = y4; } } } }
+  const uint j = g * cpg + get_sub_group_id();
+  if (j >= n) return;
   global const uchar *codes = w;
   global const half *scales = (global const half *)(w + (ulong)n * k);
   float acc[1];

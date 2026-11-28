@@ -51,6 +51,9 @@ pub const merge_threads = head_dim;
 /// Zero keeps the layer chunk. The logits tool sets it for an A/B.
 pub var flash_splits: u32 = 0;
 pub var flash_user_set: bool = false;
+/// The split count of a sliding-window visit when it is not zero; zero gives the window layers `flash_splits` too
+/// (p3-review R11: a window visit has 1,024 keys at most). The logits tool sets it with --attn-splits-window.
+pub var flash_splits_window: u32 = 0;
 
 /// A verify window runs its attention in one launch: the one-row decode kernel's grid is the rows' K/V heads, and each
 /// work-group reads its own row's position, first key and partial slots. `INK2_ROWS_OLD=1` runs one launch a row for the
@@ -155,7 +158,8 @@ fn decodeChunk(l: Layer, last_pos: u32, stride: u32) u32 {
     if (flash_splits == 0) return l.chunk;
     const keys: u32 = if (l.window > 0) @min(l.window, last_pos + 1) else last_pos + 1;
     if (keys <= 16) return l.chunk;
-    var chunk: u32 = std.math.divCeil(u32, keys, flash_splits) catch l.chunk;
+    const splits = if (l.window > 0 and flash_splits_window != 0) flash_splits_window else flash_splits;
+    var chunk: u32 = std.math.divCeil(u32, keys, splits) catch l.chunk;
     chunk = std.mem.alignForward(u32, @max(chunk, 16), 16);
     var trial = l;
     trial.chunk = chunk;
