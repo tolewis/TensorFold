@@ -398,6 +398,261 @@ KERNEL(16) void tf_ink2_attn_decode(global const ushort *q, global const ushort 
 // in fp32 in dim order and takes the key's scale after it. V codes are read a row a time with the row's scale broadcast. A
 // dead key enters as an exact zero by a select, never by a multiply: a position never written can hold any bits, also an
 // inf or a NaN scale.
+// kv8-fix Part 6: access-pattern variants and split forms of tf_ink2_attn_decode8, each behind a build switch that is off by
+// default. With every switch at 0 the kernel below the #else is the shipped kernel, text unchanged. The variants keep the
+// arithmetic and the order of every sum of the shipped kernel; only the order, the width and the count of the loads change.
+//   INK2_ATT_AHEAD=n (A1): the loads of tile t + 1 .. t + n are sent before the arithmetic of tile t (n = 1 or 2).
+//   INK2_ATT_FEW=1 (A2): V codes in 8 block reads of two rows (uc16) in place of 16 of one row, the K and V scales in one
+//     block read each in place of a gather.
+//   INK2_ATT_FEW=2 (A4): V codes in 4 block reads of four rows (ui8), the K read's layout: lane l holds dims 4l .. 4l + 3 and
+//     64 + 4l .. 64 + 4l + 3 of each row. Each dim keeps its own sum in key order, so only the lane that holds it changes.
+//   INK2_ATT_SPLIT (time-only forms, wrong output bits): 1 the loads only (K codes, V codes, scales), folded by XOR into
+//     the partials so that no load is removed. 2 the K side only (K codes, K scale, the dot, the running top and sum, no V
+//     load). 3 every load and the K side, no V arithmetic (the V codes and scale folded by XOR).
+#ifndef INK2_ATT_AHEAD
+#define INK2_ATT_AHEAD 0
+#endif
+#ifndef INK2_ATT_FEW
+#define INK2_ATT_FEW 0
+#endif
+#ifndef INK2_ATT_SPLIT
+#define INK2_ATT_SPLIT 0
+#endif
+#define INK2_ATT_V (INK2_ATT_SPLIT != 2)
+
+#if INK2_ATT_AHEAD || INK2_ATT_FEW || INK2_ATT_SPLIT
+typedef struct {
+  uint kr[4][8];
+#if INK2_ATT_FEW == 2
+  uint vw[4][8]; // read j: rows 4j .. 4j + 3, word 2r + h: row 4j + r, dims 64h + 4l .. 64h + 4l + 3
+#elif INK2_ATT_FEW == 1
+  uchar16 vr[8]; // read j: row 2j in .s0 .. .s7, row 2j + 1 in .s8 .. .sf, lane l dims 16i + l
+#else
+  uchar8 vr[16];
+#endif
+  float ksc, vsc; // this lane's key's scales
+} InkTile;
+
+// The loads of the tile at ring slot t0, in the order of the shipped kernel: V rows, then K slabs, then the scales.
+static inline void ink_tile_load(InkTile *t, global const char *kh, global const char *vh, global const float *ks,
+                                 global const float *vs, uint t0) {
+#if INK2_ATT_V
+#if INK2_ATT_FEW == 2
+  UNROLL
+  for (uint j = 0; j < 4; ++j) {
+    const uint8 x = intel_sub_group_block_read_ui8((global const uint *)(vh + (size_t)(t0 + 4 * j) * D));
+    t->vw[j][0] = x.s0; t->vw[j][1] = x.s1; t->vw[j][2] = x.s2; t->vw[j][3] = x.s3;
+    t->vw[j][4] = x.s4; t->vw[j][5] = x.s5; t->vw[j][6] = x.s6; t->vw[j][7] = x.s7;
+  }
+#elif INK2_ATT_FEW == 1
+  UNROLL
+  for (uint j = 0; j < 8; ++j) t->vr[j] = intel_sub_group_block_read_uc16((global const uchar *)(vh + (size_t)(t0 + 2 * j) * D));
+#else
+  UNROLL
+  for (uint k = 0; k < 16; ++k) t->vr[k] = intel_sub_group_block_read_uc8(vh + (size_t)(t0 + k) * D);
+#endif
+#endif
+  global const char *kt = kh + (size_t)(t0 / 16) * 2048;
+  UNROLL
+  for (uint j = 0; j < 4; ++j) {
+    const uint8 x = intel_sub_group_block_read_ui8((global const uint *)(kt + (size_t)j * 512));
+    t->kr[j][0] = x.s0; t->kr[j][1] = x.s1; t->kr[j][2] = x.s2; t->kr[j][3] = x.s3;
+    t->kr[j][4] = x.s4; t->kr[j][5] = x.s5; t->kr[j][6] = x.s6; t->kr[j][7] = x.s7;
+  }
+#if INK2_ATT_FEW
+  t->ksc = as_float(intel_sub_group_block_read((global const uint *)(ks + t0)));
+#if INK2_ATT_V
+  t->vsc = as_float(intel_sub_group_block_read((global const uint *)(vs + t0)));
+#endif
+#else
+  const uint lane = get_sub_group_local_id();
+  t->ksc = ks[t0 + lane];
+#if INK2_ATT_V
+  t->vsc = vs[t0 + lane];
+#endif
+#endif
+}
+
+// Code `i` of V row `k` of the tile for this lane, as the shipped kernel reads it (a signed code), dims of acc slot i.
+#if INK2_ATT_FEW == 2
+#define INK_VROW(T, k) (convert_float8((char8)(as_char4((T).vw[(k) / 4][2 * ((k) % 4)]), as_char4((T).vw[(k) / 4][2 * ((k) % 4) + 1]))))
+#elif INK2_ATT_FEW == 1
+#define INK_VROW(T, k) (convert_float8(as_char8((k) % 2 ? (T).vr[(k) / 2].s89abcdef : (T).vr[(k) / 2].s01234567)))
+#else
+#define INK_VROW(T, k) (convert_float8(as_char8((T).vr[k])))
+#endif
+
+KERNEL(16) void tf_ink2_attn_decode8(global const ushort *q, global const char *kc, global const float *ksc, global const char *vc,
+                                     global const float *vsc, global const ushort *tab, global const InkSeg *segs, global float *part_o,
+                                     global float2 *part_ml, global const int *rpos, global const int *rseg, uint heads, uint kv_heads,
+                                     uint ring, uint window, uint chunk, uint c0, uint chunks, float scale) {
+  const uint unit = get_group_id(0), row = unit / kv_heads, kvh = unit % kv_heads, lane = get_sub_group_local_id();
+  const uint pos = (uint)rpos[row];
+  const uint lo = window && pos + 1 > window ? pos + 1 - window : 0;
+  const uint first = window ? lo / chunk : c0;
+  const uint c = first + get_group_id(1);
+  if (c > pos / chunk || (window && c < lo / chunk)) return;
+  const uint from = max(lo, c * chunk), to = min(pos + 1, (c + 1) * chunk);
+  const InkSeg s = segs[rseg[row]];
+  global const char *kh = kc + s.off + (size_t)kvh * ring * D;
+  global const char *vh = vc + s.off + (size_t)kvh * ring * D;
+  global const float *ks = ksc + (size_t)kvh * ring;
+  global const float *vs = vsc + (size_t)kvh * ring;
+  const size_t rh0 = (size_t)row * heads + kvh * GROUP;
+  local float qs[GROUP][D];
+  UNROLL
+  for (uint g = 0; g < GROUP; ++g)
+    UNROLL
+    for (uint j = 0; j < D / 16; ++j) qs[g][j * 16 + lane] = bf2f(q[(rh0 + g) * D + j * 16 + lane]);
+  sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+  float top[GROUP], total[GROUP], acc[GROUP][D / 16];
+  UNROLL
+  for (uint g = 0; g < GROUP; ++g) {
+    top[g] = -INFINITY;
+    total[g] = 0.0f;
+    UNROLL
+    for (uint j = 0; j < D / 16; ++j) acc[g][j] = 0.0f;
+  }
+#if INK2_ATT_SPLIT == 1 || INK2_ATT_SPLIT == 3
+  uint fold = 0;
+#endif
+  const uint kfirst = from & ~15u, tiles = (to - kfirst + 15) / 16;
+  // buf[0] holds the tile in work, buf[1 .. AHEAD] the next tiles, already requested. `tl` is the ring slot of the next
+  // tile to request, `asked` the count requested.
+  InkTile buf[INK2_ATT_AHEAD + 1];
+  uint tl = kfirst % ring, at0 = tl, asked = 0;
+  UNROLL
+  for (uint i = 0; i < INK2_ATT_AHEAD; ++i)
+    if (asked < tiles) {
+      ink_tile_load(&buf[i], kh, vh, ks, vs, tl);
+      tl += 16;
+      if (tl == ring) tl = 0;
+      ++asked;
+    }
+  for (uint ti = 0; ti < tiles; ++ti) {
+    if (asked < tiles) {
+      ink_tile_load(&buf[INK2_ATT_AHEAD], kh, vh, ks, vs, tl);
+      tl += 16;
+      if (tl == ring) tl = 0;
+      ++asked;
+    }
+    const uint kp0 = kfirst + 16 * ti;
+    const uint kp = kp0 + lane;
+    const bool live = kp >= from && kp < to;
+#if INK2_ATT_SPLIT == 1
+    {
+      uint x = as_uint(buf[0].ksc) ^ as_uint(buf[0].vsc);
+      UNROLL
+      for (uint j = 0; j < 4; ++j)
+        UNROLL
+        for (uint i = 0; i < 8; ++i) x ^= buf[0].kr[j][i];
+#if INK2_ATT_FEW == 2
+      UNROLL
+      for (uint j = 0; j < 4; ++j)
+        UNROLL
+        for (uint i = 0; i < 8; ++i) x ^= buf[0].vw[j][i];
+#elif INK2_ATT_FEW == 1
+      UNROLL
+      for (uint j = 0; j < 8; ++j) { const uint4 w = as_uint4(buf[0].vr[j]); x ^= w.s0 ^ w.s1 ^ w.s2 ^ w.s3; }
+#else
+      UNROLL
+      for (uint k = 0; k < 16; ++k) { const uint2 w = as_uint2(buf[0].vr[k]); x ^= w.s0 ^ w.s1; }
+#endif
+      fold ^= x;
+    }
+#else
+    float dot[GROUP];
+    UNROLL
+    for (uint g = 0; g < GROUP; ++g) dot[g] = 0.0f;
+    UNROLL
+    for (uint j = 0; j < 4; ++j)
+      UNROLL
+      for (uint gi = 0; gi < 8; ++gi) {
+        const char4 cd = as_char4(buf[0].kr[j][gi]);
+        const uint d0 = 32 * j + 4 * gi;
+        UNROLL
+        for (uint g = 0; g < GROUP; ++g) {
+          float a = dot[g];
+          a += qs[g][d0 + 0] * (float)cd.s0; a += qs[g][d0 + 1] * (float)cd.s1;
+          a += qs[g][d0 + 2] * (float)cd.s2; a += qs[g][d0 + 3] * (float)cd.s3;
+          dot[g] = a;
+        }
+      }
+    const float kscale = buf[0].ksc;
+    const uint distance = pos - kp;
+    float p[GROUP];
+    UNROLL
+    for (uint g = 0; g < GROUP; ++g) {
+      const float bias = distance < EXTENT ? bf2f(tab[(rh0 + g) * EXTENT + distance]) : 0.0f;
+      const float score = live ? (dot[g] * kscale * scale + bias) * LOG2E : -INFINITY;
+      const float next = fmax(top[g], sub_group_reduce_max(score));
+      const float keep = exp2(top[g] - next);
+      p[g] = live ? bf_round(exp2(score - next)) : 0.0f;
+      total[g] = total[g] * keep + sub_group_reduce_add(p[g]);
+      top[g] = next;
+#if INK2_ATT_SPLIT == 0
+      UNROLL
+      for (uint j = 0; j < D / 16; ++j) acc[g][j] *= keep;
+#endif
+    }
+#if INK2_ATT_SPLIT == 3
+    {
+      uint x = as_uint(buf[0].vsc);
+#if INK2_ATT_FEW == 2
+      UNROLL
+      for (uint j = 0; j < 4; ++j)
+        UNROLL
+        for (uint i = 0; i < 8; ++i) x ^= buf[0].vw[j][i];
+#elif INK2_ATT_FEW == 1
+      UNROLL
+      for (uint j = 0; j < 8; ++j) { const uint4 w = as_uint4(buf[0].vr[j]); x ^= w.s0 ^ w.s1 ^ w.s2 ^ w.s3; }
+#else
+      UNROLL
+      for (uint k = 0; k < 16; ++k) { const uint2 w = as_uint2(buf[0].vr[k]); x ^= w.s0 ^ w.s1; }
+#endif
+      fold ^= x;
+    }
+#elif INK2_ATT_SPLIT == 0
+    const float vown = buf[0].vsc;
+    UNROLL
+    for (uint k = 0; k < 16; ++k) {
+      const float vk = sub_group_broadcast(vown, k);
+      const float8 v8 = INK_VROW(buf[0], k) * vk;
+      const bool kl = kp0 + k >= from && kp0 + k < to;
+      const float8 v = kl ? v8 : (float8)(0.0f);
+      UNROLL
+      for (uint g = 0; g < GROUP; ++g) {
+        const float w = sub_group_broadcast(p[g], k);
+        acc[g][0] += w * v.s0; acc[g][1] += w * v.s1; acc[g][2] += w * v.s2; acc[g][3] += w * v.s3;
+        acc[g][4] += w * v.s4; acc[g][5] += w * v.s5; acc[g][6] += w * v.s6; acc[g][7] += w * v.s7;
+      }
+    }
+#endif
+#endif
+    UNROLL
+    for (uint i = 0; i < INK2_ATT_AHEAD; ++i) buf[i] = buf[i + 1];
+  }
+#if INK2_ATT_SPLIT == 1 || INK2_ATT_SPLIT == 3
+  acc[0][0] += as_float(fold & 0x007fffffu); // keeps every load: the partials depend on each loaded word
+#endif
+  UNROLL
+  for (uint g = 0; g < GROUP; ++g) {
+    const size_t slot = (rh0 + g) * chunks + get_group_id(1);
+    if (lane == 0) part_ml[slot] = (float2)(top[g], total[g]);
+#if INK2_ATT_FEW == 2
+    // lane l holds dims 4l .. 4l + 3 in acc slots 0 .. 3 and 64 + 4l .. 64 + 4l + 3 in slots 4 .. 7
+    UNROLL
+    for (uint j = 0; j < 4; ++j) {
+      part_o[slot * D + 4 * lane + j] = acc[g][j];
+      part_o[slot * D + 64 + 4 * lane + j] = acc[g][4 + j];
+    }
+#else
+    UNROLL
+    for (uint j = 0; j < D / 16; ++j) part_o[slot * D + j * 16 + lane] = acc[g][j];
+#endif
+  }
+}
+#else
 KERNEL(16) void tf_ink2_attn_decode8(global const ushort *q, global const char *kc, global const float *ksc, global const char *vc,
                                      global const float *vsc, global const ushort *tab, global const InkSeg *segs, global float *part_o,
                                      global float2 *part_ml, global const int *rpos, global const int *rseg, uint heads, uint kv_heads,
@@ -513,6 +768,7 @@ KERNEL(16) void tf_ink2_attn_decode8(global const ushort *q, global const char *
     for (uint j = 0; j < D / 16; ++j) part_o[slot * D + j * 16 + lane] = acc[g][j];
   }
 }
+#endif
 
 // Folds the chunks and any sub-chunks in order, adds the sink logit, applies the gate and rounds once to bf16.
 // Grid (rows * heads). Eight sub-groups, each over one eighth of the chunks and every channel, so each thread folds eight
