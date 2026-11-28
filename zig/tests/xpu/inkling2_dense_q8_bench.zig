@@ -79,7 +79,7 @@ const Bench = struct {
     }
 
     fn run(b: *Bench, head: bool, w: host.Ref, x: host.Ref, y: host.Ref, rows: u32, n: u32, k: u32) !void {
-        if (head) try host.head(&b.k, b.dev.s, w, x, y, rows, n) else try host.dense(&b.k, b.dev.s, w, x, y, rows, n, k);
+        if (head) try host.head(&b.k, b.dev.s, w, x, y, rows, n) else try host.dense(&b.k, b.dev.s, w, x, y, null, rows, n, k);
     }
 
     /// Microseconds of one call, the median of `rounds` rounds of `iterations` launches, the weight copy rotating.
