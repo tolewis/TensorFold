@@ -429,6 +429,10 @@ pub const Xpu = struct {
         const r = self.model.r;
         const words = (self.vocab() + 31) / 32;
         if (windows.len != out.len or windows.len > st.batch_rows) return error.InvalidInklingWindows;
+        // V11 (TF_TOKLOG): a one-row window of one stream is one served decode token
+        const tok = windows.len == 1 and windows[0].rows() == 1;
+        if (tok) xpu.profile.tokEntry(2);
+        defer if (tok) xpu.profile.tokRet();
         var segments: [st.batch_rows]fwd.Segment = undefined;
         var ids: [st.batch_rows]u32 = undefined;
         var total: usize = 0;
@@ -452,6 +456,7 @@ pub const Xpu = struct {
         const generation = if (self.prepared) self.nextTapGeneration() else 0;
         const t_fwd = verifyNow();
         try fwd.runShared(self.model, &self.scratch, segments[0..windows.len], ids[0..total], .{ .all = true, .taps = self.tapPtr(), .txn = true });
+        xpu.profile.tokMark(.fret);
         const t_sel = verifyNow();
         const v = self.vocab();
         const all = self.window[0 .. total * v];
@@ -493,6 +498,7 @@ pub const Xpu = struct {
         if (whole) {
             try r.download(std.mem.sliceAsBytes(all), self.scratch.logits_all);
             try r.sync();
+            xpu.profile.tokMark(.dl);
         }
         var base: usize = 0;
         for (windows, out, segments[0..windows.len]) |w, o, seg| {
@@ -524,11 +530,13 @@ pub const Xpu = struct {
                 }
                 if (o.rows.len == seg.rows) o.rows[k] = logprobRow(l, o.sampled[k], w.stream.logprobs orelse 0);
             }
+            xpu.profile.tokMark(.draw);
             try r.copy(seg.cache.logits, st.view(self.scratch.logits_all, (base + seg.rows - 1) * v * 4, v * 4), v * 4);
             base += seg.rows;
         }
         const t_draw = verifyNow();
         try r.sync();
+        xpu.profile.tokMark(.cp);
         if (std.c.getenv("TF_VERIFY_TIMES") != null and total >= 8) {
             const ms = struct {
                 fn of(a: u64, b: u64) f64 {

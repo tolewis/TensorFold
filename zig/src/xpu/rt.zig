@@ -210,6 +210,7 @@ pub const Runtime = struct {
 
     pub fn download(self: *Runtime, dst: []u8, src: Buffer) Error!void {
         if (dst.len > src.len) return error.Invalid;
+        if (@import("profile.zig").tok_live) @import("profile.zig").tokDownload(dst.len);
         try self.drv.check(self.drv.api.zeCommandListAppendMemoryCopy(self.list, dst.ptr, src.ptr, dst.len, null, 0, null), "download");
     }
 
@@ -241,6 +242,7 @@ pub const Runtime = struct {
     }
 
     pub fn sync(self: *Runtime) Error!void {
+        if (@import("profile.zig").tok_live) @import("profile.zig").tokSync();
         const log = std.c.getenv("TF_TP_SYNCLOG") != null;
         const t0: u64 = if (log) profNow() else 0;
         try self.drv.check(self.drv.api.zeCommandListHostSynchronize(self.list, std.math.maxInt(u64)), "sync");

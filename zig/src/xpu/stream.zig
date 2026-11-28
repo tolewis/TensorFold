@@ -25,6 +25,7 @@ pub const Stream = struct {
 
     pub fn synchronize(self: Stream) Error!void {
         const d = self.ctx.d;
+        if (@import("profile.zig").tok_live) @import("profile.zig").tokSync();
         const rc = d.api.zeCommandListHostSynchronize(self.list, @import("std").math.maxInt(u64));
         // an unbounded wait that fails means the queue did not drain: its copies may still touch host memory, nothing on it is safe
         if (rc != 0) ze.on_lost(rc, "zeCommandListHostSynchronize");

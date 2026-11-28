@@ -355,7 +355,7 @@ pub const Profile = struct {
 // device-busy part of a later token (at that forward's last append), so the write is not in the gap it measures.
 
 /// The host marks of one token, in the order the code reaches them.
-pub const Tok = enum(u8) { entry, fstart, uploaded, first, enqueued, waited, fret, sel_app, sel_sync, dl, draw, ret };
+pub const Tok = enum(u8) { entry, fstart, uploaded, first, enqueued, waited, fret, sel_app, sel_sync, dl, draw, cp, ret };
 const tok_marks = @as(usize, @intFromEnum(Tok.ret)) + 1;
 /// Device stamp slots of a token: the forward's first kernel, the forward's end, the sampler kernel start and end.
 pub const TokDev = enum(u8) { fstart, fend, sstart, send, estart, eend };
@@ -380,7 +380,18 @@ const TokRec = struct {
     ev_gap: u64 = 0,
     /// TF_TOKLOG_EMPTY=<n>: n empty launches after the forward's end stamp.
     empties: u32 = 0,
+    /// Host waits on the stream and bytes downloaded to the host, while the token is open.
+    syncs: u32 = 0,
+    dl_bytes: u64 = 0,
 };
+
+pub fn tokSync() void {
+    tok_recs[tok_k % tok_ring].syncs += 1;
+}
+
+pub fn tokDownload(n: usize) void {
+    tok_recs[tok_k % tok_ring].dl_bytes += n;
+}
 
 pub var tok_on: bool = false;
 var tok_read: bool = false;
@@ -412,7 +423,7 @@ fn tokWrite(s: []const u8) void {
     if (tok_fd >= 0) _ = std.c.write(tok_fd, s.ptr, s.len);
 }
 
-/// A feed starts: a new token record. `path` 1 queueFn, 2 verifyFn, 3 the logits tool.
+/// A feed starts: a new token record. `path` 1 queueFn, 2 verifyFn (a one-row window, the served path), 3 the logits tool.
 pub fn tokEntry(path: u8) void {
     tokInit();
     if (!tok_on) return;
@@ -557,14 +568,15 @@ pub fn tokEmit(ctx: *const Context) void {
             return rec.t[@intFromEnum(m)];
         }
     };
-    const line = std.fmt.bufPrint(&buf, "TOK {d} gen {d} path {d} fwd_dev {d:.1} launches {d} ev_launches {d} ev_busy {d:.1} ev_span {d:.1} ev_gap {d:.1} empties {d} empty_us {d:.2} | waited {d:.1} fret {d:.1} sel_app {d:.1} sel_dev_start {d:.1} sel_dev_end {d:.1} sel_sync {d:.1} dl {d:.1} draw {d:.1} ret {d:.1} | next entry {d:.1} fstart {d:.1} uploaded {d:.1} first {d:.1} dev_start {d:.1} | own fstart {d:.1} uploaded {d:.1} first {d:.1} enqueued {d:.1} | cal {d} ns\n", .{
+    const line = std.fmt.bufPrint(&buf, "TOK {d} gen {d} path {d} fwd_dev {d:.1} launches {d} ev_launches {d} ev_busy {d:.1} ev_span {d:.1} ev_gap {d:.1} empties {d} empty_us {d:.2} syncs {d} dl_bytes {d} | waited {d:.1} fret {d:.1} sel_app {d:.1} sel_dev_start {d:.1} sel_dev_end {d:.1} sel_sync {d:.1} dl {d:.1} draw {d:.1} cp {d:.1} ret {d:.1} | next entry {d:.1} fstart {d:.1} uploaded {d:.1} first {d:.1} dev_start {d:.1} | own fstart {d:.1} uploaded {d:.1} first {d:.1} enqueued {d:.1} | cal {d} ns\n", .{
         tok_k - 2,                     o.gen,                         o.path,                        fwd_us,
         o.launches,                    o.ev_launches,                 @as(f64, @floatFromInt(o.ev_busy)) / 1e3,
         @as(f64, @floatFromInt(o.ev_span)) / 1e3, @as(f64, @floatFromInt(o.ev_gap)) / 1e3, o.empties,
-        empty_us,
+        empty_us,                      o.syncs,                       o.dl_bytes,
         us(T.at(o, .waited), e),       us(T.at(o, .fret), e),         us(T.at(o, .sel_app), e),
         sel_s,                         sel_e,                         us(T.at(o, .sel_sync), e),
-        us(T.at(o, .dl), e),           us(T.at(o, .draw), e),         us(T.at(o, .ret), e),
+        us(T.at(o, .dl), e),           us(T.at(o, .draw), e),         us(T.at(o, .cp), e),
+        us(T.at(o, .ret), e),
         us(T.at(n, .entry), e),        us(T.at(n, .fstart), e),       us(T.at(n, .uploaded), e),
         us(T.at(n, .first), e),        next_dev,                      us(T.at(o, .fstart), e),
         us(T.at(o, .uploaded), e),     us(T.at(o, .first), e),        us(T.at(o, .enqueued), e),

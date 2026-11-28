@@ -110,9 +110,13 @@ pub const Sampler = struct {
     pub fn raceRows(s: *Sampler, logits: ?*anyopaque, vocab: u32, positions: []const u32, seed: u64, inv_t: f32) ![]const u32 {
         if (positions.len == 0 or positions.len > s.rows_max) return error.Inkling2SampleRows;
         try s.r.upload(s.cfg, std.mem.sliceAsBytes(positions));
+        try xpu.launch.tokStamp(s.r.stream(s.ctx), .sstart);
         try xpu.launch.dispatch(s.race, s.r.stream(s.ctx), .{ @intCast(positions.len), 1, 1 }, .{ logits, s.cfg.ptr, s.out.ptr, vocab, @as(u32, @truncate(seed)), @as(u32, @truncate(seed >> 32)), inv_t });
+        try xpu.launch.tokStamp(s.r.stream(s.ctx), .send);
         try s.r.download(std.mem.sliceAsBytes(s.host_out[0..positions.len]), s.out);
+        xpu.profile.tokMark(.sel_app);
         try s.r.sync();
+        xpu.profile.tokMark(.sel_sync);
         return s.host_out[0..positions.len];
     }
 };
